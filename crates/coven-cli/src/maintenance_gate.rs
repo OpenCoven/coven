@@ -106,6 +106,39 @@ pub struct MaintenanceGate {
     common_dir: PathBuf,
 }
 
+/// Whether `project_root` could possibly sit inside a git repository.
+///
+/// Only ever used to skip work: a `false` result means no `.git` entry and no
+/// bare-repository layout exists anywhere from `project_root` up to the
+/// filesystem root, which `git rev-parse` would report as "not a git
+/// repository" too. A `true` result decides nothing — `git` still runs and
+/// still has the final say. Deliberately conservative, because a wrong `false`
+/// would silently disable the maintenance fence:
+///
+/// - a `.git` file (worktree link) counts as much as a `.git` directory;
+/// - a bare repository has no `.git` at all, so its `HEAD` + `objects` layout
+///   counts too;
+/// - `GIT_DIR` / `GIT_COMMON_DIR` can point anywhere, so their presence in the
+///   environment skips this check entirely.
+///
+/// Nothing is cached. A `git init` between two launches is picked up by the
+/// next one.
+fn maybe_in_repository(project_root: &Path) -> bool {
+    if std::env::var_os("GIT_DIR").is_some() || std::env::var_os("GIT_COMMON_DIR").is_some() {
+        return true;
+    }
+    let mut current = Some(project_root);
+    while let Some(directory) = current {
+        if directory.join(".git").exists()
+            || (directory.join("HEAD").exists() && directory.join("objects").is_dir())
+        {
+            return true;
+        }
+        current = directory.parent();
+    }
+    false
+}
+
 impl MaintenanceGate {
     /// Resolve the common directory for `project_root`. This accepts a
     /// worktree root as well as the primary checkout.
@@ -133,6 +166,15 @@ impl MaintenanceGate {
     /// exclusion domain to join; callers use this only for launch paths, never
     /// for claim or owner commands (which require a repository).
     pub fn discover_optional(project_root: &Path) -> Result<Option<Self>> {
+        // Every session launch calls this, and spawning `git` costs more than
+        // the rest of launch-to-first-output put together (~14 ms of the
+        // ~37 ms floor on macOS, measured in bead coven-mwb). A directory with
+        // no repository anywhere above it cannot be a worktree, and that check
+        // is a handful of stats. Anything that might be a repository still
+        // goes to `git`, which stays the authority.
+        if !maybe_in_repository(project_root) {
+            return Ok(None);
+        }
         let output = std::process::Command::new("git")
             .arg("-C")
             .arg(project_root)
@@ -618,6 +660,53 @@ mod tests {
     use std::fs::FileTimes;
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn plain_directory_has_no_gate_and_never_consults_git() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        assert!(!maybe_in_repository(temp.path()));
+        assert!(MaintenanceGate::discover_optional(temp.path())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn repository_layouts_still_reach_git() -> Result<()> {
+        // Each of these must fall through to `git`, because treating one as a
+        // plain directory would silently drop the maintenance fence.
+        let worktree_dir = tempfile::tempdir()?;
+        std::fs::create_dir(worktree_dir.path().join(".git"))?;
+        assert!(maybe_in_repository(worktree_dir.path()));
+
+        let linked = tempfile::tempdir()?;
+        std::fs::write(
+            linked.path().join(".git"),
+            b"gitdir: /elsewhere/.git/worktrees/w",
+        )?;
+        assert!(maybe_in_repository(linked.path()));
+
+        let nested = tempfile::tempdir()?;
+        std::fs::create_dir(nested.path().join(".git"))?;
+        let deep = nested.path().join("crates/coven-cli/src");
+        std::fs::create_dir_all(&deep)?;
+        assert!(maybe_in_repository(&deep));
+
+        let bare = tempfile::tempdir()?;
+        std::fs::write(bare.path().join("HEAD"), b"ref: refs/heads/main\n")?;
+        std::fs::create_dir(bare.path().join("objects"))?;
+        assert!(maybe_in_repository(bare.path()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_repository_created_after_a_launch_is_seen_by_the_next_one() -> Result<()> {
+        // Nothing is cached, so the fence cannot be disabled for the lifetime
+        // of a daemon by an early miss.
+        let temp = tempfile::tempdir()?;
+        assert!(!maybe_in_repository(temp.path()));
+        std::fs::create_dir(temp.path().join(".git"))?;
+        assert!(maybe_in_repository(temp.path()));
+        Ok(())
+    }
 
     fn assert_contended(error: &anyhow::Error) {
         assert!(error
