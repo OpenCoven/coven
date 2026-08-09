@@ -1015,7 +1015,7 @@ fn apply_plan(worktree_path: &Path, plan: &[Planned]) -> AfsResult<()> {
         let host = worktree_path.join(relative);
         match item {
             Planned::Removal { .. } => {
-                if host.exists() {
+                if std::fs::symlink_metadata(&host).is_ok() {
                     std::fs::remove_file(&host)
                         .with_context(|| format!("failed to remove {}", host.display()))
                         .map_err(AfsError::from)?;
@@ -1646,6 +1646,27 @@ mod tests {
             git_ok(&root, &["show", &format!("{}:src/main.rs", committed.commit)]),
             "fn main() { println!(\"safe\"); }"
         );
+    }
+
+    #[test]
+    fn apply_plan_removes_a_dangling_symlink_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("worktree");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        let dangling_target = root.join("missing-target");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&dangling_target, root.join("src/dangle")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&dangling_target, root.join("src/dangle")).unwrap();
+
+        apply_plan(
+            &root,
+            &[Planned::Removal {
+                path: "/src/dangle".to_string(),
+            }],
+        )
+        .expect("apply_plan should remove a dangling symlink");
+        assert!(std::fs::symlink_metadata(root.join("src/dangle")).is_err());
     }
 
     #[test]
