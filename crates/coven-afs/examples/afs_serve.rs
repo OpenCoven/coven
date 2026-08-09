@@ -76,7 +76,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // example writes it to a file readable only by the current user rather
     // than to stdout, so a terminal transcript or CI log never carries it.
     let token_path = std::env::temp_dir().join(format!("afs-export-{}.token", std::process::id()));
-    write_token(&token_path, export.token())?;
+    write_token(&token_path, &export.token())?;
+
+    // `mount_nfs` puts the export path in argv, so the token is `ps`-visible
+    // for the length of that call. Rotating afterwards makes a scraped value
+    // useless. The delay is a stand-in for the daemon's mount route, which
+    // rotates the moment the mount returns.
+    let gate = export.gate_handle();
+    if let Ok(after) = std::env::var("AFS_ROTATE_AFTER") {
+        let seconds: u64 = after.parse()?;
+        let path = token_path.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            let next = gate.rotate();
+            if let Err(error) = write_token(&path, &next) {
+                eprintln!("afs_serve: rotate wrote no token file: {error}");
+                return;
+            }
+            println!("afs_serve: token rotated; {} refreshed", path.display());
+        });
+    }
 
     let listener = NFSTcpListener::bind(&format!("{host}:{port}"), export).await?;
     println!("afs_serve: port={}", listener.get_listen_port());
