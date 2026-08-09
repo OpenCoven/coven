@@ -430,6 +430,80 @@ static SUPERVISED_STREAM_CANCELLATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 #[cfg(unix)]
 static SUPERVISED_STREAM_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(all(test, unix))]
+// The test signaler and guard restoration share this lock so a test TERM can
+// never race a restored disposition. This observer is not compiled into the
+// production signal path.
+#[derive(Default)]
+struct SupervisedStreamCancellationTestLifecycle {
+    observer: Option<thread::ThreadId>,
+    active: bool,
+}
+
+#[cfg(all(test, unix))]
+static SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE: Mutex<
+    SupervisedStreamCancellationTestLifecycle,
+> = Mutex::new(SupervisedStreamCancellationTestLifecycle {
+    observer: None,
+    active: false,
+});
+
+#[cfg(all(test, unix))]
+struct SupervisedStreamCancellationTestObserver {
+    owner: thread::ThreadId,
+}
+
+#[cfg(all(test, unix))]
+impl SupervisedStreamCancellationTestObserver {
+    fn arm() -> Result<Self> {
+        let owner = thread::current().id();
+        let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.observer.is_some() {
+            anyhow::bail!("a supervised stream cancellation test observer is already active");
+        }
+        lifecycle.observer = Some(owner);
+        lifecycle.active = false;
+        Ok(Self { owner })
+    }
+
+    fn send_sigterm_if_active(&self, target: usize) -> Result<bool> {
+        let lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.observer.as_ref() != Some(&self.owner) || !lifecycle.active {
+            return Ok(false);
+        }
+
+        let result = unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGTERM) };
+        if result != 0 {
+            return Err(std::io::Error::from_raw_os_error(result))
+                .context("sending fixture SIGTERM to the stream runner thread");
+        }
+        // Keep restoration excluded until the target thread has run the
+        // atomic-only handler. Otherwise a queued thread signal could outlive
+        // the cancellation disposition and be delivered to a restored one.
+        while SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed) != libc::SIGTERM {
+            thread::yield_now();
+        }
+        Ok(true)
+    }
+}
+
+#[cfg(all(test, unix))]
+impl Drop for SupervisedStreamCancellationTestObserver {
+    fn drop(&mut self) {
+        let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.observer.as_ref() == Some(&self.owner) {
+            lifecycle.active = false;
+            lifecycle.observer = None;
+        }
+    }
+}
+
 #[cfg(unix)]
 extern "C" fn cancel_supervised_stream(signal: libc::c_int) {
     SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(signal, Ordering::Relaxed);
@@ -447,6 +521,8 @@ struct SupervisedStreamCancellationGuard {
     previous_handlers: Vec<(libc::c_int, libc::sigaction)>,
     signal_mask: SupervisedSignalMask,
     active: bool,
+    #[cfg(test)]
+    test_lifecycle_active: bool,
 }
 
 #[cfg(unix)]
@@ -570,11 +646,26 @@ impl SupervisedStreamCancellationGuard {
             }
         }
 
+        #[cfg(test)]
+        let test_lifecycle_active = {
+            let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.active = true;
+                true
+            } else {
+                false
+            }
+        };
+
         Ok(Self {
             _lock: lock,
             previous_handlers,
             signal_mask,
             active: true,
+            #[cfg(test)]
+            test_lifecycle_active,
         })
     }
 
@@ -591,6 +682,16 @@ impl SupervisedStreamCancellationGuard {
     }
 
     fn finish(mut self) -> Result<Option<libc::c_int>> {
+        #[cfg(test)]
+        let mut test_lifecycle = self.test_lifecycle_active.then(|| {
+            SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        #[cfg(test)]
+        if let Some(lifecycle) = &mut test_lifecycle {
+            lifecycle.active = false;
+        }
         self.signal_mask
             .reblock()
             .context("failed to re-block supervised stream cancellation signals")?;
@@ -605,6 +706,8 @@ impl SupervisedStreamCancellationGuard {
                 }
             }
         }
+        #[cfg(test)]
+        drop(test_lifecycle);
         SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
         self.active = false;
 
@@ -624,6 +727,16 @@ impl Drop for SupervisedStreamCancellationGuard {
         if !self.active {
             return;
         }
+        #[cfg(test)]
+        let mut test_lifecycle = self.test_lifecycle_active.then(|| {
+            SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        #[cfg(test)]
+        if let Some(lifecycle) = &mut test_lifecycle {
+            lifecycle.active = false;
+        }
         let _ = self.signal_mask.reblock();
         // SAFETY: every entry was captured from a successful sigaction call
         // in install. Restoring it here makes the scope transparent once the
@@ -633,6 +746,8 @@ impl Drop for SupervisedStreamCancellationGuard {
                 let _ = libc::sigaction(*signal, previous, std::ptr::null_mut());
             }
         }
+        #[cfg(test)]
+        drop(test_lifecycle);
         SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
         let _ = self.signal_mask.restore();
     }
@@ -4348,82 +4463,11 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
-    const NATIVE_STREAM_SIGTERM_TEST_CHILD_DIR: &str = "COVEN_TEST_NATIVE_STREAM_SIGTERM_DIR";
-    #[cfg(unix)]
     const NATIVE_STREAM_SIGTERM_TEST_WATCHDOG: Duration = Duration::from_secs(30);
 
     #[cfg(unix)]
-    extern "C" fn retain_native_stream_sigterm_test_signal(_signal: libc::c_int) {}
-
-    #[cfg(unix)]
-    struct NativeStreamSigtermTestSignal {
-        previous: libc::sigaction,
-        active: bool,
-    }
-
-    #[cfg(unix)]
-    impl NativeStreamSigtermTestSignal {
-        fn install() -> Result<Self> {
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = retain_native_stream_sigterm_test_signal as *const () as usize;
-            unsafe {
-                libc::sigemptyset(&mut action.sa_mask);
-            }
-            action.sa_flags = 0;
-            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
-            if unsafe { libc::sigaction(libc::SIGTERM, &action, &mut previous) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("installing native stream SIGTERM test handler");
-            }
-            Ok(Self {
-                previous,
-                active: true,
-            })
-        }
-
-        fn is_restored(&self) -> Result<bool> {
-            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
-            if unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut current) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("reading restored native stream SIGTERM handler");
-            }
-            Ok(current.sa_sigaction
-                == retain_native_stream_sigterm_test_signal as *const () as usize)
-        }
-
-        fn cancellation_handler_is_active() -> Result<bool> {
-            let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
-            if unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut current) } != 0 {
-                return Err(std::io::Error::last_os_error())
-                    .context("reading native stream SIGTERM handler");
-            }
-            Ok(current.sa_sigaction == cancel_supervised_stream as *const () as usize)
-        }
-
-        fn restore(&mut self) -> Result<()> {
-            if !self.active {
-                return Ok(());
-            }
-            if unsafe { libc::sigaction(libc::SIGTERM, &self.previous, std::ptr::null_mut()) } != 0
-            {
-                return Err(std::io::Error::last_os_error())
-                    .context("restoring native stream SIGTERM test handler");
-            }
-            self.active = false;
-            Ok(())
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for NativeStreamSigtermTestSignal {
-        fn drop(&mut self) {
-            if self.active {
-                unsafe {
-                    libc::sigaction(libc::SIGTERM, &self.previous, std::ptr::null_mut());
-                }
-            }
-        }
-    }
+    const NATIVE_STREAM_SIGTERM_FIXTURES: [(&str, &str); 2] =
+        [("harness", "harness.pid"), ("descendant", "descendant.pid")];
 
     #[cfg(unix)]
     fn native_stream_sigterm_fixture_pid(
@@ -4433,11 +4477,12 @@ while :; do sleep 1; done
     ) -> Result<Option<libc::pid_t>> {
         let path = fixture_dir.join(file_name);
         match std::fs::read_to_string(&path) {
+            Ok(contents) if contents.trim().is_empty() => Ok(None),
             Ok(contents) => {
                 let pid = contents
                     .trim()
                     .parse::<libc::pid_t>()
-                    .context("parsing fixture PID")?;
+                    .with_context(|| format!("parsing {label} fixture PID"))?;
                 if pid <= 0 {
                     anyhow::bail!("{label} fixture recorded invalid PID {pid}");
                 }
@@ -4451,53 +4496,30 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
+    fn native_stream_sigterm_fixture_is_ready(fixture_dir: &Path) -> Result<bool> {
+        for (label, file_name) in NATIVE_STREAM_SIGTERM_FIXTURES {
+            if native_stream_sigterm_fixture_pid(fixture_dir, label, file_name)?.is_none() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(unix)]
     fn native_stream_sigterm_fixture_is_reaped(pid: libc::pid_t) -> bool {
         (unsafe { libc::kill(pid, 0) }) == -1
             && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
     }
 
     #[cfg(unix)]
-    fn terminate_native_stream_sigterm_harness_group(fixture_dir: &Path) -> Vec<String> {
-        let pid = match native_stream_sigterm_fixture_pid(fixture_dir, "harness", "harness.pid") {
-            Ok(Some(pid)) => pid,
-            // The fixture writes its harness PID before starting a descendant.
-            // With no PID, there is no process group to target.
-            Ok(None) => return Vec::new(),
-            Err(error) => {
-                return vec![format!(
-                    "reading fixture harness PID for cleanup: {error:#}"
-                )]
-            }
-        };
-
-        // stream_harness_with_program reaches spawn_strict_child_process_tree,
-        // whose Unix setup calls setsid(). The harness PID is therefore the
-        // exact leader of the isolated harness process group.
-        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return vec![format!(
-                    "failed to terminate fixture harness process group led by {pid}: {error}"
-                )];
-            }
-        }
-        Vec::new()
-    }
-
-    #[cfg(unix)]
-    fn cleanup_native_stream_sigterm_fixtures(
-        fixture_dir: &Path,
-        require_recorded_pids: bool,
-    ) -> Vec<String> {
-        const FIXTURES: [(&str, &str); 2] =
-            [("harness", "harness.pid"), ("descendant", "descendant.pid")];
-        let mut pids = [None; FIXTURES.len()];
-        let mut pid_errors = [None, None];
-        let mut reaped = [false; FIXTURES.len()];
-        let grace_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
+    fn cleanup_native_stream_sigterm_fixtures(fixture_dir: &Path) -> Vec<String> {
+        let mut pids: [Option<libc::pid_t>; 2] = [None; 2];
+        let mut pid_errors: [Option<String>; 2] = std::array::from_fn(|_| None);
+        let mut reaped = [false; 2];
+        let reaping_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
 
         loop {
-            for (index, (label, file_name)) in FIXTURES.iter().enumerate() {
+            for (index, (label, file_name)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
                 if pids[index].is_none() {
                     match native_stream_sigterm_fixture_pid(fixture_dir, label, file_name) {
                         Ok(Some(pid)) => {
@@ -4509,53 +4531,50 @@ while :; do sleep 1; done
                     }
                 }
                 if let Some(pid) = pids[index] {
-                    reaped[index] = native_stream_sigterm_fixture_is_reaped(pid);
+                    if !reaped[index] {
+                        reaped[index] = native_stream_sigterm_fixture_is_reaped(pid);
+                    }
                 }
             }
 
-            let all_recorded = pids.iter().all(Option::is_some);
-            let all_reaped = pids
-                .iter()
-                .enumerate()
-                .all(|(index, pid)| pid.is_none() || reaped[index]);
-            let no_pid_errors = pid_errors.iter().all(Option::is_none);
-            if all_reaped && no_pid_errors && (!require_recorded_pids || all_recorded) {
+            if pids.iter().all(Option::is_some) && reaped.iter().all(|reaped| *reaped) {
                 return Vec::new();
             }
-            if Instant::now() >= grace_deadline {
+            if Instant::now() >= reaping_deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
 
         let mut failures = Vec::new();
-        for (index, (label, _)) in FIXTURES.iter().enumerate() {
+        for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
             let Some(pid) = pids[index] else {
                 if let Some(error) = &pid_errors[index] {
                     failures.push(format!(
-                        "cancelled native stream could not read {label} PID before reaping grace expired: {error}"
+                        "cancelled native stream could not read {label} PID before the reaping watchdog expired: {error}"
                     ));
-                } else if require_recorded_pids {
+                } else {
                     failures.push(format!(
-                        "cancelled native stream did not record {label} PID before reaping grace expired"
+                        "cancelled native stream did not record {label} PID before the reaping watchdog expired"
                     ));
                 }
                 continue;
             };
-            if !reaped[index] {
-                failures.push(format!(
-                    "cancelled native stream left {label} {pid} unreaped after reaping grace; \
-                     attempting exact-PID failure cleanup"
-                ));
-                if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() == Some(libc::ESRCH) {
-                        reaped[index] = true;
-                    } else {
-                        failures.push(format!(
-                            "failed to clean up unreaped {label} {pid} with SIGKILL: {error}"
-                        ));
-                    }
+            if reaped[index] {
+                continue;
+            }
+
+            failures.push(format!(
+                "cancelled native stream left {label} {pid} alive after the reaping watchdog; attempting exact-PID cleanup"
+            ));
+            if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    reaped[index] = true;
+                } else {
+                    failures.push(format!(
+                        "failed to clean up unreaped {label} {pid} with SIGKILL: {error}"
+                    ));
                 }
             }
         }
@@ -4569,7 +4588,9 @@ while :; do sleep 1; done
         {
             for (index, pid) in pids.iter().enumerate() {
                 if let Some(pid) = pid {
-                    reaped[index] = native_stream_sigterm_fixture_is_reaped(*pid);
+                    if !reaped[index] {
+                        reaped[index] = native_stream_sigterm_fixture_is_reaped(*pid);
+                    }
                 }
             }
             if pids
@@ -4580,7 +4601,8 @@ while :; do sleep 1; done
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        for (index, (label, _)) in FIXTURES.iter().enumerate() {
+
+        for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
             if let Some(pid) = pids[index] {
                 if !reaped[index] {
                     failures.push(format!(
@@ -4593,15 +4615,30 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
-    fn write_native_stream_sigterm_fixture(fixture_dir: &Path) -> Result<()> {
+    fn native_stream_sigterm_handler_is_restored() -> Result<bool> {
+        let _lock = SUPERVISED_STREAM_CANCELLATION_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut current: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGTERM, std::ptr::null(), &mut current) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("reading restored native stream SIGTERM handler");
+        }
+        Ok(current.sa_sigaction != cancel_supervised_stream as *const () as usize)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_stream_sigterm_cancels_and_reaps_process_tree() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let fake_harness = fixture_dir.join("long-lived-stream");
+        let temp_dir = tempfile::tempdir()?;
+        let fake_harness = temp_dir.path().join("long-lived-stream");
         std::fs::write(
             &fake_harness,
             r#"#!/bin/sh
 printf '%s\n' "$$" > harness.pid
-sleep 120 &
+sleep 120 </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" > descendant.pid
 while :; do sleep 1; done
 "#,
@@ -4609,50 +4646,61 @@ while :; do sleep 1; done
         let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_harness, permissions)?;
-        Ok(())
-    }
 
-    #[cfg(unix)]
-    fn native_stream_sigterm_child(fixture_dir: &Path) -> Result<()> {
-        let signal_guard = NativeStreamSigtermTestSignal::install()?;
+        let lifecycle = Arc::new(SupervisedStreamCancellationTestObserver::arm()?);
+        let signal_lifecycle = Arc::clone(&lifecycle);
         let runner_thread = unsafe { libc::pthread_self() } as usize;
-        let signal_dir = fixture_dir.to_path_buf();
+        let signal_dir = temp_dir.path().to_path_buf();
         let stream_finished = Arc::new(AtomicBool::new(false));
         let signal_stream_finished = Arc::clone(&stream_finished);
         let signaler = thread::spawn(move || -> Result<()> {
-            let deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
-            while !(signal_dir.join("harness.pid").exists()
-                && signal_dir.join("descendant.pid").exists())
-            {
+            let startup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
+            loop {
                 if signal_stream_finished.load(Ordering::Relaxed) {
-                    anyhow::bail!("native stream returned before the fixture started");
-                }
-                if Instant::now() >= deadline {
                     anyhow::bail!(
-                        "native stream fixture did not start before the watchdog expired"
+                        "native stream returned before the fixture became ready; no SIGTERM was sent"
                     );
+                }
+                match native_stream_sigterm_fixture_is_ready(&signal_dir) {
+                    Ok(true) => {
+                        if signal_lifecycle.send_sigterm_if_active(runner_thread)? {
+                            return Ok(());
+                        }
+                        anyhow::bail!(
+                            "native stream handler was inactive before the fixture could be signalled; no SIGTERM was sent"
+                        );
+                    }
+                    Ok(false) if Instant::now() < startup_deadline => {}
+                    Ok(false) => {
+                        let sent = signal_lifecycle.send_sigterm_if_active(runner_thread)?;
+                        if sent {
+                            anyhow::bail!(
+                                "native stream fixture did not become ready before the startup watchdog expired; sent SIGTERM while its handler was active"
+                            );
+                        }
+                        anyhow::bail!(
+                            "native stream fixture did not become ready before the startup watchdog expired; handler was inactive and no SIGTERM was sent"
+                        );
+                    }
+                    Err(error) => {
+                        let sent = signal_lifecycle.send_sigterm_if_active(runner_thread)?;
+                        if sent {
+                            anyhow::bail!(
+                                "native stream fixture readiness failed: {error:#}; sent SIGTERM while its handler was active"
+                            );
+                        }
+                        anyhow::bail!(
+                            "native stream fixture readiness failed: {error:#}; handler was inactive and no SIGTERM was sent"
+                        );
+                    }
                 }
                 thread::sleep(Duration::from_millis(10));
             }
-            if signal_stream_finished.load(Ordering::Relaxed) {
-                anyhow::bail!("native stream returned before the fixture could be signalled");
-            }
-            if !NativeStreamSigtermTestSignal::cancellation_handler_is_active()? {
-                anyhow::bail!("native stream SIGTERM handler was not active for the fixture");
-            }
-            let result =
-                unsafe { libc::pthread_kill(runner_thread as libc::pthread_t, libc::SIGTERM) };
-            if result != 0 {
-                return Err(std::io::Error::from_raw_os_error(result))
-                    .context("sending fixture SIGTERM to the stream runner thread");
-            }
-            Ok(())
         });
 
-        let fake_harness = fixture_dir.join("long-lived-stream");
         let stream_result = stream_harness_with_program(
             fake_harness.to_str().expect("fixture path is UTF-8"),
-            fixture_dir,
+            temp_dir.path(),
             Vec::new(),
             false,
             "streamy",
@@ -4664,15 +4712,9 @@ while :; do sleep 1; done
             Ok(result) => result,
             Err(_) => Err(anyhow::anyhow!("native stream signal thread panicked")),
         };
-        let restoration_result = signal_guard.is_restored();
-        let mut signal_guard = signal_guard;
-        let guard_restore_result = signal_guard.restore();
+        let restoration_result = native_stream_sigterm_handler_is_restored();
 
-        // Complete fixture cleanup before reporting a runner, signal, or
-        // restoration failure. The parent test repeats this after a watchdog
-        // termination so a malformed child test process cannot strand either
-        // exact fixture PID.
-        let mut failures = cleanup_native_stream_sigterm_fixtures(fixture_dir, true);
+        let mut failures = cleanup_native_stream_sigterm_fixtures(temp_dir.path());
         if let Err(error) = signal_result {
             failures.push(format!("native stream signal thread failed: {error:#}"));
         }
@@ -4693,100 +4735,7 @@ while :; do sleep 1; done
                 .push("native stream runner did not restore the previous SIGTERM handler".into()),
             Err(error) => failures.push(format!("{error:#}")),
         }
-        if let Err(error) = guard_restore_result {
-            failures.push(format!("{error:#}"));
-        }
-        if !failures.is_empty() {
-            anyhow::bail!("{}", failures.join("; "));
-        }
-        Ok(())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn native_stream_sigterm_cancels_and_reaps_process_tree() -> Result<()> {
-        if let Some(fixture_dir) = std::env::var_os(NATIVE_STREAM_SIGTERM_TEST_CHILD_DIR) {
-            return native_stream_sigterm_child(Path::new(&fixture_dir));
-        }
-
-        let temp_dir = tempfile::tempdir()?;
-        write_native_stream_sigterm_fixture(temp_dir.path())?;
-        let current_exe =
-            std::env::current_exe().context("resolving native stream SIGTERM test executable")?;
-        let mut child = std::process::Command::new(current_exe)
-            .arg("--exact")
-            .arg("pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree")
-            .arg("--nocapture")
-            .env(NATIVE_STREAM_SIGTERM_TEST_CHILD_DIR, temp_dir.path())
-            .spawn()
-            .context("spawning isolated native stream SIGTERM test")?;
-
-        let mut failures = Vec::new();
-        let deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
-        let mut child_status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) if Instant::now() < deadline => {
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Ok(None) => {
-                    failures.push(
-                        "isolated native stream SIGTERM test exceeded the watchdog; terminating it"
-                            .into(),
-                    );
-                    break None;
-                }
-                Err(error) => {
-                    failures.push(format!(
-                        "polling isolated native stream SIGTERM test: {error}"
-                    ));
-                    break None;
-                }
-            }
-        };
-        if child_status.is_none() {
-            // The harness writes harness.pid before it starts the long-lived
-            // sleep(120) descendant. Kill its isolated process group first so
-            // a watchdog cannot strand a child between that sleep starting
-            // and descendant.pid being written.
-            failures.extend(terminate_native_stream_sigterm_harness_group(
-                temp_dir.path(),
-            ));
-            if let Err(error) = child.kill() {
-                failures.push(format!(
-                    "terminating isolated native stream SIGTERM test: {error}"
-                ));
-            }
-            match child.wait() {
-                Ok(status) => child_status = Some(status),
-                Err(error) => failures.push(format!(
-                    "waiting for terminated native stream SIGTERM test: {error}"
-                )),
-            }
-            // If the harness wrote its PID while the test child was being
-            // terminated, its group still contains every unrecorded
-            // descendant and can be targeted precisely.
-            failures.extend(terminate_native_stream_sigterm_harness_group(
-                temp_dir.path(),
-            ));
-        }
-
-        // The isolated child may be killed by the watchdog before it can
-        // clean up, so verify and clean both exact fixture PIDs here before
-        // reporting its outcome.
-        failures.extend(cleanup_native_stream_sigterm_fixtures(
-            temp_dir.path(),
-            child_status
-                .as_ref()
-                .is_some_and(std::process::ExitStatus::success),
-        ));
-        match child_status {
-            Some(status) if status.success() => {}
-            Some(status) => failures.push(format!(
-                "isolated native stream SIGTERM test exited unsuccessfully: {status}"
-            )),
-            None => failures.push("isolated native stream SIGTERM test had no exit status".into()),
-        }
+        drop(lifecycle);
         if !failures.is_empty() {
             anyhow::bail!("{}", failures.join("; "));
         }
