@@ -747,6 +747,7 @@ dependencies = [
  "chrono",
  "clap",
  "clap_complete",
+ "coven-afs",
  "coven-runtime-spec",
  "coven-threads-core",
  "crossterm",

@@ -127,6 +127,32 @@ pub struct HealthCapabilities {
     pub event_cursor: String,
     pub structured_errors: bool,
     pub session_handoff: bool,
+    /// Whether the `afs.*` route family is served at all.
+    pub afs: bool,
+    /// Mount backend, or `false` when none is available. A client must branch
+    /// on this rather than assume mounting works: SDK-only operation is a
+    /// supported mode, not a degraded one.
+    pub afs_mount: MountCapability,
+    /// Whether the daemon can materialize a delta into a git branch.
+    pub afs_commit: bool,
+}
+
+/// `afsMount`: a backend name, or `false`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountCapability {
+    Backend(String),
+    Unavailable(bool),
+}
+
+impl MountCapability {
+    /// No mount backend is exposed yet. The NFS export from coven-110 is
+    /// protocol-correct but an agent process could not write through it on
+    /// macOS (bead coven-x77), so advertising a backend would promise
+    /// something the daemon cannot currently deliver.
+    pub fn unavailable() -> Self {
+        Self::Unavailable(false)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,6 +335,12 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             event_cursor: "sequence".to_string(),
             structured_errors: true,
             session_handoff: true,
+            afs: true,
+            afs_mount: MountCapability::unavailable(),
+            // Commit materialization is specified in DESIGN.md section 5 but
+            // not implemented yet; the capability says so rather than letting
+            // a client discover it from a 404.
+            afs_commit: false,
         },
         daemon,
         hub: None,
@@ -401,6 +433,10 @@ pub fn handle_request_with_runtime(
             &health_response_with_hub(coven_home, daemon, runtime.event_writer_health()),
         ),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
+        ("POST", "/afs/sessions") => afs_create(coven_home, body),
+        ("GET", "/afs/sessions") => afs_list(coven_home),
+        ("GET", p) if p.starts_with("/afs/sessions/") => afs_read(coven_home, p, query),
+        ("POST", p) if p.starts_with("/afs/sessions/") => afs_write(coven_home, p, body),
         ("GET", "/overview") => overview_response(coven_home),
         ("POST", "/actions") => {
             let payload = match parse_body(body) {
@@ -6659,6 +6695,172 @@ fn ward_change_json(change: &crate::ward::AppliedChange) -> Value {
     value
 }
 
+// ---- AFS routes ---------------------------------------------------------
+//
+// `afs.session.*`, `afs.timeline`, and `afs.mount` from
+// `specs/coven-agent-fs/DESIGN.md` section 3.2, mapped onto the daemon's REST
+// idiom. Same-user local IPC only: like session handoff, these must never be
+// proxied to a remote listener.
+
+fn afs_failure(error: crate::afs::AfsError) -> Result<ApiResponse> {
+    let (status, code, message) = error.parts();
+    api_error(status, code, &message, None)
+}
+
+/// Split `/afs/sessions/<id>[/<action>]`.
+fn afs_target(path: &str) -> Option<(String, Option<String>)> {
+    let rest = path.strip_prefix("/afs/sessions/")?;
+    let rest = rest.trim_end_matches('/');
+    if rest.is_empty() {
+        return None;
+    }
+    match rest.split_once('/') {
+        Some((id, action)) if !id.is_empty() && !action.is_empty() => {
+            Some((id.to_string(), Some(action.to_string())))
+        }
+        Some(_) => None,
+        None => Some((rest.to_string(), None)),
+    }
+}
+
+fn afs_create(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(_) => return api_error(400, "invalid_request", "Malformed request body.", None),
+    };
+    let request: crate::afs::CreateRequest = match serde_json::from_value(payload) {
+        Ok(request) => request,
+        Err(error) => {
+            return api_error(
+                400,
+                "invalid_request",
+                &format!("Invalid AFS session request: {error}"),
+                None,
+            )
+        }
+    };
+    if request.project_root.trim().is_empty() {
+        return api_error(400, "invalid_request", "projectRoot is required.", None);
+    }
+    match crate::afs::AfsStore::new(coven_home).create(&request) {
+        Ok(view) => json_response(201, &view),
+        Err(error) => afs_failure(error),
+    }
+}
+
+fn afs_list(coven_home: &Path) -> Result<ApiResponse> {
+    match crate::afs::AfsStore::new(coven_home).list() {
+        Ok(sessions) => json_response(200, &json!({ "sessions": sessions })),
+        Err(error) => afs_failure(error),
+    }
+}
+
+fn afs_read(coven_home: &Path, path: &str, query: Option<&str>) -> Result<ApiResponse> {
+    let Some((id, action)) = afs_target(path) else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let store = crate::afs::AfsStore::new(coven_home);
+    match action.as_deref() {
+        None => match store.get(&id) {
+            Ok(view) => json_response(200, &view),
+            Err(error) => afs_failure(error),
+        },
+        Some("diff") => match store.diff(&id) {
+            Ok(view) => json_response(200, &view),
+            Err(error) => afs_failure(error),
+        },
+        Some("timeline") => {
+            let since = query
+                .and_then(|q| query_param(q, "since"))
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            let limit = match query
+                .and_then(|q| query_param(q, "limit"))
+                .map(|value| value.parse::<usize>())
+            {
+                Some(Ok(limit)) if (1..=1000).contains(&limit) => limit,
+                Some(_) => {
+                    return api_error(
+                        400,
+                        "invalid_request",
+                        "limit must be between 1 and 1000.",
+                        None,
+                    )
+                }
+                None => 100,
+            };
+            match store.timeline(&id, since, limit) {
+                Ok(view) => json_response(200, &view),
+                Err(error) => afs_failure(error),
+            }
+        }
+        Some(_) => api_error(404, "not_found", "Route not found.", None),
+    }
+}
+
+fn afs_write(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiResponse> {
+    let Some((id, Some(action))) = afs_target(path) else {
+        return api_error(404, "not_found", "Route not found.", None);
+    };
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(_) => return api_error(400, "invalid_request", "Malformed request body.", None),
+    };
+    let store = crate::afs::AfsStore::new(coven_home);
+    match action.as_str() {
+        "join" => {
+            let actor = coven_afs::Actor {
+                afs_session_id: Some(id.clone()),
+                coven_session_id: payload
+                    .get("sessionId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                familiar_id: payload
+                    .get("familiarId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                bead_id: payload
+                    .get("beadId")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                turn: payload.get("turn").and_then(|value| value.as_i64()),
+                tool_call_id: None,
+            };
+            match store.join(&id, &actor) {
+                Ok(view) => json_response(200, &view),
+                Err(error) => afs_failure(error),
+            }
+        }
+        "discard" => {
+            let confirm = payload
+                .get("confirm")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let retain_audit = payload
+                .get("retainAudit")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            match store.discard(&id, confirm, retain_audit) {
+                Ok(()) => json_response(200, &json!({ "id": id, "discarded": true })),
+                Err(error) => afs_failure(error),
+            }
+        }
+        "commit" => api_error(
+            501,
+            "afs.commit_unsupported",
+            "Commit materialization is not implemented; health advertises afsCommit:false.",
+            None,
+        ),
+        "mount" => api_error(
+            501,
+            "afs.mount_unsupported",
+            "No mount backend is available; health advertises afsMount:false.",
+            None,
+        ),
+        _ => api_error(404, "not_found", "Route not found.", None),
+    }
+}
+
 pub(crate) fn parse_body(body: Option<&str>) -> Result<Value> {
     match body.filter(|body| !body.trim().is_empty()) {
         Some(body) => serde_json::from_str(body).context("failed to parse request body"),
@@ -6748,6 +6950,153 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn afs_project(dir: &Path) -> String {
+        let root = dir.join("project");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
+        root.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn health_advertises_the_afs_capability_set() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let response = handle_request("GET", "/api/v1/health", temp.path(), None)?;
+        assert!(response.body.contains(r#""afs":true"#));
+        // A client must be able to see that mounting and committing are not
+        // available rather than discovering it from a failed request.
+        assert!(response.body.contains(r#""afsMount":false"#));
+        assert!(response.body.contains(r#""afsCommit":false"#));
+        Ok(())
+    }
+
+    #[test]
+    fn afs_session_create_get_and_list_round_trip() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root, "beadId": "coven-5kt" }).to_string()),
+        )?;
+        assert_eq!(created.status, 201);
+        let view: serde_json::Value = serde_json::from_str(&created.body)?;
+        let id = view["id"].as_str().unwrap().to_string();
+        assert_eq!(view["state"], "open");
+        assert_eq!(view["binding"]["beadId"], "coven-5kt");
+
+        let fetched = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(fetched.status, 200);
+
+        let listed = handle_request("GET", "/api/v1/afs/sessions", temp.path(), None)?;
+        let listed: serde_json::Value = serde_json::from_str(&listed.body)?;
+        assert_eq!(listed["sessions"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn afs_routes_report_structured_errors() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing = handle_request("GET", "/api/v1/afs/sessions/afs-nope", temp.path(), None)?;
+        assert_eq!(missing.status, 404);
+        assert!(missing.body.contains(r#""code":"afs.session_not_found""#));
+
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let id = serde_json::from_str::<serde_json::Value>(&created.body)?["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Discard is destructive, so it refuses without an explicit confirm.
+        let unconfirmed = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/discard"),
+            temp.path(),
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(unconfirmed.status, 400);
+
+        // Unimplemented operations say so through the same envelope the
+        // capability flags predict.
+        let commit = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/commit"),
+            temp.path(),
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(commit.status, 501);
+        assert!(commit.body.contains("afs.commit_unsupported"));
+
+        let confirmed = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/discard"),
+            temp.path(),
+            None,
+            Some(&json!({ "confirm": true }).to_string()),
+        )?;
+        assert_eq!(confirmed.status, 200);
+        Ok(())
+    }
+
+    #[test]
+    fn afs_timeline_paginates_and_rejects_a_bad_limit() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let id = serde_json::from_str::<serde_json::Value>(&created.body)?["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/join"),
+            temp.path(),
+            None,
+            Some(&json!({ "familiarId": "echo" }).to_string()),
+        )?;
+
+        let timeline = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/timeline?since=0&limit=10"),
+            temp.path(),
+            None,
+        )?;
+        let timeline: serde_json::Value = serde_json::from_str(&timeline.body)?;
+        assert_eq!(timeline["entries"][0]["op"], "join");
+        assert_eq!(timeline["entries"][0]["familiarId"], "echo");
+        assert_eq!(timeline["hasMore"], false);
+
+        let bad = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/timeline?limit=0"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(bad.status, 400);
+        Ok(())
+    }
     use crate::project;
 
     #[test]

@@ -118,6 +118,15 @@ impl AgentFs {
             .optional()?)
     }
 
+    /// Number of regular files in the filesystem.
+    pub fn file_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM fs_inode WHERE mode & ?1 = ?2",
+            params![S_IFMT, S_IFREG],
+            |r| r.get(0),
+        )?)
+    }
+
     /// Number of entries in a directory.
     pub fn child_count(&self, parent_ino: i64) -> Result<i64> {
         Ok(self.conn.query_row(
