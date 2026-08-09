@@ -41,7 +41,7 @@ pub use diff::{Change, ChangeEntry, ChangeSet};
 pub use fs::{AgentFs, Metadata, ROOT_INO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 pub use ino::DirEntry;
 #[cfg(feature = "mount")]
-pub use nfs::{ensure_loopback, export_token, AfsNfs};
+pub use nfs::{ensure_loopback, export_token, AfsNfs, GateHandle};
 pub use overlay::OverlayFs;
 pub use path::{basename, components, normalize, parent};
 pub use provenance::{

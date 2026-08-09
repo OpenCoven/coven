@@ -429,6 +429,17 @@ What ships instead:
   `localhost:/<token>`.
 - **Loopback-only bind**, refused in library code rather than by convention,
   on an **ephemeral port** per session.
+- **Token rotation after mount.** `mount_nfs` takes the export path as a
+  positional argument and offers no stdin, environment, or config alternative
+  (`man mount_nfs` has neither an ENVIRONMENT nor a FILES section), so the
+  token is `ps`-visible for the duration of that one call. Rotating the gate
+  the moment the mount returns makes a scraped value useless. The rotation
+  primitive ships now (`AfsNfs::gate_handle`); the mount route that calls it on
+  every mount is still being built, so until that lands this mitigation is
+  available rather than enforced.
+  Established mounts are unaffected: the client holds an authenticated file
+  handle, handles are keyed on the file id under a key rotation does not
+  touch, and only a *new* traversal of the gate needs the current token.
 
 **Decision.** This is sufficient to keep an unprivileged local account out by
 default, and it is *not* sufficient to survive disclosure of the token. An
@@ -453,6 +464,15 @@ client/harness or deployment; this does not claim universal requirement, and
 it does not say Full Disk Access guarantees access. This result does not
 change default-off status or resolve loopback NFS access control, sandboxing,
 recovery, concurrency, or Linux/FUSE gates.
+
+Also on 2026-08-09, the same human-operated Terminal confirmed rotation on a
+live mount: with the export rotated out from under an established mount, reads,
+directory listings, and writes through that mount continued to work, while a
+fresh `mount_nfs` with the pre-rotation token was refused and one with the
+current token succeeded. macOS's NFSv3 client does not re-resolve the export
+path after mount. The server-side half of that property — a captured handle
+outliving rotation — is covered by a unit test, so a regression fails CI rather
+than waiting on a manual check.
 
 **Enforcement is not free.** As RESEARCH.md notes, the mount alone does not stop
 an agent writing to an absolute path outside it. AFS bounds the blast radius of

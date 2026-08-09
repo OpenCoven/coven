@@ -165,7 +165,59 @@ pub struct AfsNfs {
     /// secret scanner reads a struct field of that name being assigned as a
     /// hardcoded credential, and `AGENTS.md` requires fixing the content
     /// rather than allowlisting past it.
-    gate_name: String,
+    gate_name: GateHandle,
+}
+
+/// A rotation handle for an export's token, clonable and detachable from the
+/// export itself.
+///
+/// `NFSTcpListener::bind` takes the export by value, so whoever wants to rotate
+/// after a mount completes — the daemon's mount route, or the example below —
+/// has to hold this rather than the [`AfsNfs`].
+#[derive(Clone)]
+pub struct GateHandle {
+    inner: std::sync::Arc<std::sync::RwLock<String>>,
+}
+
+impl GateHandle {
+    fn new(token: String) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::RwLock::new(token)),
+        }
+    }
+
+    /// The current token.
+    pub fn token(&self) -> String {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Constant-time comparison of `candidate` against the current token,
+    /// performed under the read guard.
+    ///
+    /// This is what the gate `lookup` uses. It deliberately avoids
+    /// [`Self::token`]: cloning would spill another copy of a live credential
+    /// onto the heap on every probe, and freed heap is not zeroed.
+    fn matches(&self, candidate: &[u8]) -> bool {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        constant_time_eq(candidate, guard.as_bytes())
+    }
+
+    /// Replace the token, returning the new one.
+    pub fn rotate(&self) -> String {
+        let next = export_token();
+        let mut guard = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = next.clone();
+        next
+    }
 }
 
 impl AfsNfs {
@@ -181,14 +233,33 @@ impl AfsNfs {
             uid,
             gid,
             handle_key: HandleKey::random(),
-            gate_name: export_token(),
+            gate_name: GateHandle::new(export_token()),
         }
     }
 
     /// The export token. A client mounts `localhost:/<token>`; anything else
     /// reaches only the empty gate directory.
-    pub fn token(&self) -> &str {
-        &self.gate_name
+    pub fn token(&self) -> String {
+        self.gate_name.token()
+    }
+
+    /// A rotation handle that outlives moving this export into a listener.
+    pub fn gate_handle(&self) -> GateHandle {
+        self.gate_name.clone()
+    }
+
+    /// Replace the token, returning the new one.
+    ///
+    /// `mount_nfs` takes the export path as a positional argument and offers
+    /// no stdin, environment, or config alternative, so the token is visible
+    /// in `ps` for the duration of that call. Rotating immediately after the
+    /// mount completes makes the value anyone could have scraped useless.
+    ///
+    /// An established mount is unaffected: the client holds an authenticated
+    /// file handle, and handles are keyed on the file id under a key this does
+    /// not touch. Only a *new* traversal of the gate needs the current token.
+    pub fn rotate_gate(&self) -> String {
+        self.gate_name.rotate()
     }
 
     /// Synthetic attributes for the gate directory.
@@ -371,7 +442,7 @@ impl NFSFileSystem for AfsNfs {
         if dirid == GATE_ROOT {
             // The only way past the gate. A wrong name is NOENT, exactly as a
             // missing file would be, so probing reveals nothing.
-            return if constant_time_eq(name.as_bytes(), self.gate_name.as_bytes()) {
+            return if self.gate_name.matches(name.as_bytes()) {
                 Ok(ROOT_INO as u64)
             } else if name == "." || name == ".." {
                 Ok(GATE_ROOT)
@@ -641,14 +712,14 @@ mod tests {
 
         // Guessing gets NOENT — the same answer a missing file gives, so
         // probing does not distinguish "wrong token" from "no such entry".
-        for guess in ["secret", "a", export.token().trim_end_matches(|_| true)] {
+        for guess in ["secret", "a", ""] {
             assert!(export.lookup(gate, &name(guess)).await.is_err());
         }
         let almost = format!("{}0", &export.token()[..export.token().len() - 1]);
         assert!(export.lookup(gate, &name(&almost)).await.is_err());
 
         // The token opens it, and the real filesystem is behind it.
-        let root = export.lookup(gate, &name(export.token())).await.unwrap();
+        let root = export.lookup(gate, &name(&export.token())).await.unwrap();
         assert_eq!(root, ROOT_INO as u64);
         let inside = export.readdir(root, 0, 64).await.unwrap();
         assert!(
@@ -662,13 +733,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotating_the_token_keeps_an_established_mount_working() {
+        // The `ps` window: `mount_nfs` takes the export path as a positional
+        // argument, so the token is world-readable while that call runs.
+        // Rotating straight afterwards is only safe if a mount that already
+        // resolved keeps working — this is that claim, tested.
+        let export = export();
+        let first = export.token();
+
+        // What MOUNT does: resolve `/<token>` to a file handle. `path_to_id`
+        // is the same walk `mountproc3_mnt` performs.
+        let mounted_id = export
+            .path_to_id(format!("/{first}").as_bytes())
+            .await
+            .expect("the export path resolves at mount time");
+        let mounted_fh = export.id_to_fh(mounted_id);
+        export.mkdir(mounted_id, &name("work")).await.unwrap();
+
+        let second = export.rotate_gate();
+        assert_ne!(first, second);
+
+        // The established mount holds a handle, not a path. It keeps working:
+        // handles are keyed on the file id, and rotation does not touch the
+        // key.
+        assert_eq!(export.fh_to_id(&mounted_fh).unwrap(), mounted_id);
+        let listing = export.readdir(mounted_id, 0, 64).await.unwrap();
+        assert!(listing.entries.iter().any(|e| e.name.as_ref() == b"work"));
+        export.mkdir(mounted_id, &name("after")).await.unwrap();
+
+        // But the scraped token is dead: a NEW traversal with it fails.
+        assert!(
+            export
+                .path_to_id(format!("/{first}").as_bytes())
+                .await
+                .is_err(),
+            "the token visible in ps must stop working once rotated"
+        );
+        // And the current one works.
+        assert_eq!(
+            export
+                .path_to_id(format!("/{second}").as_bytes())
+                .await
+                .unwrap(),
+            mounted_id
+        );
+    }
+
+    #[tokio::test]
     async fn each_export_gets_its_own_token() {
         let first = export();
         let second = export();
         assert_ne!(first.token(), second.token());
         // A token from one export is meaningless at another's gate.
         assert!(second
-            .lookup(second.root_dir(), &name(first.token()))
+            .lookup(second.root_dir(), &name(&first.token()))
             .await
             .is_err());
     }
