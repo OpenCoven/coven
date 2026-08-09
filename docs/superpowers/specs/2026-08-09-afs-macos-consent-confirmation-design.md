@@ -1,6 +1,6 @@
 # AgentFS macOS Consent Confirmation Documentation Design
 
-**Status:** Approved documentation update  
+**Status:** Approved documentation update
 **Bead:** `coven-x77`
 
 ## Evidence
