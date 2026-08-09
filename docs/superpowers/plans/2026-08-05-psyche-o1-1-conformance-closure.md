@@ -457,13 +457,13 @@ cargo test -p coven-cli pty_runner::tests::nonblocking_wait_without_reaping_does
 cargo test -p coven-cli pty_runner::tests::cancellation_guard_blocks_supervised_signals_for_spawned_helpers -- --exact
 cargo test -p coven-cli pty_runner::tests::native_stream_does_not_wait_for_stdout_inheriting_descendant -- --exact
 cargo test -p coven-cli pty_runner::tests::successful_native_stream_cleans_closed_output_descendant -- --exact
-cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_returns_promptly_and_reaps_process_tree -- --exact
+cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_reaps_process_tree -- --exact
 cargo test -p coven-cli pty_runner::tests::codex_json_runner_reaps_a_pipe_holding_descendant_after_wrapper_exit -- --exact
 cargo test -p coven-cli pty_runner::tests::codex_json_runner_reaps_a_closed_pipe_descendant_after_wrapper_exit -- --exact
 cargo test -p coven-cli --test stream_json_integration codex_json_sigterm_reaps_descendants_and_marks_ledger_failed -- --exact
 ```
 
-Expected on Unix: every test passes, direct children and descendants are gone, cancellation is prompt, `waitid(...WNOHANG | WNOWAIT)` never reports a live child as exited, and cleanup occurs before reaping.
+Expected on Unix: every test passes, direct children and descendants are gone, cancellation returns the expected error, `waitid(...WNOHANG | WNOWAIT)` never reports a live child as exited, and cleanup occurs before reaping.
 
 - [ ] **Step 2: Run the Windows-compilable containment coverage**
 
