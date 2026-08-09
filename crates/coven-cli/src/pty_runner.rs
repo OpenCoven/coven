@@ -445,6 +445,7 @@ enum SupervisedStreamCancellationTestPhase {
     Registered,
     InstalledMasked,
     ActiveUnmasked,
+    Restoring,
     Finished,
 }
 
@@ -476,13 +477,11 @@ impl SupervisedStreamCancellationTestObserver {
         Ok(Self { owner })
     }
 
-    /// The returned installed/active phase means this call delivered SIGTERM.
+    /// Only an actually unmasked guard accepts a test SIGTERM.
     ///
-    /// The lifecycle mutex covers both this dispatch and the guard's transition
-    /// to `Finished`, which happens before handler restoration. Consequently,
-    /// this test-only helper can queue a signal while the guard is masked or
-    /// deliver one while it is unmasked, but can never signal a restored
-    /// default disposition.
+    /// The lifecycle mutex covers both this dispatch and the guard's physical
+    /// signal-mask and handler transitions. A test signal can therefore never
+    /// be queued for later delivery under a restored disposition.
     fn send_sigterm_if_guarded(
         &self,
         target: usize,
@@ -495,9 +494,10 @@ impl SupervisedStreamCancellationTestObserver {
         }
         match lifecycle.phase {
             SupervisedStreamCancellationTestPhase::Registered
+            | SupervisedStreamCancellationTestPhase::InstalledMasked
+            | SupervisedStreamCancellationTestPhase::Restoring
             | SupervisedStreamCancellationTestPhase::Finished => return Ok(lifecycle.phase),
-            SupervisedStreamCancellationTestPhase::InstalledMasked
-            | SupervisedStreamCancellationTestPhase::ActiveUnmasked => {}
+            SupervisedStreamCancellationTestPhase::ActiveUnmasked => {}
         }
 
         let result = unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGTERM) };
@@ -697,20 +697,28 @@ impl SupervisedStreamCancellationGuard {
     }
 
     fn activate(&mut self) -> Result<Option<libc::c_int>> {
+        #[cfg(test)]
+        let mut test_lifecycle = self.test_lifecycle_registered.then(|| {
+            SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        #[cfg(test)]
+        if let Some(lifecycle) = &test_lifecycle {
+            if lifecycle.observer.as_ref() == Some(&thread::current().id())
+                && lifecycle.phase != SupervisedStreamCancellationTestPhase::InstalledMasked
+            {
+                anyhow::bail!(
+                    "supervised stream cancellation test lifecycle was not installed and masked before activation"
+                );
+            }
+        }
         self.signal_mask
             .unblock_supervisor()
             .context("failed to unblock supervised stream cancellation signals")?;
         #[cfg(test)]
-        if self.test_lifecycle_registered {
-            let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lifecycle) = &mut test_lifecycle {
             if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
-                if lifecycle.phase != SupervisedStreamCancellationTestPhase::InstalledMasked {
-                    anyhow::bail!(
-                        "supervised stream cancellation test lifecycle was not installed and masked before activation"
-                    );
-                }
                 lifecycle.phase = SupervisedStreamCancellationTestPhase::ActiveUnmasked;
             }
         }
@@ -727,7 +735,7 @@ impl SupervisedStreamCancellationGuard {
         #[cfg(test)]
         if let Some(lifecycle) = &mut test_lifecycle {
             if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
-                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Restoring;
             }
         }
         self.signal_mask
@@ -744,14 +752,17 @@ impl SupervisedStreamCancellationGuard {
                 }
             }
         }
-        #[cfg(test)]
-        drop(test_lifecycle);
         SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
         self.active = false;
-
         self.signal_mask
             .restore()
             .context("failed to restore supervised stream signal mask")?;
+        #[cfg(test)]
+        if let Some(lifecycle) = &mut test_lifecycle {
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+            }
+        }
         if let Some(error) = restore_error {
             return Err(error).context("failed to restore supervised stream cancellation handlers");
         }
@@ -774,7 +785,7 @@ impl Drop for SupervisedStreamCancellationGuard {
         #[cfg(test)]
         if let Some(lifecycle) = &mut test_lifecycle {
             if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
-                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Restoring;
             }
         }
         let _ = self.signal_mask.reblock();
@@ -786,10 +797,16 @@ impl Drop for SupervisedStreamCancellationGuard {
                 let _ = libc::sigaction(*signal, previous, std::ptr::null_mut());
             }
         }
-        #[cfg(test)]
-        drop(test_lifecycle);
         SUPERVISED_STREAM_CANCELLATION_SIGNAL.store(0, Ordering::Relaxed);
         let _ = self.signal_mask.restore();
+        #[cfg(test)]
+        if let Some(lifecycle) = &mut test_lifecycle {
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+            }
+        }
+        #[cfg(test)]
+        drop(test_lifecycle);
     }
 }
 
@@ -4504,6 +4521,8 @@ while :; do sleep 1; done
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     const NATIVE_STREAM_SIGTERM_TEST_WATCHDOG: Duration = Duration::from_secs(30);
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    const NATIVE_STREAM_SIGTERM_REAPING_GRACE: Duration = Duration::from_secs(1);
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     const NATIVE_STREAM_SIGTERM_FIXTURES: [(&str, &str); 2] =
@@ -4735,6 +4754,31 @@ while :; do sleep 1; done
             native_stream_sigterm_fixture_state(&identities[0])?,
             native_stream_sigterm_fixture_state(&identities[1])?,
         ])
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn await_native_stream_sigterm_fixture_reaping_grace(
+        identities: &[NativeStreamSigtermFixtureIdentity; 2],
+    ) -> io::Result<[NativeStreamSigtermFixtureState; 2]> {
+        let deadline = Instant::now() + NATIVE_STREAM_SIGTERM_REAPING_GRACE;
+        loop {
+            match native_stream_sigterm_fixture_states(identities) {
+                Ok(states) => {
+                    if states
+                        .iter()
+                        .all(|state| *state == NativeStreamSigtermFixtureState::Reaped)
+                        || Instant::now() >= deadline
+                    {
+                        return Ok(states);
+                    }
+                }
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => {}
+            }
+            // This is containment observation after the direct child has been
+            // waited, not a normal-path timing assertion.
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -5101,13 +5145,15 @@ while :; do sleep 1; done
             return failures;
         };
 
-        let initial_states = match native_stream_sigterm_fixture_states(identities) {
+        let states_after_reaping_grace = match await_native_stream_sigterm_fixture_reaping_grace(
+            identities,
+        ) {
             Ok(states)
                 if states
                     .iter()
                     .all(|state| *state == NativeStreamSigtermFixtureState::Reaped) =>
             {
-                return Vec::new();
+                return failures;
             }
             Ok(states) => {
                 // This is the production assertion. The emergency FIFO can
@@ -5116,11 +5162,11 @@ while :; do sleep 1; done
                     match state {
                         NativeStreamSigtermFixtureState::Reaped => {}
                         NativeStreamSigtermFixtureState::Alive => failures.push(format!(
-                            "SIGTERM production reaping check failed before fixture-local emergency cleanup: {} {} was still alive",
+                            "SIGTERM production reaping check failed after the reaping grace: {} {} was still alive",
                             NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
                         )),
                         NativeStreamSigtermFixtureState::Reused => failures.push(format!(
-                            "SIGTERM production reaping check failed before fixture-local emergency cleanup: recorded {} PID {} was reused",
+                            "SIGTERM production reaping check failed after the reaping grace: recorded {} PID {} was reused",
                             NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
                         )),
                     }
@@ -5129,7 +5175,7 @@ while :; do sleep 1; done
             }
             Err(error) => {
                 failures.push(format!(
-                    "could not verify native stream fixture identities before fixture-local emergency cleanup: {error}"
+                    "could not verify native stream fixture identities through the reaping grace before fixture-local emergency cleanup: {error}"
                 ));
                 None
             }
@@ -5149,9 +5195,9 @@ while :; do sleep 1; done
                         .iter()
                         .all(|state| *state == NativeStreamSigtermFixtureState::Reaped) =>
                 {
-                    match initial_states {
-                        Some(initial_states) => {
-                            let initial_context = initial_states
+                    match states_after_reaping_grace {
+                        Some(states_after_reaping_grace) => {
+                            let initial_context = states_after_reaping_grace
                                 .iter()
                                 .enumerate()
                                 .map(|(index, state)| {
@@ -5304,14 +5350,10 @@ while :; do sleep 1; done
 
                 if fixture_identities_ready && fixture_sentinel_ready {
                     match signal_lifecycle.send_sigterm_if_guarded(runner_thread) {
-                        // `stream_harness_with_program` installs the guard
-                        // before spawning this fixture. A pending signal is
-                        // therefore safe in InstalledMasked and cancels as
-                        // soon as activate() unmasks the runner thread.
-                        Ok(
-                            SupervisedStreamCancellationTestPhase::InstalledMasked
-                            | SupervisedStreamCancellationTestPhase::ActiveUnmasked,
-                        ) => {
+                        // Dispatch begins only after
+                        // `stream_harness_with_program` has physically
+                        // unmasked its installed guard.
+                        Ok(SupervisedStreamCancellationTestPhase::ActiveUnmasked) => {
                             if let Some(failure) = startup_failure {
                                 anyhow::bail!(
                                     "{failure}; lifecycle-verified SIGTERM was delivered to contain the stalled fixture startup"
@@ -5319,9 +5361,13 @@ while :; do sleep 1; done
                             }
                             return Ok(());
                         }
-                        Ok(SupervisedStreamCancellationTestPhase::Registered) => {
+                        Ok(
+                            SupervisedStreamCancellationTestPhase::Registered
+                            | SupervisedStreamCancellationTestPhase::InstalledMasked
+                            | SupervisedStreamCancellationTestPhase::Restoring,
+                        ) => {
                             last_delivery_error = Some(
-                                "fixture was ready while the cancellation guard was still registered; waiting for guarded delivery"
+                                "fixture was ready before the cancellation guard was physically active; waiting for guarded delivery"
                                     .into(),
                             );
                         }
@@ -5354,23 +5400,27 @@ while :; do sleep 1; done
                             .map(|error| format!("; last delivery error: {error}"))
                             .unwrap_or_default(),
                     );
-                    // Hold the lifecycle mutex through pthread_kill. If the
-                    // guard remains only Registered, keep the signaler alive:
-                    // returning here would leave a fixture that becomes
-                    // signalable later with no cancellation request.
+                    // The lifecycle mutex stays held through pthread_kill.
+                    // Before actual unmasking, retain the signaler instead of
+                    // queueing a signal that could reach a restored handler.
                     match signal_lifecycle.send_sigterm_if_guarded(runner_thread) {
-                        Ok(
-                            SupervisedStreamCancellationTestPhase::InstalledMasked
-                            | SupervisedStreamCancellationTestPhase::ActiveUnmasked,
-                        ) => {
+                        Ok(SupervisedStreamCancellationTestPhase::ActiveUnmasked) => {
                             anyhow::bail!(
                                 "{failure}; lifecycle-verified SIGTERM was delivered to contain the stalled fixture startup"
                             );
                         }
-                        Ok(SupervisedStreamCancellationTestPhase::Registered) => {
+                        Ok(
+                            SupervisedStreamCancellationTestPhase::Registered
+                            | SupervisedStreamCancellationTestPhase::InstalledMasked,
+                        ) => {
                             startup_failure = Some(format!(
-                                "{failure}; guard remains registered, so SIGTERM is deferred until its disposition is safe"
+                                "{failure}; guard is not yet physically active, so SIGTERM is deferred until its disposition is safe"
                             ));
+                        }
+                        Ok(SupervisedStreamCancellationTestPhase::Restoring) => {
+                            anyhow::bail!(
+                                "{failure}; guard began restoration, so SIGTERM was not sent under a restored disposition"
+                            );
                         }
                         Ok(SupervisedStreamCancellationTestPhase::Finished) => {
                             anyhow::bail!(
