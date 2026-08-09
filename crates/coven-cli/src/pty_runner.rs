@@ -481,13 +481,19 @@ impl SupervisedStreamCancellationTestObserver {
             return Err(std::io::Error::from_raw_os_error(result))
                 .context("sending fixture SIGTERM to the stream runner thread");
         }
-        // Keep restoration excluded until the target thread has run the
-        // atomic-only handler. Otherwise a queued thread signal could outlive
-        // the cancellation disposition and be delivered to a restored one.
-        while SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed) != libc::SIGTERM {
-            thread::yield_now();
-        }
         Ok(true)
+    }
+
+    fn wait_for_sigterm_delivery(deadline: Instant) -> Result<()> {
+        while SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed) != libc::SIGTERM {
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "fixture SIGTERM was not recorded by the stream cancellation handler before the watchdog expired"
+                );
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
     }
 }
 
@@ -522,7 +528,7 @@ struct SupervisedStreamCancellationGuard {
     signal_mask: SupervisedSignalMask,
     active: bool,
     #[cfg(test)]
-    test_lifecycle_active: bool,
+    test_lifecycle_registered: bool,
 }
 
 #[cfg(unix)]
@@ -647,16 +653,11 @@ impl SupervisedStreamCancellationGuard {
         }
 
         #[cfg(test)]
-        let test_lifecycle_active = {
-            let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+        let test_lifecycle_registered = {
+            let lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
-                lifecycle.active = true;
-                true
-            } else {
-                false
-            }
+            lifecycle.observer.as_ref() == Some(&thread::current().id())
         };
 
         Ok(Self {
@@ -665,7 +666,7 @@ impl SupervisedStreamCancellationGuard {
             signal_mask,
             active: true,
             #[cfg(test)]
-            test_lifecycle_active,
+            test_lifecycle_registered,
         })
     }
 
@@ -678,12 +679,21 @@ impl SupervisedStreamCancellationGuard {
         self.signal_mask
             .unblock_supervisor()
             .context("failed to unblock supervised stream cancellation signals")?;
+        #[cfg(test)]
+        if self.test_lifecycle_registered {
+            let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.active = true;
+            }
+        }
         Ok(self.cancelled_signal())
     }
 
     fn finish(mut self) -> Result<Option<libc::c_int>> {
         #[cfg(test)]
-        let mut test_lifecycle = self.test_lifecycle_active.then(|| {
+        let mut test_lifecycle = self.test_lifecycle_registered.then(|| {
             SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -728,7 +738,7 @@ impl Drop for SupervisedStreamCancellationGuard {
             return;
         }
         #[cfg(test)]
-        let mut test_lifecycle = self.test_lifecycle_active.then(|| {
+        let mut test_lifecycle = self.test_lifecycle_registered.then(|| {
             SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4512,6 +4522,26 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
+    fn native_stream_sigterm_fixture_process_group(
+        pid: libc::pid_t,
+    ) -> io::Result<Option<libc::pid_t>> {
+        loop {
+            let process_group = unsafe { libc::getpgid(pid) };
+            if process_group >= 0 {
+                return Ok(Some(process_group));
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+    }
+
+    #[cfg(unix)]
     fn cleanup_native_stream_sigterm_fixtures(fixture_dir: &Path) -> Vec<String> {
         let mut pids: [Option<libc::pid_t>; 2] = [None; 2];
         let mut pid_errors: [Option<String>; 2] = std::array::from_fn(|_| None);
@@ -4548,7 +4578,7 @@ while :; do sleep 1; done
 
         let mut failures = Vec::new();
         for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
-            let Some(pid) = pids[index] else {
+            if pids[index].is_none() {
                 if let Some(error) = &pid_errors[index] {
                     failures.push(format!(
                         "cancelled native stream could not read {label} PID before the reaping watchdog expired: {error}"
@@ -4558,25 +4588,54 @@ while :; do sleep 1; done
                         "cancelled native stream did not record {label} PID before the reaping watchdog expired"
                     ));
                 }
-                continue;
-            };
-            if reaped[index] {
-                continue;
             }
+        }
 
-            failures.push(format!(
-                "cancelled native stream left {label} {pid} alive after the reaping watchdog; attempting exact-PID cleanup"
-            ));
-            if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    reaped[index] = true;
-                } else {
-                    failures.push(format!(
-                        "failed to clean up unreaped {label} {pid} with SIGKILL: {error}"
-                    ));
+        let harness_pid = pids[0];
+        if let Some(harness_pid) = harness_pid {
+            let mut verified_fixture_group = false;
+            for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
+                let Some(pid) = pids[index] else {
+                    continue;
+                };
+                if reaped[index] {
+                    continue;
+                }
+                match native_stream_sigterm_fixture_process_group(pid) {
+                    Ok(Some(process_group)) if process_group == harness_pid => {
+                        verified_fixture_group = true;
+                    }
+                    Ok(Some(process_group)) => failures.push(format!(
+                        "cancelled native stream {label} {pid} reported process group {process_group}, not recorded harness process group {harness_pid}; refusing fixture cleanup"
+                    )),
+                    Ok(None) => reaped[index] = true,
+                    Err(error) => failures.push(format!(
+                        "failed to read process group for still-observed {label} {pid}: {error}"
+                    )),
                 }
             }
+            if verified_fixture_group {
+                // The strict spawn makes the harness PID the leader of a new
+                // session. Killing only a group proven by one of the recorded
+                // fixture identities avoids sending SIGKILL to a recycled PID.
+                if unsafe { libc::killpg(harness_pid, libc::SIGKILL) } == -1 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        failures.push(format!(
+                            "failed to terminate verified fixture process group led by {harness_pid}: {error}"
+                        ));
+                    }
+                }
+            } else {
+                failures.push(format!(
+                    "no still-observed fixture process verified recorded harness process group {harness_pid}; refusing fixture cleanup"
+                ));
+            }
+        } else {
+            failures.push(
+                "cancelled native stream did not record harness PID, so it had not safely advanced to descendant launch and no fixture group could be cleaned"
+                    .into(),
+            );
         }
 
         let cleanup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
@@ -4606,7 +4665,7 @@ while :; do sleep 1; done
             if let Some(pid) = pids[index] {
                 if !reaped[index] {
                     failures.push(format!(
-                        "cancelled native stream {label} {pid} survived exact-PID failure cleanup"
+                        "cancelled native stream {label} {pid} survived verified fixture process-group cleanup"
                     ));
                 }
             }
@@ -4664,6 +4723,9 @@ while :; do sleep 1; done
                 match native_stream_sigterm_fixture_is_ready(&signal_dir) {
                     Ok(true) => {
                         if signal_lifecycle.send_sigterm_if_active(runner_thread)? {
+                            SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
+                                startup_deadline,
+                            )?;
                             return Ok(());
                         }
                         anyhow::bail!(
@@ -4672,26 +4734,54 @@ while :; do sleep 1; done
                     }
                     Ok(false) if Instant::now() < startup_deadline => {}
                     Ok(false) => {
-                        let sent = signal_lifecycle.send_sigterm_if_active(runner_thread)?;
-                        if sent {
-                            anyhow::bail!(
-                                "native stream fixture did not become ready before the startup watchdog expired; sent SIGTERM while its handler was active"
-                            );
+                        match signal_lifecycle.send_sigterm_if_active(runner_thread) {
+                            Ok(true) => {
+                                let delivery =
+                                    SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
+                                        startup_deadline,
+                                    );
+                                anyhow::bail!(
+                                    "native stream fixture did not become ready before the startup watchdog expired; sent SIGTERM while its handler was active{}",
+                                    delivery
+                                        .err()
+                                        .map(|error| format!(
+                                            " but it was not recorded: {error:#}"
+                                        ))
+                                        .unwrap_or_default()
+                                );
+                            }
+                            Ok(false) => anyhow::bail!(
+                                "native stream fixture did not become ready before the startup watchdog expired; handler was inactive and no SIGTERM was sent"
+                            ),
+                            Err(error) => anyhow::bail!(
+                                "native stream fixture did not become ready before the startup watchdog expired; failed to send SIGTERM while its handler was active: {error:#}"
+                            ),
                         }
-                        anyhow::bail!(
-                            "native stream fixture did not become ready before the startup watchdog expired; handler was inactive and no SIGTERM was sent"
-                        );
                     }
                     Err(error) => {
-                        let sent = signal_lifecycle.send_sigterm_if_active(runner_thread)?;
-                        if sent {
-                            anyhow::bail!(
-                                "native stream fixture readiness failed: {error:#}; sent SIGTERM while its handler was active"
-                            );
+                        match signal_lifecycle.send_sigterm_if_active(runner_thread) {
+                            Ok(true) => {
+                                let delivery =
+                                    SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
+                                        startup_deadline,
+                                    );
+                                anyhow::bail!(
+                                    "native stream fixture readiness failed: {error:#}; sent SIGTERM while its handler was active{}",
+                                    delivery
+                                        .err()
+                                        .map(|delivery_error| format!(
+                                            " but it was not recorded: {delivery_error:#}"
+                                        ))
+                                        .unwrap_or_default()
+                                );
+                            }
+                            Ok(false) => anyhow::bail!(
+                                "native stream fixture readiness failed: {error:#}; handler was inactive and no SIGTERM was sent"
+                            ),
+                            Err(send_error) => anyhow::bail!(
+                                "native stream fixture readiness failed: {error:#}; failed to send SIGTERM while its handler was active: {send_error:#}"
+                            ),
                         }
-                        anyhow::bail!(
-                            "native stream fixture readiness failed: {error:#}; handler was inactive and no SIGTERM was sent"
-                        );
                     }
                 }
                 thread::sleep(Duration::from_millis(10));
