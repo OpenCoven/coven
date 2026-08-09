@@ -723,11 +723,14 @@ name = "coven-afs"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "getrandom 0.2.17",
+ "hmac",
  "libc",
  "nfsserve",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

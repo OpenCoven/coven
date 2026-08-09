@@ -396,15 +396,54 @@ pid, and leaves the delta intact — the same posture as
 [orphan recovery](../../docs/daemon/orphan-recovery.md) for sessions. Deltas are
 never auto-discarded; unreviewed work is not garbage.
 
-**Loopback NFS exposure (unresolved).** The macOS backend serves NFSv3 on
-loopback. Any local user can reach a loopback port, so a bare port grants a
-second account on the machine read/write access to a session's files. Mitigation
-before mounts are enabled by default: bind `127.0.0.1` on an ephemeral port per
-session, never a fixed one; refuse any non-loopback bind; and require an
-export-path token that is not derivable from the session id. Whether that is
-sufficient on a shared macOS host must be settled — with an explicit decision
-recorded here — before `afsMount` defaults to on. Until then it ships
-opt-in.
+**Loopback NFS exposure (decided 2026-08-09, `coven-75e`).** The macOS backend
+serves NFSv3 on loopback. Any local user can reach a loopback port, so a bare
+port grants a second account on the machine read/write access to a session's
+files.
+
+Two findings changed the mitigation set this section originally specified, and
+both are worth recording because each defeats the obvious design:
+
+1. **An export-path token cannot live in the MOUNT protocol.**
+   `MOUNTPROC3_EXPORT` returns the export path to any caller with no
+   authentication, so a token carried there is readable by exactly the
+   attacker it is meant to stop.
+2. **The token was not the weak link.** `nfsserve`'s default file handle is
+   `[server start time in ms ‖ file id]`. The start time is readable from
+   `ps` and `fs_inode.ino` is a sequential `AUTOINCREMENT` from `ROOT_INO`, so
+   handles are forgeable. A forged handle needs no MOUNT call at all, which
+   bypasses every path-based check.
+
+What ships instead:
+
+- **Authenticated file handles.** `[file id ‖ HMAC-SHA256(key, file id)]`
+  truncated to 128 bits, under a 256-bit per-export key from OS entropy. A
+  forged or stale handle is `NFS3ERR_BADHANDLE`; the two are deliberately
+  indistinguishable, because separating them would confirm which file ids
+  exist. The per-export key also gives restart invalidation without a
+  guessable generation number.
+- **A VFS token gate.** The export roots at a synthetic gate directory rather
+  than at the filesystem. Its `readdir` returns nothing and its `lookup`
+  succeeds only on a constant-time match against a 128-bit token, so the token
+  lives where no NFS procedure enumerates it. Clients mount
+  `localhost:/<token>`.
+- **Loopback-only bind**, refused in library code rather than by convention,
+  on an **ephemeral port** per session.
+
+**Decision.** This is sufficient to keep an unprivileged local account out by
+default, and it is *not* sufficient to survive disclosure of the token. An
+attacker can still find the port, learn the export path, and mount the gate —
+they arrive at an empty directory and must produce 128 bits to go further.
+There is no second factor behind the token: NFSv3 `AUTH_UNIX` authenticates
+nothing. Mount therefore remains **opt-in and off by default**; `afsMount`
+advertises a backend only where these mitigations are active.
+
+> **Invariant: the export token is never logged, printed, or displayed.**
+> Token secrecy is the entire access-control boundary, so anything that
+> records it — a log line, an error message, a `ps`-visible mount command, a
+> Cave surface, a bug report attachment — grants full read/write to the
+> session's files. Treat it like a credential, because it is one. Code that
+> needs to show a mount target shows the port and a redacted path.
 
 On 2026-08-09, a human-operated consent-enabled Terminal mounted the
 experimental loopback NFS export and completed mounted create/write/read-back.
@@ -431,7 +470,10 @@ mount is separate work and is not claimed by this design.
 - **Copy-up cap default**: the mount spike establishes a cap in the low tens
   of MiB as the policy target, but the configurable cap is not implemented
   yet.
-- **Loopback NFS access control**: see §7; blocks mount-on-by-default.
+- **Loopback NFS access control**: decided in §7 (`coven-75e`) — authenticated
+  file handles plus a VFS token gate on an ephemeral loopback port. Mount stays
+  opt-in because token secrecy is the whole boundary; enabling it by default
+  needs a second factor, not a stronger token.
 - **Base ingest filters**: the mount spike validates the workload shape, but
   the default exclude set still needs an implementation and broader validation.
 
