@@ -93,7 +93,7 @@ impl ProcessRoots {
 /// not create state, spawn a process, or inspect workspace contents.
 pub fn report() -> PathsReport {
     let roots = ProcessRoots::capture();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = std::env::current_dir().unwrap_or_default();
     let mut surfaces = Vec::new();
 
     match roots.coven_home {
@@ -241,10 +241,11 @@ fn append_home_surfaces(
             source,
             cwd,
         ),
-        Err(_) => push_terminal(
+        Err(_) => push_terminal_with_source(
             surfaces,
             "state.familiar_workspaces",
             PathStatus::Unresolved,
+            PathSource::Configuration,
         ),
     }
     push_path(surfaces, "state.skills", &home.join("skills"), source, cwd);
@@ -411,13 +412,9 @@ fn push_adapter_environment_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path
         ),
     }
 
-    let paths: Vec<String> = std::env::var_os(harness::EXTERNAL_ADAPTER_DIRS_ENV)
+    let paths: Vec<PathBuf> = std::env::var_os(harness::EXTERNAL_ADAPTER_DIRS_ENV)
         .filter(|value| !value.is_empty())
-        .map(|value| {
-            std::env::split_paths(&value)
-                .map(|path| absolute_path(&path, cwd).display().to_string())
-                .collect()
-        })
+        .map(|value| std::env::split_paths(&value).collect())
         .unwrap_or_default();
     if paths.is_empty() {
         push_terminal(
@@ -426,14 +423,13 @@ fn push_adapter_environment_surfaces(surfaces: &mut Vec<PathSurface>, cwd: &Path
             PathStatus::NotApplicable,
         );
     } else {
-        surfaces.push(PathSurface {
-            id: "adapters.external_roots",
-            status: PathStatus::Resolved,
-            path: None,
-            paths,
-            source: PathSource::Environment,
-            access: AccessMode::ReadOnly,
-        });
+        push_paths(
+            surfaces,
+            "adapters.external_roots",
+            paths.iter().map(PathBuf::as_path),
+            PathSource::Environment,
+            cwd,
+        );
     }
 }
 
@@ -470,7 +466,7 @@ fn push_optional_path(
 ) {
     match path {
         Some(path) => push_path(surfaces, id, path, source, cwd),
-        None => push_terminal(surfaces, id, PathStatus::Unresolved),
+        None => push_terminal_with_source(surfaces, id, PathStatus::Unresolved, source),
     }
 }
 
@@ -481,14 +477,17 @@ fn push_path(
     source: PathSource,
     cwd: &Path,
 ) {
-    surfaces.push(PathSurface {
-        id,
-        status: PathStatus::Resolved,
-        path: Some(absolute_path(path, cwd).display().to_string()),
-        paths: Vec::new(),
-        source,
-        access: AccessMode::ReadOnly,
-    });
+    match resolved_path_string(path, cwd) {
+        Some(path) => surfaces.push(PathSurface {
+            id,
+            status: PathStatus::Resolved,
+            path: Some(path),
+            paths: Vec::new(),
+            source,
+            access: AccessMode::ReadOnly,
+        }),
+        None => push_terminal_with_source(surfaces, id, PathStatus::Unresolved, source),
+    }
 }
 
 fn push_paths<'a>(
@@ -498,36 +497,68 @@ fn push_paths<'a>(
     source: PathSource,
     cwd: &Path,
 ) {
-    surfaces.push(PathSurface {
-        id,
-        status: PathStatus::Resolved,
-        path: None,
-        paths: paths
-            .into_iter()
-            .map(|path| absolute_path(path, cwd).display().to_string())
-            .collect(),
-        source,
-        access: AccessMode::ReadOnly,
-    });
+    let paths: Option<Vec<String>> = paths
+        .into_iter()
+        .map(|path| resolved_path_string(path, cwd))
+        .collect();
+    match paths {
+        Some(paths) => surfaces.push(PathSurface {
+            id,
+            status: PathStatus::Resolved,
+            path: None,
+            paths,
+            source,
+            access: AccessMode::ReadOnly,
+        }),
+        None => push_terminal_with_source(surfaces, id, PathStatus::Unresolved, source),
+    }
 }
 
 fn push_terminal(surfaces: &mut Vec<PathSurface>, id: &'static str, status: PathStatus) {
+    push_terminal_with_source(surfaces, id, status, PathSource::Default);
+}
+
+fn push_terminal_with_source(
+    surfaces: &mut Vec<PathSurface>,
+    id: &'static str,
+    status: PathStatus,
+    source: PathSource,
+) {
     surfaces.push(PathSurface {
         id,
         status,
         path: None,
         paths: Vec::new(),
-        source: PathSource::Default,
+        source,
         access: AccessMode::ReadOnly,
     });
 }
 
-fn absolute_path(path: &Path, cwd: &Path) -> PathBuf {
+fn absolute_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
     if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
+        return Some(path.to_path_buf());
     }
+    if !cwd.is_absolute() {
+        return None;
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows drive-relative paths (for example `C:state`) use per-drive
+        // process state that a lexical join cannot reproduce. `cwd` is the
+        // absolute process directory captured immediately before this call.
+        std::path::absolute(path)
+            .ok()
+            .filter(|resolved| resolved.is_absolute())
+    }
+    #[cfg(not(windows))]
+    {
+        Some(cwd.join(path))
+    }
+}
+
+fn resolved_path_string(path: &Path, cwd: &Path) -> Option<String> {
+    absolute_path(path, cwd)?.to_str().map(ToOwned::to_owned)
 }
 
 fn nonempty_env(name: &str) -> bool {
@@ -567,12 +598,9 @@ fn user_home_source(home: Option<&Path>) -> PathSource {
     let drive_and_path = std::env::var_os("HOMEDRIVE")
         .filter(|value| !value.is_empty())
         .zip(std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()))
-        .map(|(drive, path)| {
-            PathBuf::from(format!(
-                "{}{}",
-                drive.to_string_lossy(),
-                path.to_string_lossy()
-            ))
+        .map(|(mut drive, path)| {
+            drive.push(path);
+            PathBuf::from(drive)
         });
     if matches_home || drive_and_path.is_some_and(|candidate| candidate == home) {
         PathSource::Environment
@@ -592,15 +620,117 @@ mod tests {
 
     #[test]
     fn absolute_path_keeps_absolute_paths_and_resolves_relative_paths_lexically() {
-        let cwd = Path::new("/tmp/coven-config-paths");
+        let cwd = std::env::current_dir().expect("absolute process directory");
+        let resolved = absolute_path(Path::new("relative/state"), &cwd)
+            .expect("resolve relative path against process directory");
+        let absolute = cwd.join("absolute/state");
+
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with(Path::new("relative/state")));
         assert_eq!(
-            absolute_path(Path::new("relative/state"), cwd),
-            cwd.join("relative/state")
+            absolute_path(&absolute, &cwd),
+            Some(absolute),
+            "absolute paths must remain unchanged"
         );
-        assert_eq!(
-            absolute_path(Path::new("/var/lib/coven"), cwd),
-            PathBuf::from("/var/lib/coven")
+    }
+
+    #[test]
+    fn push_path_fails_closed_without_an_absolute_working_directory() {
+        let mut surfaces = Vec::new();
+
+        push_path(
+            &mut surfaces,
+            "test.relative",
+            Path::new("relative/state"),
+            PathSource::Environment,
+            Path::new("."),
         );
+
+        assert_eq!(surfaces.len(), 1);
+        assert!(matches!(surfaces[0].status, PathStatus::Unresolved));
+        assert!(surfaces[0].path.is_none());
+        assert!(matches!(surfaces[0].source, PathSource::Environment));
+    }
+
+    #[test]
+    fn push_optional_path_preserves_the_unresolved_source() {
+        let mut surfaces = Vec::new();
+
+        push_optional_path(
+            &mut surfaces,
+            "test.optional",
+            None,
+            PathSource::Environment,
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(surfaces.len(), 1);
+        assert!(matches!(surfaces[0].status, PathStatus::Unresolved));
+        assert!(matches!(surfaces[0].source, PathSource::Environment));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_path_fails_closed_for_non_unicode_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/coven-\xFF".to_vec()));
+        let mut surfaces = Vec::new();
+
+        push_path(
+            &mut surfaces,
+            "test.non_unicode",
+            &path,
+            PathSource::Configuration,
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(surfaces.len(), 1);
+        assert!(matches!(surfaces[0].status, PathStatus::Unresolved));
+        assert!(surfaces[0].path.is_none());
+        assert!(matches!(surfaces[0].source, PathSource::Configuration));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_paths_fails_closed_without_partial_output() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let valid = PathBuf::from("/tmp/coven-valid");
+        let invalid = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/coven-\xFF".to_vec()));
+        let mut surfaces = Vec::new();
+
+        push_paths(
+            &mut surfaces,
+            "test.non_unicode_array",
+            [&valid, &invalid].into_iter().map(PathBuf::as_path),
+            PathSource::Environment,
+            Path::new("/tmp"),
+        );
+
+        assert_eq!(surfaces.len(), 1);
+        assert!(matches!(surfaces[0].status, PathStatus::Unresolved));
+        assert!(surfaces[0].paths.is_empty());
+        assert!(matches!(surfaces[0].source, PathSource::Environment));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_resolves_drive_relative_paths() {
+        use std::path::{Component, Prefix};
+
+        let resolved = absolute_path(Path::new(r"C:relative\state"), Path::new(r"C:\workspace"))
+            .expect("resolve drive-relative path");
+
+        assert!(
+            resolved.is_absolute(),
+            "drive-relative path remained relative: {}",
+            resolved.display()
+        );
+        assert!(matches!(
+            resolved.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(b'C'))
+        ));
     }
 
     #[test]
