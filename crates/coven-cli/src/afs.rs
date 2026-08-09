@@ -178,6 +178,42 @@ pub struct CommitRequest {
     /// form `AGENTS.md` requires.
     #[serde(default)]
     pub co_authors: Vec<String>,
+    /// Run every refusal check and report what would happen, without
+    /// quiescing the session, creating a worktree, or recording a commit.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// What a `dryRun` commit reports (bead `coven-fty` follow-up `coven-y7a`).
+///
+/// `wouldCommit` is only ever `true`: a preview that would be refused returns
+/// the refusal itself, as the same dotted error a real commit would raise, so
+/// a client reads one contract rather than two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitPreview {
+    pub id: String,
+    pub branch: String,
+    pub worktree_path: String,
+    pub provenance_high_water: i64,
+    pub counts: ChangeCounts,
+    /// Entries that would be written or removed, after directories and
+    /// unmaterializable nodes are dropped — not the same as `counts`.
+    pub files: usize,
+    pub dry_run: bool,
+    pub would_commit: bool,
+}
+
+/// Everything a commit needs, resolved and validated, before anything is
+/// written. Shared by `commit` and `commit_dry_run` so the two cannot diverge.
+struct CommitPlan {
+    binding: SessionBinding,
+    project_root: PathBuf,
+    branch: String,
+    worktree_path: PathBuf,
+    plan: Vec<Planned>,
+    counts: ChangeCounts,
+    high_water: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -611,14 +647,35 @@ impl AfsStore {
         Ok(())
     }
 
-    /// `afs.session.commit` — materialize the delta into a git branch
-    /// (DESIGN.md §5).
+    /// `afs.session.commit` with `dryRun` — every refusal a real commit could
+    /// raise, and none of its effects.
     ///
-    /// Every check that can refuse the commit runs *before* the worktree is
-    /// created, so a refusal leaves no branch, no worktree, and no partially
-    /// applied delta. The delta itself survives materialization — it is the
-    /// audit record — until an explicit discard.
-    pub fn commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitView> {
+    /// This shares [`plan_commit`](Self::plan_commit) with the real thing
+    /// rather than re-deriving the checks, so a preview cannot drift from what
+    /// commit actually enforces — the drift is the only way a preview could
+    /// lie. Nothing is written: no `committing` transition, no worktree, no
+    /// `afs_commit` row.
+    pub fn commit_dry_run(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitPreview> {
+        let plan = self.plan_commit(id, request)?;
+        Ok(CommitPreview {
+            id: id.to_string(),
+            branch: plan.branch,
+            worktree_path: plan.worktree_path.to_string_lossy().into_owned(),
+            provenance_high_water: plan.high_water,
+            counts: plan.counts,
+            files: plan.plan.len(),
+            dry_run: true,
+            would_commit: true,
+        })
+    }
+
+    /// Resolve and validate everything a commit needs, mutating nothing.
+    ///
+    /// Every DESIGN.md §5 check that can refuse lives here: base verification
+    /// (§5.2), the full change-set resolution and escape rejection (§5.4/§5.5),
+    /// and the branch/worktree conflict checks. Reading the provenance high
+    /// water is a `SELECT MAX`, so it is safe on this side of the line too.
+    fn plan_commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitPlan> {
         let binding = self.binding(id)?;
         self.require_open(&binding)?;
 
@@ -686,9 +743,43 @@ impl AfsStore {
             )));
         }
 
+        // A read, not a write — safe on the no-effects side of the line.
+        let high_water = self
+            .open_delta(id)?
+            .provenance_high_water()
+            .map_err(AfsError::from)?;
+
+        Ok(CommitPlan {
+            binding,
+            project_root,
+            branch,
+            worktree_path,
+            plan,
+            counts,
+            high_water,
+        })
+    }
+
+    /// `afs.session.commit` — materialize the delta into a git branch
+    /// (DESIGN.md §5).
+    ///
+    /// Every check that can refuse the commit runs *before* the worktree is
+    /// created, so a refusal leaves no branch, no worktree, and no partially
+    /// applied delta. The delta itself survives materialization — it is the
+    /// audit record — until an explicit discard.
+    pub fn commit(&self, id: &str, request: &CommitRequest) -> AfsResult<CommitView> {
+        let CommitPlan {
+            binding,
+            project_root,
+            branch,
+            worktree_path,
+            plan,
+            counts,
+            high_water,
+        } = self.plan_commit(id, request)?;
+
         // §5.1 — quiesce only once nothing can still refuse.
         let delta = self.open_delta(id)?;
-        let high_water = delta.provenance_high_water().map_err(AfsError::from)?;
         delta
             .set_session_state(&binding.id, STATE_COMMITTING)
             .map_err(AfsError::from)?;
@@ -1500,6 +1591,92 @@ mod tests {
             commits[0].provenance_high_water,
             committed.provenance_high_water
         );
+    }
+
+    #[test]
+    fn a_dry_run_previews_the_commit_and_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"// new");
+        delta_write(&store, &view.id, "/README.md", b"# changed");
+
+        let preview = store
+            .commit_dry_run(&view.id, &CommitRequest::default())
+            .unwrap();
+        assert!(preview.dry_run && preview.would_commit);
+        assert_eq!(preview.branch, format!("afs/{}", view.id));
+        assert_eq!(preview.counts.added, 1);
+        assert_eq!(preview.counts.modified, 1);
+        assert_eq!(preview.files, 2);
+
+        // Zero effects: no branch, no worktree, no state change, no audit row.
+        assert!(!git_branch_exists(&root, &preview.branch));
+        assert!(!PathBuf::from(&preview.worktree_path).exists());
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+        assert!(store
+            .open_delta(&view.id)
+            .unwrap()
+            .commits()
+            .unwrap()
+            .is_empty());
+
+        // And a dry run that says "would commit" is followed by one that does.
+        let committed = store.commit(&view.id, &CommitRequest::default()).unwrap();
+        assert_eq!(committed.state, STATE_COMMITTED);
+        assert_eq!(committed.branch, preview.branch);
+        assert_eq!(
+            committed.provenance_high_water,
+            preview.provenance_high_water
+        );
+    }
+
+    #[test]
+    fn a_dry_run_raises_the_same_refusals_a_real_commit_would() {
+        // Each case is the refusal a real commit raises, proven by asking for
+        // both and comparing the dotted code — a preview that disagreed with
+        // the commit would be worse than no preview.
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+
+        let escaping = create(&store, &root);
+        delta_write(&store, &escaping.id, "/.git/config", b"[core]\n");
+        let (_, dry_code, _) = store
+            .commit_dry_run(&escaping.id, &CommitRequest::default())
+            .expect_err("a .git write must be refused")
+            .parts();
+        let (_, real_code, _) = commit_err(&store, &escaping.id).parts();
+        assert_eq!(dry_code, "afs.path_outside_root");
+        assert_eq!(dry_code, real_code);
+
+        let conflicted = create(&store, &root);
+        delta_write(&store, &conflicted.id, "/src/added.rs", b"// new");
+        git_ok(&root, &["branch", &format!("afs/{}", conflicted.id)]);
+        let (_, dry_conflict, _) = store
+            .commit_dry_run(&conflicted.id, &CommitRequest::default())
+            .expect_err("an existing branch must be refused")
+            .parts();
+        assert_eq!(dry_conflict, "afs.commit_conflict");
+
+        // Divergence is checked before anything else, so it must also surface.
+        let diverged = create(&store, &root);
+        delta_write(&store, &diverged.id, "/src/added.rs", b"// new");
+        std::fs::write(root.join("drift.txt"), b"drift").unwrap();
+        git_ok(&root, &["add", "--all"]);
+        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "drift"]);
+        let (_, dry_diverged, _) = store
+            .commit_dry_run(&diverged.id, &CommitRequest::default())
+            .expect_err("a moved base must be refused")
+            .parts();
+        assert_eq!(dry_diverged, "afs.base_diverged");
+
+        // Still nothing written by any of the three previews.
+        assert_eq!(store.get(&escaping.id).unwrap().state, STATE_OPEN);
+        assert_eq!(store.get(&diverged.id).unwrap().state, STATE_OPEN);
     }
 
     #[test]

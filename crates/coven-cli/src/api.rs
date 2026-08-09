@@ -6854,6 +6854,15 @@ fn afs_write(coven_home: &Path, path: &str, body: Option<&str>) -> Result<ApiRes
                     )
                 }
             };
+            // A dry run answers "would this commit land, and if not why" with
+            // no side effects at all, so a client can preview before asking an
+            // operator to confirm.
+            if request.dry_run {
+                return match store.commit_dry_run(&id, &request) {
+                    Ok(view) => json_response(200, &view),
+                    Err(error) => afs_failure(error),
+                };
+            }
             match store.commit(&id, &request) {
                 Ok(view) => json_response(200, &view),
                 Err(error) => afs_failure(error),
@@ -7064,6 +7073,18 @@ mod tests {
         )?;
         assert_eq!(commit.status, 409);
         assert!(commit.body.contains("afs.base_diverged"));
+
+        // A dry run reports the same refusal through the same envelope, so a
+        // client previewing a commit reads one contract, not two.
+        let preview = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/afs/sessions/{id}/commit"),
+            temp.path(),
+            None,
+            Some(&json!({ "dryRun": true }).to_string()),
+        )?;
+        assert_eq!(preview.status, 409);
+        assert!(preview.body.contains("afs.base_diverged"));
 
         let confirmed = handle_request_with_body(
             "POST",
