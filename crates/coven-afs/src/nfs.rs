@@ -194,6 +194,20 @@ impl GateHandle {
             .clone()
     }
 
+    /// Constant-time comparison of `candidate` against the current token,
+    /// performed under the read guard.
+    ///
+    /// This is what the gate `lookup` uses. It deliberately avoids
+    /// [`Self::token`]: cloning would spill another copy of a live credential
+    /// onto the heap on every probe, and freed heap is not zeroed.
+    fn matches(&self, candidate: &[u8]) -> bool {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        constant_time_eq(candidate, guard.as_bytes())
+    }
+
     /// Replace the token, returning the new one.
     pub fn rotate(&self) -> String {
         let next = export_token();
@@ -428,7 +442,7 @@ impl NFSFileSystem for AfsNfs {
         if dirid == GATE_ROOT {
             // The only way past the gate. A wrong name is NOENT, exactly as a
             // missing file would be, so probing reveals nothing.
-            return if constant_time_eq(name.as_bytes(), self.gate_name.token().as_bytes()) {
+            return if self.gate_name.matches(name.as_bytes()) {
                 Ok(ROOT_INO as u64)
             } else if name == "." || name == ".." {
                 Ok(GATE_ROOT)
