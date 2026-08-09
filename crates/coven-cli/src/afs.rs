@@ -1631,11 +1631,19 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&outside, root.join("src/main.rs")).unwrap();
         git_ok(&root, &["add", "--all"]);
-        git_ok(&root, &["commit", "--no-gpg-sign", "-q", "-m", "leaf symlink"]);
+        git_ok(
+            &root,
+            &["commit", "--no-gpg-sign", "-q", "-m", "leaf symlink"],
+        );
 
         let store = store(dir.path());
         let view = create(&store, &root);
-        delta_write(&store, &view.id, "/src/main.rs", b"fn main() { println!(\"safe\"); }");
+        delta_write(
+            &store,
+            &view.id,
+            "/src/main.rs",
+            b"fn main() { println!(\"safe\"); }",
+        );
 
         let committed = store
             .commit(&view.id, &CommitRequest::default())
@@ -1643,7 +1651,10 @@ mod tests {
         assert_eq!(committed.state, STATE_COMMITTED);
         assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
         assert_eq!(
-            git_ok(&root, &["show", &format!("{}:src/main.rs", committed.commit)]),
+            git_ok(
+                &root,
+                &["show", &format!("{}:src/main.rs", committed.commit)]
+            ),
             "fn main() { println!(\"safe\"); }"
         );
     }
