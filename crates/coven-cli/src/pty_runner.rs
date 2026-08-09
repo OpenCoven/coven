@@ -434,10 +434,18 @@ static SUPERVISED_STREAM_CANCELLATION_LOCK: Mutex<()> = Mutex::new(());
 // The test signaler and guard restoration share this lock so a test TERM can
 // never race a restored disposition. This observer is not compiled into the
 // production signal path.
-#[derive(Default)]
 struct SupervisedStreamCancellationTestLifecycle {
     observer: Option<thread::ThreadId>,
-    active: bool,
+    phase: SupervisedStreamCancellationTestPhase,
+}
+
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SupervisedStreamCancellationTestPhase {
+    Registered,
+    InstalledMasked,
+    ActiveUnmasked,
+    Finished,
 }
 
 #[cfg(all(test, unix))]
@@ -445,7 +453,7 @@ static SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE: Mutex<
     SupervisedStreamCancellationTestLifecycle,
 > = Mutex::new(SupervisedStreamCancellationTestLifecycle {
     observer: None,
-    active: false,
+    phase: SupervisedStreamCancellationTestPhase::Finished,
 });
 
 #[cfg(all(test, unix))]
@@ -464,16 +472,32 @@ impl SupervisedStreamCancellationTestObserver {
             anyhow::bail!("a supervised stream cancellation test observer is already active");
         }
         lifecycle.observer = Some(owner);
-        lifecycle.active = false;
+        lifecycle.phase = SupervisedStreamCancellationTestPhase::Registered;
         Ok(Self { owner })
     }
 
-    fn send_sigterm_if_active(&self, target: usize) -> Result<bool> {
+    /// The returned installed/active phase means this call delivered SIGTERM.
+    ///
+    /// The lifecycle mutex covers both this dispatch and the guard's transition
+    /// to `Finished`, which happens before handler restoration. Consequently,
+    /// this test-only helper can queue a signal while the guard is masked or
+    /// deliver one while it is unmasked, but can never signal a restored
+    /// default disposition.
+    fn send_sigterm_if_guarded(
+        &self,
+        target: usize,
+    ) -> Result<SupervisedStreamCancellationTestPhase> {
         let lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if lifecycle.observer.as_ref() != Some(&self.owner) || !lifecycle.active {
-            return Ok(false);
+        if lifecycle.observer.as_ref() != Some(&self.owner) {
+            anyhow::bail!("supervised stream cancellation test observer no longer owns lifecycle");
+        }
+        match lifecycle.phase {
+            SupervisedStreamCancellationTestPhase::Registered
+            | SupervisedStreamCancellationTestPhase::Finished => return Ok(lifecycle.phase),
+            SupervisedStreamCancellationTestPhase::InstalledMasked
+            | SupervisedStreamCancellationTestPhase::ActiveUnmasked => {}
         }
 
         let result = unsafe { libc::pthread_kill(target as libc::pthread_t, libc::SIGTERM) };
@@ -481,7 +505,7 @@ impl SupervisedStreamCancellationTestObserver {
             return Err(std::io::Error::from_raw_os_error(result))
                 .context("sending fixture SIGTERM to the stream runner thread");
         }
-        Ok(true)
+        Ok(lifecycle.phase)
     }
 }
 
@@ -492,7 +516,7 @@ impl Drop for SupervisedStreamCancellationTestObserver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if lifecycle.observer.as_ref() == Some(&self.owner) {
-            lifecycle.active = false;
+            lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
             lifecycle.observer = None;
         }
     }
@@ -642,10 +666,19 @@ impl SupervisedStreamCancellationGuard {
 
         #[cfg(test)]
         let test_lifecycle_registered = {
-            let lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
+            let mut lifecycle = SUPERVISED_STREAM_CANCELLATION_TEST_LIFECYCLE
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            lifecycle.observer.as_ref() == Some(&thread::current().id())
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                debug_assert_eq!(
+                    lifecycle.phase,
+                    SupervisedStreamCancellationTestPhase::Registered
+                );
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::InstalledMasked;
+                true
+            } else {
+                false
+            }
         };
 
         Ok(Self {
@@ -673,7 +706,12 @@ impl SupervisedStreamCancellationGuard {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
-                lifecycle.active = true;
+                if lifecycle.phase != SupervisedStreamCancellationTestPhase::InstalledMasked {
+                    anyhow::bail!(
+                        "supervised stream cancellation test lifecycle was not installed and masked before activation"
+                    );
+                }
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::ActiveUnmasked;
             }
         }
         Ok(self.cancelled_signal())
@@ -688,7 +726,9 @@ impl SupervisedStreamCancellationGuard {
         });
         #[cfg(test)]
         if let Some(lifecycle) = &mut test_lifecycle {
-            lifecycle.active = false;
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+            }
         }
         self.signal_mask
             .reblock()
@@ -733,7 +773,9 @@ impl Drop for SupervisedStreamCancellationGuard {
         });
         #[cfg(test)]
         if let Some(lifecycle) = &mut test_lifecycle {
-            lifecycle.active = false;
+            if lifecycle.observer.as_ref() == Some(&thread::current().id()) {
+                lifecycle.phase = SupervisedStreamCancellationTestPhase::Finished;
+            }
         }
         let _ = self.signal_mask.reblock();
         // SAFETY: every entry was captured from a successful sigaction call
@@ -4713,7 +4755,20 @@ while :; do sleep 1; done
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     struct NativeStreamSigtermCleanupSentinel {
         shutdown: Arc<AtomicBool>,
-        result: mpsc::Receiver<Result<()>>,
+        result: mpsc::Receiver<std::result::Result<(), String>>,
+        outcome: Option<std::result::Result<(), String>>,
+        outcome_observed: bool,
+        reader: Option<thread::JoinHandle<()>>,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    impl Drop for NativeStreamSigtermCleanupSentinel {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
@@ -4829,7 +4884,7 @@ while :; do sleep 1; done
         let (result_sender, result_receiver) = mpsc::sync_channel(1);
         let shutdown = Arc::new(AtomicBool::new(false));
         let sentinel_shutdown = Arc::clone(&shutdown);
-        thread::spawn(move || {
+        let reader = thread::spawn(move || {
             let result = (|| -> Result<()> {
                 let mut command = command;
                 let mut buffer = Vec::new();
@@ -4878,19 +4933,95 @@ while :; do sleep 1; done
                         }
                     }
                 }
-            })();
+            })()
+            .map_err(|error| format!("{error:#}"));
             let _ = result_sender.send(result);
         });
         Ok(NativeStreamSigtermCleanupSentinel {
             shutdown,
             result: result_receiver,
+            outcome: None,
+            outcome_observed: false,
+            reader: Some(reader),
         })
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn await_native_stream_sigterm_cleanup_sentinel(
+        sentinel: &mut NativeStreamSigtermCleanupSentinel,
+        deadline: Instant,
+    ) -> Result<()> {
+        if sentinel.outcome.is_none() {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            let outcome = match sentinel.result.recv_timeout(remaining) {
+                Ok(outcome) => outcome,
+                Err(RecvTimeoutError::Timeout) => {
+                    anyhow::bail!(
+                        "native stream cleanup sentinel did not acknowledge its durable command before the watchdog expired"
+                    );
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!(
+                        "native stream cleanup sentinel stopped before acknowledging its command"
+                    );
+                }
+            };
+            sentinel.outcome = Some(outcome);
+        }
+
+        sentinel.outcome_observed = true;
+        match sentinel
+            .outcome
+            .as_ref()
+            .expect("cleanup sentinel outcome is recorded before observation")
+        {
+            Ok(()) => Ok(()),
+            Err(error) => anyhow::bail!("native stream cleanup sentinel failed: {error}"),
+        }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn finish_native_stream_sigterm_cleanup_sentinel(
+        sentinel: &mut NativeStreamSigtermCleanupSentinel,
+    ) -> Vec<String> {
+        sentinel.shutdown.store(true, Ordering::Relaxed);
+        let mut failures = Vec::new();
+        let Some(reader) = sentinel.reader.take() else {
+            failures.push("native stream cleanup sentinel reader was already joined".into());
+            return failures;
+        };
+        if reader.join().is_err() {
+            failures.push("native stream cleanup sentinel reader panicked".into());
+            return failures;
+        }
+
+        if sentinel.outcome.is_none() {
+            match sentinel.result.try_recv() {
+                Ok(outcome) => sentinel.outcome = Some(outcome),
+                Err(mpsc::TryRecvError::Empty) => failures.push(
+                    "native stream cleanup sentinel reader exited without reporting a result"
+                        .into(),
+                ),
+                Err(mpsc::TryRecvError::Disconnected) => failures.push(
+                    "native stream cleanup sentinel reader disconnected without reporting a result"
+                        .into(),
+                ),
+            }
+        }
+        if let Some(Err(error)) = &sentinel.outcome {
+            if !sentinel.outcome_observed {
+                failures.push(format!("native stream cleanup sentinel failed: {error}"));
+            }
+        }
+        failures
     }
 
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn request_native_stream_sigterm_fixture_cleanup(
         cleanup: &NativeStreamSigtermCleanupHandle,
-        sentinel: &NativeStreamSigtermCleanupSentinel,
+        sentinel: &mut NativeStreamSigtermCleanupSentinel,
         deadline: Instant,
     ) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
@@ -4914,26 +5045,10 @@ while :; do sleep 1; done
             command
                 .flush()
                 .context("flushing native stream fixture cleanup command")?;
-
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .unwrap_or_default();
-            match sentinel.result.recv_timeout(remaining) {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    return Err(error).context("native stream cleanup sentinel failed");
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    anyhow::bail!(
-                        "native stream cleanup sentinel did not acknowledge its durable command before the watchdog expired"
-                    );
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    anyhow::bail!(
-                        "native stream cleanup sentinel stopped before acknowledging its command"
-                    );
-                }
-            }
+            // The reader now has the complete token; close the only test-side
+            // writer before waiting for its acknowledgement.
+            drop(command);
+            await_native_stream_sigterm_cleanup_sentinel(sentinel, deadline)?;
 
             match std::fs::read_to_string(&cleanup.acknowledgement_path) {
                 Ok(acknowledgement) if acknowledgement.trim() == cleanup.token => Ok(()),
@@ -4957,7 +5072,7 @@ while :; do sleep 1; done
     #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn cleanup_native_stream_sigterm_fixtures(
         cleanup: &NativeStreamSigtermCleanupHandle,
-        sentinel: &NativeStreamSigtermCleanupSentinel,
+        sentinel: &mut NativeStreamSigtermCleanupSentinel,
         fixture_cleanup: &mut NativeStreamSigtermFixtureCleanup,
         identities: Option<&[NativeStreamSigtermFixtureIdentity; 2]>,
     ) -> Vec<String> {
@@ -4973,20 +5088,20 @@ while :; do sleep 1; done
         }
 
         let Some(identities) = identities else {
+            failures.push(
+                "fixture identities were never captured before emergency cleanup; refusing to report PID-file absence as reaping"
+                    .into(),
+            );
             if let Err(error) = request_native_stream_sigterm_fixture_group_cleanup(fixture_cleanup)
             {
                 failures.push(format!(
                     "failed to request fixture-local native stream process-group cleanup: {error:#}"
                 ));
             }
-            failures.push(
-                "cancelled native stream cleanup was acknowledged, but fixture identities were never captured; refusing to report PID-file absence as reaping"
-                    .into(),
-            );
             return failures;
         };
 
-        match native_stream_sigterm_fixture_states(identities) {
+        let initial_states = match native_stream_sigterm_fixture_states(identities) {
             Ok(states)
                 if states
                     .iter()
@@ -4994,13 +5109,31 @@ while :; do sleep 1; done
             {
                 return Vec::new();
             }
-            Ok(_) => {}
+            Ok(states) => {
+                // This is the production assertion. The emergency FIFO can
+                // only contain a leak; it must never turn one into a pass.
+                for (index, state) in states.iter().enumerate() {
+                    match state {
+                        NativeStreamSigtermFixtureState::Reaped => {}
+                        NativeStreamSigtermFixtureState::Alive => failures.push(format!(
+                            "SIGTERM production reaping check failed before fixture-local emergency cleanup: {} {} was still alive",
+                            NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
+                        )),
+                        NativeStreamSigtermFixtureState::Reused => failures.push(format!(
+                            "SIGTERM production reaping check failed before fixture-local emergency cleanup: recorded {} PID {} was reused",
+                            NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
+                        )),
+                    }
+                }
+                Some(states)
+            }
             Err(error) => {
                 failures.push(format!(
-                    "could not verify native stream fixture identities before cleanup: {error}"
+                    "could not verify native stream fixture identities before fixture-local emergency cleanup: {error}"
                 ));
+                None
             }
-        }
+        };
 
         if let Err(error) = request_native_stream_sigterm_fixture_group_cleanup(fixture_cleanup) {
             failures.push(format!(
@@ -5016,6 +5149,29 @@ while :; do sleep 1; done
                         .iter()
                         .all(|state| *state == NativeStreamSigtermFixtureState::Reaped) =>
                 {
+                    match initial_states {
+                        Some(initial_states) => {
+                            let initial_context = initial_states
+                                .iter()
+                                .enumerate()
+                                .map(|(index, state)| {
+                                    format!(
+                                        "{} {} was {state:?}",
+                                        NATIVE_STREAM_SIGTERM_FIXTURES[index].0,
+                                        identities[index].pid
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            failures.push(format!(
+                                "fixture-local emergency cleanup reaped the recorded identities after the failed production check ({initial_context}); post-cleanup inspection does not erase that failure"
+                            ));
+                        }
+                        None => failures.push(
+                            "fixture-local emergency cleanup reaped the recorded identities, but the pre-cleanup identity inspection failed; post-cleanup reaping does not replace that production proof"
+                                .into(),
+                        ),
+                    }
                     return failures;
                 }
                 Ok(states) if Instant::now() >= cleanup_deadline => {
@@ -5037,7 +5193,7 @@ while :; do sleep 1; done
                 Ok(_) => thread::sleep(Duration::from_millis(10)),
                 Err(error) => {
                     failures.push(format!(
-                        "could not verify native stream fixture identities after cleanup: {error}"
+                        "could not verify native stream fixture identities after fixture-local emergency cleanup: {error}"
                     ));
                     return failures;
                 }
@@ -5093,7 +5249,7 @@ while :; do sleep 1; done
         std::fs::set_permissions(&fake_harness, permissions)?;
 
         let lifecycle = Arc::new(SupervisedStreamCancellationTestObserver::arm()?);
-        let cleanup_sentinel = start_native_stream_sigterm_cleanup_sentinel(&cleanup)?;
+        let mut cleanup_sentinel = start_native_stream_sigterm_cleanup_sentinel(&cleanup)?;
         let signal_lifecycle = Arc::clone(&lifecycle);
         let runner_thread = unsafe { libc::pthread_self() } as usize;
         let signal_dir = temp_dir.path().to_path_buf();
@@ -5107,10 +5263,15 @@ while :; do sleep 1; done
             let startup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
             let mut last_readiness_error = None;
             let mut last_delivery_error = None;
+            let mut startup_failure = None;
             loop {
                 if signal_stream_finished.load(Ordering::Relaxed) {
                     anyhow::bail!(
-                        "native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent"
+                        "{}native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent",
+                        startup_failure
+                            .as_deref()
+                            .map(|failure| format!("{failure}; "))
+                            .unwrap_or_default(),
                     );
                 }
 
@@ -5142,42 +5303,48 @@ while :; do sleep 1; done
                 };
 
                 if fixture_identities_ready && fixture_sentinel_ready {
-                    match signal_lifecycle.send_sigterm_if_active(runner_thread) {
-                        // `send_sigterm_if_active` holds the lifecycle lock
-                        // across pthread_kill, excluding restoration. The
-                        // final runner error below proves consumption.
-                        Ok(true) => return Ok(()),
-                        Ok(false) => {}
+                    match signal_lifecycle.send_sigterm_if_guarded(runner_thread) {
+                        // `stream_harness_with_program` installs the guard
+                        // before spawning this fixture. A pending signal is
+                        // therefore safe in InstalledMasked and cancels as
+                        // soon as activate() unmasks the runner thread.
+                        Ok(
+                            SupervisedStreamCancellationTestPhase::InstalledMasked
+                            | SupervisedStreamCancellationTestPhase::ActiveUnmasked,
+                        ) => {
+                            if let Some(failure) = startup_failure {
+                                anyhow::bail!(
+                                    "{failure}; lifecycle-verified SIGTERM was delivered to contain the stalled fixture startup"
+                                );
+                            }
+                            return Ok(());
+                        }
+                        Ok(SupervisedStreamCancellationTestPhase::Registered) => {
+                            last_delivery_error = Some(
+                                "fixture was ready while the cancellation guard was still registered; waiting for guarded delivery"
+                                    .into(),
+                            );
+                        }
+                        Ok(SupervisedStreamCancellationTestPhase::Finished) => {
+                            anyhow::bail!(
+                                "native stream reached the finished cancellation lifecycle before SIGTERM delivery"
+                            );
+                        }
                         Err(error) => last_delivery_error = Some(format!("{error:#}")),
                     }
                 }
                 if signal_stream_finished.load(Ordering::Relaxed) {
                     anyhow::bail!(
-                        "native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent"
+                        "{}native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent",
+                        startup_failure
+                            .as_deref()
+                            .map(|failure| format!("{failure}; "))
+                            .unwrap_or_default(),
                     );
                 }
-                if Instant::now() >= startup_deadline {
-                    // Reuse the owner-verified lifecycle path: its mutex keeps
-                    // handler restoration out of the thread-directed delivery.
-                    let fallback_delivery = match signal_lifecycle
-                        .send_sigterm_if_active(runner_thread)
-                    {
-                        Ok(true) => {
-                            "sent lifecycle-verified SIGTERM cancellation to the stream runner"
-                                .to_string()
-                        }
-                        Ok(false) => {
-                            "did not signal because the cancellation lifecycle was already inactive"
-                                .to_string()
-                        }
-                        Err(error) => {
-                            format!(
-                                "failed to send lifecycle-verified SIGTERM cancellation: {error:#}"
-                            )
-                        }
-                    };
-                    anyhow::bail!(
-                        "native stream fixture-start failure: the fixture, cleanup sentinel, and cancellation handler did not become ready together before the startup watchdog expired{}{}; fallback {}",
+                if Instant::now() >= startup_deadline && startup_failure.is_none() {
+                    let failure = format!(
+                        "native stream fixture-start failure: the fixture, cleanup sentinel, and cancellation handler did not become ready together before the startup watchdog expired{}{}",
                         last_readiness_error
                             .as_deref()
                             .map(|error| format!("; last readiness error: {error}"))
@@ -5186,8 +5353,36 @@ while :; do sleep 1; done
                             .as_deref()
                             .map(|error| format!("; last delivery error: {error}"))
                             .unwrap_or_default(),
-                        fallback_delivery,
                     );
+                    // Hold the lifecycle mutex through pthread_kill. If the
+                    // guard remains only Registered, keep the signaler alive:
+                    // returning here would leave a fixture that becomes
+                    // signalable later with no cancellation request.
+                    match signal_lifecycle.send_sigterm_if_guarded(runner_thread) {
+                        Ok(
+                            SupervisedStreamCancellationTestPhase::InstalledMasked
+                            | SupervisedStreamCancellationTestPhase::ActiveUnmasked,
+                        ) => {
+                            anyhow::bail!(
+                                "{failure}; lifecycle-verified SIGTERM was delivered to contain the stalled fixture startup"
+                            );
+                        }
+                        Ok(SupervisedStreamCancellationTestPhase::Registered) => {
+                            startup_failure = Some(format!(
+                                "{failure}; guard remains registered, so SIGTERM is deferred until its disposition is safe"
+                            ));
+                        }
+                        Ok(SupervisedStreamCancellationTestPhase::Finished) => {
+                            anyhow::bail!(
+                                "{failure}; guard was already finished, so SIGTERM was not sent under a restored disposition"
+                            );
+                        }
+                        Err(error) => {
+                            anyhow::bail!(
+                                "{failure}; lifecycle-verified SIGTERM delivery failed: {error:#}"
+                            );
+                        }
+                    }
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -5215,10 +5410,13 @@ while :; do sleep 1; done
             .clone();
         let mut failures = cleanup_native_stream_sigterm_fixtures(
             &cleanup,
-            &cleanup_sentinel,
+            &mut cleanup_sentinel,
             &mut fixture_cleanup,
             captured_fixture_identities.as_ref(),
         );
+        failures.extend(finish_native_stream_sigterm_cleanup_sentinel(
+            &mut cleanup_sentinel,
+        ));
         if let Err(error) = signal_result {
             failures.push(format!("native stream signal thread failed: {error:#}"));
         }
