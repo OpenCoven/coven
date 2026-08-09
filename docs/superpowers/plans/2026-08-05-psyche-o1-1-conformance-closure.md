@@ -463,7 +463,7 @@ cargo test -p coven-cli pty_runner::tests::codex_json_runner_reaps_a_closed_pipe
 cargo test -p coven-cli --test stream_json_integration codex_json_sigterm_reaps_descendants_and_marks_ledger_failed -- --exact
 ```
 
-Expected on Unix: every test passes, direct children and descendants are gone, cancellation is prompt, `waitid(...WNOHANG | WNOWAIT)` never reports a live child as exited, and cleanup occurs before reaping.
+Expected on Unix: every test passes, direct children and descendants are gone, cancellation returns the expected error, `waitid(...WNOHANG | WNOWAIT)` never reports a live child as exited, and cleanup occurs before reaping.
 
 - [ ] **Step 2: Run the Windows-compilable containment coverage**
 
