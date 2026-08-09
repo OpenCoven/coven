@@ -17,7 +17,7 @@
 [Technical architecture](./TECH.md),
 [Threat model](./THREAT_MODEL.md),
 [Telegram parity](./TELEGRAM_PARITY.md),
-[Coven prerequisites](./COVEN_PREREQUISITES.md), and
+[Coven prerequisites](./COVEN_PREREQUISITES.md),
 [Program plan](./PLAN.md), and
 [O2 contract design](./O2_CONTRACT_DESIGN.md)
 

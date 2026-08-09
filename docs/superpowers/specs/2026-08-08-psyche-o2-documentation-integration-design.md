@@ -1,7 +1,7 @@
 # Psyche O2 Documentation Integration Design
 
-**Status:** Approved for documentation-only implementation  
-**Issue:** #689  
+**Status:** Approved for documentation-only implementation
+**Issue:** #689
 **Scope:** Reconcile the proposed O2 execution-binding contract with the
 canonical Psyche documentation. No production API, schema, or runtime behavior
 is implemented by this work.
