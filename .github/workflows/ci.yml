@@ -35,6 +35,23 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
+      # `coven-afs`'s `mount` feature is opt-in, so every step above compiles
+      # the workspace *without* `crates/coven-afs/src/nfs.rs` — the NFSv3
+      # export, its ownership mapping, and the file-handle authentication that
+      # is the access-control boundary for a mounted session (DESIGN.md §7).
+      # That module went unbuilt by CI from #680 until `coven-aof`, so PRs
+      # changing it received green checks computed without it.
+      #
+      # Linux only: the export calls `libc::getuid`/`getgid`, which do not
+      # exist on Windows — `nfsserve` gates its own `fs_util` the same way.
+      # Excluding Windows is the honest fix; weakening the module to compile
+      # there would trade real coverage for a green badge.
+      - name: Clippy (coven-afs mount feature)
+        if: runner.os == 'Linux'
+        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
+      - name: Test (coven-afs mount feature)
+        if: runner.os == 'Linux'
+        run: cargo test -p coven-afs --features mount --locked
 
   performance-baseline:
     name: CLI performance baseline
