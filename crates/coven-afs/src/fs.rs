@@ -181,6 +181,25 @@ impl AgentFs {
         Ok(self.resolve(path)?.is_some())
     }
 
+    /// Checkpoint any write-ahead log back into the database file and return
+    /// to a rollback journal.
+    ///
+    /// This is how a WAL database becomes a single portable file again: the
+    /// `-wal`/`-shm` sidecars are removed as part of the mode change, and no
+    /// committed data is lost because the checkpoint happens first. Use it
+    /// before publishing a database that someone else will copy or open.
+    pub fn checkpoint_to_single_file(&self) -> Result<()> {
+        self.ensure_writable()?;
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(()),
+                other => Err(other),
+            })?;
+        self.conn.pragma_update(None, "journal_mode", "DELETE")?;
+        Ok(())
+    }
+
     /// Read file metadata (SPEC stat), including the link count.
     pub fn stat(&self, path: &str) -> Result<Metadata> {
         let ino = self

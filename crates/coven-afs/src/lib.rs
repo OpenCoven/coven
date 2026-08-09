@@ -25,6 +25,7 @@
 //! [AgentFS SPEC v0.4]: https://github.com/tursodatabase/agentfs/blob/main/SPEC.md
 
 mod audit;
+mod diff;
 mod fs;
 mod ino;
 mod kv;
@@ -32,15 +33,21 @@ mod kv;
 mod nfs;
 mod overlay;
 mod path;
+mod provenance;
 mod schema;
 
 pub use audit::ToolCall;
+pub use diff::{Change, ChangeEntry, ChangeSet};
 pub use fs::{AgentFs, Metadata, ROOT_INO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 pub use ino::DirEntry;
 #[cfg(feature = "mount")]
 pub use nfs::AfsNfs;
 pub use overlay::OverlayFs;
 pub use path::{basename, components, normalize, parent};
+pub use provenance::{
+    Actor, CommitRecord, ProvenanceRecord, SessionBinding, EXTENSION_TABLES, STATE_COMMITTED,
+    STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
+};
 
 /// Errors produced by coven-afs operations.
 #[derive(Debug, thiserror::Error)]

@@ -42,7 +42,10 @@ GET /api/v1/health
     "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true,
-    "sessionHandoff": true
+    "sessionHandoff": true,
+    "afs": true,
+    "afsMount": false,
+    "afsCommit": false
   },
   "daemon": {
     "pid": 31415,
@@ -85,8 +88,23 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `POST /api/v1/sessions/:id/handoffs/:handoffId/ack` | Acknowledge a quiesced source. |
 | `POST /api/v1/sessions/:id/handoffs/:handoffId/continuations` | Record continuation import. |
 | `POST /api/v1/store/vacuum` | Rebuild the event FTS index and compact the SQLite store. |
+| `POST /api/v1/afs/sessions` | Create an agent-filesystem session over a project root. |
+| `GET /api/v1/afs/sessions` | List agent-filesystem sessions. |
+| `GET /api/v1/afs/sessions/:id` | Fetch one agent-filesystem session. |
+| `POST /api/v1/afs/sessions/:id/join` | Attach another actor to an existing session. |
+| `GET /api/v1/afs/sessions/:id/diff` | Read the session's change set against its base. |
+| `GET /api/v1/afs/sessions/:id/timeline` | Read recorded file operations, cursor-paginated. |
+| `POST /api/v1/afs/sessions/:id/discard` | Discard a session (requires `"confirm": true`). |
 
 Detailed shapes live in the [API reference](/reference/api).
+
+Agent-filesystem routes are gated by the `afs` capability, and are **same-user
+local IPC** operations for the same reason session handoff is: they expose a
+session's working tree. `afsMount` reports the mount backend or `false`, and
+`afsCommit` reports whether the daemon can materialize a delta into a git
+branch; both are `false` today, and `POST .../mount` and `POST .../commit`
+return `501` with `afs.mount_unsupported` / `afs.commit_unsupported` to match.
+Design: [`specs/coven-agent-fs/DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/specs/coven-agent-fs/DESIGN.md).
 
 Session handoff is a **same-user local IPC** operation. A companion must use a
 separately paired authenticated transport; exposing these endpoints directly

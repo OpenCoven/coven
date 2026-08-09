@@ -3,7 +3,10 @@
 //! semantics, whiteout lifecycle, origin tracking, KV, and the tool-call
 //! audit rules.
 
-use coven_afs::{AgentFs, OverlayFs, ROOT_INO, S_IFDIR, S_IFMT, S_IFREG};
+use coven_afs::{
+    Actor, AgentFs, OverlayFs, SessionBinding, EXTENSION_TABLES, ROOT_INO, STATE_OPEN, S_IFDIR,
+    S_IFMT, S_IFREG,
+};
 use serde_json::json;
 
 fn assert_consistent(fs: &AgentFs) {
@@ -382,4 +385,69 @@ fn read_only_open_rejects_mutation_but_allows_reads() {
         ro.record_tool_call("t", None, Some(&json!(1)), None, 1, 2),
         Err(coven_afs::Error::ReadOnly)
     ));
+}
+
+/// Rules E1-E3 from `specs/coven-agent-fs/DESIGN.md` §1, proven rather than
+/// asserted: a coven-extended database satisfies the SPEC consistency rules,
+/// and dropping every `afs_*` table leaves a database that still satisfies
+/// them with its filesystem contents untouched.
+#[test]
+fn coven_extensions_are_droppable_without_changing_filesystem_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fs = AgentFs::create(dir.path().join("extended.db")).unwrap();
+    fs.write_file("/src/main.rs", b"fn main() {}").unwrap();
+    fs.write_file("/README.md", b"# project").unwrap();
+    fs.symlink("/src/main.rs", "/link.rs").unwrap();
+    fs.mkdir_p("/empty").unwrap();
+
+    fs.bind_session(&SessionBinding {
+        id: "afs-conformance".into(),
+        state: STATE_OPEN.into(),
+        bead_id: Some("coven-5kt".into()),
+        ..Default::default()
+    })
+    .unwrap();
+    fs.record_operation(
+        "write",
+        "/src/main.rs",
+        None,
+        None,
+        None,
+        12,
+        &Actor {
+            coven_session_id: Some("sess-1".into()),
+            turn: Some(7),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    fs.record_commit("afs/conformance", None, None, "planned")
+        .unwrap();
+
+    assert_consistent(&fs);
+    let before: Vec<(String, Vec<u8>)> = ["/src/main.rs", "/README.md"]
+        .iter()
+        .map(|path| (path.to_string(), fs.read_file(path).unwrap()))
+        .collect();
+
+    fs.drop_extensions().unwrap();
+
+    assert_consistent(&fs);
+    for (path, contents) in before {
+        assert_eq!(fs.read_file(&path).unwrap(), contents, "{path} changed");
+    }
+    assert_eq!(fs.read_link("/link.rs").unwrap(), "/src/main.rs");
+    assert!(fs.exists("/empty").unwrap());
+    assert!(!fs.has_extensions().unwrap());
+    for table in EXTENSION_TABLES {
+        assert!(
+            !fs.table_exists(table).unwrap(),
+            "{table} survived drop_extensions"
+        );
+    }
+
+    // A dropped database still reads through the coven accessors, which is the
+    // upstream-produced-database case from rule E3.
+    assert_eq!(fs.session_binding().unwrap(), None);
+    assert!(fs.provenance_since(0, 10).unwrap().is_empty());
 }
