@@ -4426,27 +4426,28 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
-    fn native_stream_sigterm_fixture_pids(
+    fn native_stream_sigterm_fixture_pid(
         fixture_dir: &Path,
-    ) -> (Vec<(&'static str, libc::pid_t)>, Vec<String>) {
-        let mut fixtures = Vec::new();
-        let mut failures = Vec::new();
-        for (label, file_name) in [("harness", "harness.pid"), ("descendant", "descendant.pid")] {
-            let path = fixture_dir.join(file_name);
-            match std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {label} PID file {}", path.display()))
-                .and_then(|contents| {
-                    contents
-                        .trim()
-                        .parse::<libc::pid_t>()
-                        .context("parsing fixture PID")
-                }) {
-                Ok(pid) if pid > 0 => fixtures.push((label, pid)),
-                Ok(pid) => failures.push(format!("{label} fixture recorded invalid PID {pid}")),
-                Err(error) => failures.push(format!("{label} fixture PID unavailable: {error:#}")),
+        label: &str,
+        file_name: &str,
+    ) -> Result<Option<libc::pid_t>> {
+        let path = fixture_dir.join(file_name);
+        match std::fs::read_to_string(&path) {
+            Ok(contents) => {
+                let pid = contents
+                    .trim()
+                    .parse::<libc::pid_t>()
+                    .context("parsing fixture PID")?;
+                if pid <= 0 {
+                    anyhow::bail!("{label} fixture recorded invalid PID {pid}");
+                }
+                Ok(Some(pid))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => {
+                Err(error).with_context(|| format!("reading {label} PID file {}", path.display()))
             }
         }
-        (fixtures, failures)
     }
 
     #[cfg(unix)]
@@ -4456,22 +4457,100 @@ while :; do sleep 1; done
     }
 
     #[cfg(unix)]
-    fn cleanup_native_stream_sigterm_fixtures(fixture_dir: &Path) -> Vec<String> {
-        let (fixtures, mut failures) = native_stream_sigterm_fixture_pids(fixture_dir);
-        let mut reaped = fixtures
-            .iter()
-            .map(|(_, pid)| native_stream_sigterm_fixture_is_reaped(*pid))
-            .collect::<Vec<_>>();
+    fn terminate_native_stream_sigterm_harness_group(fixture_dir: &Path) -> Vec<String> {
+        let pid = match native_stream_sigterm_fixture_pid(fixture_dir, "harness", "harness.pid") {
+            Ok(Some(pid)) => pid,
+            // The fixture writes its harness PID before starting a descendant.
+            // With no PID, there is no process group to target.
+            Ok(None) => return Vec::new(),
+            Err(error) => {
+                return vec![format!(
+                    "reading fixture harness PID for cleanup: {error:#}"
+                )]
+            }
+        };
 
-        for ((label, pid), reaped) in fixtures.iter().zip(&mut reaped) {
-            if !*reaped {
+        // stream_harness_with_program reaches spawn_strict_child_process_tree,
+        // whose Unix setup calls setsid(). The harness PID is therefore the
+        // exact leader of the isolated harness process group.
+        if unsafe { libc::kill(-pid, libc::SIGKILL) } == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return vec![format!(
+                    "failed to terminate fixture harness process group led by {pid}: {error}"
+                )];
+            }
+        }
+        Vec::new()
+    }
+
+    #[cfg(unix)]
+    fn cleanup_native_stream_sigterm_fixtures(
+        fixture_dir: &Path,
+        require_recorded_pids: bool,
+    ) -> Vec<String> {
+        const FIXTURES: [(&str, &str); 2] =
+            [("harness", "harness.pid"), ("descendant", "descendant.pid")];
+        let mut pids = [None; FIXTURES.len()];
+        let mut pid_errors = [None, None];
+        let mut reaped = [false; FIXTURES.len()];
+        let grace_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
+
+        loop {
+            for (index, (label, file_name)) in FIXTURES.iter().enumerate() {
+                if pids[index].is_none() {
+                    match native_stream_sigterm_fixture_pid(fixture_dir, label, file_name) {
+                        Ok(Some(pid)) => {
+                            pids[index] = Some(pid);
+                            pid_errors[index] = None;
+                        }
+                        Ok(None) => pid_errors[index] = None,
+                        Err(error) => pid_errors[index] = Some(format!("{error:#}")),
+                    }
+                }
+                if let Some(pid) = pids[index] {
+                    reaped[index] = native_stream_sigterm_fixture_is_reaped(pid);
+                }
+            }
+
+            let all_recorded = pids.iter().all(Option::is_some);
+            let all_reaped = pids
+                .iter()
+                .enumerate()
+                .all(|(index, pid)| pid.is_none() || reaped[index]);
+            let no_pid_errors = pid_errors.iter().all(Option::is_none);
+            if all_reaped && no_pid_errors && (!require_recorded_pids || all_recorded) {
+                return Vec::new();
+            }
+            if Instant::now() >= grace_deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut failures = Vec::new();
+        for (index, (label, _)) in FIXTURES.iter().enumerate() {
+            let Some(pid) = pids[index] else {
+                if let Some(error) = &pid_errors[index] {
+                    failures.push(format!(
+                        "cancelled native stream could not read {label} PID before reaping grace expired: {error}"
+                    ));
+                } else if require_recorded_pids {
+                    failures.push(format!(
+                        "cancelled native stream did not record {label} PID before reaping grace expired"
+                    ));
+                }
+                continue;
+            };
+            if !reaped[index] {
                 failures.push(format!(
-                    "cancelled native stream left {label} {pid} unreaped before cleanup"
+                    "cancelled native stream left {label} {pid} unreaped after reaping grace; \
+                     attempting exact-PID failure cleanup"
                 ));
-                if unsafe { libc::kill(*pid, libc::SIGKILL) } == -1 {
+                if unsafe { libc::kill(pid, libc::SIGKILL) } == -1 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() == Some(libc::ESRCH) {
-                        *reaped = true;
+                        reaped[index] = true;
                     } else {
                         failures.push(format!(
                             "failed to clean up unreaped {label} {pid} with SIGKILL: {error}"
@@ -4482,19 +4561,32 @@ while :; do sleep 1; done
         }
 
         let cleanup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
-        while reaped.iter().any(|reaped| !reaped) && Instant::now() < cleanup_deadline {
-            for ((_, pid), reaped) in fixtures.iter().zip(&mut reaped) {
-                *reaped = native_stream_sigterm_fixture_is_reaped(*pid);
+        while pids
+            .iter()
+            .enumerate()
+            .any(|(index, pid)| pid.is_some() && !reaped[index])
+            && Instant::now() < cleanup_deadline
+        {
+            for (index, pid) in pids.iter().enumerate() {
+                if let Some(pid) = pid {
+                    reaped[index] = native_stream_sigterm_fixture_is_reaped(*pid);
+                }
             }
-            if reaped.iter().any(|reaped| !reaped) {
+            if pids
+                .iter()
+                .enumerate()
+                .any(|(index, pid)| pid.is_some() && !reaped[index])
+            {
                 thread::sleep(Duration::from_millis(10));
             }
         }
-        for ((label, pid), reaped) in fixtures.iter().zip(&reaped) {
-            if !reaped {
-                failures.push(format!(
-                    "cancelled native stream {label} {pid} survived cleanup"
-                ));
+        for (index, (label, _)) in FIXTURES.iter().enumerate() {
+            if let Some(pid) = pids[index] {
+                if !reaped[index] {
+                    failures.push(format!(
+                        "cancelled native stream {label} {pid} survived exact-PID failure cleanup"
+                    ));
+                }
             }
         }
         failures
@@ -4523,6 +4615,7 @@ while :; do sleep 1; done
     #[cfg(unix)]
     fn native_stream_sigterm_child(fixture_dir: &Path) -> Result<()> {
         let signal_guard = NativeStreamSigtermTestSignal::install()?;
+        let runner_thread = unsafe { libc::pthread_self() } as usize;
         let signal_dir = fixture_dir.to_path_buf();
         let stream_finished = Arc::new(AtomicBool::new(false));
         let signal_stream_finished = Arc::clone(&stream_finished);
@@ -4547,10 +4640,11 @@ while :; do sleep 1; done
             if !NativeStreamSigtermTestSignal::cancellation_handler_is_active()? {
                 anyhow::bail!("native stream SIGTERM handler was not active for the fixture");
             }
-            let result = unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
+            let result =
+                unsafe { libc::pthread_kill(runner_thread as libc::pthread_t, libc::SIGTERM) };
             if result != 0 {
                 return Err(std::io::Error::from_raw_os_error(result))
-                    .context("sending fixture SIGTERM to the signaler thread");
+                    .context("sending fixture SIGTERM to the stream runner thread");
             }
             Ok(())
         });
@@ -4578,7 +4672,7 @@ while :; do sleep 1; done
         // restoration failure. The parent test repeats this after a watchdog
         // termination so a malformed child test process cannot strand either
         // exact fixture PID.
-        let mut failures = cleanup_native_stream_sigterm_fixtures(fixture_dir);
+        let mut failures = cleanup_native_stream_sigterm_fixtures(fixture_dir, true);
         if let Err(error) = signal_result {
             failures.push(format!("native stream signal thread failed: {error:#}"));
         }
@@ -4651,6 +4745,13 @@ while :; do sleep 1; done
             }
         };
         if child_status.is_none() {
+            // The harness writes harness.pid before it starts the long-lived
+            // sleep(120) descendant. Kill its isolated process group first so
+            // a watchdog cannot strand a child between that sleep starting
+            // and descendant.pid being written.
+            failures.extend(terminate_native_stream_sigterm_harness_group(
+                temp_dir.path(),
+            ));
             if let Err(error) = child.kill() {
                 failures.push(format!(
                     "terminating isolated native stream SIGTERM test: {error}"
@@ -4662,12 +4763,23 @@ while :; do sleep 1; done
                     "waiting for terminated native stream SIGTERM test: {error}"
                 )),
             }
+            // If the harness wrote its PID while the test child was being
+            // terminated, its group still contains every unrecorded
+            // descendant and can be targeted precisely.
+            failures.extend(terminate_native_stream_sigterm_harness_group(
+                temp_dir.path(),
+            ));
         }
 
         // The isolated child may be killed by the watchdog before it can
         // clean up, so verify and clean both exact fixture PIDs here before
         // reporting its outcome.
-        failures.extend(cleanup_native_stream_sigterm_fixtures(temp_dir.path()));
+        failures.extend(cleanup_native_stream_sigterm_fixtures(
+            temp_dir.path(),
+            child_status
+                .as_ref()
+                .is_some_and(std::process::ExitStatus::success),
+        ));
         match child_status {
             Some(status) if status.success() => {}
             Some(status) => failures.push(format!(
