@@ -544,12 +544,19 @@ fn absolute_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
 
     #[cfg(windows)]
     {
-        // Windows drive-relative paths (for example `C:state`) use per-drive
-        // process state that a lexical join cannot reproduce. `cwd` is the
-        // absolute process directory captured immediately before this call.
-        std::path::absolute(path)
-            .ok()
-            .filter(|resolved| resolved.is_absolute())
+        use std::path::Component;
+
+        let needs_process_resolution =
+            path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_)));
+        if needs_process_resolution {
+            // Drive-relative paths (for example `C:state`) use per-drive
+            // process state that a lexical join cannot reproduce.
+            std::path::absolute(path)
+                .ok()
+                .filter(|resolved| resolved.is_absolute())
+        } else {
+            Some(cwd.join(path))
+        }
     }
     #[cfg(not(windows))]
     {
@@ -731,6 +738,17 @@ mod tests {
             resolved.components().next(),
             Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(b'C'))
         ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_resolves_plain_relative_paths_against_captured_cwd() {
+        let cwd = Path::new(r"C:\workspace");
+
+        assert_eq!(
+            absolute_path(Path::new(r"relative\state"), cwd),
+            Some(PathBuf::from(r"C:\workspace\relative\state"))
+        );
     }
 
     #[test]
