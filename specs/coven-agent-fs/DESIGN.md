@@ -431,7 +431,7 @@ mount is separate work and is not claimed by this design.
 | Step | Bead | State |
 |---|---|---|
 | Storage engine + overlay | `coven-d4p` | merged — PR #658, `e2da654` |
-| macOS mount + benchmark | `coven-110` | merged experimental spike — PR #680, conditional on the Full Disk Access confirmation |
+| macOS mount + benchmark | `coven-110` | merged experimental spike — PR #680, Terminal mounted-I/O confirmation passed; macOS network-volume/privacy access must be assessed per client/harness or deployment |
 | This design | `coven-vhw` | — |
 | Daemon API + extension tables | not yet filed | ready to file |
 | Cave surfaces | not yet filed | needs the daemon API |

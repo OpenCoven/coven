@@ -10,8 +10,8 @@ gates the architecture. This spike measures it, and exercises the kext-free
 macOS mount path end to end.
 
 **Verdict: GO on the storage engine, conditional on write-ahead logging.
-The macOS mount is protocol-correct but blocked from agent processes by a
-platform access control that needs one manual confirmation (§4).**
+The macOS loopback NFS path is validated for a consent-enabled,
+human-operated Terminal/client.**
 
 ---
 
@@ -109,7 +109,7 @@ rather than the single portable file that makes a delta copyable. They are
 checkpointed away on clean close. The daemon should call `enable_wal()` when
 it opens a session delta; a database being handed to someone else should not.
 
-## 4. The macOS mount: correct, and blocked by the platform
+## 4. The macOS mount: correct, and now manually confirmed
 
 What works, verified against a live server with RPC tracing:
 
@@ -122,7 +122,7 @@ What works, verified against a live server with RPC tracing:
 - Spotlight walks the mounted tree without trouble, which is the clearest
   proof the export is well-formed.
 
-What does not work: **`open()` from an agent's own shell returns `EPERM`** —
+What does not work for an automated agent shell: **`open()` returns `EPERM`** —
 for files (`cat`) and directories (`ls`) alike — while `stat` on the same path
 succeeds and the server logs no error. Metadata passes, `open` is refused, and
 the refusal happens client-side without an RPC.
@@ -139,8 +139,7 @@ calling process, not an NFS or permission fault:
 - it is not the server — the same operations succeed for Spotlight, and
   ACCESS grants every right.
 
-**One manual confirmation is needed**, from a Terminal that has Full Disk
-Access, because this session's process almost certainly does not:
+On 2026-08-09, the manual confirmation path passed from a consent-enabled, human-operated Terminal/client, with `afs_serve` listening on `127.0.0.1:12049`:
 
 ```sh
 cargo run -p coven-afs --features mount --example afs_serve -- /tmp/afs.db 12049 &
@@ -150,11 +149,17 @@ mkdir /tmp/afsmnt/hello && echo written > /tmp/afsmnt/hello/file.txt && cat /tmp
 umount -f /tmp/afsmnt
 ```
 
-If that writes and reads back, the mount path is fully working and the
-constraint is "the agent process needs Full Disk Access / Network Volumes
-consent" — a deployment requirement to document, not a design problem. If it
-still fails, the macOS mount needs a different backend (FSKit, or a
-privileged helper) and this becomes a blocking finding.
+The `mount_nfs` client mounted `localhost:/` at `/private/tmp/afsmnt` and
+`mount` reported NFS with `nodev` and `nosuid`. `mkdir /tmp/afsmnt/hello`, the
+write to `file.txt`, and the read-back of `written` all succeeded. The earlier
+`Connection refused` was just startup timing: Cargo/server startup had not
+completed yet. The later local write happened while unmounted and is not NFS
+evidence.
+
+This is consistent with a per-process macOS privacy/TCC requirement such as
+Network Volumes or Full Disk Access for the client or agent process. Do not
+read that as universal sufficiency in every deployment context; treat it as a
+process-consent requirement to document and re-check per harness.
 
 Linux/FUSE was **not** evaluated: this spike ran on macOS, and `fuser` needs a
 Linux host to mean anything. The inode API in §1 is the layer a `fuser`
@@ -168,17 +173,20 @@ architecture is answered: with WAL, an agent-shaped workload runs at
 dependency-tree shapes, at ~1.2–1.5x on-disk overhead. Copy-up is linear and
 capped by policy. Nothing here argues against the design in DESIGN.md.
 
-**Conditional on the mount.** The NFS export is protocol-correct and mounts
-without privileges, but no agent process has yet written a byte through it on
-this machine. Do not schedule mount-dependent work until §4's confirmation
-runs. The SDK-only path (`afsMount: false` in DESIGN.md §3.1) is unaffected
-and remains the safe default.
+**Consent-enabled mount validation may proceed.** The NFS export is
+protocol-correct and the human-operated Terminal/client path now has a manual
+write/read confirmation. Keep the SDK-only path (`afsMount: false` in
+DESIGN.md §3.1) as the safe default until the remaining gates below close.
 
 **Two limits to remember.** The export serializes all RPCs behind one mutex
 over a single SQLite connection, so nothing here measures parallel clients.
 And loopback NFS is still unauthenticated — DESIGN.md §7's access-control
 question is untouched by this spike and still gates enabling mounts by
 default.
+
+**Remaining gates.** Unauthenticated loopback access control, one SQLite
+connection/mutex and untested parallel clients, recovery/default-enable
+policy, sandboxing, and Linux/FUSE remain unresolved.
 
 ## 6. Reproducing
 

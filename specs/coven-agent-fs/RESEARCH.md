@@ -63,8 +63,10 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
 - Turso cloud-sync semantics (conflict resolution, audit preservation) unfetched — irrelevant if we build native, relevant if we ever interop.
 - Windows mount story: nothing exists upstream; ProjFS is the plausible native route, unscoped.
 - Linux/FUSE performance remains unmeasured. The macOS NFS spike is
-  protocol-correct but needs an agent-process Full Disk Access confirmation
-  before mount-dependent work can proceed.
+  protocol-correct; the human-operated Terminal mounted-I/O confirmation
+  passed, and per-process network-volume / Full Disk Access consent remains a
+  deployment requirement to re-check for the client or agent process before
+  using it broadly.
 
 ## Recommended next steps
 
@@ -73,8 +75,9 @@ From the surveyed products (high, per-source): (a) POSIX view so git/grep/existi
    [PR #658](https://github.com/OpenCoven/coven/pull/658).
 2. **Delivered as an experimental spike:** a feature-gated `nfsserve` NFSv3
    export, inode-addressed operations, and the macOS benchmark. The storage
-   verdict is GO with WAL; the mount remains blocked on the Full Disk Access
-   confirmation, loopback access control, and a Linux/FUSE evaluation. See
+   verdict is GO with WAL; the mount has passed the human-operated Terminal
+   mounted-I/O confirmation, but loopback access control, per-process
+   network-volume consent, and a Linux/FUSE evaluation remain open. See
    [MOUNT-SPIKE.md](./MOUNT-SPIKE.md).
 3. Design doc in the coven repo: daemon API surface + provenance extension tables + Cave diff/timeline UI. **Delivered:** [DESIGN.md](./DESIGN.md).
 4. Decide interop stance: freeze on "SPEC-compatible, coven-extended" and document the extension tables. **Frozen:** [DESIGN.md §1](./DESIGN.md).
