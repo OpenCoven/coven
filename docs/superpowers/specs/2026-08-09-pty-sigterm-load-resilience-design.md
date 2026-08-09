@@ -7,11 +7,11 @@
 
 `native_stream_sigterm_cancels_and_reaps_process_tree` must exercise the
 native-stream cancellation path without creating a signal-disposition race or
-using fixture PID files as unsafe cleanup authority. A previous acknowledgement
-poll observed the production cancellation atomic after `pthread_kill`; guard
-finish legitimately clears that atomic, producing a false watchdog failure.
-Likewise, PID-file readiness can precede guard activation, and numeric PIDs or
-their process-group equality can be reused before failure cleanup runs.
+falling back to unsafe PID-file cleanup. A previous acknowledgement poll
+observed the production cancellation atomic after `pthread_kill`; guard finish
+legitimately clears that atomic, producing a false watchdog failure. Likewise,
+PID-file readiness can precede guard activation, and numeric PIDs or their
+process-group equality can be reused before failure cleanup runs.
 
 ## Decision
 
@@ -30,19 +30,18 @@ The test will assert behavior, not host scheduling speed:
   and its seconds/microseconds start timestamp. A later missing PID is reaped
   only when it was first captured under that identity; a different start
   identity is reported as reuse, never as fixture reaping.
-- Failure cleanup uses a per-test FIFO command and unpredictable token created
-  before launch. The fixture-owned sentinel acknowledges that exact token and
-  calls `kill -KILL 0` from inside its own `setsid` process group. The test
-  therefore never sends a destructive signal to a PID or PGID read from a
-  fixture file. The FIFO stays usable even when the harness or descendant PID
-  file was never published.
 
 If PID readiness appears before activation, the signaler keeps bounded polling
 outside lifecycle locks. If the runner finishes first, it records a non-signal
-failure and lets the main thread perform cleanup. At watchdog expiry, it asks
-the fixture sentinel to end its own group rather than sending SIGTERM without
-both prerequisites. Watchdogs remain diagnostic safeguards, not a normal
-performance promise.
+failure and lets the main thread perform cleanup. If the 30-second
+fixture-start watchdog expires and the owner-scoped guard lifecycle is still
+active, the fallback sends a thread-directed SIGTERM while holding the
+lifecycle mutex, then records a fixture-start failure; if the lifecycle is
+inactive, it records the failure without signalling. The stream then returns
+and identity-safe cleanup plus aggregated assertions run. This is a
+containment failure path, not normal cancellation or a performance assertion;
+it never signals under the restored/default handler and does not alter async
+handler semantics.
 
 ## Scope
 
@@ -59,7 +58,6 @@ unsafe PID cleanup.
 Run the named unit test normally and under Python-supervised load from exactly
 24 locally started `yes` spinners. The test must continue to prove the
 cancellation error, handler restoration, durable fixture reaping, and absence
-of side effects in the production handler. If platform identity inspection or
-the FIFO acknowledgement cannot prove cleanup, the test fails without a
-destructive fallback; this may leave a fixture only in that explicitly reported
-broken-fixture case.
+of side effects in the production handler. If platform identity inspection
+cannot prove cleanup, the test fails without an unsafe fallback; this may leave
+a fixture only in that explicitly reported broken-fixture case.

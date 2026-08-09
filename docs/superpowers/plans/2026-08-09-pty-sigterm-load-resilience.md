@@ -9,11 +9,16 @@ or destructive PID-file cleanup.
 **Architecture:** The production stream runner is unchanged. The test observer
 holds its test-only lifecycle lock across `pthread_kill`; the runner's expected
 cancellation error is the acknowledgement that matters. The signaler waits
-outside locks until fixture identities and guard activation coexist. A
-pre-created tokenized FIFO lets a fixture-owned sentinel kill its own
-`setsid` group on failure, so the test never kills a group from numeric PID
-files. Linux identities use `/proc/<pid>/stat` start ticks; macOS identities
-use `proc_pidinfo(PROC_PIDTBSDINFO)` start timestamps.
+outside locks until fixture identities and guard activation coexist. On
+fixture-start watchdog expiry, the fallback rechecks the owner-scoped guard
+lifecycle under the lifecycle mutex: if it is still active, it sends a
+thread-directed SIGTERM and then records a fixture-start failure; if it is
+inactive, it records the failure without signalling. The stream returns and
+identity-safe cleanup plus aggregated assertions run. This containment path is
+not normal cancellation or a performance assertion, and it never signals under
+the restored/default handler or changes async handler semantics. Linux
+identities use `/proc/<pid>/stat` start ticks; macOS identities use
+`proc_pidinfo(PROC_PIDTBSDINFO)` start timestamps.
 
 **Tech Stack:** Rust, `libc`, Cargo test runner, POSIX shell test fixture.
 
@@ -67,13 +72,14 @@ lock and retries until the watchdog. Do not poll
 `SUPERVISED_STREAM_CANCELLATION_SIGNAL` after `pthread_kill`: guard finish may
 clear it. The final expected cancellation error is the consumption assertion.
 
-On expiry, request tokenized FIFO cleanup rather than dispatching SIGTERM
-without both readiness and activation. After the runner returns, classify each
-captured PID by its recorded platform start identity. PID reuse is a failure,
-not evidence of reaping. The fixture sentinel is the only failure-path
-SIGKILL issuer and executes `kill -KILL 0` from its own group after
-acknowledging the token. Missing PID files cannot prevent that request because
-the FIFO exists before launch.
+On expiry, if the owner-scoped guard lifecycle is still active, send a
+thread-directed SIGTERM while holding the lifecycle mutex, then record a
+fixture-start failure; if the lifecycle is inactive, record the failure
+without signalling. After the runner returns, classify each captured PID by its
+recorded platform start identity. PID reuse is a failure, not evidence of
+reaping. The fallback is a containment failure path, not normal cancellation or
+a performance assertion, and it never signals under the restored/default
+handler or changes async handler semantics.
 
 - [ ] **Step 3: Format and run the renamed test**
 
@@ -85,7 +91,9 @@ cargo test -p coven-cli pty_runner::tests::native_stream_sigterm_cancels_and_rea
 ```
 
 Expected: formatting passes, and the test proves the cancellation error,
-handler restoration, and durable fixture reaping.
+handler restoration, and durable fixture reaping. Any watchdog fallback is a
+containment failure path that still runs identity-safe cleanup and aggregated
+assertions.
 
 - [ ] **Step 4: Run the targeted test under deliberate CPU load**
 
@@ -123,7 +131,9 @@ PY
 
 Expected: the test passes under load. It may take longer than two seconds,
 which is acceptable because correctness is the cancellation error plus
-process-tree reaping.
+process-tree reaping. If the watchdog fallback is taken, it must do so via the
+owner-scoped lifecycle-mutex path described above, not via FIFO cleanup or
+unconditional SIGTERM.
 
 - [ ] **Step 5: Commit the test fix**
 
