@@ -139,7 +139,7 @@ calling process, not an NFS or permission fault:
 - it is not the server — the same operations succeed for Spotlight, and
   ACCESS grants every right.
 
-The manual confirmation path passed from a consent-enabled, human-operated Terminal/client, with `afs_serve` listening on `127.0.0.1:12049`:
+On 2026-08-09, the manual confirmation path passed from a consent-enabled, human-operated Terminal/client, with `afs_serve` listening on `127.0.0.1:12049`:
 
 ```sh
 cargo run -p coven-afs --features mount --example afs_serve -- /tmp/afs.db 12049 &
