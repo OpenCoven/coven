@@ -483,18 +483,6 @@ impl SupervisedStreamCancellationTestObserver {
         }
         Ok(true)
     }
-
-    fn wait_for_sigterm_delivery(deadline: Instant) -> Result<()> {
-        while SUPERVISED_STREAM_CANCELLATION_SIGNAL.load(Ordering::Relaxed) != libc::SIGTERM {
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "fixture SIGTERM was not recorded by the stream cancellation handler before the watchdog expired"
-                );
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(all(test, unix))]
@@ -4472,14 +4460,145 @@ while :; do sleep 1; done
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     const NATIVE_STREAM_SIGTERM_TEST_WATCHDOG: Duration = Duration::from_secs(30);
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     const NATIVE_STREAM_SIGTERM_FIXTURES: [(&str, &str); 2] =
         [("harness", "harness.pid"), ("descendant", "descendant.pid")];
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct NativeStreamSigtermFixtureIdentity {
+        pid: libc::pid_t,
+        started_at: NativeStreamSigtermProcessStart,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NativeStreamSigtermProcessStart {
+        #[cfg(target_os = "linux")]
+        LinuxClockTick(u64),
+        #[cfg(target_os = "macos")]
+        MacOs { seconds: u64, microseconds: u64 },
+    }
+
+    #[cfg(target_os = "macos")]
+    #[repr(C)]
+    struct NativeStreamSigtermMacOsProcBsdInfo {
+        flags: u32,
+        status: u32,
+        exit_status: u32,
+        pid: u32,
+        parent_pid: u32,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        real_uid: libc::uid_t,
+        real_gid: libc::gid_t,
+        saved_uid: libc::uid_t,
+        saved_gid: libc::gid_t,
+        reserved: u32,
+        command: [libc::c_char; 16],
+        name: [libc::c_char; 32],
+        open_files: u32,
+        process_group: u32,
+        job_control_count: u32,
+        controlling_terminal: u32,
+        terminal_process_group: u32,
+        nice: i32,
+        start_seconds: u64,
+        start_microseconds: u64,
+    }
+
+    #[cfg(target_os = "macos")]
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: libc::pid_t,
+            flavor: libc::c_int,
+            arg: u64,
+            buffer: *mut libc::c_void,
+            buffer_size: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    #[cfg(target_os = "linux")]
+    fn native_stream_sigterm_process_start(
+        pid: libc::pid_t,
+    ) -> io::Result<Option<NativeStreamSigtermProcessStart>> {
+        let stat_path = PathBuf::from(format!("/proc/{pid}/stat"));
+        let stat = match std::fs::read_to_string(&stat_path) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let (_, fields) = stat.rsplit_once(") ").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("malformed process stat record at {}", stat_path.display()),
+            )
+        })?;
+        let start_tick = fields
+            .split_whitespace()
+            // Field 3 begins after the process name; starttime is field 22.
+            .nth(19)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing process start time at {}", stat_path.display()),
+                )
+            })?
+            .parse()
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "parsing process start time at {}: {error}",
+                        stat_path.display()
+                    ),
+                )
+            })?;
+        Ok(Some(NativeStreamSigtermProcessStart::LinuxClockTick(
+            start_tick,
+        )))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_stream_sigterm_process_start(
+        pid: libc::pid_t,
+    ) -> io::Result<Option<NativeStreamSigtermProcessStart>> {
+        const PROC_PIDTBSDINFO: libc::c_int = 3;
+        let mut info: NativeStreamSigtermMacOsProcBsdInfo = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` is initialized and passed with its exact C layout and size.
+        let result = unsafe {
+            proc_pidinfo(
+                pid,
+                PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut NativeStreamSigtermMacOsProcBsdInfo).cast(),
+                std::mem::size_of::<NativeStreamSigtermMacOsProcBsdInfo>() as libc::c_int,
+            )
+        };
+        if result == std::mem::size_of::<NativeStreamSigtermMacOsProcBsdInfo>() as libc::c_int {
+            return Ok(Some(NativeStreamSigtermProcessStart::MacOs {
+                seconds: info.start_seconds,
+                microseconds: info.start_microseconds,
+            }));
+        }
+        if result == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("proc_pidinfo returned {result} bytes for process {pid}"),
+        ))
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn native_stream_sigterm_fixture_pid(
         fixture_dir: &Path,
         label: &str,
@@ -4505,175 +4624,245 @@ while :; do sleep 1; done
         }
     }
 
-    #[cfg(unix)]
-    fn native_stream_sigterm_fixture_is_ready(fixture_dir: &Path) -> Result<bool> {
-        for (label, file_name) in NATIVE_STREAM_SIGTERM_FIXTURES {
-            if native_stream_sigterm_fixture_pid(fixture_dir, label, file_name)?.is_none() {
-                return Ok(false);
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn native_stream_sigterm_fixture_identities(
+        fixture_dir: &Path,
+    ) -> Result<Option<[NativeStreamSigtermFixtureIdentity; 2]>> {
+        let Some(harness_pid) = native_stream_sigterm_fixture_pid(
+            fixture_dir,
+            NATIVE_STREAM_SIGTERM_FIXTURES[0].0,
+            NATIVE_STREAM_SIGTERM_FIXTURES[0].1,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(descendant_pid) = native_stream_sigterm_fixture_pid(
+            fixture_dir,
+            NATIVE_STREAM_SIGTERM_FIXTURES[1].0,
+            NATIVE_STREAM_SIGTERM_FIXTURES[1].1,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(harness_started_at) = native_stream_sigterm_process_start(harness_pid)? else {
+            return Ok(None);
+        };
+        let Some(descendant_started_at) = native_stream_sigterm_process_start(descendant_pid)?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some([
+            NativeStreamSigtermFixtureIdentity {
+                pid: harness_pid,
+                started_at: harness_started_at,
+            },
+            NativeStreamSigtermFixtureIdentity {
+                pid: descendant_pid,
+                started_at: descendant_started_at,
+            },
+        ]))
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NativeStreamSigtermFixtureState {
+        Reaped,
+        Alive,
+        Reused,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn native_stream_sigterm_fixture_state(
+        identity: &NativeStreamSigtermFixtureIdentity,
+    ) -> io::Result<NativeStreamSigtermFixtureState> {
+        match native_stream_sigterm_process_start(identity.pid)? {
+            None => Ok(NativeStreamSigtermFixtureState::Reaped),
+            Some(started_at) if started_at == identity.started_at => {
+                Ok(NativeStreamSigtermFixtureState::Alive)
             }
+            Some(_) => Ok(NativeStreamSigtermFixtureState::Reused),
         }
-        Ok(true)
     }
 
-    #[cfg(unix)]
-    fn native_stream_sigterm_fixture_is_reaped(pid: libc::pid_t) -> bool {
-        (unsafe { libc::kill(pid, 0) }) == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn native_stream_sigterm_fixture_states(
+        identities: &[NativeStreamSigtermFixtureIdentity; 2],
+    ) -> io::Result<[NativeStreamSigtermFixtureState; 2]> {
+        Ok([
+            native_stream_sigterm_fixture_state(&identities[0])?,
+            native_stream_sigterm_fixture_state(&identities[1])?,
+        ])
     }
 
-    #[cfg(unix)]
-    fn native_stream_sigterm_fixture_process_group(
-        pid: libc::pid_t,
-    ) -> io::Result<Option<libc::pid_t>> {
-        loop {
-            let process_group = unsafe { libc::getpgid(pid) };
-            if process_group >= 0 {
-                return Ok(Some(process_group));
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                return Ok(None);
-            }
-            return Err(error);
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    #[derive(Clone)]
+    struct NativeStreamSigtermCleanupHandle {
+        command_path: PathBuf,
+        acknowledgement_path: PathBuf,
+        token: String,
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn create_native_stream_sigterm_cleanup_handle(
+        fixture_dir: &Path,
+    ) -> Result<NativeStreamSigtermCleanupHandle> {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let command_path = fixture_dir.join("cleanup.fifo");
+        let command_path_c = CString::new(command_path.as_os_str().as_bytes())
+            .context("encoding native stream fixture cleanup FIFO path")?;
+        // SAFETY: the temporary fixture directory is unique and the C string
+        // is NUL-terminated for mkfifo.
+        if unsafe { libc::mkfifo(command_path_c.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error())
+                .context("creating native stream fixture cleanup FIFO");
         }
+        Ok(NativeStreamSigtermCleanupHandle {
+            command_path,
+            acknowledgement_path: fixture_dir.join("cleanup.ack"),
+            token: format!("coven-native-stream-sigterm-{}", uuid::Uuid::new_v4()),
+        })
     }
 
-    #[cfg(unix)]
-    fn cleanup_native_stream_sigterm_fixtures(fixture_dir: &Path) -> Vec<String> {
-        let mut pids: [Option<libc::pid_t>; 2] = [None; 2];
-        let mut pid_errors: [Option<String>; 2] = std::array::from_fn(|_| None);
-        let mut reaped = [false; 2];
-        let reaping_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn request_native_stream_sigterm_fixture_cleanup(
+        cleanup: &NativeStreamSigtermCleanupHandle,
+        deadline: Instant,
+    ) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Open both ends so writing before the fixture sentinel has opened
+        // its read end is safe; retain this descriptor until the sentinel
+        // acknowledges the exact, per-test token.
+        let mut command = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&cleanup.command_path)
+            .with_context(|| {
+                format!(
+                    "opening native stream fixture cleanup FIFO {}",
+                    cleanup.command_path.display()
+                )
+            })?;
+        writeln!(command, "{}", cleanup.token)
+            .context("writing native stream fixture cleanup command")?;
+        command
+            .flush()
+            .context("flushing native stream fixture cleanup command")?;
 
         loop {
-            for (index, (label, file_name)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
-                if pids[index].is_none() {
-                    match native_stream_sigterm_fixture_pid(fixture_dir, label, file_name) {
-                        Ok(Some(pid)) => {
-                            pids[index] = Some(pid);
-                            pid_errors[index] = None;
-                        }
-                        Ok(None) => pid_errors[index] = None,
-                        Err(error) => pid_errors[index] = Some(format!("{error:#}")),
-                    }
-                }
-                if let Some(pid) = pids[index] {
-                    if !reaped[index] {
-                        reaped[index] = native_stream_sigterm_fixture_is_reaped(pid);
-                    }
+            match std::fs::read_to_string(&cleanup.acknowledgement_path) {
+                Ok(acknowledgement) if acknowledgement.trim() == cleanup.token => return Ok(()),
+                Ok(acknowledgement) if !acknowledgement.trim().is_empty() => anyhow::bail!(
+                    "native stream fixture cleanup acknowledgement did not match its token"
+                ),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "reading native stream fixture cleanup acknowledgement {}",
+                            cleanup.acknowledgement_path.display()
+                        )
+                    });
                 }
             }
-
-            if pids.iter().all(Option::is_some) && reaped.iter().all(|reaped| *reaped) {
-                return Vec::new();
-            }
-            if Instant::now() >= reaping_deadline {
-                break;
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "native stream fixture did not acknowledge its durable cleanup command before the watchdog expired"
+                );
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
+    fn cleanup_native_stream_sigterm_fixtures(
+        cleanup: &NativeStreamSigtermCleanupHandle,
+        identities: Option<&[NativeStreamSigtermFixtureIdentity; 2]>,
+    ) -> Vec<String> {
+        let Some(identities) = identities else {
+            return match request_native_stream_sigterm_fixture_cleanup(
+                cleanup,
+                Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
+            ) {
+                Ok(()) => vec![
+                    "cancelled native stream cleanup was acknowledged, but fixture identities were never captured; refusing to report PID-file absence as reaping"
+                        .into(),
+                ],
+                Err(error) => vec![format!(
+                    "cancelled native stream did not capture durable fixture identities and its cleanup sentinel was unavailable: {error:#}"
+                )],
+            };
+        };
 
         let mut failures = Vec::new();
-        for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
-            if pids[index].is_none() {
-                if let Some(error) = &pid_errors[index] {
-                    failures.push(format!(
-                        "cancelled native stream could not read {label} PID before the reaping watchdog expired: {error}"
-                    ));
-                } else {
-                    failures.push(format!(
-                        "cancelled native stream did not record {label} PID before the reaping watchdog expired"
-                    ));
-                }
+        match native_stream_sigterm_fixture_states(identities) {
+            Ok(states)
+                if states
+                    .iter()
+                    .all(|state| *state == NativeStreamSigtermFixtureState::Reaped) =>
+            {
+                return Vec::new();
+            }
+            Ok(_) => {}
+            Err(error) => {
+                failures.push(format!(
+                    "could not verify native stream fixture identities before cleanup: {error}"
+                ));
             }
         }
 
-        let harness_pid = pids[0];
-        if let Some(harness_pid) = harness_pid {
-            let mut verified_fixture_group = false;
-            for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
-                let Some(pid) = pids[index] else {
-                    continue;
-                };
-                if reaped[index] {
-                    continue;
-                }
-                match native_stream_sigterm_fixture_process_group(pid) {
-                    Ok(Some(process_group)) if process_group == harness_pid => {
-                        verified_fixture_group = true;
-                    }
-                    Ok(Some(process_group)) => failures.push(format!(
-                        "cancelled native stream {label} {pid} reported process group {process_group}, not recorded harness process group {harness_pid}; refusing fixture cleanup"
-                    )),
-                    Ok(None) => reaped[index] = true,
-                    Err(error) => failures.push(format!(
-                        "failed to read process group for still-observed {label} {pid}: {error}"
-                    )),
-                }
-            }
-            if verified_fixture_group {
-                // The strict spawn makes the harness PID the leader of a new
-                // session. Killing only a group proven by one of the recorded
-                // fixture identities avoids sending SIGKILL to a recycled PID.
-                if unsafe { libc::killpg(harness_pid, libc::SIGKILL) } == -1 {
-                    let error = std::io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        failures.push(format!(
-                            "failed to terminate verified fixture process group led by {harness_pid}: {error}"
-                        ));
-                    }
-                }
-            } else {
-                failures.push(format!(
-                    "no still-observed fixture process verified recorded harness process group {harness_pid}; refusing fixture cleanup"
-                ));
-            }
-        } else {
-            failures.push(
-                "cancelled native stream did not record harness PID, so it had not safely advanced to descendant launch and no fixture group could be cleaned"
-                    .into(),
-            );
+        if let Err(error) = request_native_stream_sigterm_fixture_cleanup(
+            cleanup,
+            Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
+        ) {
+            failures.push(format!(
+                "failed to request durable native stream fixture cleanup: {error:#}"
+            ));
         }
 
         let cleanup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
-        while pids
-            .iter()
-            .enumerate()
-            .any(|(index, pid)| pid.is_some() && !reaped[index])
-            && Instant::now() < cleanup_deadline
-        {
-            for (index, pid) in pids.iter().enumerate() {
-                if let Some(pid) = pid {
-                    if !reaped[index] {
-                        reaped[index] = native_stream_sigterm_fixture_is_reaped(*pid);
+        loop {
+            match native_stream_sigterm_fixture_states(identities) {
+                Ok(states)
+                    if states
+                        .iter()
+                        .all(|state| *state == NativeStreamSigtermFixtureState::Reaped) =>
+                {
+                    return failures;
+                }
+                Ok(states) if Instant::now() >= cleanup_deadline => {
+                    for (index, state) in states.iter().enumerate() {
+                        match state {
+                            NativeStreamSigtermFixtureState::Reaped => {}
+                            NativeStreamSigtermFixtureState::Alive => failures.push(format!(
+                                "cancelled native stream left {} {} alive after durable cleanup",
+                                NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
+                            )),
+                            NativeStreamSigtermFixtureState::Reused => failures.push(format!(
+                                "recorded {} PID {} was reused; refusing to report that unrelated process as fixture reaping",
+                                NATIVE_STREAM_SIGTERM_FIXTURES[index].0, identities[index].pid
+                            )),
+                        }
                     }
+                    return failures;
                 }
-            }
-            if pids
-                .iter()
-                .enumerate()
-                .any(|(index, pid)| pid.is_some() && !reaped[index])
-            {
-                thread::sleep(Duration::from_millis(10));
-            }
-        }
-
-        for (index, (label, _)) in NATIVE_STREAM_SIGTERM_FIXTURES.iter().enumerate() {
-            if let Some(pid) = pids[index] {
-                if !reaped[index] {
+                Ok(_) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => {
                     failures.push(format!(
-                        "cancelled native stream {label} {pid} survived verified fixture process-group cleanup"
+                        "could not verify native stream fixture identities after cleanup: {error}"
                     ));
+                    return failures;
                 }
             }
         }
-        failures
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     fn native_stream_sigterm_handler_is_restored() -> Result<bool> {
         let _lock = SUPERVISED_STREAM_CANCELLATION_LOCK
             .lock()
@@ -4686,21 +4875,34 @@ while :; do sleep 1; done
         Ok(current.sa_sigaction != cancel_supervised_stream as *const () as usize)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, any(target_os = "linux", target_os = "macos")))]
     #[test]
     fn native_stream_sigterm_cancels_and_reaps_process_tree() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir()?;
         let fake_harness = temp_dir.path().join("long-lived-stream");
+        let cleanup = create_native_stream_sigterm_cleanup_handle(temp_dir.path())?;
         std::fs::write(
             &fake_harness,
-            r#"#!/bin/sh
+            format!(
+                r#"#!/bin/sh
+(
+  exec 3<> cleanup.fifo
+  while IFS= read -r cleanup_command <&3; do
+    if [ "$cleanup_command" = "{cleanup_token}" ]; then
+      printf '%s\n' "$cleanup_command" > cleanup.ack
+      kill -KILL 0
+    fi
+  done
+) &
 printf '%s\n' "$$" > harness.pid
 sleep 120 </dev/null >/dev/null 2>&1 &
 printf '%s\n' "$!" > descendant.pid
 while :; do sleep 1; done
 "#,
+                cleanup_token = cleanup.token
+            ),
         )?;
         let mut permissions = std::fs::metadata(&fake_harness)?.permissions();
         permissions.set_mode(0o755);
@@ -4712,77 +4914,67 @@ while :; do sleep 1; done
         let signal_dir = temp_dir.path().to_path_buf();
         let stream_finished = Arc::new(AtomicBool::new(false));
         let signal_stream_finished = Arc::clone(&stream_finished);
+        let fixture_identities = Arc::new(Mutex::new(None));
+        let signal_fixture_identities = Arc::clone(&fixture_identities);
+        let signal_cleanup = cleanup.clone();
         let signaler = thread::spawn(move || -> Result<()> {
             let startup_deadline = Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG;
+            let mut last_readiness_error = None;
+            let mut last_delivery_error = None;
             loop {
                 if signal_stream_finished.load(Ordering::Relaxed) {
                     anyhow::bail!(
-                        "native stream returned before the fixture became ready; no SIGTERM was sent"
+                        "native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent"
                     );
                 }
-                match native_stream_sigterm_fixture_is_ready(&signal_dir) {
-                    Ok(true) => {
-                        if signal_lifecycle.send_sigterm_if_active(runner_thread)? {
-                            SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
-                                startup_deadline,
-                            )?;
-                            return Ok(());
-                        }
-                        anyhow::bail!(
-                            "native stream handler was inactive before the fixture could be signalled; no SIGTERM was sent"
-                        );
-                    }
-                    Ok(false) if Instant::now() < startup_deadline => {}
-                    Ok(false) => {
+
+                match native_stream_sigterm_fixture_identities(&signal_dir) {
+                    Ok(Some(identities)) => {
+                        *signal_fixture_identities
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(identities);
                         match signal_lifecycle.send_sigterm_if_active(runner_thread) {
-                            Ok(true) => {
-                                let delivery =
-                                    SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
-                                        startup_deadline,
-                                    );
-                                anyhow::bail!(
-                                    "native stream fixture did not become ready before the startup watchdog expired; sent SIGTERM while its handler was active{}",
-                                    delivery
-                                        .err()
-                                        .map(|error| format!(
-                                            " but it was not recorded: {error:#}"
-                                        ))
-                                        .unwrap_or_default()
-                                );
-                            }
-                            Ok(false) => anyhow::bail!(
-                                "native stream fixture did not become ready before the startup watchdog expired; handler was inactive and no SIGTERM was sent"
-                            ),
-                            Err(error) => anyhow::bail!(
-                                "native stream fixture did not become ready before the startup watchdog expired; failed to send SIGTERM while its handler was active: {error:#}"
-                            ),
+                            // `send_sigterm_if_active` holds the lifecycle
+                            // lock across pthread_kill, excluding restoration.
+                            // The final runner error below proves consumption.
+                            Ok(true) => return Ok(()),
+                            Ok(false) => {}
+                            Err(error) => last_delivery_error = Some(format!("{error:#}")),
                         }
                     }
+                    Ok(None) => {}
                     Err(error) => {
-                        match signal_lifecycle.send_sigterm_if_active(runner_thread) {
-                            Ok(true) => {
-                                let delivery =
-                                    SupervisedStreamCancellationTestObserver::wait_for_sigterm_delivery(
-                                        startup_deadline,
-                                    );
-                                anyhow::bail!(
-                                    "native stream fixture readiness failed: {error:#}; sent SIGTERM while its handler was active{}",
-                                    delivery
-                                        .err()
-                                        .map(|delivery_error| format!(
-                                            " but it was not recorded: {delivery_error:#}"
-                                        ))
-                                        .unwrap_or_default()
-                                );
-                            }
-                            Ok(false) => anyhow::bail!(
-                                "native stream fixture readiness failed: {error:#}; handler was inactive and no SIGTERM was sent"
-                            ),
-                            Err(send_error) => anyhow::bail!(
-                                "native stream fixture readiness failed: {error:#}; failed to send SIGTERM while its handler was active: {send_error:#}"
-                            ),
-                        }
+                        last_readiness_error = Some(format!("{error:#}"));
                     }
+                }
+                if signal_stream_finished.load(Ordering::Relaxed) {
+                    anyhow::bail!(
+                        "native stream returned before the fixture and cancellation handler were both ready; no SIGTERM was sent"
+                    );
+                }
+                if Instant::now() >= startup_deadline {
+                    // This is a failure-only escape hatch. It intentionally
+                    // does not use pthread_kill without both prerequisites;
+                    // the fixture's own FIFO sentinel kills only its group.
+                    let cleanup_result = request_native_stream_sigterm_fixture_cleanup(
+                        &signal_cleanup,
+                        Instant::now() + NATIVE_STREAM_SIGTERM_TEST_WATCHDOG,
+                    );
+                    anyhow::bail!(
+                        "native stream fixture and cancellation handler did not become ready together before the startup watchdog expired; no SIGTERM was sent{}{}; durable fixture cleanup {}",
+                        last_readiness_error
+                            .as_deref()
+                            .map(|error| format!("; last readiness error: {error}"))
+                            .unwrap_or_default(),
+                        last_delivery_error
+                            .as_deref()
+                            .map(|error| format!("; last delivery error: {error}"))
+                            .unwrap_or_default(),
+                        match cleanup_result {
+                            Ok(()) => "was acknowledged".to_string(),
+                            Err(error) => format!("failed: {error:#}"),
+                        }
+                    );
                 }
                 thread::sleep(Duration::from_millis(10));
             }
@@ -4804,7 +4996,12 @@ while :; do sleep 1; done
         };
         let restoration_result = native_stream_sigterm_handler_is_restored();
 
-        let mut failures = cleanup_native_stream_sigterm_fixtures(temp_dir.path());
+        let captured_fixture_identities = fixture_identities
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut failures =
+            cleanup_native_stream_sigterm_fixtures(&cleanup, captured_fixture_identities.as_ref());
         if let Err(error) = signal_result {
             failures.push(format!("native stream signal thread failed: {error:#}"));
         }
