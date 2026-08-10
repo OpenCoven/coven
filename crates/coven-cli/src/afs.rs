@@ -674,24 +674,26 @@ impl AfsStore {
         } else {
             None
         };
+        let base_header = if base.is_some() {
+            path.as_str()
+        } else {
+            "/dev/null"
+        };
+        let merged_header = if merged.is_some() {
+            path.as_str()
+        } else {
+            "/dev/null"
+        };
         let patch = match (
             std::str::from_utf8(base.as_deref().unwrap_or(&[])),
             std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
         ) {
             (Ok(""), Ok("")) if base.is_none() != merged.is_none() => {
-                let base_header = if base.is_some() {
-                    path.as_str()
-                } else {
-                    "/dev/null"
-                };
-                let merged_header = if merged.is_some() {
-                    path.as_str()
-                } else {
-                    "/dev/null"
-                };
                 bounded_diff_headers(base_header, merged_header, &path)?
             }
-            (Ok(base), Ok(merged)) => bounded_unified_diff(base, merged, &path, &path, &path)?,
+            (Ok(base), Ok(merged)) => {
+                bounded_unified_diff(base, merged, base_header, merged_header, &path)?
+            }
             _ => ("Binary files differ\n".to_string(), false),
         };
         let binary = patch.0 == "Binary files differ\n";
@@ -2329,6 +2331,7 @@ mod tests {
         assert_eq!(diff.path, "/src/added.txt");
         assert!(!diff.binary);
         assert!(!diff.truncated);
+        assert!(diff.patch.contains("--- /dev/null"));
         assert!(diff.patch.contains("+++ /src/added.txt"));
         assert!(diff.patch.contains("+new line"));
     }
@@ -2348,7 +2351,7 @@ mod tests {
         assert!(!diff.binary);
         assert!(!diff.truncated);
         assert!(diff.patch.contains("--- /notes.txt"));
-        assert!(diff.patch.contains("+++ /notes.txt"));
+        assert!(diff.patch.contains("+++ /dev/null"));
         assert!(diff.patch.contains("-alpha"));
         assert!(diff.patch.contains("-beta"));
     }
@@ -2446,8 +2449,9 @@ mod tests {
         assert!(diff.truncated);
         assert!(diff.patch.len() <= UNIFIED_DIFF_MAX_BYTES);
         assert!(std::str::from_utf8(diff.patch.as_bytes()).is_ok());
-        assert!(diff.patch.contains("--- /src/large.txt"));
-        assert!(diff.patch.starts_with("--- /src/large.txt"));
+        assert!(diff.patch.contains("--- /dev/null"));
+        assert!(diff.patch.contains("+++ /src/large.txt"));
+        assert!(diff.patch.starts_with("--- /dev/null"));
     }
 
     #[test]
