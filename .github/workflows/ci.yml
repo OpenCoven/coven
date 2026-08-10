@@ -218,6 +218,13 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
+      # The smoke test packages with --skip-build, so it needs every binary the
+      # payload declares — the same set the release builds. Without this the
+      # macOS packages would be assembled without the AFS export helper, which
+      # is precisely the gap this job exists to catch (coven-g2t).
+      - name: Build the AFS mount export helper (macOS only)
+        if: startsWith(matrix.npm-target, 'macos')
+        run: cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}
       - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
         env:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
