@@ -23,7 +23,6 @@ WORK="$(mktemp -d)"
 export COVEN_HOME="$WORK/home"
 SOCKET="$COVEN_HOME/coven.sock"
 PROJECT="$WORK/project"
-FAILED=0
 
 cleanup() {
     # Unmount before stopping the daemon: a live mount whose export dies with
@@ -40,8 +39,24 @@ trap cleanup EXIT
 
 step() { printf '\n== %s\n' "$1"; }
 ok()   { printf '   ok    %s\n' "$1"; }
-bad()  { printf '   FAIL  %s\n' "$1"; FAILED=1; }
+# Fail fast, as the header promises. Once an expectation is unmet the rest of
+# the run describes a system already known to be wrong, and cascading failures
+# obscure which one actually broke.
+bad()  { printf '   FAIL  %s\n' "$1"; exit 1; }
 api()  { curl -s --unix-socket "$SOCKET" "$@"; }
+
+# Whether `mount(8)` reports something mounted at exactly this path.
+#
+# Matched as a fixed string against the fully resolved path rather than by
+# grepping the basename: a basename can collide with an unrelated mount, and
+# `mktemp -d` returns a /var path that `mount` reports resolved to /private/var,
+# so an unresolved comparison silently never matches.
+mounted_at() {
+    local resolved
+    # `--` so a path beginning with `-` is a path, not an option to cd.
+    resolved="$(cd -- "$1" 2>/dev/null && pwd -P)" || return 1
+    mount | grep -qF " on $resolved ("
+}
 
 if [ "$(uname -s)" != "Darwin" ]; then
     echo "macOS only: no other platform advertises a mount backend"
@@ -96,12 +111,13 @@ fi
 ok "mountPoint $MOUNT_POINT"
 
 # §3.3: the response must never carry a listener address.
-printf '%s' "$MOUNT_JSON" | grep -qiE '"port"|"token"|localhost:' \
-    && bad "the mount response leaked a listener address or token" \
-    || ok "response carries no port or token"
+if printf '%s' "$MOUNT_JSON" | grep -qiE '"port"|"token"|localhost:'; then
+    bad "the mount response leaked a listener address or token"
+fi
+ok "response carries no port or token"
 
 step "the mount is real"
-mount | grep -q "$(basename "$MOUNT_POINT")" \
+mounted_at "$MOUNT_POINT" \
     && ok "visible in mount(8)" \
     || bad "not present in mount(8)"
 
@@ -138,7 +154,7 @@ step "unmount through the route"
 UNMOUNTED="$(api -X DELETE "http://localhost/api/v1/afs/sessions/$ID/mount" | python3 -c "
 import json,sys; print(json.load(sys.stdin).get('unmounted'))" 2>/dev/null)"
 [ "$UNMOUNTED" = "True" ] && ok "unmounted" || bad "unmount reported $UNMOUNTED"
-mount | grep -q "$(basename "$MOUNT_POINT")" \
+mounted_at "$MOUNT_POINT" \
     && bad "still mounted after DELETE" \
     || ok "gone from mount(8)"
 MOUNT_POINT=""
@@ -148,10 +164,5 @@ AGAIN="$(api -X DELETE "http://localhost/api/v1/afs/sessions/$ID/mount" \
     -o /dev/null -w '%{http_code}')"
 [ "$AGAIN" = "200" ] && ok "second DELETE is 200" || bad "second DELETE was $AGAIN"
 
-printf '\n'
-if [ "$FAILED" -eq 0 ]; then
-    echo "end-to-end mount verified through the daemon routes"
-else
-    echo "end-to-end mount FAILED"
-fi
-exit "$FAILED"
+printf '\nend-to-end mount verified through the daemon routes\n'
+exit 0
