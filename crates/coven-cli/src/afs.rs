@@ -1839,6 +1839,128 @@ mod tests {
         fs.write_file(path, data).unwrap();
     }
 
+    /// Every error code the daemon can emit, as one instance per variant.
+    ///
+    /// Deliberately exhaustive by construction rather than by iterating a
+    /// list: adding a variant without adding it here fails to compile against
+    /// the match below, which is the point.
+    fn every_error() -> Vec<AfsError> {
+        vec![
+            AfsError::SessionNotFound("x".into()),
+            AfsError::SessionNotOpen {
+                id: "x".into(),
+                state: "committed".into(),
+            },
+            AfsError::NameInUse("x".into()),
+            AfsError::ConfirmationRequired,
+            AfsError::BaseDiverged {
+                expected: "a".into(),
+                found: "b".into(),
+            },
+            AfsError::PathOutsideRoot {
+                path: "x".into(),
+                reason: "y".into(),
+            },
+            AfsError::PathNotFound("x".into()),
+            AfsError::PathNotFile("x".into()),
+            AfsError::CopyUpTooLarge {
+                path: "x".into(),
+                bytes: 1,
+            },
+            AfsError::CommitConflict("x".into()),
+            AfsError::CommitUnsigned("x".into()),
+            AfsError::MountUnsupported,
+            AfsError::MountBusy("x".into()),
+            AfsError::Internal(anyhow::anyhow!("x")),
+        ]
+    }
+
+    /// The §3.4 error-code table, and only that table.
+    ///
+    /// Both directions scope to this section rather than the whole file.
+    /// §3.2's operations table has rows in the same shape —
+    /// `| `afs.session.create` | POST … |` — so a whole-file search would let
+    /// an operation name satisfy a check about error codes, and would let a
+    /// code documented in some other table pass as if it were in the contract.
+    fn design_error_table() -> String {
+        let design = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../specs/coven-agent-fs/DESIGN.md"),
+        )
+        .expect("DESIGN.md is readable from the crate root");
+        let (_, rest) = design
+            .split_once("### 3.4")
+            .expect("DESIGN.md still has a §3.4 error-code section");
+        rest.split("\n---").next().unwrap_or(rest).to_string()
+    }
+
+    #[test]
+    fn every_emitted_error_code_is_in_the_design_contract_table() {
+        // DESIGN.md §3.4 is the contract a client branches on, so a code the
+        // daemon can return but the table does not list is a code no surface
+        // handles. `afs.unavailable` was exactly that until this test existed.
+        let section = design_error_table();
+
+        let mut missing = Vec::new();
+        for error in every_error() {
+            let (_, code, _) = error.parts();
+            // Only `afs.*` codes are this table's business. A malformed body
+            // is `invalid_request`, the daemon's generic code used in ninety
+            // or so places across `api.rs`; duplicating it into every feature
+            // table would make each one look like the whole contract.
+            if !code.starts_with("afs.") {
+                assert_eq!(
+                    code, "invalid_request",
+                    "an AFS error mapped to an unexpected generic code"
+                );
+                continue;
+            }
+            // Matched as a table cell rather than anywhere in the prose: §5 and
+            // §7 mention codes in passing, and a passing mention is not a
+            // contract entry.
+            if !section.contains(&format!("| `{code}` |")) {
+                missing.push(code);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "emitted but absent from the DESIGN.md §3.4 table: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_contract_table_lists_no_code_the_daemon_cannot_emit() {
+        // The other direction. A documented code nobody returns sends a client
+        // author writing a branch that never runs.
+        let section = design_error_table();
+
+        let emitted: Vec<&'static str> = every_error()
+            .into_iter()
+            .map(|error| error.parts().1)
+            .collect();
+        let documented: Vec<String> = section
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("| `afs.")?;
+                let code = rest.split('`').next()?;
+                Some(format!("afs.{code}"))
+            })
+            .collect();
+        assert!(
+            !documented.is_empty(),
+            "parsed no codes from §3.4; the table's shape changed"
+        );
+
+        let orphaned: Vec<&String> = documented
+            .iter()
+            .filter(|code| !emitted.contains(&code.as_str()))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "documented but never emitted: {orphaned:?}"
+        );
+    }
+
     fn delta_remove(store: &AfsStore, id: &str, path: &str) {
         let binding = store.binding(id).unwrap();
         let mut overlay = store.open_overlay(id, &binding).unwrap();
