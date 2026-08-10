@@ -48,6 +48,13 @@ environment-provided adapter search roots and configured familiar workspaces.
 Terminal `not_applicable`, `unsupported`, and `unresolved` surfaces
 intentionally omit `path`.
 
+Because JSON path fields are UTF-8 strings, a filesystem path that cannot be
+represented exactly as UTF-8 is reported as `unresolved`; Coven never emits a
+lossy replacement-character path. Multi-path surfaces fail closed as a whole
+rather than returning a partial list. Relative inputs are resolved against the
+process working directory using platform path semantics, including
+drive-relative paths on Windows.
+
 `source` is `environment` when an applicable environment override selected
 the location, `configuration` when `familiars.toml` selected familiar
 workspaces, and `default` otherwise. `access` is always `read_only`: it

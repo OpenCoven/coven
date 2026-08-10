@@ -335,6 +335,40 @@ fn paths_json_does_not_guess_workspaces_when_familiar_manifest_is_invalid() {
     assert!(surface.get("paths").is_none());
 }
 
+#[cfg(unix)]
+#[test]
+fn paths_json_fails_closed_for_non_unicode_environment_paths() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().expect("temporary directory");
+    let coven_home = temp
+        .path()
+        .join(OsString::from_vec(b"coven-home-\xFF".to_vec()));
+    let valid_adapter = temp.path().join("adapter-valid");
+    let invalid_adapter = temp
+        .path()
+        .join(OsString::from_vec(b"adapter-\xFF".to_vec()));
+    let adapter_dirs =
+        std::env::join_paths([&valid_adapter, &invalid_adapter]).expect("join adapter directories");
+
+    let report = report(&run_paths(
+        &temp,
+        &coven_home,
+        &[("COVEN_HARNESS_ADAPTER_DIRS", adapter_dirs)],
+    ));
+    let surfaces = surfaces(&report);
+
+    assert_eq!(surfaces["coven.home"]["status"], "unresolved");
+    assert_eq!(surfaces["coven.home"]["source"], "environment");
+    assert!(surfaces["coven.home"].get("path").is_none());
+    assert_eq!(surfaces["adapters.external_roots"]["status"], "unresolved");
+    assert_eq!(surfaces["adapters.external_roots"]["source"], "environment");
+    assert!(
+        surfaces["adapters.external_roots"].get("paths").is_none(),
+        "a multi-path surface must not emit partial or lossy output"
+    );
+}
+
 #[test]
 fn paths_requires_machine_readable_output_flag() {
     let output = Command::new(env!("CARGO_BIN_EXE_coven"))
