@@ -16,6 +16,7 @@
 //! overlay handles across requests would buy contention rather than speed.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -674,13 +675,14 @@ impl AfsStore {
         } else {
             None
         };
+        let path_header = diff_header_path(&path);
         let base_header = if base.is_some() {
-            path.as_str()
+            path_header.as_str()
         } else {
             "/dev/null"
         };
         let merged_header = if merged.is_some() {
-            path.as_str()
+            path_header.as_str()
         } else {
             "/dev/null"
         };
@@ -1468,6 +1470,36 @@ fn optional_overlay_metadata(
         Err(coven_afs::Error::NotFound(_)) => Ok(None),
         Err(error) => Err(AfsError::from(error)),
     }
+}
+
+fn diff_header_path(path: &str) -> String {
+    if !path
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+    {
+        return path.to_string();
+    }
+
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for character in path.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{08}' => quoted.push_str("\\b"),
+            '\u{0c}' => quoted.push_str("\\f"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => {
+                write!(&mut quoted, "\\u{:04x}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 fn bounded_unified_diff(
@@ -2387,6 +2419,22 @@ mod tests {
         );
         assert!(!deleted.truncated);
         assert!(!deleted.binary);
+    }
+
+    #[test]
+    fn file_diff_escapes_control_characters_in_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        let path = "/odd\tname\n.txt";
+
+        delta_write(&store, &view.id, path, b"contents\n");
+
+        let diff = store.file_diff(&view.id, path).unwrap();
+        assert_eq!(diff.path, path);
+        assert!(diff.patch.contains("+++ \"/odd\\tname\\n.txt\""));
+        assert!(!diff.patch.contains("+++ /odd\tname\n.txt"));
     }
 
     #[test]
