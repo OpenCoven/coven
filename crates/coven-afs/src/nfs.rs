@@ -370,6 +370,14 @@ impl ExportFs for AgentFs {
 }
 
 impl ExportFs for crate::OverlayExport {
+    /// Never read-only. `OverlayFs::new` refuses a read-only delta outright,
+    /// so an overlay that exists has a writable one; the base being read-only
+    /// is the point of the overlay rather than a restriction on it.
+    ///
+    /// A read-only *mount* is a separate matter, enforced by the kernel via
+    /// `mount_nfs -o ro`. The export cannot enforce it: NFSv3 has no notion of
+    /// a read-only client, so anything that reached the port with the token
+    /// could write regardless of what the export believed.
     fn is_read_only(&self) -> bool {
         false
     }

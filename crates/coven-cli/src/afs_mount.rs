@@ -198,7 +198,7 @@ pub fn mount(
     // no future daemon knows to take down.
     write_record(coven_home, &record).map_err(AfsError::Internal)?;
 
-    if let Err(error) = spawn_and_mount(id, delta, base, &point) {
+    if let Err(error) = spawn_and_mount(id, delta, base, &point, read_only) {
         let _ = reclaim(coven_home, &record);
         return Err(AfsError::Internal(error));
     }
@@ -229,7 +229,13 @@ fn prepare_mount_point(point: &Path) -> AfsResult<()> {
 ///
 /// Every failure path tears the export back down. A half-mounted session that
 /// left an NFS server listening would be exactly the orphan §7 is about.
-fn spawn_and_mount(id: &str, delta: &Path, base: Option<&Path>, point: &Path) -> Result<()> {
+fn spawn_and_mount(
+    id: &str,
+    delta: &Path,
+    base: Option<&Path>,
+    point: &Path,
+    read_only: bool,
+) -> Result<()> {
     let helper = helper_path().ok_or_else(|| anyhow!("{HELPER} is not installed"))?;
     let mut command = Command::new(&helper);
     command.arg(delta);
@@ -251,7 +257,7 @@ fn spawn_and_mount(id: &str, delta: &Path, base: Option<&Path>, point: &Path) ->
     let mut export = Export { child, stdin };
     let mut reader = BufReader::new(stdout);
 
-    let outcome = handshake_and_mount(&mut export, &mut reader, point);
+    let outcome = handshake_and_mount(&mut export, &mut reader, point, read_only);
     match outcome {
         Ok(()) => {}
         Err(error) => {
@@ -271,6 +277,7 @@ fn handshake_and_mount(
     export: &mut Export,
     reader: &mut BufReader<std::process::ChildStdout>,
     point: &Path,
+    read_only: bool,
 ) -> Result<()> {
     let port = expect_line(reader, "port")?;
     // Named `gate_name` rather than the obvious thing for the same reason the
@@ -278,7 +285,7 @@ fn handshake_and_mount(
     // that binding being assigned as a hardcoded credential.
     let gate_name = expect_line(reader, "token")?;
 
-    run_mount(&port, &gate_name, point)?;
+    run_mount(&port, &gate_name, point, read_only)?;
 
     // The token was in `mount_nfs`'s argv, so it was `ps`-visible for the
     // length of that call. Rotating now makes anything scraped useless; the
@@ -308,11 +315,25 @@ fn expect_line(reader: &mut BufReader<std::process::ChildStdout>, key: &str) -> 
         .ok_or_else(|| anyhow!("export handshake did not start with {key}"))
 }
 
-fn run_mount(port: &str, gate_name: &str, point: &Path) -> Result<()> {
-    // Unprivileged: MOUNT-SPIKE.md §4 confirmed mount_nfs needs no sudo and no
-    // kext. `soft` keeps a wedged export surfacing as I/O errors instead of
-    // unkillable processes; `nolock` skips the lock manager we do not serve.
-    let options = format!("vers=3,tcp,port={port},mountport={port},nolock,soft");
+/// The `mount_nfs` option string.
+///
+/// Unprivileged: MOUNT-SPIKE.md §4 confirmed `mount_nfs` needs no sudo and no
+/// kext. `soft` keeps a wedged export surfacing as I/O errors instead of
+/// unkillable processes; `nolock` skips the lock manager we do not serve.
+///
+/// `ro` is not cosmetic. The mount response and the record both report
+/// `readOnly`, and a caller told a mount is read-only has been given a promise
+/// the kernel is the only thing that can keep.
+fn mount_options(port: &str, read_only: bool) -> String {
+    let mut options = format!("vers=3,tcp,port={port},mountport={port},nolock,soft");
+    if read_only {
+        options.push_str(",ro");
+    }
+    options
+}
+
+fn run_mount(port: &str, gate_name: &str, point: &Path, read_only: bool) -> Result<()> {
+    let options = mount_options(port, read_only);
     let status = Command::new("mount_nfs")
         .arg("-o")
         .arg(&options)
@@ -639,6 +660,14 @@ mod tests {
             .expect_err("no backend should refuse");
         assert!(matches!(error, AfsError::MountUnsupported));
         Ok(())
+    }
+
+    #[test]
+    fn a_read_only_mount_is_mounted_read_only() {
+        // Reporting readOnly while mounting writable hands the caller a
+        // promise nothing keeps; `ro` is what makes the flag true.
+        assert!(mount_options("2049", true).ends_with(",ro"));
+        assert!(!mount_options("2049", false).contains("ro"));
     }
 
     #[test]
