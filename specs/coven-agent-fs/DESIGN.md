@@ -264,9 +264,16 @@ Dotted codes in the standard envelope (see
 | `afs.path_outside_root` | A delta path would materialize outside the repository root. |
 | `afs.copy_up_too_large` | A single copy-up exceeds the configured byte cap. |
 | `afs.commit_unsigned` | Commit signing is required but unavailable. |
+| `afs.unavailable` | The operation failed for a reason with no more specific code. |
 
 `afs.base_diverged` and `afs.path_outside_root` fail closed: neither is
 retried, downgraded, or partially applied.
+
+This table is the whole contract. A client branches on these codes, so an
+operation that can fail must map onto one of them — `afs.unavailable` is
+listed because the daemon does emit it, not because a caller should expect
+it. A new failure mode earns a code here before it reaches a client, since
+an undocumented code is one no surface handles.
 
 ---
 
