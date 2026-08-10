@@ -440,9 +440,21 @@ impl OverlayExport {
         let source = self
             .lookup_ino(from_parent, from_name)?
             .ok_or_else(|| Error::NotFound(from_path.clone()))?;
-        if let Layer::Base(base_ino) = self.resolve(source) {
+
+        // Materialize whenever the base still contributes anything here, not
+        // merely when the source id resolves to the base layer.
+        //
+        // Those are different conditions, and assuming otherwise loses data.
+        // Creating a file under a base-only directory puts that directory in
+        // the delta, so the source then resolves to Delta — while every other
+        // base child beneath it exists only in the base. The rename moves the
+        // delta entry and whites out the old path, and anything not
+        // materialized first becomes unreachable through either layer.
+        if self.fs.base_visible(&from_path)? && self.fs.base().exists(&from_path)? {
             let delta_ino = self.materialize_tree(&from_path)?;
-            self.redirect.insert(base_ino, delta_ino);
+            if let Layer::Base(base_ino) = self.resolve(source) {
+                self.redirect.insert(base_ino, delta_ino);
+            }
         }
 
         let from_dir = self.ensure_delta_dir(from_parent)?;
@@ -492,14 +504,24 @@ impl OverlayExport {
                 if self.fs.has_whiteout(&child)? {
                     continue;
                 }
+                // Iterating the base's own listing, so a stat here always
+                // resolves.
+                let base_is_dir = self.fs.base().stat(&child)?.is_dir();
                 if let Some(existing) = self.fs.delta().resolve(&child)? {
-                    // Already in the delta, so there is nothing to copy — but a
-                    // handle still tagged base must not keep resolving to the
-                    // base copy, so it is redirected all the same.
-                    if let Some(base_child) = self.fs.base().resolve(&child)? {
-                        self.redirect.insert(base_child, existing);
+                    if !base_is_dir {
+                        // Already in the delta and nothing to copy — but a
+                        // handle still tagged base must not keep resolving to
+                        // the base copy, so it is redirected all the same.
+                        if let Some(base_child) = self.fs.base().resolve(&child)? {
+                            self.redirect.insert(base_child, existing);
+                        }
+                        continue;
                     }
-                    continue;
+                    // A DIRECTORY present in both layers still has to be
+                    // descended. The base can hold children the delta does
+                    // not, and once the rename whites out the old path the
+                    // base can no longer supply them — skipping here loses
+                    // them outright. Recursing is safe: mkdir_p is idempotent.
                 }
                 self.materialize_tree(&child)?;
             }
@@ -931,6 +953,41 @@ mod tests {
             .write_ino_at(nested, 0, b"written through the old handle")
             .expect("a handle held across a rename must stay writable");
         assert_eq!(read_all(&export, nested), b"written through the old handle");
+    }
+
+    #[test]
+    fn renaming_carries_base_children_under_a_directory_the_delta_already_has() {
+        // Found in review of the first fix. `materialize_tree` skipped any
+        // child already present in the delta; for a directory that stranded
+        // the base-only files beneath it, because the rename then whites out
+        // the old path and the base can no longer supply them.
+        let temp = tempfile::tempdir().unwrap();
+        let base_path = temp.path().join("base.db");
+        {
+            let mut base = AgentFs::create(&base_path).unwrap();
+            base.write_file("/dir/sub/deep.txt", b"deep in the base")
+                .unwrap();
+        }
+        let overlay = OverlayFs::open(temp.path().join("delta.db"), &base_path).unwrap();
+        let mut export = OverlayExport::new(overlay).unwrap();
+        let root = export.root();
+
+        // Put `/dir/sub` in the delta the way ordinary use would: create a
+        // file inside it.
+        let dir = export.lookup_ino(root, "dir").unwrap().unwrap();
+        let sub = export.lookup_ino(dir, "sub").unwrap().unwrap();
+        let (fresh, _) = export.create_child(sub, "added.txt", 0o644).unwrap();
+        export.write_ino_at(fresh, 0, b"new").unwrap();
+
+        export.rename_ino(root, "dir", root, "moved").unwrap();
+
+        let moved = export.lookup_ino(root, "moved").unwrap().expect("moved");
+        let moved_sub = export.lookup_ino(moved, "sub").unwrap().expect("sub");
+        let deep = export
+            .lookup_ino(moved_sub, "deep.txt")
+            .unwrap()
+            .expect("a base-only file under a delta directory must survive the rename");
+        assert_eq!(read_all(&export, deep), b"deep in the base");
     }
 
     #[test]
