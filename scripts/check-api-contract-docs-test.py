@@ -64,6 +64,84 @@ Archive visibility is stored separately in `archived_at`.
     def test_accepts_canonical_handshake_and_lifecycle(self) -> None:
         self.assertEqual(module.validate_documents(self.canonical_documents()), [])
 
+    def test_current_launch_policy_transport_and_capability_docs_are_guarded(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        self.assertEqual(module.validate_session_launch_policy_docs(documents), [])
+
+    def test_launch_policy_docs_reject_a_missing_tcp_authority_boundary(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        path = "docs/daemon/capabilities-handshake.md"
+        documents[path] = documents[path].replace("TCP", "remote transport")
+        errors = module.validate_session_launch_policy_docs(documents)
+        self.assertIn(f"{path}: launchPolicy transport boundary is missing", errors)
+
+    def test_every_public_health_example_has_the_exact_capability_set(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        for path in module.HEALTH_CAPABILITY_EXAMPLE_DOCS:
+            with self.subTest(path=path):
+                changed = dict(documents)
+                changed[path] = changed[path].replace(
+                    '"sessionLaunchPolicy": true,', "", 1
+                )
+                errors = module.validate_session_launch_policy_docs(changed)
+                self.assertIn(
+                    f"{path}: health example missing sessionLaunchPolicy", errors
+                )
+
+    def test_every_public_health_count_is_guarded(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        for path in module.HEALTH_CAPABILITY_COUNT_DOCS:
+            with self.subTest(path=path):
+                changed = dict(documents)
+                changed[path] = changed[path].replace("all 14", "all nine", 1)
+                errors = module.validate_session_launch_policy_docs(changed)
+                self.assertIn(
+                    f"{path}: health capability field count is stale", errors
+                )
+
+    def test_every_public_capability_list_is_guarded(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        for path in module.HEALTH_CAPABILITY_LIST_DOCS:
+            with self.subTest(path=path):
+                changed = dict(documents)
+                changed[path] = changed[path].replace(
+                    "`sessionLaunchPolicy`", "`removedCapability`"
+                )
+                errors = module.validate_session_launch_policy_docs(changed)
+                self.assertIn(
+                    f"{path}: capability list missing sessionLaunchPolicy", errors
+                )
+
+    def test_every_public_transport_statement_is_guarded(self) -> None:
+        documents = {
+            path: (module.ROOT / path).read_text(encoding="utf-8")
+            for path in module.SESSION_LAUNCH_POLICY_DOCS
+        }
+        for path in module.SESSION_LAUNCH_POLICY_DOCS:
+            with self.subTest(path=path):
+                changed = dict(documents)
+                changed[path] = changed[path].replace("TCP", "remote transport")
+                changed[path] = changed[path].replace("tcp", "remote transport")
+                errors = module.validate_session_launch_policy_docs(changed)
+                self.assertIn(
+                    f"{path}: launchPolicy transport boundary is missing", errors
+                )
+
     def test_guards_public_contract_guides(self) -> None:
         for path in self.PUBLIC_CONTRACT_DOCS:
             with self.subTest(path=path):

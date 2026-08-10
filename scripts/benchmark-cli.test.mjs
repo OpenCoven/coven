@@ -1020,6 +1020,31 @@ test('stopLiveSession sends the public kill request', async () => {
   });
 });
 
+test('stopLiveSession accepts the typed already-gone kill boundary', async () => {
+  await stopLiveSession({
+    socketPath: '/fixture/coven.sock',
+    sessionId: 'session-1',
+    request: async () => ({
+      statusCode: 409,
+      body: JSON.stringify({ error: { code: 'session_not_live' } })
+    })
+  });
+});
+
+test('stopLiveSession rejects an unrelated conflict', async () => {
+  await assert.rejects(
+    stopLiveSession({
+      socketPath: '/fixture/coven.sock',
+      sessionId: 'session-1',
+      request: async () => ({
+        statusCode: 409,
+        body: JSON.stringify({ error: { code: 'session_handoff_active' } })
+      })
+    }),
+    /live fixture stop returned 409/
+  );
+});
+
 test('waitForOutputEvent resolves only after an output event is recorded', async () => {
   const paths = [];
   let reads = 0;

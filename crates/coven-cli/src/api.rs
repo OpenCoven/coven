@@ -21,8 +21,8 @@ use crate::{
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
     handoff::{HandoffPacketV1, WorkspaceSnapshot},
-    harness::{ConversationHint, HarnessLaunchMode},
-    privacy, session_launch, store, ward,
+    harness::{ConversationHint, HarnessLaunchMode, LaunchPolicy},
+    privacy, project, session_launch, store, ward,
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
@@ -127,6 +127,10 @@ pub struct HealthCapabilities {
     pub event_cursor: String,
     pub structured_errors: bool,
     pub session_handoff: bool,
+    /// Whether `POST /sessions` accepts the exact, fail-closed
+    /// `launchPolicy` contract documented for unattended Codex work.
+    #[serde(default)]
+    pub session_launch_policy: bool,
     /// Whether the `afs.*` route family is served at all.
     pub afs: bool,
     /// Mount backend, or `false` when none is available. A client must branch
@@ -239,6 +243,7 @@ pub struct SessionLaunch {
     /// transform for the underlying CLI.
     pub model: Option<String>,
     pub launch_mode: HarnessLaunchMode,
+    pub launch_policy: Option<LaunchPolicy>,
     pub prompt: String,
     pub title: String,
     pub conversation: Option<ConversationHint>,
@@ -333,7 +338,29 @@ impl SessionRuntime for NoopSessionRuntime {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestAuthority {
+    /// Filesystem-permission-protected Unix socket or owner-only Windows pipe.
+    OwnerLocalIpc,
+    /// Optional loopback TCP listener. Host/Origin checks reduce browser risk,
+    /// but they do not prove that the caller owns the daemon process.
+    Tcp,
+}
+
+impl RequestAuthority {
+    fn allows_session_launch_policy(self) -> bool {
+        matches!(self, Self::OwnerLocalIpc)
+    }
+}
+
 pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
+    health_response_for_authority(daemon, RequestAuthority::OwnerLocalIpc)
+}
+
+pub(crate) fn health_response_for_authority(
+    daemon: Option<DaemonStatus>,
+    authority: RequestAuthority,
+) -> HealthResponse {
     HealthResponse {
         ok: true,
         api_version: COVEN_API_NAMED_VERSION.to_string(),
@@ -348,6 +375,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             event_cursor: "sequence".to_string(),
             structured_errors: true,
             session_handoff: true,
+            session_launch_policy: authority.allows_session_launch_policy(),
             afs: true,
             afs_mount: MountCapability::detect(),
             afs_commit: true,
@@ -364,8 +392,9 @@ fn health_response_with_hub(
     coven_home: &Path,
     daemon: Option<DaemonStatus>,
     event_writer: Option<crate::event_writer::EventWriterHealth>,
+    authority: RequestAuthority,
 ) -> HealthResponse {
-    let mut response = health_response(daemon);
+    let mut response = health_response_for_authority(daemon, authority);
     if let Ok(summary) = crate::hub::hub_health_summary(coven_home) {
         response.hub = serde_json::from_value(summary).ok();
     }
@@ -413,6 +442,26 @@ pub fn handle_request_with_runtime(
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
+    handle_request_with_runtime_and_authority(
+        method,
+        path,
+        coven_home,
+        daemon,
+        body,
+        runtime,
+        RequestAuthority::OwnerLocalIpc,
+    )
+}
+
+pub(crate) fn handle_request_with_runtime_and_authority(
+    method: &str,
+    path: &str,
+    coven_home: &Path,
+    daemon: Option<DaemonStatus>,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+    authority: RequestAuthority,
+) -> Result<ApiResponse> {
     let (route, query) = split_path_query(path);
     let route = match normalize_api_route(route) {
         ApiRoute::Route(route) => route,
@@ -441,7 +490,7 @@ pub fn handle_request_with_runtime(
         ),
         ("GET", "/health") => json_response(
             200,
-            &health_response_with_hub(coven_home, daemon, runtime.event_writer_health()),
+            &health_response_with_hub(coven_home, daemon, runtime.event_writer_health(), authority),
         ),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
         ("POST", "/afs/sessions") => afs_create(coven_home, body),
@@ -791,7 +840,7 @@ pub fn handle_request_with_runtime(
             get_scheduler_loop_state(coven_home, loop_id)
         }
         ("GET", "/sessions") => list_sessions_response(coven_home, query),
-        ("POST", "/sessions") => launch_session(coven_home, body, runtime),
+        ("POST", "/sessions") => launch_session(coven_home, body, runtime, authority),
         ("POST", "/sessions/external") => register_external_session(coven_home, body),
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/complete") => {
             let session_id = session_action_id(path, "/complete");
@@ -1856,6 +1905,7 @@ fn launch_session(
     coven_home: &Path,
     body: Option<&str>,
     runtime: &dyn SessionRuntime,
+    authority: RequestAuthority,
 ) -> Result<ApiResponse> {
     // Client-side validation errors (malformed JSON, bad fields,
     // unsupported launchMode, malformed `conversation` object, …) must
@@ -1868,6 +1918,14 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+        return api_error(
+            403,
+            "forbidden",
+            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            None,
+        );
+    }
     let mut launch = match session_launch_from_payload(payload) {
         Ok(launch) => launch,
         Err(error) => {
@@ -1943,7 +2001,17 @@ fn launch_session(
         // missing auth, child closed stdin during stream-mode init):
         // mark the session row failed and return a structured response
         // so the client surfaces the cause and the daemon stays up.
-        store::update_session_status(&conn, &record.id, "failed", None, &current_timestamp())?;
+        // Cancellation can win while a large launch-time stdin prompt is
+        // still being delivered. Preserve that terminal decision: only a row
+        // that is still owned by the failing launch may transition to failed.
+        let _ = store::update_session_status_if_current(
+            &conn,
+            &record.id,
+            "running",
+            "failed",
+            None,
+            &current_timestamp(),
+        )?;
         return api_error(
             500,
             "launch_failed",
@@ -2423,6 +2491,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     // binary is surfaced by the runtime as a structured launch failure.
     session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
     let launch_mode = launch_mode_from_payload(&payload)?;
+    let launch_policy = launch_policy_from_payload(&payload, &harness, launch_mode)?;
     let model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -2464,6 +2533,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         harness,
         model,
         launch_mode,
+        launch_policy,
         prompt,
         title,
         conversation,
@@ -2471,6 +2541,66 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         familiar_id,
         caller_familiar_id,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchPolicyPayload {
+    approval: String,
+    sandbox: String,
+    #[serde(default)]
+    add_dirs: Vec<String>,
+}
+
+fn launch_policy_from_payload(
+    payload: &Value,
+    harness: &str,
+    launch_mode: HarnessLaunchMode,
+) -> Result<Option<LaunchPolicy>> {
+    let Some(value) = payload.get("launchPolicy") else {
+        return Ok(None);
+    };
+    let requested: LaunchPolicyPayload = serde_json::from_value(value.clone()).context(
+        "launchPolicy must be an object with approval, sandbox, and optional addDirs fields",
+    )?;
+    anyhow::ensure!(
+        requested.approval == "never",
+        "launchPolicy.approval must be exactly `never`"
+    );
+    anyhow::ensure!(
+        requested.sandbox == "workspace-write",
+        "launchPolicy.sandbox must be exactly `workspace-write`"
+    );
+    anyhow::ensure!(
+        harness == "codex" && launch_mode == HarnessLaunchMode::NonInteractive,
+        "launchPolicy is supported only for Codex nonInteractive launches"
+    );
+
+    let mut seen = HashSet::new();
+    let mut add_dirs = Vec::with_capacity(requested.add_dirs.len());
+    for (index, raw_dir) in requested.add_dirs.into_iter().enumerate() {
+        anyhow::ensure!(
+            !raw_dir.is_empty() && raw_dir.trim() == raw_dir,
+            "launchPolicy.addDirs[{index}] must be a non-empty path without surrounding whitespace"
+        );
+        let requested_path = Path::new(&raw_dir);
+        anyhow::ensure!(
+            requested_path.is_absolute(),
+            "launchPolicy.addDirs[{index}] must be an absolute path"
+        );
+        let resolved = project::canonical_project_root(requested_path).with_context(|| {
+            format!("launchPolicy.addDirs[{index}] must resolve to an existing directory")
+        })?;
+        anyhow::ensure!(
+            resolved.is_dir(),
+            "launchPolicy.addDirs[{index}] must resolve to an existing directory"
+        );
+        if seen.insert(resolved.clone()) {
+            add_dirs.push(resolved.to_string_lossy().into_owned());
+        }
+    }
+
+    Ok(Some(LaunchPolicy::unattended_workspace_write(add_dirs)))
 }
 
 fn launch_mode_from_payload(payload: &Value) -> Result<HarnessLaunchMode> {
@@ -7049,6 +7179,7 @@ mod tests {
         assert!(response.body.contains(&expected), "{}", response.body);
         assert!(response.body.contains(r#""afsCommit":true"#));
         assert!(response.body.contains(r#""afsCommitDryRun":true"#));
+        assert!(response.body.contains(r#""sessionLaunchPolicy":true"#));
         Ok(())
     }
 
@@ -7060,9 +7191,14 @@ mod tests {
             .as_object_mut()
             .expect("capabilities object")
             .remove("afsCommitDryRun");
+        payload["capabilities"]
+            .as_object_mut()
+            .expect("capabilities object")
+            .remove("sessionLaunchPolicy");
 
         let decoded: HealthResponse = serde_json::from_value(payload)?;
         assert!(!decoded.capabilities.afs_commit_dry_run);
+        assert!(!decoded.capabilities.session_launch_policy);
         Ok(())
     }
 
@@ -7481,6 +7617,7 @@ mod tests {
         assert!(response.capabilities.executor_dispatch);
         assert_eq!(response.capabilities.event_cursor, "sequence");
         assert!(response.capabilities.structured_errors);
+        assert!(response.capabilities.session_launch_policy);
         assert_eq!(response.daemon, None);
         assert_eq!(response.hub, None);
         assert_eq!(response.event_writer, None);
@@ -7682,6 +7819,7 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
 
         assert_eq!(body["capabilities"]["sessionHandoff"], true);
+        assert_eq!(body["capabilities"]["sessionLaunchPolicy"], true);
         assert_eq!(body["eventWriter"]["queuedEvents"], 3);
         assert_eq!(body["eventWriter"]["queuedBytes"], 4096);
         assert_eq!(body["storage"]["writerBacklogEvents"], 3);
@@ -7769,6 +7907,7 @@ mod tests {
         assert_eq!(body["capabilities"]["eventCursor"], "sequence");
         assert_eq!(body["capabilities"]["structuredErrors"], true);
         assert_eq!(body["capabilities"]["sessionHandoff"], true);
+        assert_eq!(body["capabilities"]["sessionLaunchPolicy"], true);
         Ok(())
     }
 
@@ -8937,6 +9076,130 @@ mod tests {
             HarnessLaunchMode::NonInteractive
         );
         assert!(runtime.launches.borrow()[0].model.is_none());
+        assert!(runtime.launches.borrow()[0].launch_policy.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn launch_policy_request_accepts_exact_workspace_write_and_canonicalizes_dirs(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        let artifacts = project_root.join("artifacts");
+        let mission_workspace = temp_dir.path().join("mission-workspace");
+        std::fs::create_dir_all(&artifacts)?;
+        std::fs::create_dir_all(&mission_workspace)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "launchMode": "nonInteractive",
+            "launchPolicy": {
+                "approval": "never",
+                "sandbox": "workspace-write",
+                "addDirs": [artifacts, mission_workspace, artifacts]
+            },
+            "prompt": "write artifacts/primary.md"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        let launch = &runtime.launches.borrow()[0];
+        assert_eq!(
+            launch.launch_policy,
+            Some(LaunchPolicy::unattended_workspace_write(vec![
+                project::canonical_project_root(&artifacts)?
+                    .to_string_lossy()
+                    .into_owned(),
+                project::canonical_project_root(&mission_workspace)?
+                    .to_string_lossy()
+                    .into_owned(),
+            ]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn launch_policy_rejects_unknown_and_unsupported_authority() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        let file = project_root.join("not-a-directory.txt");
+        std::fs::create_dir_all(&project_root)?;
+        std::fs::write(&file, "fixture")?;
+        let invalid_policies = [
+            json!({"approval":"on-request","sandbox":"workspace-write"}),
+            json!({"approval":"never","sandbox":"danger-full-access"}),
+            json!({"approval":"never","sandbox":"workspace-write","extra":true}),
+            json!({"approval":"never","sandbox":"workspace-write","addDirs":["relative/path"]}),
+            json!({"approval":"never","sandbox":"workspace-write","addDirs":[file]}),
+            json!({"approval":"never","sandbox":"workspace-write","addDirs":[" "]}),
+        ];
+
+        for launch_policy in invalid_policies {
+            let runtime = RecordingRuntime::default();
+            let body = json!({
+                "projectRoot": project_root,
+                "harness": "codex",
+                "launchMode": "nonInteractive",
+                "launchPolicy": launch_policy,
+                "prompt": "write an artifact"
+            })
+            .to_string();
+            let response = handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(
+                response.body.contains("invalid_request"),
+                "{}",
+                response.body
+            );
+            assert!(runtime.launches.borrow().is_empty());
+        }
+
+        for (harness, launch_mode) in [("claude", "nonInteractive"), ("codex", "interactive")] {
+            let runtime = RecordingRuntime::default();
+            let body = json!({
+                "projectRoot": project_root,
+                "harness": harness,
+                "launchMode": launch_mode,
+                "launchPolicy": {"approval":"never","sandbox":"workspace-write"},
+                "prompt": "write an artifact"
+            })
+            .to_string();
+            let response = handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert_eq!(response.status, 400, "{}", response.body);
+            assert!(
+                response.body.contains("Codex nonInteractive"),
+                "{}",
+                response.body
+            );
+            assert!(runtime.launches.borrow().is_empty());
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
         Ok(())
     }
 
@@ -9311,6 +9574,45 @@ mod tests {
             response.body
         );
         assert!(sessions.body.contains(r#""status":"failed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn launch_failure_does_not_overwrite_a_concurrent_killed_status() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let launched_id = std::sync::Arc::new(Mutex::new(None));
+        let runtime = CancelWinningLaunchRuntime {
+            coven_home: temp_dir.path().to_path_buf(),
+            launched_id: std::sync::Arc::clone(&launched_id),
+        };
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "launchMode": "nonInteractive",
+            "prompt": "large prompt"
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 500);
+        let launched_id = launched_id
+            .lock()
+            .unwrap()
+            .clone()
+            .context("runtime observed generated launch id")?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let session =
+            store::get_session(&conn, &launched_id)?.context("launch row remains present")?;
+        assert_eq!(session.status, "killed");
         Ok(())
     }
 
@@ -9921,6 +10223,28 @@ mod tests {
     impl SessionRuntime for FailingLaunchRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
             anyhow::bail!("launch failed")
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CancelWinningLaunchRuntime {
+        coven_home: PathBuf,
+        launched_id: std::sync::Arc<Mutex<Option<String>>>,
+    }
+
+    impl SessionRuntime for CancelWinningLaunchRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            *self.launched_id.lock().unwrap() = Some(launch.id.clone());
+            let conn = store::open_store(&store_path(&self.coven_home))?;
+            store::update_session_status(&conn, &launch.id, "killed", None, &current_timestamp())?;
+            anyhow::bail!("launch prompt delivery observed cancellation")
         }
 
         fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {

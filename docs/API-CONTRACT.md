@@ -57,7 +57,12 @@ proof of `coven.daemon.v1` support.
     "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true,
-    "sessionHandoff": true
+    "sessionHandoff": true,
+    "sessionLaunchPolicy": true,
+    "afs": true,
+    "afsMount": false,
+    "afsCommit": true,
+    "afsCommitDryRun": true
   },
   "daemon": {
     "pid": 12345,
@@ -113,6 +118,11 @@ durability.
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
 | `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
 | `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
+| `sessionLaunchPolicy` | boolean | Owner-gated local IPC accepts the exact unattended Codex launch policy. Always `false` over TCP. |
+| `afs` | boolean | The AFS route family is available. |
+| `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
+| `afsCommit` | boolean | AFS deltas can be materialized into a Git branch. |
+| `afsCommitDryRun` | boolean | AFS commit accepts the side-effect-free `dryRun` contract. |
 
 ## Structured error envelope
 
@@ -161,6 +171,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 |------------------------|-------------|--------------------------------------------------|
 | `not_found`            | 404         | Generic route not found.                         |
 | `invalid_request`      | 400 or 404  | Malformed request, unknown harness id, missing required field, or unsupported API version. |
+| `forbidden`            | 403         | The request asks TCP to exercise an owner-local-IPC-only capability such as `launchPolicy`. |
 | `session_not_found`    | 404         | Session id does not exist.                       |
 | `harness_not_found`    | 404         | `GET /capabilities/:harnessId`: harness id is not a known capability scan target. |
 | `session_not_live`     | 409         | Session exists but is not running.               |
@@ -444,11 +455,35 @@ the daemon forwards the provider-qualified id through the selected harness
 adapter's declared `strip_provider` or `preserve` transform. Clients that omit
 it retain the harness's own default model.
 
+Clients must observe `capabilities.sessionLaunchPolicy === true` before sending
+`launchPolicy`. The only supported policy is an exact, explicit Codex
+`nonInteractive` contract: approval `never`, sandbox `workspace-write`, and
+optional absolute additional directories. Every `addDirs` entry must be a
+non-empty, existing directory; entries are canonicalized and deduplicated
+before they reach Codex. This supports an explicitly granted mission workspace
+outside the research context root without granting any implicit parent or
+sibling path. Unknown fields or values, other harnesses or modes, relative,
+missing, or non-directory paths fail with `400 invalid_request` before a
+session row or process is created. Omitting `launchPolicy` preserves the
+harness default.
+This policy is owner-local-IPC-only: health advertises
+`sessionLaunchPolicy: false` over TCP, and a TCP request that nevertheless
+includes the field fails with `403 forbidden` before a session row or process
+is created. Host and Origin allowlists do not grant this authority.
+Capabilities advertise availability; the owner-gated local IPC boundary,
+exact requested write set, and Rust validation remain the authority boundary.
+
 ```json
 {
   "projectRoot": "/repo",
   "harness": "codex",
   "model": "openai/gpt-5.6-sol",
+  "launchMode": "nonInteractive",
+  "launchPolicy": {
+    "approval": "never",
+    "sandbox": "workspace-write",
+    "addDirs": []
+  },
   "prompt": "Fix the tests"
 }
 ```
@@ -1226,7 +1261,9 @@ Shared non-success responses use the structured error envelope:
 3. Verify `capabilities.sessions === true` before session requests and
    `capabilities.events === true` before event requests.
 4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
-5. Only then depend on the documented `v1` sessions/events shapes.
+5. Check `capabilities.sessionLaunchPolicy === true` before sending
+   `launchPolicy`; a missing, false, or malformed value means unsupported.
+6. Only then depend on the documented `v1` sessions/events shapes.
 
 ## Scope boundary
 

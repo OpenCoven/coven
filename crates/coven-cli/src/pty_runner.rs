@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,9 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, size as terminal_cell_size, window_size,
 };
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize, PtySystem};
+use serde::Deserialize;
+
+type HarnessEnvironmentOverrides = Vec<(String, Option<String>)>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessCommand {
@@ -24,6 +27,7 @@ pub struct HarnessCommand {
     args: Vec<String>,
     cwd: PathBuf,
     stdin_prompt: Option<Vec<u8>>,
+    env_overrides: HarnessEnvironmentOverrides,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +61,14 @@ pub struct DetachedPtyObserver {
 
 #[cfg(windows)]
 const DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+// Keep the value available to cross-platform source-contract tests while
+// taking the production value from the Windows SDK. Centralizing the
+// combination prevents a headless spawn path from silently dropping it when
+// another flag (notably `CREATE_SUSPENDED`) is also required.
+#[cfg(windows)]
+const WINDOWS_CREATE_NO_WINDOW: u32 = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+#[cfg(all(test, not(windows)))]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PTY_WRITE_QUEUE_CAPACITY: usize = 16;
 enum PtyWriteRequest {
     Write {
@@ -236,11 +248,46 @@ impl HarnessCommand {
         &self.cwd
     }
 
+    #[cfg(test)]
+    pub(crate) fn fixture(program: impl Into<String>, args: Vec<String>, cwd: PathBuf) -> Self {
+        Self {
+            program: program.into(),
+            args,
+            cwd,
+            stdin_prompt: None,
+            env_overrides: Vec::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stdin_prompt_for_test(&mut self, prompt: Vec<u8>) {
+        self.stdin_prompt = Some(prompt);
+    }
+
     fn to_command_builder(&self) -> CommandBuilder {
         let mut builder = CommandBuilder::new(&self.program);
         builder.args(&self.args);
         builder.cwd(self.cwd.as_os_str());
+        for (name, value) in &self.env_overrides {
+            match value {
+                Some(value) => builder.env(name, value),
+                None => builder.env_remove(name),
+            }
+        }
         builder
+    }
+
+    fn apply_environment(&self, command: &mut std::process::Command) {
+        for (name, value) in &self.env_overrides {
+            match value {
+                Some(value) => {
+                    command.env(name, value);
+                }
+                None => {
+                    command.env_remove(name);
+                }
+            }
+        }
     }
 }
 
@@ -280,6 +327,34 @@ pub fn build_harness_command_with_conversation(
         familiar,
         options,
         false,
+        false,
+    )
+}
+
+/// Build a daemon-owned noninteractive command whose Codex prompt is carried
+/// on stdin on every platform. Ordinary interactive/attached CLI construction
+/// keeps its existing argv/PTY behavior; this contract is for the piped daemon
+/// runner that owns stdin and can close it after the complete prompt lands.
+#[allow(clippy::too_many_arguments)]
+pub fn build_piped_harness_command_with_conversation(
+    harness_id: &str,
+    prompt: &str,
+    cwd: &Path,
+    mode: crate::harness::HarnessLaunchMode,
+    conversation: Option<&crate::harness::ConversationHint>,
+    familiar: Option<&crate::harness::FamiliarContext>,
+    options: crate::harness::HarnessLaunchOptions<'_>,
+) -> Result<HarnessCommand> {
+    build_harness_command_with_conversation_inner(
+        harness_id,
+        prompt,
+        cwd,
+        mode,
+        conversation,
+        familiar,
+        options,
+        false,
+        true,
     )
 }
 
@@ -306,6 +381,7 @@ pub fn build_codex_json_harness_command_with_conversation(
         familiar,
         options,
         true,
+        false,
     )
 }
 
@@ -319,6 +395,7 @@ fn build_harness_command_with_conversation_inner(
     familiar: Option<&crate::harness::FamiliarContext>,
     options: crate::harness::HarnessLaunchOptions<'_>,
     codex_json: bool,
+    force_codex_stdin: bool,
 ) -> Result<HarnessCommand> {
     let (program, mut args) = if codex_json {
         crate::harness::command_parts_for_codex_json_with_conversation(
@@ -350,35 +427,331 @@ fn build_harness_command_with_conversation_inner(
     } else {
         prompt
     };
-    let stdin_prompt = move_windows_codex_prompt_to_stdin(
+    let stdin_prompt = move_codex_prompt_to_stdin(
         harness_id,
         mode,
         stdin_prompt_text,
         &mut args,
-        cfg!(windows),
+        cfg!(windows) || force_codex_stdin,
     );
+    let (program, env_overrides) = prepare_harness_program(harness_id, mode, program)?;
 
     Ok(HarnessCommand {
-        program: program.to_string(),
+        program,
         args,
         cwd: cwd.to_path_buf(),
         stdin_prompt,
+        env_overrides,
     })
 }
 
-/// Windows may resolve an npm-installed Codex harness to `codex.CMD`. Rust
-/// launches batch files through `cmd.exe` and deliberately rejects multiline
-/// or otherwise unsafe batch arguments. Codex supports `-` as the prompt
-/// positional, reading the real prompt from stdin, so keep user-controlled
-/// prompt text out of the batch command line entirely.
-fn move_windows_codex_prompt_to_stdin(
+#[cfg(not(windows))]
+fn prepare_harness_program(
+    _harness_id: &str,
+    _mode: crate::harness::HarnessLaunchMode,
+    program: String,
+) -> Result<(String, HarnessEnvironmentOverrides)> {
+    Ok((program, Vec::new()))
+}
+
+#[cfg(windows)]
+fn prepare_harness_program(
+    harness_id: &str,
+    mode: crate::harness::HarnessLaunchMode,
+    program: String,
+) -> Result<(String, HarnessEnvironmentOverrides)> {
+    if harness_id != "codex"
+        || mode != crate::harness::HarnessLaunchMode::NonInteractive
+        || !windows_program_is_batch_shim(&program)
+    {
+        return Ok((program, Vec::new()));
+    }
+    let launch = resolve_official_codex_npm_shim(Path::new(&program)).with_context(|| {
+        format!(
+            "Windows Codex resolved to npm shim `{program}`, but Coven could not validate its native @openai/codex executable; reinstall @openai/codex and retry"
+        )
+    })?;
+    Ok((
+        launch.program.to_string_lossy().into_owned(),
+        launch.env_overrides,
+    ))
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+struct WindowsCodexNpmLaunch {
+    program: PathBuf,
+    env_overrides: HarnessEnvironmentOverrides,
+}
+
+#[cfg(any(windows, test))]
+fn windows_program_is_batch_shim(program: &str) -> bool {
+    Path::new(program)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        })
+}
+
+#[cfg(windows)]
+fn resolve_official_codex_npm_shim(shim_path: &Path) -> Result<WindowsCodexNpmLaunch> {
+    #[cfg(target_arch = "x86_64")]
+    const TARGET_PACKAGE: &str = "@openai/codex-win32-x64";
+    #[cfg(target_arch = "x86_64")]
+    const TARGET_TRIPLE: &str = "x86_64-pc-windows-msvc";
+    #[cfg(target_arch = "x86_64")]
+    const TARGET_CPU: &str = "x64";
+    #[cfg(target_arch = "aarch64")]
+    const TARGET_PACKAGE: &str = "@openai/codex-win32-arm64";
+    #[cfg(target_arch = "aarch64")]
+    const TARGET_TRIPLE: &str = "aarch64-pc-windows-msvc";
+    #[cfg(target_arch = "aarch64")]
+    const TARGET_CPU: &str = "arm64";
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    compile_error!("the official Codex npm package supports Windows x64 and arm64 only");
+
+    resolve_official_codex_npm_shim_for_target(shim_path, TARGET_PACKAGE, TARGET_TRIPLE, TARGET_CPU)
+}
+
+#[cfg(any(windows, test))]
+fn resolve_official_codex_npm_shim_for_target(
+    shim_path: &Path,
+    target_package: &str,
+    target_triple: &str,
+    target_cpu: &str,
+) -> Result<WindowsCodexNpmLaunch> {
+    let entry = windows_npm_shim_entry(shim_path)?;
+    let entry = std::fs::canonicalize(&entry)
+        .with_context(|| format!("failed canonicalizing `{}`", entry.display()))?;
+    anyhow::ensure!(
+        entry.file_name().and_then(|name| name.to_str()) == Some("codex.js")
+            && entry
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some("bin"),
+        "npm shim does not target the official @openai/codex bin/codex.js entry"
+    );
+    let package_root = entry
+        .parent()
+        .and_then(Path::parent)
+        .context("official Codex npm entry has no package root")?;
+    let package_json = read_json_file(&package_root.join("package.json"))?;
+    anyhow::ensure!(
+        package_json.get("name").and_then(serde_json::Value::as_str) == Some("@openai/codex"),
+        "npm shim target package is not @openai/codex"
+    );
+    let declared_entry = package_json
+        .get("bin")
+        .and_then(|bin| bin.get("codex"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .replace('\\', "/");
+    anyhow::ensure!(
+        declared_entry == "bin/codex.js",
+        "@openai/codex package does not declare the expected codex entry"
+    );
+    anyhow::ensure!(
+        package_json
+            .get("optionalDependencies")
+            .and_then(|dependencies| dependencies.get(target_package))
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "@openai/codex does not declare native package {target_package}"
+    );
+
+    let mut target_roots = Vec::new();
+    for ancestor in package_root.ancestors() {
+        target_roots.push(
+            ancestor
+                .join("node_modules")
+                .join("@openai")
+                .join(target_package.trim_start_matches("@openai/")),
+        );
+    }
+    let mut native = None;
+    for target_root in target_roots {
+        let target_metadata = target_root.join("package.json");
+        if !target_metadata.is_file() {
+            continue;
+        }
+        let target_json = read_json_file(&target_metadata)?;
+        let supports_windows = target_json
+            .get("os")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| values.iter().any(|value| value.as_str() == Some("win32")));
+        let supports_cpu = target_json
+            .get("cpu")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|values| {
+                values
+                    .iter()
+                    .any(|value| value.as_str() == Some(target_cpu))
+            });
+        if target_json.get("name").and_then(serde_json::Value::as_str) != Some("@openai/codex")
+            || !supports_windows
+            || !supports_cpu
+        {
+            continue;
+        }
+        let candidate = target_root
+            .join("vendor")
+            .join(target_triple)
+            .join("bin")
+            .join("codex.exe");
+        if candidate.is_file() {
+            let canonical_root = std::fs::canonicalize(&target_root)?;
+            let canonical_candidate = std::fs::canonicalize(&candidate)?;
+            anyhow::ensure!(
+                canonical_candidate.starts_with(&canonical_root),
+                "native Codex executable escapes its validated package root"
+            );
+            native = Some(canonical_candidate);
+            break;
+        }
+    }
+    let native = native.with_context(|| {
+        format!(
+            "native optional dependency {target_package} is missing its {target_triple} executable"
+        )
+    })?;
+    let canonical_package_root = std::fs::canonicalize(package_root)?;
+    let manager = codex_package_manager(&canonical_package_root);
+    let mut env_overrides = [
+        "CODEX_MANAGED_BY_NPM",
+        "CODEX_MANAGED_BY_BUN",
+        "CODEX_MANAGED_BY_PNPM",
+    ]
+    .into_iter()
+    .map(|name| (name.to_string(), None))
+    .collect::<Vec<_>>();
+    env_overrides.push((
+        "CODEX_MANAGED_PACKAGE_ROOT".to_string(),
+        Some(canonical_package_root.to_string_lossy().into_owned()),
+    ));
+    env_overrides.push((format!("CODEX_MANAGED_BY_{manager}"), Some("1".to_string())));
+    Ok(WindowsCodexNpmLaunch {
+        program: native,
+        env_overrides,
+    })
+}
+
+#[cfg(any(windows, test))]
+fn windows_npm_shim_entry(shim_path: &Path) -> Result<PathBuf> {
+    let bin_dir = shim_path
+        .parent()
+        .context("Windows npm shim has no parent directory")?;
+    let shim = std::fs::read_to_string(shim_path)
+        .with_context(|| format!("failed reading npm shim `{}`", shim_path.display()))?;
+    for line in shim.lines() {
+        let trimmed = line.trim_start();
+        let lowercase = trimmed.to_ascii_lowercase();
+        if lowercase.starts_with("if exist")
+            || lowercase.starts_with("@if exist")
+            || lowercase.starts_with("set")
+            || lowercase.starts_with("@set")
+            || lowercase.starts_with("call")
+            || lowercase.starts_with("@call")
+            || lowercase.starts_with("rem")
+            || lowercase.starts_with("@rem")
+            || trimmed.starts_with("::")
+            || trimmed.starts_with(':')
+        {
+            continue;
+        }
+        let quoted = line.split('"').skip(1).step_by(2).collect::<Vec<_>>();
+        for target in quoted.into_iter().rev() {
+            let lowercase = target.to_ascii_lowercase();
+            let relative = lowercase
+                .strip_prefix("%dp0%\\")
+                .map(|_| &target[6..])
+                .or_else(|| lowercase.strip_prefix("%~dp0\\").map(|_| &target[6..]))
+                .or_else(|| lowercase.strip_prefix("%dp0%/").map(|_| &target[6..]))
+                .or_else(|| lowercase.strip_prefix("%~dp0/").map(|_| &target[6..]));
+            let Some(relative) = relative else {
+                continue;
+            };
+            if relative.contains('%') {
+                continue;
+            }
+            let relative = relative.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR);
+            let candidate = bin_dir.join(relative);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    anyhow::bail!(
+        "npm shim `{}` does not contain a safe existing package entry",
+        shim_path.display()
+    )
+}
+
+#[cfg(any(windows, test))]
+fn read_json_file(path: &Path) -> Result<serde_json::Value> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed reading package metadata `{}`", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid package metadata `{}`", path.display()))
+}
+
+#[cfg(any(windows, test))]
+fn codex_package_manager(package_root: &Path) -> &'static str {
+    let user_agent = std::env::var("npm_config_user_agent")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let exec_path = std::env::var("npm_execpath")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    codex_package_manager_with_env(package_root, &user_agent, &exec_path)
+}
+
+#[cfg(any(windows, test))]
+fn codex_package_manager_with_env(
+    package_root: &Path,
+    user_agent: &str,
+    exec_path: &str,
+) -> &'static str {
+    let rendered = package_root.to_string_lossy().to_ascii_lowercase();
+    if codex_package_is_pnpm_owned(package_root)
+        || rendered.contains(".pnpm")
+        || user_agent.contains("pnpm/")
+        || exec_path.contains("pnpm")
+    {
+        "PNPM"
+    } else if rendered.contains(".bun") || user_agent.contains("bun/") || exec_path.contains("bun")
+    {
+        "BUN"
+    } else {
+        "NPM"
+    }
+}
+
+#[cfg(any(windows, test))]
+fn codex_package_is_pnpm_owned(package_root: &Path) -> bool {
+    package_root.ancestors().any(|ancestor| {
+        let node_modules = ancestor.join("node_modules");
+        if !node_modules.join(".modules.yaml").is_file() {
+            return false;
+        }
+        std::fs::canonicalize(node_modules.join("@openai").join("codex"))
+            .is_ok_and(|candidate| candidate == package_root)
+    })
+}
+
+/// Codex supports `-` as the prompt positional, reading the complete prompt
+/// from stdin. Windows always needs this because npm shims pass through
+/// cmd.exe; daemon-owned piped Codex launches request it on every platform so
+/// compiled Research prompts never become one oversized argv value.
+fn move_codex_prompt_to_stdin(
     harness_id: &str,
     mode: crate::harness::HarnessLaunchMode,
     prompt: &str,
     args: &mut [String],
-    is_windows: bool,
+    use_stdin: bool,
 ) -> Option<Vec<u8>> {
-    if !is_windows
+    if !use_stdin
         || harness_id != "codex"
         || mode != crate::harness::HarnessLaunchMode::NonInteractive
     {
@@ -921,43 +1294,68 @@ struct CodexJsonState {
 /// direct launcher, so a plain `Child::kill()` is not enough to guarantee pipe
 /// EOF or descendant cleanup.
 pub(crate) struct ChildProcessTree {
+    #[cfg(unix)]
     pid: u32,
     terminated: bool,
     #[cfg(windows)]
     job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
 }
 
+// The Job Object handle is exclusively owned by `ChildProcessTree` and the
+// Win32 job APIs used by its methods are thread-safe. Moving that ownership to
+// the daemon's cancellation registry is therefore safe.
+#[cfg(windows)]
+unsafe impl Send for ChildProcessTree {}
+
 impl ChildProcessTree {
+    #[cfg(unix)]
     pub(crate) fn attach(child: &std::process::Child) -> Self {
         let pid = child.id();
-        #[cfg(windows)]
-        let job_handle = child_job_object_for_process(child);
         Self {
             pid,
             terminated: false,
-            #[cfg(windows)]
-            job_handle,
         }
     }
 
-    fn terminate_impl(&mut self, child: &mut std::process::Child) {
+    fn terminate_tree(&mut self) -> io::Result<()> {
         if self.terminated {
-            return;
+            return Ok(());
         }
-        self.terminated = true;
         #[cfg(unix)]
         {
-            terminate_unix_process_group(self.pid);
+            terminate_unix_process_group(self.pid)?;
+            // Leave the handle retryable when signaling fails for anything
+            // other than ESRCH. `terminate_unix_process_group` treats ESRCH
+            // as success because the desired post-condition already holds.
+            self.terminated = true;
         }
         #[cfg(windows)]
         {
             if let Some(job) = self.job_handle.take() {
-                unsafe {
-                    windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
-                    windows_sys::Win32::Foundation::CloseHandle(job);
+                let terminated =
+                    unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1) };
+                let error = (terminated == 0).then(io::Error::last_os_error);
+                unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+                // Closing the KILL_ON_JOB_CLOSE handle is the kernel-enforced
+                // backstop even when the explicit termination call reports an
+                // error, so no retryable ownership remains after this point.
+                self.terminated = true;
+                if let Some(error) = error {
+                    return Err(error);
                 }
+            } else {
+                self.terminated = true;
             }
         }
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.terminated = true;
+        }
+        Ok(())
+    }
+
+    fn terminate_impl(&mut self, child: &mut std::process::Child) {
+        let _ = self.terminate_tree();
         let _ = child.kill();
     }
 }
@@ -982,7 +1380,6 @@ impl StrictChildProcessTree {
                 return None;
             }
             Some(Self(ChildProcessTree {
-                pid: child.id(),
                 terminated: false,
                 job_handle: Some(job_handle),
             }))
@@ -997,13 +1394,176 @@ impl StrictChildProcessTree {
     pub(crate) fn terminate(&mut self, child: &mut std::process::Child) {
         self.0.terminate_impl(child);
     }
+
+    /// Terminate the contained tree without borrowing the root `Child`.
+    ///
+    /// Detached piped sessions move the `Child` into their wait thread, while
+    /// the daemon retains this containment handle for cancellation. Windows
+    /// terminates the pre-attached Job Object; Unix signals the pre-created
+    /// process group. Both operations are idempotent when the tree exited.
+    pub(crate) fn terminate_tree(&mut self) -> io::Result<()> {
+        self.0.terminate_tree()
+    }
+
+    #[cfg(all(windows, test))]
+    fn close_job_handle_without_explicit_termination_for_test(&mut self) {
+        if let Some(job) = self.0.job_handle.take() {
+            // Model the handle closure the kernel performs when coven.exe is
+            // terminated too abruptly to run Drop. The configured
+            // KILL_ON_JOB_CLOSE limit must still tear down every descendant.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+        }
+        self.0.terminated = true;
+    }
+}
+
+/// Cloneable ownership of one strict process-tree containment handle.
+///
+/// A piped prompt writer and the daemon registry must be able to observe and
+/// terminate the same tree without duplicating pid-based containment. The
+/// underlying Job Object/process-group handle remains singular and every
+/// operation is serialized through this shared owner.
+#[derive(Clone)]
+pub(crate) struct SharedStrictChildProcessTree {
+    process_tree: Arc<Mutex<StrictChildProcessTree>>,
+    #[cfg(unix)]
+    guardian: Arc<Mutex<ProcessSupervisorGuardian>>,
+    child_wait_state: Arc<AtomicU8>,
+    exit_callback_complete: Arc<AtomicBool>,
+}
+
+impl SharedStrictChildProcessTree {
+    #[cfg(unix)]
+    fn new(
+        process_tree: StrictChildProcessTree,
+        guardian: ProcessSupervisorGuardian,
+        child_wait_state: Arc<AtomicU8>,
+        exit_callback_complete: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            process_tree: Arc::new(Mutex::new(process_tree)),
+            guardian: Arc::new(Mutex::new(guardian)),
+            child_wait_state,
+            exit_callback_complete,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(
+        process_tree: StrictChildProcessTree,
+        child_wait_state: Arc<AtomicU8>,
+        exit_callback_complete: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            process_tree: Arc::new(Mutex::new(process_tree)),
+            child_wait_state,
+            exit_callback_complete,
+        }
+    }
+
+    pub(crate) fn terminate_tree(&self) -> io::Result<()> {
+        let termination = match self.process_tree.lock() {
+            Ok(mut process_tree) => process_tree.terminate_tree(),
+            Err(poisoned) => poisoned.into_inner().terminate_tree(),
+        };
+        #[cfg(unix)]
+        match self.guardian.lock() {
+            Ok(mut guardian) => guardian.finish(),
+            Err(poisoned) => poisoned.into_inner().finish(),
+        }
+        termination
+    }
+
+    pub(crate) fn terminate_and_wait(&self, timeout: Duration) -> Result<()> {
+        let termination = self.terminate_tree().err();
+        let wait_state = wait_for_piped_child_reap(&self.child_wait_state, timeout);
+        match (termination, wait_state) {
+            (None, PIPED_CHILD_REAPED) => Ok(()),
+            (Some(error), PIPED_CHILD_REAPED) => Err(anyhow::Error::new(error).context(
+                "process-tree termination reported an error after the child became quiescent",
+            )),
+            (termination, PIPED_CHILD_WAIT_FAILED) => match termination {
+                Some(error) => anyhow::bail!(
+                    "process-tree termination failed ({error}) and the direct child wait failed"
+                ),
+                None => anyhow::bail!(
+                    "the direct child wait failed after process-tree termination"
+                ),
+            },
+            (termination, _) => match termination {
+                Some(error) => anyhow::bail!(
+                    "process-tree termination failed ({error}) and the child did not become quiescent within {} ms",
+                    timeout.as_millis()
+                ),
+                None => anyhow::bail!(
+                    "the child did not become quiescent within {} ms after process-tree termination",
+                    timeout.as_millis()
+                ),
+            },
+        }
+    }
+
+    pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> Result<()> {
+        match wait_for_piped_child_reap(&self.child_wait_state, timeout) {
+            PIPED_CHILD_REAPED => Ok(()),
+            PIPED_CHILD_WAIT_FAILED => {
+                anyhow::bail!("the direct child wait or output drain failed")
+            }
+            _ => anyhow::bail!(
+                "the child did not become quiescent within {} ms",
+                timeout.as_millis()
+            ),
+        }
+    }
+
+    pub(crate) fn wait_for_shutdown_quiescence(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        self.wait_for_quiescence(timeout)?;
+        while !self.exit_callback_complete.load(Ordering::Acquire) {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the piped child exit callback did not complete within {} ms",
+                timeout.as_millis()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    fn is_terminated(&self) -> bool {
+        match self.process_tree.lock() {
+            Ok(process_tree) => process_tree.0.terminated,
+            Err(poisoned) => poisoned.into_inner().0.terminated,
+        }
+    }
+
+    #[cfg(all(windows, test))]
+    fn close_job_handle_without_explicit_termination_for_test(&self) {
+        match self.process_tree.lock() {
+            Ok(mut process_tree) => {
+                process_tree.close_job_handle_without_explicit_termination_for_test()
+            }
+            Err(poisoned) => poisoned
+                .into_inner()
+                .close_job_handle_without_explicit_termination_for_test(),
+        }
+    }
 }
 
 #[cfg(unix)]
-fn terminate_unix_process_group(pid: u32) {
+fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
     // The launch config puts the child at the head of a new session, so the
     // negative pid reaches its wrapper and every descendant.
-    let _ = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 #[cfg(unix)]
@@ -1031,8 +1591,8 @@ fn poll_child_exit_without_reaping(child: &std::process::Child) -> io::Result<bo
     }
 }
 
-#[cfg(all(unix, test))]
 fn wait_for_child_exit_without_reaping(child: &std::process::Child) -> io::Result<()> {
+    #[cfg(unix)]
     loop {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         let result = unsafe {
@@ -1051,6 +1611,26 @@ fn wait_for_child_exit_without_reaping(child: &std::process::Child) -> io::Resul
             return Err(error);
         }
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{WAIT_FAILED, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+        let result = unsafe { WaitForSingleObject(child.as_raw_handle() as _, u32::MAX) };
+        match result {
+            WAIT_OBJECT_0 => Ok(()),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            other => Err(io::Error::other(format!(
+                "unexpected process wait result {other}"
+            ))),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child;
+        Ok(())
+    }
 }
 
 #[cfg(unix)]
@@ -1060,7 +1640,7 @@ impl Drop for ChildProcessTree {
             // A wrapper can exit after detaching a descendant that has already
             // closed stdout/stderr. There is then no pipe timeout to trigger
             // terminate(), but this one-shot runner still owns that group.
-            terminate_unix_process_group(self.pid);
+            let _ = terminate_unix_process_group(self.pid);
         }
     }
 }
@@ -1069,9 +1649,14 @@ impl Drop for ChildProcessTree {
 impl Drop for ChildProcessTree {
     fn drop(&mut self) {
         if let Some(job) = self.job_handle.take() {
-            // The job is configured with KILL_ON_JOB_CLOSE, so an abrupt
-            // coven.exe exit also cleans up npm/Node/Codex descendants.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(job) };
+            // Use the same non-zero cancellation code as explicit kill when
+            // Rust drops a live handle. KILL_ON_JOB_CLOSE remains the kernel
+            // backstop when coven.exe itself terminates too abruptly to run
+            // this destructor.
+            unsafe {
+                windows_sys::Win32::System::JobObjects::TerminateJobObject(job, 1);
+                windows_sys::Win32::Foundation::CloseHandle(job);
+            }
         }
     }
 }
@@ -1170,21 +1755,34 @@ fn resume_suspended_child(child: &std::process::Child) -> bool {
     previous_suspend_count == 1
 }
 
-fn configure_child_process_tree_command(_command: &mut std::process::Command) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            _command.pre_exec(|| {
-                // Isolate this turn in a fresh process group. A timeout can
-                // then kill the npm/Node/native Codex tree in one signal.
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+#[cfg(unix)]
+fn configure_child_process_tree_command(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        command.pre_exec(|| {
+            // Isolate this turn in a fresh process group. A timeout can then
+            // kill the npm/Node/native Codex tree in one signal.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+}
+
+#[cfg(any(windows, test))]
+fn windows_noninteractive_creation_flags(additional_flags: u32) -> u32 {
+    additional_flags | WINDOWS_CREATE_NO_WINDOW
+}
+
+#[cfg(windows)]
+fn configure_windows_noninteractive_command(
+    command: &mut std::process::Command,
+    additional_flags: u32,
+) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(windows_noninteractive_creation_flags(additional_flags));
 }
 
 /// Spawn a process tree that cannot execute before Coven owns its descendants.
@@ -1198,13 +1796,24 @@ pub(crate) fn spawn_strict_child_process_tree(
     configure_child_process_tree_command(command);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 
-        command.creation_flags(CREATE_SUSPENDED);
+        configure_windows_noninteractive_command(command, CREATE_SUSPENDED);
     }
 
+    spawn_configured_strict_child_process_tree(command)
+}
+
+fn spawn_configured_strict_child_process_tree(
+    command: &mut std::process::Command,
+) -> std::io::Result<(std::process::Child, StrictChildProcessTree)> {
     let mut child = command.spawn()?;
+    #[cfg(all(windows, debug_assertions))]
+    if let Err(error) = wait_at_windows_strict_preattach_test_barrier(child.id()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     match StrictChildProcessTree::attach(&child) {
         Some(tree) => Ok((child, tree)),
         None => {
@@ -1215,6 +1824,657 @@ pub(crate) fn spawn_strict_child_process_tree(
             ))
         }
     }
+}
+
+#[cfg(all(windows, debug_assertions))]
+fn wait_at_windows_strict_preattach_test_barrier(child_pid: u32) -> io::Result<()> {
+    let Some(barrier_dir) = std::env::var_os("COVEN_TEST_WINDOWS_STRICT_PREATTACH_BARRIER_DIR")
+    else {
+        return Ok(());
+    };
+    let barrier_dir = PathBuf::from(barrier_dir);
+    std::fs::create_dir_all(&barrier_dir)?;
+    std::fs::write(barrier_dir.join("pid"), child_pid.to_string())?;
+    std::fs::write(barrier_dir.join("ready"), b"ready\n")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier_dir.join("release").exists() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out at Windows strict pre-attachment test barrier",
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+pub(crate) const PROCESS_SUPERVISOR_PROTOCOL: &str = "coven.process-supervisor.v1";
+const PROCESS_SUPERVISOR_CONTROL_PREFIX: &str = "COVEN_PROCESS_SUPERVISOR_V1 ";
+const PROCESS_SUPERVISOR_MAX_REQUEST_BYTES: usize = 256 * 1024;
+const PROCESS_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProcessSupervisorRequest {
+    version: u8,
+    program: String,
+    args: Vec<String>,
+    cwd: String,
+}
+
+fn read_process_supervisor_request(reader: &mut dyn BufRead) -> Result<ProcessSupervisorRequest> {
+    let mut line = Vec::new();
+    reader
+        .take((PROCESS_SUPERVISOR_MAX_REQUEST_BYTES + 1) as u64)
+        .read_until(b'\n', &mut line)
+        .context("failed reading the process-supervisor launch frame")?;
+    anyhow::ensure!(
+        !line.is_empty(),
+        "process-supervisor launch frame is missing"
+    );
+    anyhow::ensure!(
+        line.len() <= PROCESS_SUPERVISOR_MAX_REQUEST_BYTES,
+        "process-supervisor launch frame exceeds {PROCESS_SUPERVISOR_MAX_REQUEST_BYTES} bytes"
+    );
+    anyhow::ensure!(
+        line.last() == Some(&b'\n'),
+        "process-supervisor launch frame must end with LF"
+    );
+    line.pop();
+    let request: ProcessSupervisorRequest =
+        serde_json::from_slice(&line).context("invalid process-supervisor launch JSON")?;
+    anyhow::ensure!(
+        request.version == 1,
+        "unsupported process-supervisor version"
+    );
+    anyhow::ensure!(
+        !request.program.contains('\0')
+            && !request.cwd.contains('\0')
+            && request.args.iter().all(|arg| !arg.contains('\0')),
+        "process-supervisor launch values must not contain NUL"
+    );
+    let program = Path::new(&request.program);
+    let cwd = Path::new(&request.cwd);
+    anyhow::ensure!(
+        program.is_absolute(),
+        "process-supervisor program must be absolute"
+    );
+    anyhow::ensure!(cwd.is_absolute(), "process-supervisor cwd must be absolute");
+    anyhow::ensure!(
+        cwd.is_dir(),
+        "process-supervisor cwd must be an existing directory"
+    );
+    Ok(request)
+}
+
+fn write_process_supervisor_control(event: serde_json::Value) -> Result<()> {
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "{PROCESS_SUPERVISOR_CONTROL_PREFIX}")?;
+    serde_json::to_writer(&mut stderr, &event)?;
+    writeln!(stderr)?;
+    stderr.flush()?;
+    Ok(())
+}
+
+#[cfg(unix)]
+struct ProcessSupervisorGuardian {
+    owner_write: libc::c_int,
+    setup_pid_write: libc::c_int,
+    setup_ack_read: libc::c_int,
+    pid: libc::pid_t,
+    finished: bool,
+}
+
+#[cfg(unix)]
+fn cloexec_pipe() -> io::Result<[libc::c_int; 2]> {
+    let mut fds = [-1, -1];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } == -1
+        {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+            }
+            return Err(error);
+        }
+    }
+    Ok(fds)
+}
+
+#[cfg(unix)]
+unsafe fn guardian_read_exact(fd: libc::c_int, bytes: &mut [u8]) -> bool {
+    let mut offset = 0;
+    while offset != bytes.len() {
+        let count = unsafe {
+            libc::read(
+                fd,
+                bytes[offset..].as_mut_ptr().cast(),
+                bytes.len() - offset,
+            )
+        };
+        if count > 0 {
+            offset += count as usize;
+        } else if count == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+unsafe fn guardian_write_all(fd: libc::c_int, bytes: &[u8]) -> bool {
+    let mut offset = 0;
+    while offset != bytes.len() {
+        let count =
+            unsafe { libc::write(fd, bytes[offset..].as_ptr().cast(), bytes.len() - offset) };
+        if count > 0 {
+            offset += count as usize;
+        } else if count == -1 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(unix)]
+unsafe fn guardian_remap_and_close_unrelated_fds(
+    owner_read: libc::c_int,
+    pid_read: libc::c_int,
+    ack_write: libc::c_int,
+    max_fd: libc::c_int,
+) -> Option<(libc::c_int, libc::c_int, libc::c_int)> {
+    // A guardian is forked from a multithreaded daemon and intentionally does
+    // not exec. Without this close sweep it would retain accepted API sockets,
+    // store locks, and listeners after the request handler dropped them. First
+    // duplicate the three protocol fds out of the fixed range so dup2 cannot
+    // overwrite a still-needed source, then keep only 3/4/5.
+    let owner_temp = unsafe { libc::fcntl(owner_read, libc::F_DUPFD_CLOEXEC, 64) };
+    let pid_temp = unsafe { libc::fcntl(pid_read, libc::F_DUPFD_CLOEXEC, 64) };
+    let ack_temp = unsafe { libc::fcntl(ack_write, libc::F_DUPFD_CLOEXEC, 64) };
+    if owner_temp < 0 || pid_temp < 0 || ack_temp < 0 {
+        return None;
+    }
+    if unsafe { libc::dup2(owner_temp, 3) } < 0
+        || unsafe { libc::dup2(pid_temp, 4) } < 0
+        || unsafe { libc::dup2(ack_temp, 5) } < 0
+    {
+        return None;
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let closed = unsafe { libc::syscall(libc::SYS_close_range, 6_u32, u32::MAX, 0_u32) } == 0;
+        if !closed {
+            for fd in 6..max_fd {
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    unsafe {
+        libc::closefrom(6);
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    for fd in 6..max_fd {
+        unsafe { libc::close(fd) };
+    }
+    for fd in 0..3 {
+        unsafe { libc::close(fd) };
+    }
+    Some((3, 4, 5))
+}
+
+#[cfg(unix)]
+impl ProcessSupervisorGuardian {
+    fn install(command: &mut std::process::Command) -> Result<Self> {
+        use std::os::unix::process::CommandExt;
+
+        let owner = cloexec_pipe().context("failed creating supervisor owner pipe")?;
+        let pid_channel = match cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                unsafe {
+                    libc::close(owner[0]);
+                    libc::close(owner[1]);
+                }
+                return Err(error).context("failed creating supervisor pid channel");
+            }
+        };
+        let ack_channel = match cloexec_pipe() {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                unsafe {
+                    for fd in [owner[0], owner[1], pid_channel[0], pid_channel[1]] {
+                        libc::close(fd);
+                    }
+                }
+                return Err(error).context("failed creating supervisor acknowledgement channel");
+            }
+        };
+
+        let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
+            .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int;
+        let guardian_pid = unsafe { libc::fork() };
+        if guardian_pid == -1 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                for fd in [
+                    owner[0],
+                    owner[1],
+                    pid_channel[0],
+                    pid_channel[1],
+                    ack_channel[0],
+                    ack_channel[1],
+                ] {
+                    libc::close(fd);
+                }
+            }
+            return Err(error).context("failed starting process-supervisor guardian");
+        }
+        if guardian_pid == 0 {
+            unsafe {
+                // The owning desktop may use one final group-directed SIGKILL
+                // as its crash/shutdown backstop. If the guardian remained in
+                // the supervisor's process group, that signal could kill both
+                // owners at once while the separately-sessioned target tree
+                // survived. A private session keeps the guardian alive long
+                // enough to observe owner-pipe EOF and kill the target PGID.
+                if libc::setsid() == -1 {
+                    libc::_exit(71);
+                }
+                libc::close(owner[1]);
+                libc::close(pid_channel[1]);
+                libc::close(ack_channel[0]);
+                let Some((owner_read, pid_read, ack_write)) =
+                    guardian_remap_and_close_unrelated_fds(
+                        owner[0],
+                        pid_channel[0],
+                        ack_channel[1],
+                        max_fd,
+                    )
+                else {
+                    libc::_exit(71);
+                };
+                let mut pid_bytes = [0_u8; std::mem::size_of::<libc::pid_t>()];
+                if guardian_read_exact(pid_read, &mut pid_bytes) {
+                    let target_pid = libc::pid_t::from_ne_bytes(pid_bytes);
+                    let _ = guardian_write_all(ack_write, &[1]);
+                    libc::close(pid_read);
+                    libc::close(ack_write);
+                    let mut byte = [0_u8; 1];
+                    loop {
+                        let count = libc::read(owner_read, byte.as_mut_ptr().cast(), 1);
+                        if count == 1 && byte == *b"D" {
+                            // The parent observed a spawn/exec failure. Rust's
+                            // Command implementation may already have reaped
+                            // that failed child, so signaling the numeric PGID
+                            // here would introduce a stale-id race.
+                            break;
+                        }
+                        if count == 1 && byte == *b"K" {
+                            let _ = libc::kill(-target_pid, libc::SIGKILL);
+                            break;
+                        }
+                        if count == 0 {
+                            // Owner EOF means the supervisor/daemon died
+                            // before it could perform orderly cleanup.
+                            let _ = libc::kill(-target_pid, libc::SIGKILL);
+                            break;
+                        }
+                        if count == -1
+                            && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
+                        {
+                            let _ = libc::kill(-target_pid, libc::SIGKILL);
+                            break;
+                        }
+                        if count == 1 {
+                            // Fail closed on an unknown owner command.
+                            let _ = libc::kill(-target_pid, libc::SIGKILL);
+                            break;
+                        }
+                    }
+                }
+                libc::_exit(0);
+            }
+        }
+
+        unsafe {
+            libc::close(owner[0]);
+            libc::close(pid_channel[0]);
+            libc::close(ack_channel[1]);
+        }
+        let owner_write = owner[1];
+        let setup_pid_write = pid_channel[1];
+        let setup_ack_read = ack_channel[0];
+        unsafe {
+            command.pre_exec(move || {
+                libc::close(owner_write);
+                let pid = libc::getpid().to_ne_bytes();
+                if !guardian_write_all(setup_pid_write, &pid) {
+                    return Err(io::Error::last_os_error());
+                }
+                libc::close(setup_pid_write);
+                let mut ack = [0_u8; 1];
+                if !guardian_read_exact(setup_ack_read, &mut ack) || ack != [1] {
+                    return Err(io::Error::other(
+                        "process-supervisor guardian did not acknowledge containment",
+                    ));
+                }
+                libc::close(setup_ack_read);
+                Ok(())
+            });
+        }
+        Ok(Self {
+            owner_write,
+            setup_pid_write,
+            setup_ack_read,
+            pid: guardian_pid,
+            finished: false,
+        })
+    }
+
+    fn spawn_finished(&mut self) {
+        unsafe {
+            if self.setup_pid_write >= 0 {
+                libc::close(self.setup_pid_write);
+                self.setup_pid_write = -1;
+            }
+            if self.setup_ack_read >= 0 {
+                libc::close(self.setup_ack_read);
+                self.setup_ack_read = -1;
+            }
+        }
+    }
+
+    fn finish_with_command(&mut self, command: u8) {
+        if self.finished {
+            return;
+        }
+        self.spawn_finished();
+        unsafe {
+            if self.owner_write >= 0 {
+                let _ = guardian_write_all(self.owner_write, &[command]);
+                libc::close(self.owner_write);
+                self.owner_write = -1;
+            }
+            loop {
+                let result = libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+                if result == self.pid
+                    || (result == -1
+                        && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted)
+                {
+                    break;
+                }
+            }
+        }
+        self.finished = true;
+    }
+
+    fn finish(&mut self) {
+        self.finish_with_command(b'K');
+    }
+
+    fn disarm(&mut self) {
+        self.finish_with_command(b'D');
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessSupervisorGuardian {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+#[cfg(unix)]
+type SpawnedProcessSupervisorTarget = (
+    std::process::Child,
+    StrictChildProcessTree,
+    ProcessSupervisorGuardian,
+);
+#[cfg(not(unix))]
+type SpawnedProcessSupervisorTarget = (std::process::Child, StrictChildProcessTree);
+
+fn spawn_process_supervisor_target(
+    request: &ProcessSupervisorRequest,
+) -> Result<SpawnedProcessSupervisorTarget> {
+    let mut command = std::process::Command::new(&request.program);
+    command
+        .args(&request.args)
+        .current_dir(&request.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        configure_child_process_tree_command(&mut command);
+        let mut guardian = ProcessSupervisorGuardian::install(&mut command)?;
+        let spawned = spawn_configured_strict_child_process_tree(&mut command);
+        guardian.spawn_finished();
+        let (child, process_tree) = match spawned {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                guardian.disarm();
+                return Err(error.into());
+            }
+        };
+        Ok((child, process_tree, guardian))
+    }
+    #[cfg(not(unix))]
+    {
+        let (child, process_tree) = spawn_strict_child_process_tree(&mut command)?;
+        Ok((child, process_tree))
+    }
+}
+
+fn process_supervisor_child_exited(child: &mut std::process::Child) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        poll_child_exit_without_reaping(child)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
+    }
+}
+
+#[cfg(unix)]
+fn exit_like_process_supervisor_child(
+    status: std::process::ExitStatus,
+    cancellation_signal: Option<i32>,
+) -> ! {
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(signal) = cancellation_signal.or_else(|| status.signal()) {
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+        std::process::exit(128 + signal);
+    }
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+#[cfg(not(unix))]
+fn exit_like_process_supervisor_child(
+    status: std::process::ExitStatus,
+    _cancellation_signal: Option<i32>,
+) -> ! {
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Hidden, versioned exact-handle process owner used by desktop clients.
+///
+/// The first stdin line is a bounded launch request. Keeping stdin open is the
+/// ownership lease: EOF cancels the strict target tree. On Windows an abrupt
+/// supervisor death closes its kill-on-close Job. On Unix a pre-exec guardian
+/// learns the reserved process-group id before the target can exec, then kills
+/// that group if even SIGKILL closes the supervisor's owner pipe.
+pub(crate) fn run_process_supervisor(protocol: &str) -> Result<()> {
+    if protocol != PROCESS_SUPERVISOR_PROTOCOL {
+        let _ = write_process_supervisor_control(serde_json::json!({
+            "event": "error",
+            "code": "unsupported_protocol",
+            "message": "unsupported process-supervisor protocol",
+        }));
+        anyhow::bail!("unsupported process-supervisor protocol");
+    }
+    let request = {
+        let stdin = io::stdin();
+        let mut stdin = stdin.lock();
+        match read_process_supervisor_request(&mut stdin) {
+            Ok(request) => request,
+            Err(error) => {
+                let _ = write_process_supervisor_control(serde_json::json!({
+                    "event": "error",
+                    "code": "invalid_request",
+                    "message": "invalid process-supervisor launch request",
+                }));
+                return Err(error);
+            }
+        }
+    };
+
+    #[cfg(unix)]
+    let (mut child, mut process_tree, mut guardian) =
+        match spawn_process_supervisor_target(&request) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = write_process_supervisor_control(serde_json::json!({
+                    "event": "error",
+                    "code": "spawn_failed",
+                    "message": "the supervised target could not be started",
+                }));
+                return Err(error);
+            }
+        };
+    #[cfg(not(unix))]
+    let (mut child, mut process_tree) = match spawn_process_supervisor_target(&request) {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            let _ = write_process_supervisor_control(serde_json::json!({
+                "event": "error",
+                "code": "spawn_failed",
+                "message": "the supervised target could not be started",
+            }));
+            return Err(error);
+        }
+    };
+
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .context("supervised target did not expose stdout")?;
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .context("supervised target did not expose stderr")?;
+    let mut cancellation = SupervisedStreamCancellationGuard::install("process supervisor")?;
+    write_process_supervisor_control(serde_json::json!({
+        "event": "ready",
+        "protocol": PROCESS_SUPERVISOR_PROTOCOL,
+    }))?;
+
+    let stdout_thread = thread::spawn(move || -> io::Result<()> {
+        let mut stdout = io::stdout().lock();
+        io::copy(&mut child_stdout, &mut stdout)?;
+        stdout.flush()
+    });
+    let stderr_thread = thread::spawn(move || -> io::Result<()> {
+        let mut stderr = io::stderr().lock();
+        io::copy(&mut child_stderr, &mut stderr)?;
+        stderr.flush()
+    });
+    let (owner_tx, owner_rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut byte = [0_u8; 1];
+        let outcome = loop {
+            match stdin.read(&mut byte) {
+                Ok(0) => break Ok(()),
+                Ok(_) => {
+                    break Err(anyhow::anyhow!(
+                        "unexpected bytes after process-supervisor launch frame"
+                    ));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => break Err(anyhow::Error::new(error)),
+            }
+        };
+        let _ = owner_tx.send(outcome);
+    });
+
+    let pending_signal = cancellation.activate()?;
+    let mut cancellation_signal = pending_signal;
+    let mut owner_cancelled = pending_signal.is_some();
+    while !owner_cancelled && !process_supervisor_child_exited(&mut child)? {
+        if let Some(signal) = cancellation.cancelled_signal() {
+            cancellation_signal = Some(signal);
+            owner_cancelled = true;
+            break;
+        }
+        match owner_rx.try_recv() {
+            Ok(Ok(())) => owner_cancelled = true,
+            Ok(Err(error)) => {
+                eprintln!("coven process supervisor: {error:#}");
+                owner_cancelled = true;
+            }
+            Err(mpsc::TryRecvError::Disconnected) => owner_cancelled = true,
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if !owner_cancelled {
+            thread::sleep(PROCESS_SUPERVISOR_POLL_INTERVAL);
+        }
+    }
+
+    let termination_error = process_tree.terminate_tree().err();
+    // The Unix guardian intentionally performs one final group kill when its
+    // owner pipe closes. Reap it while the target group leader is still an
+    // unreaped child, so the numeric PGID cannot be recycled underneath that
+    // fail-safe signal.
+    #[cfg(unix)]
+    guardian.finish();
+    let status = child
+        .wait()
+        .context("failed reaping the supervised target")?;
+    let observed_signal = cancellation.finish()?.or(cancellation_signal);
+    if let Some(error) = termination_error {
+        return Err(anyhow::Error::new(error)
+            .context("failed terminating the supervised target process tree"));
+    }
+
+    if !owner_cancelled {
+        stdout_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("supervised stdout pump panicked"))??;
+        stderr_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("supervised stderr pump panicked"))??;
+    }
+    exit_like_process_supervisor_child(status, observed_signal)
 }
 
 /// Run one non-interactive Codex turn through its supported JSONL protocol.
@@ -1289,6 +2549,7 @@ where
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    command.apply_environment(&mut child_command);
     let mut cancellation = SupervisedStreamCancellationGuard::install("Codex")?;
     if let Some(error) = supervised_stream_cancellation_error(&cancellation, "Codex turn") {
         anyhow::bail!(error);
@@ -1740,12 +3001,23 @@ pub fn build_stream_harness_command_with_conversation(
     )?;
     let mut args = stream_passthrough_args(args, forward_stdin);
     args.extend(["--".to_string(), prompt.to_string()]);
-    let args = crate::harness::sanitize_argv_for_platform(args);
+    let args = crate::harness::sanitize_argv_for_program(
+        harness_id,
+        crate::harness::HarnessLaunchMode::Stream,
+        &program,
+        args,
+    );
+    let (program, env_overrides) = prepare_harness_program(
+        harness_id,
+        crate::harness::HarnessLaunchMode::Stream,
+        program,
+    )?;
     Ok(HarnessCommand {
         program,
         args,
         cwd: cwd.to_path_buf(),
         stdin_prompt: None,
+        env_overrides,
     })
 }
 
@@ -1829,7 +3101,8 @@ pub fn run_piped_attached(
     command: &HarnessCommand,
     merge_stderr_to_stdout: bool,
 ) -> Result<PtyRunResult> {
-    let mut child = std::process::Command::new(&command.program)
+    let mut child_command = std::process::Command::new(&command.program);
+    child_command
         .args(&command.args)
         .current_dir(&command.cwd)
         .stdin(if command.stdin_prompt.is_some() {
@@ -1849,14 +3122,14 @@ pub fn run_piped_attached(
             Stdio::piped()
         } else {
             Stdio::inherit()
-        })
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn harness `{}` in piped mode",
-                command.program()
-            )
-        })?;
+        });
+    command.apply_environment(&mut child_command);
+    let mut child = child_command.spawn().with_context(|| {
+        format!(
+            "failed to spawn harness `{}` in piped mode",
+            command.program()
+        )
+    })?;
     write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
 
     // Codex on Windows writes its complete `exec` transcript (including the
@@ -1898,7 +3171,8 @@ pub fn run_piped_attached_captured(
     command: &HarnessCommand,
     mut on_output: Box<dyn FnMut(Vec<u8>) + Send + 'static>,
 ) -> Result<PtyRunResult> {
-    let mut child = std::process::Command::new(&command.program)
+    let mut child_command = std::process::Command::new(&command.program);
+    child_command
         .args(&command.args)
         .current_dir(&command.cwd)
         .stdin(if command.stdin_prompt.is_some() {
@@ -1907,14 +3181,14 @@ pub fn run_piped_attached_captured(
             Stdio::inherit()
         })
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| {
-            format!(
-                "failed to spawn harness `{}` in captured piped mode",
-                command.program()
-            )
-        })?;
+        .stderr(Stdio::piped());
+    command.apply_environment(&mut child_command);
+    let mut child = child_command.spawn().with_context(|| {
+        format!(
+            "failed to spawn harness `{}` in captured piped mode",
+            command.program()
+        )
+    })?;
     write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
     let mut stderr = child
         .stderr
@@ -1944,10 +3218,11 @@ pub fn stream_harness<W: Write>(
     ledger_session_id: &str,
     out: &mut W,
 ) -> Result<i32> {
-    stream_harness_with_program(
+    stream_harness_with_program_and_env(
         &command.program,
         &command.cwd,
         command.args.clone(),
+        &command.env_overrides,
         forward_stdin,
         harness_id,
         ledger_session_id,
@@ -2081,10 +3356,34 @@ fn normalize_native_stream_line<W: Write>(
         .with_context(|| format!("flushing {harness_id} stdout"))
 }
 
+#[cfg(test)]
 fn stream_harness_with_program<W: Write>(
     program: &str,
     cwd: &Path,
     args: Vec<String>,
+    forward_stdin: bool,
+    harness_id: &str,
+    ledger_session_id: &str,
+    out: &mut W,
+) -> Result<i32> {
+    stream_harness_with_program_and_env(
+        program,
+        cwd,
+        args,
+        &[],
+        forward_stdin,
+        harness_id,
+        ledger_session_id,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_harness_with_program_and_env<W: Write>(
+    program: &str,
+    cwd: &Path,
+    args: Vec<String>,
+    env_overrides: &[(String, Option<String>)],
     forward_stdin: bool,
     harness_id: &str,
     ledger_session_id: &str,
@@ -2101,6 +3400,16 @@ fn stream_harness_with_program<W: Write>(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
+    for (name, value) in env_overrides {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
     let cancellation_context = format!("{harness_id} native stream");
     let mut cancellation = SupervisedStreamCancellationGuard::install(&cancellation_context)?;
     if let Some(signal) = cancellation.cancelled_signal() {
@@ -2362,14 +3671,278 @@ pub fn spawn_detached(command: &HarnessCommand) -> Result<DetachedPtySession> {
     spawn_detached_with_observer(command, None)
 }
 
-/// Handle returned by `spawn_piped_with_observer`. The child handle itself
-/// is owned by the internal wait thread (so `wait()` can block without
-/// blocking the killer); the caller gets a writable stdin and the PID so
-/// it can signal termination via `libc::kill` instead of needing exclusive
-/// access to the `Child`.
+/// Handle returned by `spawn_piped_with_observer`. The child handle itself is
+/// owned by the internal wait thread (so `wait()` can block without blocking
+/// cancellation); the caller gets writable stdin plus the strict process-tree
+/// handle that was established before the Windows child started executing.
 pub struct PipedSession {
-    pub input: Box<dyn Write + Send>,
-    pub pid: u32,
+    input: Box<dyn Write + Send>,
+    process_tree: SharedStrictChildProcessTree,
+    prompt_delivery: Option<PipedPromptDelivery>,
+}
+
+const PIPED_PROMPT_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+const PIPED_PROMPT_DELIVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const PIPED_PROMPT_REAP_TIMEOUT: Duration = Duration::from_secs(1);
+const PIPED_CHILD_WAIT_PENDING: u8 = 0;
+const PIPED_CHILD_REAPED: u8 = 1;
+const PIPED_CHILD_WAIT_FAILED: u8 = 2;
+
+struct PipedPromptDelivery {
+    stdin: Option<std::process::ChildStdin>,
+    prompt: Option<Vec<u8>>,
+    outcome: Arc<PipedPromptOutcome>,
+}
+
+struct PipedPromptOutcome {
+    delivered: Mutex<Option<bool>>,
+    ready: Condvar,
+}
+
+impl PipedPromptOutcome {
+    fn new(delivered: Option<bool>) -> Self {
+        Self {
+            delivered: Mutex::new(delivered),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn finish(&self, delivered: bool) {
+        let mut state = self
+            .delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.is_none() {
+            *state = Some(delivered);
+            self.ready.notify_all();
+        }
+    }
+
+    fn wait(&self) -> bool {
+        let mut state = self
+            .delivered
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while state.is_none() {
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        state.unwrap_or(false)
+    }
+}
+
+impl PipedSession {
+    pub(crate) fn cancellation_handle(&self) -> SharedStrictChildProcessTree {
+        self.process_tree.clone()
+    }
+
+    /// Transfer cancellation ownership before delivering a one-shot prompt.
+    ///
+    /// `register` must retain the supplied process-tree handle whenever it
+    /// returns success. This ordering is deliberate: a large prompt may block
+    /// in an OS pipe, so daemon cancellation and shutdown must own the child
+    /// before prompt delivery starts.
+    pub(crate) fn activate<R>(
+        self,
+        register: impl FnOnce(Box<dyn Write + Send>, SharedStrictChildProcessTree) -> Result<R>,
+    ) -> Result<R> {
+        self.activate_with_prompt_timeout(PIPED_PROMPT_DELIVERY_TIMEOUT, register)
+    }
+
+    fn activate_with_prompt_timeout<R>(
+        self,
+        prompt_timeout: Duration,
+        register: impl FnOnce(Box<dyn Write + Send>, SharedStrictChildProcessTree) -> Result<R>,
+    ) -> Result<R> {
+        let Self {
+            input,
+            process_tree,
+            prompt_delivery,
+        } = self;
+        let cleanup_tree = process_tree.clone();
+        let registered = match register(input, process_tree) {
+            Ok(registered) => registered,
+            Err(error) => {
+                drop(prompt_delivery);
+                return Err(cleanup_piped_launch_failure(error, &cleanup_tree));
+            }
+        };
+
+        if let Some(delivery) = prompt_delivery {
+            delivery.deliver(prompt_timeout, &cleanup_tree)?;
+        }
+        Ok(registered)
+    }
+}
+
+impl PipedPromptDelivery {
+    fn deliver(
+        mut self,
+        timeout: Duration,
+        process_tree: &SharedStrictChildProcessTree,
+    ) -> Result<()> {
+        let outcome = Arc::clone(&self.outcome);
+        let stdin = self
+            .stdin
+            .take()
+            .context("piped prompt stdin was already consumed")?;
+        let prompt = self
+            .prompt
+            .take()
+            .context("piped prompt bytes were already consumed")?;
+        let result = deliver_piped_prompt(stdin, prompt, timeout, process_tree);
+        outcome.finish(result.is_ok());
+        result
+    }
+}
+
+impl Drop for PipedPromptDelivery {
+    fn drop(&mut self) {
+        // Registration rejection or caller abandonment means the launch-time
+        // prompt did not land. Wake the exit thread so it can persist a failed
+        // terminal result instead of trusting an unrelated root exit code.
+        self.outcome.finish(false);
+    }
+}
+
+fn deliver_piped_prompt(
+    stdin: std::process::ChildStdin,
+    prompt: Vec<u8>,
+    timeout: Duration,
+    process_tree: &SharedStrictChildProcessTree,
+) -> Result<()> {
+    if process_tree.is_terminated() {
+        return Err(cleanup_piped_launch_failure(
+            anyhow::anyhow!(
+                "harness process tree was terminated before its stdin prompt could be delivered"
+            ),
+            process_tree,
+        ));
+    }
+
+    let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+    let writer = thread::Builder::new()
+        .name("coven-piped-prompt".into())
+        .spawn(move || {
+            let mut stdin = stdin;
+            let result = stdin
+                .write_all(&prompt)
+                .and_then(|_| stdin.flush())
+                .map_err(|error| {
+                    anyhow::Error::new(error).context("failed writing harness prompt to stdin")
+                });
+            // Dropping stdin after the exact write publishes EOF so a
+            // one-shot harness can begin processing the complete prompt.
+            drop(stdin);
+            let _ = completed_tx.send(result);
+        });
+    let writer = match writer {
+        Ok(writer) => writer,
+        Err(error) => {
+            return Err(cleanup_piped_launch_failure(
+                anyhow::Error::new(error)
+                    .context("failed to start bounded harness prompt delivery"),
+                process_tree,
+            ));
+        }
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            drop(writer);
+            return Err(cleanup_piped_launch_failure(
+                anyhow::anyhow!(
+                    "timed out after {} ms while writing harness prompt to stdin",
+                    timeout.as_millis()
+                ),
+                process_tree,
+            ));
+        }
+        let wait = remaining.min(PIPED_PROMPT_DELIVERY_POLL_INTERVAL);
+        match completed_rx.recv_timeout(wait) {
+            Ok(Ok(())) => {
+                if writer.join().is_err() {
+                    return Err(cleanup_piped_launch_failure(
+                        anyhow::anyhow!("harness prompt writer panicked after delivery"),
+                        process_tree,
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(Err(error)) => {
+                let _ = writer.join();
+                return Err(cleanup_piped_launch_failure(error, process_tree));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                let _ = writer.join();
+                return Err(cleanup_piped_launch_failure(
+                    anyhow::anyhow!("harness prompt writer stopped without reporting delivery"),
+                    process_tree,
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) if process_tree.is_terminated() => {
+                drop(writer);
+                return Err(cleanup_piped_launch_failure(
+                    anyhow::anyhow!(
+                        "harness process tree was terminated while writing its stdin prompt"
+                    ),
+                    process_tree,
+                ));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+fn cleanup_piped_launch_failure(
+    primary: anyhow::Error,
+    process_tree: &SharedStrictChildProcessTree,
+) -> anyhow::Error {
+    match process_tree.terminate_and_wait(PIPED_PROMPT_REAP_TIMEOUT) {
+        Ok(()) => primary,
+        Err(cleanup) => anyhow::anyhow!("{primary:#}; cleanup failure: {cleanup:#}"),
+    }
+}
+
+fn wait_for_piped_child_reap(wait_state: &AtomicU8, timeout: Duration) -> u8 {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let state = wait_state.load(Ordering::Acquire);
+        if state != PIPED_CHILD_WAIT_PENDING || Instant::now() >= deadline {
+            return state;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(debug_assertions)]
+fn wait_at_piped_prepublication_test_barrier() -> Result<()> {
+    let Some(barrier_dir) = std::env::var_os("COVEN_TEST_PIPED_PREPUBLICATION_BARRIER_DIR") else {
+        return Ok(());
+    };
+    let barrier_dir = PathBuf::from(barrier_dir);
+    std::fs::create_dir_all(&barrier_dir)
+        .context("failed creating piped pre-publication test barrier")?;
+    std::fs::write(barrier_dir.join("ready"), b"ready\n")
+        .context("failed publishing piped pre-publication test barrier")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier_dir.join("release").exists() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out at piped pre-publication test barrier"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+fn wait_at_piped_prepublication_test_barrier() -> Result<()> {
+    Ok(())
 }
 
 /// Spawn `command` as a plain piped child process (no PTY) and stream its
@@ -2396,59 +3969,90 @@ pub fn spawn_piped_with_observer(
     std_command.stdin(Stdio::piped());
     std_command.stdout(Stdio::piped());
     std_command.stderr(Stdio::piped());
-    // Put the child in its own session/process group so the daemon can
-    // signal it (and any subprocesses it spawns — skills, MCP servers,
-    // shells) as a single unit via `kill(-pid, …)` from `PipedKiller`.
-    // Without this, signals to the pid only reach the immediate child
-    // and leave grandchildren as orphans.
+    command.apply_environment(&mut std_command);
+    // Reuse strict containment. On Windows the console-subsystem child starts
+    // suspended and hidden, enters a KILL_ON_JOB_CLOSE job before its first
+    // instruction, and only then resumes. Unix additionally installs an
+    // independent guardian before fork/exec; daemon-process death closes its
+    // owner pipe and kills the new process group even if shutdown raced before
+    // the request handler could publish its in-process cancellation handle.
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            std_command.pre_exec(|| {
-                // setsid() makes the calling process the session leader
-                // of a new session AND the leader of a new process
-                // group with no controlling terminal. Returns -1 on
-                // failure (we propagate as io::Error to abort the spawn).
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+    let (mut child, mut process_tree, mut guardian) = {
+        configure_child_process_tree_command(&mut std_command);
+        let mut guardian = ProcessSupervisorGuardian::install(&mut std_command)?;
+        let spawned = spawn_configured_strict_child_process_tree(&mut std_command);
+        guardian.spawn_finished();
+        match spawned {
+            Ok((child, process_tree)) => (child, process_tree, guardian),
+            Err(error) => {
+                guardian.disarm();
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to spawn harness `{}` in piped mode",
+                        command.program
+                    )
+                });
+            }
         }
-    }
-
-    let mut child = std_command.spawn().with_context(|| {
-        format!(
-            "failed to spawn harness `{}` in piped mode",
-            command.program
-        )
-    })?;
-
-    let pid = child.id();
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("failed to take child stdin in piped mode")?;
-    let stdin: Box<dyn Write + Send> = if let Some(prompt) = command.stdin_prompt.as_deref() {
-        if let Err(error) = stdin.write_all(prompt).and_then(|_| stdin.flush()) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error).context("failed writing harness prompt to stdin");
-        }
-        drop(stdin);
-        Box::new(io::sink())
-    } else {
-        Box::new(stdin)
     };
-    let stdout = child
-        .stdout
-        .take()
-        .context("failed to take child stdout in piped mode")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("failed to take child stderr in piped mode")?;
+    #[cfg(not(unix))]
+    let (mut child, mut process_tree) = spawn_strict_child_process_tree(&mut std_command)
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in piped mode",
+                command.program
+            )
+        })?;
+
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            process_tree.terminate(&mut child);
+            #[cfg(unix)]
+            guardian.finish();
+            let _ = child.wait();
+            anyhow::bail!("failed to take child stdin in piped mode");
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            drop(stdin);
+            process_tree.terminate(&mut child);
+            #[cfg(unix)]
+            guardian.finish();
+            let _ = child.wait();
+            anyhow::bail!("failed to take child stdout in piped mode");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdin);
+            drop(stdout);
+            process_tree.terminate(&mut child);
+            #[cfg(unix)]
+            guardian.finish();
+            let _ = child.wait();
+            anyhow::bail!("failed to take child stderr in piped mode");
+        }
+    };
+    let prompt_outcome = Arc::new(PipedPromptOutcome::new(
+        command.stdin_prompt.is_none().then_some(true),
+    ));
+    let (stdin, prompt_delivery): (Box<dyn Write + Send>, Option<PipedPromptDelivery>) =
+        if let Some(prompt) = command.stdin_prompt.clone() {
+            (
+                Box::new(io::sink()),
+                Some(PipedPromptDelivery {
+                    stdin: Some(stdin),
+                    prompt: Some(prompt),
+                    outcome: Arc::clone(&prompt_outcome),
+                }),
+            )
+        } else {
+            (Box::new(stdin), None)
+        };
 
     // Share the on_output callback between the stdout and stderr drain
     // threads — both want to feed the same observer pipeline. `on_exit` is
@@ -2468,7 +4072,7 @@ pub fn spawn_piped_with_observer(
     // the stream at the first decode error — which `BufRead::lines()`
     // would do.
     let stderr_callback = Arc::clone(&on_output_shared);
-    thread::spawn(move || {
+    let stderr_thread = thread::spawn(move || {
         let mut reader = BufReader::new(stderr);
         let mut buf: Vec<u8> = Vec::with_capacity(256);
         loop {
@@ -2503,11 +4107,36 @@ pub fn spawn_piped_with_observer(
         }
     });
 
-    // Stdout drain + wait. The wait thread OWNS `child`; the killer never
-    // touches the `Child` handle, only the PID. That removes the previous
-    // deadlock risk where `wait()` and `kill()` raced on a shared mutex.
+    // Start both output drains before this function returns and therefore
+    // before `PipedSession::activate` can begin prompt delivery. This avoids
+    // the classic duplex pipe deadlock where the parent fills stdin while the
+    // child fills stdout before either side reads.
+    //
+    // The wait thread owns `child`; cancellation uses the independently owned
+    // process-group/Job Object handle, so it never needs to lock the `Child`
+    // around a blocking wait.
+    let child_wait_state = Arc::new(AtomicU8::new(PIPED_CHILD_WAIT_PENDING));
+    let wait_state = Arc::clone(&child_wait_state);
+    let exit_callback_complete = Arc::new(AtomicBool::new(false));
+    let callback_complete = Arc::clone(&exit_callback_complete);
+    #[cfg(unix)]
+    let process_tree = SharedStrictChildProcessTree::new(
+        process_tree,
+        guardian,
+        Arc::clone(&child_wait_state),
+        Arc::clone(&exit_callback_complete),
+    );
+    #[cfg(not(unix))]
+    let process_tree = SharedStrictChildProcessTree::new(
+        process_tree,
+        Arc::clone(&child_wait_state),
+        Arc::clone(&exit_callback_complete),
+    );
+    let wait_process_tree = Arc::downgrade(&process_tree.process_tree);
+    #[cfg(unix)]
+    let wait_guardian = Arc::downgrade(&process_tree.guardian);
     let stdout_callback = Arc::clone(&on_output_shared);
-    thread::spawn(move || {
+    let stdout_thread = thread::spawn(move || {
         let mut reader = stdout;
         let mut bridge: Box<dyn FnMut(Vec<u8>) + Send + 'static> = Box::new(move |chunk| {
             if let Ok(mut cb) = stdout_callback.lock() {
@@ -2515,24 +4144,95 @@ pub fn spawn_piped_with_observer(
             }
         });
         drain_detached_output(&mut reader, Some(&mut bridge));
-        let result = match child.wait() {
-            Ok(status) => PtyRunResult {
-                status: if status.success() {
-                    "completed"
-                } else {
-                    "failed"
+    });
+    thread::spawn(move || {
+        // Observe root exit concurrently with both pipe drains, without
+        // reaping it. A wrapper can exit while a descendant keeps stdout or
+        // stderr open forever; waiting for EOF first would never reach tree
+        // cleanup. WNOWAIT (or the stable Windows process handle) reserves the
+        // root identity until its entire containment unit is terminated.
+        let pre_reap_wait_failed = wait_for_child_exit_without_reaping(&child).is_err();
+        let containment_cleanup_failed =
+            wait_process_tree
+                .upgrade()
+                .is_some_and(|process_tree| match process_tree.lock() {
+                    Ok(mut process_tree) => process_tree.terminate_tree().is_err(),
+                    Err(poisoned) => poisoned.into_inner().terminate_tree().is_err(),
+                });
+        // Close and reap the independent Unix guardian while the direct child
+        // remains WNOWAIT-reserved. Its final group signal can therefore never
+        // target a recycled numeric PGID.
+        #[cfg(unix)]
+        if let Some(guardian) = wait_guardian.upgrade() {
+            match guardian.lock() {
+                Ok(mut guardian) => guardian.finish(),
+                Err(poisoned) => poisoned.into_inner().finish(),
+            }
+        }
+        // Tree termination closes every inherited output pipe. Join both
+        // drains before publishing quiescence so no observer callback can run
+        // after `/kill` or shutdown reports completion.
+        let stdout_drain_failed = stdout_thread.join().is_err();
+        let stderr_drain_failed = stderr_thread.join().is_err();
+        let (mut result, mut state) = match child.wait() {
+            Ok(status) => (
+                PtyRunResult {
+                    status: if status.success() {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    exit_code: status.code(),
                 },
-                exit_code: status.code(),
-            },
-            Err(_) => PtyRunResult {
-                status: "failed",
-                exit_code: None,
-            },
+                PIPED_CHILD_REAPED,
+            ),
+            Err(_) => (
+                PtyRunResult {
+                    status: "failed",
+                    exit_code: None,
+                },
+                PIPED_CHILD_WAIT_FAILED,
+            ),
         };
+        // A successful cancellation response is a quiescence boundary for
+        // consumers such as Cave: do not publish completion until both pipe
+        // drains have reached EOF. Otherwise a descendant that inherited
+        // stderr could still append output after `/kill` returned.
+        if stdout_drain_failed
+            || stderr_drain_failed
+            || pre_reap_wait_failed
+            || containment_cleanup_failed
+        {
+            state = PIPED_CHILD_WAIT_FAILED;
+        }
+        wait_state.store(state, Ordering::Release);
+        // Prompt-delivery cleanup may itself wait for the reaped/quiescent
+        // state above, so publish that barrier first. Do not publish on_exit,
+        // however, until delivery has a terminal outcome: a root can exit 0
+        // after closing stdin while the required prompt write fails with
+        // EPIPE. In that race the launch and durable exit event must both be
+        // failed, never completed.
+        if !prompt_outcome.wait() {
+            result.status = "failed";
+        }
         on_exit(result);
+        callback_complete.store(true, Ordering::Release);
     });
 
-    Ok(PipedSession { input: stdin, pid })
+    // Integration-only barrier used to prove that daemon termination remains
+    // bounded when a request thread has spawned a strict child but has not yet
+    // returned the cancellation handle to LiveSessionRuntime. On Unix, the
+    // guardian owner pipe is the process-death backstop for this exact window;
+    // on Windows, the already-attached Job Object is.
+    if let Err(error) = wait_at_piped_prepublication_test_barrier() {
+        return Err(cleanup_piped_launch_failure(error, &process_tree));
+    }
+
+    Ok(PipedSession {
+        input: stdin,
+        process_tree,
+        prompt_delivery,
+    })
 }
 
 pub fn spawn_detached_with_observer(
@@ -2690,6 +4390,72 @@ pub(crate) fn windows_detached_stub_command(
         args,
         cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
         stdin_prompt: None,
+        env_overrides: Vec::new(),
+    })
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn windows_console_probe_command(build_dir: &Path) -> Result<HarnessCommand> {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/windows_console_probe.rs");
+    let executable = build_dir.join("windows-console-probe.exe");
+    let compile = std::process::Command::new("rustc.exe")
+        .args(["--edition=2021", "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .context("failed to compile native Windows console probe")?;
+    anyhow::ensure!(
+        compile.status.success(),
+        "native Windows console probe failed to compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    Ok(HarnessCommand {
+        program: executable.to_string_lossy().into_owned(),
+        args: Vec::new(),
+        cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+        stdin_prompt: None,
+        env_overrides: Vec::new(),
+    })
+}
+
+#[cfg(all(test, any(unix, windows)))]
+pub(crate) fn piped_prompt_probe_command(
+    build_dir: &Path,
+    mode: &str,
+    first: &str,
+    second: Option<&Path>,
+    prompt: Vec<u8>,
+) -> Result<HarnessCommand> {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/piped_prompt_probe.rs");
+    let executable = build_dir.join(if cfg!(windows) {
+        "piped-prompt-probe.exe"
+    } else {
+        "piped-prompt-probe"
+    });
+    let rustc = if cfg!(windows) { "rustc.exe" } else { "rustc" };
+    let compile = std::process::Command::new(rustc)
+        .args(["--edition=2021", "-o"])
+        .arg(&executable)
+        .arg(&source)
+        .output()
+        .context("failed to compile native piped-prompt probe")?;
+    anyhow::ensure!(
+        compile.status.success(),
+        "native piped-prompt probe failed to compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    let mut args = vec![mode.to_string(), first.to_string()];
+    if let Some(second) = second {
+        args.push(second.to_string_lossy().into_owned());
+    }
+    Ok(HarnessCommand {
+        program: executable.to_string_lossy().into_owned(),
+        args,
+        cwd: build_dir.to_path_buf(),
+        stdin_prompt: (!prompt.is_empty()).then_some(prompt),
+        env_overrides: Vec::new(),
     })
 }
 
@@ -3250,6 +5016,889 @@ mod tests {
         }
     }
 
+    #[test]
+    fn windows_noninteractive_flags_preserve_other_creation_flags() {
+        const CREATE_SUSPENDED_VALUE: u32 = 0x0000_0004;
+        assert_eq!(
+            windows_noninteractive_creation_flags(0),
+            WINDOWS_CREATE_NO_WINDOW
+        );
+        assert_eq!(
+            windows_noninteractive_creation_flags(CREATE_SUSPENDED_VALUE),
+            WINDOWS_CREATE_NO_WINDOW | CREATE_SUSPENDED_VALUE
+        );
+    }
+
+    #[test]
+    fn official_windows_codex_npm_shim_resolves_validated_native_package() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let shim = temp_dir.path().join("codex.cmd");
+        let package_root = temp_dir
+            .path()
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        let entry = package_root.join("bin").join("codex.js");
+        let native_root = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-win32-x64");
+        let native = native_root
+            .join("vendor")
+            .join("x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+        std::fs::create_dir_all(entry.parent().unwrap())?;
+        std::fs::create_dir_all(native.parent().unwrap())?;
+        std::fs::write(
+            temp_dir.path().join("node_modules").join(".modules.yaml"),
+            b"fixture\n",
+        )?;
+        std::fs::write(&entry, "// official entry fixture\n")?;
+        std::fs::write(&native, b"native fixture")?;
+        std::fs::write(
+            package_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "bin": { "codex": "bin/codex.js" },
+                "optionalDependencies": {
+                    "@openai/codex-win32-x64": "npm:@openai/codex@0.0.0-win32-x64"
+                }
+            }))?,
+        )?;
+        std::fs::write(
+            native_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "os": ["win32"],
+                "cpu": ["x64"]
+            }))?,
+        )?;
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nendLocal & \"%_prog%\" \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n",
+        )?;
+
+        let launch = resolve_official_codex_npm_shim_for_target(
+            &shim,
+            "@openai/codex-win32-x64",
+            "x86_64-pc-windows-msvc",
+            "x64",
+        )?;
+        assert_eq!(launch.program, std::fs::canonicalize(native)?);
+        assert!(launch.env_overrides.contains(&(
+            "CODEX_MANAGED_PACKAGE_ROOT".to_string(),
+            Some(
+                std::fs::canonicalize(package_root)?
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        )));
+        assert_eq!(
+            launch
+                .env_overrides
+                .iter()
+                .filter(|(name, value)| name.starts_with("CODEX_MANAGED_BY_")
+                    && value.as_deref() == Some("1"))
+                .count(),
+            1
+        );
+        assert!(launch
+            .env_overrides
+            .contains(&("CODEX_MANAGED_BY_PNPM".to_string(), Some("1".to_string()))));
+        Ok(())
+    }
+
+    #[test]
+    fn unofficial_windows_codex_batch_shim_fails_closed() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let shim = temp_dir.path().join("codex.cmd");
+        assert!(windows_program_is_batch_shim(&shim.to_string_lossy()));
+        std::fs::write(&shim, "@echo off\r\necho not-codex %*\r\n")?;
+        let error = resolve_official_codex_npm_shim_for_target(
+            &shim,
+            "@openai/codex-win32-x64",
+            "x86_64-pc-windows-msvc",
+            "x64",
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not contain a safe existing package entry"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_managed_package_markers_match_supported_package_managers() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let npm_root = temp_dir.path().join("npm/node_modules/@openai/codex");
+        let bun_root = temp_dir
+            .path()
+            .join(".bun/install/global/node_modules/@openai/codex");
+        std::fs::create_dir_all(&npm_root)?;
+        std::fs::create_dir_all(&bun_root)?;
+        assert_eq!(
+            codex_package_manager_with_env(&npm_root, "npm/10", "npm-cli.js"),
+            "NPM"
+        );
+        assert_eq!(
+            codex_package_manager_with_env(&npm_root, "pnpm/10", "pnpm.cjs"),
+            "PNPM"
+        );
+        assert_eq!(codex_package_manager_with_env(&bun_root, "", ""), "BUN");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unattended_launch_policy_piped_fixture_creates_primary_artifact() -> anyhow::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("project");
+        let allowed_dir = project_root.join("artifacts");
+        std::fs::create_dir_all(&allowed_dir)?;
+        let allowed_dir_text = allowed_dir.to_string_lossy().into_owned();
+        let fake_codex = temp_dir.path().join("fake-codex");
+        std::fs::write(
+            &fake_codex,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > received-args.txt\ncat > received-prompt.txt\nprintf 'fixture artifact\\n' > artifacts/primary.md\nprintf 'artifact written\\n'\n",
+        )?;
+        let mut permissions = std::fs::metadata(&fake_codex)?.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_codex, permissions)?;
+
+        let policy =
+            crate::harness::LaunchPolicy::unattended_workspace_write(
+                vec![allowed_dir_text.clone()],
+            );
+        let mut command = build_piped_harness_command_with_conversation(
+            "codex",
+            "write artifacts/primary.md",
+            &project_root,
+            crate::harness::HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            crate::harness::HarnessLaunchOptions {
+                launch_policy: Some(&policy),
+                ..Default::default()
+            },
+        )?;
+        command.program = fake_codex.to_string_lossy().into_owned();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(allowed_dir.join("primary.md"))?,
+            "fixture artifact\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_root.join("received-args.txt"))?,
+            [
+                "--ask-for-approval",
+                "never",
+                "-c",
+                r#"approval_policy="never""#,
+                "--sandbox",
+                "workspace-write",
+                "--add-dir",
+                allowed_dir_text.as_str(),
+                "exec",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "--",
+                "-",
+                "",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_root.join("received-prompt.txt"))?,
+            "write artifacts/primary.md"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_prompt_delivery_failure_terminates_after_registration() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("closed-stdin.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "close-stdin",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let child_pid = await_piped_descendant_pid(&pid_file)?;
+        let registered = Arc::new(AtomicBool::new(false));
+        let registered_in_callback = Arc::clone(&registered);
+        let error = match session.activate(|_input, process_tree| {
+            registered_in_callback.store(true, Ordering::Release);
+            Ok(process_tree)
+        }) {
+            Ok(_) => anyhow::bail!("a closed stdin unexpectedly accepted the prompt"),
+            Err(error) => error,
+        };
+        assert!(registered.load(Ordering::Acquire));
+        assert!(
+            format!("{error:#}").contains("failed writing harness prompt to stdin"),
+            "unexpected error: {error:#}"
+        );
+        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
+            "failed prompt delivery left child {child_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_prompt_failure_overrides_successful_root_exit() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("exit-zero-closed-stdin.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "exit-zero-close-stdin",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let child_pid = await_piped_descendant_pid(&pid_file)?;
+        assert!(
+            wait_for_piped_process_exit(child_pid, Duration::from_secs(10)),
+            "successful root did not exit before prompt delivery"
+        );
+        let error = match session.activate(|_input, process_tree| Ok(process_tree)) {
+            Ok(_) => anyhow::bail!("a closed stdin unexpectedly accepted the large prompt"),
+            Err(error) => error,
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("failed writing harness prompt to stdin")
+                || diagnostic.contains("terminated before its stdin prompt could be delivered"),
+            "{diagnostic}"
+        );
+        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert_eq!(
+            result.exit_code,
+            Some(0),
+            "root exit remains diagnostic but cannot override prompt failure"
+        );
+        assert!(wait_for_piped_process_exit(
+            child_pid,
+            Duration::from_secs(2)
+        ));
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_prompt_and_pre_read_output_exceeding_pipe_capacity_complete_exactly(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let receipt = temp_dir.path().join("received-prompt.bin");
+        let prompt = (0..1024 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let output_bytes = 1024 * 1024;
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "duplex",
+            &output_bytes.to_string(),
+            Some(&receipt),
+            prompt.clone(),
+        )?;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_output = Arc::clone(&captured);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                captured_for_output.lock().unwrap().extend(chunk);
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session
+            .activate_with_prompt_timeout(Duration::from_secs(8), |_input, process_tree| {
+                Ok(process_tree)
+            })?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        let output = captured.lock().unwrap();
+        assert_eq!(output.len(), output_bytes);
+        assert!(output.iter().all(|byte| *byte == b'o'));
+        assert_eq!(std::fs::read(receipt)?, prompt);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_root_exit_reaps_closed_pipe_descendant_before_completion() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("closed-pipe-descendant.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "root-exit-closed-descendant",
+            &pid_file.to_string_lossy(),
+            None,
+            Vec::new(),
+        )?;
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(2)),
+            "successful root exit left closed-pipe descendant {descendant_pid} running"
+        );
+        drop(process_tree);
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_root_exit_terminates_inherited_output_descendant_and_preserves_exit(
+    ) -> anyhow::Result<()> {
+        use std::sync::atomic::AtomicUsize;
+
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("inherited-output-descendant.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "root-exit-output-descendant",
+            &pid_file.to_string_lossy(),
+            None,
+            Vec::new(),
+        )?;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observed_output = Arc::clone(&observed);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                observed_output.fetch_add(chunk.len(), Ordering::AcqRel);
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        let count_at_exit = observed.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(observed.load(Ordering::Acquire), count_at_exit);
+        drop(process_tree);
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(
+            count_at_exit > 0,
+            "descendant never exercised inherited output"
+        );
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(2)),
+            "natural root exit left inherited-output descendant {descendant_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_prompt_timeout_terminates_and_reaps_a_child_that_never_reads() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("never-read.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "never-read",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let child_pid = await_piped_descendant_pid(&pid_file)?;
+        let started = Instant::now();
+        let error = match session
+            .activate_with_prompt_timeout(Duration::from_millis(100), |_input, process_tree| {
+                Ok(process_tree)
+            }) {
+            Ok(_) => anyhow::bail!("a never-reading child accepted the complete prompt"),
+            Err(error) => error,
+        };
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(format!("{error:#}").contains("timed out"), "{error:#}");
+        let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
+            "prompt timeout left child {child_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_piped_child_runs_without_a_console_window() -> anyhow::Result<()> {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        let temp_dir = tempfile::tempdir()?;
+        let command = windows_console_probe_command(temp_dir.path())?;
+        let mut control = std::process::Command::new(command.program());
+        control
+            .current_dir(command.cwd())
+            .creation_flags(CREATE_NEW_CONSOLE);
+        let control_output = control.output()?;
+        assert!(
+            control_output.status.success(),
+            "{:?}",
+            control_output.status
+        );
+        assert_eq!(
+            String::from_utf8(control_output.stdout)?.trim(),
+            "console=present",
+            "the console-subsystem fixture must positively observe an explicitly allocated console before it can prove production suppression"
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_output = Arc::clone(&captured);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                captured_for_output.lock().unwrap().extend(chunk);
+            }),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+        let output = String::from_utf8(captured.lock().unwrap().clone())?;
+
+        assert_eq!(result.status, "completed", "{result:?}; {output:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}; {output:?}");
+        assert_eq!(output.trim(), "console=absent");
+        Ok(())
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_official_codex_shim_launches_native_with_exact_argv_and_no_console(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let compiled_probe = windows_console_probe_command(temp_dir.path())?;
+        let shim = temp_dir.path().join("codex.cmd");
+        let package_root = temp_dir
+            .path()
+            .join("node_modules")
+            .join("@openai")
+            .join("codex");
+        let entry = package_root.join("bin").join("codex.js");
+        let native_root = package_root
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-win32-x64");
+        let native = native_root
+            .join("vendor")
+            .join("x86_64-pc-windows-msvc")
+            .join("bin")
+            .join("codex.exe");
+        std::fs::create_dir_all(entry.parent().unwrap())?;
+        std::fs::create_dir_all(native.parent().unwrap())?;
+        std::fs::write(&entry, "// official entry fixture\n")?;
+        std::fs::copy(compiled_probe.program(), &native)?;
+        std::fs::write(
+            package_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "bin": { "codex": "bin/codex.js" },
+                "optionalDependencies": {
+                    "@openai/codex-win32-x64": "npm:@openai/codex@0.0.0-win32-x64"
+                }
+            }))?,
+        )?;
+        std::fs::write(
+            native_root.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "name": "@openai/codex",
+                "os": ["win32"],
+                "cpu": ["x64"]
+            }))?,
+        )?;
+        std::fs::write(
+            &shim,
+            "@ECHO off\r\nendLocal & \"%_prog%\" \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n",
+        )?;
+        let shim_text = shim.to_string_lossy().into_owned();
+        let (interactive_program, interactive_env_overrides) = prepare_harness_program(
+            "codex",
+            crate::harness::HarnessLaunchMode::Interactive,
+            shim_text.clone(),
+        )?;
+        assert_eq!(interactive_program, shim_text);
+        assert!(
+            interactive_env_overrides.is_empty(),
+            "interactive PTY launches must retain the official wrapper and its existing environment"
+        );
+
+        let (program, env_overrides) = prepare_harness_program(
+            "codex",
+            crate::harness::HarnessLaunchMode::NonInteractive,
+            shim_text,
+        )?;
+        assert_eq!(PathBuf::from(&program), std::fs::canonicalize(&native)?);
+        assert!(!windows_program_is_batch_shim(&program));
+
+        let argv_file = temp_dir.path().join("argv.bin");
+        let env_file = temp_dir.path().join("managed-env.txt");
+        let external_dir = r#"C:\Research & Evidence\資料 ^ 100%!"#.to_string();
+        let exact_args = vec![
+            "--ask-for-approval".to_string(),
+            "never".to_string(),
+            "-c".to_string(),
+            r#"approval_policy="never""#.to_string(),
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "-c".to_string(),
+            r#"windows.sandbox="unelevated""#.to_string(),
+            "--add-dir".to_string(),
+            external_dir.clone(),
+            "exec".to_string(),
+            "--skip-git-repo-check".to_string(),
+            "--color".to_string(),
+            "never".to_string(),
+            "--".to_string(),
+            "-".to_string(),
+        ];
+        let mut fixture_args = vec![
+            "--record-argv-env".to_string(),
+            argv_file.to_string_lossy().into_owned(),
+            env_file.to_string_lossy().into_owned(),
+        ];
+        fixture_args.extend(exact_args.clone());
+        let command = HarnessCommand {
+            program,
+            args: fixture_args,
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+            env_overrides,
+        };
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_output = Arc::clone(&captured);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let session = spawn_piped_with_observer(
+            &command,
+            Some(DetachedPtyObserver {
+                on_output: Box::new(move |chunk| {
+                    captured_for_output.lock().unwrap().extend(chunk);
+                }),
+                on_exit: Box::new(move |result| {
+                    let _ = exit_tx.send(result);
+                }),
+            }),
+            false,
+        )?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(
+            String::from_utf8(captured.lock().unwrap().clone())?.trim(),
+            "console=absent"
+        );
+        assert_eq!(
+            std::fs::read_to_string(argv_file)?,
+            exact_args.join("\0"),
+            "native Codex argv changed after npm-shim resolution"
+        );
+        let managed_env = std::fs::read_to_string(env_file)?;
+        assert!(
+            managed_env.contains(&format!(
+                "package_root={}",
+                std::fs::canonicalize(package_root)?.display()
+            )),
+            "{managed_env}"
+        );
+        assert!(
+            managed_env.contains("managers=CODEX_MANAGED_BY_"),
+            "{managed_env}"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_strict_child_combines_no_window_with_suspended_containment() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let probe = windows_console_probe_command(temp_dir.path())?;
+        let mut command = std::process::Command::new(probe.program());
+        command.current_dir(probe.cwd());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+
+        let (child, process_tree) = spawn_strict_child_process_tree(&mut command)?;
+        let output = child.wait_with_output()?;
+        drop(process_tree);
+
+        assert!(output.status.success(), "{:?}", output.status);
+        assert_eq!(String::from_utf8(output.stdout)?.trim(), "console=absent");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn piped_descendant_fixture(build_dir: &Path, pid_file: &Path) -> HarnessCommand {
+        HarnessCommand::fixture(
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; wait".to_string(),
+                "piped-descendant".to_string(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            build_dir.to_path_buf(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn piped_descendant_fixture(build_dir: &Path, pid_file: &Path) -> HarnessCommand {
+        let mut command = windows_console_probe_command(build_dir).expect("compile Windows probe");
+        command.args = vec![
+            "--spawn-descendant".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ];
+        command
+    }
+
+    #[cfg(unix)]
+    fn piped_nonzero_fixture(build_dir: &Path) -> HarnessCommand {
+        HarnessCommand::fixture(
+            "/bin/sh",
+            vec!["-c".to_string(), "exit 23".to_string()],
+            build_dir.to_path_buf(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn piped_nonzero_fixture(build_dir: &Path) -> HarnessCommand {
+        let mut command = windows_console_probe_command(build_dir).expect("compile Windows probe");
+        command.args = vec!["--exit-code".to_string(), "23".to_string()];
+        command
+    }
+
+    #[cfg(any(unix, windows))]
+    fn await_piped_descendant_pid(pid_file: &Path) -> anyhow::Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    return Ok(pid);
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "piped fixture did not publish its descendant pid"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_piped_process_exit(pid: u32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait_for_piped_process_exit(pid: u32, timeout: Duration) -> bool {
+        wait_for_windows_process_exit(pid, timeout)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_child_propagates_nonzero_exit_status() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let command = piped_nonzero_fixture(temp_dir.path());
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert_eq!(result.exit_code, Some(23), "{result:?}");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_process_tree_explicit_cancel_kills_descendant() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command = piped_descendant_fixture(temp_dir.path(), &pid_file);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+
+        process_tree.terminate_tree()?;
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(10)),
+            "explicit cancellation left descendant {descendant_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn dropping_piped_process_tree_handle_kills_descendant() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command = piped_descendant_fixture(temp_dir.path(), &pid_file);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+
+        drop(process_tree);
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(10)),
+            "dropping containment left descendant {descendant_pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_kill_on_job_close_backstop_kills_descendant() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command = piped_descendant_fixture(temp_dir.path(), &pid_file);
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+
+        process_tree.close_job_handle_without_explicit_termination_for_test();
+        let _ = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        drop(process_tree);
+
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(10)),
+            "KILL_ON_JOB_CLOSE backstop left descendant {descendant_pid} running"
+        );
+        Ok(())
+    }
+
     #[derive(Clone)]
     struct RecordingResizeTarget {
         sizes: Arc<Mutex<Vec<PtySize>>>,
@@ -3678,6 +6327,7 @@ mod tests {
             args: vec![],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
 
         let mut session = spawn_detached(&command)?;
@@ -3694,11 +6344,10 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[test]
-    fn windows_detached_pty_stub_completes_after_terminal_replies() -> anyhow::Result<()> {
-        let temp_dir = tempfile::tempdir()?;
-        let trace_file = temp_dir.path().join("query-trace.txt");
-        let command = windows_detached_stub_command(temp_dir.path(), "queries", Some(&trace_file))?;
+    fn assert_windows_detached_pty_queries(
+        command: &HarnessCommand,
+        trace_file: &Path,
+    ) -> anyhow::Result<()> {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_for_output = Arc::clone(&captured);
         let (exit_tx, exit_rx) = mpsc::channel();
@@ -3714,9 +6363,13 @@ mod tests {
         let mut session = spawn_detached_with_observer_and_timeout(
             &command,
             Some(observer),
-            Some(Duration::from_secs(5)),
+            // Native CI can schedule ConPTY terminal replies several seconds
+            // apart under load. This path must complete all four query/reply
+            // exchanges before it emits meaningful output, so keep the proof
+            // bounded without racing a healthy interactive child.
+            Some(Duration::from_secs(15)),
         )?;
-        let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
+        let result = match exit_rx.recv_timeout(Duration::from_secs(20)) {
             Ok(result) => result,
             Err(error) => {
                 let _ = session.killer.kill();
@@ -3744,6 +6397,62 @@ mod tests {
             assert!(trace.lines().any(|line| line == stage), "{trace:?}");
         }
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_detached_pty_stub_completes_after_terminal_replies() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let trace_file = temp_dir.path().join("query-trace.txt");
+        let command = windows_detached_stub_command(temp_dir.path(), "queries", Some(&trace_file))?;
+
+        assert_windows_detached_pty_queries(&command, &trace_file)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_interactive_codex_batch_shim_remains_pty_interactive() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let trace_file = temp_dir.path().join("query-trace.txt");
+        // Compile the same console/PTY fixture used by the direct executable
+        // regression, then put an npm-style batch boundary in front of it.
+        let _native = windows_detached_stub_command(temp_dir.path(), "queries", Some(&trace_file))?;
+        let shim = temp_dir.path().join("codex.cmd");
+        std::fs::write(
+            &shim,
+            concat!(
+                "@echo off\r\n",
+                "\"%~dp0windows-detached-pty-stub.exe\" queries ",
+                "\"%~dp0query-trace.txt\" %*\r\n"
+            ),
+        )?;
+
+        let shim = shim.to_string_lossy().into_owned();
+        let (program, env_overrides) = prepare_harness_program(
+            "codex",
+            crate::harness::HarnessLaunchMode::Interactive,
+            shim.clone(),
+        )?;
+        assert_eq!(program, shim, "interactive Codex must retain its npm shim");
+        assert!(
+            env_overrides.is_empty(),
+            "interactive Codex must not receive native-package overrides"
+        );
+        let args = crate::harness::sanitize_argv_for_program(
+            "codex",
+            crate::harness::HarnessLaunchMode::Interactive,
+            &program,
+            vec!["--".to_string(), "interactive PTY smoke".to_string()],
+        );
+        let command = HarnessCommand {
+            program,
+            args,
+            cwd: temp_dir.path().to_path_buf(),
+            stdin_prompt: None,
+            env_overrides,
+        };
+
+        assert_windows_detached_pty_queries(&command, &trace_file)
     }
 
     /// Deliberately short, and shorter is safer here.
@@ -3926,6 +6635,7 @@ printf '%s\n' '{"type":"turn.completed"}'
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
         let mut assistant = Vec::new();
 
@@ -3974,6 +6684,7 @@ exec sleep 10
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
 
         // The activity budget must outlive shell startup so the script can
@@ -4023,6 +6734,7 @@ exec sleep 10
             // Far larger than an anonymous-pipe buffer. A synchronous write
             // would block indefinitely because the fake harness never reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
+            env_overrides: Vec::new(),
         };
 
         let started = Instant::now();
@@ -4067,6 +6779,7 @@ exit 0
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
 
         let started = Instant::now();
@@ -4135,6 +6848,7 @@ exit 23
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
         let mut assistant = Vec::new();
 
@@ -4200,6 +6914,7 @@ exit 0
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: None,
+            env_overrides: Vec::new(),
         };
 
         let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |_| Ok(()))?;
@@ -6028,15 +8743,12 @@ exit 0
         .unwrap();
 
         assert_eq!(command.program(), "claude");
-        #[cfg(windows)]
-        assert_eq!(command.args(), &["--", "\"explain ^&^& exit\""]);
-        #[cfg(not(windows))]
         assert_eq!(command.args(), &["--", "explain && exit"]);
         assert_eq!(command.cwd(), cwd);
     }
 
     #[test]
-    fn windows_codex_noninteractive_prompt_uses_stdin() {
+    fn codex_noninteractive_prompt_uses_stdin_when_requested() {
         let prompt = "first line\nsecond & line with %PATH%";
         let mut args = vec![
             "exec".to_string(),
@@ -6046,7 +8758,7 @@ exit 0
             prompt.to_string(),
         ];
 
-        let stdin_prompt = move_windows_codex_prompt_to_stdin(
+        let stdin_prompt = move_codex_prompt_to_stdin(
             "codex",
             crate::harness::HarnessLaunchMode::NonInteractive,
             prompt,
@@ -6081,18 +8793,18 @@ exit 0
         Ok(())
     }
 
-    #[cfg(windows)]
     #[test]
-    fn windows_codex_stdin_prompt_keeps_familiar_identity() -> anyhow::Result<()> {
+    fn piped_codex_stdin_prompt_keeps_identity_unicode_and_large_input() -> anyhow::Result<()> {
         let familiar = crate::harness::FamiliarContext {
             id: "codex-local".to_string(),
             display_name: "Codex Local".to_string(),
             role: None,
         };
-        let command = build_harness_command_with_conversation(
+        let prompt = format!("diagnose the failure 🔮\n{}", "evidence ".repeat(12_000));
+        let command = build_piped_harness_command_with_conversation(
             "codex",
-            "diagnose the failure",
-            Path::new("C:\\project"),
+            &prompt,
+            Path::new("/project"),
             crate::harness::HarnessLaunchMode::NonInteractive,
             None,
             Some(&familiar),
@@ -6101,7 +8813,12 @@ exit 0
 
         let prompt = String::from_utf8(command.stdin_prompt.expect("prompt should use stdin"))?;
         assert!(prompt.starts_with(&familiar.identity_preamble()));
-        assert!(prompt.ends_with("diagnose the failure"));
+        assert!(prompt.ends_with("evidence "));
+        assert!(prompt.contains("diagnose the failure 🔮"));
+        assert!(
+            prompt.len() > 100_000,
+            "fixture exceeds ordinary argv safety margins"
+        );
         assert_eq!(command.args.last().map(String::as_str), Some("-"));
         Ok(())
     }
@@ -6114,8 +8831,7 @@ exit 0
             ("codex", crate::harness::HarnessLaunchMode::Interactive),
         ] {
             let mut args = vec!["--".to_string(), prompt.to_string()];
-            let stdin_prompt =
-                move_windows_codex_prompt_to_stdin(harness, mode, prompt, &mut args, true);
+            let stdin_prompt = move_codex_prompt_to_stdin(harness, mode, prompt, &mut args, true);
             assert!(stdin_prompt.is_none());
             assert_eq!(args.last().map(String::as_str), Some(prompt));
         }
@@ -6135,6 +8851,7 @@ exit 0
             args: vec!["exec".to_string(), "--".to_string(), "-".to_string()],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"hello from stdin\nsecond & unsafe-looking line".to_vec()),
+            env_overrides: Vec::new(),
         };
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let callback_output = captured.clone();
@@ -6183,6 +8900,7 @@ exit 0
             ],
             cwd: temp_dir.path().to_path_buf(),
             stdin_prompt: Some(b"first line\nsecond line\n".to_vec()),
+            env_overrides: Vec::new(),
         };
         let mut assistant = Vec::new();
 
@@ -6260,6 +8978,7 @@ exit 0
             // the anonymous-pipe buffer, proving the activity deadline also
             // covers a blocked prompt writer rather than only stdout reads.
             stdin_prompt: Some(vec![b'x'; 1024 * 1024]),
+            env_overrides: Vec::new(),
         };
 
         let started = Instant::now();

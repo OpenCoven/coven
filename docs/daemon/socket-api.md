@@ -43,6 +43,7 @@ GET /api/v1/health
     "eventCursor": "sequence",
     "structuredErrors": true,
     "sessionHandoff": true,
+    "sessionLaunchPolicy": true,
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
@@ -55,6 +56,18 @@ GET /api/v1/health
   }
 }
 ```
+
+This example contains all 14 health capability fields: `sessions`, `events`,
+`travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
+`structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
+`afsCommit`, and `afsCommitDryRun`.
+
+`sessionLaunchPolicy` is `true` only on owner-gated local IPC. TCP health
+reports it as `false`, and TCP returns `403 forbidden` for any session request
+containing `launchPolicy`, regardless of accepted Host or Origin headers.
+Owner-local clients may use the exact Codex `nonInteractive` policy with
+approval `never`, sandbox `workspace-write`, and explicit absolute existing
+`addDirs`, including a named external mission workspace.
 
 `daemon` is `null` when daemon metadata is unavailable. When present,
 `daemon.socket` reports the active local IPC endpoint. A `hub` summary may also
@@ -75,7 +88,7 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `GET /api/v1/capabilities` | Discover routable capabilities and owning adapters. |
 | `POST /api/v1/actions` | Send a known intent through the control plane. |
 | `GET /api/v1/sessions` | List sessions. |
-| `POST /api/v1/sessions` | Launch a session. |
+| `POST /api/v1/sessions` | Launch a session. `launchPolicy` requires owner-gated local IPC and `sessionLaunchPolicy: true`; TCP rejects the field. |
 | `GET /api/v1/sessions/:id` | Fetch one session. |
 | `GET /api/v1/events?sessionId=...` | Read session events. |
 | `GET /api/v1/memory` | List familiar memory summaries with opaque ids. |

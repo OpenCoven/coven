@@ -357,9 +357,21 @@ export async function stopLiveSession({
     method: 'POST',
     path: `/api/v1/sessions/${sessionId}/kill`
   });
-  if (response.statusCode !== 202) {
-    throw new Error(`live fixture stop returned ${response.statusCode}`);
+  if (response.statusCode === 202) {
+    return;
   }
+  if (response.statusCode === 409) {
+    try {
+      const body = JSON.parse(response.body);
+      if (body?.error?.code === 'session_not_live') {
+        return;
+      }
+    } catch {
+      // Fall through to the status error below. A generic conflict is not
+      // evidence that the benchmark fixture has already stopped.
+    }
+  }
+  throw new Error(`live fixture stop returned ${response.statusCode}`);
 }
 
 export async function prepareEventTail({
@@ -426,7 +438,10 @@ export async function createHarnessFixture(fixtureRoot, environment = process.en
   const binDir = join(fixtureRoot, 'bin');
   await mkdir(binDir, { recursive: true });
   const executable = join(binDir, 'codex');
-  await writeFile(executable, '#!/bin/sh\nprintf "benchmark output\\n"\n', { mode: 0o700 });
+  // A successful noninteractive harness must accept its complete prompt before
+  // exiting. Draining stdin keeps this benchmark on the successful-launch path
+  // instead of racing the daemon's fail-closed prompt-delivery boundary.
+  await writeFile(executable, '#!/bin/sh\ncat >/dev/null\nprintf "benchmark output\\n"\n', { mode: 0o700 });
   await chmod(executable, 0o700);
   return { ...environment, PATH: `${binDir}:${environment.PATH ?? ''}` };
 }
@@ -435,7 +450,11 @@ export async function createInputHarnessFixture(fixtureRoot, environment = proce
   const binDir = join(fixtureRoot, 'event-bin');
   await mkdir(binDir, { recursive: true });
   const executable = join(binDir, 'codex');
-  await writeFile(executable, '#!/bin/sh\nwhile IFS= read -r line; do :; done\n', { mode: 0o700 });
+  await writeFile(
+    executable,
+    '#!/bin/sh\ncat >/dev/null\nwhile :; do sleep 1; done\n',
+    { mode: 0o700 }
+  );
   await chmod(executable, 0o700);
   return { ...environment, PATH: `${binDir}:${environment.PATH ?? ''}` };
 }

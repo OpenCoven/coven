@@ -79,6 +79,25 @@ title: "Coven changelog and release notes"
   [PR #714](https://github.com/OpenCoven/coven/pull/714),
   [PR #715](https://github.com/OpenCoven/coven/pull/715) and
   [PR #721](https://github.com/OpenCoven/coven/pull/721).
+- **Windows noninteractive sessions stay headless.** Piped and strictly
+  contained harness children now share one `CREATE_NO_WINDOW` policy without
+  changing interactive PTY sessions, and desktop clients can explicitly ask
+  the npm wrapper to hide its native child. The local daemon also advertises
+  and validates an exact Codex `nonInteractive` workspace-write launch policy,
+  restricting optional write roots to explicitly listed canonical directories;
+  on native Windows that policy explicitly selects Codex's unelevated
+  restricted-token backend so `workspace-write` is not downgraded to
+  `read-only`. Approval `never` is also pinned as a highest-precedence Codex
+  session config override so an enabled AutoReview policy cannot replace it
+  with the untrusted-project default.
+  Daemon-owned Codex prompts now travel losslessly over stdin on every platform
+  instead of becoming one potentially oversized command-line argument.
+  Windows daemon startup also treats its process-lifetime Job as mandatory:
+  if that Job cannot be created, configured or assigned, startup fails closed
+  rather than reopening the child birth-to-attachment containment gap. See
+  [issues #712](https://github.com/OpenCoven/coven/issues/712) and
+  [#713](https://github.com/OpenCoven/coven/issues/713).
+
 - **Faster session launch.** Session launches no longer spawn `git` to locate
   the repository maintenance gate when the project root is not inside a
   repository, restoring launch-to-first-output to its pre-gate baseline
