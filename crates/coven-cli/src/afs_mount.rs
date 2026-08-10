@@ -68,20 +68,36 @@ pub struct MountRecord {
 /// A live export child. Dropping this kills the export, which is the point:
 /// an export outliving its registry entry is a port serving files nobody is
 /// tracking.
+///
+/// That guarantee comes from the [`Drop`] impl below and nowhere else.
+/// `std::process::Child` deliberately does *not* kill on drop, so without it a
+/// dropped `Export` leaves a `coven-afs-serve` process serving the session's
+/// files on a loopback port with no registry entry and no record — and its
+/// stdin pipe stays open, so the child's own "the daemon is gone" exit never
+/// fires either.
 struct Export {
     child: Child,
     stdin: ChildStdin,
 }
 
 impl Export {
-    fn shutdown(mut self) {
-        // Best-effort: `quit` lets the child exit cleanly, and killing it is
-        // the fallback when it is already wedged. Neither failure is
-        // actionable — the mount is coming down either way.
+    /// Ask the export to stop, then make sure it has.
+    ///
+    /// Best-effort: `quit` lets the child exit cleanly, and killing it is the
+    /// fallback when it is already wedged. Neither failure is actionable — the
+    /// mount is coming down either way. Safe to reach twice; killing and
+    /// reaping an already-reaped child fails harmlessly.
+    fn terminate(&mut self) {
         let _ = writeln!(self.stdin, "quit");
         let _ = self.stdin.flush();
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+impl Drop for Export {
+    fn drop(&mut self) {
+        self.terminate();
     }
 }
 
@@ -261,11 +277,16 @@ fn spawn_and_mount(
     match outcome {
         Ok(()) => {}
         Err(error) => {
-            export.shutdown();
+            drop(export);
             return Err(error);
         }
     }
 
+    // `insert` returns any previous entry, which is dropped here and therefore
+    // terminated. That path is reachable: `mount()` guards on the on-disk
+    // record, and the record can go without `unmount()` running — the startup
+    // sweep reclaims it, or `mount()`'s own stale-owner branch clears it —
+    // neither of which touches this map.
     exports()
         .lock()
         .map_err(|_| anyhow!("mount registry poisoned"))?
@@ -378,9 +399,8 @@ pub fn unmount(coven_home: &Path, id: &str) -> AfsResult<bool> {
     };
     let mounted = pid_alive(record.owner_pid);
     if let Ok(mut guard) = exports().lock() {
-        if let Some(export) = guard.remove(id) {
-            export.shutdown();
-        }
+        // Removing drops, and dropping terminates.
+        guard.remove(id);
     }
     // Report a mount we could not take down rather than claiming success: the
     // caller asked for it to be gone, and something is holding it.
@@ -581,6 +601,65 @@ mod tests {
         assert!(sweep_orphans(home).is_empty());
         assert!(!record_path(home, "afs-junk").exists());
         Ok(())
+    }
+
+    /// A long-lived child standing in for an export, with the same piped
+    /// stdin the real one has.
+    #[cfg(unix)]
+    fn fake_export() -> (Export, u32) {
+        let mut child = Command::new("sleep")
+            .arg("60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn a stand-in child");
+        let pid = child.id();
+        let stdin = child.stdin.take().expect("stdin was piped");
+        (Export { child, stdin }, pid)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_an_export_terminates_its_child() {
+        // `std::process::Child` does not kill on drop, so this holds only
+        // because of the Drop impl. Without it the export survives as a
+        // loopback port serving a session's files with nothing tracking it.
+        let (export, pid) = fake_export();
+        assert!(pid_alive(pid), "the stand-in child should start alive");
+        drop(export);
+        assert!(
+            !pid_alive(pid),
+            "dropping an Export must terminate its child"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_registry_entry_terminates_the_export_it_displaces() {
+        // The reachable path for coven-384: `mount()` guards on the on-disk
+        // record, so a session whose record went away without `unmount()`
+        // running can mount again and displace a live entry here.
+        let mut registry: HashMap<String, Export> = HashMap::new();
+        let (first, first_pid) = fake_export();
+        let (second, second_pid) = fake_export();
+
+        registry.insert("afs-x".into(), first);
+        registry.insert("afs-x".into(), second);
+
+        assert!(
+            !pid_alive(first_pid),
+            "the displaced export must not survive its registry entry"
+        );
+        assert!(
+            pid_alive(second_pid),
+            "the replacement should still be live"
+        );
+        drop(registry);
+        assert!(
+            !pid_alive(second_pid),
+            "clearing the registry terminates it"
+        );
     }
 
     #[test]
