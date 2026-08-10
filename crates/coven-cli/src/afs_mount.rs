@@ -10,12 +10,16 @@
 //! afs/mounts/<id>/          the mount point itself
 //! ```
 //!
-//! **Off by default.** `AfsNfs` exports a single [`AgentFs`], not the merged
-//! base+delta view DESIGN.md §3.2 specifies — see bead `coven-vlw`. A mount
-//! today shows only the files a session already changed, which is not what a
-//! caller asking for a mount means. So the backend is advertised, and the
-//! routes work, only under an explicit opt-in; without it `afsMount` is
-//! `false` and `POST …/mount` answers `afs.mount_unsupported`.
+//! **Available where a backend exists.** The export serves the merged
+//! base+delta view (DESIGN.md §3.2), so a mount shows what a caller asking for
+//! one means. `afsMount` reports `"nfs"` on macOS where the export helper
+//! shipped, and `false` everywhere else.
+//!
+//! What mount availability does *not* claim is that every process can read
+//! through the mount. macOS refuses `open()` on network volumes for processes
+//! without the right privacy consent (bead `coven-x77`), which is a property
+//! of the calling process, not of the export. Capabilities advertise
+//! availability and never grant permission.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -27,10 +31,6 @@ use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::afs::{AfsError, AfsResult};
-
-/// Opt-in switch. Named for what it is: the backend is experimental until
-/// `coven-vlw` gives it a merged view to serve.
-const OPT_IN_ENV: &str = "COVEN_AFS_MOUNT_EXPERIMENTAL";
 
 /// The export process, kept beside the daemon binary.
 const HELPER: &str = "coven-afs-serve";
@@ -92,25 +92,15 @@ fn exports() -> &'static Mutex<HashMap<String, Export>> {
 
 /// The mount backend for this platform and build, or `None`.
 ///
-/// `None` is the honest answer in three distinct situations and the caller
-/// cannot tell them apart, which is fine: all three mean "do not offer to
-/// mount". The opt-in is checked first so that the common path does no
-/// filesystem work.
+/// `None` is the honest answer in two distinct situations and the caller
+/// cannot tell them apart, which is fine: both mean "do not offer to mount".
+/// Linux's FUSE backend is not built yet, so macOS is the only platform that
+/// reports one.
 pub fn backend() -> Option<&'static str> {
-    if !opted_in() {
-        return None;
-    }
     if !cfg!(target_os = "macos") {
         return None;
     }
     helper_path().is_some().then_some("nfs")
-}
-
-fn opted_in() -> bool {
-    matches!(
-        std::env::var(OPT_IN_ENV).as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
 }
 
 /// Locate the export helper next to the running daemon. A build that did not
@@ -156,7 +146,13 @@ pub fn current(coven_home: &Path, id: &str) -> Option<String> {
 }
 
 /// `afs.mount` — mount a session's filesystem and return where it landed.
-pub fn mount(coven_home: &Path, id: &str, delta: &Path, read_only: bool) -> AfsResult<MountView> {
+pub fn mount(
+    coven_home: &Path,
+    id: &str,
+    delta: &Path,
+    base: Option<&Path>,
+    read_only: bool,
+) -> AfsResult<MountView> {
     let Some(backend_name) = backend() else {
         return Err(AfsError::MountUnsupported);
     };
@@ -202,7 +198,7 @@ pub fn mount(coven_home: &Path, id: &str, delta: &Path, read_only: bool) -> AfsR
     // no future daemon knows to take down.
     write_record(coven_home, &record).map_err(AfsError::Internal)?;
 
-    if let Err(error) = spawn_and_mount(id, delta, &point) {
+    if let Err(error) = spawn_and_mount(id, delta, base, &point) {
         let _ = reclaim(coven_home, &record);
         return Err(AfsError::Internal(error));
     }
@@ -233,10 +229,17 @@ fn prepare_mount_point(point: &Path) -> AfsResult<()> {
 ///
 /// Every failure path tears the export back down. A half-mounted session that
 /// left an NFS server listening would be exactly the orphan §7 is about.
-fn spawn_and_mount(id: &str, delta: &Path, point: &Path) -> Result<()> {
+fn spawn_and_mount(id: &str, delta: &Path, base: Option<&Path>, point: &Path) -> Result<()> {
     let helper = helper_path().ok_or_else(|| anyhow!("{HELPER} is not installed"))?;
-    let mut child = Command::new(&helper)
-        .arg(delta)
+    let mut command = Command::new(&helper);
+    command.arg(delta);
+    // A second argument makes the export an overlay. Omitting it for a
+    // base-less session is deliberate, not a fallback: there is no merged view
+    // to build.
+    if let Some(base) = base {
+        command.arg(base);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -501,11 +504,10 @@ mod tests {
     const DEAD_PID: u32 = 0;
 
     #[test]
-    fn the_backend_is_off_without_the_opt_in() {
-        // The default matters more than the enabled path here: until
-        // coven-vlw lands a merged view, an accidentally-advertised backend
-        // would offer a mount showing only changed files.
-        if std::env::var(OPT_IN_ENV).is_ok() {
+    fn no_backend_is_advertised_off_macos() {
+        // FUSE is not built. A platform without a backend must report none
+        // rather than offer a mount it cannot perform.
+        if cfg!(target_os = "macos") {
             return;
         }
         assert_eq!(backend(), None);
@@ -633,7 +635,7 @@ mod tests {
             return Ok(());
         }
         let temp = tempfile::tempdir()?;
-        let error = mount(temp.path(), "afs-x", &temp.path().join("d.db"), false)
+        let error = mount(temp.path(), "afs-x", &temp.path().join("d.db"), None, false)
             .expect_err("no backend should refuse");
         assert!(matches!(error, AfsError::MountUnsupported));
         Ok(())

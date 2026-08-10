@@ -157,17 +157,22 @@ Tool-call parameters, results, and errors pass through the daemon privacy
 filters before serialization. A missing or dangling audit reference produces
 `toolCall: null` without dropping the filesystem operation.
 
-`afsMount` reports the mount backend or `false`, and is **`false` by default**,
-so `POST .../mount` returns `501` with `afs.mount_unsupported` to match. The
-mount lifecycle is implemented — the daemon spawns a per-mount export process,
-mounts it, rotates the export token, and unmounts orphans left by a dead daemon
-at startup — but the NFS export still serves a session's delta rather than the
-merged base+delta view, so a mount would show only files the session had
-already changed. Setting `COVEN_AFS_MOUNT_EXPERIMENTAL=1` on a macOS daemon
-enables the backend anyway for development. Mounting requires an open session;
-`DELETE` does not, so a session committed while mounted can still be taken
-down, and unmounting something that is not mounted succeeds rather than
-erroring.
+`afsMount` reports the mount backend or `false`. It is `"nfs"` on macOS where
+the export helper shipped and `false` elsewhere — the Linux FUSE backend is not
+built. `POST .../mount` returns `501` with `afs.mount_unsupported` wherever no
+backend is reported.
+
+The daemon spawns a per-mount export process serving the merged base+delta
+view, mounts it on loopback, rotates the export token as soon as the mount
+returns, and unmounts orphans left by a dead daemon at startup. Mounting
+requires an open session; `DELETE` does not, so a session committed while
+mounted can still be taken down, and unmounting something that is not mounted
+succeeds rather than erroring.
+
+A reported backend means the daemon can mount, not that every process can read
+through the mount: macOS refuses `open()` on network volumes for processes
+without the right privacy consent. Capabilities advertise availability and
+never grant permission.
 
 Commit creates a git worktree at the session's `base_commit`, applies the
 change set, and produces a **signed** commit carrying `Coven-Session`,

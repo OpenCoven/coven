@@ -7031,10 +7031,16 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let response = handle_request("GET", "/api/v1/health", temp.path(), None)?;
         assert!(response.body.contains(r#""afs":true"#));
-        // A client must be able to see that mounting is unavailable rather
-        // than discovering it from a failed request. Commit materialized in
-        // coven-fty, so it now advertises true.
-        assert!(response.body.contains(r#""afsMount":false"#));
+        // A client must be able to see whether mounting is available rather
+        // than discovering it from a failed request. What health reports is
+        // whatever backend detection found — asserting a constant here would
+        // pass or fail on where the test binary happens to sit relative to the
+        // export helper, which is not the contract.
+        let expected = match crate::afs_mount::backend() {
+            Some(backend) => format!(r#""afsMount":"{backend}""#),
+            None => r#""afsMount":false"#.to_string(),
+        };
+        assert!(response.body.contains(&expected), "{}", response.body);
         assert!(response.body.contains(r#""afsCommit":true"#));
         Ok(())
     }
@@ -7100,19 +7106,22 @@ mod tests {
         )?;
         assert_eq!(unconfirmed.status, 400);
 
-        // The mount lifecycle is wired, but no backend is advertised by
-        // default (bead coven-vlw: the export serves a single delta, not the
-        // merged view), so the route refuses through the same envelope the
-        // capability flags predict.
-        let mount = handle_request_with_body(
-            "POST",
-            &format!("/api/v1/afs/sessions/{id}/mount"),
-            temp.path(),
-            None,
-            Some("{}"),
-        )?;
-        assert_eq!(mount.status, 501);
-        assert!(mount.body.contains("afs.mount_unsupported"));
+        // Where no backend exists the route refuses through the same envelope
+        // the capability flags predict. Where one does, this test does not
+        // mount: a real mount belongs in a test that can also unmount, and a
+        // stray NFS mount left behind by a unit test is worse than the
+        // coverage is worth.
+        if crate::afs_mount::backend().is_none() {
+            let mount = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/afs/sessions/{id}/mount"),
+                temp.path(),
+                None,
+                Some("{}"),
+            )?;
+            assert_eq!(mount.status, 501);
+            assert!(mount.body.contains("afs.mount_unsupported"));
+        }
 
         // Unmount is idempotent: asking an unmounted session to unmount is the
         // state the caller wanted, so it succeeds rather than inventing an
