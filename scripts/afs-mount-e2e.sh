@@ -30,7 +30,10 @@ for arg in "$@"; do
     case "$arg" in
         --installed) USE_INSTALLED=1 ;;
         -h|--help)
-            sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            # Everything between the shebang and `set`, so the help cannot
+            # drift out of sync as the header grows.
+            sed -n '2,/^set -uo pipefail/p' "${BASH_SOURCE[0]}" \
+                | sed '$d' | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -95,25 +98,32 @@ if [ "$USE_INSTALLED" -eq 1 ]; then
     # readlink resolves it against the caller's directory rather than the
     # link's own, which lands nowhere.
     WRAPPER_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WRAPPER")"
+    # Both macOS platform packages: `cli-macos` is Apple Silicon and
+    # `cli-macos-x64` is Intel. Checking only the first would fail on every
+    # Intel install, where the package is present under the other name.
     INSTALL_BIN=""
-    for candidate in \
-        "$(dirname "$WRAPPER_REAL")/../node_modules/@opencoven/cli-macos/bin" \
-        "$(dirname "$WRAPPER_REAL")/../../node_modules/@opencoven/cli-macos/bin"; do
-        if [ -x "$candidate/coven" ]; then
-            INSTALL_BIN="$(cd "$candidate" && pwd -P)"
-            break
-        fi
+    wrapper_dir="$(dirname "$WRAPPER_REAL")"
+    for pkg in cli-macos cli-macos-x64; do
+        for candidate in \
+            "$wrapper_dir/../node_modules/@opencoven/$pkg/bin" \
+            "$wrapper_dir/../../node_modules/@opencoven/$pkg/bin"; do
+            if [ -x "$candidate/coven" ]; then
+                INSTALL_BIN="$(cd "$candidate" && pwd -P)"
+                INSTALL_PKG="$pkg"
+                break 2
+            fi
+        done
     done
     [ -n "$INSTALL_BIN" ] || { bad "could not locate the installed platform package from $WRAPPER"; exit 1; }
     COVEN="$INSTALL_BIN/coven"
     if [ ! -x "$INSTALL_BIN/coven-afs-serve" ]; then
         # The exact v0.3.0 failure, named rather than surfacing later as
         # afsMount=false with no explanation.
-        bad "the installed package ships no coven-afs-serve; the mount backend cannot work (coven-g2t)"
+        bad "@opencoven/${INSTALL_PKG} ships no coven-afs-serve; the mount backend cannot work (coven-g2t)"
         exit 1
     fi
     ok "installed $("$COVEN" --version 2>/dev/null | head -1)"
-    ok "helper shipped beside it"
+    ok "helper shipped beside it in @opencoven/${INSTALL_PKG}"
 else
     step "build the daemon and the export helper"
     # The daemon locates the helper beside its own executable, so both must
