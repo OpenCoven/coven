@@ -1,7 +1,7 @@
 #![cfg(windows)]
 
 use std::io::{Read, Write};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -54,12 +54,25 @@ fn main() {
     }
 
     let pid_file = args.get(2).expect("timeout mode requires a pid file");
-    set_raw_input_mode().expect("failed to enable raw VT input mode");
+    // Spawn and register the descendant before touching the terminal, so the
+    // pid is on disk as early as possible: the runner kills this process tree
+    // when its startup timeout fires, and a pid written after that is a pid
+    // the test never sees.
+    //
+    // The descendant's stdio goes to null rather than being inherited. This
+    // mode exists to produce *no* meaningful output, and an inherited handle
+    // lets any stray printable byte from `cmd.exe` reach the PTY — which the
+    // runner reads as the harness having started, permanently disabling the
+    // startup timeout under test (`coven-5ua`).
     let mut descendant = Command::new("cmd.exe")
         .args(["/d", "/c", "ping 127.0.0.1 -n 120 >nul"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .unwrap();
     std::fs::write(pid_file, descendant.id().to_string()).unwrap();
+    set_raw_input_mode().expect("failed to enable raw VT input mode");
     output.write_all(b"\x1b[6n").unwrap();
     output.flush().unwrap();
     expect_reply(&mut input, b"\x1b[1;1R", None, "timeout-cpr");

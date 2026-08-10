@@ -3746,19 +3746,24 @@ mod tests {
         Ok(())
     }
 
-    /// Headroom for the fixture to register its descendant, not a measured
-    /// budget.
+    /// Deliberately short, and shorter is safer here.
     ///
-    /// The stub spawns a `cmd.exe` descendant, writes its pid, and only then
-    /// blocks on a CPR reply that never arrives — and all of that has to
-    /// happen before the startup timeout under test fires. Two seconds was
-    /// enough on an idle host and not on a loaded CI runner, where the runner
-    /// killed the stub before the pid file existed and the test failed reading
-    /// it (`coven-047`, `coven-5ua`). The behaviour under test is that a
-    /// startup timeout fails the run and kills the descendant; how long the
-    /// timeout is set to is not part of that claim.
+    /// `spawn_detached_with_observer_and_timeout` races three claimants on one
+    /// `AtomicU8`: meaningful output, child exit, and the timeout thread's
+    /// `compare_exchange(0 -> 2)`. Only the winner acts, so if anything
+    /// printable reaches the PTY first the timeout never fires at all — the
+    /// stub then blocks forever in `expect_reply`, `on_exit` never runs, and
+    /// every watchdog in this test expires.
+    ///
+    /// The stub's descendant is `cmd.exe ... >nul`, which normally emits
+    /// nothing, but any stray printable byte claims the state permanently.
+    /// Lengthening this window widens the opportunity for that, which is what
+    /// an earlier attempt at `coven-5ua` did: raising it to 15s traded the
+    /// pid-file race for a worse failure where the timeout lost the race
+    /// outright. Two seconds is enough because the pid is now polled for
+    /// concurrently rather than read after the kill.
     #[cfg(windows)]
-    const WINDOWS_DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+    const WINDOWS_DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 
     /// Containment watchdogs. Reaching one means something is hung, not that
     /// the host was slow, so they are generous on purpose.
@@ -3818,7 +3823,20 @@ mod tests {
             Ok(result) => result,
             Err(error) => {
                 let _ = session.killer.kill();
-                return Err(error.into());
+                // Say which race was lost instead of only that a deadline
+                // passed. The startup timeout emits its own message when it
+                // wins; its absence here means something else claimed
+                // `startup_state` first and the timeout never fired, which is
+                // a different defect from slow reaping under load.
+                let observed = String::from_utf8_lossy(&captured.lock().unwrap()).into_owned();
+                let diagnosis = if observed.contains("no meaningful output") {
+                    "startup timeout fired but the child was never reaped"
+                } else {
+                    "startup timeout never fired: another claimant won startup_state"
+                };
+                return Err(anyhow::anyhow!(
+                    "{error}: {diagnosis}; observed output: {observed:?}"
+                ));
             }
         };
         let descendant_pid = descendant_pid.with_context(|| {
