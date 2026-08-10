@@ -520,6 +520,17 @@ path after mount. The server-side half of that property — a captured handle
 outliving rotation — is covered by a unit test, so a regression fails CI rather
 than waiting on a manual check.
 
+On 2026-08-10, the `scripts/afs-mount-smoke.sh` probe run from an automated
+agent shell on a maintainer's machine completed every stage: mount, readdir,
+read, and write through the mount. That is the operation MOUNT-SPIKE.md §4
+recorded as `EPERM` for an automated agent shell, so it does **not** overturn
+that finding — the likelier reading is that consent is a property of the
+process tree, and this shell inherited a terminal that had since been granted
+it. What it does establish is that nothing about being automated is
+disqualifying on its own. The genuinely unconsented data point comes from the
+`AFS mount backend (macOS)` CI job, which runs the same probe on a runner and
+reports its verdict without gating the build.
+
 **Enforcement is not free.** As RESEARCH.md notes, the mount alone does not stop
 an agent writing to an absolute path outside it. AFS bounds the blast radius of
 writes that go *through* it; the OS sandbox that forces all writes through the
