@@ -96,7 +96,8 @@ listener. A remote companion needs a separately paired transport.
   "capabilities": {
     "afs": true,
     "afsMount": "nfs",
-    "afsCommit": true
+    "afsCommit": true,
+    "afsCommitDryRun": true
   }
 }
 ```
@@ -105,8 +106,10 @@ listener. A remote companion needs a separately paired transport.
 (Linux), or `false` when no mount backend is available — a client must branch on
 it rather than assume mounting works, because SDK-only operation is a supported
 mode. `afsCommit` is false when the daemon cannot materialize commits (no git,
-or a read-only project root). Capabilities advertise availability and never
-grant permission.
+or a read-only project root). `afsCommitDryRun` separately advertises the
+side-effect-free preview contract; clients must not infer it from `afsCommit`
+because commit support predates `dryRun`. Capabilities advertise availability
+and never grant permission.
 
 ### 3.2 Operations
 
