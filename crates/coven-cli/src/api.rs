@@ -6771,9 +6771,15 @@ fn afs_read(coven_home: &Path, path: &str, query: Option<&str>) -> Result<ApiRes
             Ok(view) => json_response(200, &view),
             Err(error) => afs_failure(error),
         },
-        Some("diff") => match store.diff(&id) {
-            Ok(view) => json_response(200, &view),
-            Err(error) => afs_failure(error),
+        Some("diff") => match query.and_then(|q| decoded_query_param(q, "path")) {
+            Some(path) => match store.file_diff(&id, &path) {
+                Ok(view) => json_response(200, &view),
+                Err(error) => afs_failure(error),
+            },
+            None => match store.diff(&id) {
+                Ok(view) => json_response(200, &view),
+                Err(error) => afs_failure(error),
+            },
         },
         Some("timeline") => {
             let since = query
@@ -6927,6 +6933,11 @@ pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     })
 }
 
+pub(crate) fn decoded_query_param(query: &str, key: &str) -> Option<String> {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find_map(|(candidate, value)| (candidate == key).then_some(value.into_owned()))
+}
+
 fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
     path.trim_start_matches("/sessions/")
         .strip_suffix(suffix)
@@ -7001,6 +7012,18 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), b"fn main() {}").unwrap();
         root.to_string_lossy().into_owned()
+    }
+
+    fn afs_overlay_for(coven_home: &Path, session: &serde_json::Value) -> coven_afs::OverlayFs {
+        let id = session["id"].as_str().unwrap();
+        let fingerprint = session["base"]["fingerprint"].as_str().unwrap();
+        coven_afs::OverlayFs::open(
+            coven_home.join("afs/sessions").join(format!("{id}.db")),
+            coven_home
+                .join("afs/bases")
+                .join(format!("{fingerprint}.db")),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -7203,6 +7226,121 @@ mod tests {
         assert_eq!(bad.status, 400);
         Ok(())
     }
+
+    #[test]
+    fn afs_diff_query_path_is_percent_decoded_and_returns_file_diff_view() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        std::fs::write(
+            Path::new(&root).join("space name.txt"),
+            "alpha\nbeta\ngamma\n",
+        )?;
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let session: serde_json::Value = serde_json::from_str(&created.body)?;
+        let id = session["id"].as_str().unwrap().to_string();
+
+        let mut overlay = afs_overlay_for(temp.path(), &session);
+        overlay.write_file("/space name.txt", b"alpha\nbeta changed\ngamma\n")?;
+
+        let change_list = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/diff"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(change_list.status, 200);
+        let change_list: serde_json::Value = serde_json::from_str(&change_list.body)?;
+        assert!(change_list.get("changes").is_some());
+        assert!(change_list.get("patch").is_none());
+
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", "/space name.txt")
+            .finish();
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/diff?{query}"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(response.status, 200);
+        let response: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["path"], "/space name.txt");
+        assert_eq!(response["binary"], false);
+        assert_eq!(response["truncated"], false);
+        assert!(response["patch"]
+            .as_str()
+            .unwrap()
+            .contains("+beta changed"));
+        Ok(())
+    }
+
+    #[test]
+    fn afs_diff_query_path_missing_returns_structured_not_found() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let session: serde_json::Value = serde_json::from_str(&created.body)?;
+        let id = session["id"].as_str().unwrap().to_string();
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", "/missing.txt")
+            .finish();
+
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/diff?{query}"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""code":"afs.path_not_found""#));
+        assert!(response.body.contains("/missing.txt"));
+        Ok(())
+    }
+
+    #[test]
+    fn afs_diff_query_path_directory_returns_structured_client_error() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = afs_project(temp.path());
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/afs/sessions",
+            temp.path(),
+            None,
+            Some(&json!({ "projectRoot": root }).to_string()),
+        )?;
+        let session: serde_json::Value = serde_json::from_str(&created.body)?;
+        let id = session["id"].as_str().unwrap().to_string();
+        let mut delta =
+            coven_afs::AgentFs::create(temp.path().join("afs/sessions").join(format!("{id}.db")))?;
+        delta.mkdir_p("/fresh")?;
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("path", "/fresh")
+            .finish();
+
+        let response = handle_request(
+            "GET",
+            &format!("/api/v1/afs/sessions/{id}/diff?{query}"),
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""code":"afs.path_not_file""#));
+        assert!(response.body.contains("/fresh"));
+        Ok(())
+    }
+
     use crate::project;
 
     #[test]

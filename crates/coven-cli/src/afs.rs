@@ -16,14 +16,17 @@
 //! overlay handles across requests would buy contention rather than speed.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use similar::TextDiff;
 
 use coven_afs::{
-    Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, STATE_COMMITTED,
+    normalize, Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, STATE_COMMITTED,
     STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
 };
 
@@ -44,6 +47,7 @@ const INGEST_EXCLUDES: &[&str] = &[".git", "target", "node_modules", ".worktrees
 /// 238 ms). 16 MiB keeps a worst-case first write near ~120 ms, which stays
 /// inside a plausible interactive budget; 32 MiB would not.
 pub const COPY_UP_MAX_BYTES: u64 = 16 * 1024 * 1024;
+pub const UNIFIED_DIFF_MAX_BYTES: usize = 256 * 1024;
 
 /// Failures that map onto DESIGN.md §3.4's dotted error codes.
 ///
@@ -53,6 +57,8 @@ pub const COPY_UP_MAX_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub enum AfsError {
     SessionNotFound(String),
+    PathNotFound(String),
+    PathNotFile(String),
     SessionNotOpen {
         id: String,
         state: String,
@@ -95,6 +101,12 @@ impl AfsError {
                 404,
                 "afs.session_not_found",
                 format!("No AFS session {id}."),
+            ),
+            Self::PathNotFound(path) => (404, "afs.path_not_found", format!("No AFS path {path}.")),
+            Self::PathNotFile(path) => (
+                400,
+                "afs.path_not_file",
+                format!("AFS path {path} is not a regular file."),
             ),
             Self::SessionNotOpen { id, state } => (
                 409,
@@ -297,6 +309,15 @@ pub struct DiffView {
     pub changes: Vec<ChangeView>,
     pub counts: ChangeCounts,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileDiffView {
+    pub path: String,
+    pub patch: String,
+    pub truncated: bool,
+    pub binary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +645,71 @@ impl AfsStore {
             changes,
             counts,
             truncated: false,
+        })
+    }
+
+    /// `afs.session.diff` for a single file path.
+    pub fn file_diff(&self, id: &str, path: &str) -> AfsResult<FileDiffView> {
+        let binding = self.binding(id)?;
+        let overlay = self.open_overlay(id, &binding)?;
+        let path = normalize(path);
+
+        let base_meta = optional_agent_metadata(overlay.base(), &path)?;
+        let merged_meta = optional_overlay_metadata(&overlay, &path)?;
+        if base_meta.is_none() && merged_meta.is_none() {
+            return Err(AfsError::PathNotFound(path));
+        }
+        if base_meta.as_ref().is_some_and(|meta| !meta.is_file())
+            || merged_meta.as_ref().is_some_and(|meta| !meta.is_file())
+        {
+            return Err(AfsError::PathNotFile(path));
+        }
+
+        let base = if base_meta.is_some() {
+            Some(overlay.base().read_file(&path).map_err(AfsError::from)?)
+        } else {
+            None
+        };
+        let merged = if merged_meta.is_some() {
+            Some(overlay.read_file(&path).map_err(AfsError::from)?)
+        } else {
+            None
+        };
+        let path_header = diff_header_path(&path);
+        let base_header = if base.is_some() {
+            path_header.as_str()
+        } else {
+            "/dev/null"
+        };
+        let merged_header = if merged.is_some() {
+            path_header.as_str()
+        } else {
+            "/dev/null"
+        };
+        let (patch, truncated, binary) = match (
+            std::str::from_utf8(base.as_deref().unwrap_or(&[])),
+            std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
+        ) {
+            (Ok(""), Ok("")) if base.is_none() != merged.is_none() => {
+                let (patch, truncated) = bounded_diff_headers(base_header, merged_header, &path)?;
+                (patch, truncated, false)
+            }
+            (Ok(base), Ok(merged)) => {
+                let (patch, truncated) =
+                    bounded_unified_diff(base, merged, base_header, merged_header, &path)?;
+                (patch, truncated, false)
+            }
+            _ if matches!((&base, &merged), (Some(base), Some(merged)) if base == merged) => {
+                (String::new(), false, true)
+            }
+            _ => ("Binary files differ\n".to_string(), false, true),
+        };
+
+        Ok(FileDiffView {
+            path,
+            patch,
+            truncated,
+            binary,
         })
     }
 
@@ -1367,6 +1453,162 @@ fn cleanup_failed_materialization(project_root: &Path, worktree_path: &Path, bra
         .output();
 }
 
+fn optional_agent_metadata(fs: &AgentFs, path: &str) -> AfsResult<Option<coven_afs::Metadata>> {
+    match fs.stat(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(coven_afs::Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(AfsError::from(error)),
+    }
+}
+
+fn optional_overlay_metadata(
+    overlay: &OverlayFs,
+    path: &str,
+) -> AfsResult<Option<coven_afs::Metadata>> {
+    match overlay.stat(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(coven_afs::Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(AfsError::from(error)),
+    }
+}
+
+fn diff_header_path(path: &str) -> String {
+    if !path
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
+    {
+        return path.to_string();
+    }
+
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for character in path.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\u{08}' => quoted.push_str("\\b"),
+            '\u{0c}' => quoted.push_str("\\f"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            character if character.is_control() => {
+                write!(&mut quoted, "\\u{:04x}", character as u32)
+                    .expect("writing to a String cannot fail");
+            }
+            character => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn bounded_unified_diff(
+    base: &str,
+    merged: &str,
+    base_header: &str,
+    merged_header: &str,
+    path: &str,
+) -> AfsResult<(String, bool)> {
+    let diff = TextDiff::from_lines(base, merged);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(3).header(base_header, merged_header);
+
+    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
+    let result = unified.to_writer(&mut output);
+    finish_bounded_diff(output, result, path)
+}
+
+fn bounded_diff_headers(
+    base_header: &str,
+    merged_header: &str,
+    path: &str,
+) -> AfsResult<(String, bool)> {
+    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
+    let result = writeln!(&mut output, "--- {base_header}")
+        .and_then(|()| writeln!(&mut output, "+++ {merged_header}"));
+    finish_bounded_diff(output, result, path)
+}
+
+fn finish_bounded_diff(
+    output: CappedDiffWriter,
+    result: io::Result<()>,
+    path: &str,
+) -> AfsResult<(String, bool)> {
+    if let Err(error) = result {
+        if !output.truncated {
+            return Err(AfsError::Internal(anyhow::anyhow!(
+                "failed to render unified diff for {path}: {error}"
+            )));
+        }
+    }
+    let truncated = output.truncated;
+    let patch = String::from_utf8(output.bytes).map_err(|error| {
+        AfsError::Internal(anyhow::anyhow!(
+            "unified diff for {path} was not valid UTF-8: {error}"
+        ))
+    })?;
+    Ok((patch, truncated))
+}
+
+struct CappedDiffWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    truncated: bool,
+}
+
+impl CappedDiffWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes),
+            max_bytes,
+            truncated: false,
+        }
+    }
+}
+
+impl Write for CappedDiffWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.bytes.len() == self.max_bytes {
+            self.truncated = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "unified diff output limit reached",
+            ));
+        }
+
+        let remaining = self.max_bytes - self.bytes.len();
+        if buf.len() <= remaining {
+            self.bytes.extend_from_slice(buf);
+            return Ok(buf.len());
+        }
+
+        let text = std::str::from_utf8(buf)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut end = remaining;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == 0 {
+            self.truncated = true;
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "unified diff output limit reached",
+            ));
+        }
+
+        self.bytes.extend_from_slice(&buf[..end]);
+        self.truncated = true;
+        Ok(end)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 // ---- base ingest --------------------------------------------------------
 
 fn git_head(project_root: &Path) -> Option<String> {
@@ -1557,6 +1799,12 @@ mod tests {
     fn delta_write(store: &AfsStore, id: &str, path: &str, data: &[u8]) {
         let mut fs = store.open_delta(id).unwrap();
         fs.write_file(path, data).unwrap();
+    }
+
+    fn delta_remove(store: &AfsStore, id: &str, path: &str) {
+        let binding = store.binding(id).unwrap();
+        let mut overlay = store.open_overlay(id, &binding).unwrap();
+        overlay.remove_file(path).unwrap();
     }
 
     fn delta_symlink(store: &AfsStore, id: &str, target: &str, link: &str) {
@@ -2080,6 +2328,198 @@ mod tests {
             diff.changes.iter().all(|c| c.attribution == "unknown"),
             "writes with no provenance must be visible AND marked unknown"
         );
+    }
+
+    #[test]
+    fn file_diff_reports_a_modified_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("notes.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(
+            &store,
+            &view.id,
+            "/notes.txt",
+            b"alpha\nbeta changed\ngamma\n",
+        );
+
+        let diff = store.file_diff(&view.id, "/notes.txt").unwrap();
+        assert_eq!(diff.path, "/notes.txt");
+        assert!(!diff.binary);
+        assert!(!diff.truncated);
+        assert!(diff.patch.contains("--- /notes.txt"));
+        assert!(diff.patch.contains("+++ /notes.txt"));
+        assert!(diff.patch.contains("-beta"));
+        assert!(diff.patch.contains("+beta changed"));
+    }
+
+    #[test]
+    fn file_diff_reports_an_added_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/src/added.txt", b"new line\n");
+
+        let diff = store.file_diff(&view.id, "/src/added.txt").unwrap();
+        assert_eq!(diff.path, "/src/added.txt");
+        assert!(!diff.binary);
+        assert!(!diff.truncated);
+        assert!(diff.patch.contains("--- /dev/null"));
+        assert!(diff.patch.contains("+++ /src/added.txt"));
+        assert!(diff.patch.contains("+new line"));
+    }
+
+    #[test]
+    fn file_diff_reports_a_deleted_text_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("notes.txt"), "alpha\nbeta\n").unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_remove(&store, &view.id, "/notes.txt");
+
+        let diff = store.file_diff(&view.id, "/notes.txt").unwrap();
+        assert_eq!(diff.path, "/notes.txt");
+        assert!(!diff.binary);
+        assert!(!diff.truncated);
+        assert!(diff.patch.contains("--- /notes.txt"));
+        assert!(diff.patch.contains("+++ /dev/null"));
+        assert!(diff.patch.contains("-alpha"));
+        assert!(diff.patch.contains("-beta"));
+    }
+
+    #[test]
+    fn file_diff_distinguishes_added_and_deleted_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("deleted-empty.txt"), b"").unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/added-empty.txt", b"");
+        delta_remove(&store, &view.id, "/deleted-empty.txt");
+
+        let added = store.file_diff(&view.id, "/added-empty.txt").unwrap();
+        assert_eq!(
+            added.patch, "--- /dev/null\n+++ /added-empty.txt\n",
+            "an empty added file still needs an explicit patch"
+        );
+        assert!(!added.truncated);
+        assert!(!added.binary);
+
+        let deleted = store.file_diff(&view.id, "/deleted-empty.txt").unwrap();
+        assert_eq!(
+            deleted.patch, "--- /deleted-empty.txt\n+++ /dev/null\n",
+            "an empty deleted file still needs an explicit patch"
+        );
+        assert!(!deleted.truncated);
+        assert!(!deleted.binary);
+    }
+
+    #[test]
+    fn file_diff_escapes_control_characters_in_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        let path = "/odd\tname\n.txt";
+
+        delta_write(&store, &view.id, path, b"contents\n");
+
+        let diff = store.file_diff(&view.id, path).unwrap();
+        assert_eq!(diff.path, path);
+        assert!(diff.patch.contains("+++ \"/odd\\tname\\n.txt\""));
+        assert!(!diff.patch.contains("+++ /odd\tname\n.txt"));
+    }
+
+    #[test]
+    fn file_diff_reports_binary_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/README.md", &[0xff, 0xfe, 0xfd]);
+
+        let diff = store.file_diff(&view.id, "/README.md").unwrap();
+        assert_eq!(diff.path, "/README.md");
+        assert!(diff.binary);
+        assert!(!diff.truncated);
+        assert_eq!(diff.patch, "Binary files differ\n");
+    }
+
+    #[test]
+    fn file_diff_does_not_report_unchanged_binary_files_as_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("image.bin"), [0xff, 0xfe, 0xfd]).unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        let diff = store.file_diff(&view.id, "/image.bin").unwrap();
+        assert_eq!(diff.path, "/image.bin");
+        assert!(diff.binary);
+        assert!(!diff.truncated);
+        assert_eq!(diff.patch, "");
+    }
+
+    #[test]
+    fn file_diff_reports_missing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        assert!(matches!(
+            store.file_diff(&view.id, "/missing.txt"),
+            Err(AfsError::PathNotFound(path)) if path == "/missing.txt"
+        ));
+    }
+
+    #[test]
+    fn file_diff_rejects_non_regular_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        let mut delta = store.open_delta(&view.id).unwrap();
+        delta.mkdir_p("/fresh").unwrap();
+        delta_symlink(&store, &view.id, "/README.md", "/readme-link");
+
+        for path in ["/fresh", "/readme-link"] {
+            let error = store.file_diff(&view.id, path).unwrap_err();
+            let (status, code, message) = error.parts();
+            assert_eq!(status, 400);
+            assert_eq!(code, "afs.path_not_file");
+            assert!(message.contains(path));
+        }
+    }
+
+    #[test]
+    fn file_diff_truncates_oversized_patches() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        let large = "é\n".repeat(140_000);
+        delta_write(&store, &view.id, "/src/large.txt", large.as_bytes());
+
+        let diff = store.file_diff(&view.id, "/src/large.txt").unwrap();
+        assert_eq!(diff.path, "/src/large.txt");
+        assert!(!diff.binary);
+        assert!(diff.truncated);
+        assert!(diff.patch.len() <= UNIFIED_DIFF_MAX_BYTES);
+        assert!(std::str::from_utf8(diff.patch.as_bytes()).is_ok());
+        assert!(diff.patch.contains("--- /dev/null"));
+        assert!(diff.patch.contains("+++ /src/large.txt"));
+        assert!(diff.patch.starts_with("--- /dev/null"));
     }
 
     #[test]
