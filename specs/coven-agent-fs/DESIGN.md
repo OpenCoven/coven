@@ -424,9 +424,7 @@ boundary applies unchanged.
   to its session event. Rows whose `attribution` is `"unknown"` are marked, not
   hidden.
 - **Commit** — branch name, the change counts that would be applied, and a
-  `dryRun` preview. The preview returns a content-derived `previewToken`;
-  Cave sends it on the real commit so a plan changed after review fails with
-  `afs.preview_stale`. Commit is an explicit operator action; Cave never
+  `dryRun` preview. Commit is an explicit operator action; Cave never
   materializes automatically.
 
 Degraded states are first-class. `afs: false` hides the pane; `afsMount: false`

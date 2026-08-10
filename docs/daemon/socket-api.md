@@ -193,12 +193,10 @@ Passing `"dryRun": true` runs every one of those refusal checks and reports
 what would happen, with **no side effects**: no `committing` transition, no
 worktree, no branch, and no `afs_commit` row. A preview that would succeed
 returns `{ branch, worktreePath, counts, files, provenanceHighWater,
-previewToken, "dryRun": true, "wouldCommit": true }`; a preview that would be refused
+"dryRun": true, "wouldCommit": true }`; a preview that would be refused
 returns the same dotted error a real commit would raise, so clients read one
 contract rather than two. Preview and commit share their validation, so the
-two cannot disagree. Passing the returned `previewToken` on the real commit
-binds it to the exact resolved file bytes, removals, symlink targets, base, and
-branch that were previewed; a changed plan returns `409 afs.preview_stale`.
+two cannot disagree.
 Design: [`specs/coven-agent-fs/DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/specs/coven-agent-fs/DESIGN.md).
 
 Session handoff is a **same-user local IPC** operation. A companion must use a
