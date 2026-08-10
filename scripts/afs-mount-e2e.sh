@@ -53,7 +53,8 @@ api()  { curl -s --unix-socket "$SOCKET" "$@"; }
 # so an unresolved comparison silently never matches.
 mounted_at() {
     local resolved
-    resolved="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    # `--` so a path beginning with `-` is a path, not an option to cd.
+    resolved="$(cd -- "$1" 2>/dev/null && pwd -P)" || return 1
     mount | grep -qF " on $resolved ("
 }
 
