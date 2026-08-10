@@ -678,7 +678,20 @@ impl AfsStore {
             std::str::from_utf8(base.as_deref().unwrap_or(&[])),
             std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
         ) {
-            (Ok(base), Ok(merged)) => bounded_unified_diff(base, merged, &path)?,
+            (Ok(""), Ok("")) if base.is_none() != merged.is_none() => {
+                let base_header = if base.is_some() {
+                    path.as_str()
+                } else {
+                    "/dev/null"
+                };
+                let merged_header = if merged.is_some() {
+                    path.as_str()
+                } else {
+                    "/dev/null"
+                };
+                bounded_diff_headers(base_header, merged_header, &path)?
+            }
+            (Ok(base), Ok(merged)) => bounded_unified_diff(base, merged, &path, &path, &path)?,
             _ => ("Binary files differ\n".to_string(), false),
         };
         let binary = patch.0 == "Binary files differ\n";
@@ -1450,20 +1463,45 @@ fn optional_overlay_metadata(
     }
 }
 
-fn bounded_unified_diff(base: &str, merged: &str, path: &str) -> AfsResult<(String, bool)> {
+fn bounded_unified_diff(
+    base: &str,
+    merged: &str,
+    base_header: &str,
+    merged_header: &str,
+    path: &str,
+) -> AfsResult<(String, bool)> {
     let diff = TextDiff::from_lines(base, merged);
     let mut unified = diff.unified_diff();
-    unified.context_radius(3).header(path, path);
+    unified.context_radius(3).header(base_header, merged_header);
 
     let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
-    if let Err(error) = unified.to_writer(&mut output) {
+    let result = unified.to_writer(&mut output);
+    finish_bounded_diff(output, result, path)
+}
+
+fn bounded_diff_headers(
+    base_header: &str,
+    merged_header: &str,
+    path: &str,
+) -> AfsResult<(String, bool)> {
+    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
+    let result = writeln!(&mut output, "--- {base_header}")
+        .and_then(|()| writeln!(&mut output, "+++ {merged_header}"));
+    finish_bounded_diff(output, result, path)
+}
+
+fn finish_bounded_diff(
+    output: CappedDiffWriter,
+    result: io::Result<()>,
+    path: &str,
+) -> AfsResult<(String, bool)> {
+    if let Err(error) = result {
         if !output.truncated {
             return Err(AfsError::Internal(anyhow::anyhow!(
                 "failed to render unified diff for {path}: {error}"
             )));
         }
     }
-
     let truncated = output.truncated;
     let patch = String::from_utf8(output.bytes).map_err(|error| {
         AfsError::Internal(anyhow::anyhow!(
@@ -2313,6 +2351,34 @@ mod tests {
         assert!(diff.patch.contains("+++ /notes.txt"));
         assert!(diff.patch.contains("-alpha"));
         assert!(diff.patch.contains("-beta"));
+    }
+
+    #[test]
+    fn file_diff_distinguishes_added_and_deleted_empty_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("deleted-empty.txt"), b"").unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/added-empty.txt", b"");
+        delta_remove(&store, &view.id, "/deleted-empty.txt");
+
+        let added = store.file_diff(&view.id, "/added-empty.txt").unwrap();
+        assert_eq!(
+            added.patch, "--- /dev/null\n+++ /added-empty.txt\n",
+            "an empty added file still needs an explicit patch"
+        );
+        assert!(!added.truncated);
+        assert!(!added.binary);
+
+        let deleted = store.file_diff(&view.id, "/deleted-empty.txt").unwrap();
+        assert_eq!(
+            deleted.patch, "--- /deleted-empty.txt\n+++ /dev/null\n",
+            "an empty deleted file still needs an explicit patch"
+        );
+        assert!(!deleted.truncated);
+        assert!(!deleted.binary);
     }
 
     #[test]
