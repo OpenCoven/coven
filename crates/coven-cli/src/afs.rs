@@ -684,24 +684,29 @@ impl AfsStore {
         } else {
             "/dev/null"
         };
-        let patch = match (
+        let (patch, truncated, binary) = match (
             std::str::from_utf8(base.as_deref().unwrap_or(&[])),
             std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
         ) {
             (Ok(""), Ok("")) if base.is_none() != merged.is_none() => {
-                bounded_diff_headers(base_header, merged_header, &path)?
+                let (patch, truncated) = bounded_diff_headers(base_header, merged_header, &path)?;
+                (patch, truncated, false)
             }
             (Ok(base), Ok(merged)) => {
-                bounded_unified_diff(base, merged, base_header, merged_header, &path)?
+                let (patch, truncated) =
+                    bounded_unified_diff(base, merged, base_header, merged_header, &path)?;
+                (patch, truncated, false)
             }
-            _ => ("Binary files differ\n".to_string(), false),
+            _ if matches!((&base, &merged), (Some(base), Some(merged)) if base == merged) => {
+                (String::new(), false, true)
+            }
+            _ => ("Binary files differ\n".to_string(), false, true),
         };
-        let binary = patch.0 == "Binary files differ\n";
 
         Ok(FileDiffView {
             path,
-            patch: patch.0,
-            truncated: patch.1,
+            patch,
+            truncated,
             binary,
         })
     }
@@ -2398,6 +2403,21 @@ mod tests {
         assert!(diff.binary);
         assert!(!diff.truncated);
         assert_eq!(diff.patch, "Binary files differ\n");
+    }
+
+    #[test]
+    fn file_diff_does_not_report_unchanged_binary_files_as_different() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        std::fs::write(root.join("image.bin"), [0xff, 0xfe, 0xfd]).unwrap();
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        let diff = store.file_diff(&view.id, "/image.bin").unwrap();
+        assert_eq!(diff.path, "/image.bin");
+        assert!(diff.binary);
+        assert!(!diff.truncated);
+        assert_eq!(diff.patch, "");
     }
 
     #[test]
