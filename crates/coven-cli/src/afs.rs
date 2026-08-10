@@ -1875,16 +1875,31 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn every_emitted_error_code_is_in_the_design_contract_table() {
-        // DESIGN.md §3.4 is the contract a client branches on, so a code the
-        // daemon can return but the table does not list is a code no surface
-        // handles. `afs.unavailable` was exactly that until this test existed.
+    /// The §3.4 error-code table, and only that table.
+    ///
+    /// Both directions scope to this section rather than the whole file.
+    /// §3.2's operations table has rows in the same shape —
+    /// `| `afs.session.create` | POST … |` — so a whole-file search would let
+    /// an operation name satisfy a check about error codes, and would let a
+    /// code documented in some other table pass as if it were in the contract.
+    fn design_error_table() -> String {
         let design = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../specs/coven-agent-fs/DESIGN.md"),
         )
         .expect("DESIGN.md is readable from the crate root");
+        let (_, rest) = design
+            .split_once("### 3.4")
+            .expect("DESIGN.md still has a §3.4 error-code section");
+        rest.split("\n---").next().unwrap_or(rest).to_string()
+    }
+
+    #[test]
+    fn every_emitted_error_code_is_in_the_design_contract_table() {
+        // DESIGN.md §3.4 is the contract a client branches on, so a code the
+        // daemon can return but the table does not list is a code no surface
+        // handles. `afs.unavailable` was exactly that until this test existed.
+        let section = design_error_table();
 
         let mut missing = Vec::new();
         for error in every_error() {
@@ -1903,7 +1918,7 @@ mod tests {
             // Matched as a table cell rather than anywhere in the prose: §5 and
             // §7 mention codes in passing, and a passing mention is not a
             // contract entry.
-            if !design.contains(&format!("| `{code}` |")) {
+            if !section.contains(&format!("| `{code}` |")) {
                 missing.push(code);
             }
         }
@@ -1917,23 +1932,12 @@ mod tests {
     fn the_contract_table_lists_no_code_the_daemon_cannot_emit() {
         // The other direction. A documented code nobody returns sends a client
         // author writing a branch that never runs.
-        let design = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../specs/coven-agent-fs/DESIGN.md"),
-        )
-        .expect("DESIGN.md is readable from the crate root");
+        let section = design_error_table();
 
         let emitted: Vec<&'static str> = every_error()
             .into_iter()
             .map(|error| error.parts().1)
             .collect();
-        // Only §3.4. §3.2's operations table has rows in the same shape —
-        // `afs.session.create` and friends — and those are operation names,
-        // not codes a client branches on.
-        let section = design
-            .split_once("### 3.4")
-            .map(|(_, rest)| rest.split("\n---").next().unwrap_or(rest))
-            .expect("DESIGN.md still has a §3.4 error-code section");
         let documented: Vec<String> = section
             .lines()
             .filter_map(|line| {
