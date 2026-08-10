@@ -16,20 +16,46 @@ title: "Coven changelog and release notes"
   base/delta overlays. See
   [PR #658](https://github.com/OpenCoven/coven/pull/658) and
   [PR #678](https://github.com/OpenCoven/coven/pull/678).
-- **Experimental NFSv3 mount backend for `coven-afs`.** Behind the crate's
-  off-by-default `mount` feature, an AgentFS database can be exported over
-  loopback NFSv3 and mounted without root on macOS. The same change measured
-  the storage engine's throughput and added opt-in write-ahead logging, which
-  puts agent-shaped writes at 0.81–1.29x the host filesystem: 1.29x for
-  checkout-shaped trees, and 0.81x for `node_modules`-shaped trees, where the
-  database is faster than the host. The export is protocol-correct but remains
-  an engineering spike, and three unresolved gates keep it off by default — an
-  agent process still needs a Full Disk Access / Network Volumes confirmation
-  on macOS (if that fails, the macOS backend has to change), loopback NFS
-  access control is unsettled, and Linux/FUSE is unevaluated. No CLI, daemon,
-  API, or Cave workflow exposes it. See
-  [PR #680](https://github.com/OpenCoven/coven/pull/680) and
-  `specs/coven-agent-fs/MOUNT-SPIKE.md`.
+- **Agent filesystem sessions through the daemon.** The `afs.*` route family
+  is served over the local socket: create and join sessions over a project
+  root, read the change set, read one path's unified diff, read a
+  cursor-paginated provenance timeline enriched with the tool calls that
+  caused each operation, and discard. Capabilities are advertised in
+  `GET /api/v1/health` as `afs`, `afsMount`, and `afsCommit`, and a client is
+  expected to branch on them rather than assume. See
+  [PR #684](https://github.com/OpenCoven/coven/pull/684),
+  [PR #702](https://github.com/OpenCoven/coven/pull/702) and
+  [PR #703](https://github.com/OpenCoven/coven/pull/703).
+- **Commit materialization into signed git branches.** `afs.session.commit`
+  turns a delta into an ordinary git branch that enters the existing PR
+  pipeline, signed with the operator's existing git signing configuration.
+  Materialization is all-or-nothing: a path that would escape the repository
+  root, write under `.git/`, or resolve through an escaping symlink fails the
+  whole commit and leaves the delta intact. A `dryRun` preview reports what
+  would be applied, and what would refuse it, without side effects. See
+  [PR #690](https://github.com/OpenCoven/coven/pull/690) and
+  [PR #696](https://github.com/OpenCoven/coven/pull/696).
+- **NFSv3 mount backend, enabled on macOS.** A session can be mounted through
+  `POST /api/v1/afs/sessions/:id/mount`, and `afsMount` now reports `"nfs"` on
+  macOS where the export helper ships, `false` elsewhere. The export serves the
+  merged base+delta view rather than the delta alone, so a mounted session
+  shows the whole project and copies files up on first write; a file handle
+  taken before a write stays valid after the copy-up it causes. The daemon
+  spawns a per-mount export process, mounts it on loopback, rotates the export
+  token as soon as the mount returns, and unmounts orphans left by a dead
+  daemon at startup. Verified end to end against a real kernel client with
+  `scripts/afs-mount-e2e.sh`. See
+  [PR #701](https://github.com/OpenCoven/coven/pull/701) and
+  [PR #704](https://github.com/OpenCoven/coven/pull/704).
+
+  **Security posture.** The export is loopback-only on an ephemeral port, file
+  handles are authenticated with a keyed HMAC so a forged or stale handle is
+  refused, and the filesystem sits behind a token gate that must be named to be
+  reached. That is enough to keep an unprivileged local account out by default
+  and is *not* enough to survive disclosure of the token: NFSv3 authenticates
+  nothing, and macOS privacy consent is not a barrier here — a probe on an
+  unconsented CI runner mounted, read, and wrote successfully. Treat the export
+  token as a credential. See `specs/coven-agent-fs/DESIGN.md` §7.
 
 ### Updates
 
@@ -43,6 +69,16 @@ title: "Coven changelog and release notes"
 
 ### Bug fixes
 
+- **Agent filesystem correctness.** Four defects found by auditing the mount
+  work after it landed: an export process could outlive its registry entry and
+  keep serving a session's files on a loopback port; renaming a directory that
+  existed only in the base could strand handles to its children and, in one
+  case, lose base-only files outright; operations aimed at the token gate
+  reached the filesystem instead of being refused there; and the gate's own
+  security test passed a near-miss token roughly one run in sixteen. See
+  [PR #714](https://github.com/OpenCoven/coven/pull/714),
+  [PR #715](https://github.com/OpenCoven/coven/pull/715) and
+  [PR #721](https://github.com/OpenCoven/coven/pull/721).
 - **Faster session launch.** Session launches no longer spawn `git` to locate
   the repository maintenance gate when the project root is not inside a
   repository, restoring launch-to-first-output to its pre-gate baseline
