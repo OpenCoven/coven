@@ -12,11 +12,33 @@
 # session, reads and writes through the mount, unmounts, and checks the daemon
 # agreed at every step. Run it from a terminal on macOS:
 #
-#   ./scripts/afs-mount-e2e.sh
+#   ./scripts/afs-mount-e2e.sh              # build from this checkout
+#   ./scripts/afs-mount-e2e.sh --installed  # use the globally installed package
+#
+# `--installed` is the post-release check. v0.3.0 published five packages at
+# the right version and shipped a mount backend nobody could enable, because
+# the platform package omitted `coven-afs-serve` and nothing ever inspected
+# what users actually receive (coven-g2t). Testing the tree cannot catch that;
+# testing the artifact can.
 #
 # Exits non-zero on the first failed expectation, because unlike the probe this
 # one is asserting a contract rather than discovering a platform's behaviour.
 set -uo pipefail
+
+USE_INSTALLED=0
+for arg in "$@"; do
+    case "$arg" in
+        --installed) USE_INSTALLED=1 ;;
+        -h|--help)
+            sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *)
+            printf 'unknown option: %s\n' "$arg" >&2
+            exit 2
+            ;;
+    esac
+done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK="$(mktemp -d)"
@@ -32,7 +54,7 @@ cleanup() {
             || diskutil unmount force "$MOUNT_POINT" 2>/dev/null \
             || true
     fi
-    "$COVEN" daemon stop >/dev/null 2>&1 || true
+    [ -n "${COVEN:-}" ] && "$COVEN" daemon stop >/dev/null 2>&1 || true
     rm -rf "$WORK" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -63,14 +85,45 @@ if [ "$(uname -s)" != "Darwin" ]; then
     exit 0
 fi
 
-step "build the daemon and the export helper"
-# The daemon locates the helper beside its own executable, so both must land in
-# the same directory — which `cargo build` does for this workspace.
-cargo build -q -p coven-cli || { bad "build coven-cli"; exit 1; }
-cargo build -q -p coven-afs --features mount --bins || { bad "build helper"; exit 1; }
-COVEN="$ROOT/target/debug/coven"
-[ -x "$ROOT/target/debug/coven-afs-serve" ] || { bad "helper missing beside daemon"; exit 1; }
-ok "coven + coven-afs-serve"
+if [ "$USE_INSTALLED" -eq 1 ]; then
+    step "use the installed package"
+    # Resolved through the wrapper's own resolution rather than a guessed
+    # path, so this tests what `npm i -g` actually produced.
+    WRAPPER="$(command -v coven || true)"
+    [ -n "$WRAPPER" ] || { bad "no coven on PATH"; exit 1; }
+    # realpath, not `readlink`: the wrapper is a RELATIVE symlink, and BSD
+    # readlink resolves it against the caller's directory rather than the
+    # link's own, which lands nowhere.
+    WRAPPER_REAL="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$WRAPPER")"
+    INSTALL_BIN=""
+    for candidate in \
+        "$(dirname "$WRAPPER_REAL")/../node_modules/@opencoven/cli-macos/bin" \
+        "$(dirname "$WRAPPER_REAL")/../../node_modules/@opencoven/cli-macos/bin"; do
+        if [ -x "$candidate/coven" ]; then
+            INSTALL_BIN="$(cd "$candidate" && pwd -P)"
+            break
+        fi
+    done
+    [ -n "$INSTALL_BIN" ] || { bad "could not locate the installed platform package from $WRAPPER"; exit 1; }
+    COVEN="$INSTALL_BIN/coven"
+    if [ ! -x "$INSTALL_BIN/coven-afs-serve" ]; then
+        # The exact v0.3.0 failure, named rather than surfacing later as
+        # afsMount=false with no explanation.
+        bad "the installed package ships no coven-afs-serve; the mount backend cannot work (coven-g2t)"
+        exit 1
+    fi
+    ok "installed $("$COVEN" --version 2>/dev/null | head -1)"
+    ok "helper shipped beside it"
+else
+    step "build the daemon and the export helper"
+    # The daemon locates the helper beside its own executable, so both must
+    # land in the same directory — which `cargo build` does for this workspace.
+    cargo build -q -p coven-cli || { bad "build coven-cli"; exit 1; }
+    cargo build -q -p coven-afs --features mount --bins || { bad "build helper"; exit 1; }
+    COVEN="$ROOT/target/debug/coven"
+    [ -x "$ROOT/target/debug/coven-afs-serve" ] || { bad "helper missing beside daemon"; exit 1; }
+    ok "coven + coven-afs-serve"
+fi
 
 step "start a daemon on a throwaway COVEN_HOME"
 mkdir -p "$COVEN_HOME" "$PROJECT"
