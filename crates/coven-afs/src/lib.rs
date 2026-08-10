@@ -32,6 +32,7 @@ mod kv;
 #[cfg(feature = "mount")]
 mod nfs;
 mod overlay;
+mod overlay_ino;
 mod path;
 mod provenance;
 mod schema;
@@ -41,8 +42,9 @@ pub use diff::{Change, ChangeEntry, ChangeSet};
 pub use fs::{AgentFs, Metadata, ROOT_INO, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 pub use ino::DirEntry;
 #[cfg(feature = "mount")]
-pub use nfs::{ensure_loopback, export_token, AfsNfs, GateHandle};
+pub use nfs::{ensure_loopback, export_token, AfsNfs, ExportFs, GateHandle};
 pub use overlay::OverlayFs;
+pub use overlay_ino::{OverlayExport, BASE_TAG};
 pub use path::{basename, components, normalize, parent};
 pub use provenance::{
     Actor, CommitRecord, ProvenanceRecord, SessionBinding, EXTENSION_TABLES, STATE_COMMITTED,

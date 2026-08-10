@@ -603,7 +603,15 @@ impl AfsStore {
         self.require_open(&binding)?;
         let delta = self.delta_path(id);
         let read_only = self.open_delta(id)?.is_read_only();
-        crate::afs_mount::mount(self.coven_home(), id, &delta, read_only)
+        // The mount shows the merged view, so the export needs both layers
+        // (DESIGN.md §3.2). A session with no base ingested has only a delta
+        // to serve, which is the one case where mounting one layer is right.
+        let base = binding
+            .base_fingerprint
+            .as_deref()
+            .map(|fingerprint| self.base_path(fingerprint))
+            .filter(|path| path.exists());
+        crate::afs_mount::mount(self.coven_home(), id, &delta, base.as_deref(), read_only)
     }
 
     /// `afs.mount` DELETE — unmount. Reports whether anything was mounted.

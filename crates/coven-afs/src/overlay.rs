@@ -53,6 +53,47 @@ impl OverlayFs {
         &self.base
     }
 
+    /// The writable delta layer, mutably. Needed by inode-addressed writes,
+    /// which reach the delta directly once a file has been copied up.
+    pub fn delta_mut(&mut self) -> &mut AgentFs {
+        &mut self.delta
+    }
+
+    /// Every recorded copy-up as `(base_ino, delta_ino)`.
+    ///
+    /// `fs_origin` is keyed by `delta_ino`, so this is the only way to build
+    /// the reverse mapping without indexing a SPEC table (DESIGN.md E1).
+    pub fn origin_pairs(&self) -> Result<Vec<(i64, i64)>> {
+        let mut stmt = self
+            .delta
+            .conn
+            .prepare("SELECT base_ino, delta_ino FROM fs_origin")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Hide `path` and everything under it from the base layer.
+    ///
+    /// The path-addressed operations do this for themselves; the
+    /// inode-addressed layer needs it directly, because deleting a name that
+    /// exists only in the base is a whiteout rather than a delta removal.
+    pub fn set_whiteout(&self, path: &str) -> Result<()> {
+        self.create_whiteout(&normalize(path))
+    }
+
+    /// Stop hiding `path`. SPEC rule: a whiteout is removed when a new file is
+    /// created at that path.
+    pub fn clear_whiteout(&self, path: &str) -> Result<()> {
+        self.remove_whiteout(&normalize(path))
+    }
+
+    /// Whether the base layer can still contribute entries at `path`.
+    pub fn base_visible(&self, path: &str) -> Result<bool> {
+        self.base_visible_at(&normalize(path))
+    }
+
     // ---- whiteouts ---------------------------------------------------------
 
     /// Whether `path` has a whiteout in the delta layer.

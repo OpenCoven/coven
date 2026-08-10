@@ -481,11 +481,8 @@ What ships instead:
 - **Token rotation after mount.** `mount_nfs` takes the export path as a
   positional argument and offers no stdin, environment, or config alternative
   (`man mount_nfs` has neither an ENVIRONMENT nor a FILES section), so the
-  token is `ps`-visible for the duration of that one call. Rotating the gate
-  the moment the mount returns makes a scraped value useless. The rotation
-  primitive ships now (`AfsNfs::gate_handle`); the mount route that calls it on
-  every mount is still being built, so until that lands this mitigation is
-  available rather than enforced.
+  token is `ps`-visible for the duration of that one call. The daemon rotates
+  the gate the moment the mount returns, which makes a scraped value useless.
   Established mounts are unaffected: the client holds an authenticated file
   handle, handles are keyed on the file id under a key rotation does not
   touch, and only a *new* traversal of the gate needs the current token.
