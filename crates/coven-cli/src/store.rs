@@ -289,6 +289,15 @@ pub struct ExecutorDispatchRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutorResultEnvelopeRecord {
+    pub envelope_id: String,
+    pub job_id: String,
+    pub node_id: String,
+    pub envelope_json: String,
+    pub recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HubJobRecord {
     pub job_id: String,
     pub state: String,
@@ -732,6 +741,34 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
 
         CREATE INDEX IF NOT EXISTS idx_executor_dispatches_node
             ON executor_dispatches(node_id, updated_at DESC);
+
+        CREATE TABLE IF NOT EXISTS executor_result_envelopes (
+            sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+            envelope_id TEXT UNIQUE NOT NULL,
+            job_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            envelope_json TEXT NOT NULL,
+            recorded_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_executor_result_envelopes_job
+            ON executor_result_envelopes(job_id, sequence);
+
+        INSERT OR IGNORE INTO executor_result_envelopes (
+            envelope_id,
+            job_id,
+            node_id,
+            envelope_json,
+            recorded_at
+        )
+        SELECT
+            'legacy:' || job_id,
+            job_id,
+            node_id,
+            envelope_json,
+            updated_at
+        FROM executor_dispatches
+        WHERE envelope_json IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS hub_jobs (
             job_id TEXT PRIMARY KEY NOT NULL,
@@ -1695,6 +1732,36 @@ pub fn upsert_executor_dispatch(conn: &Connection, record: &ExecutorDispatchReco
     Ok(())
 }
 
+pub fn insert_executor_dispatch_if_absent(
+    conn: &Connection,
+    record: &ExecutorDispatchRecord,
+) -> Result<bool> {
+    let affected = conn
+        .execute(
+            "INSERT INTO executor_dispatches (
+                job_id,
+                node_id,
+                status,
+                job_json,
+                envelope_json,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(job_id) DO NOTHING",
+            params![
+                &record.job_id,
+                &record.node_id,
+                &record.status,
+                &record.job_json,
+                &record.envelope_json,
+                &record.created_at,
+                &record.updated_at,
+            ],
+        )
+        .with_context(|| format!("failed to insert executor dispatch {}", record.job_id))?;
+    Ok(affected == 1)
+}
+
 pub fn get_executor_dispatch(
     conn: &Connection,
     job_id: &str,
@@ -1719,6 +1786,69 @@ pub fn get_executor_dispatch(
     )
     .optional()
     .with_context(|| format!("failed to read executor dispatch {job_id}"))
+}
+
+pub fn append_executor_result_envelope(
+    conn: &Connection,
+    record: &ExecutorResultEnvelopeRecord,
+) -> Result<bool> {
+    let affected = conn
+        .execute(
+            "INSERT INTO executor_result_envelopes (
+                envelope_id,
+                job_id,
+                node_id,
+                envelope_json,
+                recorded_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(envelope_id) DO NOTHING",
+            params![
+                &record.envelope_id,
+                &record.job_id,
+                &record.node_id,
+                &record.envelope_json,
+                &record.recorded_at,
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "failed to append executor result envelope {}",
+                record.envelope_id
+            )
+        })?;
+    Ok(affected == 1)
+}
+
+pub fn list_executor_result_envelopes(
+    conn: &Connection,
+    job_id: &str,
+) -> Result<Vec<ExecutorResultEnvelopeRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT envelope_id, job_id, node_id, envelope_json, recorded_at
+             FROM executor_result_envelopes
+             WHERE job_id = ?1
+             ORDER BY sequence",
+        )
+        .with_context(|| format!("failed to prepare executor result envelope list {job_id}"))?;
+    let rows = statement
+        .query_map(params![job_id], |row| {
+            Ok(ExecutorResultEnvelopeRecord {
+                envelope_id: row.get(0)?,
+                job_id: row.get(1)?,
+                node_id: row.get(2)?,
+                envelope_json: row.get(3)?,
+                recorded_at: row.get(4)?,
+            })
+        })
+        .with_context(|| format!("failed to list executor result envelopes {job_id}"))?;
+    let mut records = Vec::new();
+    for row in rows {
+        records.push(
+            row.with_context(|| format!("failed to read executor result envelope {job_id}"))?,
+        );
+    }
+    Ok(records)
 }
 
 pub fn upsert_hub_job(conn: &Connection, record: &HubJobRecord) -> Result<()> {
@@ -4617,6 +4747,78 @@ END;
         );
         assert_eq!(record.created_at, "2026-07-06T00:00:00Z");
         assert!(get_executor_dispatch(&reopened, "job-missing")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn executor_result_envelopes_are_append_only_and_replay_safe() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("coven.db");
+        let conn = open_store(&path)?;
+        let first = ExecutorResultEnvelopeRecord {
+            envelope_id: "sha256:first".to_string(),
+            job_id: "job-1".to_string(),
+            node_id: "node-gpu".to_string(),
+            envelope_json: r#"{"jobId":"job-1","status":"completed"}"#.to_string(),
+            recorded_at: "2026-08-09T00:00:00Z".to_string(),
+        };
+        let second = ExecutorResultEnvelopeRecord {
+            envelope_id: "sha256:second".to_string(),
+            job_id: "job-1".to_string(),
+            node_id: "node-gpu".to_string(),
+            envelope_json: r#"{"jobId":"job-1","status":"failed"}"#.to_string(),
+            recorded_at: "2026-08-09T00:01:00Z".to_string(),
+        };
+
+        assert!(append_executor_result_envelope(&conn, &first)?);
+        assert!(!append_executor_result_envelope(&conn, &first)?);
+        assert!(append_executor_result_envelope(&conn, &second)?);
+        drop(conn);
+
+        let reopened = open_store(&path)?;
+        assert_eq!(
+            list_executor_result_envelopes(&reopened, "job-1")?,
+            vec![first, second]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executor_result_envelopes_backfill_legacy_dispatch_results() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("legacy.db");
+        let legacy = Connection::open(&path)?;
+        legacy.execute_batch(
+            "CREATE TABLE executor_dispatches (
+                job_id TEXT PRIMARY KEY NOT NULL,
+                node_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                job_json TEXT NOT NULL,
+                envelope_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            INSERT INTO executor_dispatches (
+                job_id, node_id, status, job_json, envelope_json, created_at, updated_at
+            ) VALUES (
+                'job-legacy',
+                'node-legacy',
+                'completed',
+                '{\"jobId\":\"job-legacy\"}',
+                '{\"jobId\":\"job-legacy\",\"status\":\"completed\"}',
+                '2026-07-06T00:00:00Z',
+                '2026-07-06T00:01:00Z'
+            );",
+        )?;
+        drop(legacy);
+
+        let conn = open_store(&path)?;
+        let records = list_executor_result_envelopes(&conn, "job-legacy")?;
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].envelope_id, "legacy:job-legacy");
+        assert_eq!(records[0].node_id, "node-legacy");
+        assert_eq!(records[0].recorded_at, "2026-07-06T00:01:00Z");
         Ok(())
     }
 
