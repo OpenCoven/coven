@@ -3746,6 +3746,46 @@ mod tests {
         Ok(())
     }
 
+    /// Headroom for the fixture to register its descendant, not a measured
+    /// budget.
+    ///
+    /// The stub spawns a `cmd.exe` descendant, writes its pid, and only then
+    /// blocks on a CPR reply that never arrives — and all of that has to
+    /// happen before the startup timeout under test fires. Two seconds was
+    /// enough on an idle host and not on a loaded CI runner, where the runner
+    /// killed the stub before the pid file existed and the test failed reading
+    /// it (`coven-047`, `coven-5ua`). The behaviour under test is that a
+    /// startup timeout fails the run and kills the descendant; how long the
+    /// timeout is set to is not part of that claim.
+    #[cfg(windows)]
+    const WINDOWS_DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// Containment watchdogs. Reaching one means something is hung, not that
+    /// the host was slow, so they are generous on purpose.
+    #[cfg(windows)]
+    const WINDOWS_DETACHED_TEST_WATCHDOG: Duration = Duration::from_secs(60);
+
+    /// Wait for the fixture to record its descendant's pid.
+    ///
+    /// Reading the file once races the stub writing it. Polling until the
+    /// startup timeout has had time to fire keeps the failure message
+    /// meaningful: if this expires the fixture genuinely never registered,
+    /// which is a fixture problem rather than a runner one.
+    #[cfg(windows)]
+    fn await_windows_descendant_pid(pid_file: &Path, deadline: Instant) -> Option<u32> {
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    return Some(pid);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_detached_pty_timeout_fails_and_kills_descendant() -> anyhow::Result<()> {
@@ -3767,24 +3807,27 @@ mod tests {
         let mut session = spawn_detached_with_observer_and_timeout(
             &command,
             Some(observer),
-            Some(Duration::from_secs(2)),
+            Some(WINDOWS_DETACHED_STARTUP_TIMEOUT),
         )?;
-        let result = match exit_rx.recv_timeout(Duration::from_secs(10)) {
+        // Capture the pid while the stub is still running. Reading it after
+        // the exit callback races the runner's own process-tree kill.
+        let pid_deadline = Instant::now() + WINDOWS_DETACHED_STARTUP_TIMEOUT;
+        let descendant_pid = await_windows_descendant_pid(&pid_file, pid_deadline);
+
+        let result = match exit_rx.recv_timeout(WINDOWS_DETACHED_TEST_WATCHDOG) {
             Ok(result) => result,
             Err(error) => {
                 let _ = session.killer.kill();
                 return Err(error.into());
             }
         };
-        let descendant_pid: u32 = std::fs::read_to_string(&pid_file)
-            .with_context(|| {
-                format!(
-                    "timeout stub did not create pid file; observed output: {:?}",
-                    String::from_utf8_lossy(&captured.lock().unwrap())
-                )
-            })?
-            .trim()
-            .parse()?;
+        let descendant_pid = descendant_pid.with_context(|| {
+            format!(
+                "timeout stub did not create pid file within {:?}; observed output: {:?}",
+                WINDOWS_DETACHED_STARTUP_TIMEOUT,
+                String::from_utf8_lossy(&captured.lock().unwrap())
+            )
+        })?;
 
         assert_eq!(result.status, "failed");
         assert_eq!(result.exit_code, None);
@@ -3792,7 +3835,7 @@ mod tests {
         assert!(output.contains("no meaningful output"), "{output:?}");
         assert!(!output.contains("\x1b[6n"), "query leaked: {output:?}");
         assert!(
-            wait_for_windows_process_exit(descendant_pid, Duration::from_secs(3)),
+            wait_for_windows_process_exit(descendant_pid, WINDOWS_DETACHED_TEST_WATCHDOG),
             "startup timeout left descendant process {descendant_pid} running"
         );
         Ok(())
