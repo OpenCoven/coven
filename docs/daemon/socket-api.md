@@ -92,8 +92,8 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `GET /api/v1/afs/sessions` | List agent-filesystem sessions. |
 | `GET /api/v1/afs/sessions/:id` | Fetch one agent-filesystem session. |
 | `POST /api/v1/afs/sessions/:id/join` | Attach another actor to an existing session. |
-| `GET /api/v1/afs/sessions/:id/diff` | Read the session's change set against its base. |
-| `GET /api/v1/afs/sessions/:id/timeline` | Read recorded file operations, cursor-paginated. |
+| `GET /api/v1/afs/sessions/:id/diff` | Read the change set, or add `?path=` for one file's unified diff. |
+| `GET /api/v1/afs/sessions/:id/timeline` | Read file operations with linked, redacted tool-call context. |
 | `POST /api/v1/afs/sessions/:id/commit` | Materialize the session's delta into a signed git branch. |
 | `POST /api/v1/afs/sessions/:id/discard` | Discard a session (requires `"confirm": true`). |
 | `POST /api/v1/afs/sessions/:id/mount` | Mount the session's filesystem; returns `mountPoint`, `backend`, `readOnly`. |
@@ -105,6 +105,57 @@ Agent-filesystem routes are gated by the `afs` capability, and are **same-user
 local IPC** operations for the same reason session handoff is: they expose a
 session's working tree. `afsCommit` reports whether the daemon can materialize
 a delta into a git branch and is now `true`.
+
+`GET /api/v1/afs/sessions/:id/diff` returns the change list. Supplying a
+percent-encoded regular-file path returns the daemon-owned review patch
+instead:
+
+```json
+{
+  "path": "/src/main.rs",
+  "patch": "--- /src/main.rs\n+++ /src/main.rs\n@@ ...",
+  "truncated": false,
+  "binary": false
+}
+```
+
+Text patches are capped at 262,144 bytes and remain valid UTF-8 when
+`truncated` is true. Added and deleted text content uses `/dev/null` on the
+missing side. Metadata-only empty-file changes have an empty patch and retain
+their added/deleted kind in the change-list response. Differing binary content
+returns `binary: true` and the stable patch `"Binary files differ\n"`.
+Missing paths return `afs.path_not_found`; directories and symlinks return
+`afs.path_not_file`.
+
+Timeline pages remain cursor-paginated on provenance `seq`. Each operation
+keeps `toolCallId` and adds `toolCall` when that audit row still exists:
+
+```json
+{
+  "entries": [{
+    "seq": 17,
+    "op": "write",
+    "path": "/src/main.rs",
+    "toolCallId": 42,
+    "toolCall": {
+      "id": 42,
+      "name": "write_file",
+      "parameters": "{\"path\":\"/src/main.rs\"}",
+      "result": "{\"bytes\":1841}",
+      "error": null,
+      "startedAt": 1786320000,
+      "completedAt": 1786320001,
+      "durationMs": 1000
+    }
+  }],
+  "nextCursor": 17,
+  "hasMore": false
+}
+```
+
+Tool-call parameters, results, and errors pass through the daemon privacy
+filters before serialization. A missing or dangling audit reference produces
+`toolCall: null` without dropping the filesystem operation.
 
 `afsMount` reports the mount backend or `false`, and is **`false` by default**,
 so `POST .../mount` returns `501` with `afs.mount_unsupported` to match. The

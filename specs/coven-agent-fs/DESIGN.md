@@ -177,9 +177,56 @@ returns one unified diff, truncated at a documented byte cap with
 }
 ```
 
+The path-specific response is:
+
+```json
+{
+  "path": "/src/main.rs",
+  "patch": "--- /src/main.rs\n+++ /src/main.rs\n@@ ...",
+  "truncated": false,
+  "binary": false
+}
+```
+
+`patch` is capped at 262,144 bytes during generation and is truncated only on
+a UTF-8 boundary. Added and deleted text content uses `/dev/null` for the
+missing side. A metadata-only empty-file change has no text hunk, so its patch
+is empty and its change kind remains authoritative in the change-set response.
+Differing non-UTF-8 content returns the exact marker
+`"Binary files differ\n"` with `binary: true`. A missing path returns
+`afs.path_not_found`; a directory or symlink returns `afs.path_not_file`.
+
 **Timeline.** Cursor-paginated on `afs_provenance.seq`, matching the daemon's
 existing `eventCursor: "sequence"` idiom: `?since=<seq>&limit=<n>`, newest-last,
-`nextCursor` echoed in the response.
+`nextCursor` echoed in the response. Each provenance row retains
+`toolCallId` and includes the linked audit record when present:
+
+```json
+{
+  "entries": [{
+    "seq": 17,
+    "op": "write",
+    "path": "/src/main.rs",
+    "toolCallId": 42,
+    "toolCall": {
+      "id": 42,
+      "name": "write_file",
+      "parameters": "{\"path\":\"/src/main.rs\"}",
+      "result": "{\"bytes\":1841}",
+      "error": null,
+      "startedAt": 1786320000,
+      "completedAt": 1786320001,
+      "durationMs": 1000
+    }
+  }],
+  "nextCursor": 17,
+  "hasMore": false
+}
+```
+
+The daemon redacts `parameters`, `result`, and `error` before serialization.
+Missing and dangling audit references serialize as `toolCall: null` without
+dropping the provenance row.
 
 **Commit.**
 
@@ -208,6 +255,8 @@ Dotted codes in the standard envelope (see
 | `afs.session_not_found` | Unknown or already-discarded AFS session. |
 | `afs.session_not_open` | Operation requires `state = open`. |
 | `afs.name_in_use` | Another open session holds that joinable name. |
+| `afs.path_not_found` | The requested path exists in neither the base nor merged view. |
+| `afs.path_not_file` | The requested path is a directory, symlink, or other non-regular node. |
 | `afs.mount_unsupported` | No mount backend on this platform (`afsMount: false`). |
 | `afs.mount_busy` | Already mounted, or the mount point is not empty. |
 | `afs.base_diverged` | Project root moved off the recorded base commit. |
