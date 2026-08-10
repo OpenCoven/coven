@@ -31,7 +31,7 @@ libc = { version = "0.2", optional = true }
 # are already in the workspace lock, so the mount feature pulls in no new
 # transitive dependencies.
 hmac = { version = "0.12", optional = true }
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 getrandom = { version = "0.2", optional = true }
 # Only the out-of-process export binary initializes a subscriber; the library
 # stays subscriber-agnostic and merely emits `tracing` events.
