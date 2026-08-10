@@ -209,10 +209,24 @@ jobs:
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
         env:
           COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
+      # The per-mount NFS export process, which the daemon spawns and locates
+      # beside its own executable. macOS only: `afs_mount::backend()` returns
+      # None on other platforms, and the `mount` feature does not compile on
+      # Windows. Without this the package ships one binary and every installed
+      # user gets `afsMount: false` (coven-g2t).
+      - name: Build the AFS mount export helper (macOS only)
+        if: startsWith(matrix.npm-target, 'macos')
+        run: cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}
+        env:
+          COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.0
         with:
           name: coven-${{ matrix.npm-target }}
-          path: target/${{ matrix.rust-target }}/release/${{ matrix.binary }}
+          # Both binaries when the helper was built; the glob matches nothing
+          # extra on platforms that skipped it.
+          path: |
+            target/${{ matrix.rust-target }}/release/${{ matrix.binary }}
+            target/${{ matrix.rust-target }}/release/coven-afs-serve
           if-no-files-found: error
 
   npm-dry-run:

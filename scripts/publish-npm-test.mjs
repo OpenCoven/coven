@@ -17,7 +17,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { defaultTargetName, isMainModule, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
 import { nativePackageSet } from './release-npm-recovery-contract.mjs';
 import { platformMatrix } from './release-npm-platform-matrix.mjs';
@@ -58,6 +58,22 @@ test('parseReleaseTag rejects malformed and unrelated prerelease tags', () => {
       /stable vX.Y.Z tag or vX.Y.Z-recovery.N/
     );
   }
+});
+
+test('macOS platform packages ship the AFS mount export helper', () => {
+  // v0.3.0 shipped without it and every installed user got `afsMount: false`,
+  // because the daemon locates the helper beside its own executable and it
+  // was never packaged. This asserts the declaration that puts it there.
+  assert.equal(targetHelperBinaryName('macos'), 'coven-afs-serve');
+  assert.equal(targetHelperBinaryName('macos-x64'), 'coven-afs-serve');
+});
+
+test('non-macOS platform packages ship no mount helper', () => {
+  // Deliberate, not incidental: `afs_mount::backend()` returns None off
+  // macOS, and the `mount` feature does not compile on Windows, so shipping
+  // the helper there would be dead weight.
+  assert.equal(targetHelperBinaryName('linux-x64'), undefined);
+  assert.equal(targetHelperBinaryName('windows'), undefined);
 });
 
 test('nativePackageSet accepts only complete historical native package sets', () => {
