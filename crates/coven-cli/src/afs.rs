@@ -80,6 +80,10 @@ pub enum AfsError {
     /// Signing is required and unavailable; Coven never falls back to an
     /// unsigned commit to make materialization land.
     CommitUnsigned(String),
+    /// No mount backend on this platform or in this build.
+    MountUnsupported,
+    /// Already mounted, or the mount point is not empty.
+    MountBusy(String),
     Internal(anyhow::Error),
 }
 
@@ -131,6 +135,12 @@ impl AfsError {
                 "afs.commit_unsigned",
                 format!("Commit signing is required but unavailable: {message}"),
             ),
+            Self::MountUnsupported => (
+                501,
+                "afs.mount_unsupported",
+                "No mount backend is available; health advertises afsMount:false.".to_string(),
+            ),
+            Self::MountBusy(message) => (409, "afs.mount_busy", message.clone()),
             Self::Internal(error) => (500, "afs.unavailable", error.to_string()),
         }
     }
@@ -148,7 +158,7 @@ impl From<coven_afs::Error> for AfsError {
     }
 }
 
-type AfsResult<T> = std::result::Result<T, AfsError>;
+pub(crate) type AfsResult<T> = std::result::Result<T, AfsError>;
 
 // ---- wire shapes --------------------------------------------------------
 
@@ -524,9 +534,39 @@ impl AfsStore {
                 familiar_id: binding.familiar_id.clone(),
                 bead_id: binding.bead_id.clone(),
             },
-            mount: None,
+            mount: crate::afs_mount::current(self.coven_home(), id),
             changes: counts,
         })
+    }
+
+    /// `afs.mount` — mount the session's filesystem.
+    ///
+    /// Mounting requires an open session for the same reason writing does: a
+    /// committed or discarded delta is a record, and handing back a writable
+    /// mount over one would let an agent edit history.
+    pub fn mount(&self, id: &str) -> AfsResult<crate::afs_mount::MountView> {
+        let binding = self.binding(id)?;
+        self.require_open(&binding)?;
+        let delta = self.delta_path(id);
+        let read_only = self.open_delta(id)?.is_read_only();
+        crate::afs_mount::mount(self.coven_home(), id, &delta, read_only)
+    }
+
+    /// `afs.mount` DELETE — unmount. Reports whether anything was mounted.
+    ///
+    /// Unlike mount, this does not require an open session: a session that was
+    /// committed while mounted still needs its mount taken down, and refusing
+    /// would strand it.
+    pub fn unmount(&self, id: &str) -> AfsResult<bool> {
+        // Still resolve the binding, so unmounting an unknown session is
+        // `afs.session_not_found` rather than a cheerful no-op.
+        self.binding(id)?;
+        crate::afs_mount::unmount(self.coven_home(), id)
+    }
+
+    /// `<COVEN_HOME>`, recovered from the `afs` root this store was built on.
+    fn coven_home(&self) -> &Path {
+        self.root.parent().unwrap_or(&self.root)
     }
 
     /// `afs.session.join` — attach a second actor to an existing delta.

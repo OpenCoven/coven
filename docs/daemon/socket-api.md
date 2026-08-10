@@ -96,15 +96,27 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `GET /api/v1/afs/sessions/:id/timeline` | Read recorded file operations, cursor-paginated. |
 | `POST /api/v1/afs/sessions/:id/commit` | Materialize the session's delta into a signed git branch. |
 | `POST /api/v1/afs/sessions/:id/discard` | Discard a session (requires `"confirm": true`). |
+| `POST /api/v1/afs/sessions/:id/mount` | Mount the session's filesystem; returns `mountPoint`, `backend`, `readOnly`. |
+| `DELETE /api/v1/afs/sessions/:id/mount` | Unmount. Idempotent. |
 
 Detailed shapes live in the [API reference](/reference/api).
 
 Agent-filesystem routes are gated by the `afs` capability, and are **same-user
 local IPC** operations for the same reason session handoff is: they expose a
-session's working tree. `afsMount` reports the mount backend or `false` and is
-`false` today, so `POST .../mount` returns `501` with `afs.mount_unsupported`
-to match. `afsCommit` reports whether the daemon can materialize a delta into a
-git branch and is now `true`.
+session's working tree. `afsCommit` reports whether the daemon can materialize
+a delta into a git branch and is now `true`.
+
+`afsMount` reports the mount backend or `false`, and is **`false` by default**,
+so `POST .../mount` returns `501` with `afs.mount_unsupported` to match. The
+mount lifecycle is implemented — the daemon spawns a per-mount export process,
+mounts it, rotates the export token, and unmounts orphans left by a dead daemon
+at startup — but the NFS export still serves a session's delta rather than the
+merged base+delta view, so a mount would show only files the session had
+already changed. Setting `COVEN_AFS_MOUNT_EXPERIMENTAL=1` on a macOS daemon
+enables the backend anyway for development. Mounting requires an open session;
+`DELETE` does not, so a session committed while mounted can still be taken
+down, and unmounting something that is not mounted succeeds rather than
+erroring.
 
 Commit creates a git worktree at the session's `base_commit`, applies the
 change set, and produces a **signed** commit carrying `Coven-Session`,

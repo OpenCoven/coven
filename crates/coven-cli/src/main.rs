@@ -13,6 +13,7 @@ use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use uuid::Uuid;
 
 mod afs;
+mod afs_mount;
 mod api;
 mod capabilities;
 mod cockpit_sources;
