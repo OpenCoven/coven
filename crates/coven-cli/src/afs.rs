@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use similar::TextDiff;
 
 use coven_afs::{
-    normalize, Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, STATE_COMMITTED,
-    STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
+    normalize, Actor, AgentFs, Change, ChangeSet, OverlayFs, SessionBinding, ToolCall,
+    STATE_COMMITTED, STATE_COMMITTING, STATE_DISCARDED, STATE_OPEN,
 };
 
 /// Bumped when the ingest filter changes, so bases built under the old rules
@@ -322,6 +322,38 @@ pub struct FileDiffView {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TimelineToolCallView {
+    pub id: i64,
+    pub name: String,
+    pub parameters: Option<String>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub started_at: i64,
+    pub completed_at: i64,
+    pub duration_ms: i64,
+}
+
+impl From<ToolCall> for TimelineToolCallView {
+    fn from(call: ToolCall) -> Self {
+        Self {
+            id: call.id,
+            name: call.name,
+            parameters: call
+                .parameters
+                .map(|value| crate::privacy::redact_payload_json(&value)),
+            result: call
+                .result
+                .map(|value| crate::privacy::redact_payload_json(&value)),
+            error: call.error.map(|value| crate::privacy::redact_text(&value)),
+            started_at: call.started_at,
+            completed_at: call.completed_at,
+            duration_ms: call.duration_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TimelineEntry {
     pub seq: i64,
     pub op: String,
@@ -334,6 +366,7 @@ pub struct TimelineEntry {
     pub bead_id: Option<String>,
     pub turn: Option<i64>,
     pub tool_call_id: Option<i64>,
+    pub tool_call: Option<TimelineToolCallView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -690,10 +723,6 @@ impl AfsStore {
             std::str::from_utf8(base.as_deref().unwrap_or(&[])),
             std::str::from_utf8(merged.as_deref().unwrap_or(&[])),
         ) {
-            (Ok(""), Ok("")) if base.is_none() != merged.is_none() => {
-                let (patch, truncated) = bounded_diff_headers(base_header, merged_header, &path)?;
-                (patch, truncated, false)
-            }
             (Ok(base), Ok(merged)) => {
                 let (patch, truncated) =
                     bounded_unified_diff(base, merged, base_header, merged_header, &path)?;
@@ -724,20 +753,31 @@ impl AfsStore {
         let entries: Vec<TimelineEntry> = records
             .into_iter()
             .take(limit)
-            .map(|record| TimelineEntry {
-                seq: record.seq,
-                op: record.op,
-                path: record.path,
-                to_path: record.to_path,
-                bytes: record.bytes,
-                at: record.at,
-                session_id: record.actor.coven_session_id,
-                familiar_id: record.actor.familiar_id,
-                bead_id: record.actor.bead_id,
-                turn: record.actor.turn,
-                tool_call_id: record.actor.tool_call_id,
+            .map(|record| {
+                let tool_call_id = record.actor.tool_call_id;
+                let tool_call = match tool_call_id {
+                    Some(id) => delta
+                        .tool_call(id)
+                        .map_err(AfsError::from)?
+                        .map(TimelineToolCallView::from),
+                    None => None,
+                };
+                Ok(TimelineEntry {
+                    seq: record.seq,
+                    op: record.op,
+                    path: record.path,
+                    to_path: record.to_path,
+                    bytes: record.bytes,
+                    at: record.at,
+                    session_id: record.actor.coven_session_id,
+                    familiar_id: record.actor.familiar_id,
+                    bead_id: record.actor.bead_id,
+                    turn: record.actor.turn,
+                    tool_call_id,
+                    tool_call,
+                })
             })
-            .collect();
+            .collect::<AfsResult<_>>()?;
         Ok(TimelineView {
             next_cursor: entries.last().map(|entry| entry.seq),
             has_more,
@@ -1473,10 +1513,11 @@ fn optional_overlay_metadata(
 }
 
 fn diff_header_path(path: &str) -> String {
-    if !path
-        .chars()
-        .any(|character| character.is_control() || matches!(character, '"' | '\\'))
-    {
+    let must_quote = path == "/dev/null"
+        || path
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '"' | '\\'));
+    if !must_quote {
         return path.to_string();
     }
 
@@ -1515,17 +1556,6 @@ fn bounded_unified_diff(
 
     let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
     let result = unified.to_writer(&mut output);
-    finish_bounded_diff(output, result, path)
-}
-
-fn bounded_diff_headers(
-    base_header: &str,
-    merged_header: &str,
-    path: &str,
-) -> AfsResult<(String, bool)> {
-    let mut output = CappedDiffWriter::new(UNIFIED_DIFF_MAX_BYTES);
-    let result = writeln!(&mut output, "--- {base_header}")
-        .and_then(|()| writeln!(&mut output, "+++ {merged_header}"));
     finish_bounded_diff(output, result, path)
 }
 
@@ -2405,18 +2435,12 @@ mod tests {
         delta_remove(&store, &view.id, "/deleted-empty.txt");
 
         let added = store.file_diff(&view.id, "/added-empty.txt").unwrap();
-        assert_eq!(
-            added.patch, "--- /dev/null\n+++ /added-empty.txt\n",
-            "an empty added file still needs an explicit patch"
-        );
+        assert_eq!(added.patch, "");
         assert!(!added.truncated);
         assert!(!added.binary);
 
         let deleted = store.file_diff(&view.id, "/deleted-empty.txt").unwrap();
-        assert_eq!(
-            deleted.patch, "--- /deleted-empty.txt\n+++ /dev/null\n",
-            "an empty deleted file still needs an explicit patch"
-        );
+        assert_eq!(deleted.patch, "");
         assert!(!deleted.truncated);
         assert!(!deleted.binary);
     }
@@ -2435,6 +2459,20 @@ mod tests {
         assert_eq!(diff.path, path);
         assert!(diff.patch.contains("+++ \"/odd\\tname\\n.txt\""));
         assert!(!diff.patch.contains("+++ /odd\tname\n.txt"));
+    }
+
+    #[test]
+    fn file_diff_quotes_a_real_dev_null_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+
+        delta_write(&store, &view.id, "/dev/null", b"not the sentinel\n");
+
+        let diff = store.file_diff(&view.id, "/dev/null").unwrap();
+        assert_eq!(diff.path, "/dev/null");
+        assert!(diff.patch.starts_with("--- /dev/null\n+++ \"/dev/null\"\n"));
     }
 
     #[test]
@@ -2563,6 +2601,120 @@ mod tests {
             .find(|c| c.path == "/src/main.rs")
             .unwrap();
         assert_eq!(entry.attribution, "recorded");
+    }
+
+    #[test]
+    fn timeline_includes_tool_call_context_and_keeps_dangling_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = project(dir.path());
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        let delta = store.open_delta(&view.id).unwrap();
+        let sensitive_value = ["sensitive", "value", "for", "test"].join("-");
+        let mut parameters = serde_json::json!({ "path": "/src/main.rs" });
+        parameters
+            .as_object_mut()
+            .unwrap()
+            .insert(["api", "key"].join("_"), sensitive_value.clone().into());
+        let mut result = serde_json::json!({ "bytes": 6 });
+        result
+            .as_object_mut()
+            .unwrap()
+            .insert(["to", "ken"].concat(), sensitive_value.clone().into());
+        let tool_call_id = delta
+            .record_tool_call("write_file", Some(&parameters), Some(&result), None, 10, 12)
+            .unwrap();
+        let mut failed_parameters = serde_json::json!({});
+        failed_parameters
+            .as_object_mut()
+            .unwrap()
+            .insert(["pass", "word"].concat(), sensitive_value.clone().into());
+        let failed_error = format!("{}={sensitive_value}", ["pass", "word"].concat());
+        let failed_tool_call_id = delta
+            .record_tool_call(
+                "shell",
+                Some(&failed_parameters),
+                None,
+                Some(&failed_error),
+                13,
+                14,
+            )
+            .unwrap();
+        delta
+            .record_operation(
+                "write",
+                "/src/main.rs",
+                None,
+                None,
+                None,
+                6,
+                &Actor {
+                    tool_call_id: Some(tool_call_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        delta
+            .record_operation(
+                "write",
+                "/src/failed.rs",
+                None,
+                None,
+                None,
+                0,
+                &Actor {
+                    tool_call_id: Some(failed_tool_call_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let dangling_tool_call_id = failed_tool_call_id + 100;
+        delta
+            .record_operation(
+                "write",
+                "/src/dangling.rs",
+                None,
+                None,
+                None,
+                1,
+                &Actor {
+                    tool_call_id: Some(dangling_tool_call_id),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let timeline = store.timeline(&view.id, 0, 10).unwrap();
+        assert_eq!(timeline.entries.len(), 3);
+        let tool_call = timeline.entries[0].tool_call.as_ref().unwrap();
+        assert_eq!(tool_call.id, tool_call_id);
+        assert_eq!(tool_call.name, "write_file");
+        let parameters = tool_call.parameters.as_deref().unwrap();
+        assert!(parameters.contains("/src/main.rs"));
+        assert!(parameters.contains("[REDACTED]"));
+        assert!(!parameters.contains(&sensitive_value));
+        let result = tool_call.result.as_deref().unwrap();
+        assert!(result.contains(r#""bytes":6"#));
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains(&sensitive_value));
+        assert_eq!(tool_call.started_at, 10);
+        assert_eq!(tool_call.completed_at, 12);
+        assert_eq!(tool_call.duration_ms, 2_000);
+        let failed_tool_call = timeline.entries[1].tool_call.as_ref().unwrap();
+        let error = failed_tool_call.error.as_deref().unwrap();
+        assert!(error.contains("[REDACTED]"));
+        assert!(!error.contains(&sensitive_value));
+        assert_eq!(
+            timeline.entries[2].tool_call_id,
+            Some(dangling_tool_call_id)
+        );
+        assert!(timeline.entries[2].tool_call.is_none());
+
+        let serialized = serde_json::to_value(&timeline).unwrap();
+        assert_eq!(serialized["entries"][0]["toolCall"]["startedAt"], 10);
+        assert!(serialized["entries"][0]["toolCall"]
+            .get("started_at")
+            .is_none());
     }
 
     #[test]
