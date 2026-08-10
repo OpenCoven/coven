@@ -6,6 +6,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use rusqlite::OptionalExtension;
+
 use crate::fs::AgentFs;
 use crate::{Error, Result};
 
@@ -70,6 +72,20 @@ impl AgentFs {
         Ok(id)
     }
 
+    /// Look up one tool call by its stable row id.
+    pub fn tool_call(&self, id: i64) -> Result<Option<ToolCall>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, name, parameters, result, error,
+                        started_at, completed_at, duration_ms
+                 FROM tool_calls WHERE id = ?1",
+                [id],
+                tool_call_from_row,
+            )
+            .optional()?)
+    }
+
     /// Tool calls with a given name, most recent first.
     pub fn tool_calls_by_name(&self, name: &str) -> Result<Vec<ToolCall>> {
         self.query_tool_calls(
@@ -96,19 +112,54 @@ impl AgentFs {
     ) -> Result<Vec<ToolCall>> {
         let mut stmt = self.conn.prepare(sql)?;
         let rows = stmt
-            .query_map(params, |r| {
-                Ok(ToolCall {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    parameters: r.get(2)?,
-                    result: r.get(3)?,
-                    error: r.get(4)?,
-                    started_at: r.get(5)?,
-                    completed_at: r.get(6)?,
-                    duration_ms: r.get(7)?,
-                })
-            })?
+            .query_map(params, tool_call_from_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+}
+
+fn tool_call_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolCall> {
+    Ok(ToolCall {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        parameters: row.get(2)?,
+        result: row.get(3)?,
+        error: row.get(4)?,
+        started_at: row.get(5)?,
+        completed_at: row.get(6)?,
+        duration_ms: row.get(7)?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn looks_up_tool_call_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = AgentFs::create(dir.path().join("afs.db")).unwrap();
+        let id = fs
+            .record_tool_call(
+                "write_file",
+                Some(&json!({ "path": "/src/main.rs" })),
+                Some(&json!({ "bytes": 7 })),
+                None,
+                10,
+                12,
+            )
+            .unwrap();
+
+        let call = fs.tool_call(id).unwrap().unwrap();
+        assert_eq!(call.id, id);
+        assert_eq!(call.name, "write_file");
+        assert_eq!(
+            call.parameters.as_deref(),
+            Some(r#"{"path":"/src/main.rs"}"#)
+        );
+        assert_eq!(call.result.as_deref(), Some(r#"{"bytes":7}"#));
+        assert_eq!(call.duration_ms, 2_000);
+        assert!(fs.tool_call(id + 1).unwrap().is_none());
     }
 }
