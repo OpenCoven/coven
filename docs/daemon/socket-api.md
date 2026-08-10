@@ -45,7 +45,8 @@ GET /api/v1/health
     "sessionHandoff": true,
     "afs": true,
     "afsMount": false,
-    "afsCommit": true
+    "afsCommit": true,
+    "afsCommitDryRun": true
   },
   "daemon": {
     "pid": 31415,
@@ -104,7 +105,10 @@ Detailed shapes live in the [API reference](/reference/api).
 Agent-filesystem routes are gated by the `afs` capability, and are **same-user
 local IPC** operations for the same reason session handoff is: they expose a
 session's working tree. `afsCommit` reports whether the daemon can materialize
-a delta into a git branch and is now `true`.
+a delta into a git branch. `afsCommitDryRun` separately reports support for the
+side-effect-free commit preview contract; clients must not infer preview support
+from `afsCommit`, because older daemons accepted commit requests before
+`dryRun` existed.
 
 `GET /api/v1/afs/sessions/:id/diff` returns the change list. Supplying a
 percent-encoded regular-file path returns the daemon-owned review patch

@@ -135,6 +135,11 @@ pub struct HealthCapabilities {
     pub afs_mount: MountCapability,
     /// Whether the daemon can materialize a delta into a git branch.
     pub afs_commit: bool,
+    /// Whether `afs.session.commit` accepts the side-effect-free `dryRun`
+    /// contract. Clients must not infer this from `afsCommit`: older daemons
+    /// accepted commit requests before preview semantics existed.
+    #[serde(default)]
+    pub afs_commit_dry_run: bool,
 }
 
 /// `afsMount`: a backend name, or `false`.
@@ -346,6 +351,7 @@ pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
             afs: true,
             afs_mount: MountCapability::detect(),
             afs_commit: true,
+            afs_commit_dry_run: true,
         },
         daemon,
         hub: None,
@@ -7042,6 +7048,21 @@ mod tests {
         };
         assert!(response.body.contains(&expected), "{}", response.body);
         assert!(response.body.contains(r#""afsCommit":true"#));
+        assert!(response.body.contains(r#""afsCommitDryRun":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn older_health_payloads_default_afs_commit_dry_run_to_false() -> anyhow::Result<()> {
+        let current = health_response(None);
+        let mut payload = serde_json::to_value(&current)?;
+        payload["capabilities"]
+            .as_object_mut()
+            .expect("capabilities object")
+            .remove("afsCommitDryRun");
+
+        let decoded: HealthResponse = serde_json::from_value(payload)?;
+        assert!(!decoded.capabilities.afs_commit_dry_run);
         Ok(())
     }
 
