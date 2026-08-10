@@ -104,6 +104,21 @@ impl AgentFs {
         Ok(entries)
     }
 
+    /// The name a directory entry has under a given parent.
+    ///
+    /// Used to reconstruct a path from an inode. A hard-linked file has
+    /// several names; this returns the one under the parent asked about.
+    pub fn child_name(&self, parent_ino: i64, ino: i64) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT name FROM fs_dentry WHERE parent_ino = ?1 AND ino = ?2",
+                params![parent_ino, ino],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("dentry for inode {ino}")))
+    }
+
     /// The directory holding an inode, or `None` for the root and for any
     /// inode with no dentry. A hard-linked file has several parents; this
     /// returns the lowest-numbered one, which is enough for resolving `..`.
