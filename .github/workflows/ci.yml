@@ -53,6 +53,37 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test -p coven-afs --features mount --locked
 
+  afs-mount-macos:
+    name: AFS mount backend (macOS)
+    # macOS is the only platform that advertises a mount backend
+    # (`afsMount: "nfs"`), and the `Rust checks` matrix does not include it.
+    # A separate job rather than a third matrix entry: this needs to build one
+    # crate, not the workspace, and the mount steps in that job are already
+    # conditioned on `runner.os == 'Linux'` for reasons that do not apply here.
+    #
+    # This does not close a *compile* gap. `crates/coven-cli/src/afs_mount.rs`
+    # uses `cfg!(target_os = "macos")` — the macro, so both branches type-check
+    # on Linux — and its helpers are `cfg(unix)`, which Linux covers. What is
+    # missing is Darwin behaviour: the nfsserve stack, the uid/gid mapping in
+    # `nfs.rs`, and the only place `mount_nfs` can actually run.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy (coven-afs mount feature)
+        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
+      - name: Test (coven-afs mount feature)
+        run: cargo test -p coven-afs --features mount --locked
+      # Informational. `coven-x77` found that macOS refuses `open()` on network
+      # volumes for processes without privacy consent, and a runner is exactly
+      # such a process — so this may well be refused. Recording which stage
+      # refuses turns a standing guess into an answer; it must never gate a PR.
+      - name: Probe a real mount (informational)
+        continue-on-error: true
+        run: ./scripts/afs-mount-smoke.sh
+
   performance-baseline:
     name: CLI performance baseline
     runs-on: ubuntu-latest

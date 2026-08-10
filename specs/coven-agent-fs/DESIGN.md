@@ -520,6 +520,29 @@ path after mount. The server-side half of that property — a captured handle
 outliving rotation — is covered by a unit test, so a regression fails CI rather
 than waiting on a manual check.
 
+On 2026-08-10, the `scripts/afs-mount-smoke.sh` probe run from an automated
+agent shell on a maintainer's machine completed every stage: mount, readdir,
+read, and write through the mount. That is the operation MOUNT-SPIKE.md §4
+recorded as `EPERM` for an automated agent shell, so it does **not** overturn
+that finding — the likelier reading is that consent is a property of the
+process tree, and this shell inherited a terminal that had since been granted
+it. What it does establish is that nothing about being automated is
+disqualifying on its own.
+
+The genuinely unconsented data point arrived the same day from the `AFS mount
+backend (macOS)` CI job, on a stock GitHub runner with no consent granted to
+anything: **every stage passed — mount, readdir, read, and write.** So the
+`EPERM` MOUNT-SPIKE.md §4 recorded was specific to that harness or that macOS
+version; it is not a blanket privacy restriction on network volumes, and it is
+not a barrier a design may lean on.
+
+That matters for §7's threat model rather than for convenience. The mitigation
+list here is the whole of the access control: an unprivileged local process
+that reaches the port and knows the token reads and writes the session's files,
+and nothing in the operating system stops it afterwards. Any future reasoning
+that treats macOS consent as a second factor is reasoning from a finding this
+job disproved.
+
 **Enforcement is not free.** As RESEARCH.md notes, the mount alone does not stop
 an agent writing to an absolute path outside it. AFS bounds the blast radius of
 writes that go *through* it; the OS sandbox that forces all writes through the
