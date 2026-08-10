@@ -83,6 +83,9 @@ pub enum AfsError {
     },
     /// The target branch or worktree path is already taken.
     CommitConflict(String),
+    /// The caller supplied a preview token for an earlier materialization
+    /// plan, but the delta or target branch has changed since that preview.
+    PreviewStale,
     /// Signing is required and unavailable; Coven never falls back to an
     /// unsigned commit to make materialization land.
     CommitUnsigned(String),
@@ -91,6 +94,48 @@ pub enum AfsError {
     /// Already mounted, or the mount point is not empty.
     MountBusy(String),
     Internal(anyhow::Error),
+}
+
+fn commit_plan_token(base_commit: &str, branch: &str, plan: &[Planned]) -> String {
+    fn field(digest: &mut Sha256, value: &[u8]) {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+
+    let mut digest = Sha256::new();
+    field(&mut digest, base_commit.as_bytes());
+    field(&mut digest, branch.as_bytes());
+    for item in plan {
+        match item {
+            Planned::File {
+                path,
+                data,
+                executable,
+            } => {
+                digest.update([b'f']);
+                field(&mut digest, path.as_bytes());
+                field(&mut digest, data);
+                digest.update([u8::from(*executable)]);
+            }
+            Planned::Symlink { path, target } => {
+                digest.update([b'l']);
+                field(&mut digest, path.as_bytes());
+                field(&mut digest, target.as_bytes());
+            }
+            Planned::Removal { path } => {
+                digest.update([b'r']);
+                field(&mut digest, path.as_bytes());
+            }
+        }
+    }
+    format!(
+        "sha256:{}",
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 impl AfsError {
@@ -142,6 +187,11 @@ impl AfsError {
                 format!("{path} is {bytes} bytes, over the {COPY_UP_MAX_BYTES}-byte copy-up cap."),
             ),
             Self::CommitConflict(message) => (409, "afs.commit_conflict", message.clone()),
+            Self::PreviewStale => (
+                409,
+                "afs.preview_stale",
+                "The AFS commit plan changed after preview; preview the commit again.".to_string(),
+            ),
             Self::CommitUnsigned(message) => (
                 500,
                 "afs.commit_unsigned",
@@ -204,6 +254,10 @@ pub struct CommitRequest {
     /// quiescing the session, creating a worktree, or recording a commit.
     #[serde(default)]
     pub dry_run: bool,
+    /// Optional token returned by `dryRun`. When present, commit refuses if
+    /// the resolved materialization plan changed after preview.
+    #[serde(default)]
+    pub preview_token: Option<String>,
 }
 
 /// What a `dryRun` commit reports (bead `coven-fty` follow-up `coven-y7a`).
@@ -218,6 +272,7 @@ pub struct CommitPreview {
     pub branch: String,
     pub worktree_path: String,
     pub provenance_high_water: i64,
+    pub preview_token: String,
     pub counts: ChangeCounts,
     /// Entries that would be written or removed, after directories and
     /// unmaterializable nodes are dropped — not the same as `counts`.
@@ -236,6 +291,7 @@ struct CommitPlan {
     plan: Vec<Planned>,
     counts: ChangeCounts,
     high_water: i64,
+    preview_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,6 +892,7 @@ impl AfsStore {
             branch: plan.branch,
             worktree_path: plan.worktree_path.to_string_lossy().into_owned(),
             provenance_high_water: plan.high_water,
+            preview_token: plan.preview_token,
             counts: plan.counts,
             files: plan.plan.len(),
             dry_run: true,
@@ -922,6 +979,7 @@ impl AfsStore {
             .open_delta(id)?
             .provenance_high_water()
             .map_err(AfsError::from)?;
+        let preview_token = commit_plan_token(&expected, &branch, &plan);
 
         Ok(CommitPlan {
             binding,
@@ -931,6 +989,7 @@ impl AfsStore {
             plan,
             counts,
             high_water,
+            preview_token,
         })
     }
 
@@ -950,7 +1009,15 @@ impl AfsStore {
             plan,
             counts,
             high_water,
+            preview_token,
         } = self.plan_commit(id, request)?;
+        if request
+            .preview_token
+            .as_deref()
+            .is_some_and(|expected| expected != preview_token)
+        {
+            return Err(AfsError::PreviewStale);
+        }
 
         // §5.1 — quiesce only once nothing can still refuse.
         let delta = self.open_delta(id)?;
@@ -1937,6 +2004,7 @@ mod tests {
         assert_eq!(preview.counts.added, 1);
         assert_eq!(preview.counts.modified, 1);
         assert_eq!(preview.files, 2);
+        assert!(preview.preview_token.starts_with("sha256:"));
 
         // Zero effects: no branch, no worktree, no state change, no audit row.
         assert!(!git_branch_exists(&root, &preview.branch));
@@ -1950,13 +2018,51 @@ mod tests {
             .is_empty());
 
         // And a dry run that says "would commit" is followed by one that does.
-        let committed = store.commit(&view.id, &CommitRequest::default()).unwrap();
+        let committed = store
+            .commit(
+                &view.id,
+                &CommitRequest {
+                    preview_token: Some(preview.preview_token.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(committed.state, STATE_COMMITTED);
         assert_eq!(committed.branch, preview.branch);
         assert_eq!(
             committed.provenance_high_water,
             preview.provenance_high_water
         );
+    }
+
+    #[test]
+    fn commit_refuses_a_preview_token_after_the_plan_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = signing_key(dir.path());
+        let root = git_project(dir.path(), &key);
+        let store = store(dir.path());
+        let view = create(&store, &root);
+        delta_write(&store, &view.id, "/src/added.rs", b"first");
+
+        let preview = store
+            .commit_dry_run(&view.id, &CommitRequest::default())
+            .unwrap();
+        // This mutation need not carry provenance for the token to catch it:
+        // the token covers the resolved bytes, not only the audit cursor.
+        delta_write(&store, &view.id, "/src/added.rs", b"changed after preview");
+
+        let error = store
+            .commit(
+                &view.id,
+                &CommitRequest {
+                    preview_token: Some(preview.preview_token.clone()),
+                    ..Default::default()
+                },
+            )
+            .expect_err("a stale preview must not materialize");
+        assert_eq!(error.parts().1, "afs.preview_stale");
+        assert_eq!(store.get(&view.id).unwrap().state, STATE_OPEN);
+        assert!(!git_branch_exists(&root, &preview.branch));
     }
 
     #[test]
