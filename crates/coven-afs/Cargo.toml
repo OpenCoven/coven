@@ -30,7 +30,7 @@ libc = { version = "0.2", optional = true }
 # File-handle authentication (see the Trust section in src/nfs.rs). All three
 # are already in the workspace lock, so the mount feature pulls in no new
 # transitive dependencies.
-hmac = { version = "0.12", optional = true }
+hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.10", optional = true }
 getrandom = { version = "0.2", optional = true }
 # Only the out-of-process export binary initializes a subscriber; the library
