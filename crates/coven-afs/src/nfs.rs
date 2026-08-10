@@ -153,8 +153,8 @@ const GATE_ROOT: fileid3 = u64::MAX;
 /// `MOUNTPROC3_EXPORT` dumps the export path to any caller, unauthenticated,
 /// so a token carried there is readable by exactly the attacker it is meant to
 /// stop. Inside the VFS there is no procedure that lists it.
-pub struct AfsNfs {
-    fs: Mutex<AgentFs>,
+pub struct AfsNfs<F: ExportFs = AgentFs> {
+    fs: Mutex<F>,
     read_only: bool,
     uid: u32,
     gid: u32,
@@ -220,10 +220,244 @@ impl GateHandle {
     }
 }
 
-impl AfsNfs {
-    /// Wrap a filesystem for export. A read-only [`AgentFs`] is exported
+/// The inode-addressed operations an NFS export needs from a filesystem.
+///
+/// Implemented by [`AgentFs`], which exports one layer, and by
+/// [`OverlayExport`], which exports a merged base+delta view. The export is
+/// written against this rather than against `AgentFs` because mounting a
+/// session means mounting the merged view (DESIGN.md §3.2); exporting the
+/// delta alone would show only the files a session had already changed.
+///
+/// Every method takes `&mut self`: the overlay caches inode paths as clients
+/// walk down from the root, so operations that look read-only to a caller are
+/// not read-only to the implementation.
+pub trait ExportFs: Send + 'static {
+    fn is_read_only(&self) -> bool;
+    fn root_ino(&self) -> i64;
+    fn lookup_ino(&mut self, parent: i64, name: &str) -> crate::Result<Option<i64>>;
+    fn parent_of(&mut self, ino: i64) -> crate::Result<Option<i64>>;
+    fn stat_ino(&mut self, ino: i64) -> crate::Result<Metadata>;
+    fn setattr_ino(
+        &mut self,
+        ino: i64,
+        mode: Option<u32>,
+        uid: Option<i64>,
+        gid: Option<i64>,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> crate::Result<Metadata>;
+    fn read_ino_at(
+        &mut self,
+        ino: i64,
+        offset: u64,
+        count: usize,
+    ) -> crate::Result<(Vec<u8>, bool)>;
+    fn write_ino_at(&mut self, ino: i64, offset: u64, data: &[u8]) -> crate::Result<Metadata>;
+    fn truncate_ino(&mut self, ino: i64, size: u64) -> crate::Result<Metadata>;
+    fn create_child(
+        &mut self,
+        parent: i64,
+        name: &str,
+        mode: u32,
+    ) -> crate::Result<(i64, Metadata)>;
+    fn mkdir_ino(&mut self, parent: i64, name: &str, mode: u32) -> crate::Result<(i64, Metadata)>;
+    fn symlink_ino(
+        &mut self,
+        parent: i64,
+        name: &str,
+        target: &str,
+    ) -> crate::Result<(i64, Metadata)>;
+    fn readlink_ino(&mut self, ino: i64) -> crate::Result<String>;
+    fn remove_ino(&mut self, parent: i64, name: &str) -> crate::Result<()>;
+    fn rename_ino(
+        &mut self,
+        from_parent: i64,
+        from_name: &str,
+        to_parent: i64,
+        to_name: &str,
+    ) -> crate::Result<()>;
+    fn readdir_ino(
+        &mut self,
+        parent: i64,
+        start_after: i64,
+        limit: usize,
+    ) -> crate::Result<Vec<crate::ino::DirEntry>>;
+}
+
+impl ExportFs for AgentFs {
+    fn is_read_only(&self) -> bool {
+        AgentFs::is_read_only(self)
+    }
+    fn root_ino(&self) -> i64 {
+        ROOT_INO
+    }
+    fn lookup_ino(&mut self, parent: i64, name: &str) -> crate::Result<Option<i64>> {
+        AgentFs::lookup_ino(self, parent, name)
+    }
+    fn parent_of(&mut self, ino: i64) -> crate::Result<Option<i64>> {
+        AgentFs::parent_of(self, ino)
+    }
+    fn stat_ino(&mut self, ino: i64) -> crate::Result<Metadata> {
+        AgentFs::stat_ino(self, ino)
+    }
+    fn setattr_ino(
+        &mut self,
+        ino: i64,
+        mode: Option<u32>,
+        uid: Option<i64>,
+        gid: Option<i64>,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> crate::Result<Metadata> {
+        AgentFs::setattr_ino(self, ino, mode, uid, gid, atime, mtime)
+    }
+    fn read_ino_at(
+        &mut self,
+        ino: i64,
+        offset: u64,
+        count: usize,
+    ) -> crate::Result<(Vec<u8>, bool)> {
+        AgentFs::read_ino_at(self, ino, offset, count)
+    }
+    fn write_ino_at(&mut self, ino: i64, offset: u64, data: &[u8]) -> crate::Result<Metadata> {
+        AgentFs::write_ino_at(self, ino, offset, data)
+    }
+    fn truncate_ino(&mut self, ino: i64, size: u64) -> crate::Result<Metadata> {
+        AgentFs::truncate_ino(self, ino, size)
+    }
+    fn create_child(
+        &mut self,
+        parent: i64,
+        name: &str,
+        mode: u32,
+    ) -> crate::Result<(i64, Metadata)> {
+        AgentFs::create_child(self, parent, name, mode)
+    }
+    fn mkdir_ino(&mut self, parent: i64, name: &str, mode: u32) -> crate::Result<(i64, Metadata)> {
+        AgentFs::mkdir_ino(self, parent, name, mode)
+    }
+    fn symlink_ino(
+        &mut self,
+        parent: i64,
+        name: &str,
+        target: &str,
+    ) -> crate::Result<(i64, Metadata)> {
+        AgentFs::symlink_ino(self, parent, name, target)
+    }
+    fn readlink_ino(&mut self, ino: i64) -> crate::Result<String> {
+        AgentFs::readlink_ino(self, ino)
+    }
+    fn remove_ino(&mut self, parent: i64, name: &str) -> crate::Result<()> {
+        AgentFs::remove_ino(self, parent, name)
+    }
+    fn rename_ino(
+        &mut self,
+        from_parent: i64,
+        from_name: &str,
+        to_parent: i64,
+        to_name: &str,
+    ) -> crate::Result<()> {
+        AgentFs::rename_ino(self, from_parent, from_name, to_parent, to_name)
+    }
+    fn readdir_ino(
+        &mut self,
+        parent: i64,
+        start_after: i64,
+        limit: usize,
+    ) -> crate::Result<Vec<crate::ino::DirEntry>> {
+        AgentFs::readdir_ino(self, parent, start_after, limit)
+    }
+}
+
+impl ExportFs for crate::OverlayExport {
+    fn is_read_only(&self) -> bool {
+        false
+    }
+    fn root_ino(&self) -> i64 {
+        self.root()
+    }
+    fn lookup_ino(&mut self, parent: i64, name: &str) -> crate::Result<Option<i64>> {
+        crate::OverlayExport::lookup_ino(self, parent, name)
+    }
+    fn parent_of(&mut self, ino: i64) -> crate::Result<Option<i64>> {
+        crate::OverlayExport::parent_of(self, ino)
+    }
+    fn stat_ino(&mut self, ino: i64) -> crate::Result<Metadata> {
+        crate::OverlayExport::stat_ino(self, ino)
+    }
+    fn setattr_ino(
+        &mut self,
+        ino: i64,
+        mode: Option<u32>,
+        uid: Option<i64>,
+        gid: Option<i64>,
+        atime: Option<(i64, i64)>,
+        mtime: Option<(i64, i64)>,
+    ) -> crate::Result<Metadata> {
+        crate::OverlayExport::setattr_ino(self, ino, mode, uid, gid, atime, mtime)
+    }
+    fn read_ino_at(
+        &mut self,
+        ino: i64,
+        offset: u64,
+        count: usize,
+    ) -> crate::Result<(Vec<u8>, bool)> {
+        crate::OverlayExport::read_ino_at(self, ino, offset, count)
+    }
+    fn write_ino_at(&mut self, ino: i64, offset: u64, data: &[u8]) -> crate::Result<Metadata> {
+        crate::OverlayExport::write_ino_at(self, ino, offset, data)
+    }
+    fn truncate_ino(&mut self, ino: i64, size: u64) -> crate::Result<Metadata> {
+        crate::OverlayExport::truncate_ino(self, ino, size)
+    }
+    fn create_child(
+        &mut self,
+        parent: i64,
+        name: &str,
+        mode: u32,
+    ) -> crate::Result<(i64, Metadata)> {
+        crate::OverlayExport::create_child(self, parent, name, mode)
+    }
+    fn mkdir_ino(&mut self, parent: i64, name: &str, mode: u32) -> crate::Result<(i64, Metadata)> {
+        crate::OverlayExport::mkdir_ino(self, parent, name, mode)
+    }
+    fn symlink_ino(
+        &mut self,
+        parent: i64,
+        name: &str,
+        target: &str,
+    ) -> crate::Result<(i64, Metadata)> {
+        crate::OverlayExport::symlink_ino(self, parent, name, target)
+    }
+    fn readlink_ino(&mut self, ino: i64) -> crate::Result<String> {
+        crate::OverlayExport::readlink_ino(self, ino)
+    }
+    fn remove_ino(&mut self, parent: i64, name: &str) -> crate::Result<()> {
+        crate::OverlayExport::remove_ino(self, parent, name)
+    }
+    fn rename_ino(
+        &mut self,
+        from_parent: i64,
+        from_name: &str,
+        to_parent: i64,
+        to_name: &str,
+    ) -> crate::Result<()> {
+        crate::OverlayExport::rename_ino(self, from_parent, from_name, to_parent, to_name)
+    }
+    fn readdir_ino(
+        &mut self,
+        parent: i64,
+        start_after: i64,
+        limit: usize,
+    ) -> crate::Result<Vec<crate::ino::DirEntry>> {
+        crate::OverlayExport::readdir_ino(self, parent, start_after, limit)
+    }
+}
+
+impl<F: ExportFs> AfsNfs<F> {
+    /// Wrap a filesystem for export. A read-only filesystem is exported
     /// read-only.
-    pub fn new(fs: AgentFs) -> Self {
+    pub fn new(fs: F) -> Self {
         // SAFETY: getuid/getgid are always-succeeding POSIX calls with no
         // preconditions and no memory effects.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -295,7 +529,16 @@ impl AfsNfs {
         attr
     }
 
-    fn with<T>(&self, op: impl FnOnce(&mut AgentFs) -> crate::Result<T>) -> Result<T, nfsstat3> {
+    /// The exported filesystem's root inode. `AgentFs` roots at [`ROOT_INO`];
+    /// an overlay roots at whatever it presents as the merged root.
+    fn root_of_export(&self) -> i64 {
+        self.fs
+            .lock()
+            .map(|guard| guard.root_ino())
+            .unwrap_or(ROOT_INO)
+    }
+
+    fn with<T>(&self, op: impl FnOnce(&mut F) -> crate::Result<T>) -> Result<T, nfsstat3> {
         let mut guard = self.fs.lock().map_err(|_| nfsstat3::NFS3ERR_SERVERFAULT)?;
         op(&mut guard).map_err(status)
     }
@@ -358,7 +601,7 @@ fn name_of(name: &filename3) -> Result<String, nfsstat3> {
 
 /// Apply the mutable parts of a `sattr3` to an inode. Size is applied first so
 /// a truncate-on-create carries the requested length.
-fn apply_sattr(fs: &mut AgentFs, ino: i64, attr: &sattr3) -> crate::Result<Metadata> {
+fn apply_sattr<F: ExportFs>(fs: &mut F, ino: i64, attr: &sattr3) -> crate::Result<Metadata> {
     if let set_size3::size(size) = attr.size {
         fs.truncate_ino(ino, size)?;
     }
@@ -392,7 +635,7 @@ fn apply_sattr(fs: &mut AgentFs, ino: i64, attr: &sattr3) -> crate::Result<Metad
 }
 
 #[async_trait]
-impl NFSFileSystem for AfsNfs {
+impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
     fn capabilities(&self) -> VFSCapabilities {
         if self.read_only {
             VFSCapabilities::ReadOnly
@@ -443,7 +686,7 @@ impl NFSFileSystem for AfsNfs {
             // The only way past the gate. A wrong name is NOENT, exactly as a
             // missing file would be, so probing reveals nothing.
             return if self.gate_name.matches(name.as_bytes()) {
-                Ok(ROOT_INO as u64)
+                Ok(self.root_of_export() as u64)
             } else if name == "." || name == ".." {
                 Ok(GATE_ROOT)
             } else {
@@ -730,6 +973,67 @@ mod tests {
         // The gate answers getattr as a directory so a client can traverse it.
         let attr = export.getattr(gate).await.unwrap();
         assert!(matches!(attr.ftype, ftype3::NF3DIR));
+    }
+
+    /// An overlay export with a base file and an empty delta.
+    fn overlay_export(dir: &std::path::Path) -> AfsNfs<crate::OverlayExport> {
+        let base_path = dir.join("base.db");
+        {
+            let mut base = AgentFs::create(&base_path).unwrap();
+            base.write_file("/from-base.txt", b"base content").unwrap();
+        }
+        let overlay = crate::OverlayFs::open(dir.join("delta.db"), &base_path).unwrap();
+        AfsNfs::new(crate::OverlayExport::new(overlay).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_export_serves_the_merged_view_not_just_the_delta() {
+        // DESIGN.md §3.2: a mount shows the merged base+delta view. Exporting
+        // the delta alone would show only files the session had already
+        // changed, which for a fresh session is nothing at all.
+        let temp = tempfile::tempdir().unwrap();
+        let export = overlay_export(temp.path());
+        let root = export
+            .path_to_id(format!("/{}", export.token()).as_bytes())
+            .await
+            .expect("the gate opens");
+
+        let listing = export.readdir(root, 0, 64).await.unwrap();
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|e| e.name.as_ref() == b"from-base.txt"),
+            "a base-only file must be visible through the mount"
+        );
+
+        let id = export.lookup(root, &name("from-base.txt")).await.unwrap();
+        let (data, _) = export.read(id, 0, 64).await.unwrap();
+        assert_eq!(data, b"base content");
+    }
+
+    #[tokio::test]
+    async fn a_file_handle_survives_the_copy_up_a_write_causes() {
+        // The acceptance criterion for coven-vlw, at the layer that matters:
+        // the client holds an NFS file handle, and the write that moves the
+        // file into the delta must not invalidate it.
+        let temp = tempfile::tempdir().unwrap();
+        let export = overlay_export(temp.path());
+        let root = export
+            .path_to_id(format!("/{}", export.token()).as_bytes())
+            .await
+            .expect("the gate opens");
+
+        let id = export.lookup(root, &name("from-base.txt")).await.unwrap();
+        let handle = export.id_to_fh(id);
+
+        export.write(id, 0, b"rewritten...").await.unwrap();
+
+        // Same handle, resolved the way a server does on every operation.
+        let resolved = export.fh_to_id(&handle).expect("the handle still resolves");
+        assert_eq!(resolved, id);
+        let (data, _) = export.read(resolved, 0, 64).await.unwrap();
+        assert_eq!(data, b"rewritten...");
     }
 
     #[tokio::test]

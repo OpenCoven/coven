@@ -405,6 +405,87 @@ impl OverlayExport {
         Ok(())
     }
 
+    /// Move a name, materializing whatever the base still owns.
+    ///
+    /// Rename is the operation where the two layers genuinely fight: the base
+    /// is read-only, so a name cannot move out of it. The source is copied
+    /// into the delta first, moved there, and the old name whited out if the
+    /// base would otherwise keep supplying it.
+    pub fn rename_ino(
+        &mut self,
+        from_parent: i64,
+        from_name: &str,
+        to_parent: i64,
+        to_name: &str,
+    ) -> Result<()> {
+        let from_dir_path = self.path_of(from_parent)?;
+        let from_path = Self::child_path(&from_dir_path, from_name);
+        let to_dir_path = self.path_of(to_parent)?;
+        let to_path = Self::child_path(&to_dir_path, to_name);
+        if from_path == to_path {
+            return Ok(());
+        }
+
+        let source = self
+            .lookup_ino(from_parent, from_name)?
+            .ok_or_else(|| Error::NotFound(from_path.clone()))?;
+        if let Layer::Base(base_ino) = self.resolve(source) {
+            let delta_ino = self.materialize_tree(&from_path)?;
+            self.redirect.insert(base_ino, delta_ino);
+        }
+
+        let from_dir = self.ensure_delta_dir(from_parent)?;
+        let to_dir = self.ensure_delta_dir(to_parent)?;
+        self.fs.clear_whiteout(&to_path)?;
+        self.fs
+            .delta_mut()
+            .rename_ino(from_dir, from_name, to_dir, to_name)?;
+
+        // The delta entry moved, but the base's copy of the old name did not.
+        // Without a whiteout the file reappears at its original path, which
+        // reads as the rename having copied rather than moved.
+        let base_keeps_source = match self.base_dir_ino(from_parent, &from_dir_path)? {
+            Some(base_dir) => self.fs.base().lookup_ino(base_dir, from_name)?.is_some(),
+            None => false,
+        };
+        if base_keeps_source {
+            self.fs.set_whiteout(&from_path)?;
+        }
+
+        self.paths.remove(&source);
+        self.remember(source, to_path);
+        Ok(())
+    }
+
+    /// Copy a base subtree into the delta, returning the delta inode.
+    ///
+    /// Only rename needs this. Reads and writes never do: a file copies up
+    /// alone, and a directory keeps serving its children through the merge.
+    /// Moving a directory out of the base is the one case where the delta has
+    /// to own the whole subtree, and the cost is proportional to it.
+    fn materialize_tree(&mut self, path: &str) -> Result<i64> {
+        let meta = self.fs.base().stat(path)?;
+        if meta.is_file() {
+            return self.fs.copy_up(path);
+        }
+        if meta.is_symlink() {
+            let target = self.fs.base().read_link(path)?;
+            return self.fs.delta_mut().symlink(&target, path);
+        }
+        let ino = self.fs.delta_mut().mkdir_p(path)?;
+        for name in self.fs.base().readdir(path)? {
+            let child = Self::child_path(path, &name);
+            if self.fs.has_whiteout(&child)? {
+                continue;
+            }
+            if self.fs.delta().exists(&child)? {
+                continue;
+            }
+            self.materialize_tree(&child)?;
+        }
+        Ok(ino)
+    }
+
     /// Change attributes, copying the file up first if it is still base.
     pub fn setattr_ino(
         &mut self,
@@ -734,6 +815,64 @@ mod tests {
         assert_eq!(meta.mode & 0o777, 0o600);
         // Content survived the copy-up.
         assert_eq!(read_all(&export, id), b"unchanged");
+    }
+
+    #[test]
+    fn renaming_a_base_only_file_moves_it_rather_than_copying_it() {
+        // Without a whiteout on the source, the base keeps supplying the old
+        // name and the file appears at both paths — a copy, not a move.
+        let temp = tempfile::tempdir().unwrap();
+        let mut export = export(temp.path());
+        let root = export.root();
+
+        export
+            .rename_ino(root, "keep.txt", root, "moved.txt")
+            .unwrap();
+
+        assert_eq!(export.lookup_ino(root, "keep.txt").unwrap(), None);
+        let moved = export
+            .lookup_ino(root, "moved.txt")
+            .unwrap()
+            .expect("moved");
+        assert_eq!(read_all(&export, moved), b"unchanged");
+        let listed = names(&export.readdir_ino(root, 0, 100).unwrap());
+        assert!(listed.contains(&"moved.txt".to_string()));
+        assert!(!listed.contains(&"keep.txt".to_string()), "{listed:?}");
+    }
+
+    #[test]
+    fn renaming_a_base_only_directory_carries_its_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut export = export(temp.path());
+        let root = export.root();
+
+        export.rename_ino(root, "dir", root, "moved").unwrap();
+
+        assert_eq!(export.lookup_ino(root, "dir").unwrap(), None);
+        let moved = export.lookup_ino(root, "moved").unwrap().expect("moved");
+        let nested = export
+            .lookup_ino(moved, "nested.txt")
+            .unwrap()
+            .expect("child");
+        assert_eq!(read_all(&export, nested), b"nested");
+    }
+
+    #[test]
+    fn renaming_onto_a_whited_out_name_lifts_the_whiteout() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut export = export(temp.path());
+        let root = export.root();
+        export.remove_ino(root, "drop.txt").unwrap();
+
+        export
+            .rename_ino(root, "keep.txt", root, "drop.txt")
+            .unwrap();
+
+        let found = export
+            .lookup_ino(root, "drop.txt")
+            .unwrap()
+            .expect("visible");
+        assert_eq!(read_all(&export, found), b"unchanged");
     }
 
     #[test]

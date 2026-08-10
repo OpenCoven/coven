@@ -9,8 +9,12 @@
 //! rather than a thread to guess about.
 //!
 //! ```text
-//! coven-afs-serve <db-path>
+//! coven-afs-serve <delta-path> [base-path]
 //! ```
+//!
+//! With a base, the export serves the merged base+delta view a mount is
+//! supposed to show (DESIGN.md §3.2). Without one it serves the delta alone,
+//! which is only useful for a session that has no base.
 //!
 //! **Handshake.** One line each on stdout, in order:
 //!
@@ -31,7 +35,7 @@
 //! — the one that was briefly `ps`-visible — stops opening the gate. The
 //! parent never learns the replacement, because it has no further use for it.
 
-use coven_afs::{AfsNfs, AgentFs};
+use coven_afs::{AfsNfs, AgentFs, OverlayExport, OverlayFs};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 
 /// DESIGN.md §7 invariant: the export token is never logged, printed, or
@@ -59,10 +63,12 @@ fn refuse_terminal_stdout() -> Result<(), Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!("usage: coven-afs-serve <db-path>");
+    let mut args = std::env::args().skip(1);
+    let Some(path) = args.next() else {
+        eprintln!("usage: coven-afs-serve <delta-path> [base-path]");
         std::process::exit(2);
     };
+    let base = args.next();
     refuse_terminal_stdout()?;
 
     tracing_subscriber::fmt()
@@ -72,16 +78,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    // `create` is open-or-create; the daemon always hands us an existing
-    // session delta.
-    let fs = AgentFs::create(&path)?;
-    // A mounted overlay is scratch state whose durability story is "discard or
-    // commit", so the WAL trade MOUNT-SPIKE.md §3 measured is the right one
-    // here. The daemon opens session deltas this way; a delta being handed to
-    // someone else does not.
-    fs.enable_wal()?;
+    // Two shapes of export, one serving path. Splitting the listener setup
+    // per branch would duplicate the handshake, which is the part that must
+    // not drift.
+    match base {
+        Some(base) => {
+            let overlay = OverlayFs::open(&path, &base)?;
+            // A mounted overlay is scratch state whose durability story is
+            // "discard or commit", so the WAL trade MOUNT-SPIKE.md §3 measured
+            // is the right one. The daemon opens session deltas this way; a
+            // delta being handed to someone else does not.
+            overlay.delta().enable_wal()?;
+            serve(AfsNfs::new(OverlayExport::new(overlay)?)).await
+        }
+        None => {
+            let fs = AgentFs::create(&path)?;
+            fs.enable_wal()?;
+            serve(AfsNfs::new(fs)).await
+        }
+    }
+}
 
-    let export = AfsNfs::new(fs);
+/// Bind, hand the parent the port and token, and serve until told to stop.
+async fn serve<F: coven_afs::ExportFs>(
+    export: AfsNfs<F>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let gate = export.gate_handle();
     // Port 0: the OS picks, so the export never lands on a guessable port.
     let listener = NFSTcpListener::bind("127.0.0.1:0", export).await?;
