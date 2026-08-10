@@ -553,6 +553,14 @@ and nothing in the operating system stops it afterwards. Any future reasoning
 that treats macOS consent as a second factor is reasoning from a finding this
 job disproved.
 
+On 2026-08-10 the mount was driven end to end through the daemon routes for
+the first time (`scripts/afs-mount-e2e.sh`): `POST …/mount` produced a real
+mount, a base-only file was readable through it, a write through the mount
+appeared in `afs.session.diff`, `GET …/sessions/:id` reported the mount point,
+and `DELETE …/mount` removed it. Until then `afsMount: "nfs"` rested on
+in-process tests and an export-level probe; the route a caller actually uses
+had never been exercised against a kernel client.
+
 **Enforcement is not free.** As RESEARCH.md notes, the mount alone does not stop
 an agent writing to an absolute path outside it. AFS bounds the blast radius of
 writes that go *through* it; the OS sandbox that forces all writes through the
