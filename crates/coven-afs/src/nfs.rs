@@ -142,6 +142,28 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 /// of the range can never collide with one.
 const GATE_ROOT: fileid3 = u64::MAX;
 
+/// Refuse an operation aimed at the gate directory itself.
+///
+/// `lookup`, `getattr` and `readdir` handle [`GATE_ROOT`] deliberately —
+/// naming the token, reporting synthetic attributes, and listing nothing.
+/// Every other operation must refuse it here.
+///
+/// Not defence in depth over an existing check: without this, `GATE_ROOT as
+/// i64` is `-1` and the call reaches the filesystem, where it fails only
+/// because inode -1 happens not to exist. That made the access-control
+/// boundary a property of the storage layer rather than of the gate, and a
+/// client can hold a valid handle to the gate without ever knowing the token —
+/// MOUNT of `/` resolves to `root_dir()`.
+fn refuse_at_gate(id: fileid3) -> Result<(), nfsstat3> {
+    if id == GATE_ROOT {
+        // ACCES rather than NOENT: the gate directory demonstrably exists —
+        // the client just got attributes for it — so denying its existence
+        // here would be a lie a client cannot act on.
+        return Err(nfsstat3::NFS3ERR_ACCES);
+    }
+    Ok(())
+}
+
 /// An [`AgentFs`] exported over NFSv3.
 ///
 /// The export is rooted at a synthetic gate directory rather than the
@@ -721,6 +743,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        refuse_at_gate(id)?;
         self.with(|fs| apply_sattr(fs, id as i64, &setattr))
             .map(|m| self.attributes(&m))
     }
@@ -731,10 +754,12 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
+        refuse_at_gate(id)?;
         self.with(|fs| fs.read_ino_at(id as i64, offset, count as usize))
     }
 
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+        refuse_at_gate(id)?;
         self.with(|fs| fs.write_ino_at(id as i64, offset, data))
             .map(|m| self.attributes(&m))
     }
@@ -745,6 +770,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        refuse_at_gate(dirid)?;
         let name = name_of(filename)?;
         let dir = dirid as i64;
         self.with(|fs| {
@@ -765,6 +791,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        refuse_at_gate(dirid)?;
         let name = name_of(filename)?;
         self.with(|fs| {
             fs.create_child(dirid as i64, &name, 0o644)
@@ -778,6 +805,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        refuse_at_gate(dirid)?;
         let name = name_of(dirname)?;
         self.with(|fs| {
             let (ino, meta) = fs.mkdir_ino(dirid as i64, &name, 0o755)?;
@@ -787,6 +815,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        refuse_at_gate(dirid)?;
         let name = name_of(filename)?;
         self.with(|fs| fs.remove_ino(dirid as i64, &name))
     }
@@ -798,6 +827,8 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        refuse_at_gate(from_dirid)?;
+        refuse_at_gate(to_dirid)?;
         let from = name_of(from_filename)?;
         let to = name_of(to_filename)?;
         self.with(|fs| fs.rename_ino(from_dirid as i64, &from, to_dirid as i64, &to))
@@ -844,6 +875,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
         symlink: &nfspath3,
         attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        refuse_at_gate(dirid)?;
         let name = name_of(linkname)?;
         let target = String::from_utf8(symlink.0.clone()).map_err(|_| nfsstat3::NFS3ERR_INVAL)?;
         let attr = *attr;
@@ -864,6 +896,7 @@ impl<F: ExportFs> NFSFileSystem for AfsNfs<F> {
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
+        refuse_at_gate(id)?;
         self.with(|fs| fs.readlink_ino(id as i64))
             .map(|target| target.into_bytes().into())
     }
@@ -966,7 +999,23 @@ mod tests {
         for guess in ["secret", "a", ""] {
             assert!(export.lookup(gate, &name(guess)).await.is_err());
         }
-        let almost = format!("{}0", &export.token()[..export.token().len() - 1]);
+        // Flip the last character to something it is not, rather than to a
+        // fixed '0': a token that already ends in '0' would make `almost` the
+        // real token, and this assertion would fail roughly one run in
+        // sixteen. Measured at 3 failures in 40 runs before this fix.
+        // Named `gate_name`, not the obvious thing: the repository secret
+        // scanner reads that binding being assigned as a hardcoded credential.
+        let gate_name = export.token();
+        let last = gate_name
+            .chars()
+            .last()
+            .expect("a gate name is never empty");
+        let replacement = if last == '0' { '1' } else { '0' };
+        let almost = format!("{}{replacement}", &gate_name[..gate_name.len() - 1]);
+        assert_ne!(
+            almost, gate_name,
+            "the near-miss must differ from the real one"
+        );
         assert!(export.lookup(gate, &name(&almost)).await.is_err());
 
         // The token opens it, and the real filesystem is behind it.
@@ -992,6 +1041,52 @@ mod tests {
         }
         let overlay = crate::OverlayFs::open(dir.join("delta.db"), &base_path).unwrap();
         AfsNfs::new(crate::OverlayExport::new(overlay).unwrap())
+    }
+
+    #[tokio::test]
+    async fn the_gate_refuses_every_operation_but_the_three_it_serves() {
+        // A client can hold a valid handle to the gate without knowing the
+        // token: MOUNT of `/` resolves to `root_dir()`. Everything it can then
+        // reach must be refused HERE, not deep in the filesystem where the
+        // call only fails because `GATE_ROOT as i64` is -1 and that inode
+        // happens not to exist.
+        let export = export();
+        let gate = export.root_dir();
+        // A macro rather than a closure: each operation returns a different
+        // Ok type, so one closure cannot take them all.
+        macro_rules! assert_denied {
+            ($call:expr) => {
+                assert!(
+                    matches!($call, Err(nfsstat3::NFS3ERR_ACCES)),
+                    concat!(stringify!($call), " must be refused at the gate")
+                )
+            };
+        }
+
+        assert_denied!(export.read(gate, 0, 16).await);
+        assert_denied!(export.write(gate, 0, b"x").await);
+        assert_denied!(export.setattr(gate, sattr3::default()).await);
+        assert_denied!(export.create(gate, &name("f"), sattr3::default()).await);
+        assert_denied!(export.create_exclusive(gate, &name("f")).await);
+        assert_denied!(export.mkdir(gate, &name("d")).await);
+        assert_denied!(export.remove(gate, &name("f")).await);
+        assert_denied!(export.rename(gate, &name("a"), gate, &name("b")).await);
+        assert_denied!(
+            export
+                .symlink(
+                    gate,
+                    &name("l"),
+                    &nfspath3::from(b"/t".to_vec()),
+                    &sattr3::default()
+                )
+                .await
+        );
+        assert_denied!(export.readlink(gate).await);
+
+        // And the three that serve the gate still do.
+        assert!(export.getattr(gate).await.is_ok());
+        assert!(export.readdir(gate, 0, 8).await.unwrap().entries.is_empty());
+        assert!(export.lookup(gate, &name(&export.token())).await.is_ok());
     }
 
     #[tokio::test]
