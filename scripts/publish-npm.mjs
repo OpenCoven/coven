@@ -16,14 +16,21 @@ const targets = {
     os: 'darwin',
     cpu: 'arm64',
     rustTarget: 'aarch64-apple-darwin',
-    binaryName: 'coven'
+    binaryName: 'coven',
+    // The per-mount NFS export process. Declared only for macOS because
+    // `afs_mount::backend()` returns None elsewhere, and the `mount` feature
+    // does not compile on Windows at all. Shipping it where nothing can use
+    // it would be dead weight; omitting it on macOS makes `afsMount` false
+    // for every installed user, which is what this fixes.
+    helperBinaryName: 'coven-afs-serve'
   },
   'macos-x64': {
     packageName: '@opencoven/cli-macos-x64',
     os: 'darwin',
     cpu: 'x64',
     rustTarget: 'x86_64-apple-darwin',
-    binaryName: 'coven'
+    binaryName: 'coven',
+    helperBinaryName: 'coven-afs-serve'
   },
   'linux-x64': {
     packageName: '@opencoven/cli-linux-x64',
@@ -86,6 +93,17 @@ function main() {
   if (!wrapperOnly) {
     if (!skipBuild) {
       run('cargo', ['build', '--release', '--package', 'coven-cli', '--target', target.rustTarget]);
+      if (target.helperBinaryName) {
+        // Built here as well as in CI, so a local `--dry-run` produces the
+        // same payload the release does. Without this the helper check below
+        // would fail locally for a reason that has nothing to do with the
+        // package being wrong.
+        run('cargo', [
+          'build', '--release', '-p', 'coven-afs',
+          '--features', 'mount', '--bins',
+          '--target', target.rustTarget
+        ]);
+      }
     }
 
     const binaryPath = path.join(repoRoot, 'target', target.rustTarget, 'release', target.binaryName);
@@ -158,6 +176,18 @@ function writePlatformPackage(targetName, target, binaryPath, version) {
   cpSync(path.join(repoRoot, 'npm', 'coven-platform-template', 'README.md'), path.join(outDir, 'README.md'));
   cpSync(binaryPath, path.join(binDir, target.binaryName));
   chmodSync(path.join(binDir, target.binaryName), 0o755);
+
+  if (target.helperBinaryName) {
+    const helperPath = path.join(path.dirname(binaryPath), target.helperBinaryName);
+    if (!existsSync(helperPath)) {
+      // Loud rather than optional. v0.3.0 shipped without this helper and
+      // every installed user got `afsMount: false`; nothing failed, because
+      // nothing looked.
+      fail(`Declared helper binary not found at ${helperPath}`);
+    }
+    cpSync(helperPath, path.join(binDir, target.helperBinaryName));
+    chmodSync(path.join(binDir, target.helperBinaryName), 0o755);
+  }
   return outDir;
 }
 
@@ -210,6 +240,15 @@ export function releaseVersion(env = process.env, packageVersion = wrapperPackag
 
 export function targetPackageName(targetName) {
   return targets[targetName]?.packageName;
+}
+
+/// The extra binary a platform package ships beside `coven`, or undefined.
+///
+/// Exported so the packaging contract is testable: v0.3.0 shipped without the
+/// AFS export helper and nothing failed, because nothing inspected what went
+/// into the tarball.
+export function targetHelperBinaryName(targetName) {
+  return targets[targetName]?.helperBinaryName;
 }
 
 export function nativeTargetNamesForPackageSet(packageSet = process.env.COVEN_NPM_NATIVE_PACKAGE_SET ?? 'post-intel') {
