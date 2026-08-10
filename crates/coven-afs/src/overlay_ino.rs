@@ -129,6 +129,17 @@ impl OverlayExport {
         self.paths.insert(id, path);
     }
 
+    /// Drop cached paths for `path` and everything under it.
+    ///
+    /// Dropping rather than repointing: `path_of` falls back to walking
+    /// `fs_dentry`, which is slower but always right, and rewriting a subtree's
+    /// worth of cached strings would be the same walk done eagerly.
+    fn forget_subtree(&mut self, path: &str) {
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        self.paths
+            .retain(|_, cached| cached != path && !cached.starts_with(&prefix));
+    }
+
     /// Join a parent path and a child name.
     fn child_path(parent: &str, name: &str) -> String {
         if parent == "/" {
@@ -452,7 +463,11 @@ impl OverlayExport {
             self.fs.set_whiteout(&from_path)?;
         }
 
-        self.paths.remove(&source);
+        // The renamed entry keeps its identity; the cached paths of everything
+        // beneath it do not. Those entries would otherwise resolve to the
+        // pre-rename path, which `copy_up` then fails on because the rename
+        // whited it out.
+        self.forget_subtree(&from_path);
         self.remember(source, to_path);
         Ok(())
     }
@@ -465,25 +480,38 @@ impl OverlayExport {
     /// to own the whole subtree, and the cost is proportional to it.
     fn materialize_tree(&mut self, path: &str) -> Result<i64> {
         let meta = self.fs.base().stat(path)?;
-        if meta.is_file() {
-            return self.fs.copy_up(path);
-        }
-        if meta.is_symlink() {
+        let delta_ino = if meta.is_file() {
+            self.fs.copy_up(path)?
+        } else if meta.is_symlink() {
             let target = self.fs.base().read_link(path)?;
-            return self.fs.delta_mut().symlink(&target, path);
-        }
-        let ino = self.fs.delta_mut().mkdir_p(path)?;
-        for name in self.fs.base().readdir(path)? {
-            let child = Self::child_path(path, &name);
-            if self.fs.has_whiteout(&child)? {
-                continue;
+            self.fs.delta_mut().symlink(&target, path)?
+        } else {
+            let ino = self.fs.delta_mut().mkdir_p(path)?;
+            for name in self.fs.base().readdir(path)? {
+                let child = Self::child_path(path, &name);
+                if self.fs.has_whiteout(&child)? {
+                    continue;
+                }
+                if let Some(existing) = self.fs.delta().resolve(&child)? {
+                    // Already in the delta, so there is nothing to copy — but a
+                    // handle still tagged base must not keep resolving to the
+                    // base copy, so it is redirected all the same.
+                    if let Some(base_child) = self.fs.base().resolve(&child)? {
+                        self.redirect.insert(base_child, existing);
+                    }
+                    continue;
+                }
+                self.materialize_tree(&child)?;
             }
-            if self.fs.delta().exists(&child)? {
-                continue;
-            }
-            self.materialize_tree(&child)?;
-        }
-        Ok(ino)
+            ino
+        };
+        // Every node, not just the root. A handle to a descendant is tagged
+        // base, and without its own redirect it keeps resolving to the base
+        // copy — reading content that the delta has since moved past, silently.
+        // Handle stability across copy-up is the property this module exists
+        // for, and it has to hold at every depth.
+        self.redirect.insert(meta.ino, delta_ino);
+        Ok(delta_ino)
     }
 
     /// Change attributes, copying the file up first if it is still base.
@@ -855,6 +883,54 @@ mod tests {
             .unwrap()
             .expect("child");
         assert_eq!(read_all(&export, nested), b"nested");
+    }
+
+    #[test]
+    fn a_handle_taken_before_a_directory_rename_still_reads_current_content() {
+        // The existing rename test re-looks-up the child through the NEW
+        // parent, which takes the delta path and never exercises a handle
+        // held across the rename. Holding handles across a rename is exactly
+        // what an NFS client does.
+        let temp = tempfile::tempdir().unwrap();
+        let mut export = export(temp.path());
+        let root = export.root();
+
+        let dir = export.lookup_ino(root, "dir").unwrap().unwrap();
+        let nested = export.lookup_ino(dir, "nested.txt").unwrap().unwrap();
+        assert_ne!(nested & BASE_TAG, 0, "starts out a tagged base handle");
+
+        export.rename_ino(root, "dir", root, "moved").unwrap();
+
+        // Write through the NEW path, then read through the OLD handle. Before
+        // the fix the handle still resolved to the base copy and returned the
+        // pre-write content.
+        let moved = export.lookup_ino(root, "moved").unwrap().unwrap();
+        let via_new = export.lookup_ino(moved, "nested.txt").unwrap().unwrap();
+        export
+            .write_ino_at(via_new, 0, b"updated after the rename")
+            .unwrap();
+
+        assert_eq!(read_all(&export, nested), b"updated after the rename");
+    }
+
+    #[test]
+    fn a_handle_taken_before_a_directory_rename_can_still_be_written() {
+        // The compounded failure: the descendant's cached path was stale, so
+        // materialize() called copy_up on the pre-rename path, which the
+        // rename had whited out — the write failed NotFound.
+        let temp = tempfile::tempdir().unwrap();
+        let mut export = export(temp.path());
+        let root = export.root();
+
+        let dir = export.lookup_ino(root, "dir").unwrap().unwrap();
+        let nested = export.lookup_ino(dir, "nested.txt").unwrap().unwrap();
+
+        export.rename_ino(root, "dir", root, "moved").unwrap();
+
+        export
+            .write_ino_at(nested, 0, b"written through the old handle")
+            .expect("a handle held across a rename must stay writable");
+        assert_eq!(read_all(&export, nested), b"written through the old handle");
     }
 
     #[test]
