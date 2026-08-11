@@ -4,6 +4,10 @@ use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -3763,13 +3767,25 @@ fn run_harness_attached(
     launch_mode: harness::HarnessLaunchMode,
     stream_json: bool,
 ) -> Result<pty_runner::PtyRunResult> {
+    run_harness_attached_observed(command, launch_mode, stream_json, None)
+}
+
+fn run_harness_attached_observed(
+    command: &pty_runner::HarnessCommand,
+    launch_mode: harness::HarnessLaunchMode,
+    stream_json: bool,
+    observer: Option<pty_runner::AttachedOutputObserver>,
+) -> Result<pty_runner::PtyRunResult> {
     #[cfg(windows)]
     if launch_mode == harness::HarnessLaunchMode::NonInteractive {
+        if let Some(observer) = observer {
+            return pty_runner::run_piped_attached_observed(command, observer);
+        }
         return pty_runner::run_piped_attached(command, stream_json);
     }
     #[cfg(not(windows))]
     let _ = (launch_mode, stream_json);
-    pty_runner::run_attached(command)
+    pty_runner::run_attached_observed(command, observer)
 }
 
 /// Lock stdout, emit one stream-JSON frame, release. Per-frame locking keeps
@@ -4411,6 +4427,40 @@ fn run_session(
     // Preserve the JSONL-only captured-output contract from #315 on
     // non-Windows platforms. Windows Codex must bypass ConPTY and use the
     // verified ordinary-pipe path so Cave receives a terminal response.
+    let event_writer = if stream_json {
+        None
+    } else {
+        Some(match event_writer::EventWriter::start(coven_home.clone()) {
+            Ok(writer) => writer,
+            Err(error) => {
+                store::update_session_status(
+                    &conn,
+                    &record.id,
+                    FAILED_SESSION_STATUS,
+                    None,
+                    &current_timestamp(),
+                )?;
+                return Err(error).context("failed to start attached session event writer");
+            }
+        })
+    };
+    let output_pressured = Arc::new(AtomicBool::new(false));
+    let output_observer = event_writer.as_ref().map(|event_writer| {
+        let output_writer = event_writer.clone();
+        let output_session_id = record.id.clone();
+        let output_pressured = Arc::clone(&output_pressured);
+        Box::new(move |chunk| {
+            let text = String::from_utf8(chunk)
+                .context("attached PTY observer received invalid UTF-8 output")?;
+            match output_writer.record_output(&output_session_id, text)? {
+                true => Ok(()),
+                false => {
+                    output_pressured.store(true, Ordering::Release);
+                    Ok(())
+                }
+            }
+        }) as pty_runner::AttachedOutputObserver
+    });
     #[cfg(not(windows))]
     let attached = if stream_json {
         let output_session_id = record.id.clone();
@@ -4425,7 +4475,7 @@ fn run_session(
             }),
         )
     } else {
-        run_harness_attached(&command, launch_mode, false)
+        run_harness_attached_observed(&command, launch_mode, false, output_observer)
     };
     #[cfg(windows)]
     let attached = if stream_json {
@@ -4441,11 +4491,21 @@ fn run_session(
             }),
         )
     } else {
-        run_harness_attached(&command, launch_mode, false)
+        run_harness_attached_observed(&command, launch_mode, false, output_observer)
     };
+    if output_pressured.load(Ordering::Acquire) {
+        eprintln!(
+            "coven: event writer is pressured; some raw output for session `{}` was rejected",
+            record.id
+        );
+    }
 
     match attached {
         Ok(result) => {
+            let exit_event = event_writer
+                .as_ref()
+                .map(|event_writer| event_writer.record_exit(&record.id, result.clone()))
+                .transpose();
             store::update_session_status(
                 &conn,
                 &record.id,
@@ -4453,6 +4513,7 @@ fn run_session(
                 result.exit_code,
                 &current_timestamp(),
             )?;
+            exit_event?;
             if stream_json {
                 let is_error = result.exit_code.is_some_and(|c| c != 0);
                 emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
@@ -4482,6 +4543,18 @@ fn run_session(
             Ok(())
         }
         Err(error) => {
+            let exit_event = event_writer
+                .as_ref()
+                .map(|event_writer| {
+                    event_writer.record_exit(
+                        &record.id,
+                        pty_runner::PtyRunResult {
+                            status: FAILED_SESSION_STATUS,
+                            exit_code: None,
+                        },
+                    )
+                })
+                .transpose();
             store::update_session_status(
                 &conn,
                 &record.id,
@@ -4489,6 +4562,11 @@ fn run_session(
                 None,
                 &current_timestamp(),
             )?;
+            if let Err(persistence_error) = exit_event {
+                return Err(persistence_error).context(format!(
+                    "failed to persist terminal event after attached run error: {error:#}"
+                ));
+            }
             if stream_json {
                 emit_stream_event(&stream_json::Event::Result(stream_json::RunResult {
                     subtype: "error_during_execution".into(),

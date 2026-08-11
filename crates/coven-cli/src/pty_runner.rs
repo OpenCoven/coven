@@ -59,6 +59,8 @@ pub struct DetachedPtyObserver {
     pub on_exit: Box<dyn FnOnce(PtyRunResult) + Send + 'static>,
 }
 
+pub type AttachedOutputObserver = Box<dyn FnMut(Vec<u8>) -> Result<()> + Send + 'static>;
+
 #[cfg(windows)]
 const DETACHED_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 // Keep the value available to cross-platform source-contract tests while
@@ -3037,9 +3039,12 @@ fn stream_passthrough_args(args: Vec<String>, forward_stdin: bool) -> Vec<String
     filtered
 }
 
-pub fn run_attached(command: &HarnessCommand) -> Result<PtyRunResult> {
+pub fn run_attached_observed(
+    command: &HarnessCommand,
+    observer: Option<AttachedOutputObserver>,
+) -> Result<PtyRunResult> {
     let pty_system = native_pty_system();
-    run_attached_with_pty_system(command, pty_system.as_ref())
+    run_attached_with_pty_system(command, pty_system.as_ref(), observer)
 }
 
 /// Run `command` on a PTY like `run_attached`, but capture the PTY output
@@ -3152,6 +3157,86 @@ pub fn run_piped_attached(
             .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))?
             .context("failed forwarding harness stderr to stdout")?;
     }
+    Ok(PtyRunResult {
+        status: if status.success() {
+            "completed"
+        } else {
+            "failed"
+        },
+        exit_code: status.code(),
+    })
+}
+
+#[cfg(windows)]
+pub fn run_piped_attached_observed(
+    command: &HarnessCommand,
+    observer: AttachedOutputObserver,
+) -> Result<PtyRunResult> {
+    let mut child_command = std::process::Command::new(&command.program);
+    child_command
+        .args(&command.args)
+        .current_dir(&command.cwd)
+        .stdin(if command.stdin_prompt.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.apply_environment(&mut child_command);
+    let mut child = child_command.spawn().with_context(|| {
+        format!(
+            "failed to spawn harness `{}` in observed piped mode",
+            command.program()
+        )
+    })?;
+    write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("observed piped harness did not expose stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("observed piped harness did not expose stderr")?;
+    let observer = Arc::new(Mutex::new(observer));
+
+    let stdout_observer = Arc::clone(&observer);
+    let stdout_forwarder = thread::spawn(move || -> Result<()> {
+        let mut reader = stdout;
+        let stdout = io::stdout();
+        let mut writer = stdout.lock();
+        let callback: AttachedOutputObserver = Box::new(move |chunk| {
+            let mut observer = stdout_observer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("attached output observer lock poisoned"))?;
+            observer(chunk)
+        });
+        copy_attached_output(&mut reader, &mut writer, Some(callback))
+    });
+    let stderr_observer = observer;
+    let stderr_forwarder = thread::spawn(move || -> Result<()> {
+        let mut reader = stderr;
+        let stderr = io::stderr();
+        let mut writer = stderr.lock();
+        let callback: AttachedOutputObserver = Box::new(move |chunk| {
+            let mut observer = stderr_observer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("attached output observer lock poisoned"))?;
+            observer(chunk)
+        });
+        copy_attached_output(&mut reader, &mut writer, Some(callback))
+    });
+
+    let status = child.wait().context("failed waiting for piped harness")?;
+    let stdout_result = stdout_forwarder
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout forwarding thread panicked"))?;
+    let stderr_result = stderr_forwarder
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))?;
+    stdout_result?;
+    stderr_result?;
     Ok(PtyRunResult {
         status: if status.success() {
             "completed"
@@ -4844,6 +4929,7 @@ impl Drop for PtyResizeWatcher {
 fn run_attached_with_pty_system(
     command: &HarnessCommand,
     pty_system: &(dyn PtySystem + Send),
+    observer: Option<AttachedOutputObserver>,
 ) -> Result<PtyRunResult> {
     let initial_size = attached_terminal_size();
     let pair = pty_system
@@ -4875,8 +4961,7 @@ fn run_attached_with_pty_system(
 
     let output_thread = thread::spawn(move || {
         let mut stdout = io::stdout().lock();
-        io::copy(&mut reader, &mut stdout)?;
-        stdout.flush()
+        copy_attached_output(&mut reader, &mut stdout, observer)
     });
 
     // Only forward stdin to the PTY when it is an interactive terminal. A
@@ -4896,7 +4981,9 @@ fn run_attached_with_pty_system(
     if let Some(watcher) = resize_watcher.as_mut() {
         watcher.stop();
     }
-    let _ = output_thread.join();
+    output_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("attached output thread panicked"))??;
     let exit_code = i32::try_from(exit_status.exit_code()).unwrap_or(i32::MAX);
     let status = if exit_status.success() {
         "completed"
@@ -4908,6 +4995,73 @@ fn run_attached_with_pty_system(
         status,
         exit_code: Some(exit_code),
     })
+}
+
+fn copy_attached_output(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    mut observer: Option<AttachedOutputObserver>,
+) -> Result<()> {
+    let mut buffer = [0_u8; 8192];
+    let mut observed = Vec::with_capacity(buffer.len());
+    let mut observer_error = None;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(bytes_read) => {
+                let chunk = &buffer[..bytes_read];
+                writer.write_all(chunk)?;
+                if let Some(callback) = observer.as_deref_mut() {
+                    observed.extend_from_slice(chunk);
+                    if let Err(error) = emit_observed_utf8(&mut observed, callback, false) {
+                        observer_error = Some(error);
+                        observer = None;
+                        observed.clear();
+                    }
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    if let Some(callback) = observer.as_deref_mut() {
+        if let Err(error) = emit_observed_utf8(&mut observed, callback, true) {
+            observer_error = Some(error);
+        }
+    }
+    writer
+        .flush()
+        .context("failed to flush attached harness output")?;
+    match observer_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+fn emit_observed_utf8(
+    pending: &mut Vec<u8>,
+    observer: &mut (dyn FnMut(Vec<u8>) -> Result<()> + Send + 'static),
+    finish: bool,
+) -> Result<()> {
+    let valid_up_to = match std::str::from_utf8(pending) {
+        Ok(_) => pending.len(),
+        Err(error) => error.valid_up_to(),
+    };
+    if valid_up_to > 0 {
+        observer(pending.drain(..valid_up_to).collect())?;
+    }
+    while pending.len() > 4
+        && std::str::from_utf8(pending)
+            .err()
+            .is_some_and(|error| error.valid_up_to() == 0)
+    {
+        let byte = pending.drain(..1).collect::<Vec<_>>();
+        observer(String::from_utf8_lossy(&byte).into_owned().into_bytes())?;
+    }
+    if finish && !pending.is_empty() {
+        observer(String::from_utf8_lossy(pending).into_owned().into_bytes())?;
+        pending.clear();
+    }
+    Ok(())
 }
 
 struct RawModeGuard {
@@ -8572,6 +8726,48 @@ exit 0
             "🎉",
             "split codepoint must round-trip; the drain owns per-call buffer state"
         );
+    }
+
+    #[test]
+    fn attached_output_mirrors_raw_bytes_and_reassembles_observed_utf8() -> anyhow::Result<()> {
+        let emoji = "🎉".as_bytes();
+        let (head, tail) = emoji.split_at(2);
+        let mut reader = ChunkedReader {
+            chunks: vec![head, tail].into(),
+        };
+        let mut mirrored = Vec::new();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_observer = Arc::clone(&captured);
+        let observer: AttachedOutputObserver = Box::new(move |chunk| {
+            captured_for_observer.lock().unwrap().push(chunk);
+            Ok(())
+        });
+
+        copy_attached_output(&mut reader, &mut mirrored, Some(observer))?;
+
+        assert_eq!(mirrored, emoji);
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.as_slice(), [emoji]);
+        assert!(captured
+            .iter()
+            .all(|chunk| std::str::from_utf8(chunk).is_ok()));
+        Ok(())
+    }
+
+    #[test]
+    fn attached_output_drains_after_observer_failure_and_returns_the_error() {
+        let mut reader = ChunkedReader {
+            chunks: vec![&b"first"[..], &b"second"[..]].into(),
+        };
+        let mut mirrored = Vec::new();
+        let observer: AttachedOutputObserver =
+            Box::new(|_| anyhow::bail!("simulated ledger failure"));
+
+        let error = copy_attached_output(&mut reader, &mut mirrored, Some(observer))
+            .expect_err("observer failure must surface");
+
+        assert_eq!(mirrored, b"firstsecond");
+        assert!(error.to_string().contains("simulated ledger failure"));
     }
 
     #[test]

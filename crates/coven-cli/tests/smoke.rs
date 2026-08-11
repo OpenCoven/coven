@@ -1078,6 +1078,95 @@ fn piped_run_output_has_no_eof_control_artifact() -> anyhow::Result<()> {
 }
 
 #[test]
+fn attached_copilot_run_persists_output_and_exit_events() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let project = temp_dir.path().join("project");
+    let fake_bin = temp_dir.path().join("bin");
+    fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(&project)?;
+    fs::create_dir_all(&fake_bin)?;
+    init_git_repo(&project)?;
+    write_fake_copilot(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+
+    let run = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &project,
+        &[],
+        &["run", "copilot", "ledger check"],
+    )?;
+    assert_success("attached copilot run", &run);
+    assert_stdout_contains("attached copilot run", &run, "fake copilot ledger output");
+
+    let sessions = run_coven(&coven, &coven_home, &path, &["sessions", "--json"])?;
+    assert_success("list copilot sessions", &sessions);
+    let sessions = parse_stdout_json("list copilot sessions", &sessions)?;
+    let session_id = sessions["sessions"]
+        .as_array()
+        .context("sessions array")?
+        .iter()
+        .find(|session| session["harness"] == "copilot")
+        .and_then(|session| session["id"].as_str())
+        .context("copilot session id")?;
+
+    let events = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["sessions", "events", session_id, "--json"],
+    )?;
+    assert_success("list copilot session events", &events);
+    let events = parse_stdout_json("list copilot session events", &events)?;
+    let events = events["events"].as_array().context("events array")?;
+    let kinds: Vec<_> = events
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect();
+
+    assert_eq!(kinds, ["output", "exit"]);
+    let output_payload: Value = serde_json::from_str(
+        events[0]["payload_json"]
+            .as_str()
+            .context("output payload JSON")?,
+    )?;
+    assert!(
+        output_payload["data"]
+            .as_str()
+            .is_some_and(|data| data.contains("fake copilot ledger output")),
+        "unexpected output payload: {}",
+        output_payload
+    );
+    let exit_payload: Value = serde_json::from_str(
+        events[1]["payload_json"]
+            .as_str()
+            .context("exit payload JSON")?,
+    )?;
+    assert_eq!(exit_payload["status"], "completed");
+    assert_eq!(exit_payload["exitCode"], 0);
+
+    let log = run_coven(
+        &coven,
+        &coven_home,
+        &path,
+        &["sessions", "log", session_id, "--json"],
+    )?;
+    assert_success("read copilot session log", &log);
+    let log = parse_stdout_json("read copilot session log", &log)?;
+    assert!(log
+        .as_array()
+        .context("log lines")?
+        .iter()
+        .any(|line| line["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("fake copilot ledger output"))));
+    Ok(())
+}
+
+#[test]
 fn adapter_install_hermes_writes_trusted_manifest() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -1678,6 +1767,18 @@ printf 'fake codex complete: %s\n' "$*"
     let mut permissions = fs::metadata(&codex)?.permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(&codex, permissions)?;
+    Ok(())
+}
+
+fn write_fake_copilot(fake_bin: &Path) -> anyhow::Result<()> {
+    let copilot = fake_bin.join("copilot");
+    fs::write(
+        &copilot,
+        "#!/bin/sh\nprintf 'fake copilot ledger output\\n'\n",
+    )?;
+    let mut permissions = fs::metadata(&copilot)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&copilot, permissions)?;
     Ok(())
 }
 
