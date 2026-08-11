@@ -157,10 +157,11 @@ Tool-call parameters, results, and errors pass through the daemon privacy
 filters before serialization. A missing or dangling audit reference produces
 `toolCall: null` without dropping the filesystem operation.
 
-`afsMount` reports the mount backend or `false`. It is `"nfs"` on macOS where
-the export helper shipped and `false` elsewhere — the Linux FUSE backend is not
-built. `POST .../mount` returns `501` with `afs.mount_unsupported` wherever no
-backend is reported.
+`afsMount` reports the mount backend or `false`. It is currently `false` on all
+platforms: the macOS NFS backend cannot pass its export credential to
+`mount_nfs` without exposing it in the process list, and the Linux FUSE backend
+is not built. `POST .../mount` returns `501` with `afs.mount_unsupported`
+wherever no backend is reported.
 
 The daemon spawns a per-mount export process serving the merged base+delta
 view, mounts it on loopback, rotates the export token as soon as the mount
