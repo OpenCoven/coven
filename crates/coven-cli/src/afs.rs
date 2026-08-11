@@ -848,7 +848,10 @@ fn reject_escape(normalized: &str) -> AfsResult<()> {
             reason: "it contains a relative component after normalization".to_string(),
         });
     }
-    if components.next() == Some(".git") {
+    if components
+        .next()
+        .is_some_and(|component| component.eq_ignore_ascii_case(".git"))
+    {
         return Err(AfsError::PathOutsideRoot {
             path: normalized.to_string(),
             reason: "writes under .git/ are never materialized".to_string(),
@@ -1806,6 +1809,8 @@ mod tests {
         assert!(reject_escape("/").is_err());
         assert!(reject_escape("/.git/config").is_err());
         assert!(reject_escape("/.git").is_err());
+        assert!(reject_escape("/.GIT/config").is_err());
+        assert!(reject_escape("/.Git").is_err());
     }
 
     #[test]
