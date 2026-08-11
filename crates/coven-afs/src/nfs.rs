@@ -116,7 +116,7 @@ impl HandleKey {
         type Mac = hmac::Hmac<sha2::Sha256>;
         use hmac::Mac as _;
         let mut mac =
-            <Mac as hmac::Mac>::new_from_slice(&self.0).expect("HMAC accepts any key len");
+            <Mac as hmac::KeyInit>::new_from_slice(&self.0).expect("HMAC accepts any key len");
         mac.update(&id.to_le_bytes());
         let full = mac.finalize().into_bytes();
         let mut tag = [0u8; 16];
