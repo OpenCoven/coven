@@ -6,12 +6,15 @@
 
 **Status:** W1 complete and G3 approved 2026-08-02 - bounded implementation planning next
 
-**O1 implementation candidate:** Named-contract negotiation and lifecycle
-vocabulary pass focused Rust, TypeScript, and documentation guardrail tests.
-O1 remains incomplete until the reviewed PR merges and issue #567 plus Bead
-`coven-psy-o1` record the merge evidence. This candidate addresses only C-S1
-vocabulary and C-S8 documentation; C-S3-C-S6 and C-S9-C-S12 remain planned,
-and G4/G6 remain blocked.
+**O1/O1.1 complete:** O1 named-contract negotiation and lifecycle vocabulary
+merged in PR #574. Corrective continuation, stream-identity, and
+process-supervision behavior merged in PR #622; the approved O1.1 annex merged
+in PR #633; its implementation plan merged in PR #639; and the remaining
+conformance coverage merged in PR #664 with all 12 hosted checks successful.
+Issue #567 and Bead `coven-psy-o1` remain the closed O1 trackers and receive an
+append-only O1.1 evidence note. This closes only C-S1 vocabulary and C-S8
+documentation. C-S3-C-S6 and C-S9-C-S12 remain separate work, while G4, G6,
+and production child dispatch remain blocked.
 
 **O2 proposal:** [O2 contract design](./O2_CONTRACT_DESIGN.md) defines
 immutable opaque binding and mismatch correlation only. Stable adoption,
