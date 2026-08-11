@@ -1,7 +1,7 @@
 # Psyche O1.1 Corrective Delivery Annex
 
-**Status:** Approved design; implementation evidence remains part of the O1
-delivery candidate
+**Status:** Complete - corrective runtime, approved annex, conformance coverage,
+hosted verification, and observed merge evidence are recorded
 
 **Decision date:** 2026-08-05
 
@@ -10,6 +10,21 @@ delivery candidate
 **Scope:** Corrective delivery invariants discovered while implementing O1.
 This annex does not create a new named API contract, Psyche prerequisite, or
 program workstream.
+
+**Observed delivery evidence:**
+
+- corrective runtime PR #622 merged at
+  `f68be0a0af373caf81780b70a5d3bf7d680e0f6e`;
+- this approved annex merged in PR #633 at
+  `c183d923e6d9e9d8172f39a193d624fe40095892`;
+- the conformance plan merged in PR #639 at
+  `7f713ca3b3247b06d0fcff5aff3c756aa63c25eb`; and
+- the remaining conformance coverage merged in PR #664 at
+  `3d18a53c309fad64cc177ad2d984e6b09de0ffc1`, with all 12 hosted
+  checks successful.
+
+This evidence closes O1.1 only. It does not satisfy C-S3-C-S6, C-S9-C-S12,
+G4, G6, or production Psyche child dispatch.
 
 ## 1. Purpose
 
@@ -335,16 +350,18 @@ semantic regression and requires a separately reviewed compatibility decision.
 
 ## 10. Completion evidence
 
-O1.1 is complete only when:
+O1.1 is complete because:
 
-1. this corrective annex is approved and committed;
-2. the implementation diff is reviewed against both O1 and O1.1;
-3. every verification gate above passes against the exact candidate head;
-4. the reviewed PR merges;
-5. issue #567 and Bead `coven-psy-o1` record the observed merge SHA and
-   verification evidence; and
-6. the record explicitly states that C-S3 through C-S6, C-S9 through C-S12,
-   G4, G6, and production Psyche child dispatch remain incomplete.
+1. this corrective annex was approved and merged in PR #633;
+2. the corrective implementation was reviewed against O1 and O1.1;
+3. the focused continuation, stream-identity, process-ownership, cancellation,
+   PID-safety, and malformed-frame regressions pass;
+4. PR #664 passed all 12 hosted checks, including Unix and Windows Rust,
+   OpenClaw, secret, dependency, package, and performance checks;
+5. the observed implementation merge is
+   `3d18a53c309fad64cc177ad2d984e6b09de0ffc1`; and
+6. C-S3-C-S6, C-S9-C-S12, G4, G6, and production Psyche child dispatch remain
+   explicitly incomplete.
 
 O1.1 strengthens the truthfulness and safety of O1 delivery. It does not expand
 the set of Psyche prerequisites represented as satisfied.

@@ -1,12 +1,15 @@
 # Psyche O1 Coven Contract Design
 
-**Status:** Implementation verified; delivery evidence is tracked in issue #567 and Bead `coven-psy-o1`
+**Status:** Complete - O1 merged in PR #574; corrective O1.1 delivery and
+conformance evidence merged in PRs #622, #633, #639, and #664
 
 **Decision date:** 2026-08-02
 
 **Work item:** `coven-psy-o1`
 
 **GitHub issue:** [#567](https://github.com/OpenCoven/coven/issues/567)
+
+**Corrective delivery annex:** [`docs/superpowers/specs/2026-08-05-psyche-o1-1-corrective-annex-design.md`](../../docs/superpowers/specs/2026-08-05-psyche-o1-1-corrective-annex-design.md)
 
 **Depends on:** W1/G3, merged in PR #566 at
 `3bcdd99be1dd77ee1377e69ac0acb02dd9c929e0`
