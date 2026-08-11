@@ -2036,6 +2036,45 @@ fn launch_session(
     json_response(201, &record)
 }
 
+const MAX_EXTERNAL_SESSION_LABELS: usize = 16;
+const MAX_EXTERNAL_SESSION_LABEL_BYTES: usize = 64;
+
+fn external_session_labels(payload: &Value) -> Result<Vec<String>> {
+    let Some(value) = payload.get("labels") else {
+        return Ok(Vec::new());
+    };
+    let labels = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("labels must be an array"))?;
+    if labels.len() > MAX_EXTERNAL_SESSION_LABELS {
+        anyhow::bail!("labels must contain at most {MAX_EXTERNAL_SESSION_LABELS} entries");
+    }
+
+    let mut parsed = Vec::with_capacity(labels.len());
+    let mut seen = HashSet::with_capacity(labels.len());
+    for value in labels {
+        let label = value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("every label must be a string"))?;
+        if label.is_empty() || label.len() > MAX_EXTERNAL_SESSION_LABEL_BYTES {
+            anyhow::bail!(
+                "every label must contain 1 to {MAX_EXTERNAL_SESSION_LABEL_BYTES} ASCII bytes"
+            );
+        }
+        if !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+        {
+            anyhow::bail!("labels may contain only ASCII alphanumeric characters or . _ : -");
+        }
+        if !seen.insert(label) {
+            anyhow::bail!("labels must not contain duplicates");
+        }
+        parsed.push(label.to_string());
+    }
+    Ok(parsed)
+}
+
 fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<ApiResponse> {
     let payload = match parse_body(body) {
         Ok(payload) => payload,
@@ -2051,6 +2090,10 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
     };
     let harness = match required_string(&payload, "harness") {
         Ok(h) => h,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    let labels = match external_session_labels(&payload) {
+        Ok(labels) => labels,
         Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
     };
     let title = payload
@@ -2077,7 +2120,7 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
         updated_at: now,
         conversation_id: None,
         familiar_id: None,
-        labels: Vec::new(),
+        labels,
         visibility: "private".to_string(),
         external: true,
         transcript_path,
@@ -15851,6 +15894,221 @@ tier = 0
             "idempotent re-register should return 200"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_persists_valid_labels() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let labels = json!(["source:psyche-build", "ui.native"]);
+        let body = json!({
+            "id": "psyche-session-labeled",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build",
+            "labels": labels
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["labels"], labels);
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "psyche-session-labeled")?
+            .expect("registered session should be persisted");
+        assert_eq!(stored.labels, vec!["source:psyche-build", "ui.native"]);
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_accepts_inclusive_label_bounds() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut labels = vec!["a".repeat(64), "ui.native_source:psyche-build".to_string()];
+        labels.extend((0..14).map(|index| format!("label-{index}")));
+        assert_eq!(labels[0].len(), 64);
+        assert_eq!(labels.len(), 16);
+        let body = json!({
+            "id": "psyche-session-label-boundaries",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build",
+            "labels": labels
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["labels"], json!(labels));
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "psyche-session-label-boundaries")?
+            .expect("registered session should be persisted");
+        assert_eq!(stored.labels, labels);
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_defaults_missing_labels_to_empty() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "id": "psyche-session-no-labels",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["labels"], json!([]));
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "psyche-session-no-labels")?
+            .expect("registered session should be persisted");
+        assert!(stored.labels.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_accepts_empty_labels() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "id": "psyche-session-empty-labels",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build",
+            "labels": []
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 201, "unexpected body: {}", response.body);
+        let record: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(record["labels"], json!([]));
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "psyche-session-empty-labels")?
+            .expect("registered session should be persisted");
+        assert!(stored.labels.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_rejects_invalid_labels() -> anyhow::Result<()> {
+        let cases = [
+            ("string", json!("source:psyche-build")),
+            ("non-string member", json!(["valid", 1])),
+            ("empty label", json!([""])),
+            ("illegal space", json!(["source:psyche build"])),
+            ("non-ASCII", json!(["source:psyché"])),
+            ("65-byte label", json!(["a".repeat(65)])),
+            (
+                "duplicate",
+                json!(["source:psyche-build", "source:psyche-build"]),
+            ),
+            (
+                "17 labels",
+                json!((0..17)
+                    .map(|index| format!("label-{index}"))
+                    .collect::<Vec<_>>()),
+            ),
+        ];
+
+        for (index, (name, labels)) in cases.into_iter().enumerate() {
+            let temp = tempfile::tempdir()?;
+            let body = json!({
+                "id": format!("psyche-session-invalid-{index}"),
+                "projectRoot": temp.path().to_string_lossy(),
+                "harness": "psyche-build",
+                "labels": labels
+            })
+            .to_string();
+
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/sessions/external",
+                temp.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 400, "case {name}: {}", response.body);
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "invalid_request", "case {name}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn register_external_session_idempotency_retains_original_labels() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = json!({
+            "id": "psyche-session-idempotent-labels",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build",
+            "labels": ["source:psyche-build"]
+        })
+        .to_string();
+        let second = json!({
+            "id": "psyche-session-idempotent-labels",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "psyche-build",
+            "labels": ["source:foreign"]
+        })
+        .to_string();
+
+        let first_response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&first),
+        )?;
+        assert_eq!(first_response.status, 201);
+
+        let second_response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&second),
+        )?;
+        assert_eq!(second_response.status, 200);
+        let record: serde_json::Value = serde_json::from_str(&second_response.body)?;
+        assert_eq!(record["labels"], json!(["source:psyche-build"]));
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "psyche-session-idempotent-labels")?
+            .expect("registered session should be persisted");
+        assert_eq!(stored.labels, vec!["source:psyche-build"]);
         Ok(())
     }
 
