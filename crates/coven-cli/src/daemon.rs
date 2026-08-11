@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::io::Write;
 #[cfg(unix)]
-use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc, Mutex, Weak,
+    Arc, Condvar, Mutex, Weak,
 };
 use std::time::{Duration, Instant};
 
@@ -58,6 +58,18 @@ pub struct DaemonSpawnSpec {
 
 pub trait RuntimeKiller: Send {
     fn kill(&mut self) -> Result<()>;
+
+    /// Begin daemon-shutdown cancellation without waiting for this one child.
+    /// The default preserves existing PTY behavior; strict piped trees split
+    /// signaling from their quiescence proof so N live sessions do not each
+    /// consume the daemon's bounded stop budget serially.
+    fn signal_shutdown(&mut self) -> Result<()> {
+        self.kill()
+    }
+
+    fn wait_for_shutdown_quiescence(&mut self, _timeout: Duration) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Sentinel error returned by `LiveSessionRuntime::send_input` and
@@ -87,6 +99,213 @@ pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
     event_writer: Option<crate::event_writer::EventWriter>,
     sessions: Arc<Mutex<HashMap<String, LiveSessionHandle>>>,
+    shutting_down: AtomicBool,
+    launch_gate: Arc<LiveLaunchGate>,
+}
+
+#[derive(Default)]
+struct LiveLaunchGate {
+    state: Mutex<LiveLaunchGateState>,
+    drained: Condvar,
+}
+
+#[derive(Default)]
+struct LiveLaunchGateState {
+    closed: bool,
+    next_id: u64,
+    in_flight: HashMap<u64, Option<SharedLaunchKiller>>,
+}
+
+struct LiveLaunchAdmission {
+    gate: Arc<LiveLaunchGate>,
+    id: u64,
+    active: bool,
+}
+
+#[derive(Clone)]
+struct SharedLaunchKiller {
+    killer: Arc<Mutex<Box<dyn RuntimeKiller>>>,
+}
+
+impl RuntimeKiller for SharedLaunchKiller {
+    fn kill(&mut self) -> Result<()> {
+        match self.killer.lock() {
+            Ok(mut killer) => killer.kill(),
+            Err(poisoned) => poisoned.into_inner().kill(),
+        }
+    }
+
+    fn signal_shutdown(&mut self) -> Result<()> {
+        match self.killer.lock() {
+            Ok(mut killer) => killer.signal_shutdown(),
+            Err(poisoned) => poisoned.into_inner().signal_shutdown(),
+        }
+    }
+
+    fn wait_for_shutdown_quiescence(&mut self, timeout: Duration) -> Result<()> {
+        match self.killer.lock() {
+            Ok(mut killer) => killer.wait_for_shutdown_quiescence(timeout),
+            Err(poisoned) => poisoned.into_inner().wait_for_shutdown_quiescence(timeout),
+        }
+    }
+}
+
+impl LiveLaunchGate {
+    fn begin(self: &Arc<Self>) -> Result<LiveLaunchAdmission> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        anyhow::ensure!(
+            !state.closed,
+            "daemon is shutting down; refusing to launch a new live session"
+        );
+        let id = state.next_id;
+        state.next_id = state.next_id.wrapping_add(1);
+        state.in_flight.insert(id, None);
+        Ok(LiveLaunchAdmission {
+            gate: Arc::clone(self),
+            id,
+            active: true,
+        })
+    }
+
+    fn close_and_wait(&self) -> Result<()> {
+        const ADMISSION_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.closed = true;
+        // A published entry owns an exact tree and is signaled immediately.
+        // An unpublished entry never holds this mutex across OS spawn: if its
+        // closure resumes, `publish` observes the closed gate and terminates
+        // that exact tree before returning it. Piped Unix launches also carry
+        // an out-of-process owner-pipe guardian across this pre-publication
+        // window; Windows strict launches carry a KILL_ON_JOB_CLOSE handle as
+        // soon as their suspended CreateProcess call returns.
+        let mut provisional = state
+            .in_flight
+            .values()
+            .filter_map(Clone::clone)
+            .collect::<Vec<_>>();
+        drop(state);
+        let mut failures = Vec::new();
+        for killer in &mut provisional {
+            if let Err(error) = killer.signal_shutdown() {
+                failures.push(format!("{error:#}"));
+            }
+        }
+
+        let deadline = Instant::now() + ADMISSION_DRAIN_BUDGET;
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !state.in_flight.is_empty() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let waited = self.drained.wait_timeout(state, remaining);
+            state = match waited {
+                Ok((state, _)) => state,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "failed to terminate {} provisional launch process tree(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
+        Ok(())
+    }
+}
+
+impl LiveLaunchAdmission {
+    fn spawn_owned<T>(
+        &self,
+        spawn: impl FnOnce(&mut dyn FnMut(Box<dyn RuntimeKiller>) -> Result<()>) -> Result<T>,
+    ) -> Result<(T, SharedLaunchKiller)> {
+        let mut published = None;
+        let mut publish = |killer: Box<dyn RuntimeKiller>| -> Result<()> {
+            anyhow::ensure!(
+                published.is_none(),
+                "live launch killer was published twice"
+            );
+            let mut shared = SharedLaunchKiller {
+                killer: Arc::new(Mutex::new(killer)),
+            };
+            let mut state = match self.gate.state.lock() {
+                Ok(state) => state,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let accepted = self.active && !state.closed;
+            if accepted {
+                let slot = state.in_flight.get_mut(&self.id).ok_or_else(|| {
+                    anyhow::anyhow!("live launch admission disappeared before spawn ownership")
+                })?;
+                *slot = Some(shared.clone());
+            }
+            drop(state);
+            if !accepted {
+                let cleanup = shared.signal_shutdown().err();
+                return match cleanup {
+                    Some(error) => Err(anyhow::anyhow!(
+                        "daemon is shutting down; rejected spawned session cleanup failed: {error:#}"
+                    )),
+                    None => Err(anyhow::anyhow!(
+                        "daemon is shutting down; refusing to spawn a new live session"
+                    )),
+                };
+            }
+            published = Some(shared);
+            Ok(())
+        };
+        let value = match spawn(&mut publish) {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(mut killer) = published.take() {
+                    let cleanup = killer.signal_shutdown().err();
+                    return match cleanup {
+                        Some(cleanup) => Err(anyhow::anyhow!(
+                            "{error:#}; failed to terminate rejected spawned session: {cleanup:#}"
+                        )),
+                        None => Err(error),
+                    };
+                }
+                return Err(error);
+            }
+        };
+        let killer = published.context("spawn returned without publishing exact ownership")?;
+        Ok((value, killer))
+    }
+
+    fn release(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = match self.gate.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.in_flight.remove(&self.id);
+        self.active = false;
+        if state.in_flight.is_empty() {
+            self.gate.drained.notify_all();
+        }
+    }
+}
+
+impl Drop for LiveLaunchAdmission {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// What kind of underlying process is bound to a registered live session.
@@ -194,7 +413,13 @@ impl LiveSessionRuntime {
             coven_home: Some(coven_home),
             event_writer: Some(event_writer),
             sessions: Arc::default(),
+            shutting_down: AtomicBool::new(false),
+            launch_gate: Arc::default(),
         })
+    }
+
+    fn begin_launch(&self) -> Result<LiveLaunchAdmission> {
+        self.launch_gate.begin()
     }
 
     #[allow(dead_code)]
@@ -228,13 +453,40 @@ impl LiveSessionRuntime {
         session_id: String,
         kind: LiveSessionKind,
         input: Box<dyn Write + Send>,
-        killer: Box<dyn RuntimeKiller>,
+        mut killer: Box<dyn RuntimeKiller>,
+        registration: Arc<LiveSessionRegistration>,
+    ) -> Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return reject_registration_during_shutdown(killer.as_mut());
+        }
+        self.register_kind_after_initial_shutdown_check(
+            session_id,
+            kind,
+            input,
+            killer,
+            registration,
+        )
+    }
+
+    fn register_kind_after_initial_shutdown_check(
+        &self,
+        session_id: String,
+        kind: LiveSessionKind,
+        input: Box<dyn Write + Send>,
+        mut killer: Box<dyn RuntimeKiller>,
         registration: Arc<LiveSessionRegistration>,
     ) -> Result<()> {
         let mut sessions = self
             .sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            // The launch may have passed the first admission check and spawned
+            // while shutdown was waiting for this registry lock. Never run a
+            // potentially blocking process-tree kill while holding that lock.
+            drop(sessions);
+            return reject_registration_during_shutdown(killer.as_mut());
+        }
         let replaced = sessions.insert(
             session_id.clone(),
             LiveSessionHandle {
@@ -256,6 +508,67 @@ impl LiveSessionRuntime {
         drop(sessions);
         drop(replaced);
         drop(removed);
+        Ok(())
+    }
+
+    /// Stop admitting sessions, remove every owned handle, and explicitly
+    /// terminate each process tree. Dropping the handles remains a containment
+    /// backstop (notably KILL_ON_JOB_CLOSE on Windows), while this method gives
+    /// graceful daemon shutdown a checked, observable cancellation path.
+    fn shutdown_all(&self) -> Result<()> {
+        self.shutting_down.store(true, Ordering::Release);
+        // No prompt bytes are delivered while an admission remains in this
+        // gate. Closing it makes every pre-registration launcher either fail
+        // registration and kill its exact tree or finish registering that tree
+        // before shutdown drains the live map. This is also the barrier that
+        // keeps a detached Unix request thread from losing a locally owned
+        // setsid child when the daemon process exits.
+        let admission_failure = self.launch_gate.close_and_wait().err();
+        let handles = {
+            let mut sessions = match self.sessions.lock() {
+                Ok(sessions) => sessions,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sessions
+                .drain()
+                .map(|(_, handle)| handle)
+                .collect::<Vec<_>>()
+        };
+        let mut failures = Vec::new();
+        if let Some(error) = admission_failure {
+            failures.push(format!("{error:#}"));
+        }
+        for handle in &handles {
+            let result = match handle.killer.lock() {
+                Ok(mut killer) => killer.signal_shutdown(),
+                Err(poisoned) => poisoned.into_inner().signal_shutdown(),
+            };
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        // All trees have been signaled before any wait begins. Share one
+        // deadline across the set so shutdown remains bounded instead of
+        // multiplying the wait budget by the number of live sessions.
+        let quiescence_deadline = Instant::now() + Duration::from_secs(1);
+        for handle in handles {
+            let remaining = quiescence_deadline.saturating_duration_since(Instant::now());
+            let result = match handle.killer.lock() {
+                Ok(mut killer) => killer.wait_for_shutdown_quiescence(remaining),
+                Err(poisoned) => poisoned
+                    .into_inner()
+                    .wait_for_shutdown_quiescence(remaining),
+            };
+            if let Err(error) = result {
+                failures.push(format!("{error:#}"));
+            }
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "failed to terminate {} live session process tree(s): {}",
+            failures.len(),
+            failures.join("; ")
+        );
         Ok(())
     }
 
@@ -288,6 +601,16 @@ impl LiveSessionRuntime {
             output_observer_with_cleanup(self.event_writer.clone(), session_id, Some(cleanup)),
             registration,
         )
+    }
+}
+
+fn reject_registration_during_shutdown(killer: &mut dyn RuntimeKiller) -> Result<()> {
+    const REJECTION: &str = "daemon is shutting down; refusing to register a new live session";
+    match killer.kill() {
+        Ok(()) => anyhow::bail!(REJECTION),
+        Err(error) => anyhow::bail!(
+            "{REJECTION}; failed to terminate the rejected session process tree: {error:#}"
+        ),
     }
 }
 
@@ -505,6 +828,10 @@ impl LiveSessionRuntime {
         launch: &SessionLaunch,
         writer: Option<crate::maintenance_gate::WriterLease>,
     ) -> Result<()> {
+        anyhow::ensure!(
+            !self.shutting_down.load(Ordering::Acquire),
+            "daemon is shutting down; refusing to launch a new session"
+        );
         let familiar_ctx = match (&self.coven_home, launch.familiar_id.as_deref()) {
             (Some(home), familiar_id) => {
                 crate::familiar_identity::resolve_optional(home, familiar_id)?
@@ -514,21 +841,42 @@ impl LiveSessionRuntime {
             }
             (None, None) => None,
         };
-        let command = pty_runner::build_harness_command_with_conversation(
-            &launch.harness,
-            &launch.prompt,
-            Path::new(&launch.cwd),
-            launch.launch_mode,
-            launch.conversation.as_ref(),
-            familiar_ctx.as_ref(),
-            crate::harness::HarnessLaunchOptions {
-                model: launch.model.as_deref(),
-                ..Default::default()
-            },
-        )?;
+        let launch_options = crate::harness::HarnessLaunchOptions {
+            model: launch.model.as_deref(),
+            launch_policy: launch.launch_policy.as_ref(),
+            ..Default::default()
+        };
+        let command = if launch.harness == "codex"
+            && launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
+        {
+            pty_runner::build_piped_harness_command_with_conversation(
+                &launch.harness,
+                &launch.prompt,
+                Path::new(&launch.cwd),
+                launch.launch_mode,
+                launch.conversation.as_ref(),
+                familiar_ctx.as_ref(),
+                launch_options,
+            )?
+        } else {
+            pty_runner::build_harness_command_with_conversation(
+                &launch.harness,
+                &launch.prompt,
+                Path::new(&launch.cwd),
+                launch.launch_mode,
+                launch.conversation.as_ref(),
+                familiar_ctx.as_ref(),
+                launch_options,
+            )?
+        };
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
         let observer = Some(observer);
+        // Hold admission from before the OS spawn until the exact process-tree
+        // handle is in the live registry. Shutdown closes and drains this gate,
+        // so a detached request handler cannot lose a pre-registration Unix
+        // process group when the daemon exits.
+        let launch_admission = self.begin_launch()?;
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
             // Defense in depth: only allow Stream mode for harnesses that
@@ -543,52 +891,74 @@ impl LiveSessionRuntime {
                     launch.harness
                 );
             }
-            let piped = pty_runner::spawn_piped_with_observer(&command, observer, true)?;
-            let mut killer_box = piped_killer(piped.pid);
-            let mut input = piped.input;
-            // Send the launch's prompt as the first stream-json user
-            // message so the chat doesn't need a separate send call right
-            // after launch. A write failure here means the child already
-            // exited (e.g. auth missing) — treat that as a hard launch
-            // error: kill what's left of the child and surface it to the
-            // caller so the session row is marked failed instead of
-            // pretending we delivered the prompt.
+            let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
+                let piped = pty_runner::spawn_piped_with_observer(&command, observer, true)?;
+                let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
+                publish(killer)?;
+                Ok(piped)
+            })?;
+            piped.activate(|input, process_tree| {
+                self.register_kind_with_registration(
+                    launch.id.clone(),
+                    LiveSessionKind::Stream,
+                    input,
+                    Box::new(process_tree),
+                    registration,
+                )?;
+                launch_admission.release();
+                Ok(())
+            })?;
+            // Register cancellation ownership before sending the launch's
+            // first stream-json user message. A child that stops reading can
+            // still block this per-session input lock, but daemon shutdown or
+            // /kill owns an independent strict process-tree handle and can
+            // interrupt the write without waiting for that lock.
             if !launch.prompt.is_empty() {
-                if let Err(error) = write_stream_message(input.as_mut(), &launch.prompt) {
-                    let _ = killer_box.kill();
-                    return Err(error).with_context(|| {
-                        format!(
-                            "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
-                            launch.harness
-                        )
-                    });
+                if let Err(error) = SessionRuntime::send_input(
+                    self,
+                    &launch.id,
+                    &json!({ "data": launch.prompt.as_str() }),
+                ) {
+                    let cleanup = SessionRuntime::kill_session(self, &launch.id).err();
+                    let primary = error.context(format!(
+                        "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
+                        launch.harness
+                    ));
+                    return match cleanup {
+                        Some(cleanup) => Err(anyhow::anyhow!(
+                            "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
+                        )),
+                        None => Err(primary),
+                    };
                 }
             }
-            return self.register_kind_with_registration(
-                launch.id.clone(),
-                LiveSessionKind::Stream,
-                input,
-                killer_box,
-                registration,
-            );
+            return Ok(());
         }
 
-        // ConPTY can terminate one-shot `codex exec` children immediately on
-        // Windows (observed as u32::MAX with no output). These sessions do not
-        // need a terminal: the prompt is already in argv and stdout/stderr are
-        // machine-drained. Ordinary pipes match direct `codex exec`, preserve
-        // output observation, and let the child reach a real exit status.
-        #[cfg(windows)]
-        if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive {
-            let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
-            let killer = piped_killer(piped.pid);
-            return self.register_kind_with_registration(
-                launch.id.clone(),
-                LiveSessionKind::Pty,
-                piped.input,
-                killer,
-                registration,
-            );
+        // Noninteractive Codex is a machine-owned one-shot on every platform:
+        // ordinary pipes carry its complete prompt on stdin and keep argv
+        // bounded. Windows additionally routes every noninteractive harness
+        // here because ConPTY can terminate those children immediately.
+        if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
+            && (cfg!(windows) || launch.harness == "codex")
+        {
+            let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
+                let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
+                let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
+                publish(killer)?;
+                Ok(piped)
+            })?;
+            return piped.activate(|input, process_tree| {
+                self.register_kind_with_registration(
+                    launch.id.clone(),
+                    LiveSessionKind::Pty,
+                    input,
+                    Box::new(process_tree),
+                    registration,
+                )?;
+                launch_admission.release();
+                Ok(())
+            });
         }
 
         // Interactive claude launches hit the workspace trust dialog (not
@@ -601,14 +971,21 @@ impl LiveSessionRuntime {
             ensure_claude_trusts_dir(&launch.cwd);
         }
 
-        let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
+        let (input, provisional_killer) = launch_admission.spawn_owned(|publish| {
+            let detached = pty_runner::spawn_detached_with_observer(&command, observer)?;
+            let killer: Box<dyn RuntimeKiller> = Box::new(detached.killer);
+            publish(killer)?;
+            Ok(detached.input)
+        })?;
         self.register_kind_with_registration(
             launch.id.clone(),
             LiveSessionKind::Pty,
-            detached.input,
-            Box::new(detached.killer),
+            input,
+            Box::new(provisional_killer),
             registration,
-        )
+        )?;
+        launch_admission.release();
+        Ok(())
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -669,44 +1046,42 @@ impl LiveSessionRuntime {
                 })
             })?
         };
-        let mut killer = handle
-            .killer
-            .lock()
-            .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
-        killer.kill()
+        let kill_result = {
+            let mut killer = handle
+                .killer
+                .lock()
+                .map_err(|_| anyhow::anyhow!("live session killer lock poisoned"))?;
+            killer.kill()
+        };
+        if let Err(error) = kill_result {
+            // A quiescence timeout does not prove the strict owner is safe to
+            // discard. Retain the exact input/killer handle for a retry unless
+            // the exit callback already proved the process gone or daemon
+            // shutdown has taken over containment.
+            if !handle.registration.exited.load(Ordering::Acquire)
+                && !self.shutting_down.load(Ordering::Acquire)
+            {
+                let mut sessions = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("live session registry lock poisoned"))?;
+                if !handle.registration.exited.load(Ordering::Acquire)
+                    && !self.shutting_down.load(Ordering::Acquire)
+                    && !sessions.contains_key(session_id)
+                {
+                    sessions.insert(session_id.to_string(), handle);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 
-fn piped_killer(pid: u32) -> Box<dyn RuntimeKiller> {
-    #[cfg(windows)]
-    let job_handle = {
-        use windows_sys::Win32::{
-            Foundation::INVALID_HANDLE_VALUE,
-            System::{
-                JobObjects::{AssignProcessToJobObject, CreateJobObjectW},
-                Threading::{OpenProcess, PROCESS_ALL_ACCESS},
-            },
-        };
-        // SAFETY: Windows API calls; handles are owned by PipedKiller.
-        unsafe {
-            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-            if job != INVALID_HANDLE_VALUE && job != 0 as _ {
-                let ph = OpenProcess(PROCESS_ALL_ACCESS, 0, pid);
-                if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
-                    AssignProcessToJobObject(job, ph);
-                    windows_sys::Win32::Foundation::CloseHandle(ph);
-                }
-                Some(job)
-            } else {
-                None
-            }
-        }
-    };
-    Box::new(PipedKiller {
-        pid,
-        #[cfg(windows)]
-        job_handle,
-    })
+impl Drop for LiveSessionRuntime {
+    fn drop(&mut self) {
+        let _ = self.shutdown_all();
+    }
 }
 
 /// Wrap raw user text in claude's stream-json user-message envelope and
@@ -735,102 +1110,27 @@ fn write_stream_message(input: &mut dyn Write, text: &str) -> Result<()> {
     Ok(())
 }
 
-/// Killer for a non-PTY piped child (stream-mode harness sessions).
-/// `pty_runner::spawn_piped_with_observer` returns just the child's PID
-/// because the `Child` handle itself lives inside the wait/drain thread —
-/// sharing it through a `Mutex` would deadlock when `wait()` blocks while
-/// `kill()` waits for the same lock.
-///
-/// The spawn path puts the child in its own session/process group via
-/// `setsid()` (pre_exec), so we can signal the entire group with one
-/// syscall — that picks up subprocesses the harness may have spawned
-/// (skills, MCP servers, shells, …) which would otherwise survive as
-/// orphans. We send SIGKILL (not SIGTERM) because the daemon kill path
-/// is reached from explicit user intent (`/kill`, `/clear`, chat exit)
-/// where the right behavior is "stop immediately"; SIGTERM would let a
-/// harness that ignores it linger past the user's request.
-struct PipedKiller {
-    pid: u32,
-    /// On Windows, a Job Object handle that owns the child process tree.
-    /// Calling TerminateJobObject on it kills the child and all descendants.
-    #[cfg(windows)]
-    job_handle: Option<windows_sys::Win32::Foundation::HANDLE>,
-}
-
-#[cfg(windows)]
-unsafe impl Send for PipedKiller {}
-
-#[cfg(windows)]
-impl Drop for PipedKiller {
-    fn drop(&mut self) {
-        if let Some(h) = self.job_handle.take() {
-            // SAFETY: h is a valid handle owned by this struct.
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
-        }
+impl RuntimeKiller for pty_runner::StrictChildProcessTree {
+    fn kill(&mut self) -> Result<()> {
+        self.terminate_tree()
+            .context("failed to terminate contained piped harness process tree")
     }
 }
 
-impl RuntimeKiller for PipedKiller {
-    #[cfg(unix)]
+impl RuntimeKiller for pty_runner::SharedStrictChildProcessTree {
     fn kill(&mut self) -> Result<()> {
-        let pid = self.pid as libc::pid_t;
-        // Negative argument signals the process group (pgid == pid
-        // since the child called setsid). SIGKILL can't be ignored.
-        let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
-        if rc != 0 {
-            let error = std::io::Error::last_os_error();
-            // ESRCH means the group is already gone — fine, that's
-            // the post-condition we want.
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error).with_context(|| {
-                    format!("failed to SIGKILL stream harness process group {pid}")
-                });
-            }
-        }
-        Ok(())
+        self.terminate_and_wait(Duration::from_secs(1))
+            .context("failed to terminate and quiesce contained piped harness process tree")
     }
 
-    #[cfg(windows)]
-    fn kill(&mut self) -> Result<()> {
-        use windows_sys::Win32::{
-            Foundation::INVALID_HANDLE_VALUE,
-            System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
-        };
-        // Prefer Job Object kill (terminates the whole child tree).
-        if let Some(h) = self.job_handle.take() {
-            // SAFETY: h is a valid job handle; exit code 1 is conventional.
-            let rc = unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(h, 1) };
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
-            if rc == 0 {
-                // Fall back to direct TerminateProcess on the root pid.
-                unsafe {
-                    let ph = OpenProcess(PROCESS_TERMINATE, 0, self.pid);
-                    if ph != INVALID_HANDLE_VALUE && ph != 0 as _ {
-                        TerminateProcess(ph, 1);
-                        windows_sys::Win32::Foundation::CloseHandle(ph);
-                    }
-                }
-            }
-            return Ok(());
-        }
-        // No job object — fall back to TerminateProcess on the root pid.
-        unsafe {
-            let ph = OpenProcess(PROCESS_TERMINATE, 0, self.pid);
-            if ph == INVALID_HANDLE_VALUE || ph == 0 as _ {
-                return Ok(()); // Already gone.
-            }
-            TerminateProcess(ph, 1);
-            windows_sys::Win32::Foundation::CloseHandle(ph);
-        }
-        Ok(())
+    fn signal_shutdown(&mut self) -> Result<()> {
+        self.terminate_tree()
+            .context("failed to terminate contained piped harness process tree")
     }
 
-    #[cfg(not(any(unix, windows)))]
-    fn kill(&mut self) -> Result<()> {
-        anyhow::bail!(
-            "stream-mode harness kill not implemented on this platform (pid {})",
-            self.pid
-        )
+    fn wait_for_shutdown_quiescence(&mut self, timeout: Duration) -> Result<()> {
+        pty_runner::SharedStrictChildProcessTree::wait_for_shutdown_quiescence(self, timeout)
+            .context("contained piped harness process tree did not finish shutdown cleanup")
     }
 }
 
@@ -1059,6 +1359,7 @@ pub fn start_background_server(
 ) -> Result<DaemonStatus> {
     let spec = background_server_spec(current_exe, coven_home);
     ensure_private_coven_home(coven_home)?;
+    prevent_background_server_stdio_handle_leaks()?;
     let child = background_server_command(&spec)
         .spawn()
         .with_context(|| format!("failed to start Coven daemon {}", spec.program.display()))?;
@@ -1069,6 +1370,47 @@ pub fn start_background_server(
     };
     write_status(coven_home, &status)?;
     Ok(status)
+}
+
+#[cfg(windows)]
+fn prevent_background_server_stdio_handle_leaks() -> Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE},
+        System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE},
+    };
+
+    // `CreateProcessW(..., bInheritHandles=TRUE, ...)` inherits every handle
+    // still marked inheritable in the launcher, not only the null std handles
+    // Rust creates for the detached `daemon serve` child. When `daemon start`
+    // itself was launched with captured stdout/stderr, those inherited capture
+    // handles otherwise stay open for the daemon's lifetime and the caller
+    // never observes pipe EOF/Child `close` after the launcher exits.
+    //
+    // Clearing HANDLE_FLAG_INHERIT does not close these handles or prevent the
+    // launcher from writing its normal diagnostics. Rust creates inheritable
+    // duplicates for any later child whose stdio is intentionally inherited;
+    // the daemon child below receives its own null std handles.
+    for (label, stream) in [
+        ("stdin", STD_INPUT_HANDLE),
+        ("stdout", STD_OUTPUT_HANDLE),
+        ("stderr", STD_ERROR_HANDLE),
+    ] {
+        let handle = unsafe { GetStdHandle(stream) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("failed to prevent inherited {label} from leaking into Coven daemon")
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn prevent_background_server_stdio_handle_leaks() -> Result<()> {
+    Ok(())
 }
 
 fn background_server_command(spec: &DaemonSpawnSpec) -> Command {
@@ -1956,9 +2298,9 @@ fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>
     }
 }
 
-// `bind_tcp_listener` and `serve_next_tcp_connection` expose the TCP transport
-// so it can be unit-tested in isolation; `serve_forever` wires them into the
-// daemon's accept loop alongside the Unix socket listener.
+// `bind_tcp_listener` plus the accepted-stream handler expose the TCP transport
+// so it can be tested in isolation; `serve_forever` wires them into the daemon's
+// accept loop alongside the Unix socket listener.
 //
 // TCP gets read/write timeouts and a Content-Length cap because — unlike the
 // Unix socket — a misbehaving network client can otherwise hold the API
@@ -2042,6 +2384,7 @@ fn is_client_disconnect(error: &anyhow::Error) -> bool {
 }
 
 #[cfg(unix)]
+#[cfg(test)]
 pub fn serve_next_tcp_connection(
     listener: &TcpListener,
     coven_home: &Path,
@@ -2052,6 +2395,23 @@ pub fn serve_next_tcp_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept TCP API connection")?;
+    serve_accepted_tcp_connection(stream, coven_home, status, runtime, allowed_hosts)
+}
+
+#[cfg(unix)]
+fn serve_accepted_tcp_connection(
+    stream: TcpStream,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+    allowed_hosts: &[String],
+) -> Result<()> {
+    // Production may place the listener in nonblocking mode so its auxiliary
+    // accept thread can observe daemon shutdown. Accepted sockets must retain
+    // the ordinary bounded blocking request semantics.
+    stream
+        .set_nonblocking(false)
+        .context("failed to configure accepted TCP API connection")?;
     stream
         .set_read_timeout(Some(TCP_IO_TIMEOUT))
         .context("failed to set TCP read timeout")?;
@@ -2343,8 +2703,9 @@ fn record_store_maintenance_failure_with_free_disk_check(
 /// exits via any path that runs destructors — normal return, `Err` propagation,
 /// or panic unwinding. This is what prevents orphaned `~/.coven/coven.sock`
 /// files from appearing when the daemon crashes (see OpenCoven/coven#197).
-/// SIGKILL and `_exit` bypass Drop; the explicit signal handler covers SIGTERM
-/// / SIGINT / SIGHUP.
+/// SIGKILL bypasses Drop. SIGTERM / SIGINT / SIGHUP only set a signal-safe
+/// flag; the accept loop then drains live process ownership before this guard
+/// removes endpoint metadata during normal unwinding.
 #[cfg(unix)]
 struct ShutdownGuard {
     socket_path: PathBuf,
@@ -2371,20 +2732,28 @@ fn daemon_status_file_pid(status_path: &Path) -> Option<u32> {
 }
 
 #[cfg(unix)]
+static DAEMON_TERMINATION_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
 extern "C" fn handle_termination_signal(sig: libc::c_int) {
-    // Only async-signal-safe calls below. Anything that might allocate or take
-    // a lock is forbidden. The ownership-aware ShutdownGuard handles normal
-    // unwinding cleanup; signal exits leave stale metadata for the next
-    // status/start command to validate and clear.
-    let msg: &[u8] = b"coven daemon: received termination signal, exiting\n";
+    // Only async-signal-safe work belongs here. AtomicBool uses a lock-free
+    // primitive on Coven's supported Unix targets and write(2) is signal-safe.
+    // No allocation, lock, or destructor runs in the handler itself.
+    DAEMON_TERMINATION_REQUESTED.store(true, Ordering::Release);
+    let msg: &[u8] = b"coven daemon: received termination signal, shutting down\n";
     unsafe {
         libc::write(
             libc::STDERR_FILENO,
             msg.as_ptr() as *const libc::c_void,
             msg.len(),
         );
-        libc::_exit(128 + sig);
     }
+    let _ = sig;
+}
+
+#[cfg(unix)]
+fn daemon_termination_requested() -> bool {
+    DAEMON_TERMINATION_REQUESTED.load(Ordering::Acquire)
 }
 
 #[cfg(unix)]
@@ -2394,6 +2763,7 @@ fn install_termination_signal_handlers(socket_path: &Path, status_path: &Path) -
     let _status_cstr = CString::new(status_path.as_os_str().as_bytes())
         .context("daemon status path contained an interior NUL")?;
 
+    DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
         // SAFETY: sigaction is the documented POSIX API for installing signal
         // handlers; we pass a zero-initialized struct, our handler pointer,
@@ -2402,10 +2772,8 @@ fn install_termination_signal_handlers(socket_path: &Path, status_path: &Path) -
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handle_termination_signal as *const () as usize;
             libc::sigemptyset(&mut sa.sa_mask);
-            // Intentionally no SA_RESTART: we want blocking syscalls (accept)
-            // to return EINTR so the loop can exit promptly. The handler
-            // itself calls _exit, so EINTR handling in the loop is academic,
-            // but the principle is right.
+            // Intentionally no SA_RESTART: accept must return EINTR so the
+            // ordinary daemon loop can observe the flag and run cleanup.
             sa.sa_flags = 0;
             if libc::sigaction(sig, &sa, std::ptr::null_mut()) != 0 {
                 return Err(std::io::Error::last_os_error())
@@ -2671,6 +3039,14 @@ pub fn serve_forever(
     // guard would delete the incumbent's status file and unlink its live socket on
     // our way out — re-orphaning the very daemon we declined to replace.
     let unix_listener = bind_api_socket(coven_home)?;
+    // A process-directed signal may be delivered to any daemon thread, not
+    // necessarily the one blocked in accept(2). Nonblocking accept gives the
+    // main loop a bounded opportunity to observe the signal-safe flag even in
+    // that case; the explicit EINTR branch below remains the prompt path when
+    // the accepting thread receives the signal itself.
+    unix_listener
+        .set_nonblocking(true)
+        .context("failed to configure interruptible Unix API listener")?;
     write_status(coven_home, &status)?;
     let _shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
@@ -2696,36 +3072,87 @@ pub fn serve_forever(
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
 
-    if let Some(addr) = tcp_addr {
+    let (tcp_thread, active_tcp_connection) = if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
+        tcp_listener
+            .set_nonblocking(true)
+            .context("failed to configure interruptible TCP API listener")?;
         let tcp_home = coven_home.to_path_buf();
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
         let tcp_allowed_hosts: Vec<String> = allowed_hosts.to_vec();
+        let active_tcp_connection = Arc::new(Mutex::new(None::<TcpStream>));
+        let active_tcp_for_thread = Arc::clone(&active_tcp_connection);
         // TCP accept errors are logged and the loop continues — misbehaving
         // network clients should not bring down the daemon. The Unix loop
         // below uses the same strategy: a single malformed local request must
         // not orphan the socket file (see #197).
-        std::thread::Builder::new()
-            .name("coven-tcp-api".into())
-            .spawn(move || loop {
-                if let Err(error) = serve_next_tcp_connection(
-                    &tcp_listener,
-                    &tcp_home,
-                    Some(tcp_status.clone()),
-                    tcp_runtime.as_ref(),
-                    &tcp_allowed_hosts,
-                ) {
-                    // A client hanging up mid-response is expected under SSE +
-                    // polling load; don't log it or throttle the accept loop.
-                    if !is_client_disconnect(&error) {
-                        eprintln!("coven daemon: TCP connection error: {error:#}");
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+        let thread = Some(
+            std::thread::Builder::new()
+                .name("coven-tcp-api".into())
+                .spawn(move || {
+                    while !daemon_termination_requested() {
+                        let stream = match tcp_listener.accept() {
+                            Ok((stream, _)) => stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(std::time::Duration::from_millis(25));
+                                continue;
+                            }
+                            Err(error) => {
+                                eprintln!("coven daemon: TCP connection error: {error:#}");
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
+                        };
+                        if daemon_termination_requested() {
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            break;
+                        }
+                        let cancellation = match stream.try_clone() {
+                            Ok(cancellation) => cancellation,
+                            Err(error) => {
+                                eprintln!(
+                                    "coven daemon: failed to retain TCP shutdown handle: {error:#}"
+                                );
+                                let _ = stream.shutdown(std::net::Shutdown::Both);
+                                continue;
+                            }
+                        };
+                        match active_tcp_for_thread.lock() {
+                            Ok(mut active) => *active = Some(cancellation),
+                            Err(poisoned) => *poisoned.into_inner() = Some(cancellation),
+                        }
+                        let result = serve_accepted_tcp_connection(
+                            stream,
+                            &tcp_home,
+                            Some(tcp_status.clone()),
+                            tcp_runtime.as_ref(),
+                            &tcp_allowed_hosts,
+                        );
+                        match active_tcp_for_thread.lock() {
+                            Ok(mut active) => {
+                                active.take();
+                            }
+                            Err(poisoned) => {
+                                poisoned.into_inner().take();
+                            }
+                        }
+                        if let Err(error) = result {
+                            // A client hanging up mid-response is expected under SSE +
+                            // polling load; don't log or throttle that path.
+                            if !is_client_disconnect(&error) {
+                                eprintln!("coven daemon: TCP connection error: {error:#}");
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                        }
                     }
-                }
-            })
-            .context("failed to spawn TCP API thread")?;
-    }
+                })
+                .context("failed to spawn TCP API thread")?,
+        );
+        (thread, Some(active_tcp_connection))
+    } else {
+        (None, None)
+    };
 
     // Handle each accepted connection on its own thread. The Unix accept loop
     // used to be serial — accept, then run the handler to completion before
@@ -2745,8 +3172,21 @@ pub fn serve_forever(
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     use std::sync::atomic::Ordering;
     loop {
+        if daemon_termination_requested() {
+            break;
+        }
         let (stream, _) = match unix_listener.accept() {
             Ok(pair) => pair,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::Interrupted
+                    && daemon_termination_requested() =>
+            {
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                continue;
+            }
             Err(error) => {
                 eprintln!("coven daemon: unix accept error: {error:#}");
                 append_daemon_recovery_log(coven_home, &format!("unix accept error: {error:#}"));
@@ -2806,6 +3246,53 @@ pub fn serve_forever(
                 &format!("failed to spawn unix handler thread: {error:#}"),
             );
         }
+    }
+
+    // Close admission and terminate process trees before waiting on any
+    // transport worker. In particular, a TCP client may have sent only part of
+    // a request and be sitting inside a 30-second socket read; the documented
+    // daemon-stop budget is two seconds, so shutdown must not wait for that
+    // client before it kills live sessions.
+    let runtime_shutdown = runtime
+        .shutdown_all()
+        .context("failed to terminate live sessions during daemon shutdown");
+    let tcp_shutdown = if let Some(tcp_thread) = tcp_thread {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while !tcp_thread.is_finished() && Instant::now() < deadline {
+            if let Some(active) = active_tcp_connection.as_ref() {
+                cancel_active_tcp_connection(active);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if tcp_thread.is_finished() {
+            tcp_thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("TCP API thread panicked during daemon shutdown"))
+        } else {
+            // Dropping JoinHandle detaches only this already-cancelled worker.
+            // The daemon process exits immediately after serve_forever returns,
+            // so it cannot outlive the process or retain live-session ownership.
+            eprintln!(
+                "coven daemon: TCP API worker did not stop within 250 ms; detaching for process exit"
+            );
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
+    runtime_shutdown?;
+    tcp_shutdown?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn cancel_active_tcp_connection(active: &Mutex<Option<TcpStream>>) {
+    let stream = match active.lock() {
+        Ok(mut active) => active.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    };
+    if let Some(stream) = stream {
+        let _ = stream.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -2872,13 +3359,18 @@ where
         None
     };
     let response = match local_control.unwrap_or_else(|| {
-        crate::api::handle_request_with_runtime(
+        let authority = match guard {
+            HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
+            HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
+        };
+        crate::api::handle_request_with_runtime_and_authority(
             method,
             path,
             coven_home,
             status,
             body.as_deref(),
             runtime,
+            authority,
         )
     }) {
         Ok(response) => response,
@@ -3045,6 +3537,9 @@ fn serve_accepted_connection(
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
 ) -> Result<()> {
+    stream
+        .set_nonblocking(false)
+        .context("failed to configure accepted Unix API connection")?;
     // Best-effort I/O timeouts so a stalled client doesn't pin the handler
     // thread forever. These are an optimization, not a precondition: on macOS
     // setsockopt(SO_RCVTIMEO) returns EINVAL (os error 22) for some accepted
@@ -3076,6 +3571,7 @@ fn http_reason_phrase(status: u16) -> &'static str {
         201 => "Created",
         202 => "Accepted",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         409 => "Conflict",
         413 => "Payload Too Large",
@@ -3182,12 +3678,111 @@ pub(crate) fn windows_pipe_path(coven_home: &Path) -> PathBuf {
     PathBuf::from(r"\\.\pipe").join(daemon_windows_pipe_name(coven_home))
 }
 
+/// Put the Windows daemon itself in a process-lifetime kill-on-close Job.
+///
+/// Children inherit every non-breakaway parent Job at CreateProcess time.
+/// This supplies birth-time containment for the narrow interval before a
+/// suspended noninteractive child is assigned to its per-session Job. The
+/// handle is intentionally retained by the process until kernel teardown; an
+/// abrupt `TerminateProcess` from `daemon stop` then closes it and kills every
+/// inherited descendant, while the per-session Job remains the checked,
+/// explicit cancellation owner during normal operation.
+///
+/// This Job is a required startup invariant, not an optional backstop. The
+/// per-session Job becomes the normal owner only after attachment, so running
+/// without the daemon Job would reopen a birth-to-attachment interval where an
+/// abrupt daemon exit could orphan the suspended child. Creation,
+/// configuration, or assignment failure therefore aborts daemon startup
+/// instead of continuing with degraded containment.
+#[cfg(windows)]
+fn install_daemon_lifetime_job() -> Result<()> {
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+    install_daemon_lifetime_job_with(|job, process| {
+        // SAFETY: both handles are supplied by the checked installer below.
+        if unsafe { AssignProcessToJobObject(job, process) } == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(windows)]
+fn install_daemon_lifetime_job_with(
+    assign_process: impl FnOnce(
+        windows_sys::Win32::Foundation::HANDLE,
+        windows_sys::Win32::Foundation::HANDLE,
+    ) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::mem::size_of;
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+        System::{
+            JobObjects::{
+                CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            },
+            Threading::GetCurrentProcess,
+        },
+    };
+
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        anyhow::ensure!(
+            job != INVALID_HANDLE_VALUE && !job.is_null(),
+            "failed to create daemon lifetime Job: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const std::ffi::c_void,
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) == 0
+        {
+            let error = std::io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(error).context("failed to configure daemon lifetime Job");
+        }
+        if let Err(error) = assign_process(job, GetCurrentProcess()) {
+            CloseHandle(job);
+            return Err(error).context(
+                "failed to assign Coven daemon to its lifetime Job; the parent Job must permit modern nested jobs",
+            );
+        }
+        // HANDLE is Copy and has no Rust destructor. Deliberately do not call
+        // CloseHandle: kernel process teardown is the lifetime boundary this
+        // Job is designed to enforce.
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 pub fn serve_forever(
     coven_home: &Path,
     started_at: String,
     tcp_addr: Option<&str>,
     allowed_hosts: &[String],
+) -> Result<()> {
+    serve_forever_with_lifetime_job_installer(
+        coven_home,
+        started_at,
+        tcp_addr,
+        allowed_hosts,
+        install_daemon_lifetime_job,
+    )
+}
+
+#[cfg(windows)]
+fn serve_forever_with_lifetime_job_installer(
+    coven_home: &Path,
+    started_at: String,
+    tcp_addr: Option<&str>,
+    allowed_hosts: &[String],
+    install_lifetime_job: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     use interprocess::{
         local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
@@ -3202,6 +3797,7 @@ pub fn serve_forever(
     let _ = allowed_hosts; // only meaningful on the (Unix) TCP transport
 
     let _serve_lock = acquire_serve_lock(coven_home)?;
+    install_lifetime_job()?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
@@ -3336,6 +3932,52 @@ mod tests {
         assert_eq!(status["hubId"], hub_id);
         assert_eq!(status["nodesTotal"], 0);
         assert_eq!(status["nodesAvailable"], 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn termination_signal_requests_graceful_cleanup_instead_of_immediate_exit() {
+        DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
+        handle_termination_signal(libc::SIGTERM);
+        assert!(daemon_termination_requested());
+        DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_daemon_startup_fails_closed_when_lifetime_job_assignment_fails() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let error = serve_forever_with_lifetime_job_installer(
+            temp_dir.path(),
+            "2026-08-11T00:00:00Z".to_string(),
+            None,
+            &[],
+            || {
+                install_daemon_lifetime_job_with(|_, _| {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected assignment refusal",
+                    ))
+                })
+            },
+        )
+        .expect_err("daemon startup must reject a missing lifetime Job");
+
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("failed to assign Coven daemon to its lifetime Job"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("injected assignment refusal"),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            read_status(temp_dir.path())?,
+            None,
+            "failed lifetime Job assignment published daemon readiness"
+        );
         Ok(())
     }
 
@@ -3833,6 +4475,7 @@ mod tests {
             harness: "codex".to_string(),
             model: None,
             launch_mode: crate::harness::HarnessLaunchMode::Stream,
+            launch_policy: None,
             prompt: "hello".to_string(),
             title: "stream codex (should be rejected)".to_string(),
             conversation: None,
@@ -4109,6 +4752,643 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn runtime_shutdown_kills_all_handles_and_refuses_new_registrations() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let first = Arc::new(Mutex::new(false));
+        let second = Arc::new(Mutex::new(false));
+        for (id, killed) in [
+            ("first", Arc::clone(&first)),
+            ("second", Arc::clone(&second)),
+        ] {
+            runtime.register(
+                id.to_string(),
+                Box::new(SharedBuffer::default()),
+                Box::new(RecordingKiller { killed }),
+            )?;
+        }
+
+        runtime.shutdown_all()?;
+
+        assert!(*first.lock().unwrap());
+        assert!(*second.lock().unwrap());
+        let late_killed = Arc::new(Mutex::new(false));
+        let late = runtime
+            .register(
+                "late".to_string(),
+                Box::new(SharedBuffer::default()),
+                Box::new(RecordingKiller {
+                    killed: Arc::clone(&late_killed),
+                }),
+            )
+            .expect_err("shutdown must close admission");
+        assert!(late.to_string().contains("shutting down"), "{late:#}");
+        assert!(
+            *late_killed.lock().unwrap(),
+            "pre-lock shutdown rejection must explicitly invoke the supplied PTY killer"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_lock_shutdown_rejection_kills_without_holding_registry_lock() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        runtime.shutting_down.store(true, Ordering::Release);
+        let killed = Arc::new(Mutex::new(false));
+        let registry_was_unlocked = Arc::new(Mutex::new(false));
+        let error = runtime
+            .register_kind_after_initial_shutdown_check(
+                "late-after-check".to_string(),
+                LiveSessionKind::Pty,
+                Box::new(SharedBuffer::default()),
+                Box::new(RegistryObservingKiller {
+                    sessions: Arc::downgrade(&runtime.sessions),
+                    killed: Arc::clone(&killed),
+                    registry_was_unlocked: Arc::clone(&registry_was_unlocked),
+                    fail_message: None,
+                }),
+                Arc::new(LiveSessionRegistration::new(None)),
+            )
+            .expect_err("shutdown observed under the registry lock must reject admission");
+
+        assert!(error.to_string().contains("shutting down"), "{error:#}");
+        assert!(*killed.lock().unwrap());
+        assert!(
+            *registry_was_unlocked.lock().unwrap(),
+            "late-registration cleanup ran while holding the registry lock"
+        );
+        assert!(runtime.sessions.lock().unwrap().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn late_registration_reports_shutdown_and_cleanup_failure() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        runtime.shutting_down.store(true, Ordering::Release);
+        let error = runtime
+            .register(
+                "late-cleanup-failure".to_string(),
+                Box::new(SharedBuffer::default()),
+                Box::new(FailingKiller("synthetic cleanup failure")),
+            )
+            .expect_err("late registration must fail closed when cleanup also fails");
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("shutting down"), "{diagnostic}");
+        assert!(
+            diagnostic.contains("failed to terminate the rejected session process tree"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("synthetic cleanup failure"),
+            "{diagnostic}"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn daemon_shutdown_descendant_fixture(
+        build_dir: &Path,
+        pid_file: &Path,
+    ) -> pty_runner::HarnessCommand {
+        pty_runner::HarnessCommand::fixture(
+            "/bin/sh",
+            vec![
+                "-c".to_string(),
+                "sleep 120 </dev/null >/dev/null 2>&1 & echo $! > \"$1\"; wait".to_string(),
+                "daemon-shutdown-descendant".to_string(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            build_dir.to_path_buf(),
+        )
+    }
+
+    #[cfg(windows)]
+    fn daemon_shutdown_descendant_fixture(
+        build_dir: &Path,
+        pid_file: &Path,
+    ) -> pty_runner::HarnessCommand {
+        let probe = pty_runner::windows_console_probe_command(build_dir)
+            .expect("compile native Windows process probe");
+        pty_runner::HarnessCommand::fixture(
+            probe.program().to_string(),
+            vec![
+                "--spawn-descendant".to_string(),
+                pid_file.to_string_lossy().into_owned(),
+            ],
+            probe.cwd().to_path_buf(),
+        )
+    }
+
+    #[cfg(any(unix, windows))]
+    fn await_daemon_shutdown_descendant_pid(pid_file: &Path) -> Result<u32> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(pid_file) {
+                if let Ok(pid) = raw.trim().parse::<u32>() {
+                    return Ok(pid);
+                }
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "piped fixture did not publish its descendant pid"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn await_daemon_shutdown_descendant_exit(pid: u32, context: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                return Ok(());
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "{context} left descendant {pid} running"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(windows)]
+    fn await_daemon_shutdown_descendant_exit(pid: u32, context: &str) -> Result<()> {
+        anyhow::ensure!(
+            wait_for_windows_process_exit(pid, Duration::from_secs(10)),
+            "{context} left descendant {pid} running"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn dropping_runtime_terminates_registered_piped_process_tree() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let command = daemon_shutdown_descendant_fixture(temp_dir.path(), &pid_file);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let observer = pty_runner::DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let descendant_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let runtime = LiveSessionRuntime::default();
+        piped.activate(|input, process_tree| {
+            runtime.register("piped".to_string(), input, Box::new(process_tree))
+        })?;
+
+        drop(runtime);
+        let result = exit_rx
+            .try_recv()
+            .context("runtime drop returned before the piped exit callback completed")?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        await_daemon_shutdown_descendant_exit(descendant_pid, "runtime drop")?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn shutdown_admission_failure_drops_already_spawned_piped_process_tree() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("descendant.pid");
+        let mut command = daemon_shutdown_descendant_fixture(temp_dir.path(), &pid_file);
+        command.set_stdin_prompt_for_test(vec![b'x'; 1024 * 1024]);
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let observer = pty_runner::DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let descendant_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let runtime = LiveSessionRuntime::default();
+        runtime.shutdown_all()?;
+
+        let error = piped
+            .activate(|input, process_tree| {
+                runtime.register("late-piped".to_string(), input, Box::new(process_tree))
+            })
+            .expect_err("shutdown admission must reject a late spawned tree");
+        assert!(error.to_string().contains("shutting down"), "{error:#}");
+        let result = exit_rx.recv_timeout(Duration::from_secs(10))?;
+        assert_eq!(result.status, "failed", "{result:?}");
+        await_daemon_shutdown_descendant_exit(descendant_pid, "rejected registration")?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn runtime_kill_interrupts_in_flight_piped_prompt_within_stop_budget() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("never-read.pid");
+        let command = pty_runner::piped_prompt_probe_command(
+            temp_dir.path(),
+            "never-read",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let observer = pty_runner::DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let activation_runtime = Arc::clone(&runtime);
+        let (activation_tx, activation_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = piped.activate(|input, process_tree| {
+                activation_runtime.register(
+                    "blocked-prompt".to_string(),
+                    input,
+                    Box::new(process_tree),
+                )
+            });
+            let _ = activation_tx.send(result);
+        });
+        let registration_deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key("blocked-prompt")
+        {
+            anyhow::ensure!(
+                Instant::now() < registration_deadline,
+                "piped prompt was not registered before its writer blocked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        SessionRuntime::kill_session(runtime.as_ref(), "blocked-prompt")?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let activation = activation_rx.recv_timeout(Duration::from_secs(2))?;
+        let error = activation.expect_err("cancellation must interrupt prompt delivery");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("terminated") || diagnostic.contains("failed writing"),
+            "{diagnostic}"
+        );
+        let exit = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(exit.status, "failed", "{exit:?}");
+        await_daemon_shutdown_descendant_exit(child_pid, "prompt cancellation")?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn concurrent_api_kill_during_prompt_delivery_preserves_killed_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let pid_file = temp_dir.path().join("api-cancel-never-read.pid");
+        let command = pty_runner::piped_prompt_probe_command(
+            temp_dir.path(),
+            "never-read",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+        let runtime = Arc::new(PromptCancellationApiRuntime {
+            inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
+            command: Mutex::new(Some(command)),
+            launched: Mutex::new(Some(launched_tx)),
+            await_root_exit_before_activate: None,
+        });
+        let body = serde_json::json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "launchMode": "nonInteractive",
+            "prompt": "cancel this blocked delivery"
+        })
+        .to_string();
+        let launch_runtime = Arc::clone(&runtime);
+        let launch_home = temp_dir.path().to_path_buf();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let response = crate::api::handle_request_with_runtime(
+                "POST",
+                "/sessions",
+                &launch_home,
+                None,
+                Some(&body),
+                launch_runtime.as_ref(),
+            );
+            let _ = response_tx.send(response);
+        });
+
+        let session_id = launched_rx.recv_timeout(Duration::from_secs(2))?;
+        let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let registration_deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .inner
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&session_id)
+        {
+            anyhow::ensure!(
+                Instant::now() < registration_deadline,
+                "API launch did not register before prompt delivery blocked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let kill = crate::api::handle_request_with_runtime(
+            "POST",
+            &format!("/sessions/{session_id}/kill"),
+            temp_dir.path(),
+            None,
+            None,
+            runtime.as_ref(),
+        )?;
+        assert_eq!(kill.status, 202, "{}", kill.body);
+        let launch = response_rx.recv_timeout(Duration::from_secs(2))??;
+        assert_eq!(launch.status, 500, "{}", launch.body);
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        let row = crate::store::get_session(&conn, &session_id)?
+            .context("cancelled API launch row remains present")?;
+        assert_eq!(row.status, "killed");
+        await_daemon_shutdown_descendant_exit(child_pid, "concurrent API cancellation")?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn api_prompt_delivery_failure_wins_over_successful_root_exit() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let pid_file = temp_dir.path().join("api-exit-zero-closed-stdin.pid");
+        let command = pty_runner::piped_prompt_probe_command(
+            temp_dir.path(),
+            "exit-zero-close-stdin",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+        let runtime = PromptCancellationApiRuntime {
+            inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
+            command: Mutex::new(Some(command)),
+            launched: Mutex::new(Some(launched_tx)),
+            await_root_exit_before_activate: Some(pid_file.clone()),
+        };
+        let body = serde_json::json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "launchMode": "nonInteractive",
+            "prompt": "this prompt is replaced by the pipe-capacity fixture payload"
+        })
+        .to_string();
+
+        let response = crate::api::handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        assert!(response.body.contains("launch_failed"), "{}", response.body);
+        let session_id = launched_rx.recv_timeout(Duration::from_secs(2))?;
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let (row, exit_payload) = loop {
+            let row = crate::store::get_session(&conn, &session_id)?
+                .context("failed API launch row remains present")?;
+            let exit_payload = crate::store::list_events(&conn, &session_id)?
+                .into_iter()
+                .find(|event| event.kind == "exit")
+                .map(|event| event.payload_json);
+            if let Some(exit_payload) = exit_payload {
+                break (row, exit_payload);
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "failed API launch never persisted its exit event"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert_eq!(row.status, "failed", "{row:?}");
+        let exit_payload: Value = serde_json::from_str(&exit_payload)?;
+        assert_eq!(exit_payload["status"], "failed", "{exit_payload}");
+        assert_eq!(exit_payload["exitCode"], 0, "{exit_payload}");
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn piped_kill_returns_only_after_descendant_output_is_quiescent() -> Result<()> {
+        use std::sync::atomic::AtomicUsize;
+
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("output-descendant.pid");
+        let command = pty_runner::piped_prompt_probe_command(
+            temp_dir.path(),
+            "descendant-output",
+            &pid_file.to_string_lossy(),
+            None,
+            Vec::new(),
+        )?;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let observer_count = Arc::clone(&observed);
+        let observer = pty_runner::DetachedPtyObserver {
+            on_output: Box::new(move |chunk| {
+                observer_count.fetch_add(chunk.len(), Ordering::AcqRel);
+            }),
+            on_exit: Box::new(|_| {}),
+        };
+        let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+        let descendant_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let runtime = LiveSessionRuntime::default();
+        piped.activate(|input, process_tree| {
+            runtime.register(
+                "output-descendant".to_string(),
+                input,
+                Box::new(process_tree),
+            )
+        })?;
+
+        let output_deadline = Instant::now() + Duration::from_secs(2);
+        while observed.load(Ordering::Acquire) == 0 {
+            anyhow::ensure!(
+                Instant::now() < output_deadline,
+                "output descendant did not emit its readiness output"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let started = Instant::now();
+        SessionRuntime::kill_session(&runtime, "output-descendant")?;
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let count_at_return = observed.load(Ordering::Acquire);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            observed.load(Ordering::Acquire),
+            count_at_return,
+            "descendant output was observed after cancellation returned"
+        );
+        await_daemon_shutdown_descendant_exit(descendant_pid, "quiescent cancellation")?;
+
+        let already_gone = SessionRuntime::kill_session(&runtime, "output-descendant")
+            .expect_err("a completed cancellation must be idempotently not-live");
+        assert!(already_gone.downcast_ref::<NotLiveError>().is_some());
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn shutdown_bounds_pre_registration_launch_and_kills_its_exact_tree() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("pre-registration.pid");
+        let command = pty_runner::piped_prompt_probe_command(
+            temp_dir.path(),
+            "never-read",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (exit_tx, exit_rx) = std::sync::mpsc::channel();
+        let observer = pty_runner::DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = exit_tx.send(result);
+            }),
+        };
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let admission = runtime.begin_launch()?;
+        let (piped, _provisional_killer) = admission.spawn_owned(|publish| {
+            let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            let killer: Box<dyn RuntimeKiller> = Box::new(piped.cancellation_handle());
+            publish(killer)?;
+            Ok(piped)
+        })?;
+        let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        let activation_runtime = Arc::clone(&runtime);
+        let (at_registration_tx, at_registration_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let (activation_tx, activation_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = piped.activate(|input, process_tree| {
+                let _ = at_registration_tx.send(());
+                let _ = continue_rx.recv();
+                let registered = activation_runtime.register(
+                    "pre-registration".to_string(),
+                    input,
+                    Box::new(process_tree),
+                );
+                admission.release();
+                registered
+            });
+            let _ = activation_tx.send(result);
+        });
+        at_registration_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let shutdown_runtime = Arc::clone(&runtime);
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = shutdown_tx.send(shutdown_runtime.shutdown_all());
+        });
+        shutdown_rx.recv_timeout(Duration::from_secs(2))??;
+        await_daemon_shutdown_descendant_exit(child_pid, "bounded pre-registration shutdown")?;
+        continue_tx.send(())?;
+        let activation = activation_rx.recv_timeout(Duration::from_secs(2))?;
+        let error = activation.expect_err("closed admission must reject the pending launch");
+        assert!(error.to_string().contains("shutting down"), "{error:#}");
+        let exit = exit_rx.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(exit.status, "failed", "{exit:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_budget_does_not_wait_for_spawn_closure_after_ownership_publication() -> Result<()> {
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let admission = runtime.begin_launch()?;
+        let killed = Arc::new(Mutex::new(false));
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let killed_in_spawn = Arc::clone(&killed);
+        let spawn_thread = std::thread::spawn(move || {
+            admission.spawn_owned(|publish| {
+                publish(Box::new(RecordingKiller {
+                    killed: killed_in_spawn,
+                }))?;
+                let _ = published_tx.send(());
+                let _ = continue_rx.recv();
+                Ok(())
+            })
+        });
+        published_rx.recv_timeout(Duration::from_secs(1))?;
+
+        let started = Instant::now();
+        runtime.shutdown_all()?;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown exceeded its external stop budget"
+        );
+        assert!(*killed.lock().unwrap());
+        continue_tx.send(())?;
+        let _ = spawn_thread.join().expect("spawn closure thread")?;
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_budget_closes_gate_while_spawn_closure_is_stalled_before_publication() -> Result<()>
+    {
+        let runtime = Arc::new(LiveSessionRuntime::default());
+        let admission = runtime.begin_launch()?;
+        let killed = Arc::new(Mutex::new(false));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (continue_tx, continue_rx) = std::sync::mpsc::channel();
+        let killed_in_spawn = Arc::clone(&killed);
+        let spawn_thread = std::thread::spawn(move || {
+            admission.spawn_owned(|publish| {
+                let _ = entered_tx.send(());
+                let _ = continue_rx.recv();
+                publish(Box::new(RecordingKiller {
+                    killed: killed_in_spawn,
+                }))?;
+                Ok(())
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(1))?;
+
+        let started = Instant::now();
+        runtime.shutdown_all()?;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "shutdown waited on a pre-publication spawn closure"
+        );
+        assert!(!*killed.lock().unwrap());
+
+        continue_tx.send(())?;
+        let error = match spawn_thread.join().expect("spawn closure thread") {
+            Ok(_) => anyhow::bail!("a closed launch gate accepted late ownership publication"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("shutting down"), "{error:#}");
+        assert!(
+            *killed.lock().unwrap(),
+            "late publication did not invoke the exact supplied killer"
+        );
+        Ok(())
+    }
+
     #[derive(Clone, Default)]
     struct SharedBuffer {
         data: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -4140,6 +5420,131 @@ mod tests {
         fn kill(&mut self) -> Result<()> {
             *self.killed.lock().unwrap() = true;
             Ok(())
+        }
+    }
+
+    struct RegistryObservingKiller {
+        sessions: Weak<Mutex<HashMap<String, LiveSessionHandle>>>,
+        killed: Arc<Mutex<bool>>,
+        registry_was_unlocked: Arc<Mutex<bool>>,
+        fail_message: Option<&'static str>,
+    }
+
+    impl RuntimeKiller for RegistryObservingKiller {
+        fn kill(&mut self) -> Result<()> {
+            *self.killed.lock().unwrap() = true;
+            let unlocked = self
+                .sessions
+                .upgrade()
+                .is_some_and(|sessions| sessions.try_lock().is_ok());
+            *self.registry_was_unlocked.lock().unwrap() = unlocked;
+            if let Some(message) = self.fail_message {
+                anyhow::bail!(message);
+            }
+            Ok(())
+        }
+    }
+
+    struct FailingKiller(&'static str);
+
+    impl RuntimeKiller for FailingKiller {
+        fn kill(&mut self) -> Result<()> {
+            anyhow::bail!(self.0)
+        }
+    }
+
+    struct CountingFailingKiller {
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl RuntimeKiller for CountingFailingKiller {
+        fn kill(&mut self) -> Result<()> {
+            self.attempts.fetch_add(1, Ordering::AcqRel);
+            anyhow::bail!("quiescence proof timed out")
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    struct PromptCancellationApiRuntime {
+        inner: LiveSessionRuntime,
+        command: Mutex<Option<pty_runner::HarnessCommand>>,
+        launched: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        await_root_exit_before_activate: Option<PathBuf>,
+    }
+
+    #[cfg(any(unix, windows))]
+    impl SessionRuntime for PromptCancellationApiRuntime {
+        fn launch_session(&self, launch: &crate::api::SessionLaunch) -> Result<()> {
+            if let Some(sender) = self.launched.lock().unwrap().take() {
+                let _ = sender.send(launch.id.clone());
+            }
+            let command = self
+                .command
+                .lock()
+                .unwrap()
+                .take()
+                .context("prompt-cancellation fixture command was already consumed")?;
+            let (observer, registration) = self.inner.observer_for_session(launch.id.clone());
+            let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            if let Some(pid_file) = &self.await_root_exit_before_activate {
+                let pid = await_daemon_shutdown_descendant_pid(pid_file)?;
+                await_daemon_shutdown_descendant_exit(pid, "successful pre-delivery root exit")?;
+            }
+            piped.activate(|input, process_tree| {
+                self.inner.register_kind_with_registration(
+                    launch.id.clone(),
+                    LiveSessionKind::Pty,
+                    input,
+                    Box::new(process_tree),
+                    registration,
+                )
+            })
+        }
+
+        fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            SessionRuntime::send_input(&self.inner, session_id, payload)
+        }
+
+        fn kill_session(&self, session_id: &str) -> Result<()> {
+            SessionRuntime::kill_session(&self.inner, session_id)
+        }
+
+        fn with_session_event_boundary(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+            action: &mut dyn FnMut() -> crate::api::SessionEventBoundaryResult,
+        ) -> Option<crate::api::SessionEventBoundaryResult> {
+            SessionRuntime::with_session_event_boundary(
+                &self.inner,
+                session_id,
+                kind,
+                payload,
+                action,
+            )
+        }
+
+        fn record_session_event(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+        ) -> Option<Result<()>> {
+            SessionRuntime::record_session_event(&self.inner, session_id, kind, payload)
+        }
+
+        fn can_record_session_event(
+            &self,
+            session_id: &str,
+            kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            SessionRuntime::can_record_session_event(&self.inner, session_id, kind, payload)
+        }
+
+        fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+            SessionRuntime::event_writer_health(&self.inner)
         }
     }
 
@@ -4326,6 +5731,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_kill_retains_exact_handle_for_retry() {
+        let runtime = LiveSessionRuntime::default();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        runtime
+            .register(
+                "retry-kill".to_string(),
+                Box::new(SharedBuffer::default()),
+                Box::new(CountingFailingKiller {
+                    attempts: Arc::clone(&attempts),
+                }),
+            )
+            .unwrap();
+
+        for expected_attempts in 1..=2 {
+            let error = SessionRuntime::kill_session(&runtime, "retry-kill")
+                .expect_err("failing quiescence proof remains retryable");
+            assert!(error.to_string().contains("quiescence proof"));
+            assert_eq!(attempts.load(Ordering::Acquire), expected_attempts);
+            assert!(
+                runtime.sessions.lock().unwrap().contains_key("retry-kill"),
+                "failed kill discarded the exact ownership handle"
+            );
+        }
+    }
+
+    #[test]
     fn kill_event_commits_before_concurrent_exit() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
@@ -4402,7 +5833,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn handle_http_stream_processes_health_request() {
+    fn owner_local_ipc_health_advertises_session_launch_policy() {
         use crate::api::NoopSessionRuntime;
         use std::io::Cursor;
         let temp = tempfile::tempdir().expect("tempdir");
@@ -4424,6 +5855,10 @@ mod tests {
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+        assert!(
+            response.contains(r#""sessionLaunchPolicy":true"#),
+            "got: {response}"
+        );
     }
 
     #[cfg(unix)]
@@ -4705,7 +6140,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bind_tcp_listener_serves_health_over_tcp() {
+    fn tcp_health_does_not_advertise_owner_only_session_launch_policy() {
         use crate::api::NoopSessionRuntime;
         use std::io::{Read, Write};
         use std::net::TcpStream;
@@ -4736,6 +6171,84 @@ mod tests {
 
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
         assert!(response.contains("\"apiVersion\""), "got: {response}");
+        assert!(
+            response.contains(r#""sessionLaunchPolicy":false"#),
+            "got: {response}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_rejects_launch_policy_before_session_row_or_runtime_launch() -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpStream;
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+
+        struct LaunchDetectingRuntime(Arc<AtomicBool>);
+        impl SessionRuntime for LaunchDetectingRuntime {
+            fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> Result<()> {
+                self.0.store(true, Ordering::Release);
+                Ok(())
+            }
+
+            fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _session_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        ensure_private_coven_home(temp.path())?;
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root)?;
+        let body = serde_json::json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "launchMode": "nonInteractive",
+            "launchPolicy": {
+                "approval": "never",
+                "sandbox": "workspace-write",
+                "addDirs": []
+            },
+            "prompt": "write artifacts/primary.md"
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let listener = bind_tcp_listener("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let coven_home = temp.path().to_path_buf();
+        let launched = Arc::new(AtomicBool::new(false));
+        let launched_for_server = Arc::clone(&launched);
+        let server = thread::spawn(move || {
+            let runtime = LaunchDetectingRuntime(launched_for_server);
+            serve_next_tcp_connection(&listener, &coven_home, None, &runtime, &[])
+        });
+
+        let mut client = TcpStream::connect(addr)?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        client.write_all(request.as_bytes())?;
+        let mut response = String::new();
+        client.read_to_string(&mut response)?;
+        server.join().expect("server thread")?;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "got: {response}"
+        );
+        assert!(response.contains(r#""code":"forbidden""#), "{response}");
+        assert!(response.contains("owner-gated local IPC"), "{response}");
+        assert!(!launched.load(Ordering::Acquire));
+        let conn = crate::store::open_store(&temp.path().join(crate::STORE_FILE_NAME))?;
+        assert!(crate::store::list_sessions(&conn)?.is_empty());
+        Ok(())
     }
 
     #[cfg(unix)]

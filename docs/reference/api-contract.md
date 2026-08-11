@@ -71,7 +71,12 @@ GET /api/v1/health
     "executorDispatch": true,
     "eventCursor": "sequence",
     "structuredErrors": true,
-    "sessionHandoff": true
+    "sessionHandoff": true,
+    "sessionLaunchPolicy": true,
+    "afs": true,
+    "afsMount": false,
+    "afsCommit": true,
+    "afsCommitDryRun": true
   },
   "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<local IPC endpoint>" },
   "eventWriter": {
@@ -86,6 +91,18 @@ GET /api/v1/health
   }
 }
 ```
+
+The health `capabilities` object contains all 14 fields: `sessions`, `events`,
+`travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
+`structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
+`afsCommit`, and `afsCommitDryRun`.
+
+`sessionLaunchPolicy` is `true` only over owner-gated local IPC. TCP health
+always reports it as `false`, and TCP rejects any `POST /api/v1/sessions`
+payload containing `launchPolicy` with `403 forbidden`; passing Host or Origin
+checks does not elevate TCP authority. The initial exact policy supports Codex
+`nonInteractive` approval `never`, sandbox `workspace-write`, and explicit
+absolute existing `addDirs`, including a named external mission workspace.
 
 When present, `eventWriter.state` is `healthy`, `pressured`, or `failed`.
 Pressure reports explicitly rejected raw output; lifecycle and terminal events

@@ -56,6 +56,23 @@ pub enum HarnessLaunchMode {
     Stream,
 }
 
+/// Exact, daemon-authorized launch policy for unattended Codex work.
+///
+/// This is deliberately not a general-purpose permission enum. The local API
+/// accepts only this one policy today, and the harness builder independently
+/// enforces its Codex/non-interactive boundary so another caller cannot use it
+/// to broaden an interactive or unsupported launch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchPolicy {
+    pub add_dirs: Vec<String>,
+}
+
+impl LaunchPolicy {
+    pub fn unattended_workspace_write(add_dirs: Vec<String>) -> Self {
+        Self { add_dirs }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HarnessSpeed {
     Fast,
@@ -134,6 +151,11 @@ pub struct HarnessLaunchOptions<'a> {
     /// harnesses that declare none make the flag a warned no-op. Blank
     /// entries are skipped. A shared slice keeps the struct `Copy`.
     pub add_dirs: &'a [String],
+    /// Explicit daemon-authorized unattended policy. This is separate from
+    /// the interactive composer's `permission` option: it always maps to
+    /// Codex approval-never plus workspace-write, and is rejected for every
+    /// other harness or launch mode.
+    pub launch_policy: Option<&'a LaunchPolicy>,
 }
 
 impl<'a> HarnessLaunchOptions<'a> {
@@ -1911,6 +1933,7 @@ fn command_parts_with_specs(
     // ahead of the prompt positional, mirroring model selection. Harnesses
     // that declare no add-dir mechanism yield no args (the run layer warns).
     let add_dir_args: Vec<String> = spec.add_dir_args(options.add_dirs);
+    let launch_policy_args = launch_policy_args(harness_id, mode, options)?;
     let launch_option_args = launch_option_args(harness_id, options);
 
     // Resolve effective prompt: inject familiar identity preamble when present.
@@ -1935,16 +1958,22 @@ fn command_parts_with_specs(
                 args.insert(0, flag.to_string());
             }
             return Ok((
-                program,
+                program.clone(),
                 with_claude_permission_flags_enabled(
                     harness_id,
-                    sanitize_argv_for_platform(prepend_launch_args(
-                        &model_args,
-                        &sandbox_args,
-                        &add_dir_args,
-                        &launch_option_args,
-                        args,
-                    )),
+                    sanitize_argv_for_program(
+                        harness_id,
+                        mode,
+                        &program,
+                        prepend_launch_args(
+                            &model_args,
+                            &sandbox_args,
+                            &add_dir_args,
+                            &launch_policy_args,
+                            &launch_option_args,
+                            args,
+                        ),
+                    ),
                     claude_bypass_enabled,
                 ),
             ));
@@ -1955,16 +1984,22 @@ fn command_parts_with_specs(
             add_codex_exec_json_flag(&spec, &mut args)?;
         }
         return Ok((
-            program,
+            program.clone(),
             with_claude_permission_flags_enabled(
                 harness_id,
-                sanitize_argv_for_platform(prepend_launch_args(
-                    &model_args,
-                    &sandbox_args,
-                    &add_dir_args,
-                    &launch_option_args,
-                    args,
-                )),
+                sanitize_argv_for_program(
+                    harness_id,
+                    mode,
+                    &program,
+                    prepend_launch_args(
+                        &model_args,
+                        &sandbox_args,
+                        &add_dir_args,
+                        &launch_policy_args,
+                        &launch_option_args,
+                        args,
+                    ),
+                ),
                 claude_bypass_enabled,
             ),
         ));
@@ -1980,23 +2015,29 @@ fn command_parts_with_specs(
                 args.insert(0, f.identity_preamble());
                 args.insert(0, flag.to_string());
             }
-            let args = sanitize_argv_for_platform(prepend_launch_args(
-                &model_args,
-                &sandbox_args,
-                &add_dir_args,
-                &launch_option_args,
-                // The prompt rides behind the harness's prompt flag when it
-                // declares one (continuity launches are always
-                // non-interactive, so the shared `prompt_flag` applies), or
-                // behind `--` for positional-prompt harnesses — user data
-                // must not parse as harness flags either way.
-                args.into_iter()
-                    .chain(match spec.prompt_flag.as_deref() {
-                        Some(flag) => vec![format!("{flag}={effective_prompt}")],
-                        None => vec!["--".to_string(), effective_prompt],
-                    })
-                    .collect(),
-            ));
+            let args = sanitize_argv_for_program(
+                harness_id,
+                mode,
+                &program,
+                prepend_launch_args(
+                    &model_args,
+                    &sandbox_args,
+                    &add_dir_args,
+                    &launch_policy_args,
+                    &launch_option_args,
+                    // The prompt rides behind the harness's prompt flag when it
+                    // declares one (continuity launches are always
+                    // non-interactive, so the shared `prompt_flag` applies), or
+                    // behind `--` for positional-prompt harnesses — user data
+                    // must not parse as harness flags either way.
+                    args.into_iter()
+                        .chain(match spec.prompt_flag.as_deref() {
+                            Some(flag) => vec![format!("{flag}={effective_prompt}")],
+                            None => vec!["--".to_string(), effective_prompt],
+                        })
+                        .collect(),
+                ),
+            );
             return Ok((
                 program,
                 with_claude_permission_flags_enabled(harness_id, args, claude_bypass_enabled),
@@ -2015,16 +2056,22 @@ fn command_parts_with_specs(
         args.insert(0, flag.to_string());
     }
     Ok((
-        program,
+        program.clone(),
         with_claude_permission_flags_enabled(
             harness_id,
-            sanitize_argv_for_platform(prepend_launch_args(
-                &model_args,
-                &sandbox_args,
-                &add_dir_args,
-                &launch_option_args,
-                args,
-            )),
+            sanitize_argv_for_program(
+                harness_id,
+                mode,
+                &program,
+                prepend_launch_args(
+                    &model_args,
+                    &sandbox_args,
+                    &add_dir_args,
+                    &launch_policy_args,
+                    &launch_option_args,
+                    args,
+                ),
+            ),
             claude_bypass_enabled,
         ),
     ))
@@ -2065,6 +2112,55 @@ fn launch_option_args(harness_id: &str, options: HarnessLaunchOptions<'_>) -> Ve
         .unwrap_or_default()
 }
 
+fn launch_policy_args(
+    harness_id: &str,
+    mode: HarnessLaunchMode,
+    options: HarnessLaunchOptions<'_>,
+) -> Result<Vec<String>> {
+    let Some(policy) = options.launch_policy else {
+        return Ok(Vec::new());
+    };
+    if harness_id != "codex" || mode != HarnessLaunchMode::NonInteractive {
+        anyhow::bail!("launchPolicy is supported only for Codex nonInteractive launches");
+    }
+    if options.permission.is_some() || !options.add_dirs.is_empty() {
+        anyhow::bail!(
+            "launchPolicy cannot be combined with separate permission or add-dir options"
+        );
+    }
+
+    // Keep the public flag for Codex versions that honor it directly, but also
+    // pin the config value as a highest-precedence session override. Codex
+    // 0.146.1 parses the root `--ask-for-approval` flag without inheriting it
+    // into `exec`; its headless default can then be discarded when AutoReview
+    // is configured, allowing an untrusted project to select `untrusted`.
+    // The explicit config override survives that AutoReview rebuild.
+    let mut args = vec![
+        "--ask-for-approval".to_string(),
+        "never".to_string(),
+        "-c".to_string(),
+        r#"approval_policy="never""#.to_string(),
+        "--sandbox".to_string(),
+        "workspace-write".to_string(),
+    ];
+    // Codex 0.146.1 safely downgrades `workspace-write` to `read-only` on
+    // native Windows unless a supported Windows sandbox backend is selected.
+    // The unelevated restricted-token backend is the least-privileged backend
+    // that enforces workspace-write there. Keep this explicit override inside
+    // the already Windows/Codex/noninteractive-only launchPolicy boundary;
+    // Codex reports backend setup failures through the preserved stderr/exit
+    // path instead of silently running without a sandbox.
+    if cfg!(windows) {
+        args.push("-c".to_string());
+        args.push(r#"windows.sandbox="unelevated""#.to_string());
+    }
+    for dir in &policy.add_dirs {
+        args.push("--add-dir".to_string());
+        args.push(dir.clone());
+    }
+    Ok(args)
+}
+
 /// Prepend resolved launch argv tokens ahead of `args` (which ends with the
 /// prompt positional). Keeps Coven-managed options before the prompt, matching
 /// how Cave emits run flags.
@@ -2072,22 +2168,30 @@ fn prepend_launch_args(
     model_args: &[String],
     sandbox_args: &[String],
     add_dir_args: &[String],
+    policy_args: &[String],
     option_args: &[String],
     args: Vec<String>,
 ) -> Vec<String> {
     if model_args.is_empty()
         && sandbox_args.is_empty()
         && add_dir_args.is_empty()
+        && policy_args.is_empty()
         && option_args.is_empty()
     {
         return args;
     }
     let mut out = Vec::with_capacity(
-        model_args.len() + sandbox_args.len() + add_dir_args.len() + option_args.len() + args.len(),
+        model_args.len()
+            + sandbox_args.len()
+            + add_dir_args.len()
+            + policy_args.len()
+            + option_args.len()
+            + args.len(),
     );
     out.extend_from_slice(model_args);
     out.extend_from_slice(sandbox_args);
     out.extend_from_slice(add_dir_args);
+    out.extend_from_slice(policy_args);
     out.extend_from_slice(option_args);
     out.extend(args);
     out
@@ -2098,44 +2202,60 @@ fn prepend_launch_args(
 /// messages and stdout is a stream of newline-delimited JSON events.
 /// Returns `None` for harnesses that don't support stream mode so the
 /// caller can fall back to a one-shot launch.
-/// On Windows, harness executables often resolve to `.cmd` shims that are
-/// invoked through `cmd.exe`. cmd.exe interprets metacharacters like
-/// `& | < > ^ % ! "` in arguments even inside double-quoted strings in some
-/// invocation paths. Neutralize them by caret-escaping the dangerous
-/// characters and wrapping affected arguments in quotes so `.cmd` shims that
-/// re-expand `%*` keep the value as data during a second `cmd.exe` parse.
-///
-/// On non-Windows platforms this is a no-op: the OS exec model passes
-/// argv entries as null-terminated byte arrays without shell parsing.
+/// Preserve the established quoting contract only where a Windows batch shim
+/// actually causes argv to cross a second cmd.exe parse. Native executables
+/// always receive exact values. Security-sensitive noninteractive Codex npm
+/// shims also keep exact argv here because the command builder subsequently
+/// resolves them to their validated native executable before spawn. Interactive
+/// and stream Codex retain their existing shim/PTY behavior.
 #[cfg(windows)]
-pub(crate) fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
+pub(crate) fn sanitize_argv_for_program(
+    harness_id: &str,
+    mode: HarnessLaunchMode,
+    program: &str,
+    args: Vec<String>,
+) -> Vec<String> {
+    let is_batch = Path::new(program)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat")
+        });
+    if !is_batch || (harness_id == "codex" && mode == HarnessLaunchMode::NonInteractive) {
+        return args;
+    }
     args.into_iter()
         .map(|arg| escape_cmd_shim_metacharacters(&arg))
         .collect()
 }
 
 #[cfg(not(windows))]
-pub(crate) fn sanitize_argv_for_platform(args: Vec<String>) -> Vec<String> {
+pub(crate) fn sanitize_argv_for_program(
+    _harness_id: &str,
+    _mode: HarnessLaunchMode,
+    _program: &str,
+    args: Vec<String>,
+) -> Vec<String> {
     args
 }
 
-#[cfg(any(windows, test))]
+#[cfg(windows)]
 fn escape_cmd_shim_metacharacters(arg: &str) -> String {
-    // Characters that cmd.exe treats as special when a `.cmd` shim causes argv
-    // to be re-parsed. The caller still passes a single argv entry; this only
-    // neutralizes characters within that entry.
     const CMD_METACHARACTERS: &[char] = &['&', '|', '<', '>', '^', '%', '!', '"'];
-    if !arg.chars().any(|c| CMD_METACHARACTERS.contains(&c)) {
+    if !arg
+        .chars()
+        .any(|character| CMD_METACHARACTERS.contains(&character))
+    {
         return arg.to_string();
     }
 
     let mut escaped = String::with_capacity((arg.len() * 2) + 2);
     escaped.push('"');
-    for ch in arg.chars() {
-        if CMD_METACHARACTERS.contains(&ch) {
+    for character in arg.chars() {
+        if CMD_METACHARACTERS.contains(&character) {
             escaped.push('^');
         }
-        escaped.push(ch);
+        escaped.push(character);
     }
     escaped.push('"');
     escaped
@@ -2533,15 +2653,34 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
     #[test]
-    fn cmd_shim_metacharacters_are_caret_escaped_and_wrapped() {
-        assert_eq!(escape_cmd_shim_metacharacters("safe prompt"), "safe prompt");
-
-        let escaped = escape_cmd_shim_metacharacters(r#"a&b|c<d>e^f%g!h"i"#);
-
-        assert_eq!(escaped, r#""a^&b^|c^<d^>e^^f^%g^!h^"i""#);
-        assert!(escaped.starts_with('"'));
-        assert!(escaped.ends_with('"'));
+    fn windows_launch_argv_escaping_is_scoped_to_batch_modes_that_retain_the_shim() {
+        let external_dir = r#"C:\Research & Evidence\資料 ^ 100%!"#;
+        let native = sanitize_argv_for_program(
+            "codex",
+            HarnessLaunchMode::Interactive,
+            r"C:\Tools\codex.exe",
+            vec![external_dir.to_string()],
+        );
+        assert_eq!(native, [external_dir]);
+        let noninteractive_batch = sanitize_argv_for_program(
+            "codex",
+            HarnessLaunchMode::NonInteractive,
+            r"C:\Tools\codex.cmd",
+            vec![external_dir.to_string()],
+        );
+        assert_eq!(noninteractive_batch, [external_dir]);
+        let interactive_batch = sanitize_argv_for_program(
+            "codex",
+            HarnessLaunchMode::Interactive,
+            r"C:\Tools\codex.cmd",
+            vec![external_dir.to_string()],
+        );
+        assert_eq!(
+            interactive_batch,
+            [escape_cmd_shim_metacharacters(external_dir)]
+        );
     }
 
     #[test]
@@ -5472,6 +5611,131 @@ mod tests {
         let prompt_pos = args.iter().position(|a| a == "fix tests").unwrap();
         assert!(sandbox_pos < prompt_pos, "{args:?}");
         Ok(())
+    }
+
+    #[test]
+    fn codex_noninteractive_launch_policy_emits_exact_supported_argv() -> anyhow::Result<()> {
+        let policy = LaunchPolicy::unattended_workspace_write(vec![
+            "/repo/artifacts".to_string(),
+            "/repo/cache".to_string(),
+        ]);
+        let (_, args) = command_parts_with_built_ins(
+            "codex",
+            "write the artifact",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                launch_policy: Some(&policy),
+                ..Default::default()
+            },
+        )?;
+
+        let mut expected = vec![
+            "--ask-for-approval",
+            "never",
+            "-c",
+            r#"approval_policy="never""#,
+            "--sandbox",
+            "workspace-write",
+        ];
+        if cfg!(windows) {
+            expected.extend(["-c", r#"windows.sandbox="unelevated""#]);
+        }
+        expected.extend([
+            "--add-dir",
+            "/repo/artifacts",
+            "--add-dir",
+            "/repo/cache",
+            "exec",
+            "--skip-git-repo-check",
+            "--color",
+            "never",
+            "--",
+            "write the artifact",
+        ]);
+        assert_eq!(args, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_codex_preserves_external_launch_policy_dir_exactly_before_native_resolution(
+    ) -> anyhow::Result<()> {
+        let external_dir = r#"C:\Research & Evidence\資料 ^ 100%!"#.to_string();
+        let policy = LaunchPolicy::unattended_workspace_write(vec![external_dir.clone()]);
+        for resolved_program in [r"C:\Tools\codex.exe", r"C:\Tools\codex.cmd"] {
+            let (program, args) = command_parts_with_specs(
+                &built_in_harness_specs(),
+                "codex",
+                "write the artifact",
+                HarnessLaunchMode::NonInteractive,
+                None,
+                None,
+                HarnessLaunchOptions {
+                    launch_policy: Some(&policy),
+                    ..Default::default()
+                },
+                false,
+                false,
+                |_| resolved_program.to_string(),
+            )?;
+            let windows_args = sanitize_argv_for_program(
+                "codex",
+                HarnessLaunchMode::NonInteractive,
+                &program,
+                args,
+            );
+            let add_dir = windows_args
+                .windows(2)
+                .find(|pair| pair[0] == "--add-dir")
+                .expect("launch policy emits --add-dir");
+            assert_eq!(add_dir[1], external_dir, "{program}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn launch_policy_rejects_unsupported_harnesses_modes_and_mixed_grants() {
+        let policy = LaunchPolicy::unattended_workspace_write(Vec::new());
+        for (harness, mode) in [
+            ("claude", HarnessLaunchMode::NonInteractive),
+            ("codex", HarnessLaunchMode::Interactive),
+            ("codex", HarnessLaunchMode::Stream),
+        ] {
+            let error = command_parts_with_built_ins(
+                harness,
+                "hello",
+                mode,
+                None,
+                None,
+                HarnessLaunchOptions {
+                    launch_policy: Some(&policy),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("Codex nonInteractive"),
+                "{error}"
+            );
+        }
+
+        let mixed_dir = vec!["/unvalidated".to_string()];
+        let error = command_parts_with_built_ins(
+            "codex",
+            "hello",
+            HarnessLaunchMode::NonInteractive,
+            None,
+            None,
+            HarnessLaunchOptions {
+                permission: Some(Permission::ReadOnly),
+                add_dirs: &mixed_dir,
+                launch_policy: Some(&policy),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be combined"), "{error}");
     }
 
     #[test]

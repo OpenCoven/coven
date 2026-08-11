@@ -28,7 +28,7 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
 
 ## Contract and discovery
 
@@ -41,9 +41,13 @@ All error responses use the structured envelope documented in the [API contract]
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
 | POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | `{ ok, accepted, status, event }` · `400 invalid_request` |
 
-The health `capabilities` object currently contains all nine fields:
+The health `capabilities` object currently contains all 14 fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
-`eventCursor`, `structuredErrors`, and `sessionHandoff`. `daemon` is either `null` or
+`eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`,
+`afs`, `afsMount`, `afsCommit`, and `afsCommitDryRun`. The
+`sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
+always `false` over TCP; Host and Origin allowlists do not elevate TCP
+authority. `daemon` is either `null` or
 `{ pid, startedAt, socket }`, where the socket is under
 the active local IPC endpoint; the optional `hub` field is a control-plane
 summary.
@@ -64,7 +68,7 @@ snapshot reported by `eventWriter`.
 | Method | Path | Purpose | Body / query | Success | Errors |
 |---|---|---|---|---|---|
 | GET | `/api/v1/sessions` | List sessions. | — | `SessionRecord[]` | — |
-| POST | `/api/v1/sessions` | Launch a project-scoped harness session. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request`, `500 launch_failed` |
+| POST | `/api/v1/sessions` | Launch a project-scoped harness session. `launchPolicy` requires `capabilities.sessionLaunchPolicy === true`; its initial exact contract is `{ approval: "never", sandbox: "workspace-write", addDirs?: string[] }` for Codex `nonInteractive`, with every additional directory absolute, existing, canonicalized, and explicitly listed (including an external mission workspace when named). The field is owner-local-IPC-only; TCP returns `403 forbidden`. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, launchPolicy?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request`, `403 forbidden`, `500 launch_failed` |
 | POST | `/api/v1/sessions/external` | Register (or idempotently re-register) an externally launched session. | session descriptor | `201` new / `200` existing | `400`, `409 session_id_conflict` |
 | GET | `/api/v1/sessions/:id` | Fetch one session. | — | `SessionRecord` | `404 session_not_found` |
 | POST | `/api/v1/sessions/:id/complete` | Mark an external session completed. | `{ exitCode?, ... }` | updated record | `404 session_not_found`, `422 not_external_session` |
@@ -241,7 +245,7 @@ Full hub request/response shapes live in the [API contract](/API-CONTRACT).
 GET /api/v1/health
 ```
 
-The response provides the active named `apiVersion`, all nine health
+The response provides the active named `apiVersion`, all 14 health
 `capabilities` fields, and optional daemon metadata (`pid`, `startedAt`, and
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.

@@ -1028,14 +1028,83 @@ while :; do sleep 1; done
     );
 }
 
-/// End-to-end Windows regression: an npm-style `codex.cmd` must receive a
-/// multiline prompt through stdin (not ConPTY/cmd argv), and the Coven CLI
-/// must surface the Codex JSON response as an `assistant` frame. The second
-/// invocation proves Cave can keep using the stable Coven ledger id while
-/// Coven resumes the native Codex thread internally.
+#[cfg(windows)]
+fn install_official_windows_codex_fixture(root: &std::path::Path) -> std::path::PathBuf {
+    use std::fs;
+
+    let fake_bin = root.join("bin");
+    let package_root = root.join("node_modules").join("@openai").join("codex");
+    let entry = package_root.join("bin").join("codex.js");
+    let native_root = root
+        .join("node_modules")
+        .join("@openai")
+        .join("codex-win32-x64");
+    let native = native_root
+        .join("vendor")
+        .join("x86_64-pc-windows-msvc")
+        .join("bin")
+        .join("codex.exe");
+    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
+    fs::create_dir_all(entry.parent().unwrap()).expect("failed to create Codex package bin");
+    fs::create_dir_all(native.parent().unwrap()).expect("failed to create native package bin");
+    fs::write(&entry, "// official Codex entry fixture\n")
+        .expect("failed to write Codex entry fixture");
+    fs::write(
+        package_root.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "@openai/codex",
+            "bin": { "codex": "bin/codex.js" },
+            "optionalDependencies": {
+                "@openai/codex-win32-x64": "npm:@openai/codex@0.0.0-win32-x64"
+            }
+        }))
+        .unwrap(),
+    )
+    .expect("failed to write Codex package metadata");
+    fs::write(
+        native_root.join("package.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "name": "@openai/codex",
+            "os": ["win32"],
+            "cpu": ["x64"]
+        }))
+        .unwrap(),
+    )
+    .expect("failed to write native package metadata");
+    fs::write(
+        fake_bin.join("codex.cmd"),
+        concat!(
+            "@echo off\r\n",
+            "\"%~dp0\\..\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n"
+        ),
+    )
+    .expect("failed to write official Codex shim fixture");
+
+    let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/windows_codex_json_probe.rs");
+    let compile = Command::new("rustc.exe")
+        .args(["--edition=2021", "-o"])
+        .arg(&native)
+        .arg(&fixture)
+        .output()
+        .expect("failed to compile native Codex JSON probe");
+    assert!(
+        compile.status.success(),
+        "native Codex JSON probe failed to compile: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+    fake_bin
+}
+
+/// End-to-end Windows regression: an official npm `codex.cmd` is validated
+/// and resolved to its native executable before launch. The native executable
+/// must receive a multiline prompt through stdin (not cmd argv), and Coven
+/// must surface its JSON response as an `assistant` frame. The second run
+/// proves Cave can keep using the stable Coven ledger id while Coven resumes
+/// the native Codex thread internally.
 #[cfg(windows)]
 #[test]
-fn windows_codex_cmd_stream_json_emits_assistant_and_resumes_native_thread() {
+fn windows_official_codex_stream_json_emits_assistant_and_resumes_native_thread() {
     use std::fs;
 
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -1053,25 +1122,7 @@ description = "Windows Codex regression fixture"
     .expect("failed to write familiar fixture");
     let project_root = temp_dir.path().join("project");
     fs::create_dir_all(&project_root).expect("failed to create project root");
-    let fake_bin = temp_dir.path().join("bin");
-    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
-    let fake_codex = fake_bin.join("codex.cmd");
-    fs::write(
-        &fake_codex,
-        concat!(
-            "@echo off\r\n",
-            // findstr copies stdin without PowerShell's multi-second cold
-            // start, which flaked the sibling pty_runner test (issue #407).
-            "\"%SystemRoot%\\System32\\findstr.exe\" \"^\" > stdin.txt\r\n",
-            "echo %* > args.txt\r\n",
-            "echo {\"type\":\"thread.started\",\"thread_id\":\"thread-789\"}\r\n",
-            "echo {\"type\":\"turn.started\"}\r\n",
-            "echo {\"type\":\"item.completed\",\"item\":{\"id\":\"item-1\",\"type\":\"agent_message\",\"text\":\"reply for Cave\"}}\r\n",
-            "echo {\"type\":\"turn.completed\"}\r\n",
-            "exit /b 0\r\n"
-        ),
-    )
-    .expect("failed to write fake codex cmd");
+    let fake_bin = install_official_windows_codex_fixture(temp_dir.path());
 
     let mut paths = vec![fake_bin.clone()];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -1195,7 +1246,7 @@ description = "Windows Codex regression fixture"
 /// override keeps this integration regression bounded.
 #[cfg(windows)]
 #[test]
-fn windows_silent_codex_cmd_emits_terminal_error_and_marks_session_failed() {
+fn windows_silent_official_codex_emits_terminal_error_and_marks_session_failed() {
     use std::fs;
 
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -1203,13 +1254,7 @@ fn windows_silent_codex_cmd_emits_terminal_error_and_marks_session_failed() {
     fs::create_dir_all(&coven_home).expect("failed to create coven home");
     let project_root = temp_dir.path().join("project");
     fs::create_dir_all(&project_root).expect("failed to create project root");
-    let fake_bin = temp_dir.path().join("bin");
-    fs::create_dir_all(&fake_bin).expect("failed to create fake bin dir");
-    fs::write(
-        fake_bin.join("codex.cmd"),
-        "@echo off\r\n:spin\r\ngoto spin\r\n",
-    )
-    .expect("failed to write silent codex cmd");
+    let fake_bin = install_official_windows_codex_fixture(temp_dir.path());
 
     let mut paths = vec![fake_bin];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -1223,6 +1268,7 @@ fn windows_silent_codex_cmd_emits_terminal_error_and_marks_session_failed() {
         .env("COVEN_HOME", &coven_home)
         .env("PATH", &path)
         .env("PATHEXT", ".CMD")
+        .env("COVEN_TEST_CODEX_PROBE_SILENT", "1")
         .env("COVEN_TEST_CODEX_JSON_IDLE_TIMEOUT_MS", "150")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

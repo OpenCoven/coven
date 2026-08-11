@@ -508,6 +508,324 @@ test('wrapper binary maps windows x64 to windows native package and exe binary',
   assert.match(bin, /process\.platform === 'win32' \? 'coven\.exe' : 'coven'/);
 });
 
+test('wrapper no-window mode is an explicit exact-value opt-in', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /COVEN_WINDOWS_HIDE_NATIVE_WINDOW/);
+  assert.match(
+    bin,
+    /hideNativeWindowSignal\?\.\[1\] === '1'/,
+    'values other than the documented literal 1 must preserve ordinary CLI behavior'
+  );
+  assert.match(bin, /name\.toUpperCase\(\) === WINDOWS_HIDE_NATIVE_WINDOW_ENV/);
+  assert.match(bin, /delete childEnv\[name\]/);
+  assert.match(bin, /hideNativeWindow \? \['pipe', 'pipe', 'pipe'\] : 'inherit'/);
+  assert.match(bin, /windowsHide: hideNativeWindow/);
+});
+
+test('wrapper exposes a strict native-binary path discovery contract', () => {
+  const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
+  const bin = readFileSync(binPath, 'utf8');
+  assert.match(bin, /--print-native-binary-path/);
+  assert.match(bin, /args\.length !== 1/);
+  assert.match(bin, /path\.isAbsolute\(binary\)/);
+  assert.match(bin, /process\.stdout\.write\(`\$\{binary\}\\n`\)/);
+});
+
+test('wrapper docs publish the complete native process-supervisor v1 contract', () => {
+  const readme = readFileSync(
+    new URL(['..', 'npm', 'coven', 'README.md'].join('/'), import.meta.url),
+    'utf8'
+  );
+  assert.match(readme, /coven process-supervisor\s+--protocol coven\.process-supervisor\.v1/);
+  assert.match(
+    readme,
+    /\{"version":1,"program":"\/absolute\/path\/to\/program","args":\["arg"\],"cwd":"\/absolute\/existing\/directory"\}/
+  );
+  assert.match(readme, /limited to 256 KiB/);
+  assert.match(readme, /COVEN_PROCESS_SUPERVISOR_V1/);
+  assert.match(readme, /Keep supervisor stdin open as the\s+ownership lease/);
+  assert.match(readme, /target stdout and stderr are forwarded unchanged/);
+  assert.match(readme, /native supervisor process directly/);
+});
+
+test(
+  'wrapper path discovery prints the exact native executable without launching it',
+  { skip: !SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`] },
+  () => {
+    const fixture = mkdtempSync(path.join(tmpdir(), 'coven-wrapper-native-path-'));
+    try {
+      const wrapperDir = path.join(fixture, 'wrapper');
+      const wrapperBinDir = path.join(wrapperDir, 'bin');
+      const wrapperPath = path.join(wrapperBinDir, 'coven.js');
+      mkdirSync(wrapperBinDir, { recursive: true });
+      writeFileSync(
+        path.join(wrapperDir, 'package.json'),
+        JSON.stringify({ name: '@opencoven/cli-test', type: 'module' })
+      );
+      copyFileSync(
+        fileURLToPath(new URL('../npm/coven/bin/coven.js', import.meta.url)),
+        wrapperPath
+      );
+      const [packageName, binaryName] =
+        SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`];
+      const nativeDir = path.join(wrapperDir, 'node_modules', ...packageName.split('/'));
+      const nativeBinDir = path.join(nativeDir, 'bin');
+      const nativePath = path.join(nativeBinDir, binaryName);
+      mkdirSync(nativeBinDir, { recursive: true });
+      writeFileSync(
+        path.join(nativeDir, 'package.json'),
+        JSON.stringify({ name: packageName, version: '0.0.0' })
+      );
+      symlinkSync(process.execPath, nativePath);
+
+      const result = spawnSync(
+        process.execPath,
+        [wrapperPath, '--print-native-binary-path'],
+        { encoding: 'utf8' }
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stderr, '');
+      assert.equal(result.stdout, `${realpathSync(nativePath)}\n`);
+
+      const mixed = spawnSync(
+        process.execPath,
+        [wrapperPath, '--print-native-binary-path', '--version'],
+        { encoding: 'utf8' }
+      );
+      assert.equal(mixed.status, 1);
+      assert.equal(mixed.stdout, '');
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+);
+
+test(
+  'Windows wrapper opt-in launches its console-subsystem native child without a console',
+  { skip: process.platform !== 'win32', timeout: 30_000 },
+  async () => {
+    const fixture = mkdtempSync(path.join(tmpdir(), 'coven-wrapper-console-'));
+    try {
+      const wrapperDir = path.join(fixture, 'wrapper');
+      const wrapperBinDir = path.join(wrapperDir, 'bin');
+      const wrapperPath = path.join(wrapperBinDir, 'coven.js');
+      const nativeDir = path.join(
+        wrapperDir,
+        'node_modules',
+        '@opencoven',
+        'cli-windows'
+      );
+      const nativeBinDir = path.join(nativeDir, 'bin');
+      const nativePath = path.join(nativeBinDir, 'coven.exe');
+      mkdirSync(wrapperBinDir, { recursive: true });
+      mkdirSync(nativeBinDir, { recursive: true });
+      writeFileSync(
+        path.join(wrapperDir, 'package.json'),
+        JSON.stringify({ name: '@opencoven/cli-test', type: 'module' })
+      );
+      writeFileSync(
+        path.join(nativeDir, 'package.json'),
+        JSON.stringify({ name: '@opencoven/cli-windows', version: '0.0.0' })
+      );
+      copyFileSync(
+        fileURLToPath(new URL('../npm/coven/bin/coven.js', import.meta.url)),
+        wrapperPath
+      );
+      const source = fileURLToPath(
+        new URL(
+          '../crates/coven-cli/tests/fixtures/windows_console_probe.rs',
+          import.meta.url
+        )
+      );
+      const compile = spawnSync(
+        'rustc.exe',
+        ['--edition=2021', '-o', nativePath, source],
+        { encoding: 'utf8' }
+      );
+      assert.equal(compile.status, 0, compile.stderr);
+
+      const nativePathResult = spawnSync(
+        process.execPath,
+        [wrapperPath, '--print-native-binary-path'],
+        { encoding: 'utf8' }
+      );
+      assert.equal(nativePathResult.status, 0, nativePathResult.stderr);
+      assert.equal(nativePathResult.stdout, `${nativePath}\n`);
+
+      const ordinaryEnv = { ...process.env };
+      delete ordinaryEnv.COVEN_WINDOWS_HIDE_NATIVE_WINDOW;
+      const ordinary = spawnSync(process.execPath, [wrapperPath], {
+        encoding: 'utf8',
+        env: ordinaryEnv
+      });
+      assert.equal(ordinary.status, 0, ordinary.stderr);
+      assert.match(
+        ordinary.stdout,
+        /console=(?:present|absent)/,
+        'the native console-subsystem probe must run even when the CI parent is already headless'
+      );
+      const allocatedOrdinary = spawnSync(
+        nativePath,
+        ['--launch-new-console', process.execPath, wrapperPath],
+        { encoding: 'utf8', env: ordinaryEnv }
+      );
+      assert.equal(allocatedOrdinary.status, 0, allocatedOrdinary.stderr);
+      assert.match(
+        allocatedOrdinary.stdout,
+        /console=present/,
+        'the same wrapper/native probe must observe the explicitly allocated positive-control console'
+      );
+
+      const nonOptIn = spawnSync(process.execPath, [wrapperPath], {
+        encoding: 'utf8',
+        env: {
+          ...ordinaryEnv,
+          COVEN_WINDOWS_HIDE_NATIVE_WINDOW: 'true'
+        }
+      });
+      assert.equal(nonOptIn.status, 0, nonOptIn.stderr);
+      assert.equal(
+        nonOptIn.stdout,
+        ordinary.stdout,
+        'values other than literal 1 must preserve the parent console state'
+      );
+
+      const nonOptInEnv = spawnSync(
+        process.execPath,
+        [wrapperPath, '--print-env', 'coven_windows_hide_native_window'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...ordinaryEnv,
+            Coven_Windows_Hide_Native_Window: 'true'
+          }
+        }
+      );
+      assert.equal(nonOptInEnv.status, 0, nonOptInEnv.stderr);
+      assert.match(nonOptInEnv.stdout, /env=absent/);
+
+      const hidden = spawnSync(process.execPath, [wrapperPath], {
+        encoding: 'utf8',
+        env: {
+          ...ordinaryEnv,
+          COVEN_WINDOWS_HIDE_NATIVE_WINDOW: '1'
+        }
+      });
+      assert.equal(hidden.status, 0, hidden.stderr);
+      assert.match(hidden.stdout, /console=absent/);
+      const allocatedHidden = spawnSync(
+        nativePath,
+        ['--launch-new-console', process.execPath, wrapperPath],
+        {
+          encoding: 'utf8',
+          env: {
+            ...ordinaryEnv,
+            COVEN_WINDOWS_HIDE_NATIVE_WINDOW: '1'
+          }
+        }
+      );
+      assert.equal(allocatedHidden.status, 0, allocatedHidden.stderr);
+      assert.match(
+        allocatedHidden.stdout,
+        /console=absent/,
+        'wrapper opt-in must suppress the native console even when its Node parent owns an allocated console'
+      );
+
+      const forwardedInput = 'stdin-forwarding-資料-&!^%\n'.repeat(4096);
+      const hiddenForwarding = spawnSync(
+        process.execPath,
+        [wrapperPath, '--echo-stdio-exit', '23'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...ordinaryEnv,
+            COVEN_WINDOWS_HIDE_NATIVE_WINDOW: '1'
+          },
+          input: forwardedInput,
+          maxBuffer: 2 * 1024 * 1024
+        }
+      );
+      assert.equal(hiddenForwarding.status, 23, hiddenForwarding.stderr);
+      assert.equal(
+        hiddenForwarding.stdout,
+        `console=absent\n${forwardedInput}`,
+        'hidden wrapper must preserve pipe-backed stdin and stdout exactly'
+      );
+      assert.equal(
+        hiddenForwarding.stderr,
+        'stderr=forwarded\n',
+        'hidden wrapper must preserve pipe-backed stderr exactly'
+      );
+
+      const brokenDestination = spawn(
+        process.execPath,
+        [wrapperPath, '--spam-stdout'],
+        {
+          env: {
+            ...ordinaryEnv,
+            COVEN_WINDOWS_HIDE_NATIVE_WINDOW: '1'
+          },
+          stdio: ['ignore', 'pipe', 'pipe']
+        }
+      );
+      brokenDestination.stderr.resume();
+      await once(brokenDestination.stdout, 'data');
+      brokenDestination.stdout.destroy();
+      const [brokenCode] = await once(brokenDestination, 'close');
+      assert.equal(
+        brokenCode,
+        1,
+        'a broken forwarded output destination must fail closed instead of reporting native success'
+      );
+
+      const hiddenEnv = spawnSync(
+        process.execPath,
+        [wrapperPath, '--print-env', 'COVEN_WINDOWS_HIDE_NATIVE_WINDOW'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...ordinaryEnv,
+            COVEN_WINDOWS_HIDE_NATIVE_WINDOW: '1'
+          }
+        }
+      );
+      assert.equal(hiddenEnv.status, 0, hiddenEnv.stderr);
+      assert.match(hiddenEnv.stdout, /env=absent/);
+
+      const ctrlReady = path.join(fixture, 'ctrl-c-ready');
+      const ctrlPid = path.join(fixture, 'ctrl-c-native.pid');
+      const ctrlC = spawnSync(
+        nativePath,
+        [
+          '--launch-new-console-ctrl-c',
+          ctrlReady,
+          process.execPath,
+          wrapperPath,
+          '--ctrl-c-ready',
+          ctrlReady,
+          ctrlPid
+        ],
+        { encoding: 'utf8', env: ordinaryEnv }
+      );
+      assert.equal(ctrlC.status, 0, ctrlC.stderr);
+      assert.match(
+        ctrlC.stdout,
+        /ctrl-c-exit=130/,
+        'ordinary wrapper did not preserve forwarded Ctrl-C as exit code 130'
+      );
+      const ctrlNativePid = Number.parseInt(readFileSync(ctrlPid, 'utf8'), 10);
+      assert.throws(
+        () => process.kill(ctrlNativePid, 0),
+        /ESRCH/,
+        'ordinary wrapper Ctrl-C left its native child running'
+      );
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+);
+
 test('wrapper includes conventional Windows signal fallback', () => {
   const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
   const bin = readFileSync(binPath, 'utf8');

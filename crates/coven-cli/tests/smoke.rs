@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
-use std::net::Shutdown;
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -143,6 +143,223 @@ fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result
         second_pid, first_pid,
         "daemon start should reuse the verified running daemon instead of spawning another serve process"
     );
+    Ok(())
+}
+
+#[test]
+fn daemon_stop_terminates_live_piped_session_descendants() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let project_root = temp_dir.path().join("project");
+    let fake_bin = temp_dir.path().join("bin");
+    let descendant_pid_file = temp_dir.path().join("descendant.pid");
+    fs::create_dir_all(&project_root)?;
+    fs::create_dir_all(&fake_bin)?;
+    write_shutdown_fake_codex(&fake_bin, &descendant_pid_file)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("daemon start for shutdown containment", &start);
+    wait_for_daemon_health(&coven_home)?;
+    let body = json!({
+        "projectRoot": project_root,
+        "harness": "codex",
+        "launchMode": "nonInteractive",
+        "prompt": "hold for daemon shutdown",
+        "title": "Shutdown containment"
+    })
+    .to_string();
+    let (status, response) = unix_http_request(&coven_home, "POST", "/sessions", Some(&body))?;
+    assert_eq!(status, 201, "unexpected launch response: {response}");
+
+    wait_until("piped descendant pid", || Ok(descendant_pid_file.exists()))?;
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)?
+        .trim()
+        .parse::<u32>()?;
+    assert!(
+        pid_is_alive(descendant_pid),
+        "fixture descendant should be live before daemon stop"
+    );
+
+    let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
+    assert_success("daemon stop with live piped child", &stop);
+    wait_until("piped descendant termination after daemon stop", || {
+        Ok(!pid_is_alive(descendant_pid))
+    })?;
+    assert!(
+        !coven_home.join("coven.sock").exists(),
+        "graceful shutdown should remove its Unix socket"
+    );
+    assert!(
+        !coven_home.join("daemon.json").exists(),
+        "graceful shutdown should remove its status file"
+    );
+    Ok(())
+}
+
+#[test]
+fn daemon_stop_kills_piped_tree_stalled_before_runtime_publication() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let project_root = temp_dir.path().join("project");
+    let fake_bin = temp_dir.path().join("bin");
+    let barrier_dir = temp_dir.path().join("prepublication-barrier");
+    let descendant_pid_file = temp_dir.path().join("prepublication-descendant.pid");
+    fs::create_dir_all(&project_root)?;
+    fs::create_dir_all(&fake_bin)?;
+    write_shutdown_fake_codex(&fake_bin, &descendant_pid_file)?;
+    let path = prepend_path(&fake_bin);
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let start = Command::new(&coven)
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .env("COVEN_TEST_PIPED_PREPUBLICATION_BARRIER_DIR", &barrier_dir)
+        .output()?;
+    assert_success("daemon start for pre-publication containment", &start);
+    wait_for_daemon_health(&coven_home)?;
+
+    let body = json!({
+        "projectRoot": project_root,
+        "harness": "codex",
+        "launchMode": "nonInteractive",
+        "prompt": "hold before runtime ownership publication",
+        "title": "Pre-publication shutdown containment"
+    })
+    .to_string();
+    let request = format!(
+        "POST /sessions HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    let mut launch_stream = UnixStream::connect(coven_home.join("coven.sock"))?;
+    launch_stream.write_all(request.as_bytes())?;
+    launch_stream.shutdown(Shutdown::Write)?;
+
+    wait_until("piped pre-publication barrier", || {
+        Ok(barrier_dir.join("ready").exists())
+    })?;
+    wait_until("pre-publication descendant pid", || {
+        Ok(descendant_pid_file.exists())
+    })?;
+    let descendant_pid = fs::read_to_string(&descendant_pid_file)?
+        .trim()
+        .parse::<u32>()?;
+    assert!(
+        pid_is_alive(descendant_pid),
+        "fixture descendant should be live in the pre-publication window"
+    );
+
+    let started = Instant::now();
+    let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
+    let elapsed = started.elapsed();
+    assert_success("daemon stop during pre-publication launch", &stop);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "daemon stop exceeded its documented two-second deadline: {elapsed:?}"
+    );
+    wait_until("pre-publication descendant guardian cleanup", || {
+        Ok(!pid_is_alive(descendant_pid))
+    })?;
+    drop(launch_stream);
+    Ok(())
+}
+
+#[test]
+fn stalled_tcp_request_cannot_exhaust_daemon_stop_deadline() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let port_reservation = TcpListener::bind("127.0.0.1:0")?;
+    let tcp_addr = port_reservation.local_addr()?.to_string();
+    drop(port_reservation);
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+    let mut daemon = Command::new(&coven)
+        .args(["daemon", "serve", "--tcp", &tcp_addr])
+        .env("COVEN_HOME", &coven_home)
+        .env("PATH", &path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    wait_for_daemon_health(&coven_home)?;
+
+    let mut stalled = TcpStream::connect(&tcp_addr)?;
+    stalled.write_all(
+        b"POST /api/v1/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{",
+    )?;
+    stalled.flush()?;
+    // The TCP worker polls accept every 25 ms. Leave ample time for it to
+    // accept this request and block waiting for the deliberately absent body.
+    thread::sleep(Duration::from_millis(250));
+
+    let started = Instant::now();
+    // `serve` is our direct child in this test. Reap it concurrently with the
+    // separate `daemon stop` command; otherwise that command's kill(0) probe
+    // correctly observes our unreaped zombie as an extant pid and times out.
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let stop_coven = coven.clone();
+    let stop_home = coven_home.clone();
+    let stop_path = path.clone();
+    thread::spawn(move || {
+        let _ = stop_tx.send(run_coven(
+            &stop_coven,
+            &stop_home,
+            &stop_path,
+            &["daemon", "stop"],
+        ));
+    });
+    let daemon_deadline = Instant::now() + Duration::from_secs(2);
+    let daemon_status = loop {
+        if let Some(status) = daemon.try_wait()? {
+            break Some(status);
+        }
+        if Instant::now() >= daemon_deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stop = stop_rx.recv_timeout(Duration::from_secs(3))??;
+    let elapsed = started.elapsed();
+    if daemon_status.is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    assert_success("daemon stop with stalled TCP request", &stop);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "daemon stop exceeded its documented two-second deadline: {elapsed:?}"
+    );
+    let daemon_status = daemon_status.expect("successful daemon stop must reap the serve process");
+    assert!(
+        daemon_status.success(),
+        "foreground daemon exited with {daemon_status}"
+    );
+    assert!(
+        !coven_home.join("coven.sock").exists(),
+        "bounded graceful shutdown should remove its Unix socket"
+    );
+    assert!(
+        !coven_home.join("daemon.json").exists(),
+        "bounded graceful shutdown should remove its status file"
+    );
+    drop(stalled);
     Ok(())
 }
 
@@ -1457,6 +1674,21 @@ if [ "$*" = "hold-for-kill" ]; then
 fi
 printf 'fake codex complete: %s\n' "$*"
 "#,
+    )?;
+    let mut permissions = fs::metadata(&codex)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex, permissions)?;
+    Ok(())
+}
+
+fn write_shutdown_fake_codex(fake_bin: &Path, pid_file: &Path) -> anyhow::Result<()> {
+    let codex = fake_bin.join("codex");
+    fs::write(
+        &codex,
+        format!(
+            "#!/bin/sh\nsleep 300 </dev/null >/dev/null 2>&1 &\nprintf '%s\\n' \"$!\" > '{}'\nprintf 'fake codex ready for daemon shutdown\\n'\nwait\n",
+            pid_file.display()
+        ),
     )?;
     let mut permissions = fs::metadata(&codex)?.permissions();
     permissions.set_mode(0o755);

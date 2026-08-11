@@ -2,6 +2,7 @@
 import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { constants as osConstants } from 'node:os';
+import path from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -16,6 +17,8 @@ const binaryName = process.platform === 'win32' ? 'coven.exe' : 'coven';
 const platformKey = `${process.platform}-${process.arch}`;
 const packageName = PLATFORM_PACKAGES[platformKey];
 const MEMORY_DASHBOARD_MIN_NODE_MAJOR = 24;
+const WINDOWS_HIDE_NATIVE_WINDOW_ENV = 'COVEN_WINDOWS_HIDE_NATIVE_WINDOW';
+const PRINT_NATIVE_BINARY_PATH_ARG = '--print-native-binary-path';
 
 function resolveBinary() {
   if (!packageName) {
@@ -73,7 +76,36 @@ try {
 // line. (The wrapper previously short-circuited --version to its own
 // package.json version, which shadowed that output for npm installs.)
 const args = process.argv.slice(2);
+if (args.includes(PRINT_NATIVE_BINARY_PATH_ARG)) {
+  if (args.length !== 1) {
+    console.error(`${PRINT_NATIVE_BINARY_PATH_ARG} cannot be combined with other arguments.`);
+    process.exit(1);
+  }
+  if (!path.isAbsolute(binary) || /[\r\n]/.test(binary)) {
+    console.error('Resolved native Coven binary path is not a safe absolute path.');
+    process.exit(1);
+  }
+  process.stdout.write(`${binary}\n`);
+  process.exit(0);
+}
 const childEnv = { ...process.env };
+// Desktop clients that intentionally own no console can opt into a hidden
+// native child. Keep ordinary CLI launches unchanged so inherited output,
+// terminal attachment, and Ctrl-C behavior retain their existing semantics.
+const hideNativeWindowSignal = Object.entries(process.env).find(
+  ([name]) => name.toUpperCase() === WINDOWS_HIDE_NATIVE_WINDOW_ENV
+);
+const hideNativeWindow =
+  process.platform === 'win32' && hideNativeWindowSignal?.[1] === '1';
+// This is a wrapper-boundary instruction, not ambient Coven configuration.
+// Consume every casing of the name (Windows environment lookup is
+// case-insensitive) so the native CLI and launched harnesses cannot inherit
+// it and accidentally hide an unrelated nested wrapper invocation.
+for (const name of Object.keys(childEnv)) {
+  if (name.toUpperCase() === WINDOWS_HIDE_NATIVE_WINDOW_ENV) {
+    delete childEnv[name];
+  }
+}
 const opensMemoryDashboard = isMemoryOpenInvocation(args);
 const requestsHelp = args.some((arg) => arg === '--help' || arg === '-h');
 if (
@@ -97,11 +129,52 @@ if (opensMemoryDashboard) {
   }
 }
 
+// libuv can apply CREATE_NO_WINDOW only when none of the child's stdio entries
+// inherit Windows handles. The opt-in desktop path therefore uses pipes and
+// transparently forwards them; ordinary terminal-owned CLI launches retain
+// direct inherited stdio and their existing console/Ctrl-C behavior.
 const child = spawn(binary, args, {
-  stdio: 'inherit',
-  windowsHide: false,
+  stdio: hideNativeWindow ? ['pipe', 'pipe', 'pipe'] : 'inherit',
+  windowsHide: hideNativeWindow,
   env: childEnv
 });
+
+let forwardingError = null;
+if (hideNativeWindow) {
+  const failForwarding = (label, error) => {
+    if (
+      label === 'stdin' &&
+      (error?.code === 'EPIPE' || error?.code === 'ERR_STREAM_DESTROYED')
+    ) {
+      // A target may intentionally close stdin before it exits. This is not a
+      // wrapper transport failure; its own exit status remains authoritative.
+      return;
+    }
+    if (!forwardingError) {
+      forwardingError = new Error(`${label} forwarding failed: ${error.message}`);
+      process.exitCode = 1;
+      try {
+        process.stderr.write(`Coven wrapper: ${forwardingError.message}\n`);
+      } catch {
+        // The stderr destination itself may be the failed stream.
+      }
+      if (!child.killed) {
+        child.kill('SIGTERM');
+      }
+    }
+  };
+
+  child.stdin.on('error', (error) => failForwarding('stdin', error));
+  child.stdout.on('error', (error) => failForwarding('stdout source', error));
+  child.stderr.on('error', (error) => failForwarding('stderr source', error));
+  process.stdout.on('error', (error) => failForwarding('stdout', error));
+  process.stderr.on('error', (error) => failForwarding('stderr', error));
+  process.stdin.on('error', (error) => failForwarding('stdin source', error));
+
+  process.stdin.pipe(child.stdin);
+  child.stdout.pipe(process.stdout, { end: false });
+  child.stderr.pipe(process.stderr, { end: false });
+}
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
@@ -116,15 +189,30 @@ child.on('error', (error) => {
   process.exit(1);
 });
 
-child.on('exit', (code, signal) => {
+child.on(hideNativeWindow ? 'close' : 'exit', (code, signal) => {
+  if (hideNativeWindow) {
+    process.stdin.unpipe(child.stdin);
+    process.stdin.pause();
+  }
+  if (forwardingError) {
+    process.exitCode = 1;
+    return;
+  }
   if (signal) {
     if (process.platform === 'win32') {
       const signalNumber = osConstants.signals[signal];
-      process.exit(signalNumber === undefined ? 1 : 128 + signalNumber);
+      process.exitCode = signalNumber === undefined ? 1 : 128 + signalNumber;
+      return;
     }
     process.removeAllListeners(signal);
     process.kill(process.pid, signal);
     return;
   }
-  process.exit(code ?? 1);
+  // Setting exitCode (rather than forcing process.exit) lets pipe-backed
+  // stdout/stderr finish flushing without truncating the native CLI output.
+  if (hideNativeWindow) {
+    process.exitCode = code ?? 1;
+  } else {
+    process.exit(code ?? 1);
+  }
 });

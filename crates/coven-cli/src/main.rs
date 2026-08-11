@@ -227,6 +227,11 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    #[command(hide = true, name = "process-supervisor")]
+    ProcessSupervisor {
+        #[arg(long, value_name = "PROTOCOL")]
+        protocol: String,
+    },
     #[command(about = "Inspect and decide Ward proposals or migrate configuration")]
     Ward {
         #[command(subcommand)]
@@ -1105,6 +1110,16 @@ fn main() -> Result<()> {
     ) {
         return run_cli(cli);
     }
+    // The process supervisor is a native provider primitive, not a normal
+    // stateful Coven command. It must establish target containment before any
+    // settings/state initialization can create threads or block on a profile
+    // lock. Its first stderr line is the machine-readable admission result.
+    if let Some(Command::ProcessSupervisor { protocol }) = &cli.command {
+        if pty_runner::run_process_supervisor(protocol).is_err() {
+            std::process::exit(70);
+        }
+        unreachable!("process supervisor exits with its target status");
+    }
 
     let loaded =
         settings::user_settings_path().as_deref().and_then(|path| {
@@ -1191,6 +1206,9 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Adapter { command }) => run_adapter_command(command),
         Some(Command::Engine { command }) => run_engine_command(command),
         Some(Command::Daemon { command }) => run_daemon_command(command),
+        Some(Command::ProcessSupervisor { .. }) => {
+            unreachable!("process supervisor runs before state initialization")
+        }
         Some(Command::Ward { command }) => run_ward_command(command),
         Some(Command::Executor { command }) => run_executor_command(command),
         Some(Command::Run {
@@ -3964,6 +3982,7 @@ fn run_session(
         speed: requested_speed,
         permission: requested_permission,
         add_dirs: &requested_add_dirs,
+        launch_policy: None,
     };
 
     let effective_prompt = match (&familiar_ctx, spec.as_ref()) {

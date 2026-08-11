@@ -15,6 +15,16 @@ Treat a missing, false, or malformed required capability as unsupported and
 fail before sending the dependent request. Clients should ignore unknown
 additive capabilities.
 
+For example, a client must require `capabilities.sessionLaunchPolicy === true`
+before adding `launchPolicy` to `POST /api/v1/sessions`. The capability says
+the daemon understands that request shape; it does not grant filesystem
+authority. The daemon still validates the exact policy and accepts only
+absolute, existing, canonical additional directories in the explicit write
+set, including an explicitly named external mission workspace when needed.
+This capability is `true` only on the owner-gated local IPC transport. TCP
+health reports it as `false`, and TCP rejects the field even when Host and
+Origin pass their separate loopback/allowlist checks.
+
 `GET /api/v1/api-version` is a legacy route-family diagnostic. Its literal
 `apiVersion: "v1"` and `supportedApiVersions: ["v1"]` values describe the
 `/api/v1/*` namespace. New clients must not use it as proof of

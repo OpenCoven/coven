@@ -114,6 +114,45 @@ PIPELESS_TABLE_BLOCK = re.compile(
     r"\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+(?:\n|$)"
 )
 STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
+HEALTH_CAPABILITY_FIELDS = (
+    "sessions",
+    "events",
+    "travel",
+    "scheduler",
+    "hub",
+    "executorDispatch",
+    "eventCursor",
+    "structuredErrors",
+    "sessionHandoff",
+    "sessionLaunchPolicy",
+    "afs",
+    "afsMount",
+    "afsCommit",
+    "afsCommitDryRun",
+)
+SESSION_LAUNCH_POLICY_DOCS = (
+    "docs/API-CONTRACT.md",
+    "docs/reference/api.md",
+    "docs/reference/api-contract.md",
+    "docs/daemon/socket-api.md",
+    "docs/daemon/capabilities-handshake.md",
+)
+HEALTH_CAPABILITY_EXAMPLE_DOCS = (
+    "docs/API-CONTRACT.md",
+    "docs/reference/api-contract.md",
+    "docs/daemon/socket-api.md",
+)
+HEALTH_CAPABILITY_LIST_DOCS = (
+    "docs/API-CONTRACT.md",
+    "docs/reference/api.md",
+    "docs/reference/api-contract.md",
+    "docs/daemon/socket-api.md",
+)
+HEALTH_CAPABILITY_COUNT_DOCS = (
+    "docs/reference/api.md",
+    "docs/reference/api-contract.md",
+    "docs/daemon/socket-api.md",
+)
 
 
 def legacy_route_explained(text: str) -> bool:
@@ -356,6 +395,36 @@ def validate_documents(documents: dict[str, str]) -> list[str]:
     return errors
 
 
+def validate_session_launch_policy_docs(documents: dict[str, str]) -> list[str]:
+    """Pin the transport and field-list parts of the privileged launch contract."""
+    errors: list[str] = []
+    for path in SESSION_LAUNCH_POLICY_DOCS:
+        text = documents[path]
+        lowered = text.lower()
+        if "sessionLaunchPolicy" not in text:
+            errors.append(f"{path}: sessionLaunchPolicy capability is missing")
+        if "tcp" not in lowered or not re.search(
+            r"owner[-\s]+(?:gated[-\s]+)?local[-\s]+ipc", lowered
+        ):
+            errors.append(f"{path}: launchPolicy transport boundary is missing")
+
+    for path in HEALTH_CAPABILITY_EXAMPLE_DOCS:
+        for field in HEALTH_CAPABILITY_FIELDS:
+            if f'"{field}"' not in documents[path]:
+                errors.append(f"{path}: health example missing {field}")
+
+    for path in HEALTH_CAPABILITY_LIST_DOCS:
+        for field in HEALTH_CAPABILITY_FIELDS:
+            if f"`{field}`" not in documents[path]:
+                errors.append(f"{path}: capability list missing {field}")
+
+    expected_count = len(HEALTH_CAPABILITY_FIELDS)
+    for path in HEALTH_CAPABILITY_COUNT_DOCS:
+        if not re.search(rf"\ball {expected_count}\b[^.\n]*\bfields\b", documents[path]):
+            errors.append(f"{path}: health capability field count is stale")
+    return errors
+
+
 def main() -> int:
     paths = tuple(dict.fromkeys(CONTRACT_DOCS + LIFECYCLE_DOCS + HEALTH_GUIDANCE_DOCS))
     documents: dict[str, str] = {}
@@ -369,6 +438,7 @@ def main() -> int:
             )
             return 1
     errors = validate_documents(documents)
+    errors.extend(validate_session_launch_policy_docs(documents))
 
     for error in errors:
         print(error, file=sys.stderr)
