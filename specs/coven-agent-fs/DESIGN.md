@@ -484,8 +484,8 @@ What ships instead:
   token is `ps`-visible for the duration of that one call. The daemon rotates
   the gate the moment the mount returns, but a local process can use a scraped
   value before then and retain the authenticated file handle after rotation.
-  Established mounts are unaffected because handles are keyed on the file id
-  under a key rotation does not touch; only a *new* traversal of the gate needs
+  Established mounts are unaffected because handles are keyed on the file id,
+  which a key rotation does not touch; only a *new* traversal of the gate needs
   the current token.
 
 **Decision.** This is sufficient to keep an unprivileged local account out by
