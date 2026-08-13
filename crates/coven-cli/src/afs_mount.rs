@@ -102,8 +102,7 @@ pub fn backend() -> Option<&'static str> {
     None
 }
 
-/// Locate the export helper next to the running daemon. A build that did not
-/// ship it advertises no backend rather than failing at mount time.
+/// Locate the export helper next to the running daemon.
 fn helper_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join(HELPER);
