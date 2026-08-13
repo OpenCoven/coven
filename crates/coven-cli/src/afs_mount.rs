@@ -10,10 +10,11 @@
 //! afs/mounts/<id>/          the mount point itself
 //! ```
 //!
-//! **Available where a backend exists.** The export serves the merged
-//! base+delta view (DESIGN.md §3.2), so a mount shows what a caller asking for
-//! one means. `afsMount` reports `"nfs"` on macOS where the export helper
-//! shipped, and `false` everywhere else.
+//! **Unavailable until the backend has a safe authentication channel.**
+//! `mount_nfs` requires the export path on its command line. Because that path
+//! contains the export credential, enabling the backend would expose access to
+//! other local users through the process list. `afsMount` therefore reports
+//! `false` on every platform.
 //!
 //! What mount availability does *not* claim is that every process can read
 //! through the mount. macOS refuses `open()` on network volumes for processes
@@ -108,19 +109,16 @@ fn exports() -> &'static Mutex<HashMap<String, Export>> {
 
 /// The mount backend for this platform and build, or `None`.
 ///
-/// `None` is the honest answer in two distinct situations and the caller
-/// cannot tell them apart, which is fine: both mean "do not offer to mount".
-/// Linux's FUSE backend is not built yet, so macOS is the only platform that
-/// reports one.
+/// NFS cannot currently pass the export credential to `mount_nfs` without
+/// placing it in a process argument visible to other local users. Rotation
+/// after mounting is insufficient: a process that uses the credential before
+/// rotation can retain an authenticated file handle. Keep the backend disabled
+/// until the credential can be transferred without that disclosure window.
 pub fn backend() -> Option<&'static str> {
-    if !cfg!(target_os = "macos") {
-        return None;
-    }
-    helper_path().is_some().then_some("nfs")
+    None
 }
 
-/// Locate the export helper next to the running daemon. A build that did not
-/// ship it advertises no backend rather than failing at mount time.
+/// Locate the export helper next to the running daemon.
 fn helper_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join(HELPER);
@@ -545,12 +543,9 @@ mod tests {
     const DEAD_PID: u32 = 0;
 
     #[test]
-    fn no_backend_is_advertised_off_macos() {
-        // FUSE is not built. A platform without a backend must report none
-        // rather than offer a mount it cannot perform.
-        if cfg!(target_os = "macos") {
-            return;
-        }
+    fn no_backend_is_advertised() {
+        // The NFS credential would be visible in mount_nfs's process
+        // arguments, and FUSE is not built. Do not advertise either backend.
         assert_eq!(backend(), None);
     }
 

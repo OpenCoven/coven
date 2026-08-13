@@ -492,18 +492,20 @@ What ships instead:
   positional argument and offers no stdin, environment, or config alternative
   (`man mount_nfs` has neither an ENVIRONMENT nor a FILES section), so the
   token is `ps`-visible for the duration of that one call. The daemon rotates
-  the gate the moment the mount returns, which makes a scraped value useless.
-  Established mounts are unaffected: the client holds an authenticated file
-  handle, handles are keyed on the file id under a key rotation does not
-  touch, and only a *new* traversal of the gate needs the current token.
+  the gate the moment the mount returns, but a local process can use a scraped
+  value before then and retain the authenticated file handle after rotation.
+  Established mounts are unaffected because handles are keyed on the file id,
+  which a key rotation does not touch; only a *new* traversal of the gate needs
+  the current token.
 
 **Decision.** This is sufficient to keep an unprivileged local account out by
 default, and it is *not* sufficient to survive disclosure of the token. An
 attacker can still find the port, learn the export path, and mount the gate —
 they arrive at an empty directory and must produce 128 bits to go further.
 There is no second factor behind the token: NFSv3 `AUTH_UNIX` authenticates
-nothing. Mount therefore remains **opt-in and off by default**; `afsMount`
-advertises a backend only where these mitigations are active.
+nothing. Mount therefore remains **disabled**; `afsMount` advertises no backend
+until the export credential can reach the mount client without a disclosure
+window.
 
 > **Invariant: the export token is never logged, printed, or displayed.**
 > Token secrecy is the entire access-control boundary, so anything that
