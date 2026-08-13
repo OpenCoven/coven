@@ -30,6 +30,7 @@ mod engine;
 mod engine_install;
 mod eval_loop;
 mod event_writer;
+mod execution_binding;
 mod executor_node;
 mod familiar_identity;
 mod handoff;
