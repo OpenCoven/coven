@@ -83,6 +83,12 @@ pub struct SessionRecord {
     /// only persists what the launcher explicitly passed in.
     #[serde(default)]
     pub familiar_id: Option<String>,
+    /// Immutable `psyche.execution_binding.v1` identity bound at session
+    /// creation (see `execution_binding`). `None` for sessions launched
+    /// outside Psyche delegation. Coven never mutates this once set — there
+    /// is deliberately no update path for this column.
+    #[serde(default)]
+    pub execution_binding: Option<crate::execution_binding::ExecutionBinding>,
     #[serde(default)]
     pub labels: Vec<String>,
     #[serde(default = "default_visibility")]
@@ -535,6 +541,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             labels TEXT,
             visibility TEXT NOT NULL DEFAULT 'private',
             familiar_id TEXT,
+            execution_binding_json TEXT,
             external INTEGER NOT NULL DEFAULT 0,
             transcript_path TEXT
         );
@@ -807,6 +814,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     ensure_labels_column(conn)?;
     ensure_visibility_column(conn)?;
     ensure_familiar_id_column(conn)?;
+    ensure_execution_binding_column(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
     ensure_session_external_columns(conn)?;
 
@@ -1153,6 +1161,18 @@ fn ensure_familiar_id_column(conn: &Connection) -> Result<()> {
     )
     .context("failed to create sessions.familiar_id index")?;
     Ok(())
+}
+
+/// The Psyche execution binding is a single immutable value bound at launch:
+/// no separate table, no update path, just a nullable column carrying the
+/// serialized `psyche.execution_binding.v1` tuple.
+fn ensure_execution_binding_column(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "sessions",
+        "execution_binding_json",
+        "ALTER TABLE sessions ADD COLUMN execution_binding_json TEXT",
+    )
 }
 
 /// Stores created at the initial node_registry schema (#266) predate the
@@ -1994,12 +2014,18 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
     } else {
         Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
     };
+    let execution_binding_json: Option<String> = record
+        .execution_binding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize session execution binding")?;
     conn.execute(
         "INSERT INTO sessions (
             id, project_root, harness, title, status, exit_code, archived_at,
             created_at, updated_at, conversation_id, labels, visibility, familiar_id,
-            external, transcript_path
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            external, transcript_path, execution_binding_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             &record.id,
             &record.project_root,
@@ -2016,6 +2042,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.familiar_id,
             record.external as i32,
             &record.transcript_path,
+            execution_binding_json,
         ],
     )
     .with_context(|| format!("failed to insert session {}", record.id))?;
@@ -2029,13 +2056,19 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
     } else {
         Some(serde_json::to_string(&record.labels).context("failed to serialize session labels")?)
     };
+    let execution_binding_json: Option<String> = record
+        .execution_binding
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .context("failed to serialize session execution binding")?;
     let affected = conn
         .execute(
             "INSERT OR IGNORE INTO sessions (
                 id, project_root, harness, title, status, exit_code, archived_at,
                 created_at, updated_at, conversation_id, labels, visibility, familiar_id,
-                external, transcript_path
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                external, transcript_path, execution_binding_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 &record.id,
                 &record.project_root,
@@ -2052,6 +2085,7 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.familiar_id,
                 record.external as i32,
                 &record.transcript_path,
+                execution_binding_json,
             ],
         )
         .with_context(|| format!("failed to upsert session {}", record.id))?;
@@ -2355,7 +2389,21 @@ const SESSION_COLUMNS: &str = "id,
                 visibility,
                 familiar_id,
                 external,
-                transcript_path";
+                transcript_path,
+                execution_binding_json";
+
+/// Deserializes and fully validates a non-null stored `execution_binding_json`
+/// value. Never returns a partially-trusted binding: invalid JSON, an
+/// unsupported contract, or an invalid digest/shape are all reported as a
+/// conversion failure rather than silently collapsing to `None`. Deliberately
+/// does not recheck expiry — that is a launch-time/read-time policy decision
+/// for callers, not a store invariant.
+fn parse_stored_execution_binding(
+    raw: &str,
+) -> Result<crate::execution_binding::ExecutionBinding, Box<dyn std::error::Error + Send + Sync>> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    crate::execution_binding::parse(&value).map_err(|err| Box::new(err) as _)
+}
 
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let labels_str: Option<String> = row.get(10)?;
@@ -2373,6 +2421,14 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         .unwrap_or_default();
     let visibility: String = row.get(11)?;
     let external_int: i32 = row.get(13)?;
+    let execution_binding_json: Option<String> = row.get(15)?;
+    let execution_binding = execution_binding_json
+        .as_deref()
+        .map(parse_stored_execution_binding)
+        .transpose()
+        .map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, err)
+        })?;
     Ok(SessionRecord {
         id: row.get(0)?,
         project_root: row.get(1)?,
@@ -2385,6 +2441,7 @@ fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionR
         updated_at: row.get(8)?,
         conversation_id: row.get(9)?,
         familiar_id: row.get(12)?,
+        execution_binding,
         labels,
         visibility,
         external: external_int != 0,
@@ -6719,6 +6776,7 @@ END;
             updated_at: created_at.to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -7157,6 +7215,7 @@ END;
             updated_at: "2026-07-12T10:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: true,
@@ -7177,6 +7236,7 @@ END;
             updated_at: "2026-07-12T10:01:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -7217,6 +7277,345 @@ END;
         assert!(ext_in_list.transcript_path.is_some());
         assert!(int_in_list.transcript_path.is_none());
 
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------------
+    // execution_binding_json tests (Task 2, #728)
+    // -------------------------------------------------------------------------
+
+    fn digest_fixture(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    /// A single canonical valid binding, reused across round-trip tests so
+    /// raw-byte comparisons stay stable.
+    fn execution_binding_fixture() -> crate::execution_binding::ExecutionBinding {
+        crate::execution_binding::ExecutionBinding {
+            contract: crate::execution_binding::CONTRACT.to_string(),
+            principal_ref: "principal:operator".to_string(),
+            familiar_id: "sage".to_string(),
+            familiar_snapshot_digest: digest_fixture('a'),
+            project_digest: digest_fixture('b'),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            request_digest: digest_fixture('c'),
+            policy_revision: "policy:7".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            parent: None,
+            delegation_digest: None,
+        }
+    }
+
+    #[test]
+    fn execution_binding_fresh_schema_has_column() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let cols = table_columns(&conn, "sessions")?;
+        assert!(
+            cols.iter().any(|c| c == "execution_binding_json"),
+            "sessions.execution_binding_json column missing; cols={cols:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_legacy_migration_defaults_null() -> Result<()> {
+        // Simulate a pre-feature store that predates the execution_binding_json
+        // column (same shape used by legacy_db_without_familiar_id_column_migrates_in_place).
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy.sqlite3");
+        {
+            let legacy = Connection::open(&path)?;
+            legacy.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                INSERT INTO sessions(id, project_root, harness, title, status, created_at, updated_at)
+                  VALUES ('legacy-1', '/tmp', 'codex', 'old', 'completed', '2026-01-01', '2026-01-01');",
+            )?;
+        }
+        let conn = open_store(&path)?;
+        let cols = table_columns(&conn, "sessions")?;
+        assert!(cols.iter().any(|c| c == "execution_binding_json"));
+        let raw: Option<String> = conn.query_row(
+            "SELECT execution_binding_json FROM sessions WHERE id='legacy-1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(raw, None);
+        let migrated = get_session(&conn, "legacy-1")?.expect("legacy row should still read back");
+        assert_eq!(migrated.execution_binding, None);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_round_trips_through_insert_get_list_and_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let mut bound = session_record("bound", "2026-06-03T00:00:00Z");
+        bound.execution_binding = Some(execution_binding_fixture());
+        let unbound = session_record("unbound", "2026-06-03T00:00:01Z");
+        {
+            let conn = open_store(&path)?;
+            insert_session(&conn, &bound)?;
+            insert_session(&conn, &unbound)?;
+
+            let got_bound = get_session(&conn, "bound")?.expect("bound session exists");
+            assert_eq!(
+                got_bound.execution_binding,
+                Some(execution_binding_fixture())
+            );
+            let got_unbound = get_session(&conn, "unbound")?.expect("unbound session exists");
+            assert_eq!(got_unbound.execution_binding, None);
+
+            let listed = list_sessions(&conn)?;
+            let listed_bound = listed.iter().find(|s| s.id == "bound").unwrap();
+            let listed_unbound = listed.iter().find(|s| s.id == "unbound").unwrap();
+            assert_eq!(
+                listed_bound.execution_binding,
+                Some(execution_binding_fixture())
+            );
+            assert_eq!(listed_unbound.execution_binding, None);
+        }
+        // Reopen the store from disk — the typed value must round-trip
+        // through a fresh connection, not just survive in-process.
+        {
+            let conn = open_store(&path)?;
+            let reopened = get_session(&conn, "bound")?.expect("bound session exists after reopen");
+            assert_eq!(
+                reopened.execution_binding,
+                Some(execution_binding_fixture())
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_raw_json_is_byte_identical_across_reopen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let mut bound = session_record("bound", "2026-06-03T00:00:00Z");
+        bound.execution_binding = Some(execution_binding_fixture());
+        let before = {
+            let conn = open_store(&path)?;
+            insert_session(&conn, &bound)?;
+            conn.query_row(
+                "SELECT execution_binding_json FROM sessions WHERE id='bound'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?
+        };
+        let after = {
+            let conn = open_store(&path)?;
+            conn.query_row(
+                "SELECT execution_binding_json FROM sessions WHERE id='bound'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?
+        };
+        assert_eq!(
+            before, after,
+            "raw stored JSON must be byte-identical across reopen"
+        );
+        assert_eq!(
+            before,
+            serde_json::to_string(&execution_binding_fixture()).unwrap()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_invalid_json_stored_text_is_a_store_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("s1", "2026-06-03T00:00:00Z"))?;
+        conn.execute(
+            "UPDATE sessions SET execution_binding_json = ?1 WHERE id = 's1'",
+            params!["{not valid json"],
+        )?;
+        let error = get_session(&conn, "s1").expect_err("invalid JSON must be a store error");
+        assert!(
+            error.to_string().to_lowercase().contains("session"),
+            "unexpected error: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_unsupported_contract_stored_text_is_a_store_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("s1", "2026-06-03T00:00:00Z"))?;
+        let mut binding = execution_binding_fixture();
+        binding.contract = "psyche.execution_binding.v0".to_string();
+        let raw = serde_json::to_string(&binding).unwrap();
+        conn.execute(
+            "UPDATE sessions SET execution_binding_json = ?1 WHERE id = 's1'",
+            params![raw],
+        )?;
+        let result = get_session(&conn, "s1");
+        assert!(
+            result.is_err(),
+            "unsupported contract stored text must be a store error, got: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_invalid_digest_stored_text_is_a_store_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("s1", "2026-06-03T00:00:00Z"))?;
+        let mut binding = execution_binding_fixture();
+        binding.project_digest = "not-a-digest".to_string();
+        let raw = serde_json::to_string(&binding).unwrap();
+        conn.execute(
+            "UPDATE sessions SET execution_binding_json = ?1 WHERE id = 's1'",
+            params![raw],
+        )?;
+        let result = get_session(&conn, "s1");
+        assert!(
+            result.is_err(),
+            "invalid digest shape stored text must be a store error, got: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_invalid_shape_stored_text_is_a_store_error() -> Result<()> {
+        // A syntactically valid JSON object that is missing required
+        // executionBinding members must still be rejected, never silently
+        // treated as None.
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        insert_session(&conn, &session_record("s1", "2026-06-03T00:00:00Z"))?;
+        conn.execute(
+            "UPDATE sessions SET execution_binding_json = ?1 WHERE id = 's1'",
+            params![
+                serde_json::json!({ "contract": crate::execution_binding::CONTRACT }).to_string()
+            ],
+        )?;
+        let result = get_session(&conn, "s1");
+        assert!(
+            result.is_err(),
+            "shape violation stored text must be a store error, got: {result:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_unbound_session_serializes_execution_binding_null() -> Result<()> {
+        let record = session_record("s1", "2026-06-03T00:00:00Z");
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["execution_binding"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_bound_session_serializes_full_typed_object() -> Result<()> {
+        let mut record = session_record("s1", "2026-06-03T00:00:00Z");
+        record.execution_binding = Some(execution_binding_fixture());
+        let value = serde_json::to_value(&record).unwrap();
+        let binding = &value["execution_binding"];
+        assert_eq!(binding["contract"], crate::execution_binding::CONTRACT);
+        assert_eq!(binding["familiarId"], "sage");
+        assert_eq!(binding["projectDigest"], digest_fixture('b'));
+        assert_eq!(binding["parent"], serde_json::Value::Null);
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_two_sessions_with_identical_bindings_both_insert() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let mut first = session_record("s1", "2026-06-03T00:00:00Z");
+        first.execution_binding = Some(execution_binding_fixture());
+        let mut second = session_record("s2", "2026-06-03T00:00:01Z");
+        second.execution_binding = Some(execution_binding_fixture());
+        insert_session(&conn, &first)?;
+        insert_session(&conn, &second)?;
+
+        let got_first = get_session(&conn, "s1")?.expect("first session exists");
+        let got_second = get_session(&conn, "s2")?.expect("second session exists");
+        assert_eq!(
+            got_first.execution_binding,
+            Some(execution_binding_fixture())
+        );
+        assert_eq!(
+            got_second.execution_binding,
+            Some(execution_binding_fixture())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_survives_status_and_archive_updates_unchanged() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let mut bound = session_record("s1", "2026-06-03T00:00:00Z");
+        bound.execution_binding = Some(execution_binding_fixture());
+        insert_session(&conn, &bound)?;
+        let raw_before: String = conn.query_row(
+            "SELECT execution_binding_json FROM sessions WHERE id='s1'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        update_session_status(&conn, "s1", "completed", Some(0), "2026-06-03T00:01:00Z")?;
+        archive_session(&conn, "s1", "2026-06-03T00:02:00Z")?;
+        summon_session(&conn, "s1", "2026-06-03T00:03:00Z")?;
+
+        let raw_after: String = conn.query_row(
+            "SELECT execution_binding_json FROM sessions WHERE id='s1'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            raw_before, raw_after,
+            "normal status/archive updates must not touch the binding bytes"
+        );
+        let reread = get_session(&conn, "s1")?.expect("session still exists");
+        assert_eq!(reread.execution_binding, Some(execution_binding_fixture()));
+        Ok(())
+    }
+
+    #[test]
+    fn execution_binding_insert_if_absent_persists_binding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let mut bound = session_record("s1", "2026-06-03T00:00:00Z");
+        bound.execution_binding = Some(execution_binding_fixture());
+
+        let inserted = insert_session_if_absent(&conn, &bound)?;
+        assert!(
+            inserted,
+            "first insert_session_if_absent call should insert"
+        );
+        let got = get_session(&conn, "s1")?.expect("session exists");
+        assert_eq!(got.execution_binding, Some(execution_binding_fixture()));
+
+        // A second call with a different binding must be ignored (row already
+        // exists), proving the original stored bytes are untouched.
+        let mut other = bound.clone();
+        other.execution_binding = None;
+        let inserted_again = insert_session_if_absent(&conn, &other)?;
+        assert!(
+            !inserted_again,
+            "row already exists; insert must be ignored"
+        );
+        let still_bound = get_session(&conn, "s1")?.expect("session exists");
+        assert_eq!(
+            still_bound.execution_binding,
+            Some(execution_binding_fixture())
+        );
         Ok(())
     }
 

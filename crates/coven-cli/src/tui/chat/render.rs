@@ -1722,6 +1722,7 @@ mod tests {
             updated_at: "2026-05-24T00:00:00Z".to_string(),
             conversation_id: conversation.map(ToOwned::to_owned),
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
