@@ -545,39 +545,41 @@ mod tests {
 
     #[test]
     fn rejects_opaque_out_of_bounds_lengths() {
-        for field in [
-            "principalRef",
-            "familiarId",
-            "graphId",
-            "nodeId",
-            "attemptId",
-            "policyRevision",
+        for (field, path) in [
+            ("principalRef", "executionBinding.principalRef"),
+            ("familiarId", "executionBinding.familiarId"),
+            ("graphId", "executionBinding.graphId"),
+            ("nodeId", "executionBinding.nodeId"),
+            ("attemptId", "executionBinding.attemptId"),
+            ("policyRevision", "executionBinding.policyRevision"),
         ] {
             let mut value = root_value();
             value[field] = json!("");
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                "empty {field} should be rejected"
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid { path }),
+                "empty {field} should be rejected at {path}"
             );
 
             let mut value = root_value();
             value[field] = json!("x".repeat(256));
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                "256-byte {field} should be rejected"
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid { path }),
+                "256-byte {field} should be rejected at {path}"
             );
         }
     }
 
     #[test]
     fn rejects_opaque_values_with_disallowed_characters() {
-        for field in [
-            "principalRef",
-            "familiarId",
-            "graphId",
-            "nodeId",
-            "attemptId",
-            "policyRevision",
+        for (field, path) in [
+            ("principalRef", "executionBinding.principalRef"),
+            ("familiarId", "executionBinding.familiarId"),
+            ("graphId", "executionBinding.graphId"),
+            ("nodeId", "executionBinding.nodeId"),
+            ("attemptId", "executionBinding.attemptId"),
+            ("policyRevision", "executionBinding.policyRevision"),
         ] {
             for invalid in [
                 " leading",
@@ -588,9 +590,10 @@ mod tests {
             ] {
                 let mut value = root_value();
                 value[field] = json!(invalid);
-                assert!(
-                    matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                    "{field}={invalid:?} should be rejected"
+                assert_eq!(
+                    parse(&value),
+                    Err(ValidationError::Invalid { path }),
+                    "{field}={invalid:?} should be rejected at {path}"
                 );
             }
         }
@@ -605,23 +608,30 @@ mod tests {
 
     #[test]
     fn rejects_opaque_parent_fields_out_of_bounds_and_disallowed() {
-        for field in ["sessionId", "graphId", "nodeId", "attemptId"] {
+        for (field, path) in [
+            ("sessionId", "executionBinding.parent.sessionId"),
+            ("graphId", "executionBinding.parent.graphId"),
+            ("nodeId", "executionBinding.parent.nodeId"),
+            ("attemptId", "executionBinding.parent.attemptId"),
+        ] {
             let mut value = root_value();
             let mut parent = parent_value();
             parent[field] = json!("");
             value["parent"] = parent;
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                "empty parent.{field} should be rejected"
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid { path }),
+                "empty parent.{field} should be rejected at {path}"
             );
 
             let mut value = root_value();
             let mut parent = parent_value();
             parent[field] = json!("bad space");
             value["parent"] = parent;
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                "parent.{field} with disallowed character should be rejected"
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid { path }),
+                "parent.{field} with disallowed character should be rejected at {path}"
             );
         }
     }
@@ -655,13 +665,21 @@ mod tests {
             "a".repeat(71),                       // missing prefix entirely
         ];
 
-        for field in ["familiarSnapshotDigest", "projectDigest", "requestDigest"] {
+        for (field, path) in [
+            (
+                "familiarSnapshotDigest",
+                "executionBinding.familiarSnapshotDigest",
+            ),
+            ("projectDigest", "executionBinding.projectDigest"),
+            ("requestDigest", "executionBinding.requestDigest"),
+        ] {
             for invalid in &malformed {
                 let mut value = root_value();
                 value[field] = json!(invalid);
-                assert!(
-                    matches!(parse(&value), Err(ValidationError::Invalid { .. })),
-                    "{field}={invalid:?} should be rejected"
+                assert_eq!(
+                    parse(&value),
+                    Err(ValidationError::Invalid { path }),
+                    "{field}={invalid:?} should be rejected at {path}"
                 );
             }
         }
@@ -669,8 +687,11 @@ mod tests {
         for invalid in &malformed {
             let mut value = child_value();
             value["delegationDigest"] = json!(invalid);
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid {
+                    path: "executionBinding.delegationDigest"
+                }),
                 "delegationDigest={invalid:?} should be rejected"
             );
         }
@@ -681,13 +702,18 @@ mod tests {
         // delegationDigest is nullable at the value level (null is valid)...
         assert!(parse(&root_value()).is_ok());
 
-        // ...but the required digests must be strings, not null.
+        // ...but the required digests must be strings, not null. Type
+        // coercion fails during Serde deserialization itself (before
+        // per-field syntax checks run), so the reported path is the whole
+        // `executionBinding` object rather than the specific field.
         let mut value = root_value();
         value["familiarSnapshotDigest"] = json!(null);
-        assert!(matches!(
+        assert_eq!(
             parse(&value),
-            Err(ValidationError::Invalid { .. })
-        ));
+            Err(ValidationError::Invalid {
+                path: "executionBinding"
+            })
+        );
     }
 
     // --- Expiry syntax and elapsed boundary ---------------------------------
@@ -705,8 +731,11 @@ mod tests {
         ] {
             let mut value = root_value();
             value["expiresAt"] = json!(invalid);
-            assert!(
-                matches!(parse(&value), Err(ValidationError::Invalid { .. })),
+            assert_eq!(
+                parse(&value),
+                Err(ValidationError::Invalid {
+                    path: "executionBinding.expiresAt"
+                }),
                 "expiresAt={invalid:?} should be rejected"
             );
         }
