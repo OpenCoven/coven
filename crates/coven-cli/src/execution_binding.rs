@@ -68,10 +68,6 @@ pub struct ExecutionBinding {
 /// A shape, syntax, version, or expiry violation. Carries only a static
 /// field path — never the offending value — so it can propagate through
 /// error responses without leaking request contents.
-// `Expired` is only constructed by `validate_not_expired`, which the O2
-// bound input/kill enforcement work (issue #728 Task 3/4) will call; this
-// task's read path deliberately never rechecks expiry.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValidationError {
     Missing { path: &'static str },
@@ -238,10 +234,8 @@ impl ExecutionBinding {
     }
 
     /// Errors with `Expired` when `expiresAt` is less than or equal to
-    /// `now` (elapsed is inclusive of the boundary instant).
-    // Consumed by the O2 bound input/kill enforcement work (issue #728
-    // Task 3/4). This task's read path deliberately never rechecks expiry.
-    #[allow(dead_code)]
+    /// `now` (elapsed is inclusive of the boundary instant). Called by the
+    /// launch route (issue #728 Task 3) and the bound input route (Task 4).
     pub fn validate_not_expired(&self, now: DateTime<Utc>) -> Result<(), ValidationError> {
         let expires_at = parse_expiry(&self.expires_at).ok_or(ValidationError::Invalid {
             path: "executionBinding.expiresAt",
@@ -259,7 +253,10 @@ impl ExecutionBinding {
     /// top-level fields, then nested `parent` fields, then
     /// `delegationDigest` last. `None` when every field matches exactly.
     // Consumed by the O2 bound input/kill exact-proof enforcement (issue
-    // #728 Task 3/4), not by this task's persistence work.
+    // #728 Task 4), not by this task's launch-correlation work: launch
+    // correlation (Task 3) compares individual stored parent fields against
+    // individual submitted `parent` fields, not two complete
+    // `ExecutionBinding` values, so it does not call this helper.
     #[allow(dead_code)]
     pub fn first_mismatch_path(&self, supplied: &Self) -> Option<&'static str> {
         let top_level = [
