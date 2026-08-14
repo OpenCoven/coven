@@ -1,7 +1,7 @@
 [
   {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "project_root": "/home/user/myproject",
+    "project_root": "/tmp/coven-test/myproject",
     "harness": "codex",
     "title": "Implement authentication",
     "status": "completed",
@@ -13,7 +13,7 @@
   },
   {
     "id": "550e8400-e29b-41d4-a716-446655440001",
-    "project_root": "/home/user/myproject",
+    "project_root": "/tmp/coven-test/myproject",
     "harness": "claude",
     "title": "Fix failing tests",
     "status": "running",
