@@ -2028,39 +2028,35 @@ fn launch_session(
         }
         if let Some(parent) = binding.parent.as_ref() {
             let conn = store::open_store(&store_path(coven_home))?;
-            let Some(parent_session) = store::get_session(&conn, &parent.session_id)? else {
-                return api_error(
-                    404,
-                    "session_not_found",
-                    "Session was not found.",
-                    Some(json!({ "fields": ["parent.sessionId"] })),
-                );
-            };
-            let Some(parent_binding) = parent_session.execution_binding.as_ref() else {
-                return execution_binding_mismatch("parent.sessionId");
-            };
-            // §2.4: correlate against the referenced parent's own
-            // `SessionRecord.familiar_id` — the canonical id Coven actually
-            // persisted for that session — never against the parent
-            // binding's internal `executionBinding.familiarId`, which is an
-            // independent, Psyche-opaque value that may legitimately differ.
+            // Advisory pre-gate check, preserving the approved external
+            // precedence (§5.1): fail fast on an already-invalid parent
+            // reference before ever taking the maintenance gate. This is
+            // *not* the authoritative check — a concurrent writer can still
+            // sacrifice/delete `parent` between here and the maintenance
+            // gate below, which is why the identical correlation runs again,
+            // atomically with the child insert, inside a transaction after
+            // the gate is acquired (see the `record.execution_binding`
+            // revalidation near the insert below).
             // `validate_binding_relationship` already required
             // `raw_caller_familiar_id` to be an exact, present string for a
-            // child binding, so this is never the `Absent`/`Invalid` case.
-            let caller_familiar_id = raw_caller_familiar_id.as_str();
-            if parent_session.familiar_id.as_deref() != caller_familiar_id {
-                return execution_binding_mismatch("callerFamiliarId");
-            }
-            if parent_binding.graph_id != parent.graph_id {
-                return execution_binding_mismatch("parent.graphId");
-            }
-            if parent_binding.node_id != parent.node_id {
-                return execution_binding_mismatch("parent.nodeId");
-            }
-            if parent_binding.attempt_id != parent.attempt_id {
-                return execution_binding_mismatch("parent.attemptId");
+            // child binding, so `as_str()` is never the `Absent`/`Invalid`
+            // case here.
+            if let Err(response) =
+                correlate_child_parent(&conn, parent, raw_caller_familiar_id.as_str())?
+            {
+                return Ok(response);
             }
             opened_conn = Some(conn);
+            // Test-only failpoint (issue #728 BLOCKER 1, final review): a
+            // no-op in every non-test build. Deterministic concurrency tests
+            // hook this to run a real concurrent write — e.g. sacrificing
+            // this exact parent through a second connection — landing
+            // precisely in the window this blocker closes: "between initial
+            // validation and final insertion". See the in-transaction
+            // revalidation immediately before the child insert below, which
+            // is what actually protects against that window, not this
+            // advisory check.
+            parent_correlation_advisory_check_completed_failpoint();
         }
     }
     let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
@@ -2108,12 +2104,43 @@ fn launch_session(
     });
     // Reuse the connection opened for a child binding's parent lookup, if
     // any; otherwise open (and thereby initialize) the store only now, after
-    // the maintenance gate has already admitted this launch.
-    let conn = match opened_conn {
+    // the maintenance gate has already admitted this launch. Root/unbound
+    // launches take the `None` arm here and below, preserving the existing
+    // maintenance-before-store-open precedence unchanged: no parent to
+    // revalidate means no reason to pay for a transaction.
+    let mut conn = match opened_conn {
         Some(conn) => conn,
         None => store::open_store(&store_path(coven_home))?,
     };
-    store::insert_session(&conn, &record)?;
+    match record
+        .execution_binding
+        .as_ref()
+        .and_then(|binding| binding.parent.as_ref())
+    {
+        Some(parent) => {
+            // BLOCKER 1 (#728 final review): the pre-gate correlation above
+            // is advisory only — a concurrent writer can sacrifice/delete
+            // `parent`'s session between that check and this insert. Re-read
+            // and revalidate it here, inside a SQLite IMMEDIATE transaction
+            // on the very connection that performs the insert, and commit
+            // both together. That makes final parent validation and child
+            // admission a single atomic unit against concurrent writers,
+            // with no persistent FK/uniqueness constraint added to the
+            // schema.
+            let caller_familiar_id = raw_caller_familiar_id.as_str();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Err(response) = correlate_child_parent(&tx, parent, caller_familiar_id)? {
+                // Dropping `tx` without calling `commit()` rolls it back:
+                // no child row is ever inserted on a revalidation failure.
+                return Ok(response);
+            }
+            store::insert_session(&tx, &record)?;
+            tx.commit()?;
+        }
+        None => {
+            store::insert_session(&conn, &record)?;
+        }
+    }
     if let Err(error) = match writer {
         Some(writer) => runtime.launch_session_with_writer(&launch, writer),
         None => runtime.launch_session(&launch),
@@ -2200,6 +2227,83 @@ fn execution_binding_mismatch(path: &'static str) -> Result<ApiResponse> {
         Some(json!({ "fields": [path] })),
     )
 }
+
+/// Correlates a child binding's `parent.*` fields against the session
+/// referenced by `parent.session_id` (issue #728 Task 3, §2.4), reading
+/// through `conn` — a plain connection for the advisory pre-gate check, or a
+/// SQLite IMMEDIATE transaction for the authoritative revalidation performed
+/// immediately before the child row is inserted (BLOCKER 1, final review).
+/// Both call sites in `launch_session` share this single implementation so
+/// the rules, error codes, and field paths cannot drift between them.
+///
+/// Correlates against the referenced parent's own `SessionRecord.familiar_id`
+/// — the canonical id Coven actually persisted for that session — never
+/// against the parent binding's internal `executionBinding.familiarId`,
+/// which is an independent, Psyche-opaque value that may legitimately
+/// differ. `caller_familiar_id` must already be an exact, present string for
+/// a child binding (`validate_binding_relationship` enforces this before
+/// either call site runs), so a `None` here can only ever fail correlation,
+/// never bypass it.
+///
+/// Returns `Ok(Err(response))` — never a bare `Err` — for every correlation
+/// failure, so a caller can propagate the exact structured API response
+/// without constructing it twice or leaking the parent/caller values it
+/// deliberately omits from every response body.
+fn correlate_child_parent(
+    conn: &rusqlite::Connection,
+    parent: &crate::execution_binding::ExecutionBindingParent,
+    caller_familiar_id: Option<&str>,
+) -> Result<std::result::Result<(), ApiResponse>> {
+    let Some(parent_session) = store::get_session(conn, &parent.session_id)? else {
+        return Ok(Err(api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "fields": ["parent.sessionId"] })),
+        )?));
+    };
+    let Some(parent_binding) = parent_session.execution_binding.as_ref() else {
+        return Ok(Err(execution_binding_mismatch("parent.sessionId")?));
+    };
+    if parent_session.familiar_id.as_deref() != caller_familiar_id {
+        return Ok(Err(execution_binding_mismatch("callerFamiliarId")?));
+    }
+    if parent_binding.graph_id != parent.graph_id {
+        return Ok(Err(execution_binding_mismatch("parent.graphId")?));
+    }
+    if parent_binding.node_id != parent.node_id {
+        return Ok(Err(execution_binding_mismatch("parent.nodeId")?));
+    }
+    if parent_binding.attempt_id != parent.attempt_id {
+        return Ok(Err(execution_binding_mismatch("parent.attemptId")?));
+    }
+    Ok(Ok(()))
+}
+
+/// Test-only failpoint fired immediately after the advisory pre-gate parent
+/// correlation succeeds for a child binding (issue #728 BLOCKER 1, final
+/// review). Compiles to a genuine no-op in every non-test build — see the
+/// `#[cfg(not(test))]` sibling below — so it costs nothing and changes
+/// nothing outside `cargo test`. Deterministic concurrency tests install a
+/// hook (via `tests::ParentCorrelationFailpointGuard`) that performs a real
+/// concurrent write, such as sacrificing the just-validated parent through a
+/// second connection, at exactly this point: the window between the initial
+/// (pre-gate) validation and the final (in-transaction) insertion. This lets
+/// a test prove the in-transaction revalidation below — not this advisory
+/// check — is what actually protects the insert, without any sleep or
+/// timing guess.
+#[cfg(test)]
+fn parent_correlation_advisory_check_completed_failpoint() {
+    tests::PARENT_CORRELATION_FAILPOINT.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().as_mut() {
+            callback();
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn parent_correlation_advisory_check_completed_failpoint() {}
 
 /// A bound-mutation proof failure (issue #728 Task 4, §4). Distinct from
 /// [`crate::execution_binding::ValidationError`] because an absent
@@ -7589,6 +7693,34 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Backing storage for the parent-correlation failpoint (issue #728
+        /// BLOCKER 1, final review). Thread-local so parallel `cargo test`
+        /// threads never see each other's installed hook, and each test
+        /// starts with `None` — the failpoint call in `launch_session` is a
+        /// silent no-op for every test that never installs one.
+        pub(super) static PARENT_CORRELATION_FAILPOINT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// RAII installer for [`PARENT_CORRELATION_FAILPOINT`]. Clears the hook
+    /// on drop (including on test panic/unwind) so one test's failpoint can
+    /// never leak into another that happens to reuse the same test thread.
+    struct ParentCorrelationFailpointGuard;
+
+    impl ParentCorrelationFailpointGuard {
+        fn install(hook: impl FnMut() + 'static) -> Self {
+            PARENT_CORRELATION_FAILPOINT.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for ParentCorrelationFailpointGuard {
+        fn drop(&mut self) {
+            PARENT_CORRELATION_FAILPOINT.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
     fn afs_project(dir: &Path) -> String {
         let root = dir.join("project");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -11196,6 +11328,190 @@ mod tests {
             &["parent.attemptId"],
         )?;
         assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    // -- Atomic parent correlation across concurrent writers (issue #728 --
+    // -- BLOCKER 1, final review) ------------------------------------------
+
+    /// Store/helper-level proof that the `correlate_child_parent` +
+    /// child-insert sequence `launch_session` runs after the maintenance
+    /// gate is a genuinely atomic unit against a concurrent writer, not just
+    /// "the same connection performing two separate autocommit statements".
+    ///
+    /// Deterministic and sleep-free: a second, independent connection to the
+    /// same store file is configured with a zero busy timeout, so an attempt
+    /// to write while our `IMMEDIATE` transaction still holds the write lock
+    /// fails immediately with `SQLITE_BUSY` — proving the lock, not timing,
+    /// is what a concurrent sacrifice/delete would actually run into for the
+    /// whole span between revalidation and the child row's insert.
+    #[test]
+    fn child_parent_transaction_blocks_concurrent_parent_write_until_commit() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let path = store_path(temp_dir.path());
+        let mut conn = crate::store::open_store(&path)?;
+        let parent = crate::execution_binding::ExecutionBindingParent {
+            session_id: "parent-1".to_string(),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+        };
+
+        // Mirrors `launch_session`'s post-gate step exactly: an `IMMEDIATE`
+        // transaction on the connection that will also perform the insert.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert_eq!(
+            correlate_child_parent(&tx, &parent, Some("cody"))?,
+            Ok(()),
+            "parent is still valid at this point and must revalidate cleanly"
+        );
+
+        // A concurrent writer — standing in for a `sacrifice`/delete request
+        // handled on another connection — must not be able to touch
+        // `parent-1` while our transaction still holds the write lock.
+        let concurrent_writer = rusqlite::Connection::open(&path)?;
+        concurrent_writer.execute_batch("PRAGMA busy_timeout = 0;")?;
+        let concurrent_delete =
+            concurrent_writer.execute("DELETE FROM sessions WHERE id = 'parent-1'", []);
+        match concurrent_delete {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            other => panic!(
+                "a concurrent delete must be blocked (SQLITE_BUSY) while the child-insert \
+                 transaction holds the write lock, got: {other:?}"
+            ),
+        }
+
+        // Insert the child row inside the same transaction, exactly as
+        // `launch_session` does, then commit — releasing the write lock.
+        let child = test_child_session_record("child-1", "sage", &parent);
+        crate::store::insert_session(&tx, &child)?;
+        tx.commit()?;
+
+        // Only now can the concurrent writer proceed. The parent survived
+        // (our commit won the race) and the child is present too.
+        concurrent_writer
+            .execute("DELETE FROM sessions WHERE id = 'does-not-exist'", [])
+            .expect("write lock must be free once our transaction has committed");
+        let verify_conn = crate::store::open_store(&path)?;
+        assert!(store::get_session(&verify_conn, "parent-1")?.is_some());
+        assert!(store::get_session(&verify_conn, "child-1")?.is_some());
+        Ok(())
+    }
+
+    /// Builds a minimal bound `SessionRecord` for a child session correlated
+    /// against `parent`, for tests that exercise `store::insert_session`
+    /// directly rather than through the full launch route.
+    fn test_child_session_record(
+        id: &str,
+        familiar_id: &str,
+        parent: &crate::execution_binding::ExecutionBindingParent,
+    ) -> crate::store::SessionRecord {
+        let now = current_timestamp();
+        crate::store::SessionRecord {
+            id: id.to_string(),
+            project_root: "/repo".to_string(),
+            harness: "codex".to_string(),
+            title: "child session".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            conversation_id: None,
+            familiar_id: Some(familiar_id.to_string()),
+            execution_binding: Some(crate::execution_binding::ExecutionBinding {
+                contract: crate::execution_binding::CONTRACT.to_string(),
+                principal_ref: "principal:operator".to_string(),
+                familiar_id: familiar_id.to_string(),
+                familiar_snapshot_digest: digest('a'),
+                project_digest: digest('b'),
+                graph_id: "graph-2".to_string(),
+                node_id: "node-2".to_string(),
+                attempt_id: "attempt-2".to_string(),
+                request_digest: digest('d'),
+                policy_revision: "policy:7".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                parent: Some(parent.clone()),
+                delegation_digest: Some(digest('e')),
+            }),
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        }
+    }
+
+    /// Route-level regression: a concurrent parent sacrifice/delete landing
+    /// exactly between the advisory pre-gate correlation and the final,
+    /// in-transaction revalidation must never let the child through. Uses
+    /// the `parent_correlation_advisory_check_completed_failpoint` seam
+    /// (compiled out of every non-test build) to run a real delete, through
+    /// a genuinely separate connection, at precisely that window — no sleep,
+    /// no timing guess, and no reliance on the API test harness being able
+    /// to interleave two real OS threads against a single synchronous
+    /// request.
+    #[test]
+    fn child_launch_final_revalidation_catches_parent_sacrificed_after_initial_validation(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let path = store_path(temp_dir.path());
+        let _failpoint = ParentCorrelationFailpointGuard::install(move || {
+            // A real concurrent writer, on its own connection, sacrificing
+            // the parent that the advisory check just validated — the exact
+            // race BLOCKER 1 closes.
+            let conn = crate::store::open_store(&path).expect("open concurrent connection");
+            conn.execute("DELETE FROM sessions WHERE id = 'parent-1'", [])
+                .expect("concurrent parent delete");
+        });
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        // Caught by the in-transaction revalidation, which reports the
+        // parent exactly like a launch against an always-missing parent
+        // would (issue #728, §2.4) — same code, same field path.
+        assert_eq!(response.status, 404, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "session_not_found");
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({ "fields": ["parent.sessionId"] })
+        );
+        // The parent row was removed by the failpoint itself, and no child
+        // row was ever admitted: the store ends up with zero rows.
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
         Ok(())
     }
 
