@@ -1970,6 +1970,26 @@ fn launch_session(
                 Some(json!({ "fields": [field] })),
             );
         }
+        // Task 5 (#728): a bound launch must never accept a top-level
+        // `familiarId` that only matches after the legacy unbound-launch
+        // trim (§2.4, §3.1 no-normalization rule). Compare the raw,
+        // byte-exact payload value against the trimmed value
+        // `SessionLaunch.familiar_id` already holds (and that
+        // `resolve_familiar` below would otherwise silently accept); any
+        // difference — leading/trailing whitespace, or any other value
+        // that only normalizes into a match — is rejected as
+        // `execution_binding_invalid` naming `familiarId`, before
+        // resolution, the runtime, or the store. Unbound launches never
+        // take this branch and keep their existing trim/collapse-to-None
+        // behavior unchanged.
+        if raw_top_level_familiar_id(&payload) != launch.familiar_id.as_deref() {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Execution binding is invalid.",
+                Some(json!({ "fields": ["familiarId"] })),
+            );
+        }
     }
     let familiar_ctx =
         match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
@@ -2280,6 +2300,19 @@ fn raw_caller_familiar_id(payload: &Value) -> RawCallerFamiliarId<'_> {
         }
         Some(_) => RawCallerFamiliarId::Invalid,
     }
+}
+
+/// Reads the raw, byte-exact top-level `familiarId` launch field directly
+/// from the request payload, with no normalization applied — unlike
+/// `SessionLaunch.familiar_id`, which trims and collapses an empty/
+/// whitespace-only value to `None` for its legacy unbound-launch
+/// resolution purpose (and must keep doing so unchanged for unbound
+/// launches). A bound launch (§2.4, §3.1) compares this raw value against
+/// that trimmed one to reject any value that only matches after
+/// normalization. Returns `None` when the key is absent or is not a JSON
+/// string.
+fn raw_top_level_familiar_id(payload: &Value) -> Option<&str> {
+    payload.get("familiarId").and_then(Value::as_str)
 }
 
 /// Enforces the root/child cross-field rule (§2.4): a root binding requires
@@ -3073,16 +3106,26 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     };
-    // Metadata isolation (issue #728 Task 4, §4.4): once proof is verified,
-    // only `data` may reach writer capacity checks, the runtime, and the
-    // persisted event — `executionBinding` must never leak past this point
-    // on success. Unbound sessions never carry a proof, so their payload
-    // (already validated to contain nothing but what the caller sent) is
-    // used as-is, preserving old behavior entirely.
+    // Metadata isolation (issue #728 Task 4, §4.4): `executionBinding` is
+    // reserved proof metadata that must never reach writer capacity checks,
+    // the runtime, or the persisted event — on a bound session because it
+    // has already served its purpose (the exact-match proof above), and on
+    // an *unbound* session because the key is reserved regardless of
+    // whether a proof was ever required. An unbound session never runs the
+    // proof steps, so a malformed or incomplete `executionBinding` here is
+    // never validated or rejected — it is simply stripped, unvalidated,
+    // alongside a well-formed one. Every other field's shape and precedence
+    // is unaffected: this only ever removes the single reserved key,
+    // preserving the caller's exact payload (and legacy unbound behavior)
+    // otherwise.
     let action_payload = if is_bound {
         json!({ "data": data })
     } else {
-        payload.clone()
+        let mut sanitized = payload.clone();
+        if let Value::Object(fields) = &mut sanitized {
+            fields.remove("executionBinding");
+        }
+        sanitized
     };
     match runtime.can_record_session_event(session_id, "input", &action_payload) {
         Some(Ok(true)) | None => {}
@@ -10286,6 +10329,76 @@ mod tests {
             &["executionBinding.familiarId"],
         )?;
         assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_whitespace_padded_top_level_familiar_id() -> anyhow::Result<()> {
+        // Regression (issue #728 Task 6, finding 5): trimming " sage " to
+        // "sage" would resolve to, and byte-match, the canonical familiar id
+        // — but a bound launch must reject the raw padded value outright
+        // rather than silently normalizing it into a match, per the
+        // no-normalization rule (§3.1). This must fail before familiar
+        // resolution, the runtime, or the store are touched.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": " sage ",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(&response, 400, "execution_binding_invalid", &["familiarId"])?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_launch_still_trims_top_level_familiar_id() -> anyhow::Result<()> {
+        // Positive control paired with the regression above: legacy unbound
+        // launches must keep their existing trim/collapse behavior — this
+        // rule only applies to a bound launch.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": " sage ",
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["familiar_id"], "sage");
+        assert_eq!(runtime.launches.borrow().len(), 1);
         Ok(())
     }
 
@@ -19057,11 +19170,28 @@ tier = 0
             &["unbound-kill-body"],
             "an unbound session's kill body is never inspected, matching pre-O2 behavior"
         );
+        // Confirmation (issue #728 Task 6, finding 4): kill never parses the
+        // body for an unbound session at all, so there is no payload
+        // boundary to enforce — the persisted event keeps its pre-O2
+        // `{"status":"killed"}` shape regardless of what the caller sent.
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-kill-body")?;
+        let kill_event = events
+            .iter()
+            .find(|event| event.kind == "kill")
+            .expect("kill event should be persisted");
+        let payload: Value = serde_json::from_str(&kill_event.payload_json)?;
+        assert_eq!(payload, json!({ "status": "killed" }));
         Ok(())
     }
 
     #[test]
-    fn unbound_input_ignores_execution_binding_shaped_field() -> anyhow::Result<()> {
+    fn unbound_input_strips_reserved_execution_binding_field() -> anyhow::Result<()> {
+        // Regression (issue #728 Task 6, finding 4): `executionBinding` is
+        // reserved metadata even on an unbound session. It must never reach
+        // writer capacity checks, `SessionRuntime::send_input`, or the
+        // persisted input event — but every other field, and unbound
+        // input's existing precedence, is unaffected.
         let temp_dir = tempfile::tempdir()?;
         insert_test_session(temp_dir.path(), "unbound-input-body")?;
         let runtime = RecordingRuntime::default();
@@ -19077,13 +19207,86 @@ tier = 0
         )?;
 
         assert_eq!(response.status, 202, "{}", response.body);
-        // Unbound behavior is unchanged: no proof is required or stripped,
-        // so the caller's full payload (including the extraneous
-        // `executionBinding`) reaches the runtime exactly as it did before
-        // issue #728 Task 4.
         assert_eq!(
             runtime.input_payloads.borrow().as_slice(),
-            &[json!({ "data": "hello", "executionBinding": root_binding("sage") })]
+            &[json!({ "data": "hello" })],
+            "executionBinding must never reach SessionRuntime::send_input, even unbound"
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-input-body")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(
+            payload,
+            json!({ "data": "hello" }),
+            "executionBinding must never reach the persisted input event, even unbound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_strips_malformed_execution_binding_unvalidated() -> anyhow::Result<()> {
+        // An unbound session never runs proof validation (§4 precedence
+        // steps 2-4 are skipped entirely), so a syntactically malformed
+        // `executionBinding` here must not be checked or rejected — it is
+        // simply stripped, unvalidated, exactly like a well-formed one.
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-malformed")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": "not-an-object" }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-malformed/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })]
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-input-malformed")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(payload, json!({ "data": "hello" }));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_preserves_other_fields_and_precedence() -> anyhow::Result<()> {
+        // Positive control paired with the two regressions above: only the
+        // reserved `executionBinding` key is removed. Any other extraneous
+        // field the caller sends alongside `data` reaches the runtime and
+        // the persisted event unchanged, matching pre-O2 unbound behavior.
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-other-fields")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "unrelatedField": "kept" }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-other-fields/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello", "unrelatedField": "kept" })]
         );
         Ok(())
     }
