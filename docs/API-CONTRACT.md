@@ -937,11 +937,21 @@ For both routes:
   nothing to return, only nothing to prove. Coven defines correlation here,
   not authentication — read access is unchanged from today.
 
-Once the proof is required, an unbound session's input/kill precedence is
-completely unaffected: no proof check runs, and the existing status/liveness
-gate, body shape, and response are unchanged from before O2. Legacy unbound
-launches, inputs, and kills that never mention `executionBinding` behave
-identically to their pre-O2 shape.
+Once the proof is required, an unbound session's kill precedence and body
+handling are completely unaffected: no proof check runs, the body (if any)
+is never parsed, and the existing status/liveness gate and response are
+unchanged from before O2. An unbound session's input precedence is unaffected
+for every field except the now-reserved `executionBinding` key: no proof
+check runs, and every other field's existing status/liveness gate, body
+shape, and response are unchanged from before O2, but an `executionBinding`
+key present in the input body — even a malformed one, since no validation
+ever runs against it here — is always stripped before it reaches the writer,
+runtime, or persisted event; see [Metadata isolation](#metadata-isolation)
+below. Legacy unbound launches and kills that never mention
+`executionBinding` behave identically to their pre-O2 shape; legacy unbound
+input behaves identically too, unless the caller happens to send an
+`executionBinding` key, which is now silently removed rather than passed
+through unchanged.
 
 #### Operation precedence
 
@@ -983,8 +993,13 @@ apply and the remaining precedence is unchanged from today.
 6. The runtime action itself (deliver input, or send kill).
 
 For an unbound session, steps 2-4 are skipped entirely and existing
-precedence and behavior (steps 1, 5, 6) are unchanged. No runtime action
-occurs unless every required prior step succeeds.
+precedence (steps 1 and 5) is unchanged. Step 6 is unchanged for kill, whose
+body is never parsed for an unbound session; for input, step 6 is unchanged
+for every field except that a now-reserved `executionBinding` key, if
+present in the body, is always stripped before the runtime call and the
+persisted event, even though it is never validated — see
+[Metadata isolation](#metadata-isolation) below. No runtime action occurs
+unless every required prior step succeeds.
 
 #### Metadata isolation
 
@@ -992,15 +1007,26 @@ occurs unless every required prior step succeeds.
 never reaches the harness/runtime or a recorded event, on any code path,
 including error paths:
 
-- **Input:** only the existing `data` field reaches the session runtime's
-  input call; `executionBinding` is stripped from the parsed body first. The
-  persisted input event is built from `data` only — its pre-O2 shape,
-  containing no `executionBinding` key.
+- **Input, bound session:** only the existing `data` field reaches the
+  session runtime's input call; the exact-match proof above has already
+  served its purpose, so the full request body is discarded in favor of
+  `{"data": data}`. The persisted input event is likewise built from `data`
+  only — its pre-O2 shape, containing no `executionBinding` key.
+- **Input, unbound session:** every other field of the parsed body reaches
+  the session runtime's input call and the persisted input event exactly as
+  before O2 — legacy precedence and shape for those fields is unaffected.
+  The `executionBinding` key is the one exception: it is now reserved, so if
+  present it is always stripped from the body before the runtime call and
+  the persisted event, even though it is never parsed or validated on this
+  path (an unbound session never runs the proof steps). A malformed
+  `executionBinding` value is stripped the same as a well-formed one; it is
+  never a validation error here.
 - **Kill:** the binding proof exists solely to satisfy the exact-match and
   (non-)expiry checks above. It is never passed to the runtime's kill call,
   which continues to take only the session id, and the persisted kill event
   remains the pre-O2 shape — a bare `{"status": "killed"}` marker, no binding
-  fields.
+  fields. This holds for both bound and unbound sessions; an unbound kill's
+  body, if any, is never even parsed, so no stripping step applies there.
 
 ### Health negotiation
 
