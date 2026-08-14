@@ -430,7 +430,7 @@ const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" role
   </defs>
   <rect width="1200" height="630" fill="#000000"/>
   <circle cx="600" cy="300" r="292" fill="url(#glow)"/>
-  <g transform="translate(456 18) scale(0.14)">
+  <g transform="translate(426 19) scale(0.1701)">
     <path fill="#FFFFFF" shape-rendering="geometricPrecision" fill-rule="evenodd" clip-rule="evenodd" d="${d}"/>
   </g>
   <text x="600" y="360" text-anchor="middle" fill="#FFFFFF" font-family="Satoshi, Inter, system-ui, sans-serif" font-size="82" font-weight="700">OpenCoven</text>
