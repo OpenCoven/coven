@@ -947,7 +947,7 @@ Add focused tests for:
 - messages/details never contain a submitted digest or identifier value.
 
 The parent familiar mismatch must report `callerFamiliarId`; every parent
-object mismatch must report the full `executionBinding.parent.<field>` path.
+object mismatch must report the bare `parent.<field>` path.
 
 - [ ] **Step 8: Run the launch matrix**
 
