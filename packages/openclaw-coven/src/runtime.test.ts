@@ -56,6 +56,7 @@ function session(overrides: Partial<CovenSessionRecord> = {}): CovenSessionRecor
     exitCode: null,
     createdAt: "2026-04-27T10:00:00Z",
     updatedAt: "2026-04-27T10:00:00Z",
+    executionBinding: null,
     ...overrides,
   };
 }
@@ -105,6 +106,8 @@ function fakeClient(overrides: Partial<CovenClient> = {}): CovenClient {
     ]),
     sendInput: vi.fn(async () => undefined),
     killSession: vi.fn(async () => undefined),
+    sendBoundInput: vi.fn(async () => undefined),
+    killBoundSession: vi.fn(async () => undefined),
     ...overrides,
   };
 }

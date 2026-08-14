@@ -7,5 +7,6 @@
   "exit_code": null,
   "archived_at": null,
   "created_at": "2026-04-28T09:10:00.000Z",
-  "updated_at": "2026-04-28T09:12:00.000Z"
+  "updated_at": "2026-04-28T09:12:00.000Z",
+  "execution_binding": null
 }

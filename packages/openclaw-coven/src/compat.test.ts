@@ -84,6 +84,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
             events: true,
             eventCursor: "sequence",
             structuredErrors: true,
+            executionBindingContracts: ["psyche.execution_binding.v1"],
           });
           expect(health.daemon).toMatchObject({
             pid: expect.any(Number),
@@ -106,6 +107,9 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           expect(health.ok).toBe(true);
           expect(health.apiVersion).toBe("coven.daemon.v1");
           expect(health.daemon).toBeNull();
+          expect(health.capabilities).toMatchObject({
+            executionBindingContracts: ["psyche.execution_binding.v1"],
+          });
         },
       );
     });
@@ -134,6 +138,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           expect(session.exitCode).toBeNull();
           expect(session.createdAt).toBe("2026-04-28T09:10:00.000Z");
           expect(session.updatedAt).toBe("2026-04-28T09:12:00.000Z");
+          expect(session.executionBinding).toBeNull();
         },
       );
     });
@@ -155,6 +160,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           expect(session.title).toBe("Implement authentication");
           expect(session.status).toBe("completed");
           expect(session.exitCode).toBe(0);
+          expect(session.executionBinding).toBeNull();
         },
       );
     });
@@ -265,11 +271,13 @@ describe("Coven daemon API compatibility — v2026.4", () => {
         exit_code: 0,
         created_at: expect.any(String),
         updated_at: expect.any(String),
+        execution_binding: null,
       });
       expect(sessions[1]).toMatchObject({
         harness: "claude",
         status: "running",
         exit_code: null,
+        execution_binding: null,
       });
     });
 
@@ -288,6 +296,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           expect(session.projectRoot).toBe("/home/user/myproject");
           expect(session.exitCode).toBe(0);
           expect(session.status).toBe("completed");
+          expect(session.executionBinding).toBeNull();
         },
       );
     });

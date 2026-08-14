@@ -144,6 +144,11 @@ pub struct HealthCapabilities {
     /// accepted commit requests before preview semantics existed.
     #[serde(default)]
     pub afs_commit_dry_run: bool,
+    /// Exact execution-binding contracts accepted by bound session
+    /// launch/input/kill. Additive: absent/older wire payloads default to
+    /// empty rather than failing deserialization.
+    #[serde(default)]
+    pub execution_binding_contracts: Vec<String>,
 }
 
 /// `afsMount`: a backend name, or `false`.
@@ -380,6 +385,7 @@ pub(crate) fn health_response_for_authority(
             afs_mount: MountCapability::detect(),
             afs_commit: true,
             afs_commit_dry_run: true,
+            execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
         },
         daemon,
         hub: None,
@@ -8306,6 +8312,10 @@ mod tests {
         assert_eq!(body["capabilities"]["structuredErrors"], true);
         assert_eq!(body["capabilities"]["sessionHandoff"], true);
         assert_eq!(body["capabilities"]["sessionLaunchPolicy"], true);
+        assert_eq!(
+            body["capabilities"]["executionBindingContracts"],
+            json!(["psyche.execution_binding.v1"])
+        );
         Ok(())
     }
 
