@@ -751,6 +751,21 @@ mod tests {
     }
 
     #[test]
+    fn accepts_leap_second_expiry_but_rejects_seconds_above_sixty() {
+        let mut value = root_value();
+        value["expiresAt"] = json!("2030-06-15T12:34:60Z");
+        assert!(parse(&value).is_ok());
+
+        value["expiresAt"] = json!("2030-06-15T12:34:61Z");
+        assert_eq!(
+            parse(&value),
+            Err(ValidationError::Invalid {
+                path: "executionBinding.expiresAt"
+            })
+        );
+    }
+
+    #[test]
     fn expiry_is_elapsed_at_and_before_the_boundary_instant() {
         let mut value = root_value();
         value["expiresAt"] = json!("2030-06-15T12:00:00Z");
