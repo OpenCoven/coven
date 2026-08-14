@@ -357,19 +357,19 @@ impl ExecutionBinding {
                 for (different, path) in [
                     (
                         expected.session_id != actual.session_id,
-                        "executionBinding.parent.sessionId",
+                        "parent.sessionId",
                     ),
                     (
                         expected.graph_id != actual.graph_id,
-                        "executionBinding.parent.graphId",
+                        "parent.graphId",
                     ),
                     (
                         expected.node_id != actual.node_id,
-                        "executionBinding.parent.nodeId",
+                        "parent.nodeId",
                     ),
                     (
                         expected.attempt_id != actual.attempt_id,
-                        "executionBinding.parent.attemptId",
+                        "parent.attemptId",
                     ),
                 ] {
                     if different {
@@ -377,7 +377,7 @@ impl ExecutionBinding {
                     }
                 }
             }
-            _ => return Some("executionBinding.parent"),
+            _ => return Some("parent"),
         }
 
         (self.delegation_digest != supplied.delegation_digest)
@@ -885,9 +885,8 @@ Open the store before acquiring the maintenance writer. For child bindings:
 5. Return the first mismatch path only; do not infer topology or delegation authority.
 
 Freeze the familiar-correlation mismatch path as `callerFamiliarId`. Use
-`executionBinding.parent.sessionId`, `executionBinding.parent.graphId`,
-`executionBinding.parent.nodeId`, and `executionBinding.parent.attemptId` for
-the four parent-object comparisons. Use these same strings in tests and
+`parent.sessionId`, `parent.graphId`, `parent.nodeId`, and `parent.attemptId`
+for the four parent-object comparisons. Use these same strings in tests and
 `docs/API-CONTRACT.md`.
 
 Use:
@@ -1677,7 +1676,9 @@ State explicitly:
 - O2 is correlation, not authentication or replay prevention.
 
 Freeze mismatch detail paths as `callerFamiliarId` for stored-parent familiar
-correlation and `executionBinding.parent.<field>` for parent object fields.
+correlation and bare `parent.<field>` for parent object fields. Fully qualified
+`executionBinding.parent.<field>` paths remain reserved for shape-validation
+errors, not exact-match mismatches.
 
 - [ ] **Step 3: Publish the six exact errors and precedence**
 
