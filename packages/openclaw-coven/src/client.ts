@@ -527,18 +527,47 @@ function validDigest(value: string): boolean {
   return DIGEST_REGEX.test(value);
 }
 
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function isGregorianLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function daysInMonth(year: number, month: number): number {
+  return month === 2 && isGregorianLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+}
+
 /**
  * Canonical RFC3339 UTC whole-second timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
- * Fractional seconds and non-`Z` offsets are rejected by round-tripping the
- * parsed instant back through the same canonical formatting and comparing
- * byte-for-byte, matching the Rust contract's `parse_expiry`.
+ * Calendar and time-of-day fields are validated directly, field by field,
+ * rather than via `Date`: `Date` silently overflows out-of-range components
+ * (e.g. rolls `2016-12-31T24:00:00Z` into the next day) and always rejects
+ * the `:60` leap-second value, which the Rust contract's Chrono-backed
+ * `parse_expiry` accepts on every minute boundary (not only real UTC leap
+ * seconds). Matching that byte-for-byte, without normalizing or
+ * reformatting the input, keeps this validator's accepted set identical to
+ * Rust's.
  */
 function validCanonicalExpiry(value: string): boolean {
   if (!CANONICAL_EXPIRY_REGEX.test(value)) {
     return false;
   }
-  const parsed = new Date(value);
-  return Number.isFinite(parsed.valueOf()) && parsed.toISOString().replace(".000Z", "Z") === value;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const hour = Number(value.slice(11, 13));
+  const minute = Number(value.slice(14, 16));
+  const second = Number(value.slice(17, 19));
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  if (day < 1 || day > daysInMonth(year, month)) {
+    return false;
+  }
+  // Hour/minute follow the usual 0-23 / 0-59 ranges; seconds allow the
+  // leap-second value 60 in addition to the usual 0-59, with no further
+  // restriction on which minute it falls in (Chrono parity, verified above).
+  return hour <= 23 && minute <= 59 && second <= 60;
 }
 
 function normalizeExecutionBindingParent(value: unknown): CovenExecutionBindingParent {
@@ -712,17 +741,34 @@ export function createCovenClient(
       }).then(normalizeHealthResponse);
     },
     async launchSession(input, signal) {
+      let body: LaunchCovenSessionInput = input;
       if (input.executionBinding !== undefined) {
         // Validate before any request leaves the process; Rust remains
         // authoritative, this only fails fast on malformed client input.
-        normalizeExecutionBinding(input.executionBinding);
+        // Rebuild the wire body from the returned plain normalized object
+        // instead of reusing `input` verbatim: `input.executionBinding`
+        // could be a getter or carry a custom `toJSON`/prototype that
+        // would let JSON.stringify serialize a different value than the
+        // one just validated. Every other launch field is copied from
+        // `input` unchanged; `input` itself is never mutated.
+        const executionBinding = normalizeExecutionBinding(input.executionBinding);
+        body = {
+          projectRoot: input.projectRoot,
+          cwd: input.cwd,
+          harness: input.harness,
+          prompt: input.prompt,
+          title: input.title,
+          familiarId: input.familiarId,
+          callerFamiliarId: input.callerFamiliarId,
+          executionBinding,
+        };
       }
       return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
         method: "POST",
         path: `${COVEN_API_BASE_PATH}/sessions`,
-        body: input,
+        body,
         signal,
       }).then(normalizeSessionRecord);
     },
