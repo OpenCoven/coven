@@ -41,25 +41,25 @@ A familiar is not a faceless bot. It has a name, purpose, memory, toolset, voice
 
 ## 2. Logo System
 
-### Primary Mark: The Trident-Flame Sigil
+### Primary Mark: The OpenCoven Crown
 
 **Symbolism:**
-- **Trident** → control, direction, execution
-- **Flame** → intelligence, transformation, power
-- **Hood/crest** → orchestration layer, system boundary
-- **Side crescents** → awareness, sensing, reach
+- **Crown silhouette** → governed authority and deliberate control
+- **Mirrored wings** → coordinated agents working as a system
+- **Rising center** → durable execution and forward motion
 
 ### Usage Rules
-- **Default:** on black background (#000000)
-- **Minimum scale:** 24px (avoid detail loss in flame detail)
-- **Clear space:** margin = height of inner flame tip
+- **Default public treatment:** white crown on a black square (#000000)
+- **Composition treatment:** transparent one-color crown inside controlled dark surfaces
+- **Minimum scale:** 24px
+- **Clear space:** at least 10% of the rendered logo width
 - **Aspect ratio:** preserve exact proportions across all variants
 
 ### Approved Logo
 
-The approved public logo is the sigil as a white icon on a black square background. Use it for docs, README, package READMEs, landing chrome, favicons, avatars, and small identity surfaces.
+The approved public logo is the crown as a white icon on a black square background. Use it for docs, README, package READMEs, favicons, avatars, and small identity surfaces. Website chrome is the controlled exception and uses the transparent composition mark.
 
-Do not substitute gradient, mark-only, black-only, monoline, or external avatar images in public surfaces.
+Do not substitute gradient, black-only, monoline, or external avatar images in public surfaces.
 
 ### Logo Files
 ```
@@ -67,6 +67,12 @@ Do not substitute gradient, mark-only, black-only, monoline, or external avatar 
 /docs/assets/opencoven-icon.svg       # Public docs copy
 /packages/cli/assets/opencoven.svg    # Package-local copy
 /packages/openclaw-coven/assets/opencoven.svg
+/brand/logo/opencoven-logo.svg        # Full-square compatibility copy
+/brand/logo/opencoven-mark.svg        # Transparent composition mark
+/brand/logo/opencoven-white.svg       # Transparent white compatibility mark
+/brand/logo/opencoven-black.svg       # Transparent black compatibility mark
+/brand/logo/opencoven-monoline.svg    # Crown silhouette compatibility alias
+/web/favicon.svg                      # Website favicon
 ```
 
 ---
@@ -169,9 +175,9 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
 - **Grid-aligned** — 24px or 32px base grids
 
 ### Reusable Motifs
-- **Trident tips** — agency, direction
-- **Crescent arcs** — sensing, awareness, connectivity
-- **Flame curves** — intelligence, transformation
+- **Crown points** — governed authority and deliberate control
+- **Mirrored wings** — coordinated agents working as a system
+- **Rising center** — durable execution and forward motion
 - **Node points** — agents, distributed actors
 - **Connection lines** — workflows, orchestration
 
@@ -182,7 +188,7 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
   ├── tool-execute.svg
   ├── gateway.svg
   ├── workflow.svg
-  ├── trident.svg
+  ├── crown.svg
   └── ...
 ```
 
@@ -463,7 +469,7 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Add `/brand` directory with logo variants
 - [ ] Implement `brand/ui/color-tokens.css`
 - [ ] Update docs site colors to match palette
-- [ ] Replace any non-brand assets with OpenCoven sigil
+- [ ] Replace any non-brand assets with the OpenCoven crown
 
 #### OpenClaw Integration (openclaw-coven)
 - [ ] Update plugin README
@@ -471,7 +477,7 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Update badge / shield colors
 
 #### Landing Page (docs.opencoven.ai)
-- [ ] Hero section: centered sigil + glow
+- [ ] Hero section: centered crown + glow
 - [ ] Capabilities grid: 90% black/white, 10% purple
 - [ ] Diagram: nodes + paths in brand colors
 - [ ] All CTAs: purple glow on hover, no scale
@@ -501,7 +507,7 @@ animation: breathe 2.5s ease-in-out infinite;
     ├── tool-execute.svg
     ├── gateway.svg
     ├── workflow.svg
-    ├── trident.svg
+    ├── crown.svg
     ├── app-icon-1024.png           # Master
     ├── app-icon-ios-set/
     │   ├── 180.png
@@ -553,6 +559,7 @@ font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
 ### Logo Usage
 - **All public surfaces:** Approved black-background, white-icon asset
 - **Small icons/badges:** Approved black-background, white-icon asset
+- **Controlled dark compositions:** Transparent `brand/logo/opencoven-mark.svg`
 - **Docs and diagrams:** Use the approved logo only when a logo is needed; diagrams otherwise use plain labels and lines
 
 ### Adding New Icons
