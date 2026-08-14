@@ -51,23 +51,42 @@ git show-ref --verify --quiet "$BASE_REF" || {
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
-OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName --limit 200)
+OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName,headRepositoryOwner,headRefOid --limit 200)
 MRGD_PR_JSON=$(gh pr list --state merged --json headRefName            --limit 500)
 
 open_branches()  { echo "$OPEN_PR_JSON" | jq -r '.[].headRefName'; }
 merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
 
+# A PR is eligible for this branch only when GitHub reports that it comes from
+# this repository's remote-tracking ref at exactly the commit we fetched. Branch
+# names alone are not a trust boundary: fork PRs can reuse names from origin.
+trusted_open_pr_filter() {
+  local branch="$1" head_oid owner repo_owner
+  head_oid=$(git rev-parse "origin/$branch" 2>/dev/null || true)
+  owner=$(git config --get remote.origin.url | sed -E 's#(git@github.com:|https://github.com/)##; s#/.*##; s#\.git$##')
+  repo_owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+
+  echo "$OPEN_PR_JSON" | jq -r \
+    --arg b "$branch" \
+    --arg oid "$head_oid" \
+    --arg owner "$repo_owner" \
+    '.[]
+     | select(.headRefName == $b)
+     | select(.headRefOid == $oid)
+     | select((.headRepositoryOwner.login // "" | ascii_downcase) == $owner)'
+}
+
 pr_number_for() {
   local branch="$1"
-  echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .number'
+  trusted_open_pr_filter "$branch" | jq -r '.number'
 }
 
 pr_title_for() {
   local branch="$1"
-  echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .title'
+  trusted_open_pr_filter "$branch" | jq -r '.title'
 }
 
-branch_is_open_pr()   { open_branches  | grep -qxF "$1"; }
+branch_is_open_pr()   { [[ -n "$(pr_number_for "$1")" ]]; }
 branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
 
 # Branch names reach these helpers with the `origin/` prefix stripped, because
@@ -124,7 +143,7 @@ merge_block_reason() {
                   or (concl == "" and stat == ""))
          | named ]) as $pending
     | if .isDraft then "draft"
-      elif .reviewDecision == "CHANGES_REQUESTED" then "changes requested by a reviewer"
+      elif .reviewDecision != "APPROVED" then "review decision is " + (.reviewDecision // "missing") + ", not APPROVED"
       elif .mergeable == "CONFLICTING" then "conflicts with the base branch"
       elif .mergeable != "MERGEABLE" then "mergeability not yet computed by GitHub"
       elif ($failing | length) > 0 then "failing checks: " + ($failing | join(", "))
