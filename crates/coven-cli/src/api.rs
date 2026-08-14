@@ -10123,6 +10123,99 @@ mod tests {
         Ok(())
     }
 
+    /// Every opaque identifier/digest value a submitted `executionBinding`
+    /// proof carries, at both the root and nested `parent` levels. Skips
+    /// `contract`, a fixed constant name rather than caller-supplied
+    /// content. Used to prove a mismatch response never echoes any
+    /// submitted value back to the caller (§7), regardless of which single
+    /// field was substituted to produce the mismatch.
+    fn submitted_binding_values(binding: &Value) -> Vec<String> {
+        let object = binding
+            .as_object()
+            .expect("binding fixture must be a JSON object");
+        let mut values = Vec::new();
+        for (key, value) in object {
+            if key == "contract" {
+                continue;
+            }
+            match value {
+                Value::String(string) => values.push(string.clone()),
+                Value::Object(parent) => {
+                    for parent_value in parent.values() {
+                        if let Value::String(string) = parent_value {
+                            values.push(string.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        values
+    }
+
+    /// Extends [`assert_binding_error`] with a redaction check (issue #728
+    /// Task 4, §7): asserts `details` names only the static `fields` path
+    /// array — never a sibling key carrying a value or digest — and that
+    /// none of `forbidden` (the opaque identifier/digest values the proof
+    /// under test submitted) appear anywhere in the raw serialized response
+    /// body.
+    /// Recursively collects every JSON string leaf under `value`, used to
+    /// compare parsed response content against forbidden submitted values by
+    /// exact match rather than raw substring search (a raw substring search
+    /// would false-positive on fixed message text that merely happens to
+    /// contain a short opaque value as a fragment, e.g. `"sage"` inside
+    /// `"message"`).
+    fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(string) => out.push(string.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    collect_json_strings(item, out);
+                }
+            }
+            Value::Object(map) => {
+                for value in map.values() {
+                    collect_json_strings(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_binding_error_redacts(
+        response: &ApiResponse,
+        status: u16,
+        code: &str,
+        expected_fields: &[&str],
+        forbidden: &[String],
+    ) -> anyhow::Result<()> {
+        assert_binding_error(response, status, code, expected_fields)?;
+        let body: Value = serde_json::from_str(&response.body)?;
+        let details = body["error"]["details"]
+            .as_object()
+            .expect("details must be a JSON object");
+        assert_eq!(
+            details.keys().collect::<Vec<_>>(),
+            vec!["fields"],
+            "details must name only the mismatched field path, never a value: {}",
+            response.body
+        );
+        let mut leaves = Vec::new();
+        collect_json_strings(&body, &mut leaves);
+        for value in forbidden {
+            assert!(
+                !value.is_empty(),
+                "forbidden value under test must not be empty"
+            );
+            assert!(
+                !leaves.iter().any(|leaf| leaf == value),
+                "response body must not leak submitted value {value:?}: {}",
+                response.body
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn bound_launch_missing_familiar_id_is_rejected() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -18368,14 +18461,16 @@ tier = 0
         for (label, field, new_value, expected_path) in &cases {
             let mut binding = root_binding("sage");
             binding[field] = new_value.clone();
+            let forbidden = submitted_binding_values(&binding);
             for route in ["input", "kill"] {
                 let body = bound_operation_body(route, &binding);
                 let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
-                assert_binding_error(
+                assert_binding_error_redacts(
                     &response,
                     409,
                     "execution_binding_mismatch",
                     &[expected_path],
+                    &forbidden,
                 )
                 .with_context(|| format!("field={label} route={route}"))?;
             }
@@ -18391,14 +18486,16 @@ tier = 0
             "nodeId": "node-x",
             "attemptId": "attempt-x",
         });
+        let forbidden = submitted_binding_values(&binding_with_parent);
         for route in ["input", "kill"] {
             let body = bound_operation_body(route, &binding_with_parent);
             let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
-            assert_binding_error(
+            assert_binding_error_redacts(
                 &response,
                 409,
                 "execution_binding_mismatch",
-                &["executionBinding.parent"],
+                &["parent"],
+                &forbidden,
             )
             .with_context(|| format!("field=parent route={route}"))?;
         }
@@ -18415,23 +18512,25 @@ tier = 0
         insert_bound_session(temp_dir.path(), "bound-parent", "sage", Some(stored))?;
 
         let cases = [
-            ("sessionId", "executionBinding.parent.sessionId"),
-            ("graphId", "executionBinding.parent.graphId"),
-            ("nodeId", "executionBinding.parent.nodeId"),
-            ("attemptId", "executionBinding.parent.attemptId"),
+            ("sessionId", "parent.sessionId"),
+            ("graphId", "parent.graphId"),
+            ("nodeId", "parent.nodeId"),
+            ("attemptId", "parent.attemptId"),
         ];
 
         for (field, expected_path) in cases {
             let mut binding = stored_value.clone();
             binding["parent"][field] = json!("different-value");
+            let forbidden = submitted_binding_values(&binding);
             for route in ["input", "kill"] {
                 let body = bound_operation_body(route, &binding);
                 let response = post_bound_operation(temp_dir.path(), "bound-parent", route, &body)?;
-                assert_binding_error(
+                assert_binding_error_redacts(
                     &response,
                     409,
                     "execution_binding_mismatch",
                     &[expected_path],
+                    &forbidden,
                 )
                 .with_context(|| format!("field=parent.{field} route={route}"))?;
             }
@@ -18447,15 +18546,17 @@ tier = 0
         insert_bound_session(temp_dir.path(), "bound-case", "sage", Some(stored))?;
         let mut binding = root_binding("sage");
         binding["familiarId"] = json!("Sage");
+        let forbidden = submitted_binding_values(&binding);
 
         for route in ["input", "kill"] {
             let body = bound_operation_body(route, &binding);
             let response = post_bound_operation(temp_dir.path(), "bound-case", route, &body)?;
-            assert_binding_error(
+            assert_binding_error_redacts(
                 &response,
                 409,
                 "execution_binding_mismatch",
                 &["executionBinding.familiarId"],
+                &forbidden,
             )
             .with_context(|| format!("route={route}"))?;
         }

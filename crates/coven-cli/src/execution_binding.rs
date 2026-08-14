@@ -252,6 +252,9 @@ impl ExecutionBinding {
     /// (expected/stored) and `supplied` (proof), in normative object order:
     /// top-level fields, then nested `parent` fields, then
     /// `delegationDigest` last. `None` when every field matches exactly.
+    /// Per §7, `parent` and its members are always named bare (`parent`,
+    /// `parent.sessionId`, ...) — never `executionBinding.parent[...]` —
+    /// matching the paths the launch-correlation route already reports.
     ///
     /// Consumed by the O2 bound input/kill exact-proof enforcement (issue
     /// #728 Task 4), not by launch-correlation (Task 3): launch correlation
@@ -311,23 +314,15 @@ impl ExecutionBinding {
         match (&self.parent, &supplied.parent) {
             (None, None) => {}
             (Some(expected), Some(actual)) => {
+                // Bare `parent.*` — not `executionBinding.parent.*` — per the
+                // normative field-path convention (§7): `parent` is named
+                // bare in every error path, matching the launch-correlation
+                // paths the Task 3 route already reports.
                 let parent_mismatch = [
-                    (
-                        expected.session_id != actual.session_id,
-                        "executionBinding.parent.sessionId",
-                    ),
-                    (
-                        expected.graph_id != actual.graph_id,
-                        "executionBinding.parent.graphId",
-                    ),
-                    (
-                        expected.node_id != actual.node_id,
-                        "executionBinding.parent.nodeId",
-                    ),
-                    (
-                        expected.attempt_id != actual.attempt_id,
-                        "executionBinding.parent.attemptId",
-                    ),
+                    (expected.session_id != actual.session_id, "parent.sessionId"),
+                    (expected.graph_id != actual.graph_id, "parent.graphId"),
+                    (expected.node_id != actual.node_id, "parent.nodeId"),
+                    (expected.attempt_id != actual.attempt_id, "parent.attemptId"),
                 ]
                 .into_iter()
                 .find_map(|(different, path)| different.then_some(path));
@@ -335,7 +330,7 @@ impl ExecutionBinding {
                     return parent_mismatch;
                 }
             }
-            _ => return Some("executionBinding.parent"),
+            _ => return Some("parent"),
         }
 
         (self.delegation_digest != supplied.delegation_digest)
@@ -870,10 +865,10 @@ mod tests {
     fn first_mismatch_path_reports_parent_fields_after_top_level_fields() {
         let expected = parse(&child_value()).expect("should parse");
         let cases = [
-            ("sessionId", "executionBinding.parent.sessionId"),
-            ("graphId", "executionBinding.parent.graphId"),
-            ("nodeId", "executionBinding.parent.nodeId"),
-            ("attemptId", "executionBinding.parent.attemptId"),
+            ("sessionId", "parent.sessionId"),
+            ("graphId", "parent.graphId"),
+            ("nodeId", "parent.nodeId"),
+            ("attemptId", "parent.attemptId"),
         ];
         for (field, expected_path) in cases {
             let mut mutated_value = child_value();
@@ -897,11 +892,11 @@ mod tests {
 
         assert_eq!(
             with_parent.first_mismatch_path(&without_parent),
-            Some("executionBinding.parent")
+            Some("parent")
         );
         assert_eq!(
             without_parent.first_mismatch_path(&with_parent),
-            Some("executionBinding.parent")
+            Some("parent")
         );
     }
 
