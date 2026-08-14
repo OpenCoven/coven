@@ -35,7 +35,7 @@ Build for harness operators and developers, not a marketing toy.
 - The product promise is durable AI systems that can stay: remember what matters, understand their purpose, use tools, coordinate with other agents, and remain understandable over time.
 - A familiar is not a faceless bot. It has a name, purpose, memory, toolset, voice, role, and place in a larger workflow.
 - Keep the philosophy clear: powerful without becoming opaque, personal without pretending to be human, extensible without collapsing into chaos.
-- Mystical symbolism is allowed only when it supports identity: sigil, trident, flame, crescents, nodes, execution paths.
+- Mystical symbolism is allowed only when it supports identity: crown silhouette, mirrored wings, rising center, nodes, execution paths.
 - Interfaces should be dense, legible, and repeatable under daily use.
 - Copy should be direct and capable. Avoid hype, jokes, and vague AI language.
 - Use `OpenCoven` for the ecosystem/org and `Coven` for the CLI/daemon/product.
@@ -281,13 +281,14 @@ Keyboard navigation must remain visible. Never remove focus indicators without a
 
 - Use monoweight, geometric, slightly sharp icons.
 - Use existing icons from `brand/icons/` when possible.
-- Use trident tips, crescents, flame curves, nodes, and connection lines only as meaningful motifs.
+- Use crown points, mirrored wings, rising forms, nodes, and connection lines only as meaningful motifs.
 - Avoid emoji and whimsical icons in system UI.
 - Test logo and icon legibility at 24px minimum.
 
 ## Logo Rules
 
-- Public surfaces use the approved black-background, white-icon logo.
+- Public surfaces use the approved black-background, white-crown logo.
+- Controlled dark compositions may use `brand/logo/opencoven-mark.svg`.
 - Use `assets/opencoven/opencoven.svg` as the shared SVG source.
 - Use `docs/assets/opencoven-icon.svg` for the generated docs site.
 - Package READMEs use package-local copies of the approved SVG.

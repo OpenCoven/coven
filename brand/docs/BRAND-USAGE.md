@@ -17,6 +17,8 @@ The static landing page uses `web/brand.css`, which mirrors these tokens and ove
 
 - Approved logo: `assets/opencoven/opencoven.svg`
 - Public docs logo: `docs/assets/opencoven-icon.svg`
+- Website favicon: `web/favicon.svg`
+- Transparent composition mark: `brand/logo/opencoven-mark.svg`
 - UI tokens: `brand/ui/color-tokens.css`
 - Typography tokens: `brand/ui/typography.css`
 - Social/OG assets: `brand/social/*`
@@ -26,7 +28,7 @@ The static landing page uses `web/brand.css`, which mirrors these tokens and ove
 
 - [ ] Colors use `--oc-*` tokens or documented semantic aliases.
 - [ ] Typography uses `--oc-font-ui`, `--oc-font-display`, or `--oc-font-mono`.
-- [ ] Logo usage stays on the approved black-background, white-icon asset.
+- [ ] Public exports use the approved black-background, white-crown asset; controlled dark compositions may use the transparent mark.
 - [ ] Hover states glow; they do not scale layout.
 - [ ] UI is mostly black/white with purple kept to accent and identity moments.
 - [ ] Diagrams are clean lines/nodes, not decorative gradients.
