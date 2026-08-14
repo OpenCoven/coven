@@ -188,7 +188,6 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
   ├── tool-execute.svg
   ├── gateway.svg
   ├── workflow.svg
-  ├── crown.svg
   └── ...
 ```
 
@@ -507,7 +506,6 @@ animation: breathe 2.5s ease-in-out infinite;
     ├── tool-execute.svg
     ├── gateway.svg
     ├── workflow.svg
-    ├── crown.svg
     ├── app-icon-1024.png           # Master
     ├── app-icon-ios-set/
     │   ├── 180.png
@@ -521,7 +519,7 @@ animation: breathe 2.5s ease-in-out infinite;
   /social
     ├── x-avatar.png                # 1024×1024
     ├── x-banner.png                # 1500×500
-    └── github-banner.png           # 1280×640
+    └── github-banner.png           # 1500×500
 
   /ui
     ├── color-tokens.css            # CSS vars + gradients
