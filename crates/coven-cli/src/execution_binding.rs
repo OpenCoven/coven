@@ -252,12 +252,12 @@ impl ExecutionBinding {
     /// (expected/stored) and `supplied` (proof), in normative object order:
     /// top-level fields, then nested `parent` fields, then
     /// `delegationDigest` last. `None` when every field matches exactly.
-    // Consumed by the O2 bound input/kill exact-proof enforcement (issue
-    // #728 Task 4), not by this task's launch-correlation work: launch
-    // correlation (Task 3) compares individual stored parent fields against
-    // individual submitted `parent` fields, not two complete
-    // `ExecutionBinding` values, so it does not call this helper.
-    #[allow(dead_code)]
+    ///
+    /// Consumed by the O2 bound input/kill exact-proof enforcement (issue
+    /// #728 Task 4), not by launch-correlation (Task 3): launch correlation
+    /// compares individual stored parent fields against individual
+    /// submitted `parent` fields, not two complete `ExecutionBinding`
+    /// values, so it does not call this helper.
     pub fn first_mismatch_path(&self, supplied: &Self) -> Option<&'static str> {
         let top_level = [
             (

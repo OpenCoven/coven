@@ -852,7 +852,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/kill") => {
             let session_id = session_action_id(path, "/kill");
-            kill_session(coven_home, session_id, runtime)
+            kill_session(coven_home, session_id, body, runtime)
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
             let session_id = session_action_id(path, "/handoffs");
@@ -2175,6 +2175,66 @@ fn execution_binding_mismatch(path: &'static str) -> Result<ApiResponse> {
     )
 }
 
+/// A bound-mutation proof failure (issue #728 Task 4, §4). Distinct from
+/// [`crate::execution_binding::ValidationError`] because an absent
+/// `executionBinding` field, or one missing a required member, must map to
+/// `400 execution_binding_required` here — not the shape-focused
+/// `execution_binding_invalid` that `execution_binding::parse` normally
+/// reports for a `Missing` field when parsing a launch-time binding.
+#[derive(Debug)]
+enum BoundProofError {
+    /// `executionBinding` is entirely absent, or present but missing one or
+    /// more required members (root or `parent`).
+    Required { path: &'static str },
+    /// `executionBinding` is present and complete but fails shape/syntax
+    /// (`Invalid`) or names an unsupported contract (`Unsupported`).
+    Validation(crate::execution_binding::ValidationError),
+    /// `executionBinding` parses and validates but does not exactly match
+    /// the session's stored binding at `path`.
+    Mismatch { path: &'static str },
+}
+
+/// Parses and exact-matches the `executionBinding` proof required by a
+/// bound input/kill request against the session's `stored` binding. See
+/// `BoundProofError` for how parse outcomes map onto the O2 error taxonomy.
+fn require_bound_proof(
+    payload: &Value,
+    stored: &crate::execution_binding::ExecutionBinding,
+) -> std::result::Result<crate::execution_binding::ExecutionBinding, BoundProofError> {
+    let Some(value) = payload.get("executionBinding") else {
+        return Err(BoundProofError::Required {
+            path: "executionBinding",
+        });
+    };
+    let supplied = crate::execution_binding::parse(value).map_err(|error| match error {
+        crate::execution_binding::ValidationError::Missing { path } => {
+            BoundProofError::Required { path }
+        }
+        other => BoundProofError::Validation(other),
+    })?;
+    if let Some(path) = stored.first_mismatch_path(&supplied) {
+        return Err(BoundProofError::Mismatch { path });
+    }
+    Ok(supplied)
+}
+
+/// Maps a [`BoundProofError`] onto its O2 response, per §7: absent/incomplete
+/// proof is `400 execution_binding_required`; malformed shape or unsupported
+/// contract reuse [`execution_binding_error`]; an exact mismatch is
+/// `409 execution_binding_mismatch` naming only the mismatched field path.
+fn bound_proof_error_response(error: BoundProofError) -> Result<ApiResponse> {
+    match error {
+        BoundProofError::Required { path } => api_error(
+            400,
+            "execution_binding_required",
+            "Bound operation requires a complete executionBinding.",
+            Some(json!({ "fields": [path] })),
+        ),
+        BoundProofError::Validation(error) => execution_binding_error(error),
+        BoundProofError::Mismatch { path } => execution_binding_mismatch(path),
+    }
+}
+
 /// The raw, byte-exact presence/value of the top-level `callerFamiliarId`
 /// launch field, read directly from the JSON payload rather than through
 /// `SessionLaunch.caller_familiar_id` (which trims and collapses an
@@ -2948,36 +3008,77 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     };
-    if session.status != "running" {
-        return session_not_live_response(session_id);
-    }
+    let is_bound = session.execution_binding.is_some();
 
     // Same structured-error pattern as `launch_session`: malformed JSON
     // or runtime send failures must NOT propagate to the accept loop
     // (that crashes the daemon process). Parse errors → 400; runtime
     // errors → 500 except for "not live" which is the dedicated 409.
-    let payload = match parse_body(body) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return api_error(
-                400,
-                "invalid_request",
-                &error.to_string(),
-                Some(json!({ "sessionId": session_id })),
-            );
+    let parse_error_response = |error: anyhow::Error| {
+        api_error(
+            400,
+            "invalid_request",
+            &error.to_string(),
+            Some(json!({ "sessionId": session_id })),
+        )
+    };
+
+    let payload = if let Some(stored_binding) = session.execution_binding.as_ref() {
+        // Bound precedence (issue #728 Task 4, §4.2): session lookup, body
+        // parse, then complete exact-match proof (including the input-only
+        // expiry rejection) all run *before* the existing status/liveness
+        // gate. This deliberately reorders the unbound flow below: a bound
+        // caller with no/incomplete/malformed/mismatched/expired proof must
+        // fail closed on the proof itself, never learning session liveness
+        // from the response.
+        let payload = match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => return parse_error_response(error),
+        };
+        let supplied = match require_bound_proof(&payload, stored_binding) {
+            Ok(supplied) => supplied,
+            Err(error) => return bound_proof_error_response(error),
+        };
+        if let Err(error) = supplied.validate_not_expired(Utc::now()) {
+            return execution_binding_error(error);
+        }
+        if session.status != "running" {
+            return session_not_live_response(session_id);
+        }
+        payload
+    } else {
+        // Unbound precedence is unchanged: liveness is checked before the
+        // body is even parsed.
+        if session.status != "running" {
+            return session_not_live_response(session_id);
+        }
+        match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => return parse_error_response(error),
         }
     };
     // Validate `data` shape here (client error) instead of letting the
     // runtime surface it as a 500. Required field, must be a string.
-    if !payload.get("data").map(|v| v.is_string()).unwrap_or(false) {
+    let Some(data) = payload.get("data").and_then(Value::as_str) else {
         return api_error(
             400,
             "invalid_request",
             "input payload requires string field `data`",
             Some(json!({ "sessionId": session_id })),
         );
-    }
-    match runtime.can_record_session_event(session_id, "input", &payload) {
+    };
+    // Metadata isolation (issue #728 Task 4, §4.4): once proof is verified,
+    // only `data` may reach writer capacity checks, the runtime, and the
+    // persisted event — `executionBinding` must never leak past this point
+    // on success. Unbound sessions never carry a proof, so their payload
+    // (already validated to contain nothing but what the caller sent) is
+    // used as-is, preserving old behavior entirely.
+    let action_payload = if is_bound {
+        json!({ "data": data })
+    } else {
+        payload.clone()
+    };
+    match runtime.can_record_session_event(session_id, "input", &action_payload) {
         Some(Ok(true)) | None => {}
         Some(Ok(false)) => {
             return api_error(
@@ -2999,7 +3100,6 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    let action_payload = payload.clone();
     let mut action = || {
         runtime
             .send_input(session_id, &action_payload)
@@ -3011,7 +3111,7 @@ fn record_input(
         coven_home,
         session_id,
         "input",
-        payload,
+        action_payload.clone(),
         &mut action,
     ) {
         Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
@@ -3051,6 +3151,7 @@ fn record_input(
 fn kill_session(
     coven_home: &Path,
     session_id: &str,
+    body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
@@ -3062,6 +3163,32 @@ fn kill_session(
             Some(json!({ "sessionId": session_id })),
         );
     };
+
+    if let Some(stored_binding) = session.execution_binding.as_ref() {
+        // Bound precedence (issue #728 Task 4, §4.3): session lookup, body
+        // parse, then complete exact-match proof, run *before* the existing
+        // status/external checks below. Unlike input, kill deliberately
+        // does NOT reject an elapsed `expiresAt` — an exact-matching but
+        // expired proof is still accepted, so a caller can always tear down
+        // a session it can prove it owns.
+        let payload = match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": session_id })),
+                );
+            }
+        };
+        if let Err(error) = require_bound_proof(&payload, stored_binding) {
+            return bound_proof_error_response(error);
+        }
+    }
+    // Unbound sessions preserve existing precedence/behavior entirely: the
+    // body (if any) is never parsed or validated for a kill request.
+
     if session.status != "running" {
         return session_not_live_response(session_id);
     }
@@ -9872,6 +9999,21 @@ mod tests {
         familiar_id: &str,
         binding: Option<crate::execution_binding::ExecutionBinding>,
     ) -> anyhow::Result<()> {
+        insert_bound_session_with_options(coven_home, id, familiar_id, binding, "running", false)
+    }
+
+    /// Like [`insert_bound_session`], but allows overriding `status` and
+    /// `external` so bound-operation precedence tests (issue #728 Task 4)
+    /// can exercise a bound session that is not-live or externally
+    /// registered without re-running the full launch path.
+    fn insert_bound_session_with_options(
+        coven_home: &Path,
+        id: &str,
+        familiar_id: &str,
+        binding: Option<crate::execution_binding::ExecutionBinding>,
+        status: &str,
+        external: bool,
+    ) -> anyhow::Result<()> {
         let conn = crate::store::open_store(&store_path(coven_home))?;
         let now = current_timestamp();
         let record = crate::store::SessionRecord {
@@ -9879,7 +10021,7 @@ mod tests {
             project_root: "/repo".to_string(),
             harness: "codex".to_string(),
             title: "parent session".to_string(),
-            status: "running".to_string(),
+            status: status.to_string(),
             exit_code: None,
             archived_at: None,
             created_at: now.clone(),
@@ -9889,7 +10031,7 @@ mod tests {
             execution_binding: binding,
             labels: Vec::new(),
             visibility: "private".to_string(),
-            external: false,
+            external,
             transcript_path: None,
         };
         crate::store::insert_session(&conn, &record)?;
@@ -11756,6 +11898,10 @@ mod tests {
     struct RecordingRuntime {
         launches: std::cell::RefCell<Vec<SessionLaunch>>,
         inputs: std::cell::RefCell<Vec<String>>,
+        // Retains the exact `send_input` payload (issue #728 Task 4) so
+        // bound-operation tests can assert `executionBinding` never reaches
+        // the runtime, not just that a `data` string was recorded.
+        input_payloads: std::cell::RefCell<Vec<Value>>,
         kills: std::cell::RefCell<Vec<String>>,
     }
 
@@ -11784,6 +11930,7 @@ mod tests {
         }
 
         fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            self.input_payloads.borrow_mut().push(payload.clone());
             let data = payload
                 .get("data")
                 .and_then(Value::as_str)
@@ -18004,6 +18151,940 @@ tier = 0
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "session_id_conflict");
         assert_eq!(body["error"]["details"]["sessionId"], "shared-id");
+        Ok(())
+    }
+
+    // -- Bound session mutations: exact proof + metadata isolation (issue
+    // #728 Task 4) ---------------------------------------------------------
+
+    #[test]
+    fn bound_input_strips_proof_from_runtime_and_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-input", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-input/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })],
+            "executionBinding must never reach SessionRuntime::send_input"
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "bound-input")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(
+            payload,
+            json!({ "data": "hello" }),
+            "executionBinding must never reach the persisted input event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_consumes_proof_without_event_leak() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-kill", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+
+        // A mismatched proof must fail closed: no kill, no event.
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+        let mismatched_body = json!({ "executionBinding": mismatched }).to_string();
+        let rejected = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&mismatched_body),
+            &runtime,
+        )?;
+        assert_eq!(rejected.status, 409, "{}", rejected.body);
+        let rejected_body: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected_body["error"]["code"], "execution_binding_mismatch");
+        assert!(runtime.kills.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-kill")?.is_empty());
+
+        // The exact matching proof is consumed and stripped: the runtime
+        // only ever sees the session id, and the persisted event keeps its
+        // pre-O2 `{"status":"killed"}` shape.
+        let matching_body = json!({ "executionBinding": root_binding("sage") }).to_string();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&matching_body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(runtime.kills.borrow().as_slice(), &["bound-kill"]);
+        let events = crate::store::list_events(&conn, "bound-kill")?;
+        let kill_event = events
+            .iter()
+            .find(|event| event.kind == "kill")
+            .expect("kill event should be persisted");
+        let payload: Value = serde_json::from_str(&kill_event.payload_json)?;
+        assert_eq!(payload, json!({ "status": "killed" }));
+        Ok(())
+    }
+
+    /// Builds the request body for a bound `input`/`kill` operation. `input`
+    /// requires the pre-existing `data` string alongside the proof; `kill`
+    /// requires only the proof (its unbound body has always been empty).
+    fn bound_operation_body(route: &str, binding: &Value) -> String {
+        match route {
+            "input" => json!({ "data": "hello", "executionBinding": binding }).to_string(),
+            "kill" => json!({ "executionBinding": binding }).to_string(),
+            other => panic!("unknown bound operation route: {other}"),
+        }
+    }
+
+    fn post_bound_operation(
+        coven_home: &Path,
+        session_id: &str,
+        route: &str,
+        body: &str,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            &format!("/sessions/{session_id}/{route}"),
+            coven_home,
+            None,
+            Some(body),
+        )
+    }
+
+    /// A `root_binding` fixture whose `expiresAt` is already in the past —
+    /// still syntactically valid, but elapsed.
+    fn expired_root_binding(familiar_id: &str) -> Value {
+        let mut binding = root_binding(familiar_id);
+        binding["expiresAt"] = json!("2020-01-01T00:00:00Z");
+        binding
+    }
+
+    #[test]
+    fn bound_operations_reject_every_mismatched_root_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-root", "sage", Some(stored))?;
+
+        // Every root-level field of the v1 object, substituted one at a
+        // time with a syntactically valid but different value. Digests use
+        // hex-only fill characters so they stay valid `sha256:` digests.
+        let cases: Vec<(&str, &str, Value, &str)> = vec![
+            (
+                "principalRef",
+                "principalRef",
+                json!("principal:other"),
+                "executionBinding.principalRef",
+            ),
+            (
+                "familiarId",
+                "familiarId",
+                json!("cody"),
+                "executionBinding.familiarId",
+            ),
+            (
+                "familiarSnapshotDigest",
+                "familiarSnapshotDigest",
+                json!(digest('d')),
+                "executionBinding.familiarSnapshotDigest",
+            ),
+            (
+                "projectDigest",
+                "projectDigest",
+                json!(digest('e')),
+                "executionBinding.projectDigest",
+            ),
+            (
+                "graphId",
+                "graphId",
+                json!("graph-9"),
+                "executionBinding.graphId",
+            ),
+            (
+                "nodeId",
+                "nodeId",
+                json!("node-9"),
+                "executionBinding.nodeId",
+            ),
+            (
+                "attemptId",
+                "attemptId",
+                json!("attempt-9"),
+                "executionBinding.attemptId",
+            ),
+            (
+                "requestDigest",
+                "requestDigest",
+                json!(digest('f')),
+                "executionBinding.requestDigest",
+            ),
+            (
+                "policyRevision",
+                "policyRevision",
+                json!("policy:9"),
+                "executionBinding.policyRevision",
+            ),
+            (
+                "expiresAt",
+                "expiresAt",
+                json!("2099-06-01T00:00:00Z"),
+                "executionBinding.expiresAt",
+            ),
+            (
+                "delegationDigest",
+                "delegationDigest",
+                json!(digest('1')),
+                "executionBinding.delegationDigest",
+            ),
+        ];
+
+        for (label, field, new_value, expected_path) in &cases {
+            let mut binding = root_binding("sage");
+            binding[field] = new_value.clone();
+            for route in ["input", "kill"] {
+                let body = bound_operation_body(route, &binding);
+                let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
+                assert_binding_error(
+                    &response,
+                    409,
+                    "execution_binding_mismatch",
+                    &[expected_path],
+                )
+                .with_context(|| format!("field={label} route={route}"))?;
+            }
+        }
+
+        // Presence mismatch: the stored `parent` is null, so supplying a
+        // (validly shaped) non-null parent must mismatch on "parent" itself
+        // rather than any nested field.
+        let mut binding_with_parent = root_binding("sage");
+        binding_with_parent["parent"] = json!({
+            "sessionId": "parent-x",
+            "graphId": "graph-x",
+            "nodeId": "node-x",
+            "attemptId": "attempt-x",
+        });
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding_with_parent);
+            let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
+            assert_binding_error(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["executionBinding.parent"],
+            )
+            .with_context(|| format!("field=parent route={route}"))?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_every_mismatched_parent_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-parent", "sage", Some(stored))?;
+
+        let cases = [
+            ("sessionId", "executionBinding.parent.sessionId"),
+            ("graphId", "executionBinding.parent.graphId"),
+            ("nodeId", "executionBinding.parent.nodeId"),
+            ("attemptId", "executionBinding.parent.attemptId"),
+        ];
+
+        for (field, expected_path) in cases {
+            let mut binding = stored_value.clone();
+            binding["parent"][field] = json!("different-value");
+            for route in ["input", "kill"] {
+                let body = bound_operation_body(route, &binding);
+                let response = post_bound_operation(temp_dir.path(), "bound-parent", route, &body)?;
+                assert_binding_error(
+                    &response,
+                    409,
+                    "execution_binding_mismatch",
+                    &[expected_path],
+                )
+                .with_context(|| format!("field=parent.{field} route={route}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_mixed_case_only_mismatches() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-case", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["familiarId"] = json!("Sage");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-case", route, &body)?;
+            assert_binding_error(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["executionBinding.familiarId"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_absent_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-absent", "sage", Some(stored))?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        assert_binding_error(
+            &input,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/kill",
+            temp_dir.path(),
+            None,
+            Some("{}"),
+        )?;
+        assert_binding_error(
+            &kill,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+
+        // No body at all must behave identically for a bound kill: an
+        // absent body parses to `{}`, which still lacks `executionBinding`.
+        let kill_no_body = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/kill",
+            temp_dir.path(),
+            None,
+            None,
+        )?;
+        assert_binding_error(
+            &kill_no_body,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_incomplete_proof_missing_root_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-incomplete", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding
+            .as_object_mut()
+            .expect("root binding fixture is an object")
+            .remove("policyRevision");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-incomplete", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_required",
+                &["executionBinding"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_incomplete_proof_missing_parent_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(
+            temp_dir.path(),
+            "bound-incomplete-parent",
+            "sage",
+            Some(stored),
+        )?;
+        let mut binding = stored_value.clone();
+        binding["parent"]
+            .as_object_mut()
+            .expect("parent fixture is an object")
+            .remove("graphId");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-incomplete-parent", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_required",
+                &["executionBinding.parent"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_extra_root_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-extra-root", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["extra"] = json!(true);
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-extra-root", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_invalid",
+                &["executionBinding"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_extra_parent_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-extra-parent", "sage", Some(stored))?;
+        let mut binding = stored_value.clone();
+        binding["parent"]["extra"] = json!(true);
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-extra-parent", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_invalid",
+                &["executionBinding.parent"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_malformed_non_object_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-malformed", "sage", Some(stored))?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/bound-malformed/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello","executionBinding":"not-an-object"}"#),
+        )?;
+        assert_binding_error(
+            &input,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/bound-malformed/kill",
+            temp_dir.path(),
+            None,
+            Some(r#"{"executionBinding":"not-an-object"}"#),
+        )?;
+        assert_binding_error(
+            &kill,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_unsupported_contract() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-unsupported", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["contract"] = json!("psyche.execution_binding.v2");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-unsupported", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_unsupported",
+                &["executionBinding.contract"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_input_rejects_expired_exact_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(temp_dir.path(), "bound-expired", "sage", Some(stored))?;
+        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-expired/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_expired",
+            &["executionBinding.expiresAt"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_input_expired_rejection_calls_no_runtime_or_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(
+            temp_dir.path(),
+            "bound-expired-no-leak",
+            "sage",
+            Some(stored),
+        )?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-expired-no-leak/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(runtime.input_payloads.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-expired-no-leak")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_accepts_expired_exact_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(temp_dir.path(), "bound-expired-kill", "sage", Some(stored))?;
+        let body = json!({ "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-expired-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        let detail = handle_request("GET", "/sessions/bound-expired-kill", temp_dir.path(), None)?;
+        assert!(detail.body.contains(r#""status":"killed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_unknown_session_wins_over_malformed_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/missing-bound/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello","executionBinding":"not-an-object"}"#),
+        )?;
+        assert_eq!(input.status, 404, "{}", input.body);
+        let input_body: Value = serde_json::from_str(&input.body)?;
+        assert_eq!(input_body["error"]["code"], "session_not_found");
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/missing-bound/kill",
+            temp_dir.path(),
+            None,
+            Some(r#"{"executionBinding":"not-an-object"}"#),
+        )?;
+        assert_eq!(kill.status, 404, "{}", kill.body);
+        let kill_body: Value = serde_json::from_str(&kill.body)?;
+        assert_eq!(kill_body["error"]["code"], "session_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_mismatch_wins_before_session_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session_with_options(
+            temp_dir.path(),
+            "bound-not-live",
+            "sage",
+            Some(stored),
+            "completed",
+            false,
+        )?;
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &mismatched);
+            let response = post_bound_operation(temp_dir.path(), "bound-not-live", route, &body)?;
+            assert_binding_error(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["executionBinding.familiarId"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_external_check_applies_after_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session_with_options(
+            temp_dir.path(),
+            "bound-external",
+            "sage",
+            Some(stored),
+            "running",
+            true,
+        )?;
+
+        // A mismatched proof against a bound, external session must still
+        // report the binding mismatch, not the external-session error:
+        // proof enforcement runs before the existing external check.
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+        let mismatch_body = json!({ "executionBinding": mismatched }).to_string();
+        let mismatch_response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-external/kill",
+            temp_dir.path(),
+            None,
+            Some(&mismatch_body),
+        )?;
+        assert_binding_error(
+            &mismatch_response,
+            409,
+            "execution_binding_mismatch",
+            &["executionBinding.familiarId"],
+        )?;
+
+        // An exact-matching proof clears the bound gate, so the existing
+        // external check applies afterward exactly as it does today.
+        let matching_body = json!({ "executionBinding": root_binding("sage") }).to_string();
+        let matching_response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-external/kill",
+            temp_dir.path(),
+            None,
+            Some(&matching_body),
+        )?;
+        assert_eq!(matching_response.status, 422, "{}", matching_response.body);
+        let body: Value = serde_json::from_str(&matching_response.body)?;
+        assert_eq!(body["error"]["code"], "external_session_not_killable");
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_and_kill_reject_completed_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "unbound-completed", "completed")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/unbound-completed/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request(
+            "POST",
+            "/sessions/unbound-completed/kill",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_and_kill_reject_orphaned_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "unbound-orphaned", "orphaned")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/unbound-orphaned/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request(
+            "POST",
+            "/sessions/unbound-orphaned/kill",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_kill_ignores_execution_binding_shaped_body() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-kill-body")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-kill-body/kill",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.kills.borrow().as_slice(),
+            &["unbound-kill-body"],
+            "an unbound session's kill body is never inspected, matching pre-O2 behavior"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_ignores_execution_binding_shaped_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-body")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-body/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        // Unbound behavior is unchanged: no proof is required or stripped,
+        // so the caller's full payload (including the extraneous
+        // `executionBinding`) reaches the runtime exactly as it did before
+        // issue #728 Task 4.
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello", "executionBinding": root_binding("sage") })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_and_kill_reject_bound_failures_without_runtime_or_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-no-leak", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+
+        let cases: Vec<(&str, String)> = vec![
+            ("input", json!({ "data": "hello" }).to_string()),
+            (
+                "input",
+                json!({ "data": "hello", "executionBinding": "nope" }).to_string(),
+            ),
+            (
+                "input",
+                json!({ "data": "hello", "executionBinding": mismatched.clone() }).to_string(),
+            ),
+            ("kill", json!({}).to_string()),
+            ("kill", json!({ "executionBinding": "nope" }).to_string()),
+            (
+                "kill",
+                json!({ "executionBinding": mismatched.clone() }).to_string(),
+            ),
+        ];
+
+        for (route, body) in cases {
+            let response = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/bound-no-leak/{route}"),
+                temp_dir.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert!(
+                response.status == 400 || response.status == 409,
+                "expected a rejection for route={route} body={body}, got {}: {}",
+                response.status,
+                response.body
+            );
+        }
+
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(runtime.input_payloads.borrow().is_empty());
+        assert!(runtime.kills.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-no-leak")?.is_empty());
+        Ok(())
+    }
+
+    struct CapacityObservingRuntime {
+        payloads: std::cell::RefCell<Vec<Value>>,
+    }
+
+    impl SessionRuntime for CapacityObservingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn can_record_session_event(
+            &self,
+            _session_id: &str,
+            _kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            self.payloads.borrow_mut().push(payload.clone());
+            Some(Ok(true))
+        }
+    }
+
+    #[test]
+    fn bound_input_writer_capacity_sees_stripped_payload() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-capacity", "sage", Some(stored))?;
+        let runtime = CapacityObservingRuntime {
+            payloads: std::cell::RefCell::new(Vec::new()),
+        };
+        let body = json!({ "data": "hello", "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-capacity/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })],
+            "writer capacity preflight must see only `data`, never `executionBinding`"
+        );
         Ok(())
     }
 }
