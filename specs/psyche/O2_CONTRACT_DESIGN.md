@@ -1,6 +1,6 @@
 # Psyche O2 Coven Contract Design
 
-**Status:** Design proposed; not yet approved or implemented.
+**Status:** Approved; implementation complete pending final repository verification.
 
 **Depends on:** O1, merged (issue #567, Bead `coven-psy-o1`).
 
@@ -160,7 +160,7 @@ syntax-checks, and exact-compares.
 |---|---|---|
 | Opaque ref/ID/policy-revision | `principalRef`, `familiarId` (both locations), `graphId`, `nodeId`, `attemptId`, `policyRevision`, `parent.sessionId`, `parent.graphId`, `parent.nodeId`, `parent.attemptId` | 1 to 255 ASCII bytes, matching `[A-Za-z0-9._:/-]` only. |
 | Digest | `familiarSnapshotDigest`, `projectDigest`, `requestDigest`, `delegationDigest` (when present) | Exactly `sha256:` followed by 64 lowercase hexadecimal characters. |
-| Timestamp | `expiresAt` | Canonical UTC RFC3339 seconds: `YYYY-MM-DDTHH:MM:SSZ`. No fractional seconds, no non-`Z` offsets. |
+| Timestamp | `expiresAt` | Canonical UTC RFC3339 seconds: `YYYY-MM-DDTHH:MM:SSZ`. No fractional seconds, no non-`Z` offsets. Coven validates by round-tripping the parsed instant back through this same canonical formatting; `SS` is not restricted to `00`-`59` only — the RFC 3339 leap-second value `60` also round-trips and is accepted. |
 | Contract | `contract` | Must equal `psyche.execution_binding.v1` exactly. |
 
 Coven validates only syntax, contract identity, and expiry as defined here.
