@@ -127,15 +127,23 @@ syntax-checks, and exact-compares.
   authority and is persisted unchanged as `project_root`, exactly as today.
 - `executionBinding.projectDigest` is Psyche-owned, independently persisted,
   and is never derived from or checked against `project_root`.
-- A bound launch requires top-level `familiarId`. Coven runs its existing
-  `resolve_familiar` resolution on that alias exactly as it does today, and
+- A bound launch requires top-level `familiarId`. Unlike an unbound launch —
+  which trims `familiarId` and collapses an empty or whitespace-only value to
+  "no familiar" — a bound launch applies no such trimming to the raw
+  top-level `familiarId` it received (§3.1): the raw value must already be
+  byte-exact, or the request is rejected as `400 execution_binding_invalid`
+  (`details.fields: ["familiarId"]`) before resolution, the runtime, or the
+  store are touched. Coven then runs its existing `resolve_familiar`
+  resolution on that exact value exactly as it does today, and
   `executionBinding.familiarId` must exact-match the resolved
   `FamiliarContext.id`, not merely the raw alias supplied. That same
   canonical id is what Coven persists in `SessionRecord.familiar_id`. This
   equality check correlates Psyche's opaque snapshot reference to the
   familiar Coven will actually inject into the session; it does not make
   Coven the source of familiar identity or snapshot content, which remain
-  Psyche's. A mismatch is rejected before session creation.
+  Psyche's. A mismatch is rejected before session creation as
+  `409 execution_binding_mismatch`, `details.fields: ["executionBinding.familiarId"]`
+  (see §7).
 - **Root binding:** `parent` must be `null`, `delegationDigest` must be
   `null`, and `callerFamiliarId` must be absent. Any of these being present
   is rejected. Unbound launches are unaffected: their existing
@@ -195,6 +203,13 @@ either level:
   syntax check, or a mismatch (`execution_binding_mismatch`) on bound
   input/kill if it is syntactically valid but byte-differs from the stored
   value.
+- This byte-exact rule also governs the top-level `familiarId` field of a
+  *bound* launch, even though `familiarId` is not itself a member of
+  `executionBinding`: its correlation against `executionBinding.familiarId`
+  (§2.4) depends on comparing it exactly as received, with no trimming. This
+  is a deliberate departure from an *unbound* launch, which keeps its
+  existing `familiarId` trim/collapse-to-"no familiar" behavior unchanged
+  (§2.4).
 
 ## 4. Persistence and API behavior
 
@@ -251,10 +266,13 @@ attempt) and preserves operator safety. Kill still requires an exact match on
 every other field.
 
 Read/list/events endpoints (`GET /api/v1/sessions/:id`,
-`GET /api/v1/sessions`, event/cursor reads) remain plain session-id reads;
-they require no binding proof and simply return the immutable
-`execution_binding` field already stored, per §2.2/§4. O2 defines
-correlation, not authentication — read access is unchanged from today.
+`GET /api/v1/sessions`, event/cursor reads) remain plain session-id reads and
+require no binding proof. `GET /api/v1/sessions/:id` and any session-listing
+route return the immutable `execution_binding` field already stored, per
+§2.2/§4. Event/cursor reads do not: the persisted `EventRecord` shape carries
+no `execution_binding` field at all, bound or unbound, so there is nothing to
+return there. O2 defines correlation, not authentication — read access is
+unchanged from today.
 
 O2 adds no artifact-lookup route and no lookup-by-binding route. Lookup
 remains by daemon session id only.
@@ -350,11 +368,11 @@ honor bound-operation guarantees for it.
 
 | Code | Status | Condition |
 |---|---:|---|
-| `execution_binding_invalid` | 400 | Malformed, missing a required field, contains an unknown/extra member in `executionBinding` or its nested `parent` object (§3.1), or fails a cross-field rule (§2.4) at launch; malformed binding proof (including an unknown/extra member) on bound input/kill; or an externally registered session's registration request supplies `executionBinding` at all (§6). |
+| `execution_binding_invalid` | 400 | Malformed, missing a required field, contains an unknown/extra member in `executionBinding` or its nested `parent` object (§3.1), or fails the root/child cross-field rule or the top-level-`familiarId`-presence rule (§2.4) at launch; malformed binding proof (including an unknown/extra member) on bound input/kill; or an externally registered session's registration request supplies `executionBinding` at all (§6). |
 | `execution_binding_unsupported` | 400 | `contract` is not `psyche.execution_binding.v1`. |
 | `execution_binding_required` | 400 | Bound input or kill omits or supplies incomplete binding proof. |
 | `execution_binding_expired` | 409 | Launch or input references a binding whose `expiresAt` has elapsed. |
-| `execution_binding_mismatch` | 409 | Any exact-match check fails, including parent correlation mismatch, or a request attempts to mutate an existing stored binding. This includes a child launch whose `parent.sessionId` exists but carries a `null` stored `execution_binding` — details name only `parent.sessionId` in that case, since no stored binding fields exist to compare. |
+| `execution_binding_mismatch` | 409 | Any exact-match check fails, including canonical-familiar correlation (§2.4), parent correlation mismatch, or a request attempts to mutate an existing stored binding. This includes a child launch whose `parent.sessionId` exists but carries a `null` stored `execution_binding` — details name only `parent.sessionId` in that case, since no stored binding fields exist to compare. |
 | `session_not_found` | 404 | The current session, or a child launch's referenced `parent.sessionId`, does not exist at all. Unchanged from existing behavior. |
 
 Error `details` may name only the mismatched field path (e.g.
@@ -408,6 +426,12 @@ Launch:
 - rejects a top-level `familiarId` whose `resolve_familiar`-resolved
   `FamiliarContext.id` does not exact-match `executionBinding.familiarId`
   (`execution_binding_mismatch`);
+- rejects a top-level `familiarId` that carries leading/trailing whitespace
+  even when the trimmed value would otherwise resolve to, and byte-match,
+  the canonical familiar (`execution_binding_invalid`, `details.fields:
+  ["familiarId"]`), proving the bound path applies no trim before
+  correlation (§2.4/§3.1); a paired positive control confirms an *unbound*
+  launch still trims `familiarId` as before;
 - rejects a root binding carrying non-null `parent`, non-null
   `delegationDigest`, or a present `callerFamiliarId`;
 - rejects a child binding carrying null `parent`, null `delegationDigest`,
@@ -467,7 +491,14 @@ Bound input and kill:
 - a successful bound kill call records a kill event and calls
   `SessionRuntime::kill_session` with only the session id, asserting the
   recorded kill event contains no `executionBinding` key and the
-  `kill_session` call signature carries no binding argument (§5.2).
+  `kill_session` call signature carries no binding argument (§5.2);
+- an *unbound* session's input call strips a reserved `executionBinding` key
+  from the payload — even a syntactically malformed one, since an unbound
+  session never runs proof validation — before writer-capacity checks,
+  `SessionRuntime::send_input`, and the persisted input event, while every
+  other field and existing unbound precedence is unaffected; an unbound
+  kill call never parses its body at all, so no equivalent stripping step
+  applies there.
 
 ### 8.1 Metadata isolation acceptance evidence
 

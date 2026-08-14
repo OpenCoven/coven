@@ -206,11 +206,11 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `session_id_conflict`  | 409         | `POST /sessions/external`: a daemon-managed (non-external) session with the supplied id already exists. |
 | `not_external_session` | 422         | `POST /sessions/:id/complete`: the session exists but is not an external session. Use `POST /sessions/:id/kill` for daemon-managed sessions. |
 | `external_session_not_killable` | 422 | `POST /sessions/:id/kill`: the session is external and not managed by the daemon; use `POST /sessions/:id/complete` instead. |
-| `execution_binding_invalid` | 400   | `executionBinding` (or its nested `parent`) is malformed, missing a required member, or carries an unknown/extra member; a launch cross-field rule (root/child, canonical-familiar) fails; or an external-session registration request supplies `executionBinding` at all. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
+| `execution_binding_invalid` | 400   | `executionBinding` (or its nested `parent`) is malformed, missing a required member, or carries an unknown/extra member; a launch cross-field rule (root/child) or the canonical-familiar-presence rule (bound launch omits top-level `familiarId`) fails; or an external-session registration request supplies `executionBinding` at all. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
 | `execution_binding_unsupported` | 400 | `executionBinding.contract` is present but is not `psyche.execution_binding.v1`. |
 | `execution_binding_required` | 400 | A bound session's `POST /sessions/:id/input` or `POST /sessions/:id/kill` omits `executionBinding` or supplies an incomplete proof. |
 | `execution_binding_expired` | 409  | Launch, or bound input, references an `executionBinding.expiresAt` that has already elapsed. Bound kill is explicitly exempt from this check. |
-| `execution_binding_mismatch` | 409 | A bound request's `executionBinding` proof, once parsed, byte-differs from the session's stored binding on at least one field, including parent correlation. `details.fields` names only the first mismatched field path, never a value. |
+| `execution_binding_mismatch` | 409 | A bound request's `executionBinding` proof, once parsed, byte-differs from the session's stored binding on at least one field, including parent correlation. This also covers a bound launch whose `executionBinding.familiarId` does not exact-match the canonical `FamiliarContext.id` resolved from top-level `familiarId`. `details.fields` names only the first mismatched field path, never a value. |
 
 ## Capability catalog shape (`v1`)
 
@@ -754,6 +754,12 @@ members — there is no open/extensible schema at either level:
   valid but byte-differs from the stored value. For example, a `graphId`
   differing only in letter case from the stored value is rejected as a
   mismatch, not silently accepted.
+- The same byte-exact rule extends to the top-level `familiarId` field of a
+  *bound* launch (it is not itself a member of `executionBinding`, but its
+  correlation against `executionBinding.familiarId` and admission both
+  depend on it): it is never trimmed before use, unlike an unbound launch's
+  existing `familiarId` trim/collapse-to-"no familiar" behavior, which is
+  unchanged. See [Launch correlation rules](#launch-correlation-rules).
 
 ### Shape validation
 
@@ -771,8 +777,15 @@ members — there is no open/extensible schema at either level:
   Psyche-owned, independently persisted, and never derived from or checked
   against `project_root`.
 - A bound launch requires top-level `familiarId`; its absence is
-  `400 execution_binding_invalid` (`details.fields: ["familiarId"]`). Coven
-  runs its existing `resolve_familiar` resolution and
+  `400 execution_binding_invalid` (`details.fields: ["familiarId"]`). Unlike
+  an unbound launch — which trims `familiarId` and collapses an empty or
+  whitespace-only value to "no familiar" — a bound launch applies no such
+  trimming to the raw top-level `familiarId` it received: the raw value must
+  already be byte-exact. Any leading/trailing whitespace, or any other value
+  that would only resolve or match after normalization, is rejected as
+  `400 execution_binding_invalid` (`details.fields: ["familiarId"]`) before
+  familiar resolution, the runtime, or the store are touched. Coven then
+  runs its existing `resolve_familiar` resolution on that exact value and
   `executionBinding.familiarId` must exact-match the resolved
   `FamiliarContext.id` — not merely the raw alias supplied. A mismatch is
   `409 execution_binding_mismatch` (`details.fields: ["executionBinding.familiarId"]`)
@@ -856,7 +869,21 @@ exact `executionBinding` object alongside the existing `data` payload:
 ```json
 {
   "data": "existing input payload, unchanged shape",
-  "executionBinding": { "...": "complete object, matching the JSON shape above" }
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-1",
+    "nodeId": "node-1",
+    "attemptId": "attempt-1",
+    "requestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": null,
+    "delegationDigest": null
+  }
 }
 ```
 
@@ -865,7 +892,21 @@ body, gains a JSON body carrying only the binding:
 
 ```json
 {
-  "executionBinding": { "...": "complete object, matching the JSON shape above" }
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-1",
+    "nodeId": "node-1",
+    "attemptId": "attempt-1",
+    "requestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": null,
+    "delegationDigest": null
+  }
 }
 ```
 
@@ -887,10 +928,14 @@ For both routes:
   only narrows authority (stops a running attempt) and preserves operator
   safety. Kill still requires an exact match on every other field.
 - Read/list/events endpoints (`GET /api/v1/sessions/:id`,
-  `GET /api/v1/sessions`, event/cursor reads) require no binding proof; they
-  return the stored `execution_binding` field as-is. Coven defines
-  correlation here, not authentication — read access is unchanged from
-  today.
+  `GET /api/v1/sessions`, event/cursor reads) require no binding proof.
+  `GET /api/v1/sessions/:id` and any session-listing route return the stored
+  `execution_binding` field as-is. Event/cursor reads (`GET /api/v1/events`,
+  `GET /api/v1/sessions/:id/events`) do not: the `EventRecord` shape (see
+  [Event record shape and cursor pagination (`v1`)](#event-record-shape-and-cursor-pagination-v1))
+  carries no `execution_binding` field at all, bound or unbound — there is
+  nothing to return, only nothing to prove. Coven defines correlation here,
+  not authentication — read access is unchanged from today.
 
 Once the proof is required, an unbound session's input/kill precedence is
 completely unaffected: no proof check runs, and the existing status/liveness
