@@ -777,6 +777,11 @@ test('release workflow fail-closes signed recovery tags', () => {
   );
   assert.match(
     workflow,
+    /git fetch --no-tags origin main[\s\S]*git merge-base --is-ancestor "\$TAGGED_COMMIT_SHA" origin\/main[\s\S]*if \[ "\$RELEASE_MODE" != "recovery" \]/,
+    'all release tags, including recovery tags, must be contained in origin/main before mode-specific validation'
+  );
+  assert.match(
+    workflow,
     /git verify-tag "\$RELEASE_TAG"/,
     'recovery must locally verify the original stable release tag'
   );

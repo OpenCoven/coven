@@ -117,12 +117,12 @@ jobs:
             exit 1
           fi
           printf '%s\n' "$verify_output"
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$TAGGED_COMMIT_SHA" origin/main; then
+            echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
+            exit 1
+          fi
           if [ "$RELEASE_MODE" != "recovery" ]; then
-            git fetch --no-tags origin main
-            if ! git merge-base --is-ancestor "$TAGGED_COMMIT_SHA" origin/main; then
-              echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
-              exit 1
-            fi
             exit 0
           fi
           if ! BASE_TAG_OBJECT_SHA=$(git rev-parse "$RELEASE_TAG^{tag}" 2>/dev/null); then
