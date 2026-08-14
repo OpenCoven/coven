@@ -37,7 +37,7 @@ or mutate anything under `~/.coven/memory` — that is the promotion layer's job
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `query` | string | ✅ | Natural-language question or keyword phrase. |
-| `familiar` | string | ❌ | Store scope filter passed to the crate: `coven` (default; the shared store) or a familiar id for per-familiar stores. |
+| `familiar` | string | ❌ | Store scope filter passed to the crate: `coven` (default; the shared store) or a familiar id for per-familiar stores. Must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. |
 | `k` | int | ❌ | Max results. Default 5, max 20. |
 | `since` / `until` | ISO date | ❌ | Filter on manifest `timestamp`. |
 | `verified_only` | bool | ❌ | Default `true`. Drop hits whose manifest `sha256` no longer matches the promoted snapshot or whose `attested_via` file is missing. |
@@ -62,10 +62,16 @@ log query text to any destination outside the Coven filesystem.
 
 1. **Precondition.** `~/.coven/memory/manifest.jsonl` exists with ≥1 line, else return
    `{hits: [], count: 0, note: "promotion layer has not run"}` and stop.
-2. **Query the crate.** `coven-memory search --familiar <familiar> "<query>"` (add
-   `--index`/`--db` only if the store lives off the default path). The crate owns
-   ranking (fastembed/nomic-embed-text-v1.5 + TurboVec ANN; schema §11.5 pins
-   embeddings as crate-internal).
+2. **Query the crate.** Treat `query` and `familiar` as untrusted data. Validate
+   `familiar` against `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` (default `coven`);
+   reject any other value. Invoke the crate with an argv API, not a shell command
+   string, equivalent to `execve`/`subprocess.run(["coven-memory", "search",
+   "--familiar", familiar, query])`. If a runtime exposes only a shell, pass
+   every dynamic argument through robust single-argument shell escaping (for
+   example POSIX `shlex.quote`) and do not concatenate raw input. Add `--index`/
+   `--db` only if the store lives off the default path. The crate owns ranking
+   (fastembed/nomic-embed-text-v1.5 + TurboVec ANN; schema §11.5 pins embeddings
+   as crate-internal).
 3. **Join against the manifest.** For each hit, find its manifest line by `ulid`.
    Apply `since`/`until` on `timestamp`. Detect supersession: if a later
    `operation: supersede` line names this ulid as `prior_ulid`, annotate
@@ -101,8 +107,9 @@ log query text to any destination outside the Coven filesystem.
 Claude Code, CovenCave, bare SSH), does this skill work without modification?*
 
 **✅ Yes.** The skill's only dependencies are (a) the `coven-memory` CLI — a
-Coven-shipped binary, (b) `~/.coven/memory/` — a Coven-owned contract path, and
-(c) a shell. No runtime-specific hooks, session APIs, or bootstrap injection.
+Coven-shipped binary and (b) `~/.coven/memory/` — a Coven-owned contract path.
+No shell, runtime-specific hooks, session APIs, or bootstrap injection are
+required.
 FAMILIAR_ROOT resolution follows the schema's flag→env→fail-closed order and is
 only needed for optional source opening, never for querying. Session references
 use the portable `session://` class form, never raw runtime session keys.
