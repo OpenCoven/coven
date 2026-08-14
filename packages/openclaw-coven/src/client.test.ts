@@ -672,6 +672,78 @@ describe("createCovenClient", () => {
         );
       });
 
+      it("does not send executionBinding when a getter answers undefined on the single validation read, even if it would answer a binding later", async () => {
+        const binding = validBinding();
+        let executionBindingReads = 0;
+        // A time-of-check/time-of-use trap in the other direction: the
+        // getter answers `undefined` (looking unbound) on the one read
+        // `launchSession` performs, but would answer a malicious binding on
+        // any later read. If the implementation ever re-reads
+        // `executionBinding` (e.g. by serializing `input` itself), the
+        // wire body would gain an executionBinding that was never
+        // validated. It must not: the body must omit executionBinding
+        // entirely, and the getter must be invoked exactly once.
+        const input = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+        };
+        Object.defineProperty(input, "executionBinding", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            executionBindingReads += 1;
+            return executionBindingReads === 1 ? undefined : (binding as unknown);
+          },
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(
+              input as unknown as Parameters<
+                ReturnType<typeof createCovenClient>["launchSession"]
+              >[0],
+            );
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody).not.toHaveProperty("executionBinding");
+            expect(sentBody).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            expect(executionBindingReads).toBe(1);
+          },
+        );
+      });
+
       it("preserves the other launch fields exactly while replacing executionBinding", async () => {
         const binding = validBinding();
         let capturedBody = "";

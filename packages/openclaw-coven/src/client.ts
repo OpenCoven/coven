@@ -741,28 +741,39 @@ export function createCovenClient(
       }).then(normalizeHealthResponse);
     },
     async launchSession(input, signal) {
-      let body: LaunchCovenSessionInput = input;
-      if (input.executionBinding !== undefined) {
-        // Validate before any request leaves the process; Rust remains
-        // authoritative, this only fails fast on malformed client input.
-        // Rebuild the wire body from the returned plain normalized object
-        // instead of reusing `input` verbatim: `input.executionBinding`
-        // could be a getter or carry a custom `toJSON`/prototype that
-        // would let JSON.stringify serialize a different value than the
-        // one just validated. Every other launch field is copied from
-        // `input` unchanged; `input` itself is never mutated.
-        const executionBinding = normalizeExecutionBinding(input.executionBinding);
-        body = {
-          projectRoot: input.projectRoot,
-          cwd: input.cwd,
-          harness: input.harness,
-          prompt: input.prompt,
-          title: input.title,
-          familiarId: input.familiarId,
-          callerFamiliarId: input.callerFamiliarId,
-          executionBinding,
-        };
-      }
+      // Snapshot `executionBinding` exactly once: it may be a getter, and
+      // re-reading it later (e.g. implicitly during JSON.stringify) could
+      // observe a different, unvalidated value than the one checked/
+      // normalized here. Every wire body below is a plain object built
+      // from this single snapshot and the other primitive fields copied
+      // from `input`, never `input` itself, so a custom `toJSON`/
+      // prototype/getter on `input` can never reach the request. `input`
+      // itself is never mutated.
+      const executionBindingSnapshot = input.executionBinding;
+      const body: LaunchCovenSessionInput =
+        executionBindingSnapshot === undefined
+          ? {
+              projectRoot: input.projectRoot,
+              cwd: input.cwd,
+              harness: input.harness,
+              prompt: input.prompt,
+              title: input.title,
+              familiarId: input.familiarId,
+              callerFamiliarId: input.callerFamiliarId,
+            }
+          : {
+              projectRoot: input.projectRoot,
+              cwd: input.cwd,
+              harness: input.harness,
+              prompt: input.prompt,
+              title: input.title,
+              familiarId: input.familiarId,
+              callerFamiliarId: input.callerFamiliarId,
+              // Validate before any request leaves the process; Rust
+              // remains authoritative, this only fails fast on malformed
+              // client input.
+              executionBinding: normalizeExecutionBinding(executionBindingSnapshot),
+            };
       return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
