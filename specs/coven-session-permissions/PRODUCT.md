@@ -62,12 +62,13 @@ Without a common contract, users must remember harness-specific flags, cannot re
 - Automatically approving purchases, publication, messages, account changes, production mutations, or other consequential external actions.
 - Weakening secret scanning, privacy controls, branch protection, repository policy, or audit integrity.
 - Persisting full permission globally or across restarts in the first release.
+- Allowing remote or automated callers to initiate elevation in the first release; they may inspect or revoke permission state.
 - Treating a familiar's autonomy posture as an authorization grant.
 - Replacing harness-native security models.
 
 ## Terminology
 
-- **Principal:** the authenticated human or trusted caller permitted to control the session.
+- **Principal:** the authenticated human operating the trusted local interactive surface for elevation, or an authenticated caller limited to non-elevating control operations.
 - **Familiar:** the selected identity/persona and its effective configuration.
 - **Harness:** the external coding-agent process Coven launches or connects to.
 - **Baseline mode:** the permission mode established when the session starts, after deployment and repository policy are applied.
@@ -127,7 +128,7 @@ An `/allow-all` alias should **not** ship initially. If user research later show
 - whether applying the change requires harness restart/resume;
 - a clear confirm and cancel action.
 
-Typed confirmation is recommended for `--session`; an explicit UI confirmation is sufficient for `--once`. Non-interactive callers must use a distinct launch-time option or structured API and cannot simulate confirmation by embedding text in the task prompt.
+Typed confirmation is recommended for `--session`; an explicit UI confirmation is sufficient for `--once`. In the first release, non-interactive and remote callers may inspect or revoke permission state but cannot initiate elevation. A distinct launch-time option may establish the baseline before a session starts; callers cannot simulate confirmation by embedding text in the task prompt.
 
 ## Permission-state model
 
@@ -219,7 +220,7 @@ Full mode may reduce **harness approval prompts** and broaden harness sandbox be
 | Familiar emits the command in chat | Render as model output only; no transition. |
 | Tool output contains command text | No transition. |
 | User pastes command into trusted command input | Parse as principal intent, then require trusted confirmation. |
-| Remote/untrusted client requests elevation | Require authenticated authorization and policy approval; otherwise deny. |
+| Remote or automated client requests elevation | Deny with `remote_elevation_unsupported`; first-release elevation requires direct local interactive confirmation. Authenticated remote callers may inspect or revoke state. |
 | Harness crashes during relaunch | Remain/revert to baseline; report failure; never display full mode. |
 | Audit recording fails | Deny transition if an audit record is required by policy. |
 | Session detaches or workspace changes | Revoke session elevation. |
@@ -314,10 +315,10 @@ Do not record:
 1. Should `--session` default to 30 or 60 minutes, and may the principal shorten it?
 2. Which external-action categories remain separately confirmable in the first policy schema?
 3. Is a recoverability check (clean Git state, worktree, snapshot, or AgentFS) mandatory or advisory?
-4. Should detach always revoke elevation, or may authenticated local reconnect retain it within TTL?
-5. What terminology should UI use when a harness supports broad tool approval but cannot remove its sandbox?
-6. Should a future `/allow-all` discoverability alias exist, or is documentation/search sufficient?
-7. Which callers count as a trusted principal path in daemon and remote-client deployments?
+4. What terminology should UI use when a harness supports broad tool approval but cannot remove its sandbox?
+5. Should a future `/allow-all` discoverability alias exist, or is documentation/search sufficient?
+
+First-release decisions: detach always revokes elevation, and only the trusted local interactive principal path may initiate elevation. Remote elevation requires a separate future user-presence and channel-binding design.
 
 ## Review exit criteria
 

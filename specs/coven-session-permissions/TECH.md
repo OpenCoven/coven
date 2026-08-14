@@ -1,7 +1,7 @@
 # Session Permission Controls — Technical Plan
 
 **Status:** Draft for familiar review
-**Depends on:** [`PRODUCT.md`](PRODUCT.md), [`../coven-harness-capabilities/PRODUCT.md`](../coven-harness-capabilities/PRODUCT.md), [`../coven-harness-capabilities/TECH.md`](../coven-harness-capabilities/TECH.md), [`../../docs/ENGINE-CONTRACT.md`](../../docs/ENGINE-CONTRACT.md)
+**Depends on:** [`PRODUCT.md`](PRODUCT.md), [`../../docs/superpowers/specs/2026-08-03-universal-runtime-capability-recovery-design.md`](../../docs/superpowers/specs/2026-08-03-universal-runtime-capability-recovery-design.md), [`../coven-harness-capabilities/PRODUCT.md`](../coven-harness-capabilities/PRODUCT.md), [`../coven-harness-capabilities/TECH.md`](../coven-harness-capabilities/TECH.md), [`../../docs/ENGINE-CONTRACT.md`](../../docs/ENGINE-CONTRACT.md)
 **Scope:** Architecture and verification plan; no implementation is authorized by this document
 
 ## 1. Architectural decision
@@ -39,12 +39,13 @@ The TUI may render confirmation and status, but it does not decide whether eleva
 
 - `crates/coven-cli/src/harness.rs` maps the typed launch-time `Permission` (`Full` or `ReadOnly`) through a per-harness `SandboxMapping` into harness arguments.
 - `docs/reference/cli-run.md` documents launch-time `--permission <LEVEL>` behavior as harness dependent.
-- The harness-capabilities specs propose stable capability descriptors and validation.
+- The harness-capabilities specs define raw, ephemeral native scans for instructions, skills, and plugins.
+- `docs/superpowers/specs/2026-08-03-universal-runtime-capability-recovery-design.md` defines the Rust-owned `EffectiveRuntimeDescriptor` used for client-facing runtime capability truth.
 - The engine contract establishes a Rust control plane with thin harness adapters.
 
 ### Required convergence
 
-This plan must not create a competing capability registry. The session-permission feature should consume the canonical harness capability descriptors proposed by `specs/coven-harness-capabilities/`.
+This plan must not create a competing capability registry. The raw `HarnessCapabilityManifest` from `specs/coven-harness-capabilities/` remains discovery-only and must never authorize elevation. Session permissions consume and extend the Rust-owned `EffectiveRuntimeDescriptor` contract defined by the universal runtime capability design.
 
 The existing launch-time `Permission` plus `SandboxMapping` is a useful typed adapter mechanism, but it is insufficient as the running-session authority contract because:
 
@@ -184,7 +185,7 @@ pub enum InputOrigin {
 }
 ```
 
-Only policy-authorized principal variants may create a permission request. The parser must never inspect arbitrary transcript text for executable commands.
+Only `LocalInteractivePrincipal` may create a `full` request in the first release, and it must complete a Coven-owned local confirmation challenge. `AuthenticatedRemotePrincipal` may use `show` and `default`, but `full` fails with `remote_elevation_unsupported`. The parser must never inspect arbitrary transcript text for executable commands. Future remote elevation requires a separate user-presence and channel-binding protocol; authentication alone is insufficient.
 
 ### Command grammar
 
@@ -268,40 +269,53 @@ Stable denial codes should include:
 - `transition_in_progress`
 - `session_not_attached`
 - `policy_changed`
+- `remote_elevation_unsupported`
 
 Messages must be safe for logs and must not disclose which secrets or credentials triggered a denial.
 
-## 7. Harness capability contract
+## 7. Effective runtime permission capability contract
 
-Extend the canonical harness capability descriptor rather than introducing ad hoc tests. A permission descriptor needs at least:
+Permission authority extends the Rust-owned `EffectiveRuntimeDescriptor`; it does not use the raw native-scan manifest. The descriptor's capability map should expose a stable capability id such as `session.permission.full`, backed by an internal typed record:
 
-```json
-{
-  "permissions": {
-    "modes": ["default", "full"],
-    "full": {
-      "application": "relaunch_resume",
-      "revocation": "relaunch_resume",
-      "adapter_value": "<internal, not principal-facing>",
-      "verified_versions": ["..."]
-    }
-  }
+```rust
+pub struct EffectivePermissionCapability {
+    pub state: CapabilityState,
+    pub detected_version: Option<String>,
+    pub supported_versions: String,
+    pub evidence_id: String,
+    pub application: PermissionTransitionMechanism,
+    pub revocation: PermissionTransitionMechanism,
+    pub continuity: SessionContinuity,
+    pub verification: PermissionVerification,
+    pub retained_boundaries: BTreeSet<RetainedBoundary>,
+    pub adapter_mapping: PermissionAdapterMapping, // internal, never principal-supplied
 }
 ```
 
-The actual schema should follow the capability spec's typed Rust model and evidence rules. The descriptor must identify:
+The Rust resolver derives this record from the detected runtime version, adapter-owned launch mechanics, and a committed evidence packet. Each evidence packet must identify:
 
-- semantic support for broad approval/sandbox mode;
-- supported version range and evidence source;
-- whether application is live, relaunch/resume, or launch-only;
-- whether baseline restoration is live or requires relaunch;
-- whether session continuity can be preserved;
-- categories that remain constrained by the harness;
-- verification mechanism after launch.
+- runtime id and exact supported version range;
+- evidence source, release/build identity, and conformance-test revision;
+- adapter-owned application arguments or RPC and their precedence over `extra_args`;
+- live, relaunch/resume, or launch-only application behavior;
+- live or relaunch/resume baseline restoration behavior;
+- session-continuity guarantees and failure handling;
+- the strongest effective-state verification mechanism available;
+- retained workspace, credential, privacy, branch, network, and external-action boundaries.
+
+If any field is missing, stale for the detected version, or contradicted at runtime, the capability state is `unverified` and elevation is denied. Stored UI metadata, raw harness scans, process startup success, and guessed flags are never evidence.
 
 ### Supported harnesses
 
-Only Codex, Claude Code, and GitHub Copilot CLI are eligible while repository policy limits the supported set. Each adapter mapping requires an evidence packet against pinned/supported versions. Planning documents must not hard-code guessed flags.
+Only Codex, Claude Code, and GitHub Copilot CLI are eligible while repository policy limits the supported set. At this specification's publication, all three mappings are intentionally `unverified` and fail closed:
+
+| Runtime | Initial capability state | Required behavior |
+|---|---|---|
+| Codex | `unverified` | Deny until a version-bounded evidence packet proves application, restoration, continuity, verification, and retained boundaries. |
+| Claude Code | `unverified` | Deny until a version-bounded evidence packet proves application, restoration, continuity, verification, and retained boundaries. |
+| GitHub Copilot CLI | `unverified` | Deny until a version-bounded evidence packet proves application, restoration, continuity, verification, and retained boundaries. |
+
+An adapter mapping may move to `supported` only in the same change that adds its evidence packet and conformance tests. Planning documents must not hard-code guessed flags.
 
 ### Verification
 
@@ -349,7 +363,7 @@ On failure, Coven records a safe failure result and preserves/restores baseline.
 - Reject duplicate/late confirmations.
 - A turn-start operation and a permission transition must share the same session lock or transactional boundary.
 - Policy updates invalidate outstanding challenges.
-- Disconnect invalidates unconfirmed challenges and revokes active session grants according to product policy.
+- Disconnect invalidates unconfirmed challenges and revokes active session grants.
 
 ## 9. Session persistence and lifecycle
 
@@ -360,7 +374,7 @@ Revocation triggers:
 - explicit `/permissions default`;
 - one-turn completion;
 - TTL expiration;
-- detach/disconnect as selected by product policy;
+- detach/disconnect;
 - workspace or repository identity change;
 - principal identity change;
 - harness process replacement outside the coordinator;
@@ -663,8 +677,9 @@ Before general availability:
 5. Which audit backend is mandatory before one-turn elevation can ship?
 6. Should expiration use wall clock plus monotonic timers, and how is daemon suspend handled?
 7. Is emergency revocation process termination automatic after a grace period or explicitly principal-driven?
-8. How does a remote client prove a confirmation was directly initiated by a principal rather than generated by an agent?
-9. What exact capability-schema changes belong in the existing harness-capabilities work to avoid parallel registries?
+8. What exact additive descriptor-version change should carry `EffectivePermissionCapability` after the effective runtime descriptor contract lands?
+
+First-release decisions: remote callers cannot elevate, detach/disconnect always revokes active grants, and raw harness capability scans are never permission evidence.
 
 ## 21. Go/no-go gates
 
