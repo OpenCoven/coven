@@ -9,6 +9,7 @@ import {
   createCovenClient,
   PSYCHE_EXECUTION_BINDING_V1,
   type CovenExecutionBinding,
+  type LaunchCovenSessionInput,
 } from "./client.js";
 
 const DIGEST_A = `sha256:${"a".repeat(64)}`;
@@ -779,6 +780,15 @@ describe("createCovenClient", () => {
               harness: "codex",
               prompt: "Fix tests",
               title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              launchMode: "nonInteractive",
+              launchPolicy: {
+                approval: "never",
+                sandbox: "workspace-write",
+                addDirs: ["/extra-dir"],
+              },
+              conversation: { mode: "resume", id: "conversation-1" },
+              conversationId: "native-conversation-1",
               familiarId: "sage",
               callerFamiliarId: "caller-familiar",
               executionBinding: binding,
@@ -789,10 +799,202 @@ describe("createCovenClient", () => {
               harness: "codex",
               prompt: "Fix tests",
               title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              launchMode: "nonInteractive",
+              launchPolicy: {
+                approval: "never",
+                sandbox: "workspace-write",
+                addDirs: ["/extra-dir"],
+              },
+              conversation: { mode: "resume", id: "conversation-1" },
+              conversationId: "native-conversation-1",
               familiarId: "sage",
               callerFamiliarId: "caller-familiar",
               executionBinding: binding,
             });
+          },
+        );
+      });
+
+      it("legacy launchSession body remains exactly the five required fields when no optional launch fields are supplied", async () => {
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            expect(sentBody).not.toHaveProperty("model");
+            expect(sentBody).not.toHaveProperty("launchMode");
+            expect(sentBody).not.toHaveProperty("launchPolicy");
+            expect(sentBody).not.toHaveProperty("conversation");
+            expect(sentBody).not.toHaveProperty("conversationId");
+            expect(sentBody).not.toHaveProperty("familiarId");
+            expect(sentBody).not.toHaveProperty("callerFamiliarId");
+            expect(sentBody).not.toHaveProperty("executionBinding");
+          },
+        );
+      });
+
+      it("does not serialize the original input object (top-level toJSON/prototype trick) on launchSession", async () => {
+        let capturedBody = "";
+        const input: LaunchCovenSessionInput = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+          model: "openai/gpt-5.6-sol",
+          conversationId: "native-conversation-1",
+        };
+        // A non-enumerable `toJSON` on `input` itself is invisible to any
+        // membership/shape check but is still what `JSON.stringify` would
+        // call if the wire body were ever `input` (or a shallow copy that
+        // preserves accessors/`toJSON`) instead of a fresh object literal.
+        Object.defineProperty(input, "toJSON", {
+          enumerable: false,
+          configurable: true,
+          value: () => ({
+            projectRoot: "/evil",
+            cwd: "/evil",
+            harness: "evil-harness",
+            prompt: "evil prompt",
+            title: "evil title",
+            model: "evil-model",
+            conversationId: "evil-conversation",
+          }),
+        });
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(input);
+            expect(JSON.parse(capturedBody)).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              conversationId: "native-conversation-1",
+            });
+          },
+        );
+      });
+
+      it("reads an optional launch field exactly once even when it is a getter, on launchSession", async () => {
+        let modelReads = 0;
+        const input = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+        };
+        // Same time-of-check/time-of-use trap as the executionBinding getter
+        // regression above, but for a plain (non-executionBinding) optional
+        // field: proves every field is read exactly once into the fresh
+        // body object, not re-read later from `input`.
+        Object.defineProperty(input, "model", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            modelReads += 1;
+            return modelReads === 1 ? "openai/gpt-5.6-sol" : "tampered-reread";
+          },
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(
+              input as unknown as Parameters<
+                ReturnType<typeof createCovenClient>["launchSession"]
+              >[0],
+            );
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody.model).toBe("openai/gpt-5.6-sol");
+            expect(modelReads).toBe(1);
           },
         );
       });

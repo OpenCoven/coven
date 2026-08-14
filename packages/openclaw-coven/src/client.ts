@@ -77,12 +77,47 @@ export type CovenEventsResponse = {
   hasMore: boolean;
 };
 
+/**
+ * Pre-O2 harness launch mode. Mirrors the daemon's `HarnessLaunchMode`
+ * (`crates/coven-cli/src/harness.rs`) and the exact wire strings
+ * `launch_mode_from_payload` (`crates/coven-cli/src/api.rs`) accepts.
+ */
+export type CovenLaunchMode = "interactive" | "nonInteractive" | "stream";
+
+/**
+ * Pre-O2 unattended-launch policy. Mirrors the daemon's `LaunchPolicyPayload`
+ * (`crates/coven-cli/src/api.rs`): `approval`/`sandbox` are accepted only as
+ * the exact literals below, and are enforced only for Codex nonInteractive
+ * launches. `addDirs` is optional and defaults to no extra directories.
+ */
+export type CovenLaunchPolicy = {
+  approval: "never";
+  sandbox: "workspace-write";
+  addDirs?: string[];
+};
+
+/**
+ * Pre-O2 conversation continuation hint. Mirrors the daemon's
+ * `ConversationHint` (`crates/coven-cli/src/harness.rs`): `init` starts a
+ * new harness-native conversation claimed under `id`; `resume` continues an
+ * existing one.
+ */
+export type CovenConversationHint = {
+  mode: "init" | "resume";
+  id: string;
+};
+
 export type LaunchCovenSessionInput = {
   projectRoot: string;
   cwd: string;
   harness: string;
   prompt: string;
   title: string;
+  model?: string;
+  launchMode?: CovenLaunchMode;
+  launchPolicy?: CovenLaunchPolicy;
+  conversation?: CovenConversationHint;
+  conversationId?: string;
   familiarId?: string;
   callerFamiliarId?: string;
   executionBinding?: CovenExecutionBinding;
@@ -744,36 +779,39 @@ export function createCovenClient(
       // Snapshot `executionBinding` exactly once: it may be a getter, and
       // re-reading it later (e.g. implicitly during JSON.stringify) could
       // observe a different, unvalidated value than the one checked/
-      // normalized here. Every wire body below is a plain object built
-      // from this single snapshot and the other primitive fields copied
-      // from `input`, never `input` itself, so a custom `toJSON`/
-      // prototype/getter on `input` can never reach the request. `input`
-      // itself is never mutated.
+      // normalized here. The wire body below is a single fresh plain object
+      // built from this one snapshot and every other supported launch field
+      // read directly off `input`, never from `input` itself (no spread, no
+      // reused reference), so a custom `toJSON`/prototype/getter on `input`
+      // (or a stale/dropped field from an earlier, narrower body shape) can
+      // never reach the request. `input` itself is never mutated. A field
+      // `input` doesn't set reads as `undefined` here, and `JSON.stringify`
+      // always omits an object key whose value is `undefined`, so every
+      // absent optional field is naturally dropped from the wire body
+      // without any conditional key construction.
       const executionBindingSnapshot = input.executionBinding;
-      const body: LaunchCovenSessionInput =
-        executionBindingSnapshot === undefined
-          ? {
-              projectRoot: input.projectRoot,
-              cwd: input.cwd,
-              harness: input.harness,
-              prompt: input.prompt,
-              title: input.title,
-              familiarId: input.familiarId,
-              callerFamiliarId: input.callerFamiliarId,
-            }
-          : {
-              projectRoot: input.projectRoot,
-              cwd: input.cwd,
-              harness: input.harness,
-              prompt: input.prompt,
-              title: input.title,
-              familiarId: input.familiarId,
-              callerFamiliarId: input.callerFamiliarId,
-              // Validate before any request leaves the process; Rust
-              // remains authoritative, this only fails fast on malformed
-              // client input.
-              executionBinding: normalizeExecutionBinding(executionBindingSnapshot),
-            };
+      const body: LaunchCovenSessionInput = {
+        projectRoot: input.projectRoot,
+        cwd: input.cwd,
+        harness: input.harness,
+        prompt: input.prompt,
+        title: input.title,
+        model: input.model,
+        launchMode: input.launchMode,
+        launchPolicy: input.launchPolicy,
+        conversation: input.conversation,
+        conversationId: input.conversationId,
+        familiarId: input.familiarId,
+        callerFamiliarId: input.callerFamiliarId,
+        // Validate before any request leaves the process; Rust remains
+        // authoritative, this only fails fast on malformed client input.
+        // Replaces the snapshot with its validated plain normalized object
+        // so no getter/toJSON on it can be re-read at serialization time.
+        executionBinding:
+          executionBindingSnapshot === undefined
+            ? undefined
+            : normalizeExecutionBinding(executionBindingSnapshot),
+      };
       return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
