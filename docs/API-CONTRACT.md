@@ -1727,9 +1727,12 @@ Shared non-success responses use the structured error envelope:
 }
 ```
 
-A bound session (one launched with `executionBinding`) additionally requires
-a complete, exact-matching `executionBinding` proof in the request body
-before any of the above; see
+The session lookup (and its `404 session_not_found`) always runs first, even
+against a bound session with a malformed or missing proof. Only after that
+lookup succeeds does a bound session (one launched with `executionBinding`)
+additionally require a complete, exact-matching `executionBinding` proof in
+the request body, checked before the existing `409 session_not_live` and
+external-session checks above; see
 [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
 for the request shape, precedence, and the additional
 `execution_binding_required`/`execution_binding_invalid`/
