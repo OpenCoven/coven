@@ -4,6 +4,36 @@ import net from "node:net";
 import path from "node:path";
 import { lstatIfExists, pathIsInside } from "./path-utils.js";
 
+/**
+ * Contract name for the Psyche opaque execution-binding tuple that Coven
+ * validates for shape/syntax/expiry and exact-compares on bound mutations,
+ * but never interprets. See `specs/psyche/O2_CONTRACT_DESIGN.md`.
+ */
+export const PSYCHE_EXECUTION_BINDING_V1 = "psyche.execution_binding.v1" as const;
+
+export type CovenExecutionBindingParent = {
+  sessionId: string;
+  graphId: string;
+  nodeId: string;
+  attemptId: string;
+};
+
+export type CovenExecutionBinding = {
+  contract: typeof PSYCHE_EXECUTION_BINDING_V1;
+  principalRef: string;
+  familiarId: string;
+  familiarSnapshotDigest: string;
+  projectDigest: string;
+  graphId: string;
+  nodeId: string;
+  attemptId: string;
+  requestDigest: string;
+  policyRevision: string;
+  expiresAt: string;
+  parent: CovenExecutionBindingParent | null;
+  delegationDigest: string | null;
+};
+
 export type CovenSessionRecord = {
   id: string;
   projectRoot: string;
@@ -13,6 +43,7 @@ export type CovenSessionRecord = {
   exitCode: number | null;
   createdAt: string;
   updatedAt: string;
+  executionBinding: CovenExecutionBinding | null;
 };
 
 export type CovenEventRecord = {
@@ -29,6 +60,7 @@ export type CovenHealthCapabilities = {
   events?: unknown;
   eventCursor?: unknown;
   structuredErrors?: unknown;
+  executionBindingContracts?: unknown;
 };
 
 export type CovenHealthResponse = {
@@ -45,12 +77,50 @@ export type CovenEventsResponse = {
   hasMore: boolean;
 };
 
+/**
+ * Pre-O2 harness launch mode. Mirrors the daemon's `HarnessLaunchMode`
+ * (`crates/coven-cli/src/harness.rs`) and the exact wire strings
+ * `launch_mode_from_payload` (`crates/coven-cli/src/api.rs`) accepts.
+ */
+export type CovenLaunchMode = "interactive" | "nonInteractive" | "stream";
+
+/**
+ * Pre-O2 unattended-launch policy. Mirrors the daemon's `LaunchPolicyPayload`
+ * (`crates/coven-cli/src/api.rs`): `approval`/`sandbox` are accepted only as
+ * the exact literals below, and are enforced only for Codex nonInteractive
+ * launches. `addDirs` is optional and defaults to no extra directories.
+ */
+export type CovenLaunchPolicy = {
+  approval: "never";
+  sandbox: "workspace-write";
+  addDirs?: string[];
+};
+
+/**
+ * Pre-O2 conversation continuation hint. Mirrors the daemon's
+ * `ConversationHint` (`crates/coven-cli/src/harness.rs`): `init` starts a
+ * new harness-native conversation claimed under `id`; `resume` continues an
+ * existing one.
+ */
+export type CovenConversationHint = {
+  mode: "init" | "resume";
+  id: string;
+};
+
 export type LaunchCovenSessionInput = {
   projectRoot: string;
   cwd: string;
   harness: string;
   prompt: string;
   title: string;
+  model?: string;
+  launchMode?: CovenLaunchMode;
+  launchPolicy?: CovenLaunchPolicy;
+  conversation?: CovenConversationHint;
+  conversationId?: string;
+  familiarId?: string;
+  callerFamiliarId?: string;
+  executionBinding?: CovenExecutionBinding;
 };
 
 export interface CovenClient {
@@ -64,6 +134,17 @@ export interface CovenClient {
   ): Promise<CovenEventRecord[]>;
   sendInput(sessionId: string, data: string, signal?: AbortSignal): Promise<void>;
   killSession(sessionId: string, signal?: AbortSignal): Promise<void>;
+  sendBoundInput(
+    sessionId: string,
+    data: string,
+    executionBinding: CovenExecutionBinding,
+    signal?: AbortSignal,
+  ): Promise<void>;
+  killBoundSession(
+    sessionId: string,
+    executionBinding: CovenExecutionBinding,
+    signal?: AbortSignal,
+  ): Promise<void>;
 }
 
 export type CovenListEventsOptions = {
@@ -418,6 +499,200 @@ function requireNullableNumberField(
   return value;
 }
 
+const EXECUTION_BINDING_KEYS = [
+  "attemptId",
+  "contract",
+  "delegationDigest",
+  "expiresAt",
+  "familiarId",
+  "familiarSnapshotDigest",
+  "graphId",
+  "nodeId",
+  "parent",
+  "policyRevision",
+  "principalRef",
+  "projectDigest",
+  "requestDigest",
+] as const;
+
+const EXECUTION_BINDING_PARENT_KEYS = ["attemptId", "graphId", "nodeId", "sessionId"] as const;
+
+// Opaque, Psyche-defined fields: 1-255 bytes drawn only from
+// [A-Za-z0-9._:/-]. Values are never trimmed or case-folded — a rejected
+// value is invalid as-is.
+const OPAQUE_VALUE_REGEX = /^[A-Za-z0-9._:/-]+$/;
+const DIGEST_REGEX = /^sha256:[0-9a-f]{64}$/;
+const CANONICAL_EXPIRY_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/;
+
+/**
+ * Closed-object membership check shared by `executionBinding` and its
+ * `parent`: every expected key must be present and no unknown key may be
+ * present. This runs before any per-field validation so unknown/missing
+ * members are rejected as a single, uniform error class.
+ */
+function requireExactKeys(record: JsonRecord, expected: readonly string[], label: string): void {
+  const actual = Object.keys(record).sort();
+  const sortedExpected = [...expected].sort();
+  if (
+    actual.length !== sortedExpected.length ||
+    actual.some((key, index) => key !== sortedExpected[index])
+  ) {
+    throw new Error(`${label} has missing or unknown fields`);
+  }
+}
+
+function requireBindingString(record: JsonRecord, key: string, label: string): string {
+  const value = record[key];
+  if (typeof value !== "string") {
+    throw new Error(`${label}.${key} must be a string`);
+  }
+  return value;
+}
+
+function validOpaque(value: string): boolean {
+  return (
+    Buffer.byteLength(value, "ascii") === value.length &&
+    value.length >= 1 &&
+    value.length <= 255 &&
+    OPAQUE_VALUE_REGEX.test(value)
+  );
+}
+
+function validDigest(value: string): boolean {
+  return DIGEST_REGEX.test(value);
+}
+
+const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+function isGregorianLeapYear(year: number): boolean {
+  return (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+}
+
+function daysInMonth(year: number, month: number): number {
+  return month === 2 && isGregorianLeapYear(year) ? 29 : DAYS_IN_MONTH[month - 1];
+}
+
+/**
+ * Canonical RFC3339 UTC whole-second timestamp (`YYYY-MM-DDTHH:MM:SSZ`).
+ * Calendar and time-of-day fields are validated directly, field by field,
+ * rather than via `Date`: `Date` silently overflows out-of-range components
+ * (e.g. rolls `2016-12-31T24:00:00Z` into the next day) and always rejects
+ * the `:60` leap-second value, which the Rust contract's Chrono-backed
+ * `parse_expiry` accepts on every minute boundary (not only real UTC leap
+ * seconds). Matching that byte-for-byte, without normalizing or
+ * reformatting the input, keeps this validator's accepted set identical to
+ * Rust's.
+ */
+function validCanonicalExpiry(value: string): boolean {
+  if (!CANONICAL_EXPIRY_REGEX.test(value)) {
+    return false;
+  }
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const hour = Number(value.slice(11, 13));
+  const minute = Number(value.slice(14, 16));
+  const second = Number(value.slice(17, 19));
+  if (month < 1 || month > 12) {
+    return false;
+  }
+  if (day < 1 || day > daysInMonth(year, month)) {
+    return false;
+  }
+  // Hour/minute follow the usual 0-23 / 0-59 ranges; seconds allow the
+  // leap-second value 60 in addition to the usual 0-59, with no further
+  // restriction on which minute it falls in (Chrono parity, verified above).
+  return hour <= 23 && minute <= 59 && second <= 60;
+}
+
+function normalizeExecutionBindingParent(value: unknown): CovenExecutionBindingParent {
+  const record = requireRecord(value, "executionBinding.parent");
+  requireExactKeys(record, EXECUTION_BINDING_PARENT_KEYS, "executionBinding.parent");
+  const parent = {
+    sessionId: requireBindingString(record, "sessionId", "executionBinding.parent"),
+    graphId: requireBindingString(record, "graphId", "executionBinding.parent"),
+    nodeId: requireBindingString(record, "nodeId", "executionBinding.parent"),
+    attemptId: requireBindingString(record, "attemptId", "executionBinding.parent"),
+  };
+  for (const [key, field] of Object.entries(parent)) {
+    if (!validOpaque(field)) {
+      throw new Error(`executionBinding.parent.${key} is invalid`);
+    }
+  }
+  return parent;
+}
+
+/**
+ * Defense-in-depth client-side validator/normalizer for the closed
+ * `psyche.execution_binding.v1` wire object. Rust remains authoritative:
+ * this exists to fail fast and byte-exact on malformed values before a
+ * request is ever sent or a response is trusted, not to enforce business
+ * rules (e.g. expiry-at-use) that belong solely to the daemon.
+ */
+function normalizeExecutionBinding(value: unknown): CovenExecutionBinding {
+  const record = requireRecord(value, "executionBinding");
+  requireExactKeys(record, EXECUTION_BINDING_KEYS, "executionBinding");
+  const contract = requireBindingString(record, "contract", "executionBinding");
+  if (contract !== PSYCHE_EXECUTION_BINDING_V1) {
+    throw new Error("executionBinding.contract is unsupported");
+  }
+
+  const binding: CovenExecutionBinding = {
+    contract,
+    principalRef: requireBindingString(record, "principalRef", "executionBinding"),
+    familiarId: requireBindingString(record, "familiarId", "executionBinding"),
+    familiarSnapshotDigest: requireBindingString(
+      record,
+      "familiarSnapshotDigest",
+      "executionBinding",
+    ),
+    projectDigest: requireBindingString(record, "projectDigest", "executionBinding"),
+    graphId: requireBindingString(record, "graphId", "executionBinding"),
+    nodeId: requireBindingString(record, "nodeId", "executionBinding"),
+    attemptId: requireBindingString(record, "attemptId", "executionBinding"),
+    requestDigest: requireBindingString(record, "requestDigest", "executionBinding"),
+    policyRevision: requireBindingString(record, "policyRevision", "executionBinding"),
+    expiresAt: requireBindingString(record, "expiresAt", "executionBinding"),
+    parent: record.parent === null ? null : normalizeExecutionBindingParent(record.parent),
+    delegationDigest:
+      record.delegationDigest === null
+        ? null
+        : requireBindingString(record, "delegationDigest", "executionBinding"),
+  };
+
+  for (const [key, field] of [
+    ["principalRef", binding.principalRef],
+    ["familiarId", binding.familiarId],
+    ["graphId", binding.graphId],
+    ["nodeId", binding.nodeId],
+    ["attemptId", binding.attemptId],
+    ["policyRevision", binding.policyRevision],
+  ] as const) {
+    if (!validOpaque(field)) {
+      throw new Error(`executionBinding.${key} is invalid`);
+    }
+  }
+  for (const [key, field] of [
+    ["familiarSnapshotDigest", binding.familiarSnapshotDigest],
+    ["projectDigest", binding.projectDigest],
+    ["requestDigest", binding.requestDigest],
+  ] as const) {
+    if (!validDigest(field)) {
+      throw new Error(`executionBinding.${key} is invalid`);
+    }
+  }
+  if (!validCanonicalExpiry(binding.expiresAt)) {
+    throw new Error("executionBinding.expiresAt is invalid");
+  }
+  if (binding.delegationDigest !== null && !validDigest(binding.delegationDigest)) {
+    throw new Error("executionBinding.delegationDigest is invalid");
+  }
+  if ((binding.parent === null) !== (binding.delegationDigest === null)) {
+    throw new Error("executionBinding parent/delegationDigest relationship is invalid");
+  }
+  return binding;
+}
+
 function normalizeHealthResponse(value: unknown): CovenHealthResponse {
   const record = requireRecord(value, "Coven health");
   const capabilities = isJsonRecord(record.capabilities) ? record.capabilities : undefined;
@@ -430,6 +705,8 @@ function normalizeHealthResponse(value: unknown): CovenHealthResponse {
           events: capabilities.events,
           eventCursor: capabilities.eventCursor ?? capabilities.event_cursor,
           structuredErrors: capabilities.structuredErrors ?? capabilities.structured_errors,
+          executionBindingContracts:
+            capabilities.executionBindingContracts ?? capabilities.execution_binding_contracts,
         }
       : undefined,
     ok: record.ok,
@@ -439,6 +716,10 @@ function normalizeHealthResponse(value: unknown): CovenHealthResponse {
 
 function normalizeSessionRecord(value: unknown): CovenSessionRecord {
   const record = requireRecord(value, "Coven session");
+  // Rolling-upgrade compatibility: a pre-O2 daemon omits the field entirely,
+  // which normalizes to unbound (null) rather than throwing. A present
+  // non-null value is fully validated.
+  const rawExecutionBinding = record.executionBinding ?? record.execution_binding ?? null;
   return {
     id: requireStringField(record, "id", "id"),
     projectRoot: requireStringField(record, "projectRoot", "project_root"),
@@ -448,6 +729,8 @@ function normalizeSessionRecord(value: unknown): CovenSessionRecord {
     exitCode: requireNullableNumberField(record, "exitCode", "exit_code"),
     createdAt: requireStringField(record, "createdAt", "created_at"),
     updatedAt: requireStringField(record, "updatedAt", "updated_at"),
+    executionBinding:
+      rawExecutionBinding === null ? null : normalizeExecutionBinding(rawExecutionBinding),
   };
 }
 
@@ -492,13 +775,49 @@ export function createCovenClient(
         signal,
       }).then(normalizeHealthResponse);
     },
-    launchSession(input, signal) {
+    async launchSession(input, signal) {
+      // Snapshot `executionBinding` exactly once: it may be a getter, and
+      // re-reading it later (e.g. implicitly during JSON.stringify) could
+      // observe a different, unvalidated value than the one checked/
+      // normalized here. The wire body below is a single fresh plain object
+      // built from this one snapshot and every other supported launch field
+      // read directly off `input`, never from `input` itself (no spread, no
+      // reused reference), so a custom `toJSON`/prototype/getter on `input`
+      // (or a stale/dropped field from an earlier, narrower body shape) can
+      // never reach the request. `input` itself is never mutated. A field
+      // `input` doesn't set reads as `undefined` here, and `JSON.stringify`
+      // always omits an object key whose value is `undefined`, so every
+      // absent optional field is naturally dropped from the wire body
+      // without any conditional key construction.
+      const executionBindingSnapshot = input.executionBinding;
+      const body: LaunchCovenSessionInput = {
+        projectRoot: input.projectRoot,
+        cwd: input.cwd,
+        harness: input.harness,
+        prompt: input.prompt,
+        title: input.title,
+        model: input.model,
+        launchMode: input.launchMode,
+        launchPolicy: input.launchPolicy,
+        conversation: input.conversation,
+        conversationId: input.conversationId,
+        familiarId: input.familiarId,
+        callerFamiliarId: input.callerFamiliarId,
+        // Validate before any request leaves the process; Rust remains
+        // authoritative, this only fails fast on malformed client input.
+        // Replaces the snapshot with its validated plain normalized object
+        // so no getter/toJSON on it can be re-read at serialization time.
+        executionBinding:
+          executionBindingSnapshot === undefined
+            ? undefined
+            : normalizeExecutionBinding(executionBindingSnapshot),
+      };
       return requestJson<unknown>({
         socketPath,
         socketRoot: clientOptions.socketRoot,
         method: "POST",
         path: `${COVEN_API_BASE_PATH}/sessions`,
-        body: input,
+        body,
         signal,
       }).then(normalizeSessionRecord);
     },
@@ -554,6 +873,28 @@ export function createCovenClient(
         signal,
       });
     },
+    async sendBoundInput(sessionId, data, executionBinding, signal) {
+      const binding = normalizeExecutionBinding(executionBinding);
+      await requestJson<unknown>({
+        socketPath,
+        socketRoot: clientOptions.socketRoot,
+        method: "POST",
+        path: `${COVEN_API_BASE_PATH}/sessions/${encodeURIComponent(sessionId)}/input`,
+        body: { data, executionBinding: binding },
+        signal,
+      });
+    },
+    async killBoundSession(sessionId, executionBinding, signal) {
+      const binding = normalizeExecutionBinding(executionBinding);
+      await requestJson<unknown>({
+        socketPath,
+        socketRoot: clientOptions.socketRoot,
+        method: "POST",
+        path: `${COVEN_API_BASE_PATH}/sessions/${encodeURIComponent(sessionId)}/kill`,
+        body: { executionBinding: binding },
+        signal,
+      });
+    },
   };
 }
 
@@ -562,4 +903,5 @@ export const __testing = {
   normalizeEventRecord,
   normalizeHealthResponse,
   normalizeSessionRecord,
+  normalizeExecutionBinding,
 };

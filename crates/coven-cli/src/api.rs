@@ -144,6 +144,11 @@ pub struct HealthCapabilities {
     /// accepted commit requests before preview semantics existed.
     #[serde(default)]
     pub afs_commit_dry_run: bool,
+    /// Exact execution-binding contracts accepted by bound session
+    /// launch/input/kill. Additive: absent/older wire payloads default to
+    /// empty rather than failing deserialization.
+    #[serde(default)]
+    pub execution_binding_contracts: Vec<String>,
 }
 
 /// `afsMount`: a backend name, or `false`.
@@ -380,6 +385,7 @@ pub(crate) fn health_response_for_authority(
             afs_mount: MountCapability::detect(),
             afs_commit: true,
             afs_commit_dry_run: true,
+            execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
         },
         daemon,
         hub: None,
@@ -852,7 +858,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/kill") => {
             let session_id = session_action_id(path, "/kill");
-            kill_session(coven_home, session_id, runtime)
+            kill_session(coven_home, session_id, body, runtime)
         }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/handoffs") => {
             let session_id = session_action_id(path, "/handoffs");
@@ -1237,6 +1243,7 @@ fn upload_travel_delta(coven_home: &Path, body: Option<&str>, query: &str) -> Re
             updated_at: now.clone(),
             conversation_id: Some(client_id.to_string()),
             familiar_id: Some(profile.familiar_id.clone()),
+            execution_binding: None,
             labels: vec!["travel".to_string(), "offline-delta".to_string()],
             visibility: "private".to_string(),
             external: false,
@@ -1926,12 +1933,64 @@ fn launch_session(
             None,
         );
     }
-    let mut launch = match session_launch_from_payload(payload) {
+    let mut launch = match session_launch_from_payload(&payload) {
         Ok(launch) => launch,
         Err(error) => {
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    // Task 3 (#728): optional execution-binding parse. Closed-shape/contract/
+    // syntax/expiry validation (execution_binding::parse +
+    // validate_not_expired), then the root/child cross-field rule, both run
+    // before familiar resolution — `SessionLaunch`/runtime metadata stay
+    // free of this proof, per the normative launch precedence (§5.1).
+    let execution_binding = match payload.get("executionBinding") {
+        Some(value) => match crate::execution_binding::parse(value).and_then(|binding| {
+            binding.validate_not_expired(Utc::now())?;
+            Ok(binding)
+        }) {
+            Ok(binding) => Some(binding),
+            Err(error) => return execution_binding_error(error),
+        },
+        None => None,
+    };
+    // The root/child cross-field rule and parent correlation (below) must
+    // read `callerFamiliarId` at its raw, byte-exact presence — never
+    // through `SessionLaunch.caller_familiar_id`, which trims/collapses for
+    // its unrelated legacy unbound-launch display purpose (recorded to
+    // `cave-coven-calls.json` later in this function) and must keep doing
+    // so unchanged.
+    let raw_caller_familiar_id = raw_caller_familiar_id(&payload);
+    if let Some(binding) = execution_binding.as_ref() {
+        if let Err(field) = validate_binding_relationship(binding, raw_caller_familiar_id) {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Execution binding is invalid.",
+                Some(json!({ "fields": [field] })),
+            );
+        }
+        // Task 5 (#728): a bound launch must never accept a top-level
+        // `familiarId` that only matches after the legacy unbound-launch
+        // trim (§2.4, §3.1 no-normalization rule). Compare the raw,
+        // byte-exact payload value against the trimmed value
+        // `SessionLaunch.familiar_id` already holds (and that
+        // `resolve_familiar` below would otherwise silently accept); any
+        // difference — leading/trailing whitespace, or any other value
+        // that only normalizes into a match — is rejected as
+        // `execution_binding_invalid` naming `familiarId`, before
+        // resolution, the runtime, or the store. Unbound launches never
+        // take this branch and keep their existing trim/collapse-to-None
+        // behavior unchanged.
+        if raw_top_level_familiar_id(&payload) != launch.familiar_id.as_deref() {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Execution binding is invalid.",
+                Some(json!({ "fields": ["familiarId"] })),
+            );
+        }
+    }
     let familiar_ctx =
         match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
             Ok(familiar_ctx) => familiar_ctx,
@@ -1948,6 +2007,58 @@ fn launch_session(
             }
         };
     launch.familiar_id = familiar_ctx.as_ref().map(|familiar| familiar.id.clone());
+    // Task 3 (#728): canonical familiar equality and, for a child binding,
+    // parent lookup + exact correlation (§2.4). This only opens (and
+    // thereby initializes) the store when there is an actual parent to look
+    // up, i.e. a child binding — an unbound or root-bound launch must not
+    // create any store side effect ahead of the maintenance gate below, per
+    // the existing maintenance-before-store-open precedence (§5.1).
+    let mut opened_conn: Option<rusqlite::Connection> = None;
+    if let Some(binding) = execution_binding.as_ref() {
+        let Some(familiar) = familiar_ctx.as_ref() else {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Bound launch requires familiarId.",
+                Some(json!({ "fields": ["familiarId"] })),
+            );
+        };
+        if binding.familiar_id != familiar.id {
+            return execution_binding_mismatch("executionBinding.familiarId");
+        }
+        if let Some(parent) = binding.parent.as_ref() {
+            let conn = store::open_store(&store_path(coven_home))?;
+            // Advisory pre-gate check, preserving the approved external
+            // precedence (§5.1): fail fast on an already-invalid parent
+            // reference before ever taking the maintenance gate. This is
+            // *not* the authoritative check — a concurrent writer can still
+            // sacrifice/delete `parent` between here and the maintenance
+            // gate below, which is why the identical correlation runs again,
+            // atomically with the child insert, inside a transaction after
+            // the gate is acquired (see the `record.execution_binding`
+            // revalidation near the insert below).
+            // `validate_binding_relationship` already required
+            // `raw_caller_familiar_id` to be an exact, present string for a
+            // child binding, so `as_str()` is never the `Absent`/`Invalid`
+            // case here.
+            if let Err(response) =
+                correlate_child_parent(&conn, parent, raw_caller_familiar_id.as_str())?
+            {
+                return Ok(response);
+            }
+            opened_conn = Some(conn);
+            // Test-only failpoint (issue #728 BLOCKER 1, final review): a
+            // no-op in every non-test build. Deterministic concurrency tests
+            // hook this to run a real concurrent write — e.g. sacrificing
+            // this exact parent through a second connection — landing
+            // precisely in the window this blocker closes: "between initial
+            // validation and final insertion". See the in-transaction
+            // revalidation immediately before the child insert below, which
+            // is what actually protects against that window, not this
+            // advisory check.
+            parent_correlation_advisory_check_completed_failpoint();
+        }
+    }
     let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
         &launch.project_root,
     ))
@@ -1977,7 +2088,6 @@ fn launch_session(
             return api_error(423, code, &error.to_string(), details);
         }
     };
-    let conn = store::open_store(&store_path(coven_home))?;
     let now = current_timestamp();
     let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: launch.id.clone(),
@@ -1988,10 +2098,49 @@ fn launch_session(
         now,
         conversation_id: launch.conversation_id.clone(),
         familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
+        execution_binding,
         labels: Vec::new(),
         visibility: None,
     });
-    store::insert_session(&conn, &record)?;
+    // Reuse the connection opened for a child binding's parent lookup, if
+    // any; otherwise open (and thereby initialize) the store only now, after
+    // the maintenance gate has already admitted this launch. Root/unbound
+    // launches take the `None` arm here and below, preserving the existing
+    // maintenance-before-store-open precedence unchanged: no parent to
+    // revalidate means no reason to pay for a transaction.
+    let mut conn = match opened_conn {
+        Some(conn) => conn,
+        None => store::open_store(&store_path(coven_home))?,
+    };
+    match record
+        .execution_binding
+        .as_ref()
+        .and_then(|binding| binding.parent.as_ref())
+    {
+        Some(parent) => {
+            // BLOCKER 1 (#728 final review): the pre-gate correlation above
+            // is advisory only — a concurrent writer can sacrifice/delete
+            // `parent`'s session between that check and this insert. Re-read
+            // and revalidate it here, inside a SQLite IMMEDIATE transaction
+            // on the very connection that performs the insert, and commit
+            // both together. That makes final parent validation and child
+            // admission a single atomic unit against concurrent writers,
+            // with no persistent FK/uniqueness constraint added to the
+            // schema.
+            let caller_familiar_id = raw_caller_familiar_id.as_str();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Err(response) = correlate_child_parent(&tx, parent, caller_familiar_id)? {
+                // Dropping `tx` without calling `commit()` rolls it back:
+                // no child row is ever inserted on a revalidation failure.
+                return Ok(response);
+            }
+            store::insert_session(&tx, &record)?;
+            tx.commit()?;
+        }
+        None => {
+            store::insert_session(&conn, &record)?;
+        }
+    }
     if let Err(error) = match writer {
         Some(writer) => runtime.launch_session_with_writer(&launch, writer),
         None => runtime.launch_session(&launch),
@@ -2034,6 +2183,274 @@ fn launch_session(
         }
     }
     json_response(201, &record)
+}
+
+/// Maps a shape/contract/expiry violation from `execution_binding::parse` (or
+/// `validate_not_expired`) onto the O2 error codes (§7): `Missing`/`Invalid`
+/// become `400 execution_binding_invalid`, `Unsupported` becomes
+/// `400 execution_binding_unsupported`, and `Expired` becomes
+/// `409 execution_binding_expired`. Details name only the static field path —
+/// never a caller-supplied value or digest.
+fn execution_binding_error(
+    error: crate::execution_binding::ValidationError,
+) -> Result<ApiResponse> {
+    use crate::execution_binding::ValidationError;
+    match error {
+        ValidationError::Invalid { path } | ValidationError::Missing { path } => api_error(
+            400,
+            "execution_binding_invalid",
+            "Execution binding is invalid.",
+            Some(json!({ "fields": [path] })),
+        ),
+        ValidationError::Unsupported { path } => api_error(
+            400,
+            "execution_binding_unsupported",
+            "Execution binding contract is unsupported.",
+            Some(json!({ "fields": [path] })),
+        ),
+        ValidationError::Expired { path } => api_error(
+            409,
+            "execution_binding_expired",
+            "Execution binding has expired.",
+            Some(json!({ "fields": [path] })),
+        ),
+    }
+}
+
+/// `409 execution_binding_mismatch` naming only the mismatched field `path`
+/// (never a value or digest), per §7.
+fn execution_binding_mismatch(path: &'static str) -> Result<ApiResponse> {
+    api_error(
+        409,
+        "execution_binding_mismatch",
+        "Execution binding does not match the stored session.",
+        Some(json!({ "fields": [path] })),
+    )
+}
+
+/// Correlates a child binding's `parent.*` fields against the session
+/// referenced by `parent.session_id` (issue #728 Task 3, §2.4), reading
+/// through `conn` — a plain connection for the advisory pre-gate check, or a
+/// SQLite IMMEDIATE transaction for the authoritative revalidation performed
+/// immediately before the child row is inserted (BLOCKER 1, final review).
+/// Both call sites in `launch_session` share this single implementation so
+/// the rules, error codes, and field paths cannot drift between them.
+///
+/// Correlates against the referenced parent's own `SessionRecord.familiar_id`
+/// — the canonical id Coven actually persisted for that session — never
+/// against the parent binding's internal `executionBinding.familiarId`,
+/// which is an independent, Psyche-opaque value that may legitimately
+/// differ. `caller_familiar_id` must already be an exact, present string for
+/// a child binding (`validate_binding_relationship` enforces this before
+/// either call site runs), so a `None` here can only ever fail correlation,
+/// never bypass it.
+///
+/// Returns `Ok(Err(response))` — never a bare `Err` — for every correlation
+/// failure, so a caller can propagate the exact structured API response
+/// without constructing it twice or leaking the parent/caller values it
+/// deliberately omits from every response body.
+fn correlate_child_parent(
+    conn: &rusqlite::Connection,
+    parent: &crate::execution_binding::ExecutionBindingParent,
+    caller_familiar_id: Option<&str>,
+) -> Result<std::result::Result<(), ApiResponse>> {
+    let Some(parent_session) = store::get_session(conn, &parent.session_id)? else {
+        return Ok(Err(api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "fields": ["parent.sessionId"] })),
+        )?));
+    };
+    let Some(parent_binding) = parent_session.execution_binding.as_ref() else {
+        return Ok(Err(execution_binding_mismatch("parent.sessionId")?));
+    };
+    if parent_session.familiar_id.as_deref() != caller_familiar_id {
+        return Ok(Err(execution_binding_mismatch("callerFamiliarId")?));
+    }
+    if parent_binding.graph_id != parent.graph_id {
+        return Ok(Err(execution_binding_mismatch("parent.graphId")?));
+    }
+    if parent_binding.node_id != parent.node_id {
+        return Ok(Err(execution_binding_mismatch("parent.nodeId")?));
+    }
+    if parent_binding.attempt_id != parent.attempt_id {
+        return Ok(Err(execution_binding_mismatch("parent.attemptId")?));
+    }
+    Ok(Ok(()))
+}
+
+/// Test-only failpoint fired immediately after the advisory pre-gate parent
+/// correlation succeeds for a child binding (issue #728 BLOCKER 1, final
+/// review). Compiles to a genuine no-op in every non-test build — see the
+/// `#[cfg(not(test))]` sibling below — so it costs nothing and changes
+/// nothing outside `cargo test`. Deterministic concurrency tests install a
+/// hook (via `tests::ParentCorrelationFailpointGuard`) that performs a real
+/// concurrent write, such as sacrificing the just-validated parent through a
+/// second connection, at exactly this point: the window between the initial
+/// (pre-gate) validation and the final (in-transaction) insertion. This lets
+/// a test prove the in-transaction revalidation below — not this advisory
+/// check — is what actually protects the insert, without any sleep or
+/// timing guess.
+#[cfg(test)]
+fn parent_correlation_advisory_check_completed_failpoint() {
+    tests::PARENT_CORRELATION_FAILPOINT.with(|hook| {
+        if let Some(callback) = hook.borrow_mut().as_mut() {
+            callback();
+        }
+    });
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn parent_correlation_advisory_check_completed_failpoint() {}
+
+/// A bound-mutation proof failure (issue #728 Task 4, §4). Distinct from
+/// [`crate::execution_binding::ValidationError`] because an absent
+/// `executionBinding` field, or one missing a required member, must map to
+/// `400 execution_binding_required` here — not the shape-focused
+/// `execution_binding_invalid` that `execution_binding::parse` normally
+/// reports for a `Missing` field when parsing a launch-time binding.
+#[derive(Debug)]
+enum BoundProofError {
+    /// `executionBinding` is entirely absent, or present but missing one or
+    /// more required members (root or `parent`).
+    Required { path: &'static str },
+    /// `executionBinding` is present and complete but fails shape/syntax
+    /// (`Invalid`) or names an unsupported contract (`Unsupported`).
+    Validation(crate::execution_binding::ValidationError),
+    /// `executionBinding` parses and validates but does not exactly match
+    /// the session's stored binding at `path`.
+    Mismatch { path: &'static str },
+}
+
+/// Parses and exact-matches the `executionBinding` proof required by a
+/// bound input/kill request against the session's `stored` binding. See
+/// `BoundProofError` for how parse outcomes map onto the O2 error taxonomy.
+fn require_bound_proof(
+    payload: &Value,
+    stored: &crate::execution_binding::ExecutionBinding,
+) -> std::result::Result<crate::execution_binding::ExecutionBinding, BoundProofError> {
+    let Some(value) = payload.get("executionBinding") else {
+        return Err(BoundProofError::Required {
+            path: "executionBinding",
+        });
+    };
+    let supplied = crate::execution_binding::parse(value).map_err(|error| match error {
+        crate::execution_binding::ValidationError::Missing { path } => {
+            BoundProofError::Required { path }
+        }
+        other => BoundProofError::Validation(other),
+    })?;
+    if let Some(path) = stored.first_mismatch_path(&supplied) {
+        return Err(BoundProofError::Mismatch { path });
+    }
+    Ok(supplied)
+}
+
+/// Maps a [`BoundProofError`] onto its O2 response, per §7: absent/incomplete
+/// proof is `400 execution_binding_required`; malformed shape or unsupported
+/// contract reuse [`execution_binding_error`]; an exact mismatch is
+/// `409 execution_binding_mismatch` naming only the mismatched field path.
+fn bound_proof_error_response(error: BoundProofError) -> Result<ApiResponse> {
+    match error {
+        BoundProofError::Required { path } => api_error(
+            400,
+            "execution_binding_required",
+            "Bound operation requires a complete executionBinding.",
+            Some(json!({ "fields": [path] })),
+        ),
+        BoundProofError::Validation(error) => execution_binding_error(error),
+        BoundProofError::Mismatch { path } => execution_binding_mismatch(path),
+    }
+}
+
+/// The raw, byte-exact presence/value of the top-level `callerFamiliarId`
+/// launch field, read directly from the JSON payload rather than through
+/// `SessionLaunch.caller_familiar_id` (which trims and collapses an
+/// empty/whitespace-only value into `None` for its unrelated legacy
+/// unbound-launch display purpose). Bound-launch validation (§2.4, §3.1)
+/// must never trim, case-fold, or otherwise normalize this field: a present
+/// `null`, non-string, empty, or whitespace-padded value is a distinct
+/// syntax failure, not an absent field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawCallerFamiliarId<'a> {
+    /// The `callerFamiliarId` key is entirely absent from the payload.
+    Absent,
+    /// The key is present with an exact, non-empty, unpadded string value.
+    Present(&'a str),
+    /// The key is present but its value is `null`, not a string, empty, or
+    /// carries leading/trailing whitespace (including whitespace-only).
+    Invalid,
+}
+
+impl<'a> RawCallerFamiliarId<'a> {
+    /// The exact byte value when present and valid; `None` otherwise.
+    fn as_str(self) -> Option<&'a str> {
+        match self {
+            RawCallerFamiliarId::Present(id) => Some(id),
+            RawCallerFamiliarId::Absent | RawCallerFamiliarId::Invalid => None,
+        }
+    }
+}
+
+/// Reads `callerFamiliarId` directly from the raw request payload with no
+/// normalization, per §3.1.
+fn raw_caller_familiar_id(payload: &Value) -> RawCallerFamiliarId<'_> {
+    match payload.get("callerFamiliarId") {
+        None => RawCallerFamiliarId::Absent,
+        Some(Value::String(id)) if !id.is_empty() && id.trim() == id.as_str() => {
+            RawCallerFamiliarId::Present(id.as_str())
+        }
+        Some(_) => RawCallerFamiliarId::Invalid,
+    }
+}
+
+/// Reads the raw, byte-exact top-level `familiarId` launch field directly
+/// from the request payload, with no normalization applied — unlike
+/// `SessionLaunch.familiar_id`, which trims and collapses an empty/
+/// whitespace-only value to `None` for its legacy unbound-launch
+/// resolution purpose (and must keep doing so unchanged for unbound
+/// launches). A bound launch (§2.4, §3.1) compares this raw value against
+/// that trimmed one to reject any value that only matches after
+/// normalization. Returns `None` when the key is absent or is not a JSON
+/// string.
+fn raw_top_level_familiar_id(payload: &Value) -> Option<&str> {
+    payload.get("familiarId").and_then(Value::as_str)
+}
+
+/// Enforces the root/child cross-field rule (§2.4): a root binding requires
+/// `parent`, `delegationDigest`, and `callerFamiliarId` to be entirely
+/// absent; a child binding requires all three to be present. Any other
+/// combination is inconsistent. `callerFamiliarId` lives outside the parsed
+/// `executionBinding` object (it is a top-level launch field), so this
+/// cross-field check stays at the route level rather than inside
+/// `execution_binding::parse`. Returns the single field path responsible for
+/// the inconsistency on failure.
+///
+/// A raw `callerFamiliarId` that is present but invalid (`null`, non-string,
+/// empty, or whitespace-padded) always fails at `callerFamiliarId`,
+/// independent of `parent`/`delegationDigest`: it must never be collapsed
+/// into "absent", which would otherwise let a malformed value silently
+/// validate as a root binding (§3.1).
+fn validate_binding_relationship(
+    binding: &crate::execution_binding::ExecutionBinding,
+    caller_familiar_id: RawCallerFamiliarId<'_>,
+) -> std::result::Result<(), &'static str> {
+    if caller_familiar_id == RawCallerFamiliarId::Invalid {
+        return Err("callerFamiliarId");
+    }
+    match (
+        &binding.parent,
+        &binding.delegation_digest,
+        caller_familiar_id.as_str(),
+    ) {
+        (None, None, None) => Ok(()),
+        (Some(_), Some(_), Some(_)) => Ok(()),
+        (None, _, _) => Err("executionBinding.parent"),
+        (Some(_), None, _) => Err("executionBinding.delegationDigest"),
+        (Some(_), Some(_), None) => Err("callerFamiliarId"),
+    }
 }
 
 const MAX_EXTERNAL_SESSION_LABELS: usize = 16;
@@ -2080,6 +2497,17 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
         Ok(payload) => payload,
         Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
     };
+    // Task 3 (#728, §6): reject any executionBinding at all, before reading
+    // any registration field. Coven does not supervise an externally
+    // registered runtime and cannot honor bound-operation guarantees for it.
+    if payload.get("executionBinding").is_some() {
+        return api_error(
+            400,
+            "execution_binding_invalid",
+            "External sessions cannot carry execution bindings.",
+            Some(json!({ "fields": ["executionBinding"] })),
+        );
+    }
     let id = match required_string(&payload, "id") {
         Ok(id) => id,
         Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
@@ -2120,6 +2548,7 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
         updated_at: now,
         conversation_id: None,
         familiar_id: None,
+        execution_binding: None,
         labels,
         visibility: "private".to_string(),
         external: true,
@@ -2515,8 +2944,8 @@ fn handoff_error(error: anyhow::Error, session_id: &str) -> Result<ApiResponse> 
     api_error(status, code, copy, Some(json!({ "sessionId": session_id })))
 }
 
-fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
-    let project_root = required_string(&payload, "projectRoot")?;
+fn session_launch_from_payload(payload: &Value) -> Result<SessionLaunch> {
+    let project_root = required_string(payload, "projectRoot")?;
     let cwd = payload.get("cwd").and_then(Value::as_str);
     let paths = session_launch::resolve_launch_paths(Path::new(&project_root), cwd.map(Path::new))
         .map_err(|error| match error {
@@ -2525,7 +2954,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
             }
             session_launch::LaunchPathError::Cwd(error) => error,
         })?;
-    let harness = required_string(&payload, "harness")?;
+    let harness = required_string(payload, "harness")?;
     // Validate against the supported harness set up-front (client error)
     // instead of letting the runtime's arg builder surface it later as a
     // 500. Bonus: rejecting here means we never insert a session row for
@@ -2533,15 +2962,15 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
     // not required (HarnessCheck::Configured): a configured-but-missing
     // binary is surfaced by the runtime as a structured launch failure.
     session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?;
-    let launch_mode = launch_mode_from_payload(&payload)?;
-    let launch_policy = launch_policy_from_payload(&payload, &harness, launch_mode)?;
+    let launch_mode = launch_mode_from_payload(payload)?;
+    let launch_policy = launch_policy_from_payload(payload, &harness, launch_mode)?;
     let model = payload
         .get("model")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|model| !model.is_empty())
         .map(ToOwned::to_owned);
-    let prompt = required_string(&payload, "prompt")?;
+    let prompt = required_string(payload, "prompt")?;
     let title = payload
         .get("title")
         .and_then(Value::as_str)
@@ -2549,7 +2978,7 @@ fn session_launch_from_payload(payload: Value) -> Result<SessionLaunch> {
         .unwrap_or(&prompt)
         .to_string();
 
-    let conversation = conversation_from_payload(&payload)?;
+    let conversation = conversation_from_payload(payload)?;
     let conversation_id = payload
         .get("conversationId")
         .and_then(Value::as_str)
@@ -2722,36 +3151,87 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     };
-    if session.status != "running" {
-        return session_not_live_response(session_id);
-    }
+    let is_bound = session.execution_binding.is_some();
 
     // Same structured-error pattern as `launch_session`: malformed JSON
     // or runtime send failures must NOT propagate to the accept loop
     // (that crashes the daemon process). Parse errors → 400; runtime
     // errors → 500 except for "not live" which is the dedicated 409.
-    let payload = match parse_body(body) {
-        Ok(payload) => payload,
-        Err(error) => {
-            return api_error(
-                400,
-                "invalid_request",
-                &error.to_string(),
-                Some(json!({ "sessionId": session_id })),
-            );
+    let parse_error_response = |error: anyhow::Error| {
+        api_error(
+            400,
+            "invalid_request",
+            &error.to_string(),
+            Some(json!({ "sessionId": session_id })),
+        )
+    };
+
+    let payload = if let Some(stored_binding) = session.execution_binding.as_ref() {
+        // Bound precedence (issue #728 Task 4, §4.2): session lookup, body
+        // parse, then complete exact-match proof (including the input-only
+        // expiry rejection) all run *before* the existing status/liveness
+        // gate. This deliberately reorders the unbound flow below: a bound
+        // caller with no/incomplete/malformed/mismatched/expired proof must
+        // fail closed on the proof itself, never learning session liveness
+        // from the response.
+        let payload = match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => return parse_error_response(error),
+        };
+        let supplied = match require_bound_proof(&payload, stored_binding) {
+            Ok(supplied) => supplied,
+            Err(error) => return bound_proof_error_response(error),
+        };
+        if let Err(error) = supplied.validate_not_expired(Utc::now()) {
+            return execution_binding_error(error);
+        }
+        if session.status != "running" {
+            return session_not_live_response(session_id);
+        }
+        payload
+    } else {
+        // Unbound precedence is unchanged: liveness is checked before the
+        // body is even parsed.
+        if session.status != "running" {
+            return session_not_live_response(session_id);
+        }
+        match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => return parse_error_response(error),
         }
     };
     // Validate `data` shape here (client error) instead of letting the
     // runtime surface it as a 500. Required field, must be a string.
-    if !payload.get("data").map(|v| v.is_string()).unwrap_or(false) {
+    let Some(data) = payload.get("data").and_then(Value::as_str) else {
         return api_error(
             400,
             "invalid_request",
             "input payload requires string field `data`",
             Some(json!({ "sessionId": session_id })),
         );
-    }
-    match runtime.can_record_session_event(session_id, "input", &payload) {
+    };
+    // Metadata isolation (issue #728 Task 4, §4.4): `executionBinding` is
+    // reserved proof metadata that must never reach writer capacity checks,
+    // the runtime, or the persisted event — on a bound session because it
+    // has already served its purpose (the exact-match proof above), and on
+    // an *unbound* session because the key is reserved regardless of
+    // whether a proof was ever required. An unbound session never runs the
+    // proof steps, so a malformed or incomplete `executionBinding` here is
+    // never validated or rejected — it is simply stripped, unvalidated,
+    // alongside a well-formed one. Every other field's shape and precedence
+    // is unaffected: this only ever removes the single reserved key,
+    // preserving the caller's exact payload (and legacy unbound behavior)
+    // otherwise.
+    let action_payload = if is_bound {
+        json!({ "data": data })
+    } else {
+        let mut sanitized = payload.clone();
+        if let Value::Object(fields) = &mut sanitized {
+            fields.remove("executionBinding");
+        }
+        sanitized
+    };
+    match runtime.can_record_session_event(session_id, "input", &action_payload) {
         Some(Ok(true)) | None => {}
         Some(Ok(false)) => {
             return api_error(
@@ -2773,7 +3253,6 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     }
-    let action_payload = payload.clone();
     let mut action = || {
         runtime
             .send_input(session_id, &action_payload)
@@ -2785,7 +3264,7 @@ fn record_input(
         coven_home,
         session_id,
         "input",
-        payload,
+        action_payload.clone(),
         &mut action,
     ) {
         Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
@@ -2825,6 +3304,7 @@ fn record_input(
 fn kill_session(
     coven_home: &Path,
     session_id: &str,
+    body: Option<&str>,
     runtime: &dyn SessionRuntime,
 ) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
@@ -2836,6 +3316,32 @@ fn kill_session(
             Some(json!({ "sessionId": session_id })),
         );
     };
+
+    if let Some(stored_binding) = session.execution_binding.as_ref() {
+        // Bound precedence (issue #728 Task 4, §4.3): session lookup, body
+        // parse, then complete exact-match proof, run *before* the existing
+        // status/external checks below. Unlike input, kill deliberately
+        // does NOT reject an elapsed `expiresAt` — an exact-matching but
+        // expired proof is still accepted, so a caller can always tear down
+        // a session it can prove it owns.
+        let payload = match parse_body(body) {
+            Ok(payload) => payload,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": session_id })),
+                );
+            }
+        };
+        if let Err(error) = require_bound_proof(&payload, stored_binding) {
+            return bound_proof_error_response(error);
+        }
+    }
+    // Unbound sessions preserve existing precedence/behavior entirely: the
+    // body (if any) is never parsed or validated for a kill request.
+
     if session.status != "running" {
         return session_not_live_response(session_id);
     }
@@ -3155,6 +3661,7 @@ fn ensure_cockpit_session(conn: &rusqlite::Connection) -> Result<()> {
         updated_at: now,
         conversation_id: None,
         familiar_id: None,
+        execution_binding: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
         external: false,
@@ -7186,6 +7693,34 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// Backing storage for the parent-correlation failpoint (issue #728
+        /// BLOCKER 1, final review). Thread-local so parallel `cargo test`
+        /// threads never see each other's installed hook, and each test
+        /// starts with `None` — the failpoint call in `launch_session` is a
+        /// silent no-op for every test that never installs one.
+        pub(super) static PARENT_CORRELATION_FAILPOINT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    /// RAII installer for [`PARENT_CORRELATION_FAILPOINT`]. Clears the hook
+    /// on drop (including on test panic/unwind) so one test's failpoint can
+    /// never leak into another that happens to reuse the same test thread.
+    struct ParentCorrelationFailpointGuard;
+
+    impl ParentCorrelationFailpointGuard {
+        fn install(hook: impl FnMut() + 'static) -> Self {
+            PARENT_CORRELATION_FAILPOINT.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for ParentCorrelationFailpointGuard {
+        fn drop(&mut self) {
+            PARENT_CORRELATION_FAILPOINT.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
     fn afs_project(dir: &Path) -> String {
         let root = dir.join("project");
         std::fs::create_dir_all(root.join("src")).unwrap();
@@ -7576,6 +8111,7 @@ mod tests {
                     updated_at: created_at.to_string(),
                     conversation_id: None,
                     familiar_id: None,
+                    execution_binding: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
                     external: false,
@@ -7951,6 +8487,10 @@ mod tests {
         assert_eq!(body["capabilities"]["structuredErrors"], true);
         assert_eq!(body["capabilities"]["sessionHandoff"], true);
         assert_eq!(body["capabilities"]["sessionLaunchPolicy"], true);
+        assert_eq!(
+            body["capabilities"]["executionBindingContracts"],
+            json!(["psyche.execution_binding.v1"])
+        );
         Ok(())
     }
 
@@ -8707,6 +9247,7 @@ mod tests {
                 updated_at: "2026-01-01T00:00:00Z".into(),
                 conversation_id: None,
                 familiar_id: None,
+                execution_binding: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
                 external: false,
@@ -8967,6 +9508,7 @@ mod tests {
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -9084,8 +9626,48 @@ mod tests {
         assert!(response.body.contains(r#""code":"maintenance_locked""#));
         assert!(response.body.contains("cave-delete"));
         assert!(runtime.launches.borrow().is_empty());
+        // Regression (#728 Task 3): an unbound launch must consult the
+        // maintenance gate before ever opening (and thereby initializing) the
+        // writable store, so a rejected admission leaves no store file behind.
+        assert!(
+            !store_path(temp_dir.path()).exists(),
+            "a maintenance-rejected unbound launch must not initialize the store"
+        );
         let conn = store::open_store(&store_path(temp_dir.path()))?;
         assert!(store::list_sessions(&conn)?.is_empty());
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_root_launch_maintenance_lock_does_not_open_store_before_the_gate() -> anyhow::Result<()>
+    {
+        // Regression (#728 Task 3): a root-bound launch (no `parent` to look
+        // up) must preserve the existing maintenance-before-store-open
+        // precedence exactly like an unbound launch, and must not create the
+        // store as a side effect of a rejected admission.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(init.success());
+        let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let owner = gate.acquire_owner("cave-delete")?;
+
+        let (response, runtime) =
+            run_bound_launch(&temp_dir, &project_root, "sage", root_binding("sage"))?;
+
+        assert_eq!(response.status, 423, "{}", response.body);
+        assert!(response.body.contains(r#""code":"maintenance_locked""#));
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(
+            !store_path(temp_dir.path()).exists(),
+            "a maintenance-rejected root-bound launch must not initialize the store"
+        );
         owner.release()?;
         Ok(())
     }
@@ -9499,6 +10081,1719 @@ mod tests {
         assert!(
             runtime.launches.borrow().is_empty(),
             "malformed familiar config must not launch a runtime"
+        );
+        Ok(())
+    }
+
+    // -- Execution-binding launch correlation (issue #728 Task 3) --------
+
+    fn digest(byte: char) -> String {
+        format!("sha256:{}", byte.to_string().repeat(64))
+    }
+
+    fn root_binding(familiar_id: &str) -> Value {
+        json!({
+            "contract": crate::execution_binding::CONTRACT,
+            "principalRef": "principal:operator",
+            "familiarId": familiar_id,
+            "familiarSnapshotDigest": digest('a'),
+            "projectDigest": digest('b'),
+            "graphId": "graph-1",
+            "nodeId": "node-1",
+            "attemptId": "attempt-1",
+            "requestDigest": digest('c'),
+            "policyRevision": "policy:7",
+            "expiresAt": "2099-01-01T00:00:00Z",
+            "parent": null,
+            "delegationDigest": null
+        })
+    }
+
+    #[test]
+    fn bound_root_launch_persists_the_exact_binding() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["familiar_id"], "sage");
+        assert_eq!(response["execution_binding"], root_binding("sage"));
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    /// A child binding referencing `parent_session_id`. `graph_id`/`node_id`/
+    /// `attempt_id` are the submitted `parent.*` correlation fields — tests
+    /// vary these independently from the stored parent's own fields to probe
+    /// each mismatch path.
+    fn child_binding(
+        familiar_id: &str,
+        parent_session_id: &str,
+        graph_id: &str,
+        node_id: &str,
+        attempt_id: &str,
+    ) -> Value {
+        json!({
+            "contract": crate::execution_binding::CONTRACT,
+            "principalRef": "principal:operator",
+            "familiarId": familiar_id,
+            "familiarSnapshotDigest": digest('a'),
+            "projectDigest": digest('b'),
+            "graphId": "graph-2",
+            "nodeId": "node-2",
+            "attemptId": "attempt-2",
+            "requestDigest": digest('d'),
+            "policyRevision": "policy:7",
+            "expiresAt": "2099-01-01T00:00:00Z",
+            "parent": {
+                "sessionId": parent_session_id,
+                "graphId": graph_id,
+                "nodeId": node_id,
+                "attemptId": attempt_id,
+            },
+            "delegationDigest": digest('e')
+        })
+    }
+
+    /// Directly persists a session row already carrying a stored
+    /// `execution_binding`, standing in for a previously-launched bound
+    /// parent session without re-running the full launch path.
+    fn insert_bound_session(
+        coven_home: &Path,
+        id: &str,
+        familiar_id: &str,
+        binding: Option<crate::execution_binding::ExecutionBinding>,
+    ) -> anyhow::Result<()> {
+        insert_bound_session_with_options(coven_home, id, familiar_id, binding, "running", false)
+    }
+
+    /// Like [`insert_bound_session`], but allows overriding `status` and
+    /// `external` so bound-operation precedence tests (issue #728 Task 4)
+    /// can exercise a bound session that is not-live or externally
+    /// registered without re-running the full launch path.
+    fn insert_bound_session_with_options(
+        coven_home: &Path,
+        id: &str,
+        familiar_id: &str,
+        binding: Option<crate::execution_binding::ExecutionBinding>,
+        status: &str,
+        external: bool,
+    ) -> anyhow::Result<()> {
+        let conn = crate::store::open_store(&store_path(coven_home))?;
+        let now = current_timestamp();
+        let record = crate::store::SessionRecord {
+            id: id.to_string(),
+            project_root: "/repo".to_string(),
+            harness: "codex".to_string(),
+            title: "parent session".to_string(),
+            status: status.to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            conversation_id: None,
+            familiar_id: Some(familiar_id.to_string()),
+            execution_binding: binding,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external,
+            transcript_path: None,
+        };
+        crate::store::insert_session(&conn, &record)?;
+        Ok(())
+    }
+
+    fn assert_no_row_and_no_launch(
+        coven_home: &Path,
+        runtime: &RecordingRuntime,
+    ) -> anyhow::Result<()> {
+        assert_no_new_row_and_no_launch(coven_home, runtime, 0)
+    }
+
+    /// Like [`assert_no_row_and_no_launch`], but tolerant of `existing_rows`
+    /// session rows already present before the rejected launch (e.g. a
+    /// pre-seeded bound or unbound parent session).
+    fn assert_no_new_row_and_no_launch(
+        coven_home: &Path,
+        runtime: &RecordingRuntime,
+        existing_rows: usize,
+    ) -> anyhow::Result<()> {
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "a rejected bound launch must not invoke the runtime"
+        );
+        let conn = store::open_store(&store_path(coven_home))?;
+        assert_eq!(
+            store::list_sessions(&conn)?.len(),
+            existing_rows,
+            "a rejected bound launch must not insert a session row"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_child_launch_correlates_and_persists() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["familiar_id"], "sage");
+        assert_eq!(response["execution_binding"], binding);
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    fn assert_binding_error(
+        response: &ApiResponse,
+        status: u16,
+        code: &str,
+        expected_fields: &[&str],
+    ) -> anyhow::Result<()> {
+        assert_eq!(response.status, status, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], code, "{}", response.body);
+        assert_eq!(
+            body["error"]["details"]["fields"],
+            json!(expected_fields),
+            "{}",
+            response.body
+        );
+        Ok(())
+    }
+
+    /// Every opaque identifier/digest value a submitted `executionBinding`
+    /// proof carries, at both the root and nested `parent` levels. Skips
+    /// `contract`, a fixed constant name rather than caller-supplied
+    /// content. Used to prove a mismatch response never echoes any
+    /// submitted value back to the caller (§7), regardless of which single
+    /// field was substituted to produce the mismatch.
+    fn submitted_binding_values(binding: &Value) -> Vec<String> {
+        let object = binding
+            .as_object()
+            .expect("binding fixture must be a JSON object");
+        let mut values = Vec::new();
+        for (key, value) in object {
+            if key == "contract" {
+                continue;
+            }
+            match value {
+                Value::String(string) => values.push(string.clone()),
+                Value::Object(parent) => {
+                    for parent_value in parent.values() {
+                        if let Value::String(string) = parent_value {
+                            values.push(string.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        values
+    }
+
+    /// Extends [`assert_binding_error`] with a redaction check (issue #728
+    /// Task 4, §7): asserts `details` names only the static `fields` path
+    /// array — never a sibling key carrying a value or digest — and that
+    /// none of `forbidden` (the opaque identifier/digest values the proof
+    /// under test submitted) appear anywhere in the raw serialized response
+    /// body.
+    /// Recursively collects every JSON string leaf under `value`, used to
+    /// compare parsed response content against forbidden submitted values by
+    /// exact match rather than raw substring search (a raw substring search
+    /// would false-positive on fixed message text that merely happens to
+    /// contain a short opaque value as a fragment, e.g. `"sage"` inside
+    /// `"message"`).
+    fn collect_json_strings(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(string) => out.push(string.clone()),
+            Value::Array(items) => {
+                for item in items {
+                    collect_json_strings(item, out);
+                }
+            }
+            Value::Object(map) => {
+                for value in map.values() {
+                    collect_json_strings(value, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_binding_error_redacts(
+        response: &ApiResponse,
+        status: u16,
+        code: &str,
+        expected_fields: &[&str],
+        forbidden: &[String],
+    ) -> anyhow::Result<()> {
+        assert_binding_error(response, status, code, expected_fields)?;
+        let body: Value = serde_json::from_str(&response.body)?;
+        let details = body["error"]["details"]
+            .as_object()
+            .expect("details must be a JSON object");
+        assert_eq!(
+            details.keys().collect::<Vec<_>>(),
+            vec!["fields"],
+            "details must name only the mismatched field path, never a value: {}",
+            response.body
+        );
+        let mut leaves = Vec::new();
+        collect_json_strings(&body, &mut leaves);
+        for value in forbidden {
+            assert!(
+                !value.is_empty(),
+                "forbidden value under test must not be empty"
+            );
+            assert!(
+                !leaves.iter().any(|leaf| leaf == value),
+                "response body must not leak submitted value {value:?}: {}",
+                response.body
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_missing_familiar_id_is_rejected() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(&response, 400, "execution_binding_invalid", &["familiarId"])?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_canonical_familiar_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "executionBinding": root_binding("cody"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["executionBinding.familiarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_whitespace_padded_top_level_familiar_id() -> anyhow::Result<()> {
+        // Regression (issue #728 Task 6, finding 5): trimming " sage " to
+        // "sage" would resolve to, and byte-match, the canonical familiar id
+        // — but a bound launch must reject the raw padded value outright
+        // rather than silently normalizing it into a match, per the
+        // no-normalization rule (§3.1). This must fail before familiar
+        // resolution, the runtime, or the store are touched.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": " sage ",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(&response, 400, "execution_binding_invalid", &["familiarId"])?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_launch_still_trims_top_level_familiar_id() -> anyhow::Result<()> {
+        // Positive control paired with the regression above: legacy unbound
+        // launches must keep their existing trim/collapse behavior — this
+        // rule only applies to a bound launch.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": " sage ",
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response["familiar_id"], "sage");
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    fn bound_launch_body(project_root: &Path, familiar_id: &str, binding: Value) -> String {
+        json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": familiar_id,
+            "executionBinding": binding,
+        })
+        .to_string()
+    }
+
+    fn run_bound_launch(
+        temp_dir: &tempfile::TempDir,
+        project_root: &Path,
+        familiar_id: &str,
+        binding: Value,
+    ) -> anyhow::Result<(ApiResponse, RecordingRuntime)> {
+        let runtime = RecordingRuntime::default();
+        let body = bound_launch_body(project_root, familiar_id, binding);
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+        Ok((response, runtime))
+    }
+
+    #[test]
+    fn root_binding_with_only_parent_present_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["parent"] = json!({
+            "sessionId": "parent-1",
+            "graphId": "graph-1",
+            "nodeId": "node-1",
+            "attemptId": "attempt-1"
+        });
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.delegationDigest"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_binding_with_only_delegation_digest_present_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["delegationDigest"] = json!(digest('e'));
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.parent"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_binding_with_only_caller_familiar_id_present_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.parent"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_binding_missing_parent_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let mut binding = root_binding("sage");
+        binding["delegationDigest"] = json!(digest('e'));
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.parent"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_binding_missing_delegation_digest_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let mut binding = binding;
+        binding["delegationDigest"] = Value::Null;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.delegationDigest"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_binding_missing_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    /// Regressions (#728 Task 3, §3.1): a present `callerFamiliarId` must
+    /// never be trimmed/collapsed into "absent". Each of these is a raw
+    /// presence/syntax failure and must report `execution_binding_invalid`
+    /// at `callerFamiliarId` — including for an otherwise-valid **root**
+    /// binding, where the old trim-then-filter-empty normalization silently
+    /// collapsed a present-but-blank value into "absent" and let the root
+    /// binding through as if `callerFamiliarId` had never been supplied.
+    #[test]
+    fn root_binding_with_null_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": null,
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_binding_with_non_string_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": 42,
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_binding_with_empty_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn root_binding_with_whitespace_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "   ",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+        let runtime = RecordingRuntime::default();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_binding_with_whitespace_padded_caller_familiar_id_is_invalid() -> anyhow::Result<()> {
+        // Regression: trimming " cody" to "cody" would byte-match the
+        // parent's canonical familiar id, but the raw value carries padding
+        // and must be rejected as invalid rather than silently normalized
+        // into a match.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": " cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_binding_with_exact_caller_familiar_id_matches_byte_for_byte() -> anyhow::Result<()> {
+        // Positive control paired with the padding regression above: the
+        // exact, unpadded value must still be accepted and correlated.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    /// Regressions (#728 Task 3, §2.4): parent familiar correlation must
+    /// compare the request's `callerFamiliarId` against the referenced
+    /// parent's own `SessionRecord.familiar_id` — never against the parent
+    /// binding's internal `executionBinding.familiarId`. The parent here is
+    /// deliberately constructed with those two values set differently
+    /// ("mirror-familiar" as the session record's familiar, "cody" baked
+    /// into its stored binding) so a comparison against the wrong field
+    /// cannot coincidentally pass.
+    #[test]
+    fn child_launch_correlates_against_parent_session_familiar_id_not_binding_familiar_id(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(
+            temp_dir.path(),
+            "parent-1",
+            "mirror-familiar",
+            Some(parent_binding),
+        )?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "mirror-familiar",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 201, "{}", response.body);
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_rejects_caller_familiar_id_matching_only_parent_binding_familiar_id(
+    ) -> anyhow::Result<()> {
+        // The inverse of the regression above: "cody" matches the parent's
+        // stored *binding* familiarId, but not the parent *session record's*
+        // familiar_id ("mirror-familiar"). Correlation must still fail —
+        // proving the fix reads the session record field and doesn't just
+        // relax the check entirely.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(
+            temp_dir.path(),
+            "parent-1",
+            "mirror-familiar",
+            Some(parent_binding),
+        )?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_with_missing_parent_session_returns_404() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "missing-parent", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 404, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "session_not_found");
+        // A missing referenced parent must report only the normative field
+        // path — never echo the (nonexistent) parent session id back to the
+        // caller.
+        assert_eq!(
+            body["error"]["details"],
+            json!({ "fields": ["parent.sessionId"] }),
+            "{}",
+            response.body
+        );
+        assert!(
+            !response.body.contains("missing-parent"),
+            "404 details must never echo the referenced parent session id, got: {}",
+            response.body
+        );
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_with_unbound_parent_returns_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        insert_test_session(temp_dir.path(), "parent-1")?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["parent.sessionId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_rejects_parent_familiar_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "sage",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["callerFamiliarId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_rejects_parent_graph_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-wrong", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["parent.graphId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_rejects_parent_node_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-wrong", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["parent.nodeId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn child_launch_rejects_parent_attempt_mismatch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-wrong");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_mismatch",
+            &["parent.attemptId"],
+        )?;
+        assert_no_new_row_and_no_launch(temp_dir.path(), &runtime, 1)?;
+        Ok(())
+    }
+
+    // -- Atomic parent correlation across concurrent writers (issue #728 --
+    // -- BLOCKER 1, final review) ------------------------------------------
+
+    /// Store/helper-level proof that the `correlate_child_parent` +
+    /// child-insert sequence `launch_session` runs after the maintenance
+    /// gate is a genuinely atomic unit against a concurrent writer, not just
+    /// "the same connection performing two separate autocommit statements".
+    ///
+    /// Deterministic and sleep-free: a second, independent connection to the
+    /// same store file is configured with a zero busy timeout, so an attempt
+    /// to write while our `IMMEDIATE` transaction still holds the write lock
+    /// fails immediately with `SQLITE_BUSY` — proving the lock, not timing,
+    /// is what a concurrent sacrifice/delete would actually run into for the
+    /// whole span between revalidation and the child row's insert.
+    #[test]
+    fn child_parent_transaction_blocks_concurrent_parent_write_until_commit() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let path = store_path(temp_dir.path());
+        let mut conn = crate::store::open_store(&path)?;
+        let parent = crate::execution_binding::ExecutionBindingParent {
+            session_id: "parent-1".to_string(),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+        };
+
+        // Mirrors `launch_session`'s post-gate step exactly: an `IMMEDIATE`
+        // transaction on the connection that will also perform the insert.
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        assert_eq!(
+            correlate_child_parent(&tx, &parent, Some("cody"))?,
+            Ok(()),
+            "parent is still valid at this point and must revalidate cleanly"
+        );
+
+        // A concurrent writer — standing in for a `sacrifice`/delete request
+        // handled on another connection — must not be able to touch
+        // `parent-1` while our transaction still holds the write lock.
+        let concurrent_writer = rusqlite::Connection::open(&path)?;
+        concurrent_writer.execute_batch("PRAGMA busy_timeout = 0;")?;
+        let concurrent_delete =
+            concurrent_writer.execute("DELETE FROM sessions WHERE id = 'parent-1'", []);
+        match concurrent_delete {
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy => {}
+            other => panic!(
+                "a concurrent delete must be blocked (SQLITE_BUSY) while the child-insert \
+                 transaction holds the write lock, got: {other:?}"
+            ),
+        }
+
+        // Insert the child row inside the same transaction, exactly as
+        // `launch_session` does, then commit — releasing the write lock.
+        let child = test_child_session_record("child-1", "sage", &parent);
+        crate::store::insert_session(&tx, &child)?;
+        tx.commit()?;
+
+        // Only now can the concurrent writer proceed. The parent survived
+        // (our commit won the race) and the child is present too.
+        concurrent_writer
+            .execute("DELETE FROM sessions WHERE id = 'does-not-exist'", [])
+            .expect("write lock must be free once our transaction has committed");
+        let verify_conn = crate::store::open_store(&path)?;
+        assert!(store::get_session(&verify_conn, "parent-1")?.is_some());
+        assert!(store::get_session(&verify_conn, "child-1")?.is_some());
+        Ok(())
+    }
+
+    /// Builds a minimal bound `SessionRecord` for a child session correlated
+    /// against `parent`, for tests that exercise `store::insert_session`
+    /// directly rather than through the full launch route.
+    fn test_child_session_record(
+        id: &str,
+        familiar_id: &str,
+        parent: &crate::execution_binding::ExecutionBindingParent,
+    ) -> crate::store::SessionRecord {
+        let now = current_timestamp();
+        crate::store::SessionRecord {
+            id: id.to_string(),
+            project_root: "/repo".to_string(),
+            harness: "codex".to_string(),
+            title: "child session".to_string(),
+            status: "running".to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: now.clone(),
+            updated_at: now,
+            conversation_id: None,
+            familiar_id: Some(familiar_id.to_string()),
+            execution_binding: Some(crate::execution_binding::ExecutionBinding {
+                contract: crate::execution_binding::CONTRACT.to_string(),
+                principal_ref: "principal:operator".to_string(),
+                familiar_id: familiar_id.to_string(),
+                familiar_snapshot_digest: digest('a'),
+                project_digest: digest('b'),
+                graph_id: "graph-2".to_string(),
+                node_id: "node-2".to_string(),
+                attempt_id: "attempt-2".to_string(),
+                request_digest: digest('d'),
+                policy_revision: "policy:7".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                parent: Some(parent.clone()),
+                delegation_digest: Some(digest('e')),
+            }),
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        }
+    }
+
+    /// Route-level regression: a concurrent parent sacrifice/delete landing
+    /// exactly between the advisory pre-gate correlation and the final,
+    /// in-transaction revalidation must never let the child through. Uses
+    /// the `parent_correlation_advisory_check_completed_failpoint` seam
+    /// (compiled out of every non-test build) to run a real delete, through
+    /// a genuinely separate connection, at precisely that window — no sleep,
+    /// no timing guess, and no reliance on the API test harness being able
+    /// to interleave two real OS threads against a single synchronous
+    /// request.
+    #[test]
+    fn child_launch_final_revalidation_catches_parent_sacrificed_after_initial_validation(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let path = store_path(temp_dir.path());
+        let _failpoint = ParentCorrelationFailpointGuard::install(move || {
+            // A real concurrent writer, on its own connection, sacrificing
+            // the parent that the advisory check just validated — the exact
+            // race BLOCKER 1 closes.
+            let conn = crate::store::open_store(&path).expect("open concurrent connection");
+            conn.execute("DELETE FROM sessions WHERE id = 'parent-1'", [])
+                .expect("concurrent parent delete");
+        });
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        // Caught by the in-transaction revalidation, which reports the
+        // parent exactly like a launch against an always-missing parent
+        // would (issue #728, §2.4) — same code, same field path.
+        assert_eq!(response.status, 404, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "session_not_found");
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({ "fields": ["parent.sessionId"] })
+        );
+        // The parent row was removed by the failpoint itself, and no child
+        // row was ever admitted: the store ends up with zero rows.
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_unknown_contract() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["contract"] = json!("psyche.execution_binding.v2");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_unsupported",
+            &["executionBinding.contract"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_unknown_top_level_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["extra"] = json!(true);
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_unknown_parent_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        binding["parent"]["extra"] = json!(true);
+
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.parent"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_invalid_opaque_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["policyRevision"] = json!("bad revision with spaces");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.policyRevision"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_too_long_opaque_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["graphId"] = json!("g".repeat(256));
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.graphId"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_malformed_digest() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["projectDigest"] = json!("sha256:not-a-real-digest");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.projectDigest"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_malformed_timestamp() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["expiresAt"] = json!("2099-01-01T00:00:00.000Z");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding.expiresAt"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_rejects_elapsed_expiry() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["expiresAt"] = json!("2000-01-01T00:00:00Z");
+
+        let (response, runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_expired",
+            &["executionBinding.expiresAt"],
+        )?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_binding_errors_precede_maintenance_lock() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(init.success());
+        let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let owner = gate.acquire_owner("cave-delete")?;
+
+        // An invalid binding (missing familiarId at the top level) must be
+        // reported before the maintenance gate is ever consulted.
+        let (response, runtime) =
+            run_bound_launch(&temp_dir, &project_root, "", root_binding("sage"))?;
+        // familiarId "" normalizes to None (session_launch::resolve_familiar),
+        // so this is the "bound launch requires familiarId" case.
+        assert_binding_error(&response, 400, "execution_binding_invalid", &["familiarId"])?;
+        assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_allows_two_identical_root_bindings() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = root_binding("sage");
+
+        for _ in 0..2 {
+            let (response, runtime) =
+                run_bound_launch(&temp_dir, &project_root, "sage", binding.clone())?;
+            assert_eq!(response.status, 201, "{}", response.body);
+            assert_eq!(runtime.launches.borrow().len(), 1);
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert_eq!(store::list_sessions(&conn)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn bound_launch_errors_redact_supplied_values() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding = crate::execution_binding::parse(&root_binding("cody"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "parent-1", "cody", Some(parent_binding))?;
+
+        let runtime = RecordingRuntime::default();
+        let binding = child_binding(
+            "sage",
+            "parent-1",
+            "graph-should-not-leak",
+            "node-1",
+            "attempt-1",
+        );
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "sage",
+            "callerFamiliarId": "cody",
+            "executionBinding": binding,
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(
+            !response.body.contains("graph-should-not-leak"),
+            "error body must not leak the supplied graphId, got: {}",
+            response.body
+        );
+        assert!(
+            !response.body.contains(&digest('a')),
+            "error body must not leak a supplied digest, got: {}",
+            response.body
         );
         Ok(())
     }
@@ -10135,6 +12430,10 @@ mod tests {
     struct RecordingRuntime {
         launches: std::cell::RefCell<Vec<SessionLaunch>>,
         inputs: std::cell::RefCell<Vec<String>>,
+        // Retains the exact `send_input` payload (issue #728 Task 4) so
+        // bound-operation tests can assert `executionBinding` never reaches
+        // the runtime, not just that a `data` string was recorded.
+        input_payloads: std::cell::RefCell<Vec<Value>>,
         kills: std::cell::RefCell<Vec<String>>,
     }
 
@@ -10163,6 +12462,7 @@ mod tests {
         }
 
         fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            self.input_payloads.borrow_mut().push(payload.clone());
             let data = payload
                 .get("data")
                 .and_then(Value::as_str)
@@ -10341,6 +12641,7 @@ mod tests {
             updated_at: "2026-04-27T10:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -10681,6 +12982,7 @@ mod tests {
                 updated_at: "2026-08-04T00:00:00Z".to_string(),
                 conversation_id: None,
                 familiar_id: None,
+                execution_binding: None,
                 labels: Vec::new(),
                 visibility: "private".to_string(),
                 external: false,
@@ -11183,6 +13485,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -11223,6 +13526,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -11268,6 +13572,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -11307,6 +13612,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -11423,6 +13729,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -11526,6 +13833,7 @@ mod tests {
                     updated_at: now.into(),
                     conversation_id: None,
                     familiar_id: None,
+                    execution_binding: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
                     external: false,
@@ -11605,6 +13913,7 @@ description = "digs deep"
                     updated_at: now.into(),
                     conversation_id: None,
                     familiar_id: familiar.map(str::to_string),
+                    execution_binding: None,
                     labels: Vec::new(),
                     visibility: "private".to_string(),
                     external: false,
@@ -15898,6 +18207,40 @@ tier = 0
     }
 
     #[test]
+    fn external_session_rejects_execution_binding() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let body = json!({
+            "id": "engine-sess-bound",
+            "projectRoot": temp.path().to_string_lossy(),
+            "harness": "engine",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_binding_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert!(
+            store::get_session(&conn, "engine-sess-bound")?.is_none(),
+            "a rejected external registration must not insert a session row"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn register_external_session_persists_valid_labels() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let labels = json!(["source:psyche-build", "ui.native"]);
@@ -16340,6 +18683,1038 @@ tier = 0
         let body: serde_json::Value = serde_json::from_str(&response.body)?;
         assert_eq!(body["error"]["code"], "session_id_conflict");
         assert_eq!(body["error"]["details"]["sessionId"], "shared-id");
+        Ok(())
+    }
+
+    // -- Bound session mutations: exact proof + metadata isolation (issue
+    // #728 Task 4) ---------------------------------------------------------
+
+    #[test]
+    fn bound_input_strips_proof_from_runtime_and_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-input", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": root_binding("sage"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-input/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })],
+            "executionBinding must never reach SessionRuntime::send_input"
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "bound-input")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(
+            payload,
+            json!({ "data": "hello" }),
+            "executionBinding must never reach the persisted input event"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_consumes_proof_without_event_leak() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-kill", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+
+        // A mismatched proof must fail closed: no kill, no event.
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+        let mismatched_body = json!({ "executionBinding": mismatched }).to_string();
+        let rejected = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&mismatched_body),
+            &runtime,
+        )?;
+        assert_eq!(rejected.status, 409, "{}", rejected.body);
+        let rejected_body: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected_body["error"]["code"], "execution_binding_mismatch");
+        assert!(runtime.kills.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-kill")?.is_empty());
+
+        // The exact matching proof is consumed and stripped: the runtime
+        // only ever sees the session id, and the persisted event keeps its
+        // pre-O2 `{"status":"killed"}` shape.
+        let matching_body = json!({ "executionBinding": root_binding("sage") }).to_string();
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&matching_body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(runtime.kills.borrow().as_slice(), &["bound-kill"]);
+        let events = crate::store::list_events(&conn, "bound-kill")?;
+        let kill_event = events
+            .iter()
+            .find(|event| event.kind == "kill")
+            .expect("kill event should be persisted");
+        let payload: Value = serde_json::from_str(&kill_event.payload_json)?;
+        assert_eq!(payload, json!({ "status": "killed" }));
+        Ok(())
+    }
+
+    /// Builds the request body for a bound `input`/`kill` operation. `input`
+    /// requires the pre-existing `data` string alongside the proof; `kill`
+    /// requires only the proof (its unbound body has always been empty).
+    fn bound_operation_body(route: &str, binding: &Value) -> String {
+        match route {
+            "input" => json!({ "data": "hello", "executionBinding": binding }).to_string(),
+            "kill" => json!({ "executionBinding": binding }).to_string(),
+            other => panic!("unknown bound operation route: {other}"),
+        }
+    }
+
+    fn post_bound_operation(
+        coven_home: &Path,
+        session_id: &str,
+        route: &str,
+        body: &str,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            &format!("/sessions/{session_id}/{route}"),
+            coven_home,
+            None,
+            Some(body),
+        )
+    }
+
+    /// A `root_binding` fixture whose `expiresAt` is already in the past —
+    /// still syntactically valid, but elapsed.
+    fn expired_root_binding(familiar_id: &str) -> Value {
+        let mut binding = root_binding(familiar_id);
+        binding["expiresAt"] = json!("2020-01-01T00:00:00Z");
+        binding
+    }
+
+    #[test]
+    fn bound_operations_reject_every_mismatched_root_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-root", "sage", Some(stored))?;
+
+        // Every root-level field of the v1 object, substituted one at a
+        // time with a syntactically valid but different value. Digests use
+        // hex-only fill characters so they stay valid `sha256:` digests.
+        let cases: Vec<(&str, &str, Value, &str)> = vec![
+            (
+                "principalRef",
+                "principalRef",
+                json!("principal:other"),
+                "executionBinding.principalRef",
+            ),
+            (
+                "familiarId",
+                "familiarId",
+                json!("cody"),
+                "executionBinding.familiarId",
+            ),
+            (
+                "familiarSnapshotDigest",
+                "familiarSnapshotDigest",
+                json!(digest('d')),
+                "executionBinding.familiarSnapshotDigest",
+            ),
+            (
+                "projectDigest",
+                "projectDigest",
+                json!(digest('e')),
+                "executionBinding.projectDigest",
+            ),
+            (
+                "graphId",
+                "graphId",
+                json!("graph-9"),
+                "executionBinding.graphId",
+            ),
+            (
+                "nodeId",
+                "nodeId",
+                json!("node-9"),
+                "executionBinding.nodeId",
+            ),
+            (
+                "attemptId",
+                "attemptId",
+                json!("attempt-9"),
+                "executionBinding.attemptId",
+            ),
+            (
+                "requestDigest",
+                "requestDigest",
+                json!(digest('f')),
+                "executionBinding.requestDigest",
+            ),
+            (
+                "policyRevision",
+                "policyRevision",
+                json!("policy:9"),
+                "executionBinding.policyRevision",
+            ),
+            (
+                "expiresAt",
+                "expiresAt",
+                json!("2099-06-01T00:00:00Z"),
+                "executionBinding.expiresAt",
+            ),
+            (
+                "delegationDigest",
+                "delegationDigest",
+                json!(digest('1')),
+                "executionBinding.delegationDigest",
+            ),
+        ];
+
+        for (label, field, new_value, expected_path) in &cases {
+            let mut binding = root_binding("sage");
+            binding[field] = new_value.clone();
+            let forbidden = submitted_binding_values(&binding);
+            for route in ["input", "kill"] {
+                let body = bound_operation_body(route, &binding);
+                let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
+                assert_binding_error_redacts(
+                    &response,
+                    409,
+                    "execution_binding_mismatch",
+                    &[expected_path],
+                    &forbidden,
+                )
+                .with_context(|| format!("field={label} route={route}"))?;
+            }
+        }
+
+        // Presence mismatch: the stored `parent` is null, so supplying a
+        // (validly shaped) non-null parent must mismatch on "parent" itself
+        // rather than any nested field.
+        let mut binding_with_parent = root_binding("sage");
+        binding_with_parent["parent"] = json!({
+            "sessionId": "parent-x",
+            "graphId": "graph-x",
+            "nodeId": "node-x",
+            "attemptId": "attempt-x",
+        });
+        let forbidden = submitted_binding_values(&binding_with_parent);
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding_with_parent);
+            let response = post_bound_operation(temp_dir.path(), "bound-root", route, &body)?;
+            assert_binding_error_redacts(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["parent"],
+                &forbidden,
+            )
+            .with_context(|| format!("field=parent route={route}"))?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_every_mismatched_parent_field() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-parent", "sage", Some(stored))?;
+
+        let cases = [
+            ("sessionId", "parent.sessionId"),
+            ("graphId", "parent.graphId"),
+            ("nodeId", "parent.nodeId"),
+            ("attemptId", "parent.attemptId"),
+        ];
+
+        for (field, expected_path) in cases {
+            let mut binding = stored_value.clone();
+            binding["parent"][field] = json!("different-value");
+            let forbidden = submitted_binding_values(&binding);
+            for route in ["input", "kill"] {
+                let body = bound_operation_body(route, &binding);
+                let response = post_bound_operation(temp_dir.path(), "bound-parent", route, &body)?;
+                assert_binding_error_redacts(
+                    &response,
+                    409,
+                    "execution_binding_mismatch",
+                    &[expected_path],
+                    &forbidden,
+                )
+                .with_context(|| format!("field=parent.{field} route={route}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_mixed_case_only_mismatches() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-case", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["familiarId"] = json!("Sage");
+        let forbidden = submitted_binding_values(&binding);
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-case", route, &body)?;
+            assert_binding_error_redacts(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["executionBinding.familiarId"],
+                &forbidden,
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_absent_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-absent", "sage", Some(stored))?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        assert_binding_error(
+            &input,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/kill",
+            temp_dir.path(),
+            None,
+            Some("{}"),
+        )?;
+        assert_binding_error(
+            &kill,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+
+        // No body at all must behave identically for a bound kill: an
+        // absent body parses to `{}`, which still lacks `executionBinding`.
+        let kill_no_body = handle_request_with_body(
+            "POST",
+            "/sessions/bound-absent/kill",
+            temp_dir.path(),
+            None,
+            None,
+        )?;
+        assert_binding_error(
+            &kill_no_body,
+            400,
+            "execution_binding_required",
+            &["executionBinding"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_incomplete_proof_missing_root_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-incomplete", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding
+            .as_object_mut()
+            .expect("root binding fixture is an object")
+            .remove("policyRevision");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-incomplete", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_required",
+                &["executionBinding"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_incomplete_proof_missing_parent_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(
+            temp_dir.path(),
+            "bound-incomplete-parent",
+            "sage",
+            Some(stored),
+        )?;
+        let mut binding = stored_value.clone();
+        binding["parent"]
+            .as_object_mut()
+            .expect("parent fixture is an object")
+            .remove("graphId");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-incomplete-parent", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_required",
+                &["executionBinding.parent"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_extra_root_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-extra-root", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["extra"] = json!(true);
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response = post_bound_operation(temp_dir.path(), "bound-extra-root", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_invalid",
+                &["executionBinding"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_extra_parent_member() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored_value = child_binding("sage", "parent-1", "graph-1", "node-1", "attempt-1");
+        let stored = crate::execution_binding::parse(&stored_value)
+            .expect("fixture child binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-extra-parent", "sage", Some(stored))?;
+        let mut binding = stored_value.clone();
+        binding["parent"]["extra"] = json!(true);
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-extra-parent", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_invalid",
+                &["executionBinding.parent"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_malformed_non_object_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-malformed", "sage", Some(stored))?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/bound-malformed/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello","executionBinding":"not-an-object"}"#),
+        )?;
+        assert_binding_error(
+            &input,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/bound-malformed/kill",
+            temp_dir.path(),
+            None,
+            Some(r#"{"executionBinding":"not-an-object"}"#),
+        )?;
+        assert_binding_error(
+            &kill,
+            400,
+            "execution_binding_invalid",
+            &["executionBinding"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_reject_unsupported_contract() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-unsupported", "sage", Some(stored))?;
+        let mut binding = root_binding("sage");
+        binding["contract"] = json!("psyche.execution_binding.v2");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &binding);
+            let response =
+                post_bound_operation(temp_dir.path(), "bound-unsupported", route, &body)?;
+            assert_binding_error(
+                &response,
+                400,
+                "execution_binding_unsupported",
+                &["executionBinding.contract"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_input_rejects_expired_exact_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(temp_dir.path(), "bound-expired", "sage", Some(stored))?;
+        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-expired/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_binding_error(
+            &response,
+            409,
+            "execution_binding_expired",
+            &["executionBinding.expiresAt"],
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn bound_input_expired_rejection_calls_no_runtime_or_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(
+            temp_dir.path(),
+            "bound-expired-no-leak",
+            "sage",
+            Some(stored),
+        )?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-expired-no-leak/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(runtime.input_payloads.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-expired-no-leak")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_accepts_expired_exact_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let expired = expired_root_binding("sage");
+        let stored =
+            crate::execution_binding::parse(&expired).expect("expired binding still parses");
+        insert_bound_session(temp_dir.path(), "bound-expired-kill", "sage", Some(stored))?;
+        let body = json!({ "executionBinding": expired }).to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-expired-kill/kill",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        let detail = handle_request("GET", "/sessions/bound-expired-kill", temp_dir.path(), None)?;
+        assert!(detail.body.contains(r#""status":"killed""#));
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_unknown_session_wins_over_malformed_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/missing-bound/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello","executionBinding":"not-an-object"}"#),
+        )?;
+        assert_eq!(input.status, 404, "{}", input.body);
+        let input_body: Value = serde_json::from_str(&input.body)?;
+        assert_eq!(input_body["error"]["code"], "session_not_found");
+
+        let kill = handle_request_with_body(
+            "POST",
+            "/sessions/missing-bound/kill",
+            temp_dir.path(),
+            None,
+            Some(r#"{"executionBinding":"not-an-object"}"#),
+        )?;
+        assert_eq!(kill.status, 404, "{}", kill.body);
+        let kill_body: Value = serde_json::from_str(&kill.body)?;
+        assert_eq!(kill_body["error"]["code"], "session_not_found");
+        Ok(())
+    }
+
+    #[test]
+    fn bound_operations_mismatch_wins_before_session_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session_with_options(
+            temp_dir.path(),
+            "bound-not-live",
+            "sage",
+            Some(stored),
+            "completed",
+            false,
+        )?;
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+
+        for route in ["input", "kill"] {
+            let body = bound_operation_body(route, &mismatched);
+            let response = post_bound_operation(temp_dir.path(), "bound-not-live", route, &body)?;
+            assert_binding_error(
+                &response,
+                409,
+                "execution_binding_mismatch",
+                &["executionBinding.familiarId"],
+            )
+            .with_context(|| format!("route={route}"))?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_kill_external_check_applies_after_proof() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session_with_options(
+            temp_dir.path(),
+            "bound-external",
+            "sage",
+            Some(stored),
+            "running",
+            true,
+        )?;
+
+        // A mismatched proof against a bound, external session must still
+        // report the binding mismatch, not the external-session error:
+        // proof enforcement runs before the existing external check.
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+        let mismatch_body = json!({ "executionBinding": mismatched }).to_string();
+        let mismatch_response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-external/kill",
+            temp_dir.path(),
+            None,
+            Some(&mismatch_body),
+        )?;
+        assert_binding_error(
+            &mismatch_response,
+            409,
+            "execution_binding_mismatch",
+            &["executionBinding.familiarId"],
+        )?;
+
+        // An exact-matching proof clears the bound gate, so the existing
+        // external check applies afterward exactly as it does today.
+        let matching_body = json!({ "executionBinding": root_binding("sage") }).to_string();
+        let matching_response = handle_request_with_body(
+            "POST",
+            "/sessions/bound-external/kill",
+            temp_dir.path(),
+            None,
+            Some(&matching_body),
+        )?;
+        assert_eq!(matching_response.status, 422, "{}", matching_response.body);
+        let body: Value = serde_json::from_str(&matching_response.body)?;
+        assert_eq!(body["error"]["code"], "external_session_not_killable");
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_and_kill_reject_completed_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "unbound-completed", "completed")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/unbound-completed/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request(
+            "POST",
+            "/sessions/unbound-completed/kill",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_and_kill_reject_orphaned_sessions_as_not_live() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session_with_status(temp_dir.path(), "unbound-orphaned", "orphaned")?;
+
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions/unbound-orphaned/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{"data":"hello"}"#),
+        )?;
+        let kill = handle_request(
+            "POST",
+            "/sessions/unbound-orphaned/kill",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(input.status, 409);
+        assert_eq!(kill.status, 409);
+        assert!(input.body.contains(r#""code":"session_not_live""#));
+        assert!(kill.body.contains(r#""code":"session_not_live""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_kill_ignores_execution_binding_shaped_body() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-kill-body")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-kill-body/kill",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.kills.borrow().as_slice(),
+            &["unbound-kill-body"],
+            "an unbound session's kill body is never inspected, matching pre-O2 behavior"
+        );
+        // Confirmation (issue #728 Task 6, finding 4): kill never parses the
+        // body for an unbound session at all, so there is no payload
+        // boundary to enforce — the persisted event keeps its pre-O2
+        // `{"status":"killed"}` shape regardless of what the caller sent.
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-kill-body")?;
+        let kill_event = events
+            .iter()
+            .find(|event| event.kind == "kill")
+            .expect("kill event should be persisted");
+        let payload: Value = serde_json::from_str(&kill_event.payload_json)?;
+        assert_eq!(payload, json!({ "status": "killed" }));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_strips_reserved_execution_binding_field() -> anyhow::Result<()> {
+        // Regression (issue #728 Task 6, finding 4): `executionBinding` is
+        // reserved metadata even on an unbound session. It must never reach
+        // writer capacity checks, `SessionRuntime::send_input`, or the
+        // persisted input event — but every other field, and unbound
+        // input's existing precedence, is unaffected.
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-body")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-body/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })],
+            "executionBinding must never reach SessionRuntime::send_input, even unbound"
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-input-body")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(
+            payload,
+            json!({ "data": "hello" }),
+            "executionBinding must never reach the persisted input event, even unbound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_strips_malformed_execution_binding_unvalidated() -> anyhow::Result<()> {
+        // An unbound session never runs proof validation (§4 precedence
+        // steps 2-4 are skipped entirely), so a syntactically malformed
+        // `executionBinding` here must not be checked or rejected — it is
+        // simply stripped, unvalidated, exactly like a well-formed one.
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-malformed")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "executionBinding": "not-an-object" }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-malformed/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })]
+        );
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let events = crate::store::list_events(&conn, "unbound-input-malformed")?;
+        let input_event = events
+            .iter()
+            .find(|event| event.kind == "input")
+            .expect("input event should be persisted");
+        let payload: Value = serde_json::from_str(&input_event.payload_json)?;
+        assert_eq!(payload, json!({ "data": "hello" }));
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_input_preserves_other_fields_and_precedence() -> anyhow::Result<()> {
+        // Positive control paired with the two regressions above: only the
+        // reserved `executionBinding` key is removed. Any other extraneous
+        // field the caller sends alongside `data` reaches the runtime and
+        // the persisted event unchanged, matching pre-O2 unbound behavior.
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "unbound-input-other-fields")?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({ "data": "hello", "unrelatedField": "kept" }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/unbound-input-other-fields/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().as_slice(),
+            &[json!({ "data": "hello", "unrelatedField": "kept" })]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn input_and_kill_reject_bound_failures_without_runtime_or_event() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-no-leak", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+
+        let mut mismatched = root_binding("sage");
+        mismatched["familiarId"] = json!("cody");
+
+        let cases: Vec<(&str, String)> = vec![
+            ("input", json!({ "data": "hello" }).to_string()),
+            (
+                "input",
+                json!({ "data": "hello", "executionBinding": "nope" }).to_string(),
+            ),
+            (
+                "input",
+                json!({ "data": "hello", "executionBinding": mismatched.clone() }).to_string(),
+            ),
+            ("kill", json!({}).to_string()),
+            ("kill", json!({ "executionBinding": "nope" }).to_string()),
+            (
+                "kill",
+                json!({ "executionBinding": mismatched.clone() }).to_string(),
+            ),
+        ];
+
+        for (route, body) in cases {
+            let response = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/bound-no-leak/{route}"),
+                temp_dir.path(),
+                None,
+                Some(&body),
+                &runtime,
+            )?;
+            assert!(
+                response.status == 400 || response.status == 409,
+                "expected a rejection for route={route} body={body}, got {}: {}",
+                response.status,
+                response.body
+            );
+        }
+
+        assert!(runtime.inputs.borrow().is_empty());
+        assert!(runtime.input_payloads.borrow().is_empty());
+        assert!(runtime.kills.borrow().is_empty());
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        assert!(crate::store::list_events(&conn, "bound-no-leak")?.is_empty());
+        Ok(())
+    }
+
+    struct CapacityObservingRuntime {
+        payloads: std::cell::RefCell<Vec<Value>>,
+    }
+
+    impl SessionRuntime for CapacityObservingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn can_record_session_event(
+            &self,
+            _session_id: &str,
+            _kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            self.payloads.borrow_mut().push(payload.clone());
+            Some(Ok(true))
+        }
+    }
+
+    #[test]
+    fn bound_input_writer_capacity_sees_stripped_payload() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))
+            .expect("fixture root binding should parse");
+        insert_bound_session(temp_dir.path(), "bound-capacity", "sage", Some(stored))?;
+        let runtime = CapacityObservingRuntime {
+            payloads: std::cell::RefCell::new(Vec::new()),
+        };
+        let body = json!({ "data": "hello", "executionBinding": root_binding("sage") }).to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/bound-capacity/input",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 202, "{}", response.body);
+        assert_eq!(
+            runtime.payloads.borrow().as_slice(),
+            &[json!({ "data": "hello" })],
+            "writer capacity preflight must see only `data`, never `executionBinding`"
+        );
         Ok(())
     }
 }

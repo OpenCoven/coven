@@ -2421,6 +2421,7 @@ mod tests {
                 updated_at: "2026-01-01T00:05:00Z".into(),
                 conversation_id: None,
                 familiar_id: Some("charm".into()),
+                execution_binding: None,
                 labels: vec!["auth".into()],
                 visibility: "private".into(),
                 external: false,

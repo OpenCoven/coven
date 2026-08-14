@@ -601,6 +601,7 @@ fn create_local_quest_anchor(
         updated_at: timestamp.clone(),
         conversation_id: None,
         familiar_id: None,
+        execution_binding: None,
         labels: Vec::new(),
         visibility: "private".to_string(),
         external: false,

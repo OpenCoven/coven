@@ -30,6 +30,7 @@ mod engine;
 mod engine_install;
 mod eval_loop;
 mod event_writer;
+mod execution_binding;
 mod executor_node;
 mod familiar_identity;
 mod handoff;
@@ -3120,6 +3121,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         now: now.clone(),
         conversation_id: None,
         familiar_id: None,
+        execution_binding: None,
         labels: Vec::new(),
         visibility: None,
     });
@@ -3848,6 +3850,7 @@ fn continuation_sibling_record(
                 .unwrap_or_else(|| source.id.clone()),
         ),
         familiar_id: source.familiar_id.clone(),
+        execution_binding: None,
         labels: source.labels.clone(),
         visibility: Some(source.visibility.clone()),
     })
@@ -4066,6 +4069,7 @@ fn run_session(
             now,
             conversation_id: None,
             familiar_id: familiar_ctx.as_ref().map(|f| f.id.clone()),
+            execution_binding: None,
             labels,
             visibility: visibility.map(str::to_string),
         });
@@ -5615,6 +5619,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -5656,6 +5661,7 @@ mod tests {
                 updated_at: "2026-08-01T00:00:00Z".to_string(),
                 conversation_id: None,
                 familiar_id: Some("sage".to_string()),
+                execution_binding: None,
                 labels: vec!["kept".to_string()],
                 visibility: "workspace".to_string(),
                 external: false,
@@ -6836,6 +6842,7 @@ mod tests {
             updated_at: "2026-04-27T06:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -6862,6 +6869,7 @@ mod tests {
             updated_at: "2026-05-14T07:00:01Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,
@@ -6979,6 +6987,7 @@ mod tests {
             updated_at: "2026-05-08T07:05:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,

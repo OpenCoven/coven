@@ -1352,6 +1352,7 @@ mod tests {
             updated_at: "2026-08-04T00:00:00Z".to_string(),
             conversation_id: None,
             familiar_id: None,
+            execution_binding: None,
             labels: Vec::new(),
             visibility: "private".to_string(),
             external: false,

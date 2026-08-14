@@ -3,7 +3,50 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, expectTypeOf, it } from "vitest";
-import { __testing, CovenApiError, createCovenClient } from "./client.js";
+import {
+  __testing,
+  CovenApiError,
+  createCovenClient,
+  PSYCHE_EXECUTION_BINDING_V1,
+  type CovenExecutionBinding,
+  type LaunchCovenSessionInput,
+} from "./client.js";
+
+const DIGEST_A = `sha256:${"a".repeat(64)}`;
+const DIGEST_B = `sha256:${"b".repeat(64)}`;
+const DIGEST_C = `sha256:${"c".repeat(64)}`;
+const DIGEST_D = `sha256:${"d".repeat(64)}`;
+
+function validBinding(overrides: Partial<CovenExecutionBinding> = {}): CovenExecutionBinding {
+  return {
+    contract: PSYCHE_EXECUTION_BINDING_V1,
+    principalRef: "principal:operator",
+    familiarId: "sage",
+    familiarSnapshotDigest: DIGEST_A,
+    projectDigest: DIGEST_B,
+    graphId: "graph-1",
+    nodeId: "node-1",
+    attemptId: "attempt-1",
+    requestDigest: DIGEST_C,
+    policyRevision: "policy:7",
+    expiresAt: "2099-01-01T00:00:00Z",
+    parent: null,
+    delegationDigest: null,
+    ...overrides,
+  };
+}
+
+function delegatedBinding(): CovenExecutionBinding {
+  return validBinding({
+    parent: {
+      sessionId: "parent-session-1",
+      graphId: "graph-1",
+      nodeId: "parent-node-1",
+      attemptId: "parent-attempt-1",
+    },
+    delegationDigest: DIGEST_D,
+  });
+}
 
 let tmpDir: string;
 
@@ -141,6 +184,953 @@ describe("createCovenClient", () => {
     },
   );
 
+  it("preserves executionBindingContracts from the camelCase wire field as untrusted", () => {
+    const health = __testing.normalizeHealthResponse({
+      capabilities: { executionBindingContracts: [PSYCHE_EXECUTION_BINDING_V1] },
+    });
+    expect(health.capabilities?.executionBindingContracts).toEqual([PSYCHE_EXECUTION_BINDING_V1]);
+    expectTypeOf(health.capabilities?.executionBindingContracts).toEqualTypeOf<unknown>();
+  });
+
+  it("preserves executionBindingContracts from the snake_case wire field as untrusted", () => {
+    const health = __testing.normalizeHealthResponse({
+      capabilities: { execution_binding_contracts: [PSYCHE_EXECUTION_BINDING_V1] },
+    });
+    expect(health.capabilities?.executionBindingContracts).toEqual([PSYCHE_EXECUTION_BINDING_V1]);
+  });
+
+  it("prefers the camelCase executionBindingContracts over snake_case when both are present", () => {
+    const health = __testing.normalizeHealthResponse({
+      capabilities: {
+        executionBindingContracts: ["camel"],
+        execution_binding_contracts: ["snake"],
+      },
+    });
+    expect(health.capabilities?.executionBindingContracts).toEqual(["camel"]);
+  });
+
+  describe("execution binding", () => {
+    describe("session record normalization", () => {
+      it("normalizes a snake_case execution_binding into camelCase", () => {
+        const binding = validBinding();
+        const session = __testing.normalizeSessionRecord({
+          id: "session-1",
+          project_root: "/repo",
+          harness: "codex",
+          title: "Fix tests",
+          status: "running",
+          exit_code: null,
+          created_at: "2026-04-27T10:00:00Z",
+          updated_at: "2026-04-27T10:00:00Z",
+          execution_binding: binding,
+        });
+        expect(session.executionBinding).toEqual(binding);
+      });
+
+      it("normalizes a camelCase executionBinding", () => {
+        const binding = validBinding();
+        const session = __testing.normalizeSessionRecord({
+          id: "session-1",
+          projectRoot: "/repo",
+          harness: "codex",
+          title: "Fix tests",
+          status: "running",
+          exitCode: null,
+          createdAt: "2026-04-27T10:00:00Z",
+          updatedAt: "2026-04-27T10:00:00Z",
+          executionBinding: binding,
+        });
+        expect(session.executionBinding).toEqual(binding);
+      });
+
+      it("keeps an explicit null execution_binding as null", () => {
+        const session = __testing.normalizeSessionRecord({
+          id: "session-1",
+          project_root: "/repo",
+          harness: "codex",
+          title: "Fix tests",
+          status: "running",
+          exit_code: null,
+          created_at: "2026-04-27T10:00:00Z",
+          updated_at: "2026-04-27T10:00:00Z",
+          execution_binding: null,
+        });
+        expect(session.executionBinding).toBeNull();
+      });
+
+      it("normalizes an absent pre-O2 execution_binding field to null (rolling upgrade)", () => {
+        const session = __testing.normalizeSessionRecord({
+          id: "session-1",
+          project_root: "/repo",
+          harness: "codex",
+          title: "Fix tests",
+          status: "running",
+          exit_code: null,
+          created_at: "2026-04-27T10:00:00Z",
+          updated_at: "2026-04-27T10:00:00Z",
+          // execution_binding intentionally omitted
+        });
+        expect(session.executionBinding).toBeNull();
+      });
+
+      it("throws when a present execution_binding is invalid", () => {
+        expect(() =>
+          __testing.normalizeSessionRecord({
+            id: "session-1",
+            project_root: "/repo",
+            harness: "codex",
+            title: "Fix tests",
+            status: "running",
+            exit_code: null,
+            created_at: "2026-04-27T10:00:00Z",
+            updated_at: "2026-04-27T10:00:00Z",
+            execution_binding: { ...validBinding(), contract: "bogus" },
+          }),
+        ).toThrow(/executionBinding\.contract is unsupported/);
+      });
+    });
+
+    describe("normalizeExecutionBinding validator", () => {
+      it("accepts a fully valid unbound binding", () => {
+        expect(__testing.normalizeExecutionBinding(validBinding())).toEqual(validBinding());
+      });
+
+      it("accepts a fully valid delegated binding with a parent and delegationDigest", () => {
+        const binding = delegatedBinding();
+        expect(__testing.normalizeExecutionBinding(binding)).toEqual(binding);
+      });
+
+      it("throws when the root object is missing a required key", () => {
+        const { policyRevision: _drop, ...incomplete } = validBinding();
+        expect(() => __testing.normalizeExecutionBinding(incomplete)).toThrow(
+          /executionBinding has missing or unknown fields/,
+        );
+      });
+
+      it("throws when the root object has an unknown extra key", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), extra: "nope" }),
+        ).toThrow(/executionBinding has missing or unknown fields/);
+      });
+
+      it("throws when the parent object is missing a required key", () => {
+        const binding = delegatedBinding();
+        const { sessionId: _drop, ...incompleteParent } = binding.parent!;
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...binding, parent: incompleteParent }),
+        ).toThrow(/executionBinding\.parent has missing or unknown fields/);
+      });
+
+      it("throws when the parent object has an unknown extra key", () => {
+        const binding = delegatedBinding();
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...binding,
+            parent: { ...binding.parent, extra: "nope" },
+          }),
+        ).toThrow(/executionBinding\.parent has missing or unknown fields/);
+      });
+
+      it("rejects an unsupported contract value", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), contract: "psyche.other.v1" }),
+        ).toThrow(/executionBinding\.contract is unsupported/);
+      });
+
+      it.each([
+        ["principalRef"],
+        ["familiarId"],
+        ["graphId"],
+        ["nodeId"],
+        ["attemptId"],
+        ["policyRevision"],
+      ] as const)("rejects an empty opaque value for %s", (key) => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), [key]: "" }),
+        ).toThrow(new RegExp(`executionBinding\\.${key} is invalid`));
+      });
+
+      it("rejects an opaque value over the 255-byte boundary", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            principalRef: "a".repeat(256),
+          }),
+        ).toThrow(/executionBinding\.principalRef is invalid/);
+      });
+
+      it("accepts an opaque value at the exact 255-byte boundary", () => {
+        expect(
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            principalRef: "a".repeat(255),
+          }).principalRef,
+        ).toHaveLength(255);
+      });
+
+      it("rejects an opaque value containing a disallowed character", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), graphId: "graph 1" }),
+        ).toThrow(/executionBinding\.graphId is invalid/);
+      });
+
+      it("rejects an opaque value containing non-ASCII bytes", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), nodeId: "nöde-1" }),
+        ).toThrow(/executionBinding\.nodeId is invalid/);
+      });
+
+      it.each([
+        ["familiarSnapshotDigest"],
+        ["projectDigest"],
+        ["requestDigest"],
+      ] as const)("rejects an uppercase-hex digest for %s", (key) => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            [key]: `sha256:${"A".repeat(64)}`,
+          }),
+        ).toThrow(new RegExp(`executionBinding\\.${key} is invalid`));
+      });
+
+      it("rejects a digest with the wrong hex length", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            requestDigest: `sha256:${"c".repeat(63)}`,
+          }),
+        ).toThrow(/executionBinding\.requestDigest is invalid/);
+      });
+
+      it("rejects a digest missing the sha256: prefix", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            requestDigest: "c".repeat(64),
+          }),
+        ).toThrow(/executionBinding\.requestDigest is invalid/);
+      });
+
+      it("rejects a delegationDigest that is not a valid digest", () => {
+        const binding = delegatedBinding();
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...binding, delegationDigest: "not-a-digest" }),
+        ).toThrow(/executionBinding\.delegationDigest is invalid/);
+      });
+
+      it("rejects a fractional-second expiresAt", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            expiresAt: "2099-01-01T00:00:00.000Z",
+          }),
+        ).toThrow(/executionBinding\.expiresAt is invalid/);
+      });
+
+      it("rejects a non-UTC offset expiresAt", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            expiresAt: "2099-01-01T00:00:00+00:00",
+          }),
+        ).toThrow(/executionBinding\.expiresAt is invalid/);
+      });
+
+      it("rejects a calendar-invalid expiresAt (February 30th)", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            expiresAt: "2099-02-30T00:00:00Z",
+          }),
+        ).toThrow(/executionBinding\.expiresAt is invalid/);
+      });
+
+      // Parity with the Rust contract's Chrono-backed `parse_expiry`: Chrono
+      // accepts the whole-second leap-second value (`:60`) on every minute
+      // boundary, not only real UTC leap seconds, and this validator must
+      // accept exactly the same canonical forms without normalizing the
+      // stored string. See crates/coven-cli/src/execution_binding.rs.
+      it.each([
+        "2016-12-31T23:59:60Z",
+        "2020-03-15T08:30:60Z",
+        "2016-04-30T23:59:60Z",
+        "0000-02-29T23:59:60Z",
+        "2000-02-29T23:59:60Z",
+      ])("accepts the leap-second value :60 at %s (Chrono parity)", (expiresAt) => {
+        const binding = __testing.normalizeExecutionBinding({
+          ...validBinding(),
+          expiresAt,
+        });
+        // Not normalized: the stored string is returned byte-exact.
+        expect(binding.expiresAt).toBe(expiresAt);
+      });
+
+      it.each([
+        ["2020-03-15T08:30:61Z", "seconds above 60 are always invalid"],
+        ["2016-12-31T23:60:00Z", "minute 60 is invalid even alongside a valid second"],
+        ["2016-12-31T24:00:60Z", "hour 24 is invalid even alongside a leap second"],
+        ["2016-04-31T23:59:60Z", "April has no 31st, leap second or not"],
+        ["2001-02-29T23:59:60Z", "February 29th in a non-leap year is invalid"],
+        ["1900-02-29T23:59:60Z", "1900 is not a Gregorian leap year (divisible by 100, not 400)"],
+      ] as const)("rejects %s (%s)", (expiresAt, _reason) => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({
+            ...validBinding(),
+            expiresAt,
+          }),
+        ).toThrow(/executionBinding\.expiresAt is invalid/);
+      });
+
+      it("accepts February 29th in a Gregorian leap year (divisible by 400)", () => {
+        const binding = __testing.normalizeExecutionBinding({
+          ...validBinding(),
+          expiresAt: "2000-02-29T00:00:00Z",
+        });
+        expect(binding.expiresAt).toBe("2000-02-29T00:00:00Z");
+      });
+
+      it("rejects a parent present with a null delegationDigest (parity violation)", () => {
+        const binding = delegatedBinding();
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...binding, delegationDigest: null }),
+        ).toThrow(/executionBinding parent\/delegationDigest relationship is invalid/);
+      });
+
+      it("rejects a null parent with a non-null delegationDigest (parity violation)", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), delegationDigest: DIGEST_D }),
+        ).toThrow(/executionBinding parent\/delegationDigest relationship is invalid/);
+      });
+
+      it("does not trim or normalize opaque values", () => {
+        expect(() =>
+          __testing.normalizeExecutionBinding({ ...validBinding(), familiarId: " sage " }),
+        ).toThrow(/executionBinding\.familiarId is invalid/);
+      });
+    });
+
+    describe("bound client requests", () => {
+      it("sends the exact executionBinding object on a bound session launch", async () => {
+        const binding = validBinding();
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: binding,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            const session = await createCovenClient(socketPath).launchSession({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              executionBinding: binding,
+            });
+            expect(JSON.parse(capturedBody).executionBinding).toEqual(binding);
+            expect(session.executionBinding).toEqual(binding);
+          },
+        );
+      });
+
+      it("sends the validated normalized executionBinding, not a poisoned toJSON, on launchSession", async () => {
+        const binding = validBinding();
+        // A closed-object membership check on Object.keys() cannot see a
+        // non-enumerable `toJSON`, but JSON.stringify still calls it via a
+        // plain property [[Get]], so this is a realistic bypass of the
+        // exact-keys check that only a fresh-body rebuild defeats.
+        const poisoned = { ...binding };
+        Object.defineProperty(poisoned, "toJSON", {
+          enumerable: false,
+          configurable: true,
+          value: () => ({ contract: "evil", tampered: true }),
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: binding,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            const input = {
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              executionBinding: poisoned as unknown as CovenExecutionBinding,
+            };
+            await createCovenClient(socketPath).launchSession(input);
+            expect(JSON.parse(capturedBody).executionBinding).toEqual(binding);
+            // The original input is untouched: same executionBinding reference.
+            expect(input.executionBinding).toBe(poisoned);
+          },
+        );
+      });
+
+      it("sends the value validated on first read, not a later getter re-read, on launchSession", async () => {
+        const binding = validBinding();
+        let principalRefReads = 0;
+        // A getter is a time-of-check/time-of-use trap: it can answer
+        // validation's single read with a valid value, then answer a later
+        // re-serialization read with something else entirely.
+        const trapped = { ...binding };
+        Object.defineProperty(trapped, "principalRef", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            principalRefReads += 1;
+            return principalRefReads === 1 ? binding.principalRef : "principal:tampered-reread";
+          },
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: binding,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            const input = {
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              executionBinding: trapped as unknown as CovenExecutionBinding,
+            };
+            await createCovenClient(socketPath).launchSession(input);
+            const sentBinding = JSON.parse(capturedBody).executionBinding;
+            expect(sentBinding).toEqual(binding);
+            expect(sentBinding.principalRef).toBe(binding.principalRef);
+            expect(principalRefReads).toBe(1);
+            // The original input object is never mutated.
+            expect(input.executionBinding).toBe(trapped);
+            expect(input.projectRoot).toBe("/repo");
+            expect(Object.keys(input).sort()).toEqual(
+              ["cwd", "executionBinding", "harness", "projectRoot", "prompt", "title"].sort(),
+            );
+          },
+        );
+      });
+
+      it("does not send executionBinding when a getter answers undefined on the single validation read, even if it would answer a binding later", async () => {
+        const binding = validBinding();
+        let executionBindingReads = 0;
+        // A time-of-check/time-of-use trap in the other direction: the
+        // getter answers `undefined` (looking unbound) on the one read
+        // `launchSession` performs, but would answer a malicious binding on
+        // any later read. If the implementation ever re-reads
+        // `executionBinding` (e.g. by serializing `input` itself), the
+        // wire body would gain an executionBinding that was never
+        // validated. It must not: the body must omit executionBinding
+        // entirely, and the getter must be invoked exactly once.
+        const input = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+        };
+        Object.defineProperty(input, "executionBinding", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            executionBindingReads += 1;
+            return executionBindingReads === 1 ? undefined : (binding as unknown);
+          },
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(
+              input as unknown as Parameters<
+                ReturnType<typeof createCovenClient>["launchSession"]
+              >[0],
+            );
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody).not.toHaveProperty("executionBinding");
+            expect(sentBody).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            expect(executionBindingReads).toBe(1);
+          },
+        );
+      });
+
+      it("preserves the other launch fields exactly while replacing executionBinding", async () => {
+        const binding = validBinding();
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: binding,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession({
+              projectRoot: "/repo",
+              cwd: "/other-cwd",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              launchMode: "nonInteractive",
+              launchPolicy: {
+                approval: "never",
+                sandbox: "workspace-write",
+                addDirs: ["/extra-dir"],
+              },
+              conversation: { mode: "resume", id: "conversation-1" },
+              conversationId: "native-conversation-1",
+              familiarId: "sage",
+              callerFamiliarId: "caller-familiar",
+              executionBinding: binding,
+            });
+            expect(JSON.parse(capturedBody)).toEqual({
+              projectRoot: "/repo",
+              cwd: "/other-cwd",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              launchMode: "nonInteractive",
+              launchPolicy: {
+                approval: "never",
+                sandbox: "workspace-write",
+                addDirs: ["/extra-dir"],
+              },
+              conversation: { mode: "resume", id: "conversation-1" },
+              conversationId: "native-conversation-1",
+              familiarId: "sage",
+              callerFamiliarId: "caller-familiar",
+              executionBinding: binding,
+            });
+          },
+        );
+      });
+
+      it("legacy launchSession body remains exactly the five required fields when no optional launch fields are supplied", async () => {
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+            });
+            expect(sentBody).not.toHaveProperty("model");
+            expect(sentBody).not.toHaveProperty("launchMode");
+            expect(sentBody).not.toHaveProperty("launchPolicy");
+            expect(sentBody).not.toHaveProperty("conversation");
+            expect(sentBody).not.toHaveProperty("conversationId");
+            expect(sentBody).not.toHaveProperty("familiarId");
+            expect(sentBody).not.toHaveProperty("callerFamiliarId");
+            expect(sentBody).not.toHaveProperty("executionBinding");
+          },
+        );
+      });
+
+      it("does not serialize the original input object (top-level toJSON/prototype trick) on launchSession", async () => {
+        let capturedBody = "";
+        const input: LaunchCovenSessionInput = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+          model: "openai/gpt-5.6-sol",
+          conversationId: "native-conversation-1",
+        };
+        // A non-enumerable `toJSON` on `input` itself is invisible to any
+        // membership/shape check but is still what `JSON.stringify` would
+        // call if the wire body were ever `input` (or a shallow copy that
+        // preserves accessors/`toJSON`) instead of a fresh object literal.
+        Object.defineProperty(input, "toJSON", {
+          enumerable: false,
+          configurable: true,
+          value: () => ({
+            projectRoot: "/evil",
+            cwd: "/evil",
+            harness: "evil-harness",
+            prompt: "evil prompt",
+            title: "evil title",
+            model: "evil-model",
+            conversationId: "evil-conversation",
+          }),
+        });
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(input);
+            expect(JSON.parse(capturedBody)).toEqual({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              model: "openai/gpt-5.6-sol",
+              conversationId: "native-conversation-1",
+            });
+          },
+        );
+      });
+
+      it("reads an optional launch field exactly once even when it is a getter, on launchSession", async () => {
+        let modelReads = 0;
+        const input = {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+        };
+        // Same time-of-check/time-of-use trap as the executionBinding getter
+        // regression above, but for a plain (non-executionBinding) optional
+        // field: proves every field is read exactly once into the fresh
+        // body object, not re-read later from `input`.
+        Object.defineProperty(input, "model", {
+          enumerable: true,
+          configurable: true,
+          get() {
+            modelReads += 1;
+            return modelReads === 1 ? "openai/gpt-5.6-sol" : "tampered-reread";
+          },
+        });
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 201;
+              res.setHeader("Content-Type", "application/json");
+              res.end(
+                JSON.stringify({
+                  id: "session-1",
+                  project_root: "/repo",
+                  harness: "codex",
+                  title: "Fix tests",
+                  status: "running",
+                  exit_code: null,
+                  created_at: "2026-04-27T10:00:00Z",
+                  updated_at: "2026-04-27T10:00:00Z",
+                  execution_binding: null,
+                }),
+              );
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).launchSession(
+              input as unknown as Parameters<
+                ReturnType<typeof createCovenClient>["launchSession"]
+              >[0],
+            );
+            const sentBody = JSON.parse(capturedBody);
+            expect(sentBody.model).toBe("openai/gpt-5.6-sol");
+            expect(modelReads).toBe(1);
+          },
+        );
+      });
+
+      it("sendBoundInput sends exactly { data, executionBinding }", async () => {
+        const binding = validBinding();
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 202;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, accepted: true }));
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).sendBoundInput(
+              "session-1",
+              "hello\n",
+              binding,
+            );
+            expect(JSON.parse(capturedBody)).toEqual({ data: "hello\n", executionBinding: binding });
+          },
+        );
+      });
+
+      it("killBoundSession sends exactly { executionBinding }", async () => {
+        const binding = validBinding();
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 202;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, accepted: true }));
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).killBoundSession("session-1", binding);
+            expect(JSON.parse(capturedBody)).toEqual({ executionBinding: binding });
+          },
+        );
+      });
+
+      it("rejects an invalid executionBinding on launchSession before any HTTP request", async () => {
+        const missingSocket = path.join(tmpDir, "definitely-missing.sock");
+        await expect(
+          createCovenClient(missingSocket).launchSession({
+            projectRoot: "/repo",
+            cwd: "/repo",
+            harness: "codex",
+            prompt: "Fix tests",
+            title: "Fix tests",
+            executionBinding: { ...validBinding(), extra: "nope" } as CovenExecutionBinding,
+          }),
+        ).rejects.toThrow(/executionBinding has missing or unknown fields/);
+      });
+
+      it("rejects an unknown root key on sendBoundInput before any HTTP request", async () => {
+        const missingSocket = path.join(tmpDir, "definitely-missing.sock");
+        await expect(
+          createCovenClient(missingSocket).sendBoundInput(
+            "session-1",
+            "hello\n",
+            { ...validBinding(), extra: "nope" } as CovenExecutionBinding,
+          ),
+        ).rejects.toThrow(/executionBinding has missing or unknown fields/);
+      });
+
+      it("rejects an unknown parent key on killBoundSession before any HTTP request", async () => {
+        const missingSocket = path.join(tmpDir, "definitely-missing.sock");
+        const binding = delegatedBinding();
+        await expect(
+          createCovenClient(missingSocket).killBoundSession("session-1", {
+            ...binding,
+            parent: { ...binding.parent, extra: "nope" },
+          } as CovenExecutionBinding),
+        ).rejects.toThrow(/executionBinding\.parent has missing or unknown fields/);
+      });
+
+      it("legacy sendInput body remains { data } only when no binding is supplied", async () => {
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 202;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, accepted: true }));
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).sendInput("session-1", "hello\n");
+            expect(JSON.parse(capturedBody)).toEqual({ data: "hello\n" });
+          },
+        );
+      });
+
+      it("legacy killSession body remains empty when no binding is supplied", async () => {
+        let capturedBody = "";
+        await withServer(
+          (req, res) => {
+            let body = "";
+            req.on("data", (chunk: string) => {
+              body += chunk;
+            });
+            req.on("end", () => {
+              capturedBody = body;
+              res.statusCode = 202;
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify({ ok: true, accepted: true }));
+            });
+          },
+          async (socketPath) => {
+            await createCovenClient(socketPath).killSession("session-1");
+            expect(capturedBody).toBe("");
+          },
+        );
+      });
+    });
+  });
+
   it("validates a real socket inside the configured socket root", async () => {
     await withServer(
       (_req, res) => {
@@ -210,6 +1200,7 @@ describe("createCovenClient", () => {
           exitCode: 0,
           createdAt: "2026-04-27T10:00:00Z",
           updatedAt: "2026-04-27T10:00:01Z",
+          executionBinding: null,
         });
       },
     );

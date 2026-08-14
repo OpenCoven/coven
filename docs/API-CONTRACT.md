@@ -62,7 +62,8 @@ proof of `coven.daemon.v1` support.
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
-    "afsCommitDryRun": true
+    "afsCommitDryRun": true,
+    "executionBindingContracts": ["psyche.execution_binding.v1"]
   },
   "daemon": {
     "pid": 12345,
@@ -123,6 +124,7 @@ durability.
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
 | `afsCommit` | boolean | AFS deltas can be materialized into a Git branch. |
 | `afsCommitDryRun` | boolean | AFS commit accepts the side-effect-free `dryRun` contract. |
+| `executionBindingContracts` | string array | Psyche execution-binding contract names this daemon accepts. Currently `["psyche.execution_binding.v1"]`. A client that requires binding must confirm `"psyche.execution_binding.v1"` is present before sending a bound launch; an unknown or missing required value fails before any dependent request, per the existing fail-closed negotiation rule. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
 
 ## Structured error envelope
 
@@ -204,6 +206,11 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `session_id_conflict`  | 409         | `POST /sessions/external`: a daemon-managed (non-external) session with the supplied id already exists. |
 | `not_external_session` | 422         | `POST /sessions/:id/complete`: the session exists but is not an external session. Use `POST /sessions/:id/kill` for daemon-managed sessions. |
 | `external_session_not_killable` | 422 | `POST /sessions/:id/kill`: the session is external and not managed by the daemon; use `POST /sessions/:id/complete` instead. |
+| `execution_binding_invalid` | 400   | `executionBinding` (or its nested `parent`) is malformed, missing a required member, or carries an unknown/extra member; a launch cross-field rule (root/child) or the canonical-familiar-presence rule (bound launch omits top-level `familiarId`) fails; or an external-session registration request supplies `executionBinding` at all. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
+| `execution_binding_unsupported` | 400 | `executionBinding.contract` is present but is not `psyche.execution_binding.v1`. |
+| `execution_binding_required` | 400 | A bound session's `POST /sessions/:id/input` or `POST /sessions/:id/kill` omits `executionBinding` or supplies an incomplete proof. |
+| `execution_binding_expired` | 409  | Launch, or bound input, references an `executionBinding.expiresAt` that has already elapsed. Bound kill is explicitly exempt from this check. |
+| `execution_binding_mismatch` | 409 | A bound request's `executionBinding` proof, once parsed, byte-differs from the session's stored binding on at least one field, including parent correlation. This also covers a bound launch whose `executionBinding.familiarId` does not exact-match the canonical `FamiliarContext.id` resolved from top-level `familiarId`. `details.fields` names only the first mismatched field path, never a value. |
 
 ## Capability catalog shape (`v1`)
 
@@ -488,6 +495,13 @@ exact requested write set, and Rust validation remain the authority boundary.
 }
 ```
 
+A launch may additionally carry a top-level `executionBinding` object (and, for
+a delegated launch, `callerFamiliarId`) to bind the session to an opaque
+Psyche-owned `psyche.execution_binding.v1` identity. This is entirely optional
+and additive: a launch that omits `executionBinding` behaves exactly as it
+does today. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
+for the full request/response shape, validation, and error rules.
+
 ## Session record shape (`v1`)
 
 In `v1`, session responses stay as raw JSON objects using the Rust daemon's snake_case field names.
@@ -513,12 +527,20 @@ Endpoints that return this shape:
   "updated_at": "2026-05-09T06:43:05Z",
   "conversation_id": null,
   "familiar_id": null,
+  "execution_binding": null,
   "labels": [],
   "visibility": "private",
   "external": false,
   "transcript_path": null
 }
 ```
+
+`execution_binding` is `null` for every session launched without a Psyche
+binding; it is never omitted from the payload. A session launched with a
+bound `executionBinding` request field serializes the full stored
+`psyche.execution_binding.v1` object here instead, unchanged by archive
+state, cursor position, or lifecycle status. See
+[Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1).
 
 The `external` field is `true` for sessions registered via `POST /api/v1/sessions/external`; it is `false` for all daemon-launched sessions. The `transcript_path` field carries the absolute path to the external session's transcript file when provided at registration; it is `null` for daemon-launched sessions and for external sessions where no path was supplied.
 
@@ -570,6 +592,7 @@ Registers a session that is already running outside the daemon (for example, the
 | `200`  | An external session with this id was already registered (idempotent re-register). Body: the existing `SessionRecord`. |
 | `409`  | `session_id_conflict` — a daemon-managed (non-external) session with this id already exists. The daemon refuses to alias it. |
 | `400`  | `invalid_request` — malformed JSON or a required field is missing or blank.                        |
+| `400`  | `execution_binding_invalid` — the request supplies `executionBinding` at all. Coven does not supervise an externally registered runtime and cannot honor bound-operation guarantees for it; this is checked before any other field is read. `details.fields` is `["executionBinding"]`. |
 
 On success the response body is the full `SessionRecord` as described in [Session record shape (`v1`)](#session-record-shape-v1), with `external: true` and `status: "running"`.
 
@@ -600,6 +623,470 @@ Marks an externally-registered session finished. The daemon updates the session 
 ### Kill on an external session
 
 `POST /api/v1/sessions/:id/kill` returns `422 external_session_not_killable` when the target session has `external: true`. The kill endpoint is only valid for daemon-managed sessions.
+
+## Psyche execution binding contract (`v1`)
+
+Coven binds a session at launch to an immutable, opaque `psyche.execution_binding.v1`
+tuple that Psyche defines and Coven never interprets beyond syntax, contract
+identity, and expiry. Coven persists the tuple unchanged and exact-compares
+it, byte for byte, on every subsequent bound mutating request (input, kill)
+that must prove it. This is a mismatch-correlation guarantee only — it
+detects a proof drawn from, or matching, a different attempt's tuple. It is
+**not** authentication, and it is **not** a uniqueness or replay guarantee:
+two sessions may be launched with byte-identical `executionBinding` objects
+and both succeed. See [Non-goals](#non-goals) below and the normative design,
+`specs/psyche/O2_CONTRACT_DESIGN.md`.
+
+### Contract identity and field naming
+
+The named contract is `psyche.execution_binding.v1`. Requests carry it under
+the camelCase field `executionBinding`, matching request conventions. The
+persisted `SessionRecord` response exposes it under the snake_case field
+`execution_binding` (see [Session record shape (`v1`)](#session-record-shape-v1)),
+matching response conventions. The binding object itself always carries its
+own `contract` member, so a stored or returned object is self-describing
+independent of the wrapper field name. The health capability array is named
+`executionBindingContracts` (see [Capability fields](#capability-fields)) —
+distinct from the request/response field name, so it never collides by name
+or type with the `executionBinding` object itself.
+
+### JSON shape
+
+Root (non-delegated) launch — the object contains exactly these 13 members,
+no more, no fewer:
+
+```json
+{
+  "familiarId": "sage",
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-1",
+    "nodeId": "node-1",
+    "attemptId": "attempt-1",
+    "requestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": null,
+    "delegationDigest": null
+  }
+}
+```
+
+Child (delegated) launch requires the top-level `callerFamiliarId` and a
+complete, non-null `parent` object (exactly these 4 members) and
+`delegationDigest`:
+
+```json
+{
+  "familiarId": "sage",
+  "callerFamiliarId": "cody",
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-2",
+    "nodeId": "node-2",
+    "attemptId": "attempt-2",
+    "requestDigest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": {
+      "sessionId": "parent-1",
+      "graphId": "graph-1",
+      "nodeId": "node-1",
+      "attemptId": "attempt-1"
+    },
+    "delegationDigest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  }
+}
+```
+
+`GET /api/v1/sessions/:id` and any session-listing route return the same
+typed field values under `execution_binding`: `null` for an unbound session
+(never omitted), the full typed object for a bound one.
+
+### Field semantics
+
+Every field is opaque to Coven except syntax, contract identity, and expiry,
+which Coven validates. Coven never interprets principal, familiar, graph,
+node, attempt, policy, or delegation meaning.
+
+| Field | Nullable | Coven's obligation |
+|---|---:|---|
+| `contract` | No | Must equal `psyche.execution_binding.v1`; rejected otherwise. |
+| `principalRef` | No | Opaque ref syntax; store and exact-compare. |
+| `familiarId` | No | Opaque ref syntax; at launch, must exact-match the canonical `FamiliarContext.id` resolved from top-level `familiarId` (not merely the raw alias). |
+| `familiarSnapshotDigest` | No | Digest syntax; store and exact-compare. |
+| `projectDigest` | No | Digest syntax; store and exact-compare. Independent of, and never derived from or checked against, the Coven-canonical `project_root`. |
+| `graphId` | No | Opaque ID syntax; store and exact-compare. |
+| `nodeId` | No | Opaque ID syntax; store and exact-compare. |
+| `attemptId` | No | Opaque ID syntax; store and exact-compare. |
+| `requestDigest` | No | Digest syntax; store and exact-compare on bound input/kill. No uniqueness or conflict detection over this field. |
+| `policyRevision` | No | Opaque revision syntax; store and exact-compare. Coven never evaluates policy. |
+| `expiresAt` | No | Canonical UTC RFC 3339 whole-second timestamp; Coven checks syntax and, at launch and for bound input, that it has not already elapsed. |
+| `parent` | Yes | `null` for a root binding; a complete 4-field object for a child binding. Coven checks existence and exact-match against the referenced parent session's stored fields; it never infers graph topology. |
+| `delegationDigest` | Yes | `null` for a root binding; a digest for a child binding. Store and exact-compare. Coven never authorizes delegation. |
+
+### Exact-object membership and no normalization
+
+`executionBinding` and its nested `parent` are each a closed, exact set of
+members — there is no open/extensible schema at either level:
+
+- `executionBinding` must contain exactly the 13 members above — no more, no
+  fewer, no additional ones.
+- A non-null `parent` must contain exactly `sessionId`, `graphId`, `nodeId`,
+  `attemptId` — no more, no fewer, no additional ones.
+- Any unrecognized member key at either level is rejected with
+  `execution_binding_invalid` before any other validation runs. This applies
+  identically at launch and to the proof on bound input/kill.
+- Coven performs **no normalization**: no trimming, no case folding, no
+  Unicode normalization, no other reformatting. A value is checked against
+  the syntax rule below and then stored/compared exactly as received, byte
+  for byte. A same-after-normalization value is not a match — it is a syntax
+  failure (`execution_binding_invalid`) if it fails raw syntax, or a mismatch
+  (`execution_binding_mismatch`) on bound input/kill if it is syntactically
+  valid but byte-differs from the stored value. For example, a `graphId`
+  differing only in letter case from the stored value is rejected as a
+  mismatch, not silently accepted.
+- The same byte-exact rule extends to the top-level `familiarId` field of a
+  *bound* launch (it is not itself a member of `executionBinding`, but its
+  correlation against `executionBinding.familiarId` and admission both
+  depend on it): it is never trimmed before use, unlike an unbound launch's
+  existing `familiarId` trim/collapse-to-"no familiar" behavior, which is
+  unchanged. See [Launch correlation rules](#launch-correlation-rules).
+
+### Shape validation
+
+| Value class | Applies to | Rule |
+|---|---|---|
+| Opaque ref/ID/policy-revision | `principalRef`, `familiarId` (both locations), `graphId`, `nodeId`, `attemptId`, `policyRevision`, `parent.sessionId`, `parent.graphId`, `parent.nodeId`, `parent.attemptId` | 1 to 255 ASCII bytes, matching `[A-Za-z0-9._:/-]` only. |
+| Digest | `familiarSnapshotDigest`, `projectDigest`, `requestDigest`, `delegationDigest` (when present) | Exactly `sha256:` followed by 64 lowercase hexadecimal characters (71 bytes total). |
+| Timestamp | `expiresAt` | Canonical UTC RFC 3339 whole-second: `YYYY-MM-DDTHH:MM:SSZ`. No fractional seconds, no non-`Z` offset. Coven validates by parsing the value as RFC 3339 and re-serializing the parsed instant through the same canonical whole-second formatter, accepting the value only if the two are byte-identical. This check does not special-case a leap second: `SS` may be the RFC 3339 leap-second value `60` in addition to `00`-`59`, because a leap-second instant round-trips unchanged through that same parse/format pair — `SS` is not restricted to `00`-`59` only. |
+| Contract | `contract` | Must equal `psyche.execution_binding.v1` exactly. |
+
+### Launch correlation rules
+
+- The top-level, Coven-resolved canonical `projectRoot` remains Coven
+  authority and is persisted unchanged as `project_root`. `projectDigest` is
+  Psyche-owned, independently persisted, and never derived from or checked
+  against `project_root`.
+- A bound launch requires top-level `familiarId`; its absence is
+  `400 execution_binding_invalid` (`details.fields: ["familiarId"]`). Unlike
+  an unbound launch — which trims `familiarId` and collapses an empty or
+  whitespace-only value to "no familiar" — a bound launch applies no such
+  trimming to the raw top-level `familiarId` it received: the raw value must
+  already be byte-exact. Any leading/trailing whitespace, or any other value
+  that would only resolve or match after normalization, is rejected as
+  `400 execution_binding_invalid` (`details.fields: ["familiarId"]`) before
+  familiar resolution, the runtime, or the store are touched. Coven then
+  runs its existing `resolve_familiar` resolution on that exact value and
+  `executionBinding.familiarId` must exact-match the resolved
+  `FamiliarContext.id` — not merely the raw alias supplied. A mismatch is
+  `409 execution_binding_mismatch` (`details.fields: ["executionBinding.familiarId"]`)
+  and no session row is created.
+- **Root binding:** `parent` must be `null`, `delegationDigest` must be
+  `null`, and `callerFamiliarId` must be absent from the top-level request.
+  Any other combination of these three is rejected with
+  `400 execution_binding_invalid`, naming the single field responsible
+  (`executionBinding.parent`, `executionBinding.delegationDigest`, or
+  `callerFamiliarId`). A present `callerFamiliarId` that is `null`,
+  non-string, empty, or carries leading/trailing whitespace always fails at
+  `callerFamiliarId`, independent of `parent`/`delegationDigest` — it is
+  never collapsed into "absent".
+- **Child binding:** `parent` must be a complete object, `delegationDigest`
+  must be present, and `callerFamiliarId` is required. The session named by
+  `parent.sessionId` must exist (`404 session_not_found`,
+  `details.fields: ["parent.sessionId"]`, if it does not) and must itself
+  carry a stored, non-null `execution_binding`; if it exists but is unbound,
+  the response is `409 execution_binding_mismatch` naming only
+  `parent.sessionId`, since no stored binding fields exist to compare. That
+  parent's stored `familiar_id` must exact-match the request's
+  `callerFamiliarId` (mismatch: `execution_binding_mismatch`,
+  `details.fields: ["callerFamiliarId"]`), and the parent's stored
+  `graphId`/`nodeId`/`attemptId` must exact-match the request's
+  `parent.graphId`/`parent.nodeId`/`parent.attemptId` respectively (mismatch:
+  `execution_binding_mismatch`, `details.fields` naming the bare
+  `parent.graphId`/`parent.nodeId`/`parent.attemptId` path, one test per
+  field).
+- Parent correlation is existence and exact-match only. Coven never
+  authorizes delegation policy or infers graph topology beyond the single
+  parent reference given, and it does not resolve or enforce Coven Calls
+  delegation authority from `callerFamiliarId`.
+
+### Field path conventions in error `details`
+
+`details.fields` always names exactly one static field path, never a value
+or digest. Two distinct conventions apply, matching the actual daemon
+behavior:
+
+- **Shape/contract/cross-field violations** (`execution_binding_invalid`,
+  `execution_binding_unsupported`, `execution_binding_required`) name the
+  fully-qualified path from the request root, e.g. `executionBinding.contract`,
+  `executionBinding.parent`, `executionBinding.parent.sessionId`,
+  `executionBinding.delegationDigest`. `callerFamiliarId` is named bare
+  because it is a top-level launch field, not a member of `executionBinding`.
+- **Exact-match mismatches** (`execution_binding_mismatch`) name a top-level
+  `executionBinding` field with its full path (e.g.
+  `executionBinding.familiarId`, `executionBinding.graphId`,
+  `executionBinding.delegationDigest`), but name a nested `parent`
+  correlation mismatch bare — `parent`, `parent.sessionId`, `parent.graphId`,
+  `parent.nodeId`, `parent.attemptId` — never
+  `executionBinding.parent.sessionId`. `callerFamiliarId` mismatches are
+  likewise named bare. This bare-`parent.*`/`callerFamiliarId` convention is
+  normative for mismatch details and applies identically to launch parent
+  correlation and to bound input/kill proof comparison.
+
+### Persistence and API behavior
+
+- The immutable tuple is the complete `executionBinding` object plus the
+  session row's own Coven-canonical `project_root` and assigned session id.
+  Nothing else is added to it.
+- The binding is persisted atomically with session-row creation in a
+  nullable `execution_binding_json TEXT` column on the session row; there is
+  no separate binding table.
+- No route may update any field of an existing session's `execution_binding`
+  after creation. A stored binding round-trips deterministically, byte for
+  byte, across a daemon restart.
+- A `NULL` stored `execution_binding_json` is the only representation of an
+  unbound session. If a non-null stored value fails to parse as valid JSON,
+  or its `contract` does not equal `psyche.execution_binding.v1`, reading
+  that row is a store error — it is never silently treated as unbound.
+- `GET /api/v1/sessions/:id` and any listing route return the same typed
+  `execution_binding` value unchanged by archive state, cursor position, or
+  lifecycle status.
+
+### Bound input and kill
+
+`POST /api/v1/sessions/:id/input` on a bound session requires the complete,
+exact `executionBinding` object alongside the existing `data` payload:
+
+```json
+{
+  "data": "existing input payload, unchanged shape",
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-1",
+    "nodeId": "node-1",
+    "attemptId": "attempt-1",
+    "requestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": null,
+    "delegationDigest": null
+  }
+}
+```
+
+`POST /api/v1/sessions/:id/kill` on a bound session, which today carries no
+body, gains a JSON body carrying only the binding:
+
+```json
+{
+  "executionBinding": {
+    "contract": "psyche.execution_binding.v1",
+    "principalRef": "principal:operator",
+    "familiarId": "sage",
+    "familiarSnapshotDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "projectDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "graphId": "graph-1",
+    "nodeId": "node-1",
+    "attemptId": "attempt-1",
+    "requestDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "policyRevision": "policy:7",
+    "expiresAt": "2099-01-01T00:00:00Z",
+    "parent": null,
+    "delegationDigest": null
+  }
+}
+```
+
+For both routes:
+
+- A missing or incomplete proof fails closed: `400 execution_binding_required`,
+  `details.fields: ["executionBinding"]` (or the specific missing member's
+  path).
+- A malformed proof shape fails as `400 execution_binding_invalid`; an
+  unrecognized `contract` value fails as `400 execution_binding_unsupported`.
+- A present, well-formed proof that byte-differs from the stored binding on
+  any field fails as `409 execution_binding_mismatch`, naming only the first
+  mismatched field path per the conventions above.
+- **Input** additionally rejects an expired binding: `409 execution_binding_expired`,
+  `details.fields: ["executionBinding.expiresAt"]`. Input never proceeds
+  against an expired binding.
+- **Kill is explicitly exempt from the expiry check.** An exact-matching
+  proof whose `expiresAt` has already elapsed still succeeds, because kill
+  only narrows authority (stops a running attempt) and preserves operator
+  safety. Kill still requires an exact match on every other field.
+- Read/list/events endpoints (`GET /api/v1/sessions/:id`,
+  `GET /api/v1/sessions`, event/cursor reads) require no binding proof.
+  `GET /api/v1/sessions/:id` and any session-listing route return the stored
+  `execution_binding` field as-is. Event/cursor reads (`GET /api/v1/events`,
+  `GET /api/v1/sessions/:id/events`) do not: the `EventRecord` shape (see
+  [Event record shape and cursor pagination (`v1`)](#event-record-shape-and-cursor-pagination-v1))
+  carries no `execution_binding` field at all, bound or unbound — there is
+  nothing to return, only nothing to prove. Coven defines correlation here,
+  not authentication — read access is unchanged from today.
+
+Once the proof is required, an unbound session's kill precedence and body
+handling are completely unaffected: no proof check runs, the body (if any)
+is never parsed, and the existing status/liveness gate and response are
+unchanged from before O2. An unbound session's input precedence is unaffected
+for every field except the now-reserved `executionBinding` key: no proof
+check runs, and every other field's existing status/liveness gate, body
+shape, and response are unchanged from before O2, but an `executionBinding`
+key present in the input body — even a malformed one, since no validation
+ever runs against it here — is always stripped before it reaches the writer,
+runtime, or persisted event; see [Metadata isolation](#metadata-isolation)
+below. Legacy unbound launches and kills that never mention
+`executionBinding` behave identically to their pre-O2 shape; legacy unbound
+input behaves identically too, unless the caller happens to send an
+`executionBinding` key, which is now silently removed rather than passed
+through unchanged.
+
+#### Operation precedence
+
+**Launch** (`POST /api/v1/sessions`):
+
+1. Existing JSON body parsing, `projectRoot`/`cwd` resolution, and harness
+   validation, unchanged from today.
+2. `executionBinding` contract identity, shape, expiry, and root/child
+   cross-field validation, if `executionBinding` is present.
+3. Existing familiar resolution (`resolve_familiar`), unchanged from today.
+4. Canonical familiar-equality check and, for a child binding, parent lookup
+   and exact correlation.
+5. Existing maintenance-gate check, unchanged from today.
+6. Atomic session-row insert, including `execution_binding_json` if present.
+
+No session row is created, and no existing session state is mutated, unless
+every step through 5 succeeds. For an unbound launch, steps 2 and 4 do not
+apply and the remaining precedence is unchanged from today.
+
+**Input and kill** (`POST /api/v1/sessions/:id/input`,
+`POST /api/v1/sessions/:id/kill`):
+
+1. Existing session lookup by id (`404 session_not_found` if absent),
+   unchanged from today. A missing session wins over a malformed proof: an
+   unparseable `executionBinding` against a nonexistent session still
+   reports `session_not_found`.
+2. If the session is bound, require and parse the request's
+   `executionBinding` (`execution_binding_required` if missing/incomplete,
+   `execution_binding_invalid` if malformed, or `execution_binding_unsupported`
+   if its contract is unknown).
+3. Exact comparison of the parsed binding against the stored binding
+   (`execution_binding_mismatch` on any field difference — this wins even
+   over a not-live or external-session response that would otherwise apply
+   later).
+4. For input only, expiry check (`execution_binding_expired`); kill has no
+   expiry check, per its explicit exception above.
+5. Existing status/liveness and external-session checks, unchanged from
+   today.
+6. The runtime action itself (deliver input, or send kill).
+
+For an unbound session, steps 2-4 are skipped entirely and existing
+precedence (steps 1 and 5) is unchanged. Step 6 is unchanged for kill, whose
+body is never parsed for an unbound session; for input, step 6 is unchanged
+for every field except that a now-reserved `executionBinding` key, if
+present in the body, is always stripped before the runtime call and the
+persisted event, even though it is never validated — see
+[Metadata isolation](#metadata-isolation) below. No runtime action occurs
+unless every required prior step succeeds.
+
+#### Metadata isolation
+
+`executionBinding` is proof metadata consumed entirely by the API layer; it
+never reaches the harness/runtime or a recorded event, on any code path,
+including error paths:
+
+- **Input, bound session:** only the existing `data` field reaches the
+  session runtime's input call; the exact-match proof above has already
+  served its purpose, so the full request body is discarded in favor of
+  `{"data": data}`. The persisted input event is likewise built from `data`
+  only — its pre-O2 shape, containing no `executionBinding` key.
+- **Input, unbound session:** every other field of the parsed body reaches
+  the session runtime's input call and the persisted input event exactly as
+  before O2 — legacy precedence and shape for those fields is unaffected.
+  The `executionBinding` key is the one exception: it is now reserved, so if
+  present it is always stripped from the body before the runtime call and
+  the persisted event, even though it is never parsed or validated on this
+  path (an unbound session never runs the proof steps). A malformed
+  `executionBinding` value is stripped the same as a well-formed one; it is
+  never a validation error here.
+- **Kill:** the binding proof exists solely to satisfy the exact-match and
+  (non-)expiry checks above. It is never passed to the runtime's kill call,
+  which continues to take only the session id, and the persisted kill event
+  remains the pre-O2 shape — a bare `{"status": "killed"}` marker, no binding
+  fields. This holds for both bound and unbound sessions; an unbound kill's
+  body, if any, is never even parsed, so no stripping step applies there.
+
+### Health negotiation
+
+`GET /api/v1/health` advertises `capabilities.executionBindingContracts`
+additively (see [Capability fields](#capability-fields)):
+
+```json
+{
+  "capabilities": {
+    "executionBindingContracts": ["psyche.execution_binding.v1"]
+  }
+}
+```
+
+A client requiring execution binding must confirm
+`"psyche.execution_binding.v1"` is present before sending a bound launch. An
+unknown or missing required contract value fails before any dependent
+request, per the existing fail-closed rule. Legacy and unbound sessions
+remain fully compatible: a launch that omits `executionBinding` behaves
+exactly as it does today.
+
+Externally registered (non-Coven-owned) sessions must reject any
+`executionBinding` supplied at registration time (see
+[`POST /api/v1/sessions/external`](#post-apiv1sessionsexternal)), because
+Coven does not supervise that runtime and cannot honor bound-operation
+guarantees for it.
+
+### Error matrix
+
+| Code | Status | Condition |
+|---|---:|---|
+| `execution_binding_invalid` | 400 | Malformed, missing a required field, or contains an unknown/extra member in `executionBinding` or its nested `parent`; fails a root/child cross-field or canonical-familiar-presence rule at launch; malformed binding proof (including an unknown/extra member) on bound input/kill; or an externally registered session's registration request supplies `executionBinding` at all. |
+| `execution_binding_unsupported` | 400 | `contract` is not `psyche.execution_binding.v1`. |
+| `execution_binding_required` | 400 | Bound input or kill omits or supplies incomplete binding proof. |
+| `execution_binding_expired` | 409 | Launch or input references a binding whose `expiresAt` has elapsed. Kill is exempt (see above). |
+| `execution_binding_mismatch` | 409 | Any exact-match check fails, including parent correlation, canonical-familiar correlation, or a bound input/kill proof that byte-differs from the stored binding. This includes a child launch whose `parent.sessionId` exists but carries a `null` stored `execution_binding` — details name only `parent.sessionId` in that case. |
+| `session_not_found` | 404 | The current session, or a child launch's referenced `parent.sessionId`, does not exist at all. Unchanged from existing behavior (see [Stable error codes](#stable-error-codes)). |
+
+`details.fields` names only the mismatched/invalid field path (e.g.
+`executionBinding.graphId`, `parent.attemptId`); it never includes field
+values or digests. No broader denial taxonomy is introduced by this
+contract.
+
+### Non-goals
+
+This contract defines only the immutable launch/correlation core:
+
+- No adoption key, uniqueness index, single-use/replay protection, or
+  lookup-by-binding route. Two sessions may be launched with byte-identical
+  `executionBinding` objects, including identical `requestDigest` values,
+  and both succeed — a repeated valid proof is indistinguishable from a
+  replay or duplicate adoption under this contract.
+- No return-or-fence lookup semantics and no cancellation acknowledgement.
+- No content-addressed artifact binding and no crash-matrix recovery proofs
+  beyond deterministic persistence and restart round-trip.
+- No broader structured-denial taxonomy beyond the six error codes above.
+- No interpretation of `graphId`/`nodeId`/`attemptId` topology, descendant
+  enumeration, or delegation authorization — `callerFamiliarId` is
+  correlation metadata only, never a delegation-authority decision.
+- No production child/subagent dispatch.
 
 ## Event record shape and cursor pagination (`v1`)
 
@@ -1240,6 +1727,19 @@ Shared non-success responses use the structured error envelope:
 }
 ```
 
+The session lookup (and its `404 session_not_found`) always runs first, even
+against a bound session with a malformed or missing proof. Only after that
+lookup succeeds does a bound session (one launched with `executionBinding`)
+additionally require a complete, exact-matching `executionBinding` proof in
+the request body, checked before the existing `409 session_not_live` and
+external-session checks above; see
+[Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
+for the request shape, precedence, and the additional
+`execution_binding_required`/`execution_binding_invalid`/
+`execution_binding_unsupported`/`execution_binding_expired`/
+`execution_binding_mismatch` error responses that apply only to bound
+sessions.
+
 ## comux and OpenClaw bridge compatibility
 
 - comux reads the `capabilities` object from `/api/v1/health` to decide which features to use.
@@ -1263,8 +1763,11 @@ Shared non-success responses use the structured error envelope:
 4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
 5. Check `capabilities.sessionLaunchPolicy === true` before sending
    `launchPolicy`; a missing, false, or malformed value means unsupported.
-6. Only then depend on the documented `v1` sessions/events shapes.
+6. Check `capabilities.executionBindingContracts` includes
+   `"psyche.execution_binding.v1"` before sending a bound `executionBinding`
+   launch, input, or kill.
+7. Only then depend on the documented `v1` sessions/events shapes.
 
 ## Scope boundary
 
-The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, and scheduler decision/recovery routes. Do not treat route names outside this document as reserved API until they are implemented and documented here.
+The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, scheduler decision/recovery routes, and the Psyche execution binding contract described above. Do not treat route names outside this document as reserved API until they are implemented and documented here.

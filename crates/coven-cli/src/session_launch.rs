@@ -176,6 +176,9 @@ pub struct NewSessionParams {
     pub now: String,
     pub conversation_id: Option<String>,
     pub familiar_id: Option<String>,
+    /// Immutable `psyche.execution_binding.v1` identity for the new session,
+    /// when the launch was delegated by Psyche. `None` for direct launches.
+    pub execution_binding: Option<crate::execution_binding::ExecutionBinding>,
     pub labels: Vec<String>,
     /// `None` means the default (`private`).
     pub visibility: Option<String>,
@@ -197,6 +200,7 @@ pub fn new_session_record(params: NewSessionParams) -> store::SessionRecord {
         updated_at: params.now,
         conversation_id: params.conversation_id,
         familiar_id: params.familiar_id,
+        execution_binding: params.execution_binding,
         labels: params.labels,
         visibility: params.visibility.unwrap_or_else(|| "private".to_string()),
         external: false,
@@ -313,6 +317,7 @@ mod tests {
             now: "2026-01-01T00:00:00Z".into(),
             conversation_id: None,
             familiar_id: Some("sage".into()),
+            execution_binding: None,
             labels: vec!["ci".into()],
             visibility: None,
         });
@@ -324,5 +329,43 @@ mod tests {
         assert_eq!(record.transcript_path, None);
         assert_eq!(record.familiar_id.as_deref(), Some("sage"));
         assert_eq!(record.labels, vec!["ci".to_string()]);
+        assert_eq!(record.execution_binding, None);
+    }
+
+    fn execution_binding_fixture() -> crate::execution_binding::ExecutionBinding {
+        crate::execution_binding::ExecutionBinding {
+            contract: crate::execution_binding::CONTRACT.to_string(),
+            principal_ref: "principal:operator".to_string(),
+            familiar_id: "sage".to_string(),
+            familiar_snapshot_digest: format!("sha256:{}", "a".repeat(64)),
+            project_digest: format!("sha256:{}", "b".repeat(64)),
+            graph_id: "graph-1".to_string(),
+            node_id: "node-1".to_string(),
+            attempt_id: "attempt-1".to_string(),
+            request_digest: format!("sha256:{}", "c".repeat(64)),
+            policy_revision: "policy:7".to_string(),
+            expires_at: "2099-01-01T00:00:00Z".to_string(),
+            parent: None,
+            delegation_digest: None,
+        }
+    }
+
+    #[test]
+    fn new_session_record_preserves_a_bound_execution_binding() {
+        let binding = execution_binding_fixture();
+        let record = new_session_record(NewSessionParams {
+            id: "session-2".into(),
+            project_root: "/repo".into(),
+            harness: "codex".into(),
+            title: "Delegated run".into(),
+            status: "running".into(),
+            now: "2026-01-01T00:00:00Z".into(),
+            conversation_id: None,
+            familiar_id: Some("sage".into()),
+            execution_binding: Some(binding.clone()),
+            labels: Vec::new(),
+            visibility: None,
+        });
+        assert_eq!(record.execution_binding, Some(binding));
     }
 }

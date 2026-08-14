@@ -335,10 +335,13 @@ The client:
 - exposes no local success fallback.
 
 This describes the full execution lifecycle Psyche requires. The
-[proposed O2 contract](./O2_CONTRACT_DESIGN.md) covers only immutable opaque
-binding and exact-match correlation. O3 through O7 separately own adoption and
-uniqueness, lookup and fencing, cancellation acknowledgement, artifact
-binding, and cross-phase recovery.
+[O2 contract](./O2_CONTRACT_DESIGN.md) covers exactly one thing: immutable
+opaque session binding and exact-match mismatch correlation only — it defines
+no adoption, uniqueness, replay/duplicate-adoption prevention, lookup, or
+fencing behavior. O3 through O7 separately own adoption and uniqueness,
+lookup and fencing, cancellation acknowledgement, artifact binding, and
+cross-phase recovery; O2 does not anticipate or partially implement any of
+that later work.
 
 ### 4.10 Operations core
 
@@ -368,7 +371,7 @@ The initial surface-neutral contract set is:
 | `psyche.delegation.v1` | Parent-child relationship, delegated authority, acceptance criteria, and cancellation policy. |
 | `psyche.budget.v1` | Reserved, consumed, and released accounting by resource class. |
 | `psyche.approval.v1` | Psyche orchestration approval request, provenance, decision, and expiry. |
-| `psyche.execution_binding.v1` | Proposed O2 immutable opaque session binding and exact-match correlation; O3-O7 separately add adoption, lookup/fencing, cancellation, artifacts, and recovery. |
+| `psyche.execution_binding.v1` | O2 immutable opaque session binding and exact-match mismatch correlation only, per `O2_CONTRACT_DESIGN.md`; O3-O7 separately own adoption/uniqueness, lookup/fencing, cancellation acknowledgement, artifact binding, and recovery — none of those later fields belong to this O2 object. |
 | `psyche.evidence.v1` | Immutable test, artifact, trajectory, verifier, or human evidence reference. |
 | `psyche.verdict.v1` | Verification policy, evidence set, independent verifier, confidence class, and decision. |
 | `psyche.recovery.v1` | Lease, ambiguity, fence, reconciliation, and operator resolution state. |
@@ -701,7 +704,7 @@ Comprehensive orchestration is delivered through separate plans:
 | Identity kernel | Surface-neutral snapshots, revisions, contradiction checks, and session bindings. |
 | Intent ledger | Immutable normalized intents with provenance, supersession, and replay protection. |
 | Graph store and state machine | Durable nodes, dependencies, leases, budgets, cancellation, and recovery without real harnesses. |
-| Proposed O2 execution binding | Immutable opaque request/session correlation and exact mismatch rejection only. |
+| O2 execution binding | Immutable opaque request/session correlation and exact mismatch rejection only. |
 | O3-O7 execution lifecycle | Planned adoption, lookup/fencing, cancellation acknowledgement, artifact binding, and recovery required before real conformance. |
 | Multi-agent execution | Parent-child correlation, bounded delegation, propagation, result adoption, and orphan fencing. |
 | Capability router | Reviewed capability matching with negative tests for metadata poisoning and unsupported contracts. |
