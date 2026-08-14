@@ -1,6 +1,6 @@
 # Psyche O2 Coven Contract Design
 
-**Status:** Approved; implementation complete pending final repository verification.
+**Status:** Approved and implemented; merge/verification evidence is recorded by the implementation issue and PR.
 
 **Depends on:** O1, merged (issue #567, Bead `coven-psy-o1`).
 
@@ -555,34 +555,34 @@ not itself edit `RUNTIME_DESIGN.md` or add any of those fields.
 
 ## 11. Acceptance checklist
 
-- [ ] Contract name, request field, response field, and inner `contract`
+- [x] Contract name, request field, response field, and inner `contract`
       value exactly match §2.1.
-- [ ] The v1 object contains exactly the fields listed in §2.2/§2.3, with no
+- [x] The v1 object contains exactly the fields listed in §2.2/§2.3, with no
       added adoption key, request ID, or extra field.
-- [ ] Shape validation matches §3 exactly (byte length, character class,
+- [x] Shape validation matches §3 exactly (byte length, character class,
       digest format, timestamp format).
-- [ ] `executionBinding` and its nested `parent` object each reject any
+- [x] `executionBinding` and its nested `parent` object each reject any
       unknown/extra member with `execution_binding_invalid` at both launch
       and bound input/kill (§3.1); accepted values are stored/compared byte
       for byte with no trimming, case folding, or Unicode normalization
       (§3.1); positive (exact-fields-only) and negative (unknown-member)
       tests exist at both object levels, per §8.
-- [ ] `project_root`/`projectDigest` separation and canonical familiar
+- [x] `project_root`/`projectDigest` separation and canonical familiar
       equality (`resolve_familiar`/`FamiliarContext.id` versus
       `executionBinding.familiarId`) are enforced per §2.4.
-- [ ] Root/child cross-field rules (`parent`, `delegationDigest`,
+- [x] Root/child cross-field rules (`parent`, `delegationDigest`,
       `callerFamiliarId`) are enforced exactly as specified.
-- [ ] Parent correlation performs existence + exact-match only, never
+- [x] Parent correlation performs existence + exact-match only, never
       topology inference or delegation authorization.
-- [ ] Binding persists atomically in `execution_binding_json`, is immutable
+- [x] Binding persists atomically in `execution_binding_json`, is immutable
       after creation, and survives restart with deterministic serialization.
-- [ ] Unbound sessions serialize `execution_binding: null`, never omitted;
+- [x] Unbound sessions serialize `execution_binding: null`, never omitted;
       bound sessions serialize the full typed object.
-- [ ] Invalid stored JSON/contract is a store error, never silently unbound.
-- [ ] Bound input/kill require complete exact-match proof, following the
+- [x] Invalid stored JSON/contract is a store error, never silently unbound.
+- [x] Bound input/kill require complete exact-match proof, following the
       precedence in §5.1; input rejects expiry; kill's expiry exception is
       implemented and tested.
-- [ ] `executionBinding` is stripped before the runtime call and before event
+- [x] `executionBinding` is stripped before the runtime call and before event
       recording on both input and kill (§5.2): a bound session's
       `SessionRuntime::send_input` receives only `data` and its recorded
       input event contains only `data`; an unbound session's
@@ -592,26 +592,26 @@ not itself edit `RUNTIME_DESIGN.md` or add any of those fields.
       path, and the kill event carries no binding fields — verified by
       inspecting the actual runtime call and stored event, not just the HTTP
       response (§8.1).
-- [ ] Read/list/events endpoints remain unauthenticated by binding and
+- [x] Read/list/events endpoints remain unauthenticated by binding and
       unchanged in access behavior.
-- [ ] Health advertises `capabilities.executionBindingContracts` additively.
-- [ ] External session registration rejects `executionBinding` with
+- [x] Health advertises `capabilities.executionBindingContracts` additively.
+- [x] External session registration rejects `executionBinding` with
       `execution_binding_invalid`.
-- [ ] All six error codes in §7 are implemented with field-path-only details,
+- [x] All six error codes in §7 are implemented with field-path-only details,
       including the parent-exists-but-unbound and external-registration
       mappings.
-- [ ] All tests in §8 (including §8.1) are present and passing.
-- [ ] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] All tests in §8 (including §8.1) are present and passing.
+- [x] `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
       `cargo test --workspace --locked`, `python scripts/check-secrets.py`,
       `python3 scripts/check-coven-privacy.py --staged`,
       `npm --prefix packages/openclaw-coven run typecheck`, and
       `npm --prefix packages/openclaw-coven test` all pass.
-- [ ] `docs/API-CONTRACT.md` updated in the same PR as the implementation.
-- [ ] Two identical bindings on separate sessions succeed, proving no O3
+- [x] `docs/API-CONTRACT.md` updated in the same PR as the implementation.
+- [x] Two identical bindings on separate sessions succeed, proving no O3
       behavior was introduced; the design's Purpose/self-review make clear
       this also means replay and duplicate-adoption prevention are not
       claimed by O2 (§1, §9, §13).
-- [ ] `RUNTIME_DESIGN.md` wording is corrected per §10 once this design is
+- [x] `RUNTIME_DESIGN.md` wording is corrected per §10 once this design is
       approved, without adding O3-O7 fields to the O2 object.
 
 ## 12. Non-goals
