@@ -107,7 +107,7 @@ log query text to any destination outside the Coven filesystem.
 Claude Code, CovenCave, bare SSH), does this skill work without modification?*
 
 **✅ Yes.** The skill's only dependencies are (a) the `coven-memory` CLI — a
-Coven-shipped binary and (b) `~/.coven/memory/` — a Coven-owned contract path.
+Coven-shipped binary, and (b) `~/.coven/memory/` — a Coven-owned contract path.
 No shell, runtime-specific hooks, session APIs, or bootstrap injection are
 required.
 FAMILIAR_ROOT resolution follows the schema's flag→env→fail-closed order and is
