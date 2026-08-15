@@ -76,17 +76,28 @@ trusted_open_pr_filter() {
      | select((.headRepositoryOwner.login // "" | ascii_downcase) == $owner)'
 }
 
-pr_number_for() {
+trusted_pr_number_for() {
   local branch="$1"
   trusted_open_pr_filter "$branch" | jq -r '.number'
 }
 
-pr_title_for() {
+# Deletion protection stays name-based and is deliberately NOT trust-filtered.
+# The trust filter can legitimately miss a live PR — a push landing between
+# Step 0's fetch and Step 1's `gh pr list` leaves `origin/<branch>` behind
+# `headRefOid` — and a miss here would classify an open PR's branch as
+# SUPERSEDED and delete it out from under its author. Protection fails open;
+# only merging (Step 5) fails closed on the same signal.
+pr_number_for() {
   local branch="$1"
-  trusted_open_pr_filter "$branch" | jq -r '.title'
+  echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .number'
 }
 
-branch_is_open_pr()   { [[ -n "$(pr_number_for "$1")" ]]; }
+pr_title_for() {
+  local branch="$1"
+  echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .title'
+}
+
+branch_is_open_pr()   { open_branches  | grep -qxF "$1"; }
 branch_is_merged_pr() { merged_branches | grep -qxF "$1"; }
 
 # Branch names reach these helpers with the `origin/` prefix stripped, because
@@ -254,6 +265,19 @@ if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
     pr=$(pr_number_for "$branch")
     title=$(pr_title_for "$branch")
     log "  PR #$pr — $title"
+
+    # Merging fails closed on the trust signal that deletion deliberately
+    # ignores: only a PR GitHub reports as origin-owned, at exactly the commit
+    # we fetched, may be merged. A fork PR reusing an origin branch name, two
+    # open PRs sharing a head name, or a head that moved after Step 0's fetch
+    # all land here and are left for a human.
+    if [[ "$(trusted_pr_number_for "$branch")" != "$pr" ]]; then
+      reason="PR head is not this repository's origin ref at the fetched commit"
+      warn "  $(yellow 'skipped') #$pr — $reason"
+      SKIPPED_LIST+=("#$pr ($branch) — $reason")
+      (( skipped_count++ )) || true
+      continue
+    fi
 
     # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
     # force-pushing a blocked PR is itself destructive, so this runs before any
