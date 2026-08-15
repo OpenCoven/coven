@@ -14,7 +14,7 @@ The approved source is the staged
 - SHA-256: `23277948e41342302ea0f6e514a95aef59fb616f4457de63cd7ad7eba9d9ef2e`
 
 This SVG becomes the sole canonical identity source. The separately staged
-`assets/opencoven/brand-logo.png` is redundant and will not be retained.
+redundant raster compatibility copies are not retained.
 
 ## Asset Architecture
 
@@ -75,8 +75,14 @@ Preserve the existing dimensions, typography, copy, colors, and layout of:
 - `brand/social/x-banner.png`
 - `web/og.svg` and `web/og.png`
 
-Only the emblem layer changes to the new crown. SVG source files are updated
-before their PNG exports so the committed vector and raster forms agree.
+The reviewed banner exception keeps the black background, network art, and
+layout intact; it replaces only the old low-contrast emblem with the canonical
+crown in the approved dim violet `--oc-purple-banner` (`#6A5FA0`), so the mark stays subdued but
+recognizable.
+
+The OG composition keeps its existing white crown/text/purple-glow palette.
+SVG source files are updated before their PNG exports so the committed vector
+and raster forms agree.
 
 ## Generation
 

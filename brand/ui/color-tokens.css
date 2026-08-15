@@ -14,6 +14,11 @@
   --oc-purple-accent: #D4B5FF;
   --oc-purple-accent-muted: #9D7FBF;
 
+  /* Reviewed social-banner exception: the crown silhouette on the X/GitHub
+     banners, dim enough to stay subdued on black but above the near-invisible
+     contrast of the retired #171228. Banner compositions only — not a UI colour. */
+  --oc-purple-banner: #6A5FA0;
+
   /* Legacy aliases for backward compatibility */
   --oc-purple-1: #7A6DAA;     /* was #6E4BFF */
   --oc-purple-2: #9A8ECD;     /* was #8A63FF */

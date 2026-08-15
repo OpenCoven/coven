@@ -527,7 +527,7 @@ rsvg-convert \
 
 Expected: the avatar becomes the full white-crown-on-black-square treatment.
 
-- [ ] **Step 3: Build a dark-violet transparent crown for banners**
+- [ ] **Step 3: Build a dim brand-violet transparent crown for banners**
 
 Run:
 
@@ -543,12 +543,12 @@ magick \
   -trim \
   +repage \
   -resize 300x300 \
-  -fill '#171228' \
+  -fill '#6A5FA0' \
   -colorize 100 \
   /tmp/coven-logo-refresh-banner-mark.png
 ```
 
-Expected: `/tmp/coven-logo-refresh-banner-mark.png` has a transparent background and a dark-violet crown.
+Expected: `/tmp/coven-logo-refresh-banner-mark.png` has a transparent background and a dim brand-violet crown.
 
 - [ ] **Step 4: Replace only the left emblem region**
 
