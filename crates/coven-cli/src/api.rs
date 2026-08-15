@@ -1995,6 +1995,20 @@ fn launch_session(
         match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
             Ok(familiar_ctx) => familiar_ctx,
             Err(session_launch::FamiliarError::Unknown { familiar_id, error }) => {
+                // A bound launch gets a generic answer: echoing the submitted
+                // id back, plus a resolver message that distinguishes "no such
+                // familiar" from other failures, turns this endpoint into a
+                // familiar-existence oracle for a caller that already proved
+                // only its binding. Unbound launches keep the exact legacy
+                // message and details for backward compatibility.
+                if execution_binding.is_some() {
+                    return api_error(
+                        400,
+                        "unknown_familiar",
+                        "Familiar was not found.",
+                        Some(json!({ "fields": ["familiarId"] })),
+                    );
+                }
                 return api_error(
                     400,
                     "unknown_familiar",
@@ -10107,6 +10121,88 @@ mod tests {
             "parent": null,
             "delegationDigest": null
         })
+    }
+
+    #[test]
+    fn bound_launch_does_not_leak_the_unknown_familiar_id() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello coven",
+            "familiarId": "no-such-familiar",
+            "executionBinding": root_binding("no-such-familiar"),
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 400, "{}", response.body);
+        assert!(
+            response.body.contains("unknown_familiar"),
+            "expected unknown familiar error, got: {}",
+            response.body
+        );
+        assert!(
+            !response.body.contains("no-such-familiar"),
+            "a bound launch must not echo the submitted familiar id back, got: {}",
+            response.body
+        );
+        let payload: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(payload["error"]["details"]["fields"], json!(["familiarId"]));
+        assert!(
+            runtime.launches.borrow().is_empty(),
+            "unknown familiar must not launch a runtime"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unbound_launch_keeps_the_legacy_unknown_familiar_details() -> anyhow::Result<()> {
+        // The redaction is scoped to bound launches; the legacy unbound shape
+        // is relied on by existing clients and must not change with it.
+        let temp_dir = tempfile::tempdir()?;
+        seed_familiars_toml(temp_dir.path())?;
+        let project_root = temp_dir.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "claude",
+            "launchMode": "nonInteractive",
+            "prompt": "hi",
+            "familiarId": "no-such-familiar",
+        })
+        .to_string();
+
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 400, "{}", response.body);
+        let payload: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            payload["error"]["details"]["familiarId"], "no-such-familiar",
+            "unbound launches keep echoing the submitted id: {}",
+            response.body
+        );
+        Ok(())
     }
 
     #[test]
