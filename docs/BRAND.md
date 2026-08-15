@@ -41,8 +41,15 @@ Use the black-background logo with the white crown on public docs, README, packa
 
 | Asset | Purpose |
 | --- | --- |
-| [`docs/assets/opencoven-icon.svg`](https://github.com/OpenCoven/coven/blob/main/docs/assets/opencoven-icon.svg) | Public docs logo, favicon, and generated docs metadata |
+| [`docs/assets/opencoven-icon.svg`](https://github.com/OpenCoven/coven/blob/main/docs/assets/opencoven-icon.svg) | Public docs logo and generated docs metadata |
 | [`assets/opencoven/opencoven.svg`](https://github.com/OpenCoven/coven/blob/main/assets/opencoven/opencoven.svg) | Root README and shared package-logo source |
+| [`brand/logo/opencoven-logo.svg`](https://github.com/OpenCoven/coven/blob/main/brand/logo/opencoven-logo.svg) | Full black-square compatibility export |
+| [`brand/logo/opencoven-mark.svg`](https://github.com/OpenCoven/coven/blob/main/brand/logo/opencoven-mark.svg) | Transparent crown for controlled dark compositions, including website chrome |
+| [`brand/logo/opencoven-white.svg`](https://github.com/OpenCoven/coven/blob/main/brand/logo/opencoven-white.svg) | Transparent white crown compatibility export |
+| [`brand/logo/opencoven-black.svg`](https://github.com/OpenCoven/coven/blob/main/brand/logo/opencoven-black.svg) | Transparent black crown compatibility export |
+| [`brand/logo/opencoven-monoline.svg`](https://github.com/OpenCoven/coven/blob/main/brand/logo/opencoven-monoline.svg) | Compatibility alias that reuses the current crown silhouette |
+| [`web/favicon.svg`](https://github.com/OpenCoven/coven/blob/main/web/favicon.svg) | Website favicon |
+| [`web/apple-touch-icon.png`](https://github.com/OpenCoven/coven/blob/main/web/apple-touch-icon.png) | Tracked 1254×1254 canonical square raster; regenerate it whenever the approved logo changes |
 | [`brand/ui/color-tokens.css`](https://github.com/OpenCoven/coven/blob/main/brand/ui/color-tokens.css) | Canonical color tokens |
 | [`brand/ui/typography.css`](https://github.com/OpenCoven/coven/blob/main/brand/ui/typography.css) | Canonical font stacks and tracking |
 | [`brand/social/opencoven-og.png`](https://github.com/OpenCoven/coven/blob/main/brand/social/opencoven-og.png) | Social preview image; regenerate it when the approved logo changes |
@@ -50,14 +57,16 @@ Use the black-background logo with the white crown on public docs, README, packa
 
 The full black-square logo is the default public export. The transparent
 `brand/logo/opencoven-mark.svg` variant is reserved for composition inside
-controlled dark surfaces, including the landing-page navigation, hero, and
+controlled dark surfaces, including website chrome such as the landing-page navigation, hero, and
 footer. The black, white, and monoline filenames remain compatibility assets;
 the monoline filename uses the same crown silhouette because the current
 identity has no separate monoline drawing.
+Display the logo at 24px minimum, keep at least 10% clear space, and preserve
+exact proportions in every placement.
 
 ## Raster icon pack
 
-The existing raster icon pack remains available in [`assets/opencoven`](https://github.com/OpenCoven/coven/tree/main/assets/opencoven) for platform slots. The raster exports should depict the same black-background, white-icon logo.
+The existing raster icon pack remains available in [`assets/opencoven`](https://github.com/OpenCoven/coven/tree/main/assets/opencoven) for platform slots. The raster exports should depict the same black-background, white-crown logo.
 
 ## Package copies
 
