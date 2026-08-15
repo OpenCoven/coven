@@ -68,7 +68,7 @@ log query text to any destination outside the Coven filesystem.
    string, equivalent to `execve`/`subprocess.run(["coven-memory", "search",
    "--familiar", familiar, query])`. If a runtime exposes only a shell, pass
    every dynamic argument through robust single-argument shell escaping (for
-   example POSIX `shlex.quote`) and do not concatenate raw input. Add `--index`/
+   example Python `shlex.quote`) and do not concatenate raw input. Add `--index`/
    `--db` only if the store lives off the default path. The crate owns ranking
    (fastembed/nomic-embed-text-v1.5 + TurboVec ANN; schema §11.5 pins embeddings
    as crate-internal).
