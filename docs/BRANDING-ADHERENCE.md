@@ -7,17 +7,17 @@ description: "Tracks OpenCoven brand adherence across landing, docs, and package
 
 **Status:** In progress
 **Source of truth:** [`DESIGN.md`](https://github.com/OpenCoven/coven/blob/main/DESIGN.md)
-**Last updated:** 2026-05-17
+**Last updated:** 2026-08-14
 
 ## Progress
 
 - [x] Added canonical design system to `DESIGN.md`.
 - [x] Generated brand color tokens in `brand/ui/color-tokens.css`.
 - [x] Generated typography tokens in `brand/ui/typography.css`.
-- [x] Standardized public logo usage on the black-background, white-icon asset.
+- [x] Standardized public logo usage on the black-background, white-crown asset.
 - [x] Generated social/OG assets in `brand/social/` and `web/og.png`.
 - [x] Added landing-page brand override stylesheet at `web/brand.css`.
-- [x] Updated landing hero to the production copy: “Orchestrate Intelligence.” / “Multi-agent systems. Unified control. Real execution.”
+- [x] Updated landing hero to the production copy: “Familiars that Recall, Reason, and React.”
 - [x] Added contributor usage checklist in `brand/docs/BRAND-USAGE.md`.
 - [x] Updated `docs/BRAND.md` to point to the new system.
 
@@ -34,7 +34,7 @@ description: "Tracks OpenCoven brand adherence across landing, docs, and package
 
 ### Documentation (`docs/`)
 
-- [x] Brand docs now reference the approved black-background, white-icon logo.
+- [x] Brand docs now reference the approved black-background, white-crown logo.
 - [x] Checklist/progress/risks are documented here.
 - [x] Markdown diagrams are syntax-checked by the docs smoke test.
 
@@ -52,7 +52,7 @@ description: "Tracks OpenCoven brand adherence across landing, docs, and package
 
 1. **Font files are not vendored.** `typography.css` uses local/system font stacks (`EB Garamond`, `Inter`, `JetBrains Mono`, SF Pro Text, SF Mono). All three canonical faces are free/open-source on Google Fonts — Cave loads them at runtime via `next/font/google`, and other surfaces should self-host via `@font-face` from those sources. This avoids licensing mistakes while still giving pixel-identical rendering everywhere.
 2. **Landing still has inline page CSS.** It now imports token files and uses `web/brand.css` as the enforcement layer, but a later cleanup should split layout CSS into `web/page.css` for easier review.
-3. **Logo variants are not approved for public surfaces.** Public docs, README, packages, and landing chrome should use the black-background, white-icon logo only.
+3. **Public exports use the full logo; controlled landing chrome and reviewed banners have specific exceptions.** Public docs, README, packages, favicon/avatar, and OG exports use the full black-square, white-crown identity treatment; OG may composite the white crown on its black composition. Controlled dark landing navigation, hero, and footer may use the transparent `brand/logo/opencoven-mark.svg`. X/GitHub banner compositions are the reviewed social exception: the canonical crown silhouette appears in dim violet `#6A5FA0` on black, while text, network art, and layout remain unchanged. This is not permission for arbitrary logo variants.
 4. **OG image uses local generated raster output.** It should be regenerated whenever the logo or primary tagline changes.
 
 ## Risks
@@ -61,7 +61,7 @@ description: "Tracks OpenCoven brand adherence across landing, docs, and package
 - **Font mismatch:** Without bundled licensed fonts, headings may render differently across machines. The stack is intentionally safe but not pixel-identical.
 - **Token drift:** Because the landing is static HTML, future edits could bypass tokens unless reviewers enforce `brand/docs/BRAND-USAGE.md`.
 - **Package README rendering:** npm/GitHub image handling differs; package-local SVG copies avoid cross-package path dependencies.
-- **Brand drift:** Older notes allowed multiple logo variants. Treat the single black-background, white-icon asset as authoritative unless maintainers reverse it.
+- **Brand drift:** Older notes allowed multiple logo variants. Treat the full black-square, white-crown logo as authoritative for docs, README, packages, favicon/avatar, and OG exports; treat the transparent mark as the approved controlled-dark landing exception, and treat the X/GitHub banners as the reviewed dim-violet social exception only. This is not permission for arbitrary logo variants.
 
 ## Next hardening steps
 
