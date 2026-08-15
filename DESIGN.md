@@ -57,7 +57,7 @@ A familiar is not a faceless bot. It has a name, purpose, memory, toolset, voice
 
 ### Approved Logo
 
-The approved public logo is the crown as a white crown on a black square background. Use it for docs, README, package READMEs, favicons, avatars, and small identity surfaces. Website chrome is the controlled exception and uses the transparent composition mark.
+The approved public logo is the crown as a white mark on a black square background. Use it for docs, README, package READMEs, favicons, avatars, and small identity surfaces. Website chrome is the controlled exception and uses the transparent composition mark.
 
 Do not substitute gradient, black-only, monoline, or external avatar images in public surfaces.
 
@@ -582,9 +582,9 @@ font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
 **Reviewed By:** Val + Nova
 
 **Change Log:**
-- **v1.3.0** – Crown refresh alignment: clarified the public/export role of the full black-square, white-crown logo versus the controlled-dark transparent mark, documented the restrained ambient hero/OG backdrop exception, and recorded regenerated canonical assets for the refreshed crown system.
+- **v1.3.0** – Crown refresh alignment: clarified the public/export role of the full black-square, white-crown logo versus the controlled-dark transparent mark, and recorded regenerated canonical assets for the refreshed crown system. **Relaxed the v1.1.0 hard no-gradient rule**: gradients and glow remain banned on logo assets and standard UI surfaces, but a restrained ambient backdrop is now permitted behind the crown in hero/OG compositions. Added `--oc-purple-banner` for the reviewed social-banner crown treatment.
 - **v1.2.0** – Classic Coven type system: **EB Garamond** replaces Satoshi/Neue Montreal as the display face (headlines, hero, ceremonial). **Inter** is the canonical body/UI sans (replaces Geist as the default; Geist remains a Cave-selectable alternative). **JetBrains Mono** stays as the canonical mono. Fredoka is retired from Cave chrome (home-composer headline now serif). Landing hero and Quick-Start rewritten to reflect serif-first identity moments. Rationale: OpenCoven is a coven, not a Vercel demo — the type system should feel like a grimoire.
-- **v1.1.0** – Field manual redesign: flat-surface rule for standard UI surfaces, flat violet `#9A8ECD`, JetBrains Mono for labels, solid surfaces, sharp corners, hover = border-color only. Removed the older gradient/glow/glass-heavy UI patterns.
+- **v1.1.0** – Field manual redesign: no-gradient rule (hard), flat violet `#9A8ECD`, JetBrains Mono for labels, solid surfaces, sharp corners, hover = border-color only. Removed all gradient/glow/glass patterns.
 - **v1.0.0** – Initial production-ready system
 
 **Next Review:** Quarterly or when major product change occurs

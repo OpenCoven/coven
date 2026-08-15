@@ -77,7 +77,7 @@ Preserve the existing dimensions, typography, copy, colors, and layout of:
 
 The reviewed banner exception keeps the black background, network art, and
 layout intact; it replaces only the old low-contrast emblem with the canonical
-crown in the approved dim violet `#6A5FA0`, so the mark stays subdued but
+crown in the approved dim violet `--oc-purple-banner` (`#6A5FA0`), so the mark stays subdued but
 recognizable.
 
 The OG composition keeps its existing white crown/text/purple-glow palette.
