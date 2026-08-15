@@ -52,7 +52,7 @@
 - Modify: `crates/coven-cli/src/main.rs:15-73`
 - Test: `crates/coven-cli/src/execution_binding.rs`
 
-- [ ] **Step 1: Register an empty module and write the first failing parser test**
+- [x] **Step 1: Register an empty module and write the first failing parser test**
 
 Add to `main.rs` with the other module declarations:
 
@@ -103,7 +103,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the focused test and verify it fails**
+- [x] **Step 2: Run the focused test and verify it fails**
 
 Run:
 
@@ -113,7 +113,7 @@ cargo test -p coven-cli execution_binding::tests::parses_the_exact_root_shape
 
 Expected: compilation fails because `parse` and `ExecutionBinding` do not exist.
 
-- [ ] **Step 3: Add the exact typed shape and closed-object parser**
+- [x] **Step 3: Add the exact typed shape and closed-object parser**
 
 Implement the complete types and parser. Nullable fields remain required members: the explicit key-set check occurs before Serde so omitted `parent` or `delegationDigest` cannot collapse into `None`.
 
@@ -210,7 +210,7 @@ pub fn parse(value: &Value) -> Result<ExecutionBinding, ValidationError> {
 }
 ```
 
-- [ ] **Step 4: Add exact syntax, version, timestamp, and expiry validation**
+- [x] **Step 4: Add exact syntax, version, timestamp, and expiry validation**
 
 Add these methods/helpers. The timestamp check round-trips through Chrono to reject fractional seconds and non-`Z` offsets. Expiry is elapsed when it is less than or equal to the comparison instant.
 
@@ -386,7 +386,7 @@ impl ExecutionBinding {
 }
 ```
 
-- [ ] **Step 5: Add table-driven negative and child tests**
+- [x] **Step 5: Add table-driven negative and child tests**
 
 Add tests that mutate one field at a time and assert the exact `ValidationError` path:
 
@@ -473,7 +473,7 @@ Also add:
 - every top-level field and each `parent` subfield reports a mismatch path;
 - serialized field order is stable by comparing `serde_json::to_string` to one literal JSON string.
 
-- [ ] **Step 6: Run the focused module tests**
+- [x] **Step 6: Run the focused module tests**
 
 Run:
 
@@ -483,7 +483,7 @@ cargo test -p coven-cli execution_binding::tests::
 
 Expected: all execution-binding unit tests pass.
 
-- [ ] **Step 7: Commit the value object**
+- [x] **Step 7: Commit the value object**
 
 ```bash
 git add crates/coven-cli/src/main.rs crates/coven-cli/src/execution_binding.rs
@@ -508,7 +508,7 @@ git commit -m "feat(api): define Psyche execution binding"
 - Test: `crates/coven-cli/src/store.rs`
 - Test: `crates/coven-cli/src/session_launch.rs`
 
-- [ ] **Step 1: Write failing migration and round-trip tests**
+- [x] **Step 1: Write failing migration and round-trip tests**
 
 Add store tests beside the existing `familiar_id` migration tests:
 
@@ -572,7 +572,7 @@ fn execution_binding_round_trips_deterministically_across_reopen() -> Result<()>
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify they fail**
+- [x] **Step 2: Run the focused tests and verify they fail**
 
 Run:
 
@@ -582,7 +582,7 @@ cargo test -p coven-cli store::tests::execution_binding_
 
 Expected: compilation fails because `SessionRecord.execution_binding` and the SQLite column do not exist.
 
-- [ ] **Step 3: Add the typed session field and migration**
+- [x] **Step 3: Add the typed session field and migration**
 
 Add to `SessionRecord` after `familiar_id`:
 
@@ -606,7 +606,7 @@ fn ensure_execution_binding_column(conn: &Connection) -> Result<()> {
 
 Call `ensure_execution_binding_column(conn)?` immediately after `ensure_familiar_id_column(conn)?`.
 
-- [ ] **Step 4: Serialize atomically during both insert paths**
+- [x] **Step 4: Serialize atomically during both insert paths**
 
 In `insert_session` and `insert_session_if_absent`, serialize only a present typed value:
 
@@ -621,7 +621,7 @@ let execution_binding_json = record
 
 Append `execution_binding_json` to both column lists and parameter lists. Do not add an update function for this column.
 
-- [ ] **Step 5: Parse non-null stored values strictly**
+- [x] **Step 5: Parse non-null stored values strictly**
 
 Append `execution_binding_json` to `SESSION_COLUMNS`. In `session_record_from_row`, convert non-null text through Serde and `validate_shape`; map either failure to `rusqlite::Error::FromSqlConversionFailure`. Expiry is not rechecked on read because historical bindings remain readable after expiration.
 
@@ -653,7 +653,7 @@ fn execution_binding_from_sql(
 
 Populate `SessionRecord.execution_binding` from the appended column. A malformed non-null row must make `get_session` and list operations return a store error; it must never deserialize as unbound.
 
-- [ ] **Step 6: Thread the field through fresh-session construction**
+- [x] **Step 6: Thread the field through fresh-session construction**
 
 Add to `NewSessionParams`:
 
@@ -683,7 +683,7 @@ execution_binding: None,
 
 Do not change unrelated fixture values.
 
-- [ ] **Step 7: Complete persistence negative tests**
+- [x] **Step 7: Complete persistence negative tests**
 
 Add tests proving:
 
@@ -695,7 +695,7 @@ Add tests proving:
 - two distinct session rows with byte-identical bindings both insert successfully;
 - no SQL update helper exists and normal status/archive updates leave binding bytes unchanged.
 
-- [ ] **Step 8: Run focused persistence and constructor tests**
+- [x] **Step 8: Run focused persistence and constructor tests**
 
 Run:
 
@@ -706,7 +706,7 @@ cargo test -p coven-cli session_launch::tests::new_session_record_sets_launch_in
 
 Expected: all focused tests pass.
 
-- [ ] **Step 9: Commit session persistence**
+- [x] **Step 9: Commit session persistence**
 
 ```bash
 git add crates/coven-cli/src/store.rs crates/coven-cli/src/session_launch.rs \
@@ -723,7 +723,7 @@ git commit -m "feat(store): persist immutable execution bindings"
 - Modify: `crates/coven-cli/src/api.rs:230-262,1855-2025,2407-2474`
 - Test: `crates/coven-cli/src/api.rs` test module near existing launch tests
 
-- [ ] **Step 1: Add reusable launch fixtures and the first failing root test**
+- [x] **Step 1: Add reusable launch fixtures and the first failing root test**
 
 In the API test module add:
 
@@ -761,7 +761,7 @@ assert_eq!(response["execution_binding"], root_binding("sage"));
 assert_eq!(runtime.launches.borrow().len(), 1);
 ```
 
-- [ ] **Step 2: Run the root launch test and verify it fails**
+- [x] **Step 2: Run the root launch test and verify it fails**
 
 Run:
 
@@ -771,7 +771,7 @@ cargo test -p coven-cli api::tests::bound_root_launch_persists_the_exact_binding
 
 Expected: the response lacks `execution_binding` or launch parsing ignores it.
 
-- [ ] **Step 3: Parse binding after existing launch fields but before familiar resolution**
+- [x] **Step 3: Parse binding after existing launch fields but before familiar resolution**
 
 Keep `SessionLaunch` free of proof metadata. Change `session_launch_from_payload` to borrow `&Value`, preserving all current project/cwd/harness parsing:
 
@@ -835,7 +835,7 @@ fn execution_binding_error(
 
 No error details or message may contain caller values or digests.
 
-- [ ] **Step 4: Enforce root/child cross-field rules**
+- [x] **Step 4: Enforce root/child cross-field rules**
 
 Add a route-level validator because `callerFamiliarId` is outside the binding:
 
@@ -856,7 +856,7 @@ fn validate_binding_relationship(
 
 Call this in launch precedence step 2. Map any returned path to `400 execution_binding_invalid`.
 
-- [ ] **Step 5: Correlate the canonical familiar and parent before maintenance**
+- [x] **Step 5: Correlate the canonical familiar and parent before maintenance**
 
 After existing `resolve_familiar`:
 
@@ -908,7 +908,7 @@ gate block so the implemented order is parse -> binding validation ->
 gate -> insert. Pass `execution_binding` into `NewSessionParams` only after
 every validation and the maintenance gate succeed.
 
-- [ ] **Step 6: Reject bindings on external registration**
+- [x] **Step 6: Reject bindings on external registration**
 
 Immediately after successful JSON parsing in `register_external_session`, before reading registration fields:
 
@@ -923,7 +923,7 @@ if payload.get("executionBinding").is_some() {
 }
 ```
 
-- [ ] **Step 7: Add the complete launch matrix**
+- [x] **Step 7: Add the complete launch matrix**
 
 Add focused tests for:
 
@@ -949,7 +949,7 @@ Add focused tests for:
 The parent familiar mismatch must report `callerFamiliarId`; every parent
 object mismatch must report the bare `parent.<field>` path.
 
-- [ ] **Step 8: Run the launch matrix**
+- [x] **Step 8: Run the launch matrix**
 
 Run:
 
@@ -960,7 +960,7 @@ cargo test -p coven-cli api::tests::external_session_rejects_execution_binding
 
 Expected: every O2 launch/correlation test passes and existing unbound launch tests remain green.
 
-- [ ] **Step 9: Commit launch admission**
+- [x] **Step 9: Commit launch admission**
 
 ```bash
 git add crates/coven-cli/src/api.rs
@@ -973,7 +973,7 @@ git commit -m "feat(api): bind Psyche session launches"
 - Modify: `crates/coven-cli/src/api.rs:714-721,2537-2705`
 - Test: `crates/coven-cli/src/api.rs` test module near input/kill tests
 
-- [ ] **Step 1: Write failing bound-operation and isolation tests**
+- [x] **Step 1: Write failing bound-operation and isolation tests**
 
 Change `RecordingRuntime` to retain the full input payload while preserving existing string assertions:
 
@@ -1017,7 +1017,7 @@ assert_eq!(input, json!({"data": "hello"}));
 
 Add a bound kill test that posts `{"executionBinding": binding}` and proves the runtime receives only the session id and the event remains `{"status":"killed"}`.
 
-- [ ] **Step 2: Run the isolation tests and verify they fail**
+- [x] **Step 2: Run the isolation tests and verify they fail**
 
 Run:
 
@@ -1028,7 +1028,7 @@ cargo test -p coven-cli api::tests::bound_kill_consumes_proof_without_event_leak
 
 Expected: bound proof is not enforced and/or the input payload still includes `executionBinding`.
 
-- [ ] **Step 3: Pass kill bodies through the router**
+- [x] **Step 3: Pass kill bodies through the router**
 
 Change the kill route from:
 
@@ -1044,7 +1044,7 @@ kill_session(coven_home, session_id, body, runtime)
 
 and add `body: Option<&str>` to `kill_session`.
 
-- [ ] **Step 4: Add context-aware proof parsing**
+- [x] **Step 4: Add context-aware proof parsing**
 
 Add:
 
@@ -1105,7 +1105,7 @@ Preserve the exact outcomes:
 - unknown contract -> `400 execution_binding_unsupported`;
 - exact mismatch -> `409 execution_binding_mismatch`.
 
-- [ ] **Step 5: Freeze bound input precedence and strip proof**
+- [x] **Step 5: Freeze bound input precedence and strip proof**
 
 For a bound session:
 
@@ -1130,7 +1130,7 @@ let action_payload = json!({ "data": data });
 
 For an unbound session, retain current precedence: status/liveness remains ahead of body parsing, and existing requests continue to use `{"data": ...}`.
 
-- [ ] **Step 6: Freeze bound kill precedence and expiry exception**
+- [x] **Step 6: Freeze bound kill precedence and expiry exception**
 
 For a bound session:
 
@@ -1144,7 +1144,7 @@ For a bound session:
 
 For an unbound session, preserve the current no-body behavior and error precedence.
 
-- [ ] **Step 7: Add the exhaustive mismatch and precedence matrix**
+- [x] **Step 7: Add the exhaustive mismatch and precedence matrix**
 
 Use one table-driven test to clone a valid binding and substitute each of:
 
@@ -1190,7 +1190,7 @@ Add separate tests for:
   differ only by ASCII letter case return `execution_binding_mismatch`;
 - writer-backed input capacity checks see only `{"data": ...}`.
 
-- [ ] **Step 8: Run focused mutation tests**
+- [x] **Step 8: Run focused mutation tests**
 
 Run:
 
@@ -1203,7 +1203,7 @@ cargo test -p coven-cli api::tests::input_and_kill_reject_
 
 Expected: bound operations fail closed, unbound behavior is unchanged, and proof metadata never reaches runtime/event persistence.
 
-- [ ] **Step 9: Commit bound operations**
+- [x] **Step 9: Commit bound operations**
 
 ```bash
 git add crates/coven-cli/src/api.rs
@@ -1223,7 +1223,7 @@ git commit -m "feat(api): enforce bound session mutations"
 - Modify: `packages/openclaw-coven/src/fixtures/v2026.4/session-completed.json`
 - Modify: `packages/openclaw-coven/src/fixtures/v2026.4/sessions-list.json`
 
-- [ ] **Step 1: Write failing Rust health tests**
+- [x] **Step 1: Write failing Rust health tests**
 
 Extend the named-contract health test:
 
@@ -1242,7 +1242,7 @@ cargo test -p coven-cli api::tests::health_is_the_named_contract_handshake
 
 Expected: the capability is absent.
 
-- [ ] **Step 2: Add the additive health field**
+- [x] **Step 2: Add the additive health field**
 
 Add to `HealthCapabilities`:
 
@@ -1263,7 +1263,7 @@ Update every `HealthCapabilities` literal found by:
 rg -n 'HealthCapabilities \{' crates/coven-cli/src
 ```
 
-- [ ] **Step 3: Write failing TypeScript normalization and request tests**
+- [x] **Step 3: Write failing TypeScript normalization and request tests**
 
 Define one `binding` fixture in `client.test.ts`. Add tests that prove:
 
@@ -1277,7 +1277,7 @@ Define one `binding` fixture in `client.test.ts`. Add tests that prove:
 - unknown members at binding and parent level throw before an HTTP request;
 - existing unbound input/kill request bodies remain unchanged.
 
-- [ ] **Step 4: Add exact TypeScript types and validator**
+- [x] **Step 4: Add exact TypeScript types and validator**
 
 Add:
 
@@ -1450,7 +1450,7 @@ function normalizeExecutionBinding(value: unknown): CovenExecutionBinding {
 
 Client validation is defense in depth; Rust remains authoritative.
 
-- [ ] **Step 5: Extend client response and health shapes**
+- [x] **Step 5: Extend client response and health shapes**
 
 Add:
 
@@ -1506,7 +1506,7 @@ return {
 };
 ```
 
-- [ ] **Step 6: Add bound request support without breaking legacy callers**
+- [x] **Step 6: Add bound request support without breaking legacy callers**
 
 Extend launch input:
 
@@ -1554,7 +1554,7 @@ body: { executionBinding: normalizeExecutionBinding(executionBinding) }
 
 `launchSession` must validate `input.executionBinding` when present before calling `requestJson`.
 
-- [ ] **Step 7: Update compatibility fixtures**
+- [x] **Step 7: Update compatibility fixtures**
 
 Add:
 
@@ -1574,7 +1574,7 @@ to every unbound session object in `session-running.json`, `session-completed.js
 
 Do not change event fixtures.
 
-- [ ] **Step 8: Run Rust and TypeScript client tests**
+- [x] **Step 8: Run Rust and TypeScript client tests**
 
 Run:
 
@@ -1586,7 +1586,7 @@ npm --prefix packages/openclaw-coven test -- src/client.test.ts src/compat.test.
 
 Expected: health advertises the contract, TypeScript validates/normalizes exact bindings, bound methods send exact bodies, and legacy methods remain compatible.
 
-- [ ] **Step 9: Commit client parity**
+- [x] **Step 9: Commit client parity**
 
 ```bash
 git add crates/coven-cli/src/api.rs packages/openclaw-coven/src/client.ts \
@@ -1602,7 +1602,7 @@ git commit -m "feat(openclaw): support execution bindings"
 - Modify: `specs/psyche/RUNTIME_DESIGN.md`
 - Modify: `specs/psyche/O2_CONTRACT_DESIGN.md`
 
-- [ ] **Step 1: Document capability negotiation and session response**
+- [x] **Step 1: Document capability negotiation and session response**
 
 In `docs/API-CONTRACT.md`, add `executionBindingContracts` to the health example and capability table:
 
@@ -1618,7 +1618,7 @@ Document that unbound session responses always include:
 
 and bound responses include the complete typed object.
 
-- [ ] **Step 2: Document exact launch and mutation bodies**
+- [x] **Step 2: Document exact launch and mutation bodies**
 
 Add the full 13-field root and child examples from `O2_CONTRACT_DESIGN.md`, then document:
 
@@ -1680,7 +1680,7 @@ correlation and bare `parent.<field>` for parent object fields. Fully qualified
 `executionBinding.parent.<field>` paths remain reserved for shape-validation
 errors, not exact-match mismatches.
 
-- [ ] **Step 3: Publish the six exact errors and precedence**
+- [x] **Step 3: Publish the six exact errors and precedence**
 
 Add the six rows:
 
@@ -1695,7 +1695,7 @@ Add the six rows:
 
 Document field-path-only details and the launch/input/kill precedence from the design.
 
-- [ ] **Step 4: Correct the runtime contract inventory**
+- [x] **Step 4: Correct the runtime contract inventory**
 
 Replace the stale `RUNTIME_DESIGN.md` row:
 
@@ -1711,7 +1711,7 @@ with:
 
 Do not add O3-O7 fields to the O2 object.
 
-- [ ] **Step 5: Record approval without claiming final verification**
+- [x] **Step 5: Record approval without claiming final verification**
 
 After Tasks 1-5 are green, change the O2 header to:
 
@@ -1721,7 +1721,7 @@ After Tasks 1-5 are green, change the O2 header to:
 
 Do not mark the contract fully implemented yet. Leave issue/Bead evidence unchecked until those records contain final merge and verification links.
 
-- [ ] **Step 6: Validate terminology**
+- [x] **Step 6: Validate terminology**
 
 Run:
 
@@ -1733,7 +1733,7 @@ rg -n 'adoption resolution|event cursor|terminal correlation' specs/psyche/RUNTI
 
 Expected: O2 descriptions are limited to immutable correlation/exact mismatch; later lifecycle capabilities remain assigned to O3-O7.
 
-- [ ] **Step 7: Commit documentation**
+- [x] **Step 7: Commit documentation**
 
 ```bash
 git add docs/API-CONTRACT.md specs/psyche/RUNTIME_DESIGN.md \
@@ -1746,7 +1746,7 @@ git commit -m "docs: publish Psyche O2 execution binding"
 **Files:**
 - Verify: all files listed in the file map
 
-- [ ] **Step 1: Run formatting and focused tests**
+- [x] **Step 1: Run formatting and focused tests**
 
 Run:
 
@@ -1761,7 +1761,7 @@ npm --prefix packages/openclaw-coven test -- src/client.test.ts src/compat.test.
 
 Expected: all commands exit 0.
 
-- [ ] **Step 2: Run the full repository gates**
+- [x] **Step 2: Run the full repository gates**
 
 Run:
 
@@ -1774,7 +1774,7 @@ npm --prefix packages/openclaw-coven test
 
 Expected: all commands exit 0 with no warnings, test failures, or secret findings.
 
-- [ ] **Step 3: Scan the complete O2 branch diff and run diff checks**
+- [x] **Step 3: Scan the complete O2 branch diff and run diff checks**
 
 Run:
 
@@ -1787,7 +1787,7 @@ git diff origin/main...HEAD --stat
 Expected: privacy and whitespace checks pass; the branch stat contains only the
 approved plan and O2 files from the file map.
 
-- [ ] **Step 4: Audit O2 non-goals mechanically**
+- [x] **Step 4: Audit O2 non-goals mechanically**
 
 Run:
 
@@ -1799,7 +1799,7 @@ git diff origin/main...HEAD -- \
 
 Expected: matches occur only in documentation that explicitly states these are O3-O7 non-goals; no production code or SQL implements them.
 
-- [ ] **Step 5: Record the readiness packet**
+- [x] **Step 5: Record the readiness packet**
 
 Attach to the implementation issue/PR:
 
@@ -1829,7 +1829,7 @@ Known limitations:
   cancellation acknowledgement, artifact binding, or crash-matrix recovery.
 ```
 
-- [ ] **Step 6: Mark the contract implemented after every gate passes**
+- [x] **Step 6: Mark the contract implemented after every gate passes**
 
 Change the O2 header to:
 
@@ -1839,7 +1839,7 @@ Change the O2 header to:
 
 Check every acceptance item satisfied by the final diff. Leave merge-specific evidence unchecked until the PR merges.
 
-- [ ] **Step 7: Commit final verification corrections**
+- [x] **Step 7: Commit final verification corrections**
 
 If formatting or documentation corrections were required:
 
