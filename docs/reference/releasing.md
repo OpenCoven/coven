@@ -126,29 +126,32 @@ Create or update the matching GitHub Release from the successful workflow artifa
 
 The release body should include the npm install command, published package list, action run URL, tagged commit, and compare link. This GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
 
-If publishing stopped after Linux and Windows succeeded but before macOS and the wrapper published, use the narrowly-scoped recovery procedure below. For every other partial state, inspect the failure, fix the cause, and push a new patch-bumped signed tag.
-
 ### Recover a partial npm publication
 
-The recovery path exists only for one exact registry state per supported historical native-package set:
+Bump forward. There is no recovery-release path, and there deliberately is not
+one: a recovery tag re-published an already-tagged version through a second,
+weaker gate — it skipped the `origin/main` ancestry check that every other
+release must pass, and it accepted a commit that had never landed on `main`.
 
-- `@opencoven/cli-linux-x64@X.Y.Z` and `@opencoven/cli-windows@X.Y.Z` already exist.
-- `@opencoven/cli-macos@X.Y.Z` and `@opencoven/cli@X.Y.Z` do not exist.
-- If the original release wrapper declares the post-Intel set, `@opencoven/cli-macos-x64@X.Y.Z` also does not exist. The workflow rejects incomplete, unexpected, or mixed package sets.
-
-Fix the trusted-publisher configuration on a temporary recovery branch created from the original release tag. For the `v0.2.4` recovery, bootstrap `@opencoven/cli-macos-x64` as above and configure trusted publishing for it before pushing `v0.2.4-recovery.1`. Then create a **new signed recovery tag** whose commit descends from that tag. The workflow requires the original tag to be an ancestor and every intervening changed path to be on its release-only allowlist; unlike normal releases, recovery tags do not need to include unrelated later `main` commits.
+npm forbids overwriting a published version, so a partial publish is never
+repaired in place. Inspect the failed job, land the fix on `main` through the
+normal review path, then push a new patch-bumped signed tag:
 
 ```sh
-git fetch origin --tags
-git switch -c release/vX.Y.Z-recovery.N vX.Y.Z
-# Cherry-pick only the reviewed release-recovery fixes; do not merge main.
-git tag -s vX.Y.Z-recovery.N -m "Recover partial vX.Y.Z npm publication"
-git push origin release/vX.Y.Z-recovery.N vX.Y.Z-recovery.N
+git fetch origin main --tags
+git switch main
+git pull --ff-only origin main
+git tag -s vX.Y.Z+1 -m "Release vX.Y.Z+1"
+git push origin vX.Y.Z+1
 ```
 
-Never move or reuse the original release tag or a recovery tag. Increment `N` if a later, separately-reviewed recovery attempt is required.
+The skipped version keeps whichever packages already published; they are
+superseded by the new version and the wrapper never points at the incomplete
+set. Never move or reuse a release tag.
 
-Before publishing, the recovery workflow verifies both signed tags, ancestry, the changed-path allowlist, the original wrapper's complete package set, and the exact npm registry state above. It then skips the already-published Linux and Windows packages and publishes the missing macOS package or packages before the wrapper, producing the real `0.2.4` release through GitHub OIDC with provenance.
+If the failure was a missing npm package record — a brand-new native package
+such as `@opencoven/cli-macos-x64` — create that record with the bootstrap
+procedure above and configure its trusted publisher before the next tag.
 
 ## Recovering from a refused release
 

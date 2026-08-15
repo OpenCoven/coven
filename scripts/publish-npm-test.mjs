@@ -19,7 +19,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
-import { nativePackageSet } from './release-npm-recovery-contract.mjs';
 import { platformMatrix } from './release-npm-platform-matrix.mjs';
 
 const OIDC_ENV = {
@@ -29,34 +28,24 @@ const OIDC_ENV = {
 
 test('parseReleaseTag preserves stable releases', () => {
   assert.deepEqual(parseReleaseTag('v0.2.3'), {
-    releaseMode: 'normal',
     releaseTag: 'v0.2.3',
-    npmVersion: '0.2.3',
-    recoveryAttempt: null
+    npmVersion: '0.2.3'
   });
 });
 
-test('parseReleaseTag derives the base version from signed recovery tags', () => {
-  assert.deepEqual(parseReleaseTag('v0.2.3-recovery.1'), {
-    releaseMode: 'recovery',
-    releaseTag: 'v0.2.3',
-    npmVersion: '0.2.3',
-    recoveryAttempt: 1
-  });
-});
-
-test('parseReleaseTag rejects malformed and unrelated prerelease tags', () => {
+test('parseReleaseTag rejects every non-stable tag, recovery tags included', () => {
+  // Recovery releases are gone: a partial publish is recovered by pushing a new
+  // patch-bumped signed tag, never by re-releasing the same version. Any tag
+  // that is not a bare vX.Y.Z must fail closed here.
   for (const tag of [
     'v0.2',
     'v0.2.3-rc.1',
+    'v0.2.3-recovery.1',
     'v0.2.3-recovery.0',
     'v01.2.3',
     'recovery-v0.2.3'
   ]) {
-    assert.throws(
-      () => parseReleaseTag(tag),
-      /stable vX.Y.Z tag or vX.Y.Z-recovery.N/
-    );
+    assert.throws(() => parseReleaseTag(tag), /must be a stable vX\.Y\.Z tag/);
   }
 });
 
@@ -74,30 +63,6 @@ test('non-macOS platform packages ship no mount helper', () => {
   // the helper there would be dead weight.
   assert.equal(targetHelperBinaryName('linux-x64'), undefined);
   assert.equal(targetHelperBinaryName('windows'), undefined);
-});
-
-test('nativePackageSet accepts only complete historical native package sets', () => {
-  assert.equal(
-    nativePackageSet({
-      '@opencoven/cli-macos': '0.0.0',
-      '@opencoven/cli-linux-x64': '0.0.0',
-      '@opencoven/cli-windows': '0.0.0'
-    }),
-    'pre-intel'
-  );
-  assert.equal(
-    nativePackageSet({
-      '@opencoven/cli-macos': '0.0.0',
-      '@opencoven/cli-macos-x64': '0.0.0',
-      '@opencoven/cli-linux-x64': '0.0.0',
-      '@opencoven/cli-windows': '0.0.0'
-    }),
-    'post-intel'
-  );
-  assert.throws(
-    () => nativePackageSet({ '@opencoven/cli-macos': '0.0.0', '@opencoven/cli-linux-x64': '0.0.0' }),
-    /only supports the complete pre-Intel or post-Intel package sets/
-  );
 });
 
 const SIGNAL_TEST_PACKAGES = {
@@ -248,13 +213,13 @@ test('Intel macOS target publishes under its own native package name', () => {
   assert.equal(targetPackageName('macos-x64'), '@opencoven/cli-macos-x64');
 });
 
-test('native package sets keep historical recovery explicit', () => {
+test('native package sets keep the historical pre-Intel shape explicit', () => {
   assert.deepEqual(nativeTargetNamesForPackageSet('pre-intel'), ['macos', 'linux-x64', 'windows']);
   assert.deepEqual(nativeTargetNamesForPackageSet('post-intel'), ['macos', 'macos-x64', 'linux-x64', 'windows']);
   assert.throws(() => nativeTargetNamesForPackageSet('unexpected'), /Unsupported native package set/);
 });
 
-test('release platform matrix omits Intel macOS for pre-Intel recovery', () => {
+test('release platform matrix omits Intel macOS for the pre-Intel package set', () => {
   assert.deepEqual(platformMatrix('pre-intel'), {
     include: [
       { 'npm-target': 'macos', 'rust-target': 'aarch64-apple-darwin', runner: 'macos-26', binary: 'coven' },
@@ -906,7 +871,7 @@ test('release workflow builds and publishes Intel macOS as a separate target', (
   assert.match(workflow, /node scripts\/publish-npm\.mjs --target=macos-x64 --skip-build --publish --skip-wrapper/);
 });
 
-test('release builds report the stable package version during recovery', () => {
+test('release builds report the derived npm version, not the raw tag name', () => {
   const workflow = readFileSync(
     new URL(['..', '.github', 'workflows', 'release-npm.yml'].join('/'), import.meta.url),
     'utf8'
@@ -916,7 +881,7 @@ test('release builds report the stable package version during recovery', () => {
   assert.match(
     buildJob,
     /^          COVEN_BUILD_VERSION: v\$\{\{ needs\.verify-tag\.outputs\.npm_version \}\}$/m,
-    'recovery binaries must report the stable npm version, not the recovery tag name'
+    'release binaries must report the parsed npm version, not the raw ref name'
   );
   const buildScript = readFileSync(
     new URL(['..', 'crates', 'coven-cli', 'build.rs'].join('/'), import.meta.url),
@@ -1115,7 +1080,12 @@ test('release workflow verifies the signed release tag before building or publis
   );
 });
 
-test('release workflow fail-closes signed recovery tags', () => {
+test('release workflow carries no recovery-release path', () => {
+  // Recovery releases re-published an already-tagged version through a
+  // narrower gate than a normal release. That second, weaker path is removed:
+  // a partial publish is now recovered by pushing a new patch-bumped signed
+  // tag, which re-enters the single full gate. These assertions exist so the
+  // path cannot quietly come back.
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
@@ -1129,38 +1099,51 @@ test('release workflow fail-closes signed recovery tags', () => {
   );
   assert.match(
     workflow,
-    /outputs:[\s\S]*release_mode:[\s\S]*release_tag:[\s\S]*npm_version:/,
+    /outputs:[\s\S]*release_tag:[\s\S]*npm_version:/,
     'verify-tag must expose validated release context to downstream jobs'
   );
-  assert.match(
+  assert.doesNotMatch(
     workflow,
-    /git verify-tag "\$RELEASE_TAG"/,
-    'recovery must locally verify the original stable release tag'
+    /release_mode/,
+    'no release mode may exist once recovery releases are gone'
   );
-  assert.match(
+  assert.doesNotMatch(
     workflow,
-    /BASE_TAG_PAYLOAD=.*gh api/,
-    'recovery must query GitHub verification for the original release tag'
+    /BASE_TAG_PAYLOAD|BASE_COMMIT_SHA|BASE_OBJECT_TYPE/,
+    'no base-release-tag re-verification may remain'
   );
-  assert.match(
-    workflow,
-    /BASE_OBJECT_TYPE.*commit/s,
-    'recovery must reject a base tag that does not target a commit'
-  );
-  assert.match(
-    workflow,
-    /git merge-base --is-ancestor "\$BASE_COMMIT_SHA" "\$TAGGED_COMMIT_SHA"/,
-    'recovery tag must descend from the stable release tag'
-  );
-  assert.match(
-    workflow,
-    /git diff --name-only "\$BASE_COMMIT_SHA\.\.\$TAGGED_COMMIT_SHA"/,
-    'recovery must inspect every changed path after the stable release'
-  );
-  assert.match(
+  assert.doesNotMatch(
     workflow,
     /Refusing recovery: changed path/,
-    'recovery must fail closed on product or package drift'
+    'no release-only changed-path allowlist may remain'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /release-npm-recovery-contract\.mjs/,
+    'the recovery package contract must not be invoked'
+  );
+});
+
+test('every release tag must be contained in origin/main', () => {
+  // The ancestry gate used to sit inside the non-recovery branch, so a signed
+  // recovery tag could publish a commit that was never on main. It is now
+  // unconditional, and nothing may re-introduce a bypass around it.
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    // `\s*` rather than `\n`: Windows checkouts read this file back as CRLF.
+    /git fetch --no-tags origin main\s*if ! git merge-base --is-ancestor "\$TAGGED_COMMIT_SHA" origin\/main; then/,
+    'the ancestry gate must run unconditionally for every release tag'
+  );
+  assert.doesNotMatch(
+    workflow,
+    /if \[ "\$RELEASE_MODE" != "recovery" \]/,
+    'no mode check may guard the ancestry gate'
   );
 });
 
@@ -1208,34 +1191,26 @@ test('release workflow preflights selected native package availability before pu
 
   assert.match(
     preflight,
-    /^          RELEASE_MODE: \$\{\{ needs\.verify-tag\.outputs\.release_mode \}\}$/m
-  );
-  assert.match(
-    preflight,
-    /^          NATIVE_PACKAGE_SET: \$\{\{ needs\.verify-tag\.outputs\.native_package_set \}\}$/m
-  );
-  assert.match(
-    preflight,
     /^          if output=\$\(npm view "\$package_name" name 2>&1\); then$/m
   );
   assert.match(preflight, /^          printf '%s\\n' "\$output"$/m);
   assert.match(preflight, /^          if ! grep -q 'E404' <<<"\$output"; then$/m);
-  assert.match(preflight, /\[ "\$RELEASE_MODE" = "normal" \]/);
-  assert.match(preflight, /\[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]/);
   assert.match(
     preflight,
     /^          echo "::error::Package availability for \$package_name could not be verified; resolve the npm registry error before publishing\."$/m
   );
   assert.match(
     preflight,
-    /^          echo "::error::Publish a bootstrap version for \$package_name, configure npm trusted publishing for OpenCoven\/coven and release-npm\.yml with no environment, then create a new signed recovery tag\. npm assigns latest to an initial public publish; do not publish the wrapper until recovery publishes the production package\."$/m
+    /then push a new patch-bumped signed tag\./,
+    'the bootstrap hint must point at a patch bump, not a recovery tag'
+  );
+  assert.doesNotMatch(
+    preflight,
+    /RELEASE_MODE|recovery/,
+    'preflight must not branch on a release mode'
   );
 
-  const normalBranchMatch = preflight.match(
-    /^          if \[ "\$RELEASE_MODE" = "normal" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
-  );
-  assert.ok(normalBranchMatch, 'preflight must contain the normal package-check branch');
-  const normalBranch = normalBranchMatch[0];
+  // One release shape, so every native package is required every time.
   for (const packageName of [
     '@opencoven/cli-linux-x64',
     '@opencoven/cli-windows',
@@ -1243,54 +1218,17 @@ test('release workflow preflights selected native package availability before pu
     '@opencoven/cli-macos-x64'
   ]) {
     assert.match(
-      normalBranch,
+      preflight,
       new RegExp(
         String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
         'm'
       ),
-      `normal branch must require ${packageName}`
+      `preflight must require ${packageName}`
     );
   }
-
-  const postIntelBranchMatch = preflight.match(
-    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "post-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
-  );
-  assert.ok(postIntelBranchMatch, 'preflight must contain the post-intel package-check branch');
-  const postIntelBranch = postIntelBranchMatch[0];
-  for (const packageName of ['@opencoven/cli-macos', '@opencoven/cli-macos-x64']) {
-    assert.match(
-      postIntelBranch,
-      new RegExp(
-        String.raw`^          require_package\b[^\n]*${packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\s|$)`,
-        'm'
-      ),
-      `post-intel branch must require ${packageName}`
-    );
-  }
-
-  const preIntelBranchMatch = preflight.match(
-    /^          elif \[ "\$NATIVE_PACKAGE_SET" = "pre-intel" \]; then[\s\S]*?(?=^          (?:elif|else|fi)\b)/m
-  );
-  assert.ok(preIntelBranchMatch, 'preflight must contain the pre-intel package-check branch');
-  const preIntelBranch = preIntelBranchMatch[0];
-  assert.match(
-    preIntelBranch,
-    /^          require_package\b[^\n]*@opencoven\/cli-macos(?:\s|$)/m,
-    'pre-intel branch must require @opencoven/cli-macos'
-  );
-  const unsupportedBranchMatch = preflight.match(
-    /^          else\b[\s\S]*?(?=^          fi\b)/m
-  );
-  assert.ok(unsupportedBranchMatch, 'preflight must fail closed for unsupported package sets');
-  const unsupportedBranch = unsupportedBranchMatch[0];
-  assert.match(
-    unsupportedBranch,
-    /^          echo "::error::Unsupported recovery native package set \$NATIVE_PACKAGE_SET\."$/m
-  );
-  assert.match(unsupportedBranch, /^          exit 1$/m);
 });
 
-test('release workflow publishes only missing packages during recovery', () => {
+test('release workflow publishes every package unconditionally', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
@@ -1310,60 +1248,35 @@ test('release workflow publishes only missing packages during recovery', () => {
     /needs: \[build-platform, npm-dry-run, verify-tag\]/,
     'publish job must consume verified release context'
   );
-  assert.match(
+  assert.doesNotMatch(
     publish,
-    /name: Confirm expected partial npm state[\s\S]*@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows[\s\S]*@opencoven\/cli-macos[\s\S]*@opencoven\/cli-macos-x64[\s\S]*@opencoven\/cli/,
-    'recovery must prove the supported pre-Intel or post-Intel registry state'
+    /name: Confirm expected partial npm state/,
+    'no partial-registry-state assertion may remain'
   );
-  assert.match(
-    publish,
-    /Could not prove \$package_name@\$NPM_VERSION is absent/,
-    'registry errors other than E404 must fail closed'
-  );
-  assert.match(
-    dryRun,
-    /--target=linux-x64 --skip-build --dry-run --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
-    'Linux dry-run must skip an already-published version during recovery'
-  );
-  assert.match(
-    dryRun,
-    /--target=windows --skip-build --dry-run --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
-    'Windows dry-run must skip an already-published version during recovery'
-  );
-  assert.match(
-    dryRun,
-    /--target=macos --skip-build --dry-run --skip-wrapper\s*\n\s*env:/,
-    'Apple Silicon macOS dry-run must run in normal and recovery modes'
-  );
-  assert.match(
-    dryRun,
-    /--target=macos-x64 --skip-build --dry-run --skip-wrapper[\s\S]*native_package_set == 'post-intel'/,
-    'Intel macOS dry-run must run for normal and post-Intel recovery releases'
+  // Every dry-run and publish step must be unconditional: with one release
+  // shape there is nothing left to branch on, and a stray `if:` here would
+  // silently skip a package and ship a wrapper pointing at a missing version.
+  for (const target of ['linux-x64', 'windows', 'macos-x64', 'macos']) {
+    assert.match(
+      dryRun,
+      new RegExp(String.raw`--target=${target} --skip-build --dry-run --skip-wrapper\s*\n\s*env:`),
+      `${target} dry-run must be unconditional`
+    );
+    assert.match(
+      publish,
+      new RegExp(String.raw`--target=${target} --skip-build --publish --skip-wrapper\s*\n\s*env:`),
+      `${target} publication must be unconditional`
+    );
+  }
+  assert.doesNotMatch(
+    workflow,
+    /^\s*if: needs\.verify-tag\.outputs\./m,
+    'no publish step may be gated on verify-tag release context'
   );
   assert.match(
     dryRun,
     /--wrapper-only --dry-run[\s\S]*COVEN_NPM_NATIVE_PACKAGE_SET/,
     'wrapper dry-run must use the verified historical package set'
-  );
-  assert.match(
-    publish,
-    /--target=linux-x64 --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
-    'Linux publication must run only for normal releases'
-  );
-  assert.match(
-    publish,
-    /--target=windows --skip-build --publish --skip-wrapper\s*\n\s*if: needs\.verify-tag\.outputs\.release_mode == 'normal'/,
-    'Windows publication must run only for normal releases'
-  );
-  assert.match(
-    publish,
-    /--target=macos --skip-build --publish --skip-wrapper\s*\n\s*env:/,
-    'Apple Silicon macOS publication must run in normal and recovery modes'
-  );
-  assert.match(
-    publish,
-    /--target=macos-x64 --skip-build --publish --skip-wrapper[\s\S]*native_package_set == 'post-intel'/,
-    'Intel macOS publication must run for normal and post-Intel recovery releases'
   );
   assert.match(
     publish,
@@ -1425,23 +1338,24 @@ test('release workflow concurrency keeps overlapping releases from interleaving'
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
 
-test('releasing guide documents signed partial-publish recovery', () => {
+test('releasing guide sends a partial publication forward, not backward', () => {
   const guide = readFileSync(
     new URL(['..', 'docs', 'reference', 'releasing.md'].join('/'), import.meta.url),
     'utf8'
   );
 
-  assert.match(guide, /vX\.Y\.Z-recovery\.N/);
-  assert.match(guide, /new signed recovery tag/i);
-  assert.match(guide, /original tag to be an ancestor/i);
+  assert.match(guide, /Bump forward\./);
+  assert.match(guide, /new patch-bumped signed tag/i);
   assert.match(guide, /never move or reuse/i);
-  assert.match(guide, /@opencoven\/cli-linux-x64[\s\S]*@opencoven\/cli-windows/);
-  assert.match(guide, /@opencoven\/cli-macos[\s\S]*@opencoven\/cli/);
+  assert.match(guide, /npm forbids overwriting a published version/i);
+  assert.doesNotMatch(
+    guide,
+    /-recovery\.N|-recovery\.1/,
+    'the guide must not describe recovery tags'
+  );
   assert.match(guide, /@opencoven\/cli-macos-x64/);
   assert.match(guide, /npm assigns `latest` to an initial public publish/);
   assert.match(guide, /NPM_CONFIG_TAG=bootstrap/);
-  assert.match(guide, /npm trust github @opencoven\/cli-macos-x64/);
-  assert.match(guide, /v0\.2\.4-recovery\.1/);
   assert.match(guide, /npm trust github/);
 });
 
