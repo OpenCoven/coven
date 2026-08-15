@@ -37,7 +37,7 @@ or mutate anything under `~/.coven/memory` — that is the promotion layer's job
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `query` | string | ✅ | Natural-language question or keyword phrase. |
-| `familiar` | string | ❌ | Store scope filter passed to the crate: `coven` (default; the shared store) or a familiar id for per-familiar stores. Must match `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`. |
+| `familiar` | string | ❌ | Store scope filter passed to the crate: `coven` (default; the shared store) or a familiar id for per-familiar stores. Must match `^[A-Za-z0-9_-]{1,128}$` — the same shape the crate's own `validate_identifier` enforces for `familiar_id`. |
 | `k` | int | ❌ | Max results. Default 5, max 20. |
 | `since` / `until` | ISO date | ❌ | Filter on manifest `timestamp`. |
 | `verified_only` | bool | ❌ | Default `true`. Drop hits whose manifest `sha256` no longer matches the promoted snapshot or whose `attested_via` file is missing. |
@@ -63,12 +63,13 @@ log query text to any destination outside the Coven filesystem.
 1. **Precondition.** `~/.coven/memory/manifest.jsonl` exists with ≥1 line, else return
    `{hits: [], count: 0, note: "promotion layer has not run"}` and stop.
 2. **Query the crate.** Treat `query` and `familiar` as untrusted data. Validate
-   `familiar` against `^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$` (default `coven`);
-   reject any other value. Invoke the crate with an argv API, not a shell command
-   string, equivalent to `execve`/`subprocess.run(["coven-memory", "search",
-   "--familiar", familiar, query])`. If a runtime exposes only a shell, pass
-   every dynamic argument through robust single-argument shell escaping (for
-   example Python `shlex.quote`) and do not concatenate raw input. Add `--index`/
+   `familiar` against `^[A-Za-z0-9_-]{1,128}$` (default `coven`) — the shape the
+   crate's `validate_identifier` already enforces — and reject any other value.
+   Invoke the crate with an argv API, not a shell command string, equivalent to
+   `execve`/`subprocess.run(["coven-memory", "search", "--familiar", familiar,
+   query])`. If a runtime exposes only a shell, pass every dynamic argument
+   through robust single-argument shell escaping (for example Python
+   `shlex.quote`) and do not concatenate raw input. Add `--index`/
    `--db` only if the store lives off the default path. The crate owns ranking
    (fastembed/nomic-embed-text-v1.5 + TurboVec ANN; schema §11.5 pins embeddings
    as crate-internal).
