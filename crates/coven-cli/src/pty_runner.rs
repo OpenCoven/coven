@@ -1326,9 +1326,9 @@ impl ChildProcessTree {
         #[cfg(unix)]
         {
             terminate_unix_process_group(self.pid)?;
-            // Leave the handle retryable when signaling fails for anything
-            // other than ESRCH. `terminate_unix_process_group` treats ESRCH
-            // as success because the desired post-condition already holds.
+            // Leave the handle retryable when signaling fails while live
+            // processes may remain. `terminate_unix_process_group` treats
+            // platform-specific already-exited results as success.
             self.terminated = true;
         }
         #[cfg(windows)]
@@ -1561,7 +1561,11 @@ fn terminate_unix_process_group(pid: u32) -> io::Result<()> {
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
+    let already_exited = error.raw_os_error() == Some(libc::ESRCH)
+        || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM));
+    if already_exited {
+        // Darwin reports EPERM when the group contains only its unreaped
+        // zombie leader. Live same-owner descendants make kill succeed.
         Ok(())
     } else {
         Err(error)

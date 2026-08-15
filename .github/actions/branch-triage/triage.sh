@@ -51,12 +51,42 @@ git show-ref --verify --quiet "$BASE_REF" || {
 
 # ── Step 1 — collect PR data ──────────────────────────────────────────────────
 log "Loading open and merged PR data from GitHub…"
-OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName --limit 200)
+OPEN_PR_JSON=$(gh pr list --state open  --json number,title,headRefName,headRepositoryOwner,headRefOid --limit 200)
 MRGD_PR_JSON=$(gh pr list --state merged --json headRefName            --limit 500)
 
 open_branches()  { echo "$OPEN_PR_JSON" | jq -r '.[].headRefName'; }
 merged_branches(){ echo "$MRGD_PR_JSON" | jq -r '.[].headRefName'; }
 
+# A PR is eligible for this branch only when GitHub reports that it comes from
+# this repository's remote-tracking ref at exactly the commit we fetched. Branch
+# names alone are not a trust boundary: fork PRs can reuse names from origin.
+trusted_open_pr_filter() {
+  local branch="$1" head_oid owner repo_owner
+  head_oid=$(git rev-parse "origin/$branch" 2>/dev/null || true)
+  owner=$(git config --get remote.origin.url | sed -E 's#(git@github.com:|https://github.com/)##; s#/.*##; s#\.git$##')
+  repo_owner=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
+
+  echo "$OPEN_PR_JSON" | jq -r \
+    --arg b "$branch" \
+    --arg oid "$head_oid" \
+    --arg owner "$repo_owner" \
+    '.[]
+     | select(.headRefName == $b)
+     | select(.headRefOid == $oid)
+     | select((.headRepositoryOwner.login // "" | ascii_downcase) == $owner)'
+}
+
+trusted_pr_number_for() {
+  local branch="$1"
+  trusted_open_pr_filter "$branch" | jq -r '.number'
+}
+
+# Deletion protection stays name-based and is deliberately NOT trust-filtered.
+# The trust filter can legitimately miss a live PR — a push landing between
+# Step 0's fetch and Step 1's `gh pr list` leaves `origin/<branch>` behind
+# `headRefOid` — and a miss here would classify an open PR's branch as
+# SUPERSEDED and delete it out from under its author. Protection fails open;
+# only merging (Step 5) fails closed on the same signal.
 pr_number_for() {
   local branch="$1"
   echo "$OPEN_PR_JSON" | jq -r --arg b "$branch" '.[] | select(.headRefName==$b) | .number'
@@ -124,7 +154,7 @@ merge_block_reason() {
                   or (concl == "" and stat == ""))
          | named ]) as $pending
     | if .isDraft then "draft"
-      elif .reviewDecision == "CHANGES_REQUESTED" then "changes requested by a reviewer"
+      elif .reviewDecision != "APPROVED" then "review decision is " + (.reviewDecision // "missing") + ", not APPROVED"
       elif .mergeable == "CONFLICTING" then "conflicts with the base branch"
       elif .mergeable != "MERGEABLE" then "mergeability not yet computed by GitHub"
       elif ($failing | length) > 0 then "failing checks: " + ($failing | join(", "))
@@ -235,6 +265,19 @@ if [[ ${#OPEN_LIST[@]} -gt 0 ]]; then
     pr=$(pr_number_for "$branch")
     title=$(pr_title_for "$branch")
     log "  PR #$pr — $title"
+
+    # Merging fails closed on the trust signal that deletion deliberately
+    # ignores: only a PR GitHub reports as origin-owned, at exactly the commit
+    # we fetched, may be merged. A fork PR reusing an origin branch name, two
+    # open PRs sharing a head name, or a head that moved after Step 0's fetch
+    # all land here and are left for a human.
+    if [[ "$(trusted_pr_number_for "$branch")" != "$pr" ]]; then
+      reason="PR head is not this repository's origin ref at the fetched commit"
+      warn "  $(yellow 'skipped') #$pr — $reason"
+      SKIPPED_LIST+=("#$pr ($branch) — $reason")
+      (( skipped_count++ )) || true
+      continue
+    fi
 
     # Gate first: never touch a PR we would not be allowed to merge. Rebasing and
     # force-pushing a blocked PR is itself destructive, so this runs before any
