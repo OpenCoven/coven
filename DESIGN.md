@@ -1,6 +1,6 @@
 # OpenCoven — Brand & Design System
 
-**Status:** Production-Ready | Last Updated: 2026-08-14 (crown refresh alignment + ambient backdrop exception)
+**Status:** Production-Ready | Last Updated: 2026-05-24 (Field manual redesign + no-gradient rule)
 
 ---
 
@@ -41,25 +41,25 @@ A familiar is not a faceless bot. It has a name, purpose, memory, toolset, voice
 
 ## 2. Logo System
 
-### Primary Mark: The OpenCoven Crown
+### Primary Mark: The Trident-Flame Sigil
 
 **Symbolism:**
-- **Crown silhouette** → governed authority and deliberate control
-- **Mirrored wings** → coordinated agents working as a system
-- **Rising center** → durable execution and forward motion
+- **Trident** → control, direction, execution
+- **Flame** → intelligence, transformation, power
+- **Hood/crest** → orchestration layer, system boundary
+- **Side crescents** → awareness, sensing, reach
 
 ### Usage Rules
-- **Default public treatment:** white crown on a black square (#000000)
-- **Composition treatment:** transparent one-color crown inside controlled dark surfaces
-- **Minimum scale:** 24px
-- **Clear space:** at least 10% of the rendered logo width
+- **Default:** on black background (#000000)
+- **Minimum scale:** 24px (avoid detail loss in flame detail)
+- **Clear space:** margin = height of inner flame tip
 - **Aspect ratio:** preserve exact proportions across all variants
 
 ### Approved Logo
 
-The approved public logo is the crown as a white crown on a black square background. Use it for docs, README, package READMEs, favicons, avatars, and small identity surfaces. Website chrome is the controlled exception and uses the transparent composition mark.
+The approved public logo is the sigil as a white icon on a black square background. Use it for docs, README, package READMEs, landing chrome, favicons, avatars, and small identity surfaces.
 
-Do not substitute gradient, black-only, monoline, or external avatar images in public surfaces.
+Do not substitute gradient, mark-only, black-only, monoline, or external avatar images in public surfaces.
 
 ### Logo Files
 ```
@@ -67,12 +67,6 @@ Do not substitute gradient, black-only, monoline, or external avatar images in p
 /docs/assets/opencoven-icon.svg       # Public docs copy
 /packages/cli/assets/opencoven.svg    # Package-local copy
 /packages/openclaw-coven/assets/opencoven.svg
-/brand/logo/opencoven-logo.svg        # Full-square compatibility copy
-/brand/logo/opencoven-mark.svg        # Transparent composition mark
-/brand/logo/opencoven-white.svg       # Transparent white compatibility mark
-/brand/logo/opencoven-black.svg       # Transparent black compatibility mark
-/brand/logo/opencoven-monoline.svg    # Crown silhouette compatibility alias
-/web/favicon.svg                      # Website favicon
 ```
 
 ---
@@ -96,8 +90,7 @@ Do not substitute gradient, black-only, monoline, or external avatar images in p
 ### Usage Guidelines
 - **90% black / white** — compose UI on neutral foundation
 - **10% violet accents** — hover states, active borders, labels, identity moments
-- **Flat surfaces and logo assets** — use solid colors only for logo assets and normal UI surfaces
-- **Ambient backdrop exception** — a restrained gradient or glow may exist only as a separate hero/OG brand backdrop, never baked into the crown/logo and never used as a glow shadow
+- **No gradients. Ever.** — flat solid colors only; this rule has no exceptions
 - **No glow shadows** — border-color changes on hover, not box-shadow glow
 - **No blur/glass** — no backdrop-filter; panels are solid surface colors
 - **Maintain contrast** — all text must meet WCAG AA minimums
@@ -176,9 +169,9 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
 - **Grid-aligned** — 24px or 32px base grids
 
 ### Reusable Motifs
-- **Crown points** — governed authority and deliberate control
-- **Mirrored wings** — coordinated agents working as a system
-- **Rising center** — durable execution and forward motion
+- **Trident tips** — agency, direction
+- **Crescent arcs** — sensing, awareness, connectivity
+- **Flame curves** — intelligence, transformation
 - **Node points** — agents, distributed actors
 - **Connection lines** — workflows, orchestration
 
@@ -189,6 +182,7 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
   ├── tool-execute.svg
   ├── gateway.svg
   ├── workflow.svg
+  ├── trident.svg
   └── ...
 ```
 
@@ -199,8 +193,7 @@ Cave keeps Geist Sans and Geist Mono in the selectable catalog as clean alternat
 OpenCoven UI uses a **field manual aesthetic**: high information density, monospace labels, ruled borders, structured grids, zero decoration. Think ops dashboard meets field report.
 
 ### Principles
-- **Flat and solid UI** — normal UI surfaces stay solid-color only; no blur and no glow shadows
-- **Ambient backdrop exception** — restrained hero/OG ambient backdrops may use a separate gradient or glow field behind the crown, never on the crown and never as a shadow treatment
+- **Flat and solid** — no gradients, no blur, no glow shadows
 - **Monospace for labels** — `JetBrains Mono` or `SF Mono` for all uppercase labels, badges, status text, nav items, and metadata
 - **Ruled borders** — thin `rgba(255,255,255,0.06–0.10)` lines as structural dividers
 - **Dense but readable** — generous line-height in body copy, tight in labels
@@ -231,7 +224,7 @@ Code / terminal:      JetBrains Mono, 400
 
 ### Hero Section
 - **Background:** `#080808` — pure flat black
-- **Ambient backdrop rule:** no ambient wash divs, radial halos, or grid overlays baked into the crown/logo; the only exception is a restrained separate purple ambient backdrop in hero/OG brand compositions behind the centered flat transparent crown, never as a logo glow shadow
+- **No ambient wash divs, no radial halos, no grid overlays**
 - **Headline:** EB Garamond 600, flat `#9A8ECD` span (no gradient clip). The serif carries the identity; Inter would read too corporate here.
 - **Kicker:** JetBrains Mono, 10px, 0.18em tracking, prefixed with a 20px violet rule
 - **CTAs:** Sharp corners, monospace labels; primary is solid violet fill
@@ -266,8 +259,8 @@ and a place to coordinate without becoming opaque.
 **2. Visual System Diagram**
 - Nodes (agents) shown as small circles
 - Lines (execution paths) in purple
-- Central crown mark (OpenCoven core) prominent
-- Interactive hover states (node glow, path highlight)
+- Central knot/sigil (OpenCoven core) prominent
+- Interactive hover states (node border/surface highlight, path highlight)
 
 **3. Developer Experience**
 - CLI showcase
@@ -355,16 +348,14 @@ Orchestrate intelligence across agents, tools, and systems.
 ### App Icon (General)
 
 **Rules**
-- Use flat solid white crown (#ffffff)
-- Background: pure black (#000000)
+- Use solid white mark (#ffffff)
+- Background: pure black (#000000) OR subtle radial purple glow
 - No text
-- No glow, shadow, or gradient
-- Keep a safe square canvas so the crown survives squircle crop without edge clipping
+- Must pass squircle crop safely (avoid edge clipping)
 
 **Master Size:** 1024×1024 px
 - Export down to all smaller sizes (iOS: 180×180, 120×120, etc.)
 - Use appropriate transparency/anti-aliasing
-- The tracked `web/apple-touch-icon.png` is a separate 1254x1254 website export generated from the canonical square, not the future native-app icon master.
 
 **Files:**
 ```
@@ -383,8 +374,8 @@ Orchestrate intelligence across agents, tools, and systems.
 ### macOS
 
 **Dock Icon**
-- Use the same flat black-square/white-crown identity as the canonical app icon
-- No inner glow, depth, or shadow treatments
+- Slight inner glow (optional, subtle)
+- Slight depth perception (shadows underneath, not skeuomorphic)
 - Remain recognizable at 32×32 px minimum
 
 **Menu Bar Icon**
@@ -396,8 +387,7 @@ Orchestrate intelligence across agents, tools, and systems.
 
 **Splash Screen**
 - Black background (#000000)
-- Centered logo with an opacity-only reveal if animated
-- No glow pulse
+- Centered logo with soft glow pulse (2–3s loop)
 - Optional animation on app launch
 
 ---
@@ -431,7 +421,7 @@ animation: breathe 2.5s ease-in-out infinite;
 - Easing: ease-out
 
 **Focus Ring**
-- Purple glow on interactive elements
+- Purple glow on focus-visible interactive elements
 - Width: 2px
 - Color: `--oc-purple-glow` with 0.5 opacity
 
@@ -451,9 +441,8 @@ animation: breathe 2.5s ease-in-out infinite;
 - Verify icon legibility at minimum 24px scale
 
 ### ❌ Don't
-- **Use gradients on standard UI surfaces or logo assets** — keep logos, cards, controls, diagrams, and text treatments flat; only the restrained separate hero/OG ambient backdrop may use gradient/glow treatment
+- **Use gradients anywhere** — no linear, no radial, no gradient text clips. Zero exceptions.
 - Use `backdrop-filter` or glass blur effects
-- Use `box-shadow` glow on hover or focus (use `outline` for focus rings only)
 - Use pill-shaped buttons on primary actions
 - Add ambient wash divs or decorative overlays
 - Mix serif/sans fonts carelessly
@@ -473,7 +462,7 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Add `/brand` directory with logo variants
 - [ ] Implement `brand/ui/color-tokens.css`
 - [ ] Update docs site colors to match palette
-- [ ] Replace any non-brand assets with the OpenCoven crown
+- [ ] Replace any non-brand assets with OpenCoven sigil
 
 #### OpenClaw Integration (openclaw-coven)
 - [ ] Update plugin README
@@ -481,11 +470,11 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Update badge / shield colors
 
 #### Landing Page (docs.opencoven.ai)
-- [ ] Hero section: centered crown with restrained ambient backdrop glow
+- [ ] Hero section: centered sigil + glow
 - [ ] Capabilities grid: 90% black/white, 10% purple
 - [ ] Diagram: nodes + paths in brand colors
-- [ ] All CTAs: purple glow on hover, no scale
-- [ ] Footer: approved transparent crown mark inside controlled dark chrome, social links
+- [ ] All CTAs: border/surface-color shift on hover, no glow, no scale
+- [ ] Footer: logo variants, social links
 
 #### Social Media Assets
 - [ ] X avatar: white logo on black
@@ -497,7 +486,7 @@ animation: breathe 2.5s ease-in-out infinite;
 - [ ] Apply color tokens to all `<code>`, `<pre>` blocks
 - [ ] Update button styles: purple accents, no gradients
 - [ ] Ensure all headings use tight tracking
-- [ ] Logo in header/footer: approved black-background, white-crown asset
+- [ ] Logo in header/footer: approved black-background, white-icon asset
 
 ### File Structure Template
 
@@ -511,6 +500,7 @@ animation: breathe 2.5s ease-in-out infinite;
     ├── tool-execute.svg
     ├── gateway.svg
     ├── workflow.svg
+    ├── trident.svg
     ├── app-icon-1024.png           # Master
     ├── app-icon-ios-set/
     │   ├── 180.png
@@ -524,10 +514,10 @@ animation: breathe 2.5s ease-in-out infinite;
   /social
     ├── x-avatar.png                # 1024×1024
     ├── x-banner.png                # 1500×500
-    └── github-banner.png           # 1500×500
+    └── github-banner.png           # 1280×640
 
   /ui
-    ├── color-tokens.css            # CSS vars + ambient backdrop tokens
+    ├── color-tokens.css            # CSS vars + gradients
     └── typography.css              # Font stacks + scales
 
   /docs
@@ -560,9 +550,8 @@ font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
 ```
 
 ### Logo Usage
-- **All public surfaces:** Approved black-background, white-crown asset
-- **Small icons/badges:** Approved black-background, white-crown asset
-- **Controlled dark compositions:** Transparent `brand/logo/opencoven-mark.svg`
+- **All public surfaces:** Approved black-background, white-icon asset
+- **Small icons/badges:** Approved black-background, white-icon asset
 - **Docs and diagrams:** Use the approved logo only when a logo is needed; diagrams otherwise use plain labels and lines
 
 ### Adding New Icons
@@ -576,15 +565,14 @@ font-family: 'JetBrains Mono', 'SF Mono', ui-monospace, Menlo, monospace;
 
 ## 13. Versioning & Maintenance
 
-**Current Version:** 1.3.0 (2026-08-14)
+**Current Version:** 1.2.0 (2026-07-09)
 
-**Last Reviewed:** 2026-08-14
+**Last Reviewed:** 2026-07-09
 **Reviewed By:** Val + Nova
 
 **Change Log:**
-- **v1.3.0** – Crown refresh alignment: clarified the public/export role of the full black-square, white-crown logo versus the controlled-dark transparent mark, documented the restrained ambient hero/OG backdrop exception, and recorded regenerated canonical assets for the refreshed crown system.
 - **v1.2.0** – Classic Coven type system: **EB Garamond** replaces Satoshi/Neue Montreal as the display face (headlines, hero, ceremonial). **Inter** is the canonical body/UI sans (replaces Geist as the default; Geist remains a Cave-selectable alternative). **JetBrains Mono** stays as the canonical mono. Fredoka is retired from Cave chrome (home-composer headline now serif). Landing hero and Quick-Start rewritten to reflect serif-first identity moments. Rationale: OpenCoven is a coven, not a Vercel demo — the type system should feel like a grimoire.
-- **v1.1.0** – Field manual redesign: flat-surface rule for standard UI surfaces, flat violet `#9A8ECD`, JetBrains Mono for labels, solid surfaces, sharp corners, hover = border-color only. Removed the older gradient/glow/glass-heavy UI patterns.
+- **v1.1.0** – Field manual redesign: no-gradient rule (hard), flat violet `#9A8ECD`, JetBrains Mono for labels, solid surfaces, sharp corners, hover = border-color only. Removed all gradient/glow/glass patterns.
 - **v1.0.0** – Initial production-ready system
 
 **Next Review:** Quarterly or when major product change occurs

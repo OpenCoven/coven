@@ -35,7 +35,7 @@ Build for harness operators and developers, not a marketing toy.
 - The product promise is durable AI systems that can stay: remember what matters, understand their purpose, use tools, coordinate with other agents, and remain understandable over time.
 - A familiar is not a faceless bot. It has a name, purpose, memory, toolset, voice, role, and place in a larger workflow.
 - Keep the philosophy clear: powerful without becoming opaque, personal without pretending to be human, extensible without collapsing into chaos.
-- Mystical symbolism is allowed only when it supports identity: crown silhouette, mirrored wings, rising center, nodes, execution paths.
+- Mystical symbolism is allowed only when it supports identity: sigil, trident, flame, crescents, nodes, execution paths.
 - Interfaces should be dense, legible, and repeatable under daily use.
 - Copy should be direct and capable. Avoid hype, jokes, and vague AI language.
 - Use `OpenCoven` for the ecosystem/org and `Coven` for the CLI/daemon/product.
@@ -43,27 +43,30 @@ Build for harness operators and developers, not a marketing toy.
 
 ## Color Tokens
 
-Read `brand/ui/color-tokens.css` and use the named `--oc-*` values directly. Do not copy literal canonical palette values into this skill; they belong in the token file.
+Use the repo tokens, not arbitrary hex values.
 
-Active tokens to import/use:
+```css
+--oc-black: #000000;
+--oc-white: #ffffff;
 
-- `--oc-black`
-- `--oc-white`
-- `--oc-purple-1`
-- `--oc-purple-2`
-- `--oc-purple-3`
-- `--oc-purple-glow`
-- `--oc-accent-blue`
-- `--oc-danger`
-- `--oc-success`
-- `--oc-surface-0`
-- `--oc-surface-1`
-- `--oc-surface-2`
-- `--oc-border-subtle`
-- `--oc-border-strong`
-- `--oc-text`
-- `--oc-text-muted`
-- `--oc-text-faint`
+--oc-purple-1: #6E4BFF;
+--oc-purple-2: #8A63FF;
+--oc-purple-3: #A78BFF;
+--oc-purple-glow: #7C5CFF;
+
+--oc-accent-blue: #0A84FF;
+--oc-danger: #FF3B30;
+--oc-success: #30D158;
+
+--oc-surface-0: var(--oc-black);
+--oc-surface-1: #050507;
+--oc-surface-2: #080812;
+--oc-border-subtle: rgba(255, 255, 255, 0.08);
+--oc-border-strong: rgba(255, 255, 255, 0.14);
+--oc-text: rgba(255, 255, 255, 0.94);
+--oc-text-muted: rgba(255, 255, 255, 0.64);
+--oc-text-faint: rgba(255, 255, 255, 0.42);
+```
 
 ### Color Rules
 
@@ -76,20 +79,18 @@ Active tokens to import/use:
 
 ## Signature Treatments
 
-Gradients and glow are allowed only as controlled ambient brand moments, never on the crown itself.
+Ambient glow is allowed only for hero/OG backdrops and focus rings.
 
-Use the named tokens from `brand/ui/color-tokens.css` directly for ambient
-effects: `--oc-radial-glow`, `--oc-focus-ring`, and `--oc-hover-glow`. Do not
-restate their color-stop values here.
+```css
+--oc-radial-glow: radial-gradient(circle, rgba(138, 99, 255, 0.28) 0%, rgba(138, 99, 255, 0) 68%);
+--oc-focus-ring: 0 0 0 2px rgba(124, 92, 255, 0.52), 0 0 32px rgba(124, 92, 255, 0.28);
+```
 
 Use signature treatment for:
 
-- Hero/OG ambient background treatments
+- Primary logo and hero/OG assets
 - Focus rings and interactive affordances
-- Hover glow on CTAs or selected execution paths
-- Subtle radial glow behind the crown or nearby surfaces
-
-Never apply these treatments to logo or crown rendering.
+- Subtle radial glow behind the sigil
 
 Do not use gradients or glows for:
 
@@ -190,7 +191,7 @@ Use tab-like navigation for long-lived work.
 
 ### Documentation And Landing
 
-- Landing hero: black foundation, centered transparent `brand/logo/opencoven-mark.svg` in `currentColor`, restrained purple ambient glow in the surrounding chrome only, literal OpenCoven/Coven offer.
+- Landing hero: black foundation, centered sigil, restrained purple glow, literal OpenCoven/Coven offer.
 - Docs: calm technical rhythm, readable code blocks, no decorative clutter.
 - Diagrams: nodes, paths, monoline icons, purple execution highlights.
 - Keep the next section visible below a landing hero on normal mobile and desktop viewports.
@@ -208,7 +209,7 @@ Use tab-like navigation for long-lived work.
 
 ### Buttons
 
-- Primary: purple accent, white text, restrained hover glow.
+- Primary: purple accent, white text, hover border/surface shift.
 - Secondary: dark surface, subtle border, white or muted text.
 - Ghost: transparent, clear hover surface.
 - Danger: danger token, explicit label, confirmation for irreversible actions.
@@ -270,23 +271,20 @@ Keyboard navigation must remain visible. Never remove focus indicators without a
 - Standard transition: 150ms to 250ms.
 - Page or path drawing motion may run 600ms to 1200ms when it explains graph/execution flow.
 - Respect `prefers-reduced-motion`.
-- Hover glow is preferred over scale for brand CTAs.
+- Hover border/surface changes are preferred over scale for brand CTAs.
 - Do not animate body text or cause layout shift.
 
 ## Iconography
 
 - Use monoweight, geometric, slightly sharp icons.
 - Use existing icons from `brand/icons/` when possible.
-- Use crown points, mirrored wings, rising forms, nodes, and connection lines only as meaningful motifs.
+- Use trident tips, crescents, flame curves, nodes, and connection lines only as meaningful motifs.
 - Avoid emoji and whimsical icons in system UI.
 - Test logo and icon legibility at 24px minimum.
 
 ## Logo Rules
 
-- Public/exported surfaces use the approved flat white crown on a black square.
-- Do not add gradient, glow, shadow, or the retired emblem to the exported logo.
-- Controlled dark compositions inside the landing page shell may use `brand/logo/opencoven-mark.svg` with `currentColor` for nav, hero, and footer.
-- Do not apply glow to the logo itself; keep purple glow as an ambient background/UI effect only.
+- Public surfaces use the approved black-background, white-icon logo.
 - Use `assets/opencoven/opencoven.svg` as the shared SVG source.
 - Use `docs/assets/opencoven-icon.svg` for the generated docs site.
 - Package READMEs use package-local copies of the approved SVG.
@@ -376,15 +374,15 @@ Return changed files, verification run, and any brand exceptions.
 - Colors come from `--oc-*` tokens or documented semantic aliases.
 - Typography uses `--oc-font-ui`, `--oc-font-display`, or `--oc-font-mono`.
 - Purple is limited to identity, focus, selected state, CTAs, and execution highlights.
-- Hover states glow or change border/surface; they do not scale layout.
+- Hover states change border/surface; they do not glow or scale layout.
 - Dense tools are scannable and not card-heavy.
 - Destructive actions are explicit and gated.
 - Focus, disabled, loading, empty, and error states are present.
-- Public exports use the full black-square, white-crown logo; controlled dark nav, hero, and footer may use the transparent mark.
+- Logo usage stays on the approved black-background, white-icon asset.
 - Any exception is documented in `docs/BRANDING-ADHERENCE.md`.
 
 ---
 
-Last updated: 2026-08-14
-Version: 1.3.0
+Last updated: 2026-06-13
+Version: 1.2.0
 License: MIT
