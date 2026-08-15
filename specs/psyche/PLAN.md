@@ -16,11 +16,14 @@ append-only O1.1 evidence note. This closes only C-S1 vocabulary and C-S8
 documentation. C-S3-C-S6 and C-S9-C-S12 remain separate work, while G4, G6,
 and production child dispatch remain blocked.
 
-**O2 proposal:** [O2 contract design](./O2_CONTRACT_DESIGN.md) defines
-immutable opaque binding and mismatch correlation only. Stable adoption,
-lookup/fencing, cancellation acknowledgement, artifact binding, and
-cross-phase recovery remain separate O3-O7 planned work; W5/G4 still require
-the full classified conformance profile.
+**O2 complete / O3 approved:** [O2 contract design](./O2_CONTRACT_DESIGN.md)
+records the merged immutable binding and mismatch-correlation implementation
+(PR #732). [O3 request-adoption design](./O3_CONTRACT_DESIGN.md) freezes
+durable idempotent adoption for bound launch/input plus launch attempt
+uniqueness, but is not yet implemented. Lookup/fencing, cancellation
+acknowledgement, artifact binding, and cross-phase recovery remain separate
+O4-O7 planned work; W5/G4 still require the full classified conformance
+profile.
 
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
 runtime for a Coven, with durable intent and orchestration, evidence-first
@@ -29,7 +32,7 @@ independent bounded execution substrate.
 
 **Canonical decision:** [Familiar runtime design](./RUNTIME_DESIGN.md)
 
-**Companions:** [W1 Coven audit](./COVEN_W1_AUDIT.md), [O1 contract design](./O1_CONTRACT_DESIGN.md), [O2 contract design](./O2_CONTRACT_DESIGN.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
+**Companions:** [W1 Coven audit](./COVEN_W1_AUDIT.md), [O1 contract design](./O1_CONTRACT_DESIGN.md), [O2 contract design](./O2_CONTRACT_DESIGN.md), [O3 request-adoption design](./O3_CONTRACT_DESIGN.md), [Decision dossier](./DECISION_DOSSIER.md), [Product specification](./PRODUCT.md), [Technical architecture](./TECH.md), [Threat model](./THREAT_MODEL.md), [Telegram parity ledger](./TELEGRAM_PARITY.md), [Coven prerequisites](./COVEN_PREREQUISITES.md)
 
 ## 1. Fixed program decisions
 
