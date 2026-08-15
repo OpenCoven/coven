@@ -20,6 +20,7 @@ use anyhow::{bail, Context, Result};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -786,7 +787,7 @@ pub fn dispatch_to_node(
     if request.command.is_empty() {
         return api_error(400, "invalid_request", "command must not be empty.", None);
     }
-    let conn = store::open_store(&store_path(coven_home))?;
+    let mut conn = store::open_store(&store_path(coven_home))?;
     let Some(mut node) = store::get_node(&conn, node_id)? else {
         return api_error(
             404,
@@ -837,7 +838,7 @@ pub fn dispatch_to_node(
     let job_json = serde_json::to_string(&job).context("failed to serialize job spec")?;
     let now = current_timestamp();
     // Persist before dispatching so a hub crash mid-dispatch leaves evidence.
-    store::upsert_executor_dispatch(
+    store::insert_executor_dispatch_if_absent(
         &conn,
         &store::ExecutorDispatchRecord {
             job_id: job_id.clone(),
@@ -851,50 +852,11 @@ pub fn dispatch_to_node(
     )?;
 
     let envelope = executor_node::dispatch_job(transport.as_ref(), &job);
-    let envelope_json =
-        serde_json::to_string(&envelope).context("failed to serialize result envelope")?;
     let finished = current_timestamp();
-    store::upsert_executor_dispatch(
-        &conn,
-        &store::ExecutorDispatchRecord {
-            job_id: job_id.clone(),
-            node_id: node_id.to_string(),
-            status: envelope.status.clone(),
-            job_json,
-            envelope_json: Some(envelope_json),
-            created_at: now.clone(),
-            updated_at: finished.clone(),
-        },
-    )?;
-
-    // Advance a matching hub-queue job from the envelope. A transport error
-    // leaves the job assigned/held so no work is lost.
-    if store::get_hub_job(&conn, &job_id)?.is_some() {
-        let hub_state = match envelope.status.as_str() {
-            executor_node::RESULT_STATUS_COMPLETED => Some("completed"),
-            executor_node::RESULT_STATUS_FAILED
-            | executor_node::RESULT_STATUS_TIMEOUT
-            | executor_node::RESULT_STATUS_REJECTED => Some("failed"),
-            _ => None,
-        };
-        if let Some(state) = hub_state {
-            store::update_hub_job_state(&conn, &job_id, state, Some(node_id), &finished)?;
-        }
-    }
-
-    // A dispatch doubles as an availability observation.
     let unreachable = envelope.status == executor_node::RESULT_STATUS_TRANSPORT_ERROR;
-    node.available = !unreachable;
-    node.last_health_at = finished.clone();
-    node.last_error = if unreachable {
-        envelope.error.clone()
-    } else {
-        None
-    };
-    node.updated_at = finished.clone();
-    store::upsert_node(&conn, &node)?;
-    transition_jobs_for_availability(&conn, node_id, !unreachable, &finished)?;
-    sync_executor_queue(&conn, node_id, &finished)?;
+    persist_dispatch_result(
+        &mut conn, &mut node, &job, &job_json, &envelope, &now, &finished,
+    )?;
 
     if unreachable {
         return api_error(
@@ -919,6 +881,101 @@ pub fn dispatch_to_node(
     )
 }
 
+fn persist_dispatch_result(
+    conn: &mut Connection,
+    node: &mut store::NodeRecord,
+    job: &executor_node::ExecutorJob,
+    job_json: &str,
+    envelope: &executor_node::ExecutorResultEnvelope,
+    created_at: &str,
+    finished_at: &str,
+) -> Result<()> {
+    let envelope_json =
+        serde_json::to_string(envelope).context("failed to serialize result envelope")?;
+    let envelope_id = result_envelope_id(&node.node_id, &envelope_json);
+    let unreachable = envelope.status == executor_node::RESULT_STATUS_TRANSPORT_ERROR;
+    let mut observed_node = node.clone();
+    observed_node.available = !unreachable;
+    observed_node.last_health_at = finished_at.to_string();
+    observed_node.last_error = if unreachable {
+        envelope.error.clone()
+    } else {
+        None
+    };
+    observed_node.updated_at = finished_at.to_string();
+
+    let tx = conn
+        .transaction()
+        .context("failed to begin executor result transaction")?;
+    let inserted = store::append_executor_result_envelope(
+        &tx,
+        &store::ExecutorResultEnvelopeRecord {
+            envelope_id,
+            job_id: job.job_id.clone(),
+            node_id: node.node_id.clone(),
+            envelope_json: envelope_json.clone(),
+            recorded_at: finished_at.to_string(),
+        },
+    )?;
+    if !inserted {
+        tx.commit()
+            .context("failed to commit replayed executor result transaction")?;
+        return Ok(());
+    }
+    store::upsert_executor_dispatch(
+        &tx,
+        &store::ExecutorDispatchRecord {
+            job_id: job.job_id.clone(),
+            node_id: node.node_id.clone(),
+            status: envelope.status.clone(),
+            job_json: job_json.to_string(),
+            envelope_json: Some(envelope_json),
+            created_at: created_at.to_string(),
+            updated_at: finished_at.to_string(),
+        },
+    )?;
+
+    // A transport error leaves the job assigned or held so hub-owned work is
+    // never lost. Replaying a terminal envelope repeats this idempotent update.
+    if store::get_hub_job(&tx, &job.job_id)?.is_some() {
+        let hub_state = match envelope.status.as_str() {
+            executor_node::RESULT_STATUS_COMPLETED => Some("completed"),
+            executor_node::RESULT_STATUS_FAILED
+            | executor_node::RESULT_STATUS_TIMEOUT
+            | executor_node::RESULT_STATUS_REJECTED => Some("failed"),
+            _ => None,
+        };
+        if let Some(state) = hub_state {
+            store::update_hub_job_state(&tx, &job.job_id, state, Some(&node.node_id), finished_at)?;
+        }
+    }
+
+    store::upsert_node(&tx, &observed_node)?;
+    transition_jobs_for_availability(&tx, &node.node_id, !unreachable, finished_at)?;
+    sync_executor_queue(&tx, &node.node_id, finished_at)?;
+    tx.commit()
+        .context("failed to commit executor result transaction")?;
+    *node = observed_node;
+    Ok(())
+}
+
+fn result_envelope_id(node_id: &str, envelope_json: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(node_id.as_bytes());
+    digest.update([0]);
+    digest.update(envelope_json.as_bytes());
+    let hash = digest.finalize();
+    let mut id = String::with_capacity("sha256:".len() + hash.len() * 2);
+    id.push_str("sha256:");
+    for byte in hash {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let byte = usize::from(byte);
+        id.push(HEX[byte >> 4] as char);
+        id.push(HEX[byte & 0x0f] as char);
+    }
+    id
+}
+
 pub fn get_dispatch(coven_home: &Path, job_id: &str) -> Result<ApiResponse> {
     let conn = store::open_store(&store_path(coven_home))?;
     let Some(record) = store::get_executor_dispatch(&conn, job_id)? else {
@@ -936,6 +993,20 @@ pub fn get_dispatch(coven_home: &Path, job_id: &str) -> Result<ApiResponse> {
         }
         None => Value::Null,
     };
+    let result_envelopes = store::list_executor_result_envelopes(&conn, job_id)?
+        .into_iter()
+        .map(|result| {
+            let envelope: Value = serde_json::from_str(&result.envelope_json)
+                .context("failed to parse append-only result envelope")?;
+            Ok(json!({
+                "envelopeId": result.envelope_id,
+                "jobId": result.job_id,
+                "nodeId": result.node_id,
+                "envelope": envelope,
+                "recordedAt": result.recorded_at,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
     json_response(
         200,
         &json!({
@@ -944,6 +1015,7 @@ pub fn get_dispatch(coven_home: &Path, job_id: &str) -> Result<ApiResponse> {
             "status": record.status,
             "job": job,
             "envelope": envelope,
+            "resultEnvelopes": result_envelopes,
             "createdAt": record.created_at,
             "updatedAt": record.updated_at,
         }),
@@ -2070,6 +2142,188 @@ exit 2
         assert_eq!(job["job"]["protocolVersion"], "coven.executor.v1");
         assert!(job["job"]["hubId"].as_str().unwrap().starts_with("hub_"));
         assert_eq!(job["job"]["context"]["workspaceId"], "workspace-1");
+        assert_eq!(job["resultEnvelopes"].as_array().unwrap().len(), 1);
+        assert_eq!(job["resultEnvelopes"][0]["envelope"], job["envelope"]);
+        assert!(job["resultEnvelopes"][0]["envelopeId"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaying_result_envelope_is_idempotent() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = write_fake_executor_script(temp.path())?;
+        register_dispatchable_node(
+            &temp,
+            "node_compute",
+            "compute_executor",
+            &script.to_string_lossy(),
+            r#"["shell","gpu"]"#,
+        )?;
+        let request = r#"{
+            "jobId":"job_replayed",
+            "command":["echo","hello"],
+            "requiredCapabilities":["gpu"]
+        }"#;
+
+        let (first_status, first) =
+            post(&temp, "/api/v1/hub/nodes/node_compute/dispatch", request)?;
+        let (replay_status, replay) =
+            post(&temp, "/api/v1/hub/nodes/node_compute/dispatch", request)?;
+
+        assert_eq!(first_status, 200);
+        assert_eq!(replay_status, 200);
+        assert_eq!(first["envelope"], replay["envelope"]);
+        let (_, dispatch) = get(&temp, "/api/v1/hub/dispatches/job_replayed")?;
+        assert_eq!(dispatch["status"], "completed");
+        assert_eq!(dispatch["resultEnvelopes"].as_array().unwrap().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replaying_older_results_does_not_regress_newer_hub_state() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut conn = crate::store::open_store(&super::store_path(temp.path()))?;
+        let mut node = crate::store::NodeRecord {
+            node_id: "node_replay".to_string(),
+            role: "compute_executor".to_string(),
+            transport: "local".to_string(),
+            transport_config_json: None,
+            capabilities_json: r#"["shell"]"#.to_string(),
+            available: true,
+            queue_pressure: 0,
+            last_health_at: "2026-08-09T00:00:00Z".to_string(),
+            last_error: None,
+            registered_at: "2026-08-09T00:00:00Z".to_string(),
+            updated_at: "2026-08-09T00:00:00Z".to_string(),
+        };
+        crate::store::upsert_node(&conn, &node)?;
+        let job = crate::executor_node::ExecutorJob {
+            protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+            job_id: "job_replay_order".to_string(),
+            hub_id: Some("hub_test".to_string()),
+            required_capabilities: vec!["shell".to_string()],
+            command: vec!["echo".to_string(), "hello".to_string()],
+            cwd: None,
+            env: std::collections::BTreeMap::new(),
+            stdin: None,
+            timeout_seconds: Some(30),
+            context: None,
+        };
+        let job_json = serde_json::to_string(&job)?;
+        crate::store::upsert_hub_job(
+            &conn,
+            &crate::store::HubJobRecord {
+                job_id: job.job_id.clone(),
+                state: "assigned".to_string(),
+                priority: 0,
+                required_capabilities_json: r#"["shell"]"#.to_string(),
+                assigned_node_id: Some(node.node_id.clone()),
+                loop_id: None,
+                payload_json: "{}".to_string(),
+                created_at: "2026-08-09T00:00:00Z".to_string(),
+                updated_at: "2026-08-09T00:00:00Z".to_string(),
+            },
+        )?;
+        let failed = crate::executor_node::ExecutorResultEnvelope {
+            protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+            job_id: job.job_id.clone(),
+            status: crate::executor_node::RESULT_STATUS_FAILED.to_string(),
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "failed".to_string(),
+            started_at: "2026-08-09T00:00:01Z".to_string(),
+            finished_at: "2026-08-09T00:00:02Z".to_string(),
+            duration_ms: 1_000,
+            error: None,
+        };
+        let transport_error = crate::executor_node::ExecutorResultEnvelope {
+            protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+            job_id: job.job_id.clone(),
+            status: crate::executor_node::RESULT_STATUS_TRANSPORT_ERROR.to_string(),
+            exit_code: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            started_at: "2026-08-09T00:00:03Z".to_string(),
+            finished_at: "2026-08-09T00:00:04Z".to_string(),
+            duration_ms: 1_000,
+            error: Some("connection refused".to_string()),
+        };
+        let completed = crate::executor_node::ExecutorResultEnvelope {
+            protocol_version: crate::executor_node::EXECUTOR_PROTOCOL_VERSION.to_string(),
+            job_id: job.job_id.clone(),
+            status: crate::executor_node::RESULT_STATUS_COMPLETED.to_string(),
+            exit_code: Some(0),
+            stdout: "done".to_string(),
+            stderr: String::new(),
+            started_at: "2026-08-09T00:00:05Z".to_string(),
+            finished_at: "2026-08-09T00:00:06Z".to_string(),
+            duration_ms: 1_000,
+            error: None,
+        };
+
+        super::persist_dispatch_result(
+            &mut conn,
+            &mut node,
+            &job,
+            &job_json,
+            &failed,
+            "2026-08-09T00:00:01Z",
+            "2026-08-09T00:00:02Z",
+        )?;
+        super::persist_dispatch_result(
+            &mut conn,
+            &mut node,
+            &job,
+            &job_json,
+            &transport_error,
+            "2026-08-09T00:00:03Z",
+            "2026-08-09T00:00:04Z",
+        )?;
+        super::persist_dispatch_result(
+            &mut conn,
+            &mut node,
+            &job,
+            &job_json,
+            &completed,
+            "2026-08-09T00:00:05Z",
+            "2026-08-09T00:00:06Z",
+        )?;
+        super::persist_dispatch_result(
+            &mut conn,
+            &mut node,
+            &job,
+            &job_json,
+            &failed,
+            "2026-08-09T00:00:01Z",
+            "2026-08-09T00:00:02Z",
+        )?;
+        super::persist_dispatch_result(
+            &mut conn,
+            &mut node,
+            &job,
+            &job_json,
+            &transport_error,
+            "2026-08-09T00:00:03Z",
+            "2026-08-09T00:00:04Z",
+        )?;
+
+        let dispatch =
+            crate::store::get_executor_dispatch(&conn, &job.job_id)?.expect("dispatch persists");
+        let hub_job = crate::store::get_hub_job(&conn, &job.job_id)?.expect("hub job persists");
+        let stored_node =
+            crate::store::get_node(&conn, &node.node_id)?.expect("node state persists");
+        assert_eq!(dispatch.status, "completed");
+        assert_eq!(hub_job.state, "completed");
+        assert!(stored_node.available);
+        assert!(stored_node.last_error.is_none());
+        assert_eq!(
+            crate::store::list_executor_result_envelopes(&conn, &job.job_id)?.len(),
+            3
+        );
         Ok(())
     }
 

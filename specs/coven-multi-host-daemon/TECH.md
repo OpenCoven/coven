@@ -310,11 +310,17 @@ always see one shape).
   records capabilities, availability, and last error; availability
   transitions hold/resume the node's persistent subqueue.
 - `POST /api/v1/hub/nodes/:nodeId/dispatch` — hub dispatches a job outbound,
-  persists the dispatch record plus normalized envelope, treats the
-  attempt as an availability observation, and advances a matching
-  hub-queue job from the envelope.
+  appends the normalized envelope to an immutable result ledger, updates the
+  latest-state dispatch projection, treats the attempt as an availability
+  observation, and advances a matching hub-queue job from the envelope.
 - `GET /api/v1/hub/dispatches/:jobId` — durable dispatch record (job spec,
-  envelope, status).
+  latest envelope/status projection, and ordered `resultEnvelopes` ledger).
+
+Result ledger entries use deterministic envelope IDs derived from the executor
+node and canonical envelope JSON. Replaying the same envelope is idempotent:
+the append and its derived projection updates are ignored, so an older replay
+cannot replace newer hub state. Different attempts remain distinct, and ledger
+rows are never updated by the spoke protocol.
 
 Acceptance coverage for #267:
 
@@ -323,6 +329,7 @@ Acceptance coverage for #267:
 - job specs carry full context so executor nodes need no local durable
   authority;
 - executors return stdout/stderr/result metadata in a normalized envelope;
+- normalized result envelopes are append-only and safe to replay;
 - the hub records executor capability metadata and last-known
   availability; and
 - stationary and compute roles share the base protocol while advertising
