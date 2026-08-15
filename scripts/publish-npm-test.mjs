@@ -1136,7 +1136,8 @@ test('every release tag must be contained in origin/main', () => {
 
   assert.match(
     workflow,
-    /git fetch --no-tags origin main\n\s*if ! git merge-base --is-ancestor "\$TAGGED_COMMIT_SHA" origin\/main; then/,
+    // `\s*` rather than `\n`: Windows checkouts read this file back as CRLF.
+    /git fetch --no-tags origin main\s*if ! git merge-base --is-ancestor "\$TAGGED_COMMIT_SHA" origin\/main; then/,
     'the ancestry gate must run unconditionally for every release tag'
   );
   assert.doesNotMatch(
