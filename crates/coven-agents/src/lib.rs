@@ -1,0 +1,25 @@
+//! Provider-neutral agent runtime primitives for OpenCoven.
+//!
+//! The crate owns deterministic orchestration, not provider transport,
+//! persistence, sandboxing, or user interface concerns.
+
+mod agent;
+mod error;
+mod guardrail;
+mod model;
+mod observer;
+mod runner;
+mod session;
+mod tool;
+
+pub use agent::{Agent, AgentId, Handoff};
+pub use error::{BoxError, ConfigError, GuardrailStage, RunError};
+pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
+pub use model::{
+    HandoffCall, HandoffDefinition, Model, ModelAction, ModelRequest, ModelResponse, RunItem,
+    ToolCall,
+};
+pub use observer::{NoopObserver, RunEvent, RunFailureKind, RunObserver};
+pub use runner::{RunOptions, RunResult, Runner};
+pub use session::{InMemorySession, SessionStore};
+pub use tool::{Tool, ToolDefinition};
