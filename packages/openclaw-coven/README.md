@@ -128,14 +128,19 @@ sending a dependent request. Capabilities advertise availability and never grant
 | `launchAdoptedSession` | `POST /api/v1/adopted-sessions` | `201 SessionRecord` | `200 SessionRecord` |
 | `sendAdoptedInput` | `POST /api/v1/sessions/:id/adopted-input` | `202 {"adopted":true,"replayed":false,"delivery":"not_asserted"}` | `200 {"adopted":true,"replayed":true,"delivery":"not_asserted"}` |
 
-Before either mutation, the client calls `GET /api/v1/health` and requires
-`requestAdoptionContracts` to contain the exact
-`psyche.request_adoption.v1` value. Missing, malformed, or unsupported
-advertisement fails closed before the POST and never falls back to a legacy
-mutation. Non-2xx daemon responses surface as `CovenApiError` with their HTTP
-status and response body. Adoption asserts durable responsibility, not
-delivery or completion; the normative shape, errors, ordering, and retention
-rules live only in the canonical
+Before either mutation, the client calls `GET /api/v1/health` and negotiates
+in a fixed, two-step order: first it requires the named `apiVersion` to be
+the exact string `coven.daemon.v1`, then — only once that passes — it
+requires `requestAdoptionContracts` to contain the exact
+`psyche.request_adoption.v1` value. A missing, null, non-string, wrong-case,
+near-match, or otherwise unsupported `apiVersion` fails closed on its own,
+before the capability is even inspected; a valid `apiVersion` with a missing,
+malformed, or unsupported capability advertisement fails on the capability
+check instead. Either failure is closed before the POST and never falls back
+to a legacy mutation. Non-2xx daemon responses surface as `CovenApiError`
+with their HTTP status and response body. Adoption asserts durable
+responsibility, not delivery or completion; the normative shape, errors,
+ordering, and retention rules live only in the canonical
 [request-adoption contract](../../docs/API-CONTRACT.md#psyche-request-adoption-contract-v1).
 
 ## Development notes

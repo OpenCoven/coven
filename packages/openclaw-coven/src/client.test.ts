@@ -1849,6 +1849,146 @@ describe("createCovenClient", () => {
         expect(requests[0]).toBe("GET /api/v1/health");
       });
 
+      // The daemon must advertise the exact `coven.daemon.v1` contract
+      // before either adopted method is authorized to negotiate the
+      // request-adoption capability at all. Every case here has a fully
+      // valid `requestAdoptionContracts` advertisement, so a failure can
+      // only stem from the apiVersion gate.
+      it.each([
+        ["missing", undefined, false],
+        ["null", null, true],
+        ["non-string (number)", 7, true],
+        ["non-string (object)", { name: "coven.daemon.v1" }, true],
+        ["non-string (array)", ["coven.daemon.v1"], true],
+        ["wrong case", "Coven.Daemon.V1", true],
+        ["near-match (trailing space)", "coven.daemon.v1 ", true],
+        ["near-match (leading space)", " coven.daemon.v1", true],
+        ["near-match (extra suffix)", "coven.daemon.v1beta", true],
+        ["near-match (version bump)", "coven.daemon.v2", true],
+        ["unsupported legacy literal", "v1", true],
+        ["empty string", "", true],
+      ])(
+        "sends zero POST requests for %s apiVersion",
+        async (_name, apiVersion, includeProperty) => {
+          const sessionId = "session-version-fail-closed";
+          const data = "version-leak-guard-input\n";
+          const binding = validBinding();
+          const adoption = validAdoption({
+            key: "psyche:graph-1/node-1/attempt-1/version-leak-guard",
+            requestDigest: DIGEST_D,
+          });
+          const healthBody: Record<string, unknown> = { ...o3Health() };
+          if (includeProperty) {
+            healthBody.apiVersion = apiVersion;
+          } else {
+            delete healthBody.apiVersion;
+          }
+          const requests: string[] = [];
+          let error: unknown;
+          await withServer(
+            (req, res) => {
+              requests.push(`${req.method} ${req.url}`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify(healthBody));
+            },
+            async (socketPath) => {
+              const client = createCovenClient(socketPath);
+              try {
+                await invokeAdoptedMethod(client, method, sessionId, data, binding, adoption);
+              } catch (caught) {
+                error = caught;
+              }
+            },
+          );
+          expect(error).toBeInstanceOf(Error);
+          // Static, local failure — never the capability-negotiation
+          // message, and never an echo of the received version value or
+          // any caller-supplied secret.
+          expect((error as Error).message).toBe(
+            "Coven daemon API version is not supported",
+          );
+          const errorText = String(error);
+          expect(errorText).not.toContain(adoption.key);
+          expect(errorText).not.toContain(adoption.requestDigest);
+          expect(errorText).not.toContain(binding.principalRef);
+          expect(errorText).not.toContain(sessionId);
+          expect(errorText).not.toContain(data);
+          if (typeof apiVersion === "string" && apiVersion.length > 0) {
+            expect(errorText).not.toContain(apiVersion);
+          }
+          expect(requests.filter((entry) => entry.startsWith("POST"))).toEqual([]);
+          expect(requests).toEqual(["GET /api/v1/health"]);
+        },
+      );
+
+      it("fails on apiVersion before capability when both are invalid", async () => {
+        const binding = validBinding();
+        const adoption = validAdoption();
+        const healthBody = { ...o3Health(null), apiVersion: "coven.daemon.v2" };
+        const requests: string[] = [];
+        let error: unknown;
+        await withServer(
+          (req, res) => {
+            requests.push(`${req.method} ${req.url}`);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(healthBody));
+          },
+          async (socketPath) => {
+            try {
+              await invokeAdoptedMethod(
+                createCovenClient(socketPath),
+                method,
+                "session-version-precedence",
+                "version-precedence-input\n",
+                binding,
+                adoption,
+              );
+            } catch (caught) {
+              error = caught;
+            }
+          },
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe(
+          "Coven daemon API version is not supported",
+        );
+        expect(requests).toEqual(["GET /api/v1/health"]);
+      });
+
+      it("still fails on capability when apiVersion is valid and capability is invalid", async () => {
+        const binding = validBinding();
+        const adoption = validAdoption();
+        const healthBody = o3Health(null);
+        const requests: string[] = [];
+        let error: unknown;
+        await withServer(
+          (req, res) => {
+            requests.push(`${req.method} ${req.url}`);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(healthBody));
+          },
+          async (socketPath) => {
+            try {
+              await invokeAdoptedMethod(
+                createCovenClient(socketPath),
+                method,
+                "session-capability-precedence",
+                "capability-precedence-input\n",
+                binding,
+                adoption,
+              );
+            } catch (caught) {
+              error = caught;
+            }
+          },
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe(
+          "Coven daemon does not support request adoption",
+        );
+        expect(requests).toEqual(["GET /api/v1/health"]);
+      });
+
       it.each([
         ["null", null],
         ["object", { contract: REQUEST_ADOPTION_CONTRACT }],
