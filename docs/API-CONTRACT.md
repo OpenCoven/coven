@@ -1438,6 +1438,7 @@ those checks.
 
 ```json
 {
+  "apiVersion": "coven.daemon.v1",
   "capabilities": {
     "executionBindingContracts": ["psyche.execution_binding.v1"],
     "requestAdoptionContracts": ["psyche.request_adoption.v1"]
@@ -1446,16 +1447,19 @@ those checks.
 ```
 
 Before every adopted launch or input, the bundled client completes health
-negotiation and verifies that `requestAdoptionContracts` is an array containing
-the exact `psyche.request_adoption.v1` string. An absent field,
-malformed/non-array field, array without that value, or failed health request
-stops locally before POST, with no legacy fallback. It does not independently
-gate these adopted methods on `executionBindingContracts`: the O3 capability
-semantically advertises the composite adopted-route contract. This does not
-replace proof. Every adopted request must still carry a complete, exact O2
-`executionBinding`, which the Rust authority validates along with all
-per-operation admission checks. Capabilities advertise availability; they
-never grant permission or prove a request.
+negotiation in a fixed order. First it requires `health.apiVersion` to be the
+exact string `coven.daemon.v1`.
+Only after that check passes does it require
+`health.capabilities.requestAdoptionContracts` to be an array containing the
+exact `psyche.request_adoption.v1` string.
+Any health, API-version, or capability failure sends zero POST requests and
+never falls back to a legacy mutation. That O3 capability advertises the
+composite adopted-route contract; the client does not independently gate these
+adopted methods on `executionBindingContracts`. It does not replace proof:
+every adopted request must still carry a complete, exact O2 `executionBinding`
+proof, which the Rust authority validates along with all per-operation
+admission checks. Capabilities advertise availability; they never grant
+permission or prove a request.
 
 ### O4-O8 exclusions
 

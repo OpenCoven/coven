@@ -49,6 +49,16 @@ class ApiContractDocsTests(unittest.TestCase):
         "input_lease_release_failed": "500",
     }
     MISSING = object()
+    O3_API_VERSION_CLAUSE = (
+        "First it requires `health.apiVersion` to be the\n"
+        "exact string `coven.daemon.v1`."
+    )
+    O3_CAPABILITY_CLAUSE = (
+        "Only after that check passes does it require\n"
+        "`health.capabilities.requestAdoptionContracts` to be an array "
+        "containing the\n"
+        "exact `psyche.request_adoption.v1` string."
+    )
 
     def canonical_documents(self) -> dict[str, str]:
         contract = """
@@ -190,10 +200,13 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         )
         documents[path] += (
             "\n\n## Checker decoy\n"
-            "`requestAdoptionContracts` contains the exact "
-            "`psyche.request_adoption.v1` literal. The capability does not "
-            "replace the complete exact O2 proof in every request and never "
-            "falls back to a legacy mutation.\n"
+            "First it requires `health.apiVersion` to be the exact string "
+            "`coven.daemon.v1`. Only after that check passes does it require "
+            "`health.capabilities.requestAdoptionContracts` to be an array "
+            "containing the exact `psyche.request_adoption.v1` string. Any "
+            "health, API-version, or capability failure sends zero POST requests "
+            "and never falls back to a legacy mutation. Every adopted request "
+            "must still carry a complete, exact O2 `executionBinding` proof.\n"
         )
 
     def health_example_cases(
@@ -1039,18 +1052,8 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                 )
 
         execution_gate_mutations = {
-            "docs/API-CONTRACT.md": (
-                "does not independently\ngate",
-                "does independently\ngate",
-            ),
-            "docs/reference/api-contract.md": (
-                "does not\nindependently gate",
-                "does\nindependently gate",
-            ),
-            "docs/daemon/socket-api.md": (
-                "does not\nindependently gate",
-                "does\nindependently gate",
-            ),
+            path: ("does not independently gate", "does independently gate")
+            for path in module.O3_NEGOTIATION_SURFACES
         }
         for path, (old, new) in execution_gate_mutations.items():
             with self.subTest(path=path, mutation="executionBindingContracts"):
@@ -1063,25 +1066,56 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                     errors,
                 )
 
+    def test_every_o3_negotiation_surface_requires_api_version_first(self) -> None:
+        ordered_clauses = (
+            self.O3_API_VERSION_CLAUSE + "\n" + self.O3_CAPABILITY_CLAUSE
+        )
+        mutations = (
+            (
+                "missing",
+                "`health.apiVersion`",
+                "`health.contractVersion`",
+                "must require the exact health.apiVersion coven.daemon.v1",
+            ),
+            (
+                "wrong",
+                "`coven.daemon.v1`",
+                "`coven.daemon.v2`",
+                "must require the exact health.apiVersion coven.daemon.v1",
+            ),
+            (
+                "negated",
+                "First it requires `health.apiVersion`",
+                "First it does not verify `health.apiVersion`",
+                "must require the exact health.apiVersion coven.daemon.v1",
+            ),
+            (
+                "reversed",
+                ordered_clauses,
+                self.O3_CAPABILITY_CLAUSE + "\n" + self.O3_API_VERSION_CLAUSE,
+                "must check health.apiVersion before requestAdoptionContracts",
+            ),
+        )
+        for path, surface in module.O3_NEGOTIATION_SURFACES.items():
+            self.assertEqual(
+                surface.api_version_literal,
+                module.COVEN_DAEMON_API_VERSION,
+            )
+            for mutation, old, new, diagnostic in mutations:
+                with self.subTest(path=path, mutation=mutation):
+                    changed = self.o3_structure_documents()
+                    self.mutate_o3_negotiation_claim(changed, path, old, new)
+
+                    errors = module.validate_o3_document_structures(changed)
+                    self.assertIn(
+                        f"{path}: O3 negotiation claim {diagnostic}",
+                        errors,
+                    )
+
     def test_every_o3_negotiation_surface_rejects_negated_gate_claim(self) -> None:
         mutations = {
-            "docs/API-CONTRACT.md": ("verifies that", "does not verify that"),
-            "docs/reference/api.md": (
-                "checks the exact",
-                "does not check the exact",
-            ),
-            "docs/reference/api-contract.md": (
-                "require the exact O3 literal",
-                "require clients to proceed but do not verify the exact O3 literal",
-            ),
-            "docs/daemon/socket-api.md": (
-                "verifies only that `requestAdoptionContracts`",
-                "verifies only that it does not verify `requestAdoptionContracts`",
-            ),
-            "packages/openclaw-coven/README.md": (
-                "requires\n`requestAdoptionContracts`",
-                "does not require\n`requestAdoptionContracts`",
-            ),
+            path: ("does it require", "does not require")
+            for path in module.O3_NEGOTIATION_SURFACES
         }
         self.assertEqual(set(mutations), set(module.O3_NEGOTIATION_SURFACES))
         for path, (old, new) in mutations.items():
@@ -1098,17 +1132,9 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
 
     def test_owned_o3_negotiation_surfaces_guard_per_request_proof(self) -> None:
         mutations = {
-            "docs/API-CONTRACT.md": ("must still carry", "must not carry"),
-            "docs/reference/api.md": (
-                "the capability does not replace the complete exact O2\n"
-                "proof in each request",
-                "each request must not carry the complete exact O2\nproof",
-            ),
-            "docs/reference/api-contract.md": (
-                "including the mandatory\nexact O2 proof in every request",
-                "but every request must not carry the\nexact O2 proof",
-            ),
-            "docs/daemon/socket-api.md": ("still must\ncarry", "must not\ncarry"),
+            path: ("must still carry", "must not carry")
+            for path, surface in module.O3_NEGOTIATION_SURFACES.items()
+            if surface.owns_proof_boundary
         }
         self.assertEqual(
             set(mutations),
@@ -1131,14 +1157,9 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
 
     def test_owned_o3_negotiation_surfaces_guard_no_fallback(self) -> None:
         mutations = {
-            "docs/API-CONTRACT.md": ("no legacy fallback", "a legacy fallback"),
-            "docs/reference/api.md": ("never fall back", "may fall back"),
-            "docs/reference/api-contract.md": ("never retry", "may retry"),
-            "docs/daemon/socket-api.md": ("never falls back", "may fall back"),
-            "packages/openclaw-coven/README.md": (
-                "never falls back",
-                "may fall back",
-            ),
+            path: ("never falls back", "may fall back")
+            for path, surface in module.O3_NEGOTIATION_SURFACES.items()
+            if surface.owns_no_fallback
         }
         self.assertEqual(
             set(mutations),
@@ -1165,6 +1186,17 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         contradictions = (
             (
                 set(module.O3_NEGOTIATION_SURFACES),
+                " The client does not verify `apiVersion`.",
+                "must require the exact health.apiVersion coven.daemon.v1",
+            ),
+            (
+                set(module.O3_NEGOTIATION_SURFACES),
+                " The client checks `requestAdoptionContracts` before "
+                "`health.apiVersion`.",
+                "must check health.apiVersion before requestAdoptionContracts",
+            ),
+            (
+                set(module.O3_NEGOTIATION_SURFACES),
                 " The client does not verify `requestAdoptionContracts` before POST.",
                 "must gate on requestAdoptionContracts",
             ),
@@ -1184,7 +1216,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                     for path, surface in module.O3_NEGOTIATION_SURFACES.items()
                     if surface.owns_no_fallback
                 },
-                " The client may fall back to a legacy mutation.",
+                " An API-version failure may fall back to a legacy mutation.",
                 "must prohibit legacy mutation fallback",
             ),
         )
@@ -2427,22 +2459,43 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
 
     def test_openclaw_adopted_negotiation_claims_ignore_decoys(self) -> None:
         path = "packages/openclaw-coven/README.md"
-        changed = self.o3_structure_documents()
-        section = module.markdown_section(
-            changed[path], "Adopted client methods", level=3
+        cases = (
+            (
+                "missing, null, non-string, wrong-case, near-match",
+                "unsupported",
+                "missing, null, non-string, wrong-case, near-match",
+                "must require the exact health.apiVersion coven.daemon.v1",
+            ),
+            (
+                "with a missing, malformed, or unsupported\n"
+                "capability advertisement fails on the capability check instead",
+                "with any capability advertisement proceeds to POST",
+                "with a missing, malformed, or unsupported capability "
+                "advertisement fails on the capability check instead",
+                "must gate on requestAdoptionContracts",
+            ),
+            (
+                "never falls back",
+                "may fall back",
+                "never falls back",
+                "must prohibit legacy mutation fallback",
+            ),
         )
-        self.assertIsNotNone(section)
-        mutated = self.replace_once(
-            section or "", "never falls back", "may fall back"
-        )
-        changed[path] = self.replace_once(changed[path], section or "", mutated)
-        changed[path] += "\n\nDecoy: never falls back.\n"
+        for old, new, decoy, diagnostic in cases:
+            with self.subTest(diagnostic=diagnostic):
+                changed = self.o3_structure_documents()
+                section = module.markdown_section(
+                    changed[path], "Adopted client methods", level=3
+                )
+                self.assertIsNotNone(section)
+                mutated = self.replace_once(section or "", old, new)
+                changed[path] = self.replace_once(
+                    changed[path], section or "", mutated
+                )
+                changed[path] += f"\n\n## Checker decoy\n{decoy}.\n"
 
-        errors = module.validate_o3_document_structures(changed)
-        self.assertIn(
-            f"{path}: O3 negotiation claim must prohibit legacy mutation fallback",
-            errors,
-        )
+                errors = module.validate_o3_document_structures(changed)
+                self.assertIn(f"{path}: O3 negotiation claim {diagnostic}", errors)
 
     def test_cli_sacrifice_retention_claim_ignores_decoys(self) -> None:
         path = "packages/cli/README.md"

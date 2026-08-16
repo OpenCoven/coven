@@ -116,6 +116,7 @@ PIPELESS_TABLE_BLOCK = re.compile(
     r"\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+(?:\n|$)"
 )
 STRUCTURAL_ROW_MARKER = "COVEN_DOC_STRUCTURAL_ROW"
+COVEN_DAEMON_API_VERSION = "coven.daemon.v1"
 EXECUTION_BINDING_CONTRACT = "psyche.execution_binding.v1"
 REQUEST_ADOPTION_CONTRACT = "psyche.request_adoption.v1"
 HEALTH_CAPABILITY_FIELDS = (
@@ -327,6 +328,7 @@ class O3NegotiationSurface(NamedTuple):
     heading: str
     level: int
     markers: tuple[str, ...]
+    api_version_literal: str
     literal_claim: str
     owns_proof_boundary: bool
     owns_no_fallback: bool
@@ -337,6 +339,7 @@ O3_NEGOTIATION_SURFACES = {
         "Health negotiation and fail-closed clients",
         3,
         ("Before every adopted launch or input",),
+        COVEN_DAEMON_API_VERSION,
         REQUEST_ADOPTION_CONTRACT,
         True,
         True,
@@ -344,26 +347,26 @@ O3_NEGOTIATION_SURFACES = {
     "docs/reference/api.md": O3NegotiationSurface(
         "Sessions and events",
         2,
-        ("Adoption is durable",),
-        "exact O3 literal",
+        ("Before either adopted POST",),
+        COVEN_DAEMON_API_VERSION,
+        REQUEST_ADOPTION_CONTRACT,
         True,
         True,
     ),
     "docs/reference/api-contract.md": O3NegotiationSurface(
         "Negotiation",
         2,
-        (
-            "Adopted launch and input require",
-            "Legacy bound launch/input is rejected",
-        ),
-        "exact O3 literal",
+        ("Before either adopted route",),
+        COVEN_DAEMON_API_VERSION,
+        REQUEST_ADOPTION_CONTRACT,
         True,
         True,
     ),
     "docs/daemon/socket-api.md": O3NegotiationSurface(
         "Endpoints",
         2,
-        ("The bundled adopted client verifies only that",),
+        ("Before either adopted POST",),
+        COVEN_DAEMON_API_VERSION,
         REQUEST_ADOPTION_CONTRACT,
         True,
         True,
@@ -372,78 +375,70 @@ O3_NEGOTIATION_SURFACES = {
         "Adopted client methods",
         3,
         ("Before either mutation",),
+        COVEN_DAEMON_API_VERSION,
         REQUEST_ADOPTION_CONTRACT,
-        False,
+        True,
         True,
     ),
 }
 
+O3_API_VERSION_GATE_FRAGMENTS = (
+    "First it requires health.apiVersion to be the exact string "
+    "coven.daemon.v1.",
+)
+O3_REQUEST_ADOPTION_GATE_FRAGMENTS = (
+    "Only after that check passes does it require "
+    "health.capabilities.requestAdoptionContracts to be an array containing "
+    "the exact psyche.request_adoption.v1 string.",
+)
+O3_PROOF_BOUNDARY_FRAGMENTS = (
+    "every adopted request must still carry a complete, exact O2 "
+    "executionBinding proof",
+)
+O3_NO_FALLBACK_FRAGMENTS = (
+    "Any health, API-version, or capability failure sends zero POST requests "
+    "and never falls back to a legacy mutation.",
+)
+
 O3_NEGOTIATION_REQUIRED_FRAGMENTS = {
     "docs/API-CONTRACT.md": {
-        "gate": (
-            "Before every adopted launch or input, the bundled client completes "
-            "health negotiation and verifies that requestAdoptionContracts is "
-            "an array containing the exact psyche.request_adoption.v1 string.",
-            "stops locally before POST",
-        ),
-        "proof": (
-            "Every adopted request must still carry a complete, exact O2 "
-            "executionBinding",
-        ),
-        "no_fallback": ("stops locally before POST, with no legacy fallback",),
+        "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
+        "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
+        "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/reference/api.md": {
-        "gate": (
-            "The bundled client checks the exact O3 literal in "
-            "requestAdoptionContracts before either POST",
-        ),
-        "proof": (
-            "the capability does not replace the complete exact O2 proof in "
-            "each request",
-        ),
-        "no_fallback": (
-            "The adopted routes never fall back to legacy mutations",
-        ),
+        "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
+        "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
+        "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/reference/api-contract.md": {
-        "gate": (
-            "Adopted launch and input require the exact O3 literal in "
-            "requestAdoptionContracts before either dedicated route is used",
-        ),
-        "proof": (
-            "including the mandatory exact O2 proof in every request",
-        ),
-        "no_fallback": (
-            "Adopted clients fail locally when negotiation is absent or "
-            "malformed and never retry a legacy mutation",
-        ),
+        "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
+        "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
+        "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/daemon/socket-api.md": {
-        "gate": (
-            "The bundled adopted client verifies only that "
-            "requestAdoptionContracts is an array containing the exact "
-            "psyche.request_adoption.v1 literal before POST",
-        ),
-        "proof": (
-            "every adopted request still must carry the complete exact O2 "
-            "proof for Rust to validate",
-        ),
-        "no_fallback": (
-            "it sends no mutation when that check fails and never falls back",
-        ),
+        "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
+        "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
+        "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "packages/openclaw-coven/README.md": {
-        "gate": (
-            "Before either mutation, the client calls GET /api/v1/health and "
-            "requires requestAdoptionContracts to contain the exact "
-            "psyche.request_adoption.v1 value",
-            "advertisement fails closed before the POST",
+        "api_version": O3_API_VERSION_GATE_FRAGMENTS
+        + (
+            "A missing, null, non-string, wrong-case, near-match, or otherwise "
+            "unsupported health.apiVersion fails closed on its own, before the "
+            "capability is even inspected",
         ),
-        "proof": (),
-        "no_fallback": (
-            "advertisement fails closed before the POST and never falls back "
-            "to a legacy mutation",
+        "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS
+        + (
+            "a valid health.apiVersion with a missing, malformed, or unsupported "
+            "capability advertisement fails on the capability check instead",
         ),
+        "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
+        "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
 }
 
@@ -2151,6 +2146,43 @@ def o3_claim_negates_request_adoption_gate(claim: str) -> bool:
     return False
 
 
+def o3_claim_negates_api_version_gate(claim: str) -> bool:
+    normalized = normalized_markdown_text(claim, lowercase=True)
+    for statement in re.split(r"(?<=[.;!?])\s+", normalized):
+        if "apiversion" not in statement:
+            continue
+        if re.search(
+            r"\b(?:do|does|did|must)\s+not\s+"
+            r"(?:check|inspect|require|verify|gate)\b|"
+            r"\bwithout\s+(?:checking|inspecting|requiring|verifying|gating)\b|"
+            r"\bapiversion\b[^.;]{0,80}\b(?:need\s+not|is\s+not\s+required)\b",
+            statement,
+        ):
+            return True
+    return False
+
+
+def o3_claim_orders_api_version_before_request_adoption(claim: str) -> bool:
+    normalized = normalized_markdown_text(claim, lowercase=True)
+    if re.search(
+        r"\brequestadoptioncontracts\b[^.;]{0,160}"
+        r"\b(?:before|first)\b[^.;]{0,160}\b(?:health\.)?apiversion\b|"
+        r"\b(?:health\.)?apiversion\b[^.;]{0,160}\b(?:only\s+)?after\b"
+        r"[^.;]{0,160}\brequestadoptioncontracts\b",
+        normalized,
+    ):
+        return False
+    api_version_index = normalized.find("health.apiversion")
+    request_adoption_index = normalized.find(
+        "health.capabilities.requestadoptioncontracts"
+    )
+    return (
+        api_version_index >= 0
+        and request_adoption_index >= 0
+        and api_version_index < request_adoption_index
+    )
+
+
 def o3_claim_negates_per_request_proof(claim: str) -> bool:
     normalized = normalized_markdown_text(claim, lowercase=True)
     for statement in re.split(r"(?<=[.;!?])\s+", normalized):
@@ -2208,9 +2240,20 @@ def validate_o3_negotiation_claims(
             continue
         assertions = O3_NEGOTIATION_REQUIRED_FRAGMENTS[path]
         normalized = normalized_markdown_text(claim)
-        if not o3_claim_contains_fragments(
+        api_version_gate_is_valid = (
+            o3_claim_contains_fragments(claim, assertions["api_version"])
+            and surface.api_version_literal.lower() in normalized.lower()
+            and not o3_claim_negates_api_version_gate(claim)
+        )
+        if not api_version_gate_is_valid:
+            errors.append(
+                f"{path}: O3 negotiation claim must require the exact "
+                f"health.apiVersion {surface.api_version_literal}"
+            )
+        request_adoption_gate_is_valid = o3_claim_contains_fragments(
             claim, assertions["gate"]
-        ) or o3_claim_negates_request_adoption_gate(claim):
+        ) and not o3_claim_negates_request_adoption_gate(claim)
+        if not request_adoption_gate_is_valid:
             errors.append(
                 f"{path}: O3 negotiation claim must gate on "
                 "requestAdoptionContracts"
@@ -2219,6 +2262,15 @@ def validate_o3_negotiation_claims(
             errors.append(
                 f"{path}: O3 negotiation claim must require the exact "
                 f"{surface.literal_claim}"
+            )
+        if (
+            api_version_gate_is_valid
+            and request_adoption_gate_is_valid
+            and not o3_claim_orders_api_version_before_request_adoption(claim)
+        ):
+            errors.append(
+                f"{path}: O3 negotiation claim must check health.apiVersion "
+                "before requestAdoptionContracts"
             )
         if o3_claim_positively_gates_on_execution_binding(claim):
             errors.append(

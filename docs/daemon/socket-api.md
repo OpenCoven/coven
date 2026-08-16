@@ -132,13 +132,18 @@ event-persistence failures are logged while retained evidence remains; they
 cannot update a response that already returned. The marker makes no delivery
 or completion claim.
 
-The bundled adopted client verifies only that `requestAdoptionContracts` is an
-array containing the exact `psyche.request_adoption.v1` literal before POST;
-it sends no mutation when that check fails and never falls back. This O3 value
-advertises the composite adopted-route contract, so the client does not
-independently gate these methods on `executionBindingContracts`. Both health
-fields remain additive capabilities, and every adopted request still must
-carry the complete exact O2 proof for Rust to validate.
+Before either adopted POST, the bundled client calls `GET /api/v1/health` and
+negotiates in a fixed order. First it requires `health.apiVersion` to be the
+exact string `coven.daemon.v1`.
+Only after that check passes does it require
+`health.capabilities.requestAdoptionContracts` to be an array containing the
+exact `psyche.request_adoption.v1` string.
+Any health, API-version, or capability failure sends zero POST requests and
+never falls back to a legacy mutation. That O3 capability advertises the
+composite adopted-route contract; the client does not independently gate these
+adopted methods on `executionBindingContracts`. It does not replace proof:
+every adopted request must still carry a complete, exact O2 `executionBinding`
+proof for Rust to validate. Both health fields remain additive capabilities.
 
 Legacy precedence is route-specific. Bound launch first parses and validates
 the closed `executionBinding` shape and root/child relationship; a malformed
