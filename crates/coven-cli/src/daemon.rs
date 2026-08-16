@@ -94,6 +94,19 @@ impl std::fmt::Display for NotLiveError {
 
 impl std::error::Error for NotLiveError {}
 
+/// Privacy-safe launch disposition: runtime ownership may still be registered
+/// after cleanup failed, so callers must preserve an active, killable state.
+#[derive(Debug)]
+pub(crate) struct RuntimeOwnershipRetainedError;
+
+impl std::fmt::Display for RuntimeOwnershipRetainedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runtime ownership may remain after launch cleanup")
+    }
+}
+
+impl std::error::Error for RuntimeOwnershipRetainedError {}
+
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
@@ -914,25 +927,7 @@ impl LiveSessionRuntime {
             // still block this per-session input lock, but daemon shutdown or
             // /kill owns an independent strict process-tree handle and can
             // interrupt the write without waiting for that lock.
-            if !launch.prompt.is_empty() {
-                if let Err(error) = SessionRuntime::send_input(
-                    self,
-                    &launch.id,
-                    &json!({ "data": launch.prompt.as_str() }),
-                ) {
-                    let cleanup = SessionRuntime::kill_session(self, &launch.id).err();
-                    let primary = error.context(format!(
-                        "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
-                        launch.harness
-                    ));
-                    return match cleanup {
-                        Some(cleanup) => Err(anyhow::anyhow!(
-                            "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
-                        )),
-                        None => Err(primary),
-                    };
-                }
-            }
+            self.deliver_initial_stream_prompt(launch)?;
             return Ok(());
         }
 
@@ -987,6 +982,38 @@ impl LiveSessionRuntime {
         )?;
         launch_admission.release();
         Ok(())
+    }
+
+    fn deliver_initial_stream_prompt(&self, launch: &SessionLaunch) -> Result<()> {
+        if launch.prompt.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) =
+            SessionRuntime::send_input(self, &launch.id, &json!({ "data": launch.prompt.as_str() }))
+        {
+            let cleanup = SessionRuntime::kill_session(self, &launch.id);
+            let primary = error.context(format!(
+                "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
+                launch.harness
+            ));
+            return match cleanup {
+                Err(_cleanup) if self.runtime_ownership_retained_or_ambiguous(&launch.id) => {
+                    Err(anyhow::Error::new(RuntimeOwnershipRetainedError))
+                }
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
+                )),
+                Ok(()) => Err(primary),
+            };
+        }
+        Ok(())
+    }
+
+    fn runtime_ownership_retained_or_ambiguous(&self, session_id: &str) -> bool {
+        match self.sessions.lock() {
+            Ok(sessions) => sessions.contains_key(session_id),
+            Err(_) => true,
+        }
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -5452,6 +5479,112 @@ mod tests {
         fn kill(&mut self) -> Result<()> {
             anyhow::bail!(self.0)
         }
+    }
+
+    struct FailingWriter(&'static str);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stream_launch_fixture(id: &str, prompt: &str) -> crate::api::SessionLaunch {
+        crate::api::SessionLaunch {
+            id: id.to_string(),
+            project_root: "/private-project-fixture".to_string(),
+            cwd: "/private-project-fixture".to_string(),
+            harness: "private-harness-fixture".to_string(),
+            model: None,
+            launch_mode: crate::harness::HarnessLaunchMode::Stream,
+            launch_policy: None,
+            prompt: prompt.to_string(),
+            title: "private-title-fixture".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: None,
+            caller_familiar_id: None,
+        }
+    }
+
+    #[test]
+    fn failed_initial_stream_input_with_failed_cleanup_retains_typed_ownership() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "private-retained-session-fixture";
+        let prompt = "private-initial-input-fixture";
+        let input_error = "private-input-error-fixture";
+        let cleanup_error = "private-cleanup-error-fixture";
+        runtime.register_kind(
+            session_id.to_string(),
+            LiveSessionKind::Stream,
+            Box::new(FailingWriter(input_error)),
+            Box::new(FailingKiller(cleanup_error)),
+        )?;
+
+        let error = runtime
+            .deliver_initial_stream_prompt(&stream_launch_fixture(session_id, prompt))
+            .expect_err("failed cleanup must report retained runtime ownership");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_some(),
+            "returned anyhow error lost its retained-ownership disposition: {error:#}"
+        );
+        assert!(
+            runtime.sessions.lock().unwrap().contains_key(session_id),
+            "failed cleanup discarded the live runtime handle"
+        );
+        let diagnostic = format!("{error:#}");
+        for private in [
+            session_id,
+            prompt,
+            input_error,
+            cleanup_error,
+            "private-harness-fixture",
+            "private-project-fixture",
+        ] {
+            assert!(
+                !diagnostic.contains(private),
+                "retained-ownership error leaked private fixture data"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_initial_stream_input_with_successful_cleanup_is_definitive() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "definitively-cleaned-session";
+        let killer = RecordingKiller::default();
+        let killed = Arc::clone(&killer.killed);
+        runtime.register_kind(
+            session_id.to_string(),
+            LiveSessionKind::Stream,
+            Box::new(FailingWriter("initial input failed")),
+            Box::new(killer),
+        )?;
+
+        let error = runtime
+            .deliver_initial_stream_prompt(&stream_launch_fixture(session_id, "initial input"))
+            .expect_err("initial input failure must be returned after cleanup");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_none(),
+            "confirmed cleanup must remain an ordinary launch error"
+        );
+        assert!(*killed.lock().unwrap(), "cleanup kill was not invoked");
+        assert!(
+            !runtime.sessions.lock().unwrap().contains_key(session_id),
+            "confirmed cleanup left a live registry handle"
+        );
+        Ok(())
     }
 
     struct CountingFailingKiller {

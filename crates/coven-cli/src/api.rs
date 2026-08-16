@@ -2599,20 +2599,43 @@ fn launch_adopted_session(
     // compare-and-set that row to `running`.
     drop(adoption_gate);
 
-    if match writer {
+    let launch_result = match writer {
         Some(writer) => runtime.launch_session_with_writer(&launch, writer),
         None => runtime.launch_session(&launch),
-    }
-    .is_err()
-    {
-        let _ = store::update_session_status_if_current(
-            &conn,
-            &record.id,
-            "created",
-            "failed",
-            None,
-            &current_timestamp(),
-        );
+    };
+    if let Err(error) = launch_result {
+        // A retained-ownership error means the runtime registry may still own
+        // a killable handle, so `failed` would incorrectly fence cleanup.
+        if error
+            .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+            .is_some()
+        {
+            if store::update_session_status_if_current(
+                &conn,
+                &record.id,
+                "created",
+                "running",
+                None,
+                &current_timestamp(),
+            )
+            .is_err()
+            {
+                return post_adoption_error(
+                    500,
+                    "launch_failed",
+                    "Session runtime status could not be persisted after adoption.",
+                );
+            }
+        } else {
+            let _ = store::update_session_status_if_current(
+                &conn,
+                &record.id,
+                "created",
+                "failed",
+                None,
+                &current_timestamp(),
+            );
+        }
         return post_adoption_error(
             500,
             "launch_failed",
@@ -11824,6 +11847,176 @@ mod tests {
     }
 
     #[test]
+    fn adopted_launch_retained_ownership_persists_running_and_replays_without_relaunch(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("private-retained-project");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["principalRef"] = json!("principal:private-retained");
+        binding["familiarSnapshotDigest"] = json!(digest('f'));
+        binding["projectDigest"] = json!(digest('d'));
+        binding["graphId"] = json!("private-retained-graph");
+        binding["nodeId"] = json!("private-retained-node");
+        binding["attemptId"] = json!("private-retained-attempt");
+        binding["requestDigest"] = json!(digest('e'));
+        binding["policyRevision"] = json!("policy:private-retained");
+        let key = "private-retained-adoption-key";
+        let prompt = "private-retained-initial-input";
+        let mut body = adopted_launch_body(&project_root, "sage", binding.clone(), key);
+        body["prompt"] = json!(prompt);
+        let runtime = RetainedOwnershipRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            winning_status: None,
+        };
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            response_body["error"]["message"],
+            "Session runtime launch failed after adoption."
+        );
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "running");
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+        let private_project = project_root.to_string_lossy().into_owned();
+        let private_binding = binding.to_string();
+        for private in [
+            sessions[0].id.as_str(),
+            key,
+            binding["familiarSnapshotDigest"]
+                .as_str()
+                .expect("snapshot digest"),
+            binding["projectDigest"].as_str().expect("project digest"),
+            binding["requestDigest"].as_str().expect("request digest"),
+            "principal:private-retained",
+            "private-retained-graph",
+            "private-retained-node",
+            "private-retained-attempt",
+            "policy:private-retained",
+            private_binding.as_str(),
+            prompt,
+            private_project.as_str(),
+        ] {
+            assert!(
+                !response.body.contains(private),
+                "post-adoption response leaked private fixture data"
+            );
+        }
+
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let replay_body: Value = serde_json::from_str(&replay.body)?;
+        assert_eq!(replay_body["id"], sessions[0].id);
+        assert_eq!(replay_body["status"], "running");
+        assert_eq!(replay_runtime.launch_count(), 0);
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_ownership_does_not_overwrite_idle_or_terminal_winner(
+    ) -> anyhow::Result<()> {
+        for winning_status in ["idle", "completed"] {
+            let temp = tempfile::tempdir()?;
+            seed_familiars_toml(temp.path())?;
+            let project_root = temp.path().join("repo");
+            std::fs::create_dir_all(&project_root)?;
+            let body = adopted_launch_body(
+                &project_root,
+                "sage",
+                root_binding("sage"),
+                &format!("retained-{winning_status}-winner"),
+            );
+            let runtime = RetainedOwnershipRuntime {
+                coven_home: temp.path().to_path_buf(),
+                launches: std::sync::atomic::AtomicUsize::new(0),
+                kills: std::sync::atomic::AtomicUsize::new(0),
+                winning_status: Some(winning_status),
+            };
+
+            let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+            assert_eq!(response.status, 500, "{winning_status}: {}", response.body);
+            let conn = store::open_store(&store_path(temp.path()))?;
+            let session = store::list_sessions(&conn)?
+                .into_iter()
+                .next()
+                .context("retained winner session")?;
+            assert_eq!(session.status, winning_status);
+            assert_eq!(runtime.launch_count(), 1);
+
+            let replay_runtime = ConcurrentRecordingRuntime::default();
+            let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+            assert_eq!(replay.status, 200, "{winning_status}: {}", replay.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&replay.body)?["status"],
+                winning_status
+            );
+            assert_eq!(replay_runtime.launch_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_running_session_remains_killable() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = root_binding("sage");
+        let body = adopted_launch_body(&project_root, "sage", binding.clone(), "retained-killable");
+        let runtime = RetainedOwnershipRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            winning_status: None,
+        };
+
+        let launch = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(launch.status, 500, "{}", launch.body);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let session = store::list_sessions(&conn)?
+            .into_iter()
+            .next()
+            .context("retained running session")?;
+        assert_eq!(session.status, "running");
+        let kill_body = json!({ "executionBinding": binding }).to_string();
+
+        let kill = handle_request_with_runtime(
+            "POST",
+            &format!("/sessions/{}/kill", session.id),
+            temp.path(),
+            None,
+            Some(&kill_body),
+            &runtime,
+        )?;
+        assert_eq!(kill.status, 202, "{}", kill.body);
+        assert_eq!(runtime.kill_count(), 1);
+        assert_eq!(
+            store::get_session(&conn, &session.id)?
+                .context("killed retained session")?
+                .status,
+            "killed"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn adopted_launch_runtime_failure_is_redacted_persisted_and_not_relaunched(
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -11898,6 +12091,7 @@ mod tests {
             coven_home: temp.path().to_path_buf(),
             launches: std::sync::atomic::AtomicUsize::new(0),
             fail_runtime: false,
+            retain_runtime_ownership: false,
         };
 
         let failed = post_adopted_launch(temp.path(), &body, &runtime)?;
@@ -11942,6 +12136,7 @@ mod tests {
             coven_home: temp.path().to_path_buf(),
             launches: std::sync::atomic::AtomicUsize::new(0),
             fail_runtime: true,
+            retain_runtime_ownership: false,
         };
 
         let response = post_adopted_launch(temp.path(), &body, &runtime)?;
@@ -11958,6 +12153,56 @@ mod tests {
         assert_eq!(sessions[0].status, "created");
         assert_eq!(adoption_row_count(temp.path())?, 1);
         assert_eq!(runtime.launch_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_status_persistence_failure_is_marked_and_never_relaunched(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "retained-status-persistence",
+        );
+        let runtime = StatusPersistenceFailRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            fail_runtime: false,
+            retain_runtime_ownership: true,
+        };
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            response_body["error"]["message"],
+            "Session runtime status could not be persisted after adoption."
+        );
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "created");
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "created"
+        );
+        assert_eq!(replay_runtime.launch_count(), 0);
         Ok(())
     }
 
@@ -14753,6 +14998,52 @@ mod tests {
         }
     }
 
+    struct RetainedOwnershipRuntime {
+        coven_home: PathBuf,
+        launches: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        winning_status: Option<&'static str>,
+    }
+
+    impl RetainedOwnershipRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn kill_count(&self) -> usize {
+            self.kills.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for RetainedOwnershipRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(status) = self.winning_status {
+                let conn = store::open_store(&store_path(&self.coven_home))?;
+                store::update_session_status(
+                    &conn,
+                    &launch.id,
+                    status,
+                    None,
+                    &current_timestamp(),
+                )?;
+            }
+            Err(anyhow::Error::new(
+                crate::daemon::RuntimeOwnershipRetainedError,
+            ))
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     struct FailingAdoptedRuntime {
         launches: std::sync::atomic::AtomicUsize,
         secret: String,
@@ -14789,6 +15080,7 @@ mod tests {
         coven_home: PathBuf,
         launches: std::sync::atomic::AtomicUsize,
         fail_runtime: bool,
+        retain_runtime_ownership: bool,
     }
 
     impl StatusPersistenceFailRuntime {
@@ -14809,6 +15101,11 @@ mod tests {
                    SELECT RAISE(FAIL, 'blocked adopted launch status persistence');
                  END;",
             )?;
+            if self.retain_runtime_ownership {
+                return Err(anyhow::Error::new(
+                    crate::daemon::RuntimeOwnershipRetainedError,
+                ));
+            }
             if self.fail_runtime {
                 anyhow::bail!("runtime failed while status persistence was blocked");
             }
