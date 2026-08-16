@@ -750,6 +750,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "coven-agents"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "coven-cli"
 version = "0.0.0"
 dependencies = [
