@@ -223,7 +223,7 @@ mod tests {
         allowed.extend(b'A'..=b'Z');
         allowed.extend(b'a'..=b'z');
         allowed.extend(b'0'..=b'9');
-        allowed.extend([b'.', b'_', b':', b'/', b'-']);
+        allowed.extend(*b"._:/-");
         assert_eq!(
             allowed.len(),
             26 + 26 + 10 + 5,
