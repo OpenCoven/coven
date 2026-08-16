@@ -333,12 +333,6 @@ impl ChatClient for DaemonChatClient {
 
     fn sacrifice_session(&mut self, session_id: &str) -> Result<()> {
         let conn = self.open_store()?;
-        let Some(session) = store::get_session(&conn, session_id)? else {
-            anyhow::bail!("session `{session_id}` not found");
-        };
-        if session.status == "running" {
-            anyhow::bail!("session `{session_id}` is still running; do not sacrifice live work");
-        }
         store::sacrifice_session(&conn, session_id)
     }
 }
@@ -586,6 +580,59 @@ mod tests {
             Some(crate::harness::ConversationHint::Resume {
                 id: "abc-123".to_string()
             })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_chat_client_preserves_adoption_retention_error() -> Result<()> {
+        const DENIAL: &str = "session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it";
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(
+            &conn,
+            &store::SessionRecord {
+                id: "session-1".to_string(),
+                project_root: "/repo".to_string(),
+                harness: "codex".to_string(),
+                title: "Retained".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                archived_at: None,
+                created_at: "2026-08-16T00:00:00Z".to_string(),
+                updated_at: "2026-08-16T00:00:00Z".to_string(),
+                conversation_id: None,
+                familiar_id: None,
+                execution_binding: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
+            },
+        )?;
+        conn.execute(
+            "INSERT INTO request_adoptions (
+                id, adoption_key, contract, operation, request_digest, session_id,
+                execution_binding_json, adopted_at
+             ) VALUES (
+                'retained-input', 'input-key', 'psyche.request_adoption.v1', 'input',
+                'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                'session-1', '{}', '2026-08-16T00:00:00Z'
+             )",
+            [],
+        )?;
+        drop(conn);
+        let mut client = DaemonChatClient::with_coven_home(home.path().to_path_buf());
+
+        let error = client
+            .sacrifice_session("session-1")
+            .expect_err("retained evidence must deny sacrifice");
+
+        assert!(error.is::<store::AdoptionRetentionError>());
+        assert_eq!(error.to_string(), DENIAL);
+        assert_eq!(
+            format!("{:?}", error.root_cause()),
+            "AdoptionRetentionError"
         );
         Ok(())
     }

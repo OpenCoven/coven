@@ -36,8 +36,10 @@ Use `coven summon <session-id>` when you want the archived session back in the
 active list and want to replay it.
 
 Archive is not a privacy delete. If the event log contains data you no longer
-want in the local store, use `coven sacrifice <session-id> --yes` after
-confirming the session is not running.
+want in the local store, `coven sacrifice <session-id> --yes` can delete it only
+when the session is eligible, non-running, and has no adopted/reserved
+evidence. Adopted/reserved sessions remain retained; O3 provides no
+retention/fence release.
 
 ## Related
 

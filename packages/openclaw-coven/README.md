@@ -100,19 +100,18 @@ matching fixture and re-run the tests.
 The minimal fixture field names follow the Rust daemon's serialization rules:
 - `GET /api/v1/health` — camelCase `ok`, named contract
   `apiVersion: "coven.daemon.v1"`, `covenVersion`, and the bridge-required
-  capability subset `sessions`, `events`, `eventCursor`, and
-  `structuredErrors`. `daemon` is nullable; when present, its non-null fields
-  are `pid`, `startedAt`, and `socket`.
+  capability subset `sessions`, `events`, `eventCursor`, `structuredErrors`,
+  `executionBindingContracts`, and `requestAdoptionContracts`. `daemon` is
+  nullable; when present, its non-null fields are `pid`, `startedAt`, and
+  `socket`.
 - `GET /api/v1/sessions`, `POST /api/v1/sessions`, `GET /api/v1/sessions/:id` — snake_case (`project_root`, `exit_code`, `created_at`, `updated_at`)
 - `GET /api/v1/events` — snake_case (`session_id`, `payload_json`, `created_at`)
 
-The exact current Rust health DTO is documented separately in the
-[API contract](../../docs/API-CONTRACT.md#get-apiv1health). It contains `ok`,
-named `apiVersion: "coven.daemon.v1"`, `covenVersion`, nullable `daemon` whose
-present `pid`, `startedAt`, and `socket` fields are non-null, and the exact
-`capabilities` fields `sessions`, `events`, `travel`, `scheduler`, `hub`,
-`executorDispatch`, `eventCursor`, and `structuredErrors`. A store-backed
-response may also include the optional top-level `hub` summary.
+The complete current 16-field Rust health-capability DTO is maintained in the
+canonical [API contract](../../docs/API-CONTRACT.md#get-apiv1health), rather
+than duplicated here. It includes `requestAdoptionContracts`, which the
+adopted methods require; the six-field fixture subset above is not exhaustive.
+A store-backed response may also include the optional top-level `hub` summary.
 
 Separately, `GET /api/v1/api-version` is a legacy route-family diagnostic with
 literal `apiVersion: "v1"` and `supportedApiVersions: ["v1"]`; this is not
@@ -121,6 +120,23 @@ proof of named-contract support.
 Clients negotiate compatibility with `GET /api/v1/health`, verify its named
 `apiVersion`, and check every capability required by an operation before
 sending a dependent request. Capabilities advertise availability and never grant permission.
+
+### Adopted client methods
+
+| Method | Dedicated route | First adoption | Exact replay |
+|---|---|---|---|
+| `launchAdoptedSession` | `POST /api/v1/adopted-sessions` | `201 SessionRecord` | `200 SessionRecord` |
+| `sendAdoptedInput` | `POST /api/v1/sessions/:id/adopted-input` | `202 {"adopted":true,"replayed":false,"delivery":"not_asserted"}` | `200 {"adopted":true,"replayed":true,"delivery":"not_asserted"}` |
+
+Before either mutation, the client calls `GET /api/v1/health` and requires
+`requestAdoptionContracts` to contain the exact
+`psyche.request_adoption.v1` value. Missing, malformed, or unsupported
+advertisement fails closed before the POST and never falls back to a legacy
+mutation. Non-2xx daemon responses surface as `CovenApiError` with their HTTP
+status and response body. Adoption asserts durable responsibility, not
+delivery or completion; the normative shape, errors, ordering, and retention
+rules live only in the canonical
+[request-adoption contract](../../docs/API-CONTRACT.md#psyche-request-adoption-contract-v1).
 
 ## Development notes
 

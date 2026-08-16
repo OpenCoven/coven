@@ -108,6 +108,12 @@ function fakeClient(overrides: Partial<CovenClient> = {}): CovenClient {
     killSession: vi.fn(async () => undefined),
     sendBoundInput: vi.fn(async () => undefined),
     killBoundSession: vi.fn(async () => undefined),
+    launchAdoptedSession: vi.fn(async () => session()),
+    sendAdoptedInput: vi.fn(async () => ({
+      adopted: true as const,
+      replayed: false,
+      delivery: "not_asserted" as const,
+    })),
     ...overrides,
   };
 }

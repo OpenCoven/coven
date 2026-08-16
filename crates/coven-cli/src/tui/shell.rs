@@ -225,7 +225,7 @@ pub(crate) fn magical_tui_items() -> &'static [MagicalTuiItem] {
             key: "x",
             slash: "/sacrifice",
             label: "Sacrifice session",
-            description: "Permanently delete a non-running session",
+            description: "Delete eligible non-running; adopted/reserved sessions are retained",
             command: "coven sacrifice <session-id> --yes",
             action: MagicalTuiAction::SacrificeSession,
         },
@@ -413,7 +413,10 @@ fn dispatch_cast_plan(plan: CastPlan) -> Result<()> {
                 launched: Some(format!("Sacrificed session {session_id}")),
                 session_id: Some(session_id),
                 next_step: None,
-                notes: vec!["Sacrifice permanently deleted the session and its events.".to_string()],
+                notes: vec![
+                    "Sacrifice permanently deleted an eligible non-running session and its events; adopted or reserved sessions remain retained."
+                        .to_string(),
+                ],
             }
         }
         CastIntent::Doctor => {
@@ -1546,7 +1549,7 @@ fn attach_via_daemon(
         ))
     } else {
         Some(format!(
-            "Run `coven sessions` to manage this session, or `/sacrifice {}` to delete it.",
+            "Run `coven sessions` to manage this session. `/sacrifice {}` deletes only eligible non-running sessions; adopted or reserved sessions are retained.",
             session.id
         ))
     };
@@ -2413,6 +2416,19 @@ mod attach_tests {
         assert!(
             !rendered.contains("[Cast:"),
             "no Cast exit banner without an exit event: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn magical_tui_sacrifice_help_qualifies_adoption_retention() {
+        let sacrifice = magical_tui_items()
+            .iter()
+            .find(|item| item.action == MagicalTuiAction::SacrificeSession)
+            .expect("sacrifice palette item");
+
+        assert_eq!(
+            sacrifice.description,
+            "Delete eligible non-running; adopted/reserved sessions are retained"
         );
     }
 }

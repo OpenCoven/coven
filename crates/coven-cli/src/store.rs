@@ -104,6 +104,68 @@ pub struct SessionRecord {
     pub transcript_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestAdoptionRecord {
+    pub id: String,
+    pub adoption_key: Option<String>,
+    pub contract: Option<String>,
+    pub operation: RequestAdoptionOperation,
+    pub request_digest: String,
+    pub session_id: String,
+    pub execution_binding_json: String,
+    pub principal_ref: Option<String>,
+    pub project_digest: Option<String>,
+    pub graph_id: Option<String>,
+    pub node_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub adopted_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestAdoptionOperation {
+    Launch,
+    Input,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdoptionRetentionError;
+
+impl std::fmt::Display for AdoptionRetentionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(
+            "session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it",
+        )
+    }
+}
+
+impl std::error::Error for AdoptionRetentionError {}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum AdoptionResolution {
+    Absent,
+    Replay {
+        adoption_id: String,
+        session: SessionRecord,
+    },
+    Conflict {
+        field: &'static str,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum InputAdoptionResult {
+    Adopted {
+        adoption_id: String,
+        lease_id: String,
+    },
+    Replay,
+    Conflict,
+    NotLive,
+    HandoffFenced,
+}
+
 fn default_visibility() -> String {
     "private".to_string()
 }
@@ -555,6 +617,44 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             transcript_path TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS request_adoptions (
+            id TEXT PRIMARY KEY NOT NULL,
+            adoption_key TEXT,
+            contract TEXT,
+            operation TEXT NOT NULL CHECK (operation IN ('launch', 'input')),
+            request_digest TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            execution_binding_json TEXT NOT NULL,
+            principal_ref TEXT,
+            project_digest TEXT,
+            graph_id TEXT,
+            node_id TEXT,
+            attempt_id TEXT,
+            adopted_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+            CHECK (
+                (adoption_key IS NULL AND contract IS NULL AND operation = 'launch')
+                OR
+                (adoption_key IS NOT NULL AND contract IS NOT NULL)
+            ),
+            CHECK (
+                (operation = 'launch'
+                    AND principal_ref IS NOT NULL
+                    AND project_digest IS NOT NULL
+                    AND graph_id IS NOT NULL
+                    AND node_id IS NOT NULL
+                    AND attempt_id IS NOT NULL)
+                OR
+                (operation = 'input'
+                    AND adoption_key IS NOT NULL
+                    AND principal_ref IS NULL
+                    AND project_digest IS NULL
+                    AND graph_id IS NULL
+                    AND node_id IS NULL
+                    AND attempt_id IS NULL)
+            )
+        );
+
         CREATE TABLE IF NOT EXISTS events (
             id TEXT PRIMARY KEY NOT NULL,
             session_id TEXT NOT NULL,
@@ -563,6 +663,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             created_at TEXT NOT NULL,
             redaction_status TEXT NOT NULL DEFAULT 'redacted',
             sensitive INTEGER NOT NULL DEFAULT 0,
+            request_adoption_id TEXT REFERENCES request_adoptions(id) ON DELETE RESTRICT,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
@@ -852,6 +953,9 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     ensure_visibility_column(conn)?;
     ensure_familiar_id_column(conn)?;
     ensure_execution_binding_column(conn)?;
+    ensure_request_adoption_event_column(conn)?;
+    ensure_request_adoption_indexes_and_triggers(conn)?;
+    migrate_historical_request_adoptions(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
     ensure_session_external_columns(conn)?;
 
@@ -864,9 +968,17 @@ fn configure_initializing_connection(conn: &Connection) -> Result<()> {
     // WAL mode allows concurrent readers alongside a single writer and avoids
     // "database is locked" errors under typical daemon + API concurrency.
     // busy_timeout gives writers up to 5 s to retry before returning SQLITE_BUSY.
+    // recursive_triggers must be ON so that the implicit DELETE performed by
+    // `INSERT OR REPLACE` / `REPLACE INTO` conflict resolution (including
+    // conflicts on a rowid table's hidden rowid) still fires BEFORE/AFTER
+    // DELETE triggers such as `request_adoptions_no_delete`. Without it, a
+    // raw REPLACE that targets an existing hidden rowid with otherwise fresh
+    // logical identities can bypass the `request_adoptions_no_replace`
+    // logical-conflict guard entirely.
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA recursive_triggers = ON;",
     )
     .context("failed to configure writable Coven store connection")?;
     enable_wal_with_retry(conn)?;
@@ -899,18 +1011,27 @@ fn enable_wal_with_retry(conn: &Connection) -> Result<()> {
 }
 
 fn configure_runtime_writable_connection(conn: &Connection) -> Result<()> {
+    // See `configure_initializing_connection` for why recursive_triggers must
+    // be ON: it closes the hidden-rowid REPLACE bypass around the
+    // `request_adoptions_no_delete` / `request_adoptions_no_replace` guards.
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA recursive_triggers = ON;",
     )
     .context("failed to configure writable Coven store connection")?;
     Ok(())
 }
 
 fn configure_read_only_connection(conn: &Connection) -> Result<()> {
+    // Read-only connections cannot write, but recursive_triggers is set
+    // consistently here too so every connection path shares one
+    // configuration story and no writable path is ever accidentally opened
+    // without it.
     conn.execute_batch(
         "PRAGMA busy_timeout = 5000;
-         PRAGMA foreign_keys = ON;",
+         PRAGMA foreign_keys = ON;
+         PRAGMA recursive_triggers = ON;",
     )
     .context("failed to configure read-only Coven store connection")?;
     Ok(())
@@ -1210,6 +1331,171 @@ fn ensure_execution_binding_column(conn: &Connection) -> Result<()> {
         "execution_binding_json",
         "ALTER TABLE sessions ADD COLUMN execution_binding_json TEXT",
     )
+}
+
+fn ensure_request_adoption_event_column(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "events",
+        "request_adoption_id",
+        "ALTER TABLE events ADD COLUMN request_adoption_id TEXT REFERENCES request_adoptions(id) ON DELETE RESTRICT",
+    )
+}
+
+fn ensure_request_adoption_indexes_and_triggers(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE UNIQUE INDEX IF NOT EXISTS request_adoptions_key
+            ON request_adoptions(adoption_key) WHERE adoption_key IS NOT NULL;
+         CREATE UNIQUE INDEX IF NOT EXISTS request_adoptions_launch_attempt
+            ON request_adoptions(principal_ref, project_digest, graph_id, node_id, attempt_id)
+            WHERE operation = 'launch';
+         CREATE UNIQUE INDEX IF NOT EXISTS request_adoptions_launch_session
+            ON request_adoptions(session_id) WHERE operation = 'launch';
+         CREATE UNIQUE INDEX IF NOT EXISTS events_request_adoption
+            ON events(request_adoption_id) WHERE request_adoption_id IS NOT NULL;
+
+         CREATE TRIGGER IF NOT EXISTS events_request_adoption_integrity
+         BEFORE INSERT ON events
+         WHEN NEW.request_adoption_id IS NOT NULL
+         BEGIN
+           SELECT CASE WHEN NEW.kind != 'input' OR NOT EXISTS (
+             SELECT 1 FROM request_adoptions
+             WHERE id = NEW.request_adoption_id AND operation = 'input' AND session_id = NEW.session_id
+           ) THEN RAISE(ABORT, 'invalid request adoption event correlation') END;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS events_request_adoption_update_integrity
+         BEFORE UPDATE OF session_id, kind, request_adoption_id ON events
+         WHEN NEW.request_adoption_id IS NOT NULL
+         BEGIN
+           SELECT CASE WHEN NEW.kind != 'input' OR NOT EXISTS (
+             SELECT 1 FROM request_adoptions
+             WHERE id = NEW.request_adoption_id AND operation = 'input' AND session_id = NEW.session_id
+           ) THEN RAISE(ABORT, 'invalid request adoption event correlation') END;
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS events_request_adoption_no_rebind
+         BEFORE UPDATE OF session_id, kind, request_adoption_id ON events
+         WHEN (OLD.request_adoption_id IS NOT NULL OR NEW.request_adoption_id IS NOT NULL)
+           AND (NEW.request_adoption_id IS NOT OLD.request_adoption_id OR NEW.session_id IS NOT OLD.session_id OR NEW.kind IS NOT OLD.kind)
+         BEGIN
+           SELECT RAISE(ABORT, 'request adoption event correlation is immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS request_adoptions_no_update
+         BEFORE UPDATE ON request_adoptions
+         BEGIN
+           SELECT RAISE(ABORT, 'request adoptions are immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS request_adoptions_no_delete
+         BEFORE DELETE ON request_adoptions
+         BEGIN
+           SELECT RAISE(ABORT, 'request adoptions are retained');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS request_adoptions_no_replace
+         BEFORE INSERT ON request_adoptions
+         BEGIN
+           SELECT CASE
+             WHEN EXISTS (
+               SELECT 1 FROM request_adoptions WHERE id = NEW.id
+             ) THEN RAISE(ABORT, 'request adoptions are retained')
+             WHEN NEW.adoption_key IS NOT NULL AND EXISTS (
+               SELECT 1 FROM request_adoptions WHERE adoption_key = NEW.adoption_key
+             ) THEN RAISE(ABORT, 'request adoptions are retained')
+             WHEN NEW.operation = 'launch' AND EXISTS (
+               SELECT 1 FROM request_adoptions
+               WHERE operation = 'launch'
+                 AND principal_ref = NEW.principal_ref
+                 AND project_digest = NEW.project_digest
+                 AND graph_id = NEW.graph_id
+                 AND node_id = NEW.node_id
+                 AND attempt_id = NEW.attempt_id
+             ) THEN RAISE(ABORT, 'request adoptions are retained')
+             WHEN NEW.operation = 'launch' AND EXISTS (
+               SELECT 1 FROM request_adoptions
+               WHERE operation = 'launch' AND session_id = NEW.session_id
+             ) THEN RAISE(ABORT, 'request adoptions are retained')
+           END;
+         END;",
+    )
+    .context("failed to initialize request adoption indexes and triggers")
+}
+
+fn historical_request_adoption_id(session_id: &str) -> String {
+    let namespace = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        b"https://opencoven.dev/psyche/o3/request-adoptions",
+    );
+    uuid::Uuid::new_v5(
+        &namespace,
+        format!("historical-launch:{session_id}").as_bytes(),
+    )
+    .to_string()
+}
+
+fn migrate_historical_request_adoptions(conn: &Connection) -> Result<()> {
+    let sessions = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, execution_binding_json, created_at
+                 FROM sessions
+                 WHERE execution_binding_json IS NOT NULL
+                 ORDER BY id",
+            )
+            .context("failed to prepare historical request adoption migration")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("failed to query historical bound sessions")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read historical bound sessions")?;
+        rows
+    };
+
+    for (session_id, stored_json, created_at) in sessions {
+        let binding = parse_stored_execution_binding(&stored_json)
+            .map_err(|_| anyhow::anyhow!("failed to parse historical session execution binding"))?;
+        let deterministic_json = serde_json::to_string(&binding)
+            .context("failed to serialize historical session execution binding")?;
+        if deterministic_json != stored_json {
+            bail!("historical session execution binding is not deterministic");
+        }
+
+        if load_launch_adoption_for_session(conn, &session_id)?.is_some() {
+            continue;
+        }
+
+        conn.execute(
+            "INSERT INTO request_adoptions (
+                id, adoption_key, contract, operation, request_digest, session_id,
+                execution_binding_json, principal_ref, project_digest, graph_id,
+                node_id, attempt_id, adopted_at
+             ) VALUES (
+                ?1, NULL, NULL, 'launch', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             )",
+            params![
+                historical_request_adoption_id(&session_id),
+                &binding.request_digest,
+                &session_id,
+                deterministic_json,
+                &binding.principal_ref,
+                &binding.project_digest,
+                &binding.graph_id,
+                &binding.node_id,
+                &binding.attempt_id,
+                &created_at,
+            ],
+        )
+        .context("failed to migrate historical request adoption")?;
+    }
+    Ok(())
 }
 
 /// Stores created at the initial node_registry schema (#266) predate the
@@ -2264,6 +2550,30 @@ pub fn update_session_status_if_current(
     Ok(affected > 0)
 }
 
+pub fn update_session_terminal_if_active(
+    conn: &Connection,
+    session_id: &str,
+    status: &str,
+    exit_code: Option<i32>,
+    updated_at: &str,
+) -> Result<bool> {
+    if !matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "killed" | "idle" | "orphaned"
+    ) {
+        bail!("invalid terminal session status `{status}`");
+    }
+    let affected = conn
+        .execute(
+            "UPDATE sessions
+             SET status = ?2, exit_code = ?3, updated_at = ?4
+             WHERE id = ?1 AND status IN ('created', 'running')",
+            params![session_id, status, exit_code, updated_at],
+        )
+        .with_context(|| format!("failed to update session {session_id}"))?;
+    Ok(affected > 0)
+}
+
 /// Persist the harness-native id that continues a multi-turn conversation.
 ///
 /// Coven's `id` remains the stable ledger/session id exposed to callers.
@@ -2308,7 +2618,9 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
 /// those two writes (fork exhaustion, missing adapter, crash) leaves a row
 /// no process owns, so only age can prove it dead. Rows created before the
 /// cutoff become `failed`; newer rows stay untouched so a slow-but-live
-/// launch is never clobbered.
+/// launch is never clobbered. A launch adoption or historical launch
+/// reservation is durable ownership evidence, so those rows are excluded
+/// regardless of age.
 pub fn mark_stale_created_sessions_failed(
     conn: &Connection,
     created_before: &str,
@@ -2319,7 +2631,12 @@ pub fn mark_stale_created_sessions_failed(
             "UPDATE sessions
              SET status = 'failed',
                  updated_at = ?2
-             WHERE status = 'created' AND created_at < ?1",
+             WHERE status = 'created' AND created_at < ?1
+               AND NOT EXISTS (
+                 SELECT 1 FROM request_adoptions
+                 WHERE request_adoptions.session_id = sessions.id
+                  AND request_adoptions.operation = 'launch'
+               )",
             params![created_before, updated_at],
         )
         .context("failed to mark stale created sessions failed")?;
@@ -2535,6 +2852,473 @@ fn parse_stored_execution_binding(
     crate::execution_binding::parse(&value).map_err(|err| Box::new(err) as _)
 }
 
+const REQUEST_ADOPTION_COLUMNS: &str = "id,
+    adoption_key,
+    contract,
+    operation,
+    request_digest,
+    session_id,
+    execution_binding_json,
+    principal_ref,
+    project_digest,
+    graph_id,
+    node_id,
+    attempt_id,
+    adopted_at";
+
+#[derive(Debug)]
+struct RawRequestAdoptionRecord {
+    id: String,
+    adoption_key: Option<String>,
+    contract: Option<String>,
+    operation: String,
+    request_digest: String,
+    session_id: String,
+    execution_binding_json: String,
+    principal_ref: Option<String>,
+    project_digest: Option<String>,
+    graph_id: Option<String>,
+    node_id: Option<String>,
+    attempt_id: Option<String>,
+    adopted_at: String,
+}
+
+fn raw_request_adoption_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RawRequestAdoptionRecord> {
+    Ok(RawRequestAdoptionRecord {
+        id: row.get(0)?,
+        adoption_key: row.get(1)?,
+        contract: row.get(2)?,
+        operation: row.get(3)?,
+        request_digest: row.get(4)?,
+        session_id: row.get(5)?,
+        execution_binding_json: row.get(6)?,
+        principal_ref: row.get(7)?,
+        project_digest: row.get(8)?,
+        graph_id: row.get(9)?,
+        node_id: row.get(10)?,
+        attempt_id: row.get(11)?,
+        adopted_at: row.get(12)?,
+    })
+}
+
+fn valid_request_digest(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn invalid_stored_request_adoption(field: &'static str) -> anyhow::Error {
+    anyhow::anyhow!("invalid stored request adoption at {field}")
+}
+
+fn strict_request_adoption_record(
+    conn: &Connection,
+    raw: RawRequestAdoptionRecord,
+) -> Result<RequestAdoptionRecord> {
+    let operation = match raw.operation.as_str() {
+        "launch" => RequestAdoptionOperation::Launch,
+        "input" => RequestAdoptionOperation::Input,
+        _ => return Err(invalid_stored_request_adoption("operation")),
+    };
+    if !valid_request_digest(&raw.request_digest) {
+        return Err(invalid_stored_request_adoption(
+            "requestAdoption.requestDigest",
+        ));
+    }
+
+    match (&raw.adoption_key, &raw.contract) {
+        (None, None) if operation == RequestAdoptionOperation::Launch => {}
+        (Some(key), Some(contract)) => {
+            crate::request_adoption::RequestAdoption {
+                contract: contract.clone(),
+                key: key.clone(),
+                request_digest: raw.request_digest.clone(),
+            }
+            .validate()
+            .map_err(|_| invalid_stored_request_adoption("requestAdoption"))?;
+        }
+        _ => return Err(invalid_stored_request_adoption("requestAdoption")),
+    }
+    if operation == RequestAdoptionOperation::Input && raw.adoption_key.is_none() {
+        return Err(invalid_stored_request_adoption("requestAdoption.key"));
+    }
+
+    let binding = parse_stored_execution_binding(&raw.execution_binding_json)
+        .map_err(|_| invalid_stored_request_adoption("executionBinding"))?;
+    let deterministic_json = serde_json::to_string(&binding)
+        .context("failed to serialize stored request adoption execution binding")?;
+    if deterministic_json != raw.execution_binding_json {
+        return Err(invalid_stored_request_adoption("executionBinding"));
+    }
+
+    match operation {
+        RequestAdoptionOperation::Launch => {
+            let scope_matches = raw.principal_ref.as_deref() == Some(&binding.principal_ref)
+                && raw.project_digest.as_deref() == Some(&binding.project_digest)
+                && raw.graph_id.as_deref() == Some(&binding.graph_id)
+                && raw.node_id.as_deref() == Some(&binding.node_id)
+                && raw.attempt_id.as_deref() == Some(&binding.attempt_id);
+            if !scope_matches {
+                return Err(invalid_stored_request_adoption(
+                    "executionBinding.attemptId",
+                ));
+            }
+            if raw.request_digest != binding.request_digest {
+                return Err(invalid_stored_request_adoption(
+                    "requestAdoption.requestDigest",
+                ));
+            }
+        }
+        RequestAdoptionOperation::Input => {
+            if raw.principal_ref.is_some()
+                || raw.project_digest.is_some()
+                || raw.graph_id.is_some()
+                || raw.node_id.is_some()
+                || raw.attempt_id.is_some()
+            {
+                return Err(invalid_stored_request_adoption("executionBinding"));
+            }
+        }
+    }
+
+    let session_binding = conn
+        .query_row(
+            "SELECT execution_binding_json FROM sessions WHERE id = ?1",
+            [&raw.session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("failed to validate request adoption session")?;
+    match session_binding {
+        Some(Some(stored)) if stored == raw.execution_binding_json => {}
+        _ => return Err(invalid_stored_request_adoption("sessionId")),
+    }
+
+    Ok(RequestAdoptionRecord {
+        id: raw.id,
+        adoption_key: raw.adoption_key,
+        contract: raw.contract,
+        operation,
+        request_digest: raw.request_digest,
+        session_id: raw.session_id,
+        execution_binding_json: raw.execution_binding_json,
+        principal_ref: raw.principal_ref,
+        project_digest: raw.project_digest,
+        graph_id: raw.graph_id,
+        node_id: raw.node_id,
+        attempt_id: raw.attempt_id,
+        adopted_at: raw.adopted_at,
+    })
+}
+
+fn load_request_adoption<P>(
+    conn: &Connection,
+    predicate: &str,
+    params: P,
+) -> Result<Option<RequestAdoptionRecord>>
+where
+    P: rusqlite::Params,
+{
+    let sql = format!(
+        "SELECT {REQUEST_ADOPTION_COLUMNS}
+         FROM request_adoptions
+         WHERE {predicate}
+         LIMIT 1"
+    );
+    let raw = conn
+        .query_row(&sql, params, raw_request_adoption_from_row)
+        .optional()
+        .context("failed to read request adoption")?;
+    raw.map(|record| strict_request_adoption_record(conn, record))
+        .transpose()
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn load_request_adoption_by_key(
+    conn: &Connection,
+    adoption_key: &str,
+) -> Result<Option<RequestAdoptionRecord>> {
+    load_request_adoption(conn, "adoption_key = ?1", [adoption_key])
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn load_launch_adoption_by_scope(
+    conn: &Connection,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<RequestAdoptionRecord>> {
+    load_request_adoption(
+        conn,
+        "operation = 'launch'
+         AND principal_ref = ?1
+         AND project_digest = ?2
+         AND graph_id = ?3
+         AND node_id = ?4
+         AND attempt_id = ?5",
+        params![
+            &binding.principal_ref,
+            &binding.project_digest,
+            &binding.graph_id,
+            &binding.node_id,
+            &binding.attempt_id,
+        ],
+    )
+}
+
+fn load_launch_adoption_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<Option<RequestAdoptionRecord>> {
+    load_request_adoption(
+        conn,
+        "operation = 'launch' AND session_id = ?1",
+        [session_id],
+    )
+}
+
+#[cfg(test)]
+fn load_request_adoption_by_id(
+    conn: &Connection,
+    adoption_id: &str,
+) -> Result<Option<RequestAdoptionRecord>> {
+    load_request_adoption(conn, "id = ?1", [adoption_id])
+}
+
+// O3 forbids leaking ledger session ids (or any other retained identity —
+// adoption id/key/digest/binding) into errors and diagnostics. `get_session`'s
+// error path interpolates the session id into its message (see
+// `failed to read session {session_id}`), so any lookup or readback failure
+// at this shared replay boundary — used by both `resolve_launch_adoption`
+// and `resolve_input_adoption` — is replaced with a static internal error
+// rather than propagated. Adding context on top would not be enough: the
+// original message would still render in the debug/`{:#}` chain, so the
+// source error is discarded, not wrapped.
+#[cfg_attr(not(test), allow(dead_code))]
+fn replay_resolution(
+    conn: &Connection,
+    record: RequestAdoptionRecord,
+) -> Result<AdoptionResolution> {
+    let session = get_session(conn, &record.session_id)
+        .map_err(|_| invalid_stored_request_adoption("sessionId"))?
+        .ok_or_else(|| invalid_stored_request_adoption("sessionId"))?;
+    Ok(AdoptionResolution::Replay {
+        adoption_id: record.id,
+        session,
+    })
+}
+
+// O3 contract §6: a row matched by the submitted global adoption key that is
+// not an exact replay is a key collision. The response must report only
+// `requestAdoption.key` — it must not leak which hidden identity member
+// (contract, operation, digest, session, or binding) actually differs.
+// Distinct scope from a *different* key colliding with an in-flight launch
+// attempt (see `load_launch_adoption_by_scope`), which stays reported at
+// `executionBinding.attemptId`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn keyed_adoption_mismatch(
+    record: &RequestAdoptionRecord,
+    operation: RequestAdoptionOperation,
+    session_id: Option<&str>,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<&'static str>> {
+    if record.operation != operation {
+        return Ok(Some("requestAdoption.key"));
+    }
+    if record.contract.as_deref() != Some(request.contract.as_str()) {
+        return Ok(Some("requestAdoption.key"));
+    }
+    if record.request_digest != request.request_digest {
+        return Ok(Some("requestAdoption.key"));
+    }
+    if operation == RequestAdoptionOperation::Input
+        && record.session_id != session_id.expect("input resolution supplies session id")
+    {
+        return Ok(Some("requestAdoption.key"));
+    }
+    let stored_binding = parse_stored_execution_binding(&record.execution_binding_json)
+        .map_err(|_| invalid_stored_request_adoption("executionBinding"))?;
+    if stored_binding.first_mismatch_path(binding).is_some() {
+        return Ok(Some("requestAdoption.key"));
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+thread_local! {
+    // The exact key-miss/scope-read seam needed to reproduce a split-view
+    // resolver without exposing a production hook.
+    static LAUNCH_ADOPTION_KEY_MISS_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_launch_adoption_key_miss_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    LAUNCH_ADOPTION_KEY_MISS_TEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn launch_adoption_key_miss_test_hook() {
+    let hook = LAUNCH_ADOPTION_KEY_MISS_TEST_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn resolve_launch_adoption(
+    conn: &Connection,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<AdoptionResolution> {
+    if let Some(record) = load_request_adoption_by_key(conn, &request.key)? {
+        if let Some(field) = keyed_adoption_mismatch(
+            &record,
+            RequestAdoptionOperation::Launch,
+            None,
+            request,
+            binding,
+        )? {
+            return Ok(AdoptionResolution::Conflict { field });
+        }
+        return replay_resolution(conn, record);
+    }
+    #[cfg(test)]
+    launch_adoption_key_miss_test_hook();
+    if load_launch_adoption_by_scope(conn, binding)?.is_some() {
+        return Ok(AdoptionResolution::Conflict {
+            field: "executionBinding.attemptId",
+        });
+    }
+    Ok(AdoptionResolution::Absent)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn resolve_input_adoption(
+    conn: &Connection,
+    session_id: &str,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<AdoptionResolution> {
+    let Some(record) = load_request_adoption_by_key(conn, &request.key)? else {
+        return Ok(AdoptionResolution::Absent);
+    };
+    if let Some(field) = keyed_adoption_mismatch(
+        &record,
+        RequestAdoptionOperation::Input,
+        Some(session_id),
+        request,
+        binding,
+    )? {
+        return Ok(AdoptionResolution::Conflict { field });
+    }
+    replay_resolution(conn, record)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn validated_adoption_binding_json(
+    conn: &Connection,
+    session_id: &str,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<String> {
+    request
+        .validate()
+        .context("invalid request adoption identity")?;
+    binding
+        .validate_shape()
+        .context("invalid request adoption execution binding")?;
+    let binding_json =
+        serde_json::to_string(binding).context("failed to serialize request adoption binding")?;
+    let session_binding = conn
+        .query_row(
+            "SELECT execution_binding_json FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .context("failed to validate request adoption session binding")?;
+    match session_binding {
+        Some(Some(stored)) if stored == binding_json => Ok(binding_json),
+        _ => bail!("request adoption session binding does not match"),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn insert_launch_adoption(
+    conn: &Connection,
+    adoption_id: &str,
+    session_id: &str,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+    adopted_at: &str,
+) -> Result<()> {
+    let binding_json = validated_adoption_binding_json(conn, session_id, request, binding)?;
+    if request.request_digest != binding.request_digest {
+        bail!("launch request adoption digest does not match execution binding");
+    }
+    conn.execute(
+        "INSERT INTO request_adoptions (
+            id, adoption_key, contract, operation, request_digest, session_id,
+            execution_binding_json, principal_ref, project_digest, graph_id,
+            node_id, attempt_id, adopted_at
+         ) VALUES (
+            ?1, ?2, ?3, 'launch', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
+         )",
+        params![
+            adoption_id,
+            &request.key,
+            &request.contract,
+            &request.request_digest,
+            session_id,
+            binding_json,
+            &binding.principal_ref,
+            &binding.project_digest,
+            &binding.graph_id,
+            &binding.node_id,
+            &binding.attempt_id,
+            adopted_at,
+        ],
+    )
+    .context("failed to insert launch request adoption")?;
+    Ok(())
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn insert_input_adoption(
+    conn: &Connection,
+    adoption_id: &str,
+    session_id: &str,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+    adopted_at: &str,
+) -> Result<()> {
+    let binding_json = validated_adoption_binding_json(conn, session_id, request, binding)?;
+    conn.execute(
+        "INSERT INTO request_adoptions (
+            id, adoption_key, contract, operation, request_digest, session_id,
+            execution_binding_json, principal_ref, project_digest, graph_id,
+            node_id, attempt_id, adopted_at
+         ) VALUES (
+            ?1, ?2, ?3, 'input', ?4, ?5, ?6, NULL, NULL, NULL, NULL, NULL, ?7
+         )",
+        params![
+            adoption_id,
+            &request.key,
+            &request.contract,
+            &request.request_digest,
+            session_id,
+            binding_json,
+            adopted_at,
+        ],
+    )
+    .context("failed to insert input request adoption")?;
+    Ok(())
+}
+
 fn session_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let labels_str: Option<String> = row.get(10)?;
     let labels: Vec<String> = labels_str
@@ -2605,11 +3389,83 @@ pub fn summon_session(conn: &Connection, session_id: &str, updated_at: &str) -> 
     Ok(())
 }
 
-pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
-    conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
-        .with_context(|| format!("failed to sacrifice session {session_id}"))?;
+fn session_has_request_adoption(conn: &Connection, session_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM request_adoptions WHERE session_id = ?1
+         )",
+        [session_id],
+        |row| row.get(0),
+    )
+    .context("failed to check session adoption retention")
+}
 
+pub fn ensure_session_sacrificable(conn: &Connection, session_id: &str) -> Result<()> {
+    let Some(session) = get_session(conn, session_id)? else {
+        bail!("session `{session_id}` not found");
+    };
+    if session.status == crate::RUNNING_SESSION_STATUS {
+        bail!("session `{session_id}` is still running; do not sacrifice live work");
+    }
+    if session_has_request_adoption(conn, session_id)? {
+        return Err(AdoptionRetentionError.into());
+    }
     Ok(())
+}
+
+fn is_foreign_key_constraint(error: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(code, message) = error else {
+        return false;
+    };
+    code.code == ErrorCode::ConstraintViolation
+        && matches!(
+            code.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY | rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        )
+        && message.as_deref() == Some("FOREIGN KEY constraint failed")
+}
+
+fn sacrifice_session_with_pre_delete_hook<F>(
+    conn: &Connection,
+    session_id: &str,
+    after_preflight: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
+    ensure_session_sacrificable(conn, session_id)?;
+    after_preflight()?;
+
+    match conn.execute(
+        "DELETE FROM sessions
+         WHERE id = ?1 AND status != ?2",
+        params![session_id, crate::RUNNING_SESSION_STATUS],
+    ) {
+        Ok(affected) if affected > 0 => Ok(()),
+        Ok(_) => match get_session(conn, session_id)? {
+            None => Ok(()),
+            Some(session) => {
+                ensure_session_sacrificable(conn, session_id)?;
+                bail!(
+                    "session `{session_id}` changed during sacrifice (current status: {}); retry",
+                    session.status
+                )
+            }
+        },
+        Err(error)
+            if is_foreign_key_constraint(&error)
+                && session_has_request_adoption(conn, session_id)? =>
+        {
+            Err(AdoptionRetentionError.into())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to sacrifice session {session_id}"))
+        }
+    }
+}
+
+pub fn sacrifice_session(conn: &Connection, session_id: &str) -> Result<()> {
+    sacrifice_session_with_pre_delete_hook(conn, session_id, || Ok(()))
 }
 
 pub fn latest_active_for_project(
@@ -3031,7 +3887,14 @@ pub fn insert_event(conn: &Connection, record: &EventRecord) -> Result<()> {
     let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
     let sensitive = redacted_payload != record.payload_json;
     let redaction_status = if sensitive { "redacted" } else { "clean" };
-    insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)
+    insert_event_raw(
+        conn,
+        record,
+        &redacted_payload,
+        redaction_status,
+        sensitive,
+        None,
+    )
 }
 
 pub fn insert_event_with_privacy(
@@ -3039,11 +3902,27 @@ pub fn insert_event_with_privacy(
     coven_home: &Path,
     record: &EventRecord,
 ) -> Result<()> {
+    insert_event_with_privacy_and_adoption(conn, coven_home, record, None)
+}
+
+pub fn insert_event_with_privacy_and_adoption(
+    conn: &Connection,
+    coven_home: &Path,
+    record: &EventRecord,
+    request_adoption_id: Option<&str>,
+) -> Result<()> {
     let config = privacy::load_config(coven_home).unwrap_or_default();
     let redacted_payload = privacy::redact_payload_json_with_config(&record.payload_json, &config);
     let sensitive = redacted_payload != record.payload_json;
     let mut redaction_status = if sensitive { "redacted" } else { "clean" };
-    insert_event_raw(conn, record, &redacted_payload, redaction_status, sensitive)?;
+    insert_event_raw(
+        conn,
+        record,
+        &redacted_payload,
+        redaction_status,
+        sensitive,
+        request_adoption_id,
+    )?;
 
     if config.persist_raw_artifacts && sensitive {
         let artifact_result = retention_expires_at(
@@ -3093,6 +3972,7 @@ fn insert_event_raw(
     payload_json: &str,
     redaction_status: &str,
     sensitive: bool,
+    request_adoption_id: Option<&str>,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO events (
@@ -3102,8 +3982,9 @@ fn insert_event_raw(
             payload_json,
             created_at,
             redaction_status,
-            sensitive
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            sensitive,
+            request_adoption_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             &record.id,
             &record.session_id,
@@ -3112,6 +3993,7 @@ fn insert_event_raw(
             &record.created_at,
             redaction_status,
             if sensitive { 1 } else { 0 },
+            request_adoption_id,
         ],
     )
     .with_context(|| format!("failed to insert event {}", record.id))?;
@@ -3421,6 +4303,75 @@ pub fn acquire_session_input_lease(
     )?;
     transaction.commit()?;
     Ok(true)
+}
+
+pub fn session_input_handoff_fenced(conn: &Connection, session_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM session_handoffs
+             WHERE session_id = ?1 AND state IN ('claimed', 'acknowledged', 'continued')
+         )",
+        [session_id],
+        |row| row.get(0),
+    )
+    .context("failed to check session input handoff fence")
+}
+
+pub fn acquire_session_input_lease_and_adopt(
+    conn: &mut Connection,
+    session_id: &str,
+    request: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+    now: &str,
+) -> Result<InputAdoptionResult> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    match resolve_input_adoption(&transaction, session_id, request, binding)? {
+        AdoptionResolution::Replay { .. } => {
+            transaction.commit()?;
+            return Ok(InputAdoptionResult::Replay);
+        }
+        AdoptionResolution::Conflict { .. } => {
+            transaction.commit()?;
+            return Ok(InputAdoptionResult::Conflict);
+        }
+        AdoptionResolution::Absent => {}
+    }
+    let status = transaction
+        .query_row(
+            "SELECT status FROM sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("failed to check adopted input session liveness")?;
+    if status.as_deref() != Some(crate::RUNNING_SESSION_STATUS) {
+        transaction.rollback()?;
+        return Ok(InputAdoptionResult::NotLive);
+    }
+    if session_input_handoff_fenced(&transaction, session_id)? {
+        transaction.commit()?;
+        return Ok(InputAdoptionResult::HandoffFenced);
+    }
+
+    let adoption_id = uuid::Uuid::new_v4().to_string();
+    let lease_id = uuid::Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO session_input_leases (id, session_id, created_at) VALUES (?1, ?2, ?3)",
+        params![&lease_id, session_id, now],
+    )?;
+    insert_input_adoption(
+        &transaction,
+        &adoption_id,
+        session_id,
+        request,
+        binding,
+        now,
+    )?;
+    transaction.commit()?;
+    Ok(InputAdoptionResult::Adopted {
+        adoption_id,
+        lease_id,
+    })
 }
 
 pub fn release_session_input_lease(conn: &Connection, lease_id: &str) -> Result<()> {
@@ -5180,6 +6131,30 @@ END;
     }
 
     #[test]
+    fn activation_compare_and_set_never_overwrites_terminal() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+
+        for status in ["failed", "completed", "cancelled"] {
+            let mut session = session_record(status, "2026-04-27T06:00:00Z");
+            session.status = status.to_string();
+            session.exit_code = Some(17);
+            insert_session(&conn, &session)?;
+
+            assert!(!update_session_status_if_current(
+                &conn,
+                status,
+                "created",
+                "running",
+                None,
+                "2026-04-27T07:00:00Z",
+            )?);
+            assert_eq!(get_session(&conn, status)?, Some(session));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn marks_only_running_sessions_orphaned() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -5276,6 +6251,56 @@ END;
     }
 
     #[test]
+    fn stale_created_recovery_excludes_launch_adoptions_and_reservations() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let keyed_binding = execution_binding_fixture();
+        let reserved_binding = execution_binding_with_attempt("reserved-attempt");
+
+        let mut unadopted = session_record("unadopted", "2026-04-27T06:00:00Z");
+        unadopted.status = "created".to_string();
+        let mut keyed = session_record("keyed", "2026-04-27T06:00:01Z");
+        keyed.status = "created".to_string();
+        keyed.execution_binding = Some(keyed_binding.clone());
+        let mut reserved = session_record("reserved", "2026-04-27T06:00:02Z");
+        reserved.status = "created".to_string();
+        reserved.execution_binding = Some(reserved_binding.clone());
+        insert_session(&conn, &unadopted)?;
+        insert_session(&conn, &keyed)?;
+        insert_session(&conn, &reserved)?;
+
+        insert_launch_adoption(
+            &conn,
+            "keyed-adoption",
+            "keyed",
+            &request_adoption_fixture("keyed-launch", &keyed_binding.request_digest),
+            &keyed_binding,
+            "2026-04-27T06:00:01Z",
+        )?;
+        migrate_historical_request_adoptions(&conn)?;
+        let keyed_before = get_session(&conn, "keyed")?.expect("keyed session");
+        let reserved_before = get_session(&conn, "reserved")?.expect("reserved session");
+
+        assert_eq!(
+            mark_stale_created_sessions_failed(
+                &conn,
+                "2026-04-27T06:50:00Z",
+                "2026-04-27T07:00:00Z",
+            )?,
+            1
+        );
+        assert_eq!(
+            get_session(&conn, "unadopted")?
+                .expect("unadopted session")
+                .status,
+            "failed"
+        );
+        assert_eq!(get_session(&conn, "keyed")?, Some(keyed_before));
+        assert_eq!(get_session(&conn, "reserved")?, Some(reserved_before));
+        Ok(())
+    }
+
+    #[test]
     fn archives_and_summons_sessions_without_losing_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let conn = open_store(&temp_dir.path().join("coven.db"))?;
@@ -5340,6 +6365,171 @@ END;
 
         assert!(get_session(&conn, "session-1")?.is_none());
         assert!(list_events(&conn, "session-1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_session_sacrifice_returns_typed_retention_error() -> Result<()> {
+        const DENIAL: &str = "session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it";
+
+        for evidence in ["launch", "reservation", "input"] {
+            let temp_dir = tempfile::tempdir()?;
+            let conn = open_store(&temp_dir.path().join(format!("{evidence}.db")))?;
+            let binding = execution_binding_fixture();
+            let mut session = session_record("retained-session", "2026-04-27T06:00:00Z");
+            session.status = "completed".to_string();
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+
+            match evidence {
+                "launch" => insert_launch_adoption(
+                    &conn,
+                    "launch-adoption",
+                    "retained-session",
+                    &request_adoption_fixture("launch-key", &binding.request_digest),
+                    &binding,
+                    "2026-04-27T06:01:00Z",
+                )?,
+                "reservation" => migrate_historical_request_adoptions(&conn)?,
+                "input" => insert_input_adoption(
+                    &conn,
+                    "input-adoption",
+                    "retained-session",
+                    &request_adoption_fixture("input-key", &digest_fixture('d')),
+                    &binding,
+                    "2026-04-27T06:01:00Z",
+                )?,
+                _ => unreachable!(),
+            }
+
+            let preflight_error = ensure_session_sacrificable(&conn, "retained-session")
+                .expect_err("preflight must reject retained adoption evidence");
+            assert!(preflight_error.is::<AdoptionRetentionError>());
+            assert_eq!(preflight_error.to_string(), DENIAL);
+            let error = sacrifice_session(&conn, "retained-session")
+                .expect_err("retained adoption evidence must block sacrifice");
+            assert!(error.is::<AdoptionRetentionError>());
+            assert_eq!(error.to_string(), DENIAL);
+            assert_eq!(
+                format!("{:?}", error.root_cause()),
+                "AdoptionRetentionError"
+            );
+            assert_eq!(
+                get_session(&conn, "retained-session")?,
+                Some(session),
+                "{evidence} evidence must preserve the session"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM request_adoptions WHERE session_id = ?1",
+                    ["retained-session"],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                1,
+                "{evidence} evidence must remain retained"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_key_blocks_concurrent_sacrifice_after_preflight() -> Result<()> {
+        const DENIAL: &str = "session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it";
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("race.db");
+        let delete_conn = open_store(&path)?;
+        let binding = execution_binding_fixture();
+        let mut session = session_record("race-session", "2026-04-27T06:00:00Z");
+        session.status = "completed".to_string();
+        session.execution_binding = Some(binding.clone());
+        insert_session(&delete_conn, &session)?;
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let insert_barrier = std::sync::Arc::clone(&barrier);
+        let insert_path = path.clone();
+        let insert_binding = binding.clone();
+        let insert_handle = std::thread::spawn(move || -> Result<()> {
+            let insert_conn = open_store(&insert_path)?;
+            insert_barrier.wait();
+            insert_launch_adoption(
+                &insert_conn,
+                "racing-adoption",
+                "race-session",
+                &request_adoption_fixture("racing-key", &insert_binding.request_digest),
+                &insert_binding,
+                "2026-04-27T06:01:00Z",
+            )
+        });
+
+        let error = sacrifice_session_with_pre_delete_hook(
+            &delete_conn,
+            "race-session",
+            || -> Result<()> {
+                barrier.wait();
+                insert_handle.join().expect("adoption insert thread")
+            },
+        )
+        .expect_err("the racing adoption must block the session delete");
+
+        assert!(error.is::<AdoptionRetentionError>());
+        assert_eq!(error.to_string(), DENIAL);
+        assert_eq!(get_session(&delete_conn, "race-session")?, Some(session));
+        assert_eq!(
+            load_launch_adoption_for_session(&delete_conn, "race-session")?
+                .expect("racing adoption must remain")
+                .id,
+            "racing-adoption"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sacrifice_refuses_session_that_becomes_running_after_preflight() -> Result<()> {
+        const DENIAL: &str = "session `race-session` is still running; do not sacrifice live work";
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("status-race.db");
+        let delete_conn = open_store(&path)?;
+        let mut session = session_record("race-session", "2026-04-27T06:00:00Z");
+        session.status = "created".to_string();
+        insert_session(&delete_conn, &session)?;
+        insert_json_event(
+            &delete_conn,
+            "race-session",
+            "output",
+            &serde_json::json!({ "data": "keep me" }),
+            "2026-04-27T06:01:00Z",
+        )?;
+        let status_conn = open_store(&path)?;
+
+        let error = sacrifice_session_with_pre_delete_hook(&delete_conn, "race-session", || {
+            update_session_status(
+                &status_conn,
+                "race-session",
+                "running",
+                None,
+                "2026-04-27T06:02:00Z",
+            )
+        })
+        .expect_err("a session that becomes running must survive sacrifice");
+
+        assert_eq!(error.to_string(), DENIAL);
+        let retained = get_session(&delete_conn, "race-session")?.expect("session retained");
+        assert_eq!(retained.status, "running");
+        assert_eq!(list_events(&delete_conn, "race-session")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unadopted_non_running_session_remains_sacrificable() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let conn = open_store(&temp_dir.path().join("coven.db"))?;
+        let mut session = session_record("session-1", "2026-04-27T06:00:00Z");
+        session.status = "completed".to_string();
+        insert_session(&conn, &session)?;
+
+        sacrifice_session(&conn, "session-1")?;
+
+        assert!(get_session(&conn, "session-1")?.is_none());
         Ok(())
     }
 
@@ -7507,6 +8697,1911 @@ END;
             expires_at: "2099-01-01T00:00:00Z".to_string(),
             parent: None,
             delegation_digest: None,
+        }
+    }
+
+    fn execution_binding_with_attempt(
+        attempt_id: &str,
+    ) -> crate::execution_binding::ExecutionBinding {
+        let mut binding = execution_binding_fixture();
+        binding.attempt_id = attempt_id.to_string();
+        binding
+    }
+
+    fn request_adoption_fixture(
+        key: &str,
+        request_digest: &str,
+    ) -> crate::request_adoption::RequestAdoption {
+        crate::request_adoption::RequestAdoption {
+            contract: crate::request_adoption::CONTRACT.to_string(),
+            key: key.to_string(),
+            request_digest: request_digest.to_string(),
+        }
+    }
+
+    fn create_pre_o3_store(
+        path: &Path,
+        sessions: &[(
+            &str,
+            Option<crate::execution_binding::ExecutionBinding>,
+            &str,
+        )],
+    ) -> Result<()> {
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE sessions (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 project_root TEXT NOT NULL,
+                 harness TEXT NOT NULL,
+                 title TEXT NOT NULL,
+                 status TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 updated_at TEXT NOT NULL,
+                 execution_binding_json TEXT
+             );
+             CREATE TABLE events (
+                 id TEXT PRIMARY KEY NOT NULL,
+                 session_id TEXT NOT NULL,
+                 kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );",
+        )?;
+        for (id, binding, created_at) in sessions {
+            let binding_json = binding.as_ref().map(serde_json::to_string).transpose()?;
+            conn.execute(
+                "INSERT INTO sessions (
+                    id, project_root, harness, title, status, created_at, updated_at,
+                    execution_binding_json
+                 ) VALUES (?1, '/project', 'codex', ?1, 'created', ?2, ?2, ?3)",
+                params![id, created_at, binding_json],
+            )?;
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RawAdoptionSnapshot {
+        id: String,
+        adoption_key: Option<String>,
+        contract: Option<String>,
+        operation: String,
+        request_digest: String,
+        session_id: String,
+        execution_binding_json: String,
+        principal_ref: Option<String>,
+        project_digest: Option<String>,
+        graph_id: Option<String>,
+        node_id: Option<String>,
+        attempt_id: Option<String>,
+        adopted_at: String,
+    }
+
+    fn raw_adoption_rows(conn: &Connection) -> Result<Vec<RawAdoptionSnapshot>> {
+        let mut statement = conn.prepare(
+            "SELECT
+                id, adoption_key, contract, operation, request_digest, session_id,
+                execution_binding_json, principal_ref, project_digest, graph_id,
+                node_id, attempt_id, adopted_at
+             FROM request_adoptions
+             ORDER BY session_id, operation, id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(RawAdoptionSnapshot {
+                    id: row.get(0)?,
+                    adoption_key: row.get(1)?,
+                    contract: row.get(2)?,
+                    operation: row.get(3)?,
+                    request_digest: row.get(4)?,
+                    session_id: row.get(5)?,
+                    execution_binding_json: row.get(6)?,
+                    principal_ref: row.get(7)?,
+                    project_digest: row.get(8)?,
+                    graph_id: row.get(9)?,
+                    node_id: row.get(10)?,
+                    attempt_id: row.get(11)?,
+                    adopted_at: row.get(12)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(rows)
+    }
+
+    fn event_foreign_keys(conn: &Connection) -> Result<Vec<(String, String, String, String)>> {
+        let mut statement = conn.prepare("PRAGMA foreign_key_list(events)")?;
+        let foreign_keys = statement
+            .query_map([], |row| {
+                Ok((row.get(2)?, row.get(3)?, row.get(4)?, row.get(6)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)?;
+        Ok(foreign_keys)
+    }
+
+    fn assert_event_adoption_foreign_key(conn: &Connection) -> Result<()> {
+        let foreign_keys = event_foreign_keys(conn)?;
+        assert!(
+            foreign_keys.contains(&(
+                "request_adoptions".to_string(),
+                "request_adoption_id".to_string(),
+                "id".to_string(),
+                "RESTRICT".to_string(),
+            )),
+            "events adoption foreign key missing: {foreign_keys:?}"
+        );
+        assert!(
+            foreign_keys.contains(&(
+                "sessions".to_string(),
+                "session_id".to_string(),
+                "id".to_string(),
+                "CASCADE".to_string(),
+            )),
+            "events session foreign key missing: {foreign_keys:?}"
+        );
+        Ok(())
+    }
+
+    fn assert_sql_error_contains(result: rusqlite::Result<usize>, expected: &str) {
+        let error = result.expect_err("raw SQL mutation must fail");
+        assert!(
+            error.to_string().contains(expected),
+            "expected {expected:?}, got {error}"
+        );
+    }
+
+    #[test]
+    fn request_adoptions_fresh_schema_has_required_constraints() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("fresh.sqlite3");
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+
+        let table_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'request_adoptions'",
+            [],
+            |row| row.get(0),
+        )?;
+        let compact = table_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        for required in [
+            "id TEXT PRIMARY KEY NOT NULL",
+            "operation TEXT NOT NULL CHECK (operation IN ('launch', 'input'))",
+            "FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE RESTRICT",
+            "adoption_key IS NULL AND contract IS NULL AND operation = 'launch'",
+            "adoption_key IS NOT NULL AND contract IS NOT NULL",
+            "operation = 'input'",
+            "attempt_id IS NULL",
+        ] {
+            assert!(
+                compact.contains(required),
+                "missing schema fragment {required:?}: {compact}"
+            );
+        }
+
+        let schema_objects = {
+            let mut statement = conn.prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE type IN ('index', 'trigger')
+                 ORDER BY name",
+            )?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            names
+        };
+        for required in [
+            "request_adoptions_key",
+            "request_adoptions_launch_attempt",
+            "request_adoptions_launch_session",
+            "events_request_adoption",
+            "events_request_adoption_integrity",
+            "events_request_adoption_update_integrity",
+            "events_request_adoption_no_rebind",
+            "request_adoptions_no_update",
+            "request_adoptions_no_delete",
+            "request_adoptions_no_replace",
+        ] {
+            assert!(
+                schema_objects.iter().any(|name| name == required),
+                "missing schema object {required}: {schema_objects:?}"
+            );
+        }
+
+        assert!(table_columns(&conn, "events")?
+            .iter()
+            .any(|column| column == "request_adoption_id"));
+        assert_event_adoption_foreign_key(&conn)?;
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+            1
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))?,
+            1,
+            "recursive_triggers must be ON so REPLACE's implicit rowid delete \
+             still fires request_adoptions_no_delete"
+        );
+
+        let mut session = session_record("bound", "2026-08-15T00:00:00Z");
+        session.execution_binding = Some(execution_binding_fixture());
+        insert_session(&conn, &session)?;
+        let raw = serde_json::to_string(&execution_binding_fixture())?;
+        assert!(conn
+            .execute(
+                "INSERT INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'bad-operation', 'key', ?1, 'delete', ?2, 'bound', ?3,
+                    NULL, NULL, NULL, NULL, NULL, '2026-08-15T00:00:00Z'
+                 )",
+                params![crate::request_adoption::CONTRACT, digest_fixture('c'), raw],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'bad-input', NULL, NULL, 'input', ?1, 'bound', ?2,
+                    NULL, NULL, NULL, NULL, NULL, '2026-08-15T00:00:00Z'
+                 )",
+                params![digest_fixture('d'), raw],
+            )
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn every_store_connection_helper_enables_recursive_triggers() -> Result<()> {
+        // Every connection path (initializing, runtime writable, read-only,
+        // and the writable path reopened after the store already exists)
+        // must apply `PRAGMA recursive_triggers = ON`. Without it on any one
+        // path, a raw `INSERT OR REPLACE` / `REPLACE INTO` reaching that
+        // connection could bypass `request_adoptions_no_delete` via the
+        // hidden-rowid conflict path.
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("recursive-triggers.sqlite3");
+
+        fn recursive_triggers_enabled(conn: &Connection) -> Result<bool> {
+            Ok(conn.query_row("PRAGMA recursive_triggers", [], |row| row.get::<_, i64>(0))? == 1)
+        }
+
+        // `open_store` initializes the schema (configure_initializing_connection)
+        // and then hands back a runtime writable connection.
+        let opened = open_store(&path)?;
+        assert!(recursive_triggers_enabled(&opened)?);
+        drop(opened);
+
+        // `open_initialized_store` is the ordinary per-request writable path.
+        let initialized = open_initialized_store(&path)?;
+        assert!(recursive_triggers_enabled(&initialized)?);
+        drop(initialized);
+
+        // `open_existing_store_read_only` is the read-only path used by
+        // reporting/inspection commands.
+        let read_only = open_existing_store_read_only(&path)?.expect("store exists");
+        assert!(recursive_triggers_enabled(&read_only)?);
+        drop(read_only);
+
+        // `open_existing_store_writable` is the writable path reopened
+        // against a store that already exists.
+        let writable = open_existing_store_writable(&path)?.expect("store exists");
+        assert!(recursive_triggers_enabled(&writable)?);
+        drop(writable);
+
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_migrate_every_bound_session_once() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("pre-o3.sqlite3");
+        let first = execution_binding_fixture();
+        let second = execution_binding_with_attempt("attempt-2");
+        create_pre_o3_store(
+            &path,
+            &[
+                ("bound-1", Some(first.clone()), "2026-08-01T00:00:00Z"),
+                ("unbound", None, "2026-08-01T00:00:01Z"),
+                ("bound-2", Some(second.clone()), "2026-08-01T00:00:02Z"),
+            ],
+        )?;
+
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+        let rows = raw_adoption_rows(&conn)?;
+        assert_eq!(rows.len(), 2);
+        for (row, binding, created_at) in [
+            (&rows[0], &first, "2026-08-01T00:00:00Z"),
+            (&rows[1], &second, "2026-08-01T00:00:02Z"),
+        ] {
+            assert_eq!(row.adoption_key, None);
+            assert_eq!(row.contract, None);
+            assert_eq!(row.operation, "launch");
+            assert_eq!(row.request_digest, binding.request_digest);
+            assert_eq!(row.execution_binding_json, serde_json::to_string(binding)?);
+            assert_eq!(row.principal_ref.as_deref(), Some(&*binding.principal_ref));
+            assert_eq!(
+                row.project_digest.as_deref(),
+                Some(&*binding.project_digest)
+            );
+            assert_eq!(row.graph_id.as_deref(), Some(&*binding.graph_id));
+            assert_eq!(row.node_id.as_deref(), Some(&*binding.node_id));
+            assert_eq!(row.attempt_id.as_deref(), Some(&*binding.attempt_id));
+            assert_eq!(row.adopted_at, created_at);
+            uuid::Uuid::parse_str(&row.id)?;
+        }
+        assert_eq!(rows[0].session_id, "bound-1");
+        assert_eq!(rows[1].session_id, "bound-2");
+        assert_event_adoption_foreign_key(&conn)?;
+        drop(conn);
+
+        initialize_store(&path)?;
+        let reopened = open_initialized_store(&path)?;
+        assert_eq!(raw_adoption_rows(&reopened)?, rows);
+        assert_event_adoption_foreign_key(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_repeated_migration_repairs_only_missing_reservations() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("pre-o3-repeated.sqlite3");
+        let first = execution_binding_fixture();
+        let second = execution_binding_with_attempt("attempt-2");
+        let third = execution_binding_with_attempt("attempt-3");
+        create_pre_o3_store(
+            &path,
+            &[
+                ("bound-1", Some(first), "2026-08-01T00:00:00Z"),
+                ("bound-2", Some(second.clone()), "2026-08-01T00:00:01Z"),
+                ("bound-3", Some(third), "2026-08-01T00:00:02Z"),
+            ],
+        )?;
+        initialize_store(&path)?;
+
+        {
+            let conn = open_initialized_store(&path)?;
+            conn.execute_batch(
+                "DROP TRIGGER request_adoptions_no_update;
+                 DROP TRIGGER request_adoptions_no_delete;
+                 DELETE FROM request_adoptions WHERE session_id IN ('bound-2', 'bound-3');",
+            )?;
+            conn.execute(
+                "INSERT INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'keyed-bound-2', 'launch:keyed-2', ?1, 'launch', ?2, 'bound-2',
+                    ?3, ?4, ?5, ?6, ?7, ?8, '2026-08-02T00:00:00Z'
+                 )",
+                params![
+                    crate::request_adoption::CONTRACT,
+                    &second.request_digest,
+                    serde_json::to_string(&second)?,
+                    &second.principal_ref,
+                    &second.project_digest,
+                    &second.graph_id,
+                    &second.node_id,
+                    &second.attempt_id,
+                ],
+            )?;
+        }
+
+        let before = {
+            let conn = open_initialized_store(&path)?;
+            let rows = raw_adoption_rows(&conn)?;
+            assert_eq!(rows.len(), 2);
+            assert_event_adoption_foreign_key(&conn)?;
+            rows
+        };
+        initialize_store(&path)?;
+        let after = {
+            let conn = open_initialized_store(&path)?;
+            let rows = raw_adoption_rows(&conn)?;
+            assert_eq!(rows.len(), 3);
+            assert_event_adoption_foreign_key(&conn)?;
+            rows
+        };
+        for existing in &before {
+            assert!(
+                after.contains(existing),
+                "initialization modified existing row {existing:?}: {after:?}"
+            );
+        }
+        let repaired = after
+            .iter()
+            .find(|row| row.session_id == "bound-3")
+            .expect("missing reservation must be repaired");
+        assert_eq!(repaired.adoption_key, None);
+        assert_eq!(repaired.adopted_at, "2026-08-01T00:00:02Z");
+        let keyed = after
+            .iter()
+            .find(|row| row.session_id == "bound-2")
+            .expect("keyed row must survive");
+        assert_eq!(keyed.id, "keyed-bound-2");
+        assert_eq!(keyed.adopted_at, "2026-08-02T00:00:00Z");
+
+        initialize_store(&path)?;
+        let reopened = open_initialized_store(&path)?;
+        assert_eq!(raw_adoption_rows(&reopened)?, after);
+        assert_event_adoption_foreign_key(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_duplicate_historical_attempt_scope_fails_startup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("duplicate-pre-o3.sqlite3");
+        let binding = execution_binding_fixture();
+        let request_digest = binding.request_digest.clone();
+        create_pre_o3_store(
+            &path,
+            &[
+                ("bound-1", Some(binding.clone()), "2026-08-01T00:00:00Z"),
+                ("bound-2", Some(binding), "2026-08-01T00:00:01Z"),
+            ],
+        )?;
+
+        let error = initialize_store(&path).expect_err("duplicate scope must fail startup");
+        let rendered = format!("{error:#}");
+        // The `request_adoptions_no_replace` trigger checks retained identity
+        // conflicts before SQLite's unique-index constraint check runs, so it
+        // is what now raises for this duplicate attempt scope.
+        assert!(
+            rendered.contains("request adoptions are retained"),
+            "unexpected error: {rendered}"
+        );
+        // O3 forbids leaking ledger session IDs, digests, or bindings into
+        // diagnostics: the migration failure context must stay static.
+        assert!(
+            rendered.contains("failed to migrate historical request adoption"),
+            "unexpected error: {rendered}"
+        );
+        for sensitive in ["bound-1", "bound-2", request_digest.as_str()] {
+            assert!(
+                !rendered.contains(sensitive),
+                "error must not leak {sensitive}: {rendered}"
+            );
+        }
+        {
+            let conn = Connection::open(&path)?;
+            assert!(!sqlite_object_exists(&conn, "table", "request_adoptions")?);
+            assert!(!table_columns(&conn, "events")?
+                .iter()
+                .any(|column| column == "request_adoption_id"));
+            assert_eq!(
+                event_foreign_keys(&conn)?,
+                vec![(
+                    "sessions".to_string(),
+                    "session_id".to_string(),
+                    "id".to_string(),
+                    "CASCADE".to_string()
+                )]
+            );
+        }
+
+        let repaired = execution_binding_with_attempt("attempt-repaired");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute(
+                "UPDATE sessions SET execution_binding_json = ?1 WHERE id = 'bound-2'",
+                [serde_json::to_string(&repaired)?],
+            )?;
+        }
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+        assert_eq!(raw_adoption_rows(&conn)?.len(), 2);
+        assert_event_adoption_foreign_key(&conn)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_migration_rolls_back_on_corrupt_binding() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("corrupt-pre-o3.sqlite3");
+        create_pre_o3_store(
+            &path,
+            &[(
+                "bound-corrupt",
+                Some(execution_binding_fixture()),
+                "2026-08-01T00:00:00Z",
+            )],
+        )?;
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute(
+                "UPDATE sessions SET execution_binding_json = '{not-json'
+                 WHERE id = 'bound-corrupt'",
+                [],
+            )?;
+        }
+
+        let error = initialize_store(&path).expect_err("corrupt binding must fail startup");
+        assert!(
+            format!("{error:#}").contains("execution binding"),
+            "unexpected error: {error:#}"
+        );
+        {
+            let conn = Connection::open(&path)?;
+            assert!(!sqlite_object_exists(&conn, "table", "request_adoptions")?);
+            assert!(!table_columns(&conn, "events")?
+                .iter()
+                .any(|column| column == "request_adoption_id"));
+            assert_eq!(event_foreign_keys(&conn)?.len(), 1);
+        }
+
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute(
+                "UPDATE sessions SET execution_binding_json = ?1
+                 WHERE id = 'bound-corrupt'",
+                [serde_json::to_string(&execution_binding_fixture())?],
+            )?;
+        }
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+        assert_eq!(raw_adoption_rows(&conn)?.len(), 1);
+        assert_event_adoption_foreign_key(&conn)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_strict_readback_rejects_corrupt_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("strict.sqlite3");
+        let conn = open_store(&path)?;
+        let binding = execution_binding_fixture();
+        for (index, key) in [
+            "corrupt-contract",
+            "corrupt-operation",
+            "corrupt-digest",
+            "corrupt-binding-json",
+            "corrupt-binding-bytes",
+            "corrupt-nullability",
+            "corrupt-input-scope",
+            "corrupt-session-binding",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("strict-session-{index}");
+            let mut session = session_record(&session_id, "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+            let request = request_adoption_fixture(key, &digest_fixture('d'));
+            insert_input_adoption(
+                &conn,
+                &format!("strict-adoption-{index}"),
+                &session_id,
+                &request,
+                &binding,
+                "2026-08-15T00:00:00Z",
+            )?;
+        }
+        conn.execute_batch(
+            "DROP TRIGGER request_adoptions_no_update;
+             DROP TRIGGER request_adoptions_no_delete;
+             PRAGMA ignore_check_constraints = ON;",
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET contract = 'psyche.request_adoption.v0'
+             WHERE adoption_key = 'corrupt-contract'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET operation = 'deliver'
+             WHERE adoption_key = 'corrupt-operation'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET request_digest = ?1
+             WHERE adoption_key = 'corrupt-digest'",
+            [format!("sha256:{}", "A".repeat(64))],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET execution_binding_json = '{not-json'
+             WHERE adoption_key = 'corrupt-binding-json'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET execution_binding_json = execution_binding_json || ' '
+             WHERE adoption_key = 'corrupt-binding-bytes'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET contract = NULL
+             WHERE adoption_key = 'corrupt-nullability'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE request_adoptions SET principal_ref = 'principal:operator'
+             WHERE adoption_key = 'corrupt-input-scope'",
+            [],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET execution_binding_json = ?1
+             WHERE id = 'strict-session-7'",
+            [serde_json::to_string(&execution_binding_with_attempt(
+                "other-attempt",
+            ))?],
+        )?;
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF;")?;
+
+        for (index, key) in [
+            "corrupt-contract",
+            "corrupt-operation",
+            "corrupt-digest",
+            "corrupt-binding-json",
+            "corrupt-binding-bytes",
+            "corrupt-nullability",
+            "corrupt-input-scope",
+            "corrupt-session-binding",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = request_adoption_fixture(key, &digest_fixture('d'));
+            let error = resolve_input_adoption(
+                &conn,
+                &format!("strict-session-{index}"),
+                &request,
+                &binding,
+            )
+            .expect_err("corrupt adoption must be an internal store error");
+            assert!(
+                format!("{error:#}").contains("invalid stored request adoption"),
+                "unexpected error for {key}: {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_raw_update_and_delete_are_rejected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("immutable.sqlite3"))?;
+        let binding = execution_binding_fixture();
+        let mut session = session_record("immutable-session", "2026-08-15T00:00:00Z");
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+        let request = request_adoption_fixture("immutable-key", &binding.request_digest);
+        insert_launch_adoption(
+            &conn,
+            "immutable-adoption",
+            "immutable-session",
+            &request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+        let before = raw_adoption_rows(&conn)?;
+
+        assert_sql_error_contains(
+            conn.execute(
+                "UPDATE request_adoptions SET adopted_at = '2099-01-01T00:00:00Z'
+                 WHERE id = 'immutable-adoption'",
+                [],
+            ),
+            "request adoptions are immutable",
+        );
+        assert_sql_error_contains(
+            conn.execute(
+                "DELETE FROM request_adoptions WHERE id = 'immutable-adoption'",
+                [],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_raw_replace_cannot_bypass_retention() -> Result<()> {
+        // `INSERT OR REPLACE` / `REPLACE INTO` resolve a conflicting unique
+        // index by deleting the old row first; when `recursive_triggers` is
+        // off that implicit delete does not fire `request_adoptions_no_delete`.
+        // The `request_adoptions_no_replace` BEFORE INSERT trigger must abort
+        // before any such delete can happen, for every retained identity:
+        // existing id, existing adoption_key, existing launch attempt scope,
+        // and existing launch session_id.
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("replace-immutable.sqlite3"))?;
+        let binding = execution_binding_fixture();
+        let mut session = session_record("replace-session", "2026-08-15T00:00:00Z");
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+        let other_binding = execution_binding_with_attempt("other-attempt");
+        let mut other_session = session_record("replace-session-2", "2026-08-15T00:00:00Z");
+        other_session.execution_binding = Some(other_binding.clone());
+        insert_session(&conn, &other_session)?;
+
+        let request = request_adoption_fixture("replace-key", &binding.request_digest);
+        insert_launch_adoption(
+            &conn,
+            "replace-adoption",
+            "replace-session",
+            &request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+        let before = raw_adoption_rows(&conn)?;
+        assert_eq!(before.len(), 1);
+
+        let other_binding_json = serde_json::to_string(&other_binding)?;
+        let binding_json = serde_json::to_string(&binding)?;
+
+        // Same primary-key `INSERT OR REPLACE`: must not delete-then-reinsert.
+        assert_sql_error_contains(
+            conn.execute(
+                "INSERT OR REPLACE INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'replace-adoption', 'replace-key', ?1, 'launch', ?2, 'replace-session', ?3,
+                    ?4, ?5, ?6, ?7, ?8, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    crate::request_adoption::CONTRACT,
+                    digest_fixture('f'),
+                    other_binding_json,
+                    other_binding.principal_ref,
+                    other_binding.project_digest,
+                    other_binding.graph_id,
+                    other_binding.node_id,
+                    other_binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        // `REPLACE INTO` is sugar for `INSERT OR REPLACE`; same primary key.
+        assert_sql_error_contains(
+            conn.execute(
+                "REPLACE INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'replace-adoption', 'replace-key', ?1, 'launch', ?2, 'replace-session', ?3,
+                    ?4, ?5, ?6, ?7, ?8, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    crate::request_adoption::CONTRACT,
+                    digest_fixture('f'),
+                    other_binding_json,
+                    other_binding.principal_ref,
+                    other_binding.project_digest,
+                    other_binding.graph_id,
+                    other_binding.node_id,
+                    other_binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        // Different id, but the `adoption_key` collides with the retained
+        // row's key: must not silently replace it.
+        assert_sql_error_contains(
+            conn.execute(
+                "INSERT OR REPLACE INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'replace-adoption-by-key', 'replace-key', ?1, 'launch', ?2, 'replace-session-2', ?3,
+                    ?4, ?5, ?6, ?7, ?8, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    crate::request_adoption::CONTRACT,
+                    digest_fixture('f'),
+                    other_binding_json,
+                    other_binding.principal_ref,
+                    other_binding.project_digest,
+                    other_binding.graph_id,
+                    other_binding.node_id,
+                    other_binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        // Different id, no adoption_key collision, but the same launch
+        // five-field attempt scope: must not silently replace it.
+        assert_sql_error_contains(
+            conn.execute(
+                "REPLACE INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'replace-adoption-by-scope', NULL, NULL, 'launch', ?1, 'replace-session-2', ?2,
+                    ?3, ?4, ?5, ?6, ?7, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    digest_fixture('f'),
+                    binding_json,
+                    binding.principal_ref,
+                    binding.project_digest,
+                    binding.graph_id,
+                    binding.node_id,
+                    binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        // Different id, no key or scope collision, but the same launch
+        // session_id: must not silently replace it.
+        assert_sql_error_contains(
+            conn.execute(
+                "REPLACE INTO request_adoptions (
+                    id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    'replace-adoption-by-session', NULL, NULL, 'launch', ?1, 'replace-session', ?2,
+                    ?3, ?4, ?5, ?6, ?7, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    digest_fixture('f'),
+                    other_binding_json,
+                    other_binding.principal_ref,
+                    other_binding.project_digest,
+                    other_binding.graph_id,
+                    "different-node",
+                    "different-attempt",
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        // Hidden-rowid bypass: `request_adoptions` is a rowid table, so a raw
+        // REPLACE can target the retained row's hidden `rowid` directly while
+        // supplying entirely fresh logical identities (fresh id, no
+        // adoption_key, a fresh launch scope, and a fresh session). None of
+        // the `request_adoptions_no_replace` logical WHEN clauses match, so
+        // only `recursive_triggers = ON` firing `request_adoptions_no_delete`
+        // on the implicit conflict-resolution delete stops the retained row
+        // from being silently deleted and replaced.
+        let original_rowid: i64 = conn.query_row(
+            "SELECT rowid FROM request_adoptions WHERE id = 'replace-adoption'",
+            [],
+            |row| row.get(0),
+        )?;
+        let rowid_bypass_binding = execution_binding_with_attempt("rowid-bypass-attempt");
+        let mut rowid_bypass_session =
+            session_record("replace-session-rowid-bypass", "2026-08-15T00:00:00Z");
+        rowid_bypass_session.execution_binding = Some(rowid_bypass_binding.clone());
+        insert_session(&conn, &rowid_bypass_session)?;
+        let rowid_bypass_binding_json = serde_json::to_string(&rowid_bypass_binding)?;
+
+        assert_sql_error_contains(
+            conn.execute(
+                "INSERT OR REPLACE INTO request_adoptions (
+                    rowid, id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    ?1, 'rowid-bypass-insert', NULL, NULL, 'launch', ?2,
+                    'replace-session-rowid-bypass', ?3, ?4, ?5, ?6, ?7, ?8, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    original_rowid,
+                    digest_fixture('g'),
+                    rowid_bypass_binding_json,
+                    rowid_bypass_binding.principal_ref,
+                    rowid_bypass_binding.project_digest,
+                    rowid_bypass_binding.graph_id,
+                    rowid_bypass_binding.node_id,
+                    rowid_bypass_binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+
+        assert_sql_error_contains(
+            conn.execute(
+                "REPLACE INTO request_adoptions (
+                    rowid, id, adoption_key, contract, operation, request_digest, session_id,
+                    execution_binding_json, principal_ref, project_digest, graph_id,
+                    node_id, attempt_id, adopted_at
+                 ) VALUES (
+                    ?1, 'rowid-bypass-replace', NULL, NULL, 'launch', ?2,
+                    'replace-session-rowid-bypass', ?3, ?4, ?5, ?6, ?7, ?8, '2099-01-01T00:00:00Z'
+                 )",
+                params![
+                    original_rowid,
+                    digest_fixture('g'),
+                    rowid_bypass_binding_json,
+                    rowid_bypass_binding.principal_ref,
+                    rowid_bypass_binding.project_digest,
+                    rowid_bypass_binding.graph_id,
+                    rowid_bypass_binding.node_id,
+                    rowid_bypass_binding.attempt_id,
+                ],
+            ),
+            "request adoptions are retained",
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoption_event_correlation_rejects_invalid_insert_and_rebind() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("event-correlation.sqlite3"))?;
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
+            1
+        );
+        assert_event_adoption_foreign_key(&conn)?;
+        let first_binding = execution_binding_fixture();
+        let second_binding = execution_binding_with_attempt("attempt-2");
+        for (id, binding) in [
+            ("event-session-1", &first_binding),
+            ("event-session-2", &second_binding),
+        ] {
+            let mut session = session_record(id, "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+        }
+        insert_input_adoption(
+            &conn,
+            "input-adoption-1",
+            "event-session-1",
+            &request_adoption_fixture("input-key-1", &digest_fixture('d')),
+            &first_binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+        insert_input_adoption(
+            &conn,
+            "input-adoption-2",
+            "event-session-1",
+            &request_adoption_fixture("input-key-2", &digest_fixture('e')),
+            &first_binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+        insert_launch_adoption(
+            &conn,
+            "launch-adoption",
+            "event-session-2",
+            &request_adoption_fixture("launch-key", &second_binding.request_digest),
+            &second_binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+
+        conn.execute(
+            "INSERT INTO events (
+                id, session_id, kind, payload_json, created_at, request_adoption_id
+             ) VALUES (
+                'event-valid', 'event-session-1', 'input', '{}',
+                '2026-08-15T00:00:00Z', 'input-adoption-1'
+             )",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO events (id, session_id, kind, payload_json, created_at)
+             VALUES (
+                'event-null', 'event-session-1', 'input', '{}',
+                '2026-08-15T00:00:00Z'
+             )",
+            [],
+        )?;
+
+        for (id, session_id, kind, adoption_id) in [
+            (
+                "event-wrong-session",
+                "event-session-2",
+                "input",
+                "input-adoption-2",
+            ),
+            (
+                "event-launch-adoption",
+                "event-session-2",
+                "input",
+                "launch-adoption",
+            ),
+            (
+                "event-wrong-kind",
+                "event-session-1",
+                "output",
+                "input-adoption-2",
+            ),
+        ] {
+            assert_sql_error_contains(
+                conn.execute(
+                    "INSERT INTO events (
+                        id, session_id, kind, payload_json, created_at, request_adoption_id
+                     ) VALUES (?1, ?2, ?3, '{}', '2026-08-15T00:00:00Z', ?4)",
+                    params![id, session_id, kind, adoption_id],
+                ),
+                "invalid request adoption event correlation",
+            );
+        }
+        assert!(
+            conn.execute(
+                "INSERT INTO events (
+                    id, session_id, kind, payload_json, created_at, request_adoption_id
+                 ) VALUES (
+                    'event-duplicate', 'event-session-1', 'input', '{}',
+                    '2026-08-15T00:00:00Z', 'input-adoption-1'
+                 )",
+                [],
+            )
+            .is_err(),
+            "one adoption must correlate with at most one event"
+        );
+
+        for sql in [
+            "UPDATE events SET request_adoption_id = 'input-adoption-2'
+             WHERE id = 'event-valid'",
+            "UPDATE events SET request_adoption_id = NULL WHERE id = 'event-valid'",
+            "UPDATE events SET session_id = 'event-session-2' WHERE id = 'event-valid'",
+            "UPDATE events SET kind = 'output' WHERE id = 'event-valid'",
+            "UPDATE events SET request_adoption_id = 'input-adoption-2'
+             WHERE id = 'event-null'",
+        ] {
+            assert_sql_error_contains(
+                conn.execute(sql, []),
+                "request adoption event correlation is immutable",
+            );
+        }
+        assert_eq!(
+            conn.execute(
+                "UPDATE events SET request_adoption_id = request_adoption_id,
+                    session_id = session_id, kind = kind
+                 WHERE id = 'event-valid'",
+                [],
+            )?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_survive_status_archive_summon_and_event_retention() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("retention.sqlite3");
+        let conn = open_store(&path)?;
+        let binding = execution_binding_fixture();
+        let mut session = session_record("retained-session", "2026-08-01T00:00:00Z");
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+        insert_launch_adoption(
+            &conn,
+            "retained-launch",
+            "retained-session",
+            &request_adoption_fixture("retained-launch-key", &binding.request_digest),
+            &binding,
+            "2026-08-01T00:00:00Z",
+        )?;
+        insert_input_adoption(
+            &conn,
+            "retained-input",
+            "retained-session",
+            &request_adoption_fixture("retained-input-key", &digest_fixture('d')),
+            &binding,
+            "2026-08-01T00:01:00Z",
+        )?;
+        conn.execute(
+            "INSERT INTO events (
+                id, session_id, kind, payload_json, created_at, request_adoption_id
+             ) VALUES (
+                'retained-event', 'retained-session', 'input', '{}',
+                '2026-08-01T00:01:00Z', 'retained-input'
+             )",
+            [],
+        )?;
+        let before = raw_adoption_rows(&conn)?;
+
+        update_session_status(
+            &conn,
+            "retained-session",
+            "completed",
+            Some(0),
+            "2026-08-01T00:02:00Z",
+        )?;
+        archive_session(&conn, "retained-session", "2026-08-01T00:03:00Z")?;
+        summon_session(&conn, "retained-session", "2026-08-01T00:04:00Z")?;
+        assert_eq!(
+            prune_events_older_than_bounded(&conn, "2026-08-02T00:00:00Z", 10)?,
+            1
+        );
+        assert_eq!(raw_adoption_rows(&conn)?, before);
+        drop(conn);
+
+        initialize_store(&path)?;
+        let reopened = open_initialized_store(&path)?;
+        assert_eq!(raw_adoption_rows(&reopened)?, before);
+        assert_event_adoption_foreign_key(&reopened)?;
+        Ok(())
+    }
+
+    fn assert_adoption_conflict(resolution: AdoptionResolution, expected_field: &'static str) {
+        match resolution {
+            AdoptionResolution::Conflict { field } => assert_eq!(field, expected_field),
+            other => panic!("expected conflict at {expected_field}, got {other:?}"),
+        }
+    }
+
+    fn assert_adoption_replay(
+        resolution: AdoptionResolution,
+        expected_adoption_id: &str,
+        expected_session: &SessionRecord,
+    ) {
+        match resolution {
+            AdoptionResolution::Replay {
+                adoption_id,
+                session,
+            } => {
+                assert_eq!(adoption_id, expected_adoption_id);
+                assert_eq!(&session, expected_session);
+            }
+            other => panic!("expected replay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn request_adoptions_exact_launch_and_input_replay() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("exact-replay.sqlite3"))?;
+        let launch_binding = execution_binding_fixture();
+        let input_binding = execution_binding_with_attempt("input-session-attempt");
+        let mut launch_session = session_record("launch-session", "2026-08-15T00:00:00Z");
+        launch_session.execution_binding = Some(launch_binding.clone());
+        let mut input_session = session_record("input-session", "2026-08-15T00:00:01Z");
+        input_session.execution_binding = Some(input_binding.clone());
+        insert_session(&conn, &launch_session)?;
+        insert_session(&conn, &input_session)?;
+
+        let launch_request =
+            request_adoption_fixture("exact-launch", &launch_binding.request_digest);
+        let input_request = request_adoption_fixture("exact-input", &digest_fixture('d'));
+        assert!(matches!(
+            resolve_launch_adoption(&conn, &launch_request, &launch_binding)?,
+            AdoptionResolution::Absent
+        ));
+        assert!(matches!(
+            resolve_input_adoption(&conn, "input-session", &input_request, &input_binding)?,
+            AdoptionResolution::Absent
+        ));
+        insert_launch_adoption(
+            &conn,
+            "launch-adoption",
+            "launch-session",
+            &launch_request,
+            &launch_binding,
+            "2026-08-15T00:01:00Z",
+        )?;
+        insert_input_adoption(
+            &conn,
+            "input-adoption",
+            "input-session",
+            &input_request,
+            &input_binding,
+            "2026-08-15T00:02:00Z",
+        )?;
+
+        assert_adoption_replay(
+            resolve_launch_adoption(&conn, &launch_request, &launch_binding)?,
+            "launch-adoption",
+            &launch_session,
+        );
+        assert_adoption_replay(
+            resolve_input_adoption(&conn, "input-session", &input_request, &input_binding)?,
+            "input-adoption",
+            &input_session,
+        );
+        let launch_record =
+            load_request_adoption_by_id(&conn, "launch-adoption")?.expect("launch record");
+        assert_eq!(launch_record.operation, RequestAdoptionOperation::Launch);
+        assert_eq!(launch_record.adoption_key.as_deref(), Some("exact-launch"));
+        let input_record =
+            load_request_adoption_by_id(&conn, "input-adoption")?.expect("input record");
+        assert_eq!(input_record.operation, RequestAdoptionOperation::Input);
+        assert_eq!(input_record.adoption_key.as_deref(), Some("exact-input"));
+        Ok(())
+    }
+
+    // O3 forbids leaking ledger session ids (or any other retained identity)
+    // into errors and diagnostics. If a stored session row is malformed
+    // (here: unparsable `labels`), `get_session`'s failure formats the
+    // session id straight into its message. Exact replay must redact that
+    // failure at the shared `replay_resolution` boundary rather than
+    // propagate it, for both launch and input adoption resolution.
+    #[test]
+    fn request_adoptions_replay_redacts_malformed_session_readback_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("replay-redaction.sqlite3"))?;
+        let launch_binding = execution_binding_fixture();
+        let input_binding = execution_binding_with_attempt("input-session-attempt");
+        let mut launch_session = session_record("launch-session", "2026-08-15T00:00:00Z");
+        launch_session.execution_binding = Some(launch_binding.clone());
+        let mut input_session = session_record("input-session", "2026-08-15T00:00:01Z");
+        input_session.execution_binding = Some(input_binding.clone());
+        insert_session(&conn, &launch_session)?;
+        insert_session(&conn, &input_session)?;
+
+        let launch_request =
+            request_adoption_fixture("exact-launch", &launch_binding.request_digest);
+        let input_request = request_adoption_fixture("exact-input", &digest_fixture('d'));
+        insert_launch_adoption(
+            &conn,
+            "launch-adoption",
+            "launch-session",
+            &launch_request,
+            &launch_binding,
+            "2026-08-15T00:01:00Z",
+        )?;
+        insert_input_adoption(
+            &conn,
+            "input-adoption",
+            "input-session",
+            &input_request,
+            &input_binding,
+            "2026-08-15T00:02:00Z",
+        )?;
+
+        // Corrupt retained session data directly, bypassing the store API,
+        // the way a reviewer-tampered or otherwise malformed row would.
+        conn.execute(
+            "UPDATE sessions SET labels = '{not valid json' WHERE id = ?1",
+            params!["launch-session"],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET labels = '{not valid json' WHERE id = ?1",
+            params!["input-session"],
+        )?;
+
+        let launch_error = resolve_launch_adoption(&conn, &launch_request, &launch_binding)
+            .expect_err("malformed session data must surface as an internal failure");
+        let input_error =
+            resolve_input_adoption(&conn, "input-session", &input_request, &input_binding)
+                .expect_err("malformed session data must surface as an internal failure");
+
+        let sensitive = [
+            "launch-session",
+            "input-session",
+            "launch-adoption",
+            "input-adoption",
+            "exact-launch",
+            "exact-input",
+            launch_binding.request_digest.as_str(),
+            input_binding.request_digest.as_str(),
+            launch_binding.attempt_id.as_str(),
+            input_binding.attempt_id.as_str(),
+        ];
+        for error in [&launch_error, &input_error] {
+            let rendered = format!("{error:#}");
+            let debug_rendered = format!("{error:?}");
+            for value in sensitive {
+                assert!(
+                    !rendered.contains(value),
+                    "error display must not leak {value}: {rendered}"
+                );
+                assert!(
+                    !debug_rendered.contains(value),
+                    "error debug chain must not leak {value}: {debug_rendered}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_each_same_key_identity_difference_conflicts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("identity-conflicts.sqlite3"))?;
+        let mut binding = execution_binding_fixture();
+        binding.parent = Some(crate::execution_binding::ExecutionBindingParent {
+            session_id: "parent-session".to_string(),
+            graph_id: "parent-graph".to_string(),
+            node_id: "parent-node".to_string(),
+            attempt_id: "parent-attempt".to_string(),
+        });
+        binding.delegation_digest = Some(digest_fixture('d'));
+        let mut session = session_record("identity-session", "2026-08-15T00:00:00Z");
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+        let request = request_adoption_fixture("identity-key", &binding.request_digest);
+        insert_launch_adoption(
+            &conn,
+            "identity-adoption",
+            "identity-session",
+            &request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+
+        // O3 contract §6: every hidden identity member (contract, operation,
+        // digest, input session, binding) must collapse to the same
+        // `requestAdoption.key` conflict when the submitted key matches an
+        // existing row that is not an exact replay - the specific field that
+        // differs must never leak.
+        let mut changed_contract = request.clone();
+        changed_contract.contract = "psyche.request_adoption.v2".to_string();
+        assert_adoption_conflict(
+            resolve_launch_adoption(&conn, &changed_contract, &binding)?,
+            "requestAdoption.key",
+        );
+        let mut changed_digest = request.clone();
+        changed_digest.request_digest = digest_fixture('e');
+        assert_adoption_conflict(
+            resolve_launch_adoption(&conn, &changed_digest, &binding)?,
+            "requestAdoption.key",
+        );
+        assert_adoption_conflict(
+            resolve_input_adoption(&conn, "identity-session", &request, &binding)?,
+            "requestAdoption.key",
+        );
+
+        let mut other_session = session_record("identity-session-2", "2026-08-15T00:00:00Z");
+        other_session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &other_session)?;
+        let input_request = request_adoption_fixture("identity-input-key", &binding.request_digest);
+        insert_input_adoption(
+            &conn,
+            "identity-input-adoption",
+            "identity-session",
+            &input_request,
+            &binding,
+            "2026-08-15T00:00:01Z",
+        )?;
+        assert_adoption_conflict(
+            resolve_input_adoption(&conn, "identity-session-2", &input_request, &binding)?,
+            "requestAdoption.key",
+        );
+
+        type BindingMutation = Box<dyn Fn(&mut crate::execution_binding::ExecutionBinding)>;
+        let binding_cases: Vec<(&'static str, BindingMutation)> = vec![
+            (
+                "executionBinding.contract",
+                Box::new(|value| value.contract = "psyche.execution_binding.v2".to_string()),
+            ),
+            (
+                "executionBinding.principalRef",
+                Box::new(|value| value.principal_ref = "principal:other".to_string()),
+            ),
+            (
+                "executionBinding.familiarId",
+                Box::new(|value| value.familiar_id = "other-familiar".to_string()),
+            ),
+            (
+                "executionBinding.familiarSnapshotDigest",
+                Box::new(|value| value.familiar_snapshot_digest = digest_fixture('e')),
+            ),
+            (
+                "executionBinding.projectDigest",
+                Box::new(|value| value.project_digest = digest_fixture('e')),
+            ),
+            (
+                "executionBinding.graphId",
+                Box::new(|value| value.graph_id = "other-graph".to_string()),
+            ),
+            (
+                "executionBinding.nodeId",
+                Box::new(|value| value.node_id = "other-node".to_string()),
+            ),
+            (
+                "executionBinding.attemptId",
+                Box::new(|value| value.attempt_id = "other-attempt".to_string()),
+            ),
+            (
+                "executionBinding.requestDigest",
+                Box::new(|value| value.request_digest = digest_fixture('e')),
+            ),
+            (
+                "executionBinding.policyRevision",
+                Box::new(|value| value.policy_revision = "policy:other".to_string()),
+            ),
+            (
+                "executionBinding.expiresAt",
+                Box::new(|value| value.expires_at = "2098-01-01T00:00:00Z".to_string()),
+            ),
+            (
+                "parent.sessionId",
+                Box::new(|value| {
+                    value.parent.as_mut().expect("parent").session_id = "other-parent".to_string();
+                }),
+            ),
+            (
+                "parent.graphId",
+                Box::new(|value| {
+                    value.parent.as_mut().expect("parent").graph_id =
+                        "other-parent-graph".to_string();
+                }),
+            ),
+            (
+                "parent.nodeId",
+                Box::new(|value| {
+                    value.parent.as_mut().expect("parent").node_id =
+                        "other-parent-node".to_string();
+                }),
+            ),
+            (
+                "parent.attemptId",
+                Box::new(|value| {
+                    value.parent.as_mut().expect("parent").attempt_id =
+                        "other-parent-attempt".to_string();
+                }),
+            ),
+            ("parent", Box::new(|value| value.parent = None)),
+            (
+                "executionBinding.delegationDigest",
+                Box::new(|value| value.delegation_digest = Some(digest_fixture('e'))),
+            ),
+        ];
+        for (mutated_field, mutate) in binding_cases {
+            let mut changed = binding.clone();
+            mutate(&mut changed);
+            let resolution = resolve_launch_adoption(&conn, &request, &changed)?;
+            match resolution {
+                AdoptionResolution::Conflict { field } => assert_eq!(
+                    field, "requestAdoption.key",
+                    "binding mismatch at {mutated_field} must not leak its field path"
+                ),
+                other => panic!(
+                    "expected conflict at requestAdoption.key for {mutated_field}, got {other:?}"
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_global_key_and_attempt_scope_conflicts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("global-conflicts.sqlite3"))?;
+        let binding = execution_binding_fixture();
+        let second_binding = execution_binding_with_attempt("second-attempt");
+        for (id, value) in [
+            ("global-session-1", &binding),
+            ("global-session-2", &second_binding),
+        ] {
+            let mut session = session_record(id, "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(value.clone());
+            insert_session(&conn, &session)?;
+        }
+        let launch_request = request_adoption_fixture("global-key", &binding.request_digest);
+        insert_launch_adoption(
+            &conn,
+            "global-launch",
+            "global-session-1",
+            &launch_request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+
+        assert_adoption_conflict(
+            resolve_input_adoption(
+                &conn,
+                "global-session-2",
+                &request_adoption_fixture("global-key", &digest_fixture('d')),
+                &second_binding,
+            )?,
+            "requestAdoption.key",
+        );
+        assert_adoption_conflict(
+            resolve_launch_adoption(
+                &conn,
+                &request_adoption_fixture("different-key", &binding.request_digest),
+                &binding,
+            )?,
+            "executionBinding.attemptId",
+        );
+
+        let input_request = request_adoption_fixture("input-global-key", &digest_fixture('e'));
+        insert_input_adoption(
+            &conn,
+            "global-input",
+            "global-session-2",
+            &input_request,
+            &second_binding,
+            "2026-08-15T00:00:00Z",
+        )?;
+        assert_adoption_conflict(
+            resolve_input_adoption(&conn, "global-session-1", &input_request, &binding)?,
+            "requestAdoption.key",
+        );
+        assert_adoption_conflict(
+            resolve_launch_adoption(&conn, &input_request, &second_binding)?,
+            "requestAdoption.key",
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_different_attempt_id_succeeds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("different-attempt.sqlite3"))?;
+        let first = execution_binding_fixture();
+        let second = execution_binding_with_attempt("attempt-2");
+        for (id, binding) in [
+            ("attempt-session-1", &first),
+            ("attempt-session-2", &second),
+        ] {
+            let mut session = session_record(id, "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+        }
+        insert_launch_adoption(
+            &conn,
+            "attempt-adoption-1",
+            "attempt-session-1",
+            &request_adoption_fixture("attempt-key-1", &first.request_digest),
+            &first,
+            "2026-08-15T00:00:00Z",
+        )?;
+        let second_request = request_adoption_fixture("attempt-key-2", &second.request_digest);
+        assert!(matches!(
+            resolve_launch_adoption(&conn, &second_request, &second)?,
+            AdoptionResolution::Absent
+        ));
+        insert_launch_adoption(
+            &conn,
+            "attempt-adoption-2",
+            "attempt-session-2",
+            &second_request,
+            &second,
+            "2026-08-15T00:00:00Z",
+        )?;
+        assert_eq!(raw_adoption_rows(&conn)?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoption_insert_helpers_reject_incomplete_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("insert-validation.sqlite3"))?;
+        let binding = execution_binding_fixture();
+        let other_binding = execution_binding_with_attempt("other-attempt");
+        let mut session = session_record("validated-session", "2026-08-15T00:00:00Z");
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+
+        let mut invalid_request =
+            request_adoption_fixture("invalid key with spaces", &binding.request_digest);
+        assert!(insert_launch_adoption(
+            &conn,
+            "invalid-key",
+            "validated-session",
+            &invalid_request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )
+        .is_err());
+        invalid_request = request_adoption_fixture("valid-key", &digest_fixture('d'));
+        assert!(insert_launch_adoption(
+            &conn,
+            "mismatched-digest",
+            "validated-session",
+            &invalid_request,
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )
+        .is_err());
+        assert!(insert_input_adoption(
+            &conn,
+            "mismatched-session-binding",
+            "validated-session",
+            &request_adoption_fixture("input-key", &digest_fixture('d')),
+            &other_binding,
+            "2026-08-15T00:00:00Z",
+        )
+        .is_err());
+        let mut invalid_binding = binding.clone();
+        invalid_binding.project_digest = "not-a-digest".to_string();
+        assert!(insert_input_adoption(
+            &conn,
+            "invalid-binding",
+            "validated-session",
+            &request_adoption_fixture("input-key-2", &digest_fixture('d')),
+            &invalid_binding,
+            "2026-08-15T00:00:00Z",
+        )
+        .is_err());
+        assert!(insert_input_adoption(
+            &conn,
+            "missing-session",
+            "missing-session",
+            &request_adoption_fixture("input-key-3", &digest_fixture('d')),
+            &binding,
+            "2026-08-15T00:00:00Z",
+        )
+        .is_err());
+        assert!(raw_adoption_rows(&conn)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_separate_connection_insert_races_have_one_winner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("races.sqlite3");
+        let conn = open_store(&path)?;
+        let launch_binding = execution_binding_fixture();
+        let input_binding = execution_binding_with_attempt("input-attempt");
+        let cross_launch_binding = execution_binding_with_attempt("cross-launch-attempt");
+        let cross_input_binding = execution_binding_with_attempt("cross-input-attempt");
+        for (id, binding) in [
+            ("race-launch-session", &launch_binding),
+            ("race-input-session", &input_binding),
+            ("race-cross-launch-session", &cross_launch_binding),
+            ("race-cross-input-session", &cross_input_binding),
+        ] {
+            let mut session = session_record(id, "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+        }
+        drop(conn);
+
+        let launch_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut launch_handles = Vec::new();
+        for suffix in ["a", "b"] {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&launch_barrier);
+            let binding = launch_binding.clone();
+            launch_handles.push(std::thread::spawn(move || {
+                let conn = open_initialized_store(&path)?;
+                let request = request_adoption_fixture("race-launch-key", &binding.request_digest);
+                barrier.wait();
+                insert_launch_adoption(
+                    &conn,
+                    &format!("race-launch-{suffix}"),
+                    "race-launch-session",
+                    &request,
+                    &binding,
+                    "2026-08-15T00:00:00Z",
+                )
+            }));
+        }
+        launch_barrier.wait();
+        let launch_results = launch_handles
+            .into_iter()
+            .map(|handle| handle.join().expect("launch race thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            launch_results
+                .iter()
+                .filter(|result| result.is_ok())
+                .count(),
+            1,
+            "{launch_results:?}"
+        );
+
+        let input_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut input_handles = Vec::new();
+        for suffix in ["a", "b"] {
+            let path = path.clone();
+            let barrier = std::sync::Arc::clone(&input_barrier);
+            let binding = input_binding.clone();
+            input_handles.push(std::thread::spawn(move || {
+                let conn = open_initialized_store(&path)?;
+                let request = request_adoption_fixture("race-input-key", &digest_fixture('d'));
+                barrier.wait();
+                insert_input_adoption(
+                    &conn,
+                    &format!("race-input-{suffix}"),
+                    "race-input-session",
+                    &request,
+                    &binding,
+                    "2026-08-15T00:00:00Z",
+                )
+            }));
+        }
+        input_barrier.wait();
+        let input_results = input_handles
+            .into_iter()
+            .map(|handle| handle.join().expect("input race thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            input_results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{input_results:?}"
+        );
+
+        let cross_barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let launch_path = path.clone();
+        let launch_barrier = std::sync::Arc::clone(&cross_barrier);
+        let launch_binding_for_thread = cross_launch_binding.clone();
+        let cross_launch = std::thread::spawn(move || {
+            let conn = open_initialized_store(&launch_path)?;
+            let request = request_adoption_fixture(
+                "race-cross-key",
+                &launch_binding_for_thread.request_digest,
+            );
+            launch_barrier.wait();
+            insert_launch_adoption(
+                &conn,
+                "race-cross-launch",
+                "race-cross-launch-session",
+                &request,
+                &launch_binding_for_thread,
+                "2026-08-15T00:00:00Z",
+            )
+        });
+        let input_path = path.clone();
+        let input_barrier = std::sync::Arc::clone(&cross_barrier);
+        let input_binding_for_thread = cross_input_binding.clone();
+        let cross_input = std::thread::spawn(move || {
+            let conn = open_initialized_store(&input_path)?;
+            let request = request_adoption_fixture("race-cross-key", &digest_fixture('d'));
+            input_barrier.wait();
+            insert_input_adoption(
+                &conn,
+                "race-cross-input",
+                "race-cross-input-session",
+                &request,
+                &input_binding_for_thread,
+                "2026-08-15T00:00:00Z",
+            )
+        });
+        cross_barrier.wait();
+        let cross_results = [
+            cross_launch.join().expect("cross-operation launch race"),
+            cross_input.join().expect("cross-operation input race"),
+        ];
+        assert_eq!(
+            cross_results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "{cross_results:?}"
+        );
+
+        let conn = open_initialized_store(&path)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM request_adoptions
+                 WHERE adoption_key IN (
+                    'race-launch-key', 'race-input-key', 'race-cross-key'
+                 )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_close_reopen_preserves_exact_record_and_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("reopen.sqlite3");
+        let binding = execution_binding_fixture();
+        let request = request_adoption_fixture("reopen-key", &binding.request_digest);
+        let input_request = request_adoption_fixture("reopen-input-key", &digest_fixture('d'));
+        let expected_session = {
+            let conn = open_store(&path)?;
+            let mut session = session_record("reopen-session", "2026-08-15T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+            insert_launch_adoption(
+                &conn,
+                "reopen-adoption",
+                "reopen-session",
+                &request,
+                &binding,
+                "2026-08-15T00:01:00Z",
+            )?;
+            insert_input_adoption(
+                &conn,
+                "reopen-input-adoption",
+                "reopen-session",
+                &input_request,
+                &binding,
+                "2026-08-15T00:02:00Z",
+            )?;
+            let launch_before =
+                load_request_adoption_by_id(&conn, "reopen-adoption")?.expect("record");
+            let input_before =
+                load_request_adoption_by_id(&conn, "reopen-input-adoption")?.expect("record");
+            assert_adoption_replay(
+                resolve_launch_adoption(&conn, &request, &binding)?,
+                "reopen-adoption",
+                &session,
+            );
+            assert_adoption_replay(
+                resolve_input_adoption(&conn, "reopen-session", &input_request, &binding)?,
+                "reopen-input-adoption",
+                &session,
+            );
+            (launch_before, input_before, session)
+        };
+
+        initialize_store(&path)?;
+        let conn = open_initialized_store(&path)?;
+        let after = load_request_adoption_by_id(&conn, "reopen-adoption")?.expect("record");
+        assert_eq!(after, expected_session.0);
+        let input_after =
+            load_request_adoption_by_id(&conn, "reopen-input-adoption")?.expect("record");
+        assert_eq!(input_after, expected_session.1);
+        assert_adoption_replay(
+            resolve_launch_adoption(&conn, &request, &binding)?,
+            "reopen-adoption",
+            &expected_session.2,
+        );
+        assert_adoption_replay(
+            resolve_input_adoption(&conn, "reopen-session", &input_request, &binding)?,
+            "reopen-input-adoption",
+            &expected_session.2,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_atomic_not_live_rolls_back_without_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut conn = open_store(&temp.path().join("not-live-input.sqlite3"))?;
+        let binding = execution_binding_fixture();
+        let mut session = session_record("not-live-input", "2026-08-15T00:00:00Z");
+        session.status = "completed".to_string();
+        session.execution_binding = Some(binding.clone());
+        insert_session(&conn, &session)?;
+        let request = request_adoption_fixture("not-live-input-key", &digest_fixture('d'));
+
+        let result = acquire_session_input_lease_and_adopt(
+            &mut conn,
+            &session.id,
+            &request,
+            &binding,
+            "2026-08-15T00:01:00Z",
+        )?;
+
+        assert_eq!(result, InputAdoptionResult::NotLive);
+        assert!(conn.is_autocommit(), "helper must close its transaction");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM request_adoptions WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+                [&session.id],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        let transaction =
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.rollback()?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_have_no_production_mutation_or_prune_helpers() {
+        let source = include_str!("store.rs");
+        for verb in ["update", "delete", "prune"] {
+            let forbidden = ["pub fn ", verb, "_request_", "adoption"].concat();
+            assert!(
+                !source.contains(&forbidden),
+                "append-only ledger exposed forbidden helper {forbidden}"
+            );
         }
     }
 

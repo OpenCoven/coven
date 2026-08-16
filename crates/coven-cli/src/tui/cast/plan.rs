@@ -413,9 +413,11 @@ fn familiar_spell_plan(
 
 fn sacrifice_plan(session_id: &str, intent: CastIntent) -> CastPlan {
     let decision = SafetyDecision::Confirm {
-        reason: "sacrifice permanently deletes a session and its events".to_string(),
-        suggestion: "Cast will ask you to type `sacrifice` to confirm before the daemon \
-                     deletes the session and its event log."
+        reason: "sacrifice permanently deletes an eligible non-running session and its events"
+            .to_string(),
+        suggestion: "Retention rule: adopted or reserved sessions are retained. Cast will ask \
+                     you to type `sacrifice` before requesting deletion, and final retention \
+                     eligibility is checked again."
             .to_string(),
     };
     CastPlan {
@@ -425,11 +427,11 @@ fn sacrifice_plan(session_id: &str, intent: CastIntent) -> CastPlan {
         steps: vec![
             CastStep::new(
                 CastStepKind::Sacrifice,
-                "Permanently delete the session and its events",
+                "Check retention eligibility, then delete the session and its events",
             ),
             CastStep::new(
                 CastStepKind::Inform,
-                "Cast will require typed `sacrifice` confirmation before any delete",
+                "Require typed `sacrifice` confirmation before any eligible delete",
             ),
         ],
         decision,
@@ -643,11 +645,30 @@ mod tests {
 
         assert_eq!(plan.risk(), CastRisk::Confirm);
         match plan.decision {
-            SafetyDecision::Confirm { reason, .. } => {
-                assert!(reason.contains("sacrifice"));
+            SafetyDecision::Confirm { reason, suggestion } => {
+                assert_eq!(
+                    reason,
+                    "sacrifice permanently deletes an eligible non-running session and its events"
+                );
+                assert_eq!(
+                    suggestion,
+                    "Retention rule: adopted or reserved sessions are retained. Cast will ask you to type `sacrifice` before requesting deletion, and final retention eligibility is checked again."
+                );
             }
             other => panic!("expected confirm, got {other:?}"),
         }
+        assert_eq!(plan.headline, "Sacrifice session abcdef123456");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].kind, CastStepKind::Sacrifice);
+        assert_eq!(
+            plan.steps[0].note,
+            "Check retention eligibility, then delete the session and its events"
+        );
+        assert_eq!(plan.steps[1].kind, CastStepKind::Inform);
+        assert_eq!(
+            plan.steps[1].note,
+            "Require typed `sacrifice` confirmation before any eligible delete"
+        );
         assert_eq!(plan.session_id.as_deref(), Some("abcdef123456"));
     }
 

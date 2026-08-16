@@ -38,8 +38,8 @@ Commands                               Snapshot
   /tui       Open TUI                  daemon          unknown
   /doctor    Doctor
   /daemon    Daemon status
-  /run       Run an agent
-1 of 14
+  /status    Coven status
+1 of 15
 
 spell           /start
 detail          Setup check and a safe first command
@@ -70,8 +70,8 @@ Commands                               Snapshot
   /tui       Open TUI                  daemon          unknown
   /doctor    Doctor
   /daemon    Daemon status
-  /run       Run an agent
-1 of 14
+  /status    Coven status
+1 of 15
 
 spell           /start
 detail          Setup check and a safe first command
@@ -84,7 +84,7 @@ What to verify in a real terminal:
 - Empty-prompt placeholder (`> type a task or /run codex`) renders in `DIM`; typed input (`> polish the README`) renders in `TEXT`. The shift from dim to bright as the user types is the focus signal.
 - The terminal cursor is at the end of the input line. There is no synthetic `█` block.
 
-## Launcher frame — selection=12 (`/sacrifice`), width=76
+## Launcher frame — zero-based selection=13 (`/sacrifice`), width=76
 
 ```text
 Cast
@@ -100,19 +100,19 @@ Commands                               Snapshot
   /summon    Summon session
   /archive   Archive session
 › /sacrifice Sacrifice session
-13 of 14
+14 of 15
 
 spell           /sacrifice
-detail          Permanently delete a non-running session
+detail          Delete eligible non-running; adopted/reserved sessions are …
 
 enter run · ↑↓ select · esc quit · ctrl+u clear
 ```
 
 What to verify in a real terminal:
 
-- The command rail is windowed: items 7–12 are visible (six rows) with `/sacrifice` highlighted at the bottom.
-- The scroll hint `13 of 14` renders in `DIM` below the rail.
-- The action preview still resolves correctly to the new selection (`/sacrifice` + its description).
+- The command rail is windowed: zero-based item indexes 8–13 (one-based positions 9–14) are visible, with `/sacrifice` at zero-based selection 13 and highlighted at the bottom.
+- The one-based scroll hint `14 of 15` renders in `DIM` below the rail.
+- The action preview still resolves correctly to the new selection (`/sacrifice` + its eligible-non-running, adopted/reserved-retained description).
 - When the user picks `/sacrifice` and presses Enter with an empty prompt, the Cast safety gate prompts for the typed `sacrifice` confirmation — that flow is covered by `cast_plan_for_sacrifice_describes_typed_confirm_in_copy` and the smoke `sacrifice` test, not by re-rendering here.
 
 ## Cast non-interactive frame (piped stdout)

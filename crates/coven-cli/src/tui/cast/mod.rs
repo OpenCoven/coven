@@ -29,7 +29,7 @@ pub(crate) use attach::{
     reconstruct_quest, ReconstructedQuest,
 };
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
-pub(crate) use gate::{evaluate_gate, GateOutcome};
+pub(crate) use gate::{evaluate_gate, GateOutcome, SACRIFICE_CONFIRM_WORD};
 pub(crate) use intent::{parse_spell, CastHarness, CastIntent, ObserveView};
 pub(crate) use outcome::CastOutcome;
 pub(crate) use plan::{build_plan, CastPlan};

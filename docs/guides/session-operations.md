@@ -67,13 +67,17 @@ coven kill session-1
 On Windows, use a named-pipe-capable local integration to request
 `POST /api/v1/sessions/:id/kill` from the daemon that owns the session.
 
-For a non-running session you no longer need, permanently delete the record and event history only with explicit confirmation:
+For an eligible non-running session without adopted or historical reserved
+evidence, permanently delete the record and event history only with explicit
+confirmation:
 
 ```sh
 coven sacrifice session-1 --yes
 ```
 
-There is no undo for sacrifice. Archive first when you only want to remove work from the active list.
+There is no undo for sacrifice. Archive first when you only want to remove work
+from the active list. Adopted/reserved sessions cannot be sacrificed and must
+be retained; O3 provides no retention/fence release.
 
 ## Related
 

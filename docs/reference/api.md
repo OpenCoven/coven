@@ -19,7 +19,7 @@ daemon serves is listed here.
 ```mermaid
 flowchart LR
   Root["/api/v1"] --> Contract["api-version · health · capabilities · actions"]
-  Root --> Sessions["/sessions + /events"]
+  Root --> Sessions["/sessions + adopted sessions/input + /events"]
   Root --> Reads["overview · familiars · skills · memory · research · coven-calls · cast-codes"]
   Root --> Writes["cast · familiars/:id/icon|edits · skills/eval-loop"]
   Root --> Store["store/vacuum"]
@@ -28,7 +28,7 @@ flowchart LR
   Root --> Hub["/hub"]
 ```
 
-All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. Capabilities advertise availability and never grant permission.
+All error responses use the structured envelope documented in the [API contract](/API-CONTRACT#structured-error-envelope): `{ "error": { "code", "message", "details" } }`. Unknown routes, action ids, and API versions fail closed. Clients negotiate the named `coven.daemon.v1` contract with `GET /api/v1/health`, then check every capability required by the operation. Boolean operation-group flags (`sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsCommit`, `afsCommitDryRun`) are advertised in the health `capabilities` block — treat a group as unavailable unless health advertises it. `executionBindingContracts` advertises standalone O2 support. The exact O3 value in `requestAdoptionContracts` advertises the composite adopted launch/input contract, including its mandatory per-request exact O2 proof; the bundled adopted client gates on this O3 field rather than independently checking both arrays. Capabilities advertise availability and never grant permission.
 
 ## Contract and discovery
 
@@ -41,10 +41,11 @@ All error responses use the structured envelope documented in the [API contract]
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
 | POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | `{ ok, accepted, status, event }` · `400 invalid_request` |
 
-The health `capabilities` object currently contains all 14 fields:
+The health `capabilities` object currently contains all 16 fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
 `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`,
-`afs`, `afsMount`, `afsCommit`, and `afsCommitDryRun`. The
+`afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`,
+`executionBindingContracts`, and `requestAdoptionContracts`. The
 `sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
 always `false` over TCP; Host and Origin allowlists do not elevate TCP
 authority. `daemon` is either `null` or
@@ -68,14 +69,16 @@ snapshot reported by `eventWriter`.
 | Method | Path | Purpose | Body / query | Success | Errors |
 |---|---|---|---|---|---|
 | GET | `/api/v1/sessions` | List sessions. | — | `SessionRecord[]` | — |
-| POST | `/api/v1/sessions` | Launch a project-scoped harness session. `launchPolicy` requires `capabilities.sessionLaunchPolicy === true`; its initial exact contract is `{ approval: "never", sandbox: "workspace-write", addDirs?: string[] }` for Codex `nonInteractive`, with every additional directory absolute, existing, canonicalized, and explicitly listed (including an external mission workspace when named). The field is owner-local-IPC-only; TCP returns `403 forbidden`. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, launchPolicy?, conversation?, conversationId? }` | `SessionRecord` | `400 invalid_request`, `403 forbidden`, `500 launch_failed` |
-| POST | `/api/v1/sessions/external` | Register (or idempotently re-register) an externally launched session. | session descriptor | `201` new / `200` existing | `400`, `409 session_id_conflict` |
+| POST | `/api/v1/sessions` | Launch an unbound project-scoped harness session. A bound request is rejected and must use the adopted route. `launchPolicy` requires `capabilities.sessionLaunchPolicy === true`; its initial exact contract is `{ approval: "never", sandbox: "workspace-write", addDirs?: string[] }` for Codex `nonInteractive`, with every additional directory absolute, existing, canonicalized, and explicitly listed (including an external mission workspace when named). The field is owner-local-IPC-only; TCP returns `403 forbidden`. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, launchPolicy?, conversation?, conversationId? }` | `201 SessionRecord` | `400 invalid_request`, `request_adoption_required`, `request_adoption_invalid`; `403 forbidden`; `500 launch_failed` |
+| POST | `/api/v1/adopted-sessions` | Durably adopt and launch a bound session. | Normal launch fields plus complete `executionBinding` and closed `requestAdoption` metadata. | `201 SessionRecord` first adoption; `200 SessionRecord` exact replay | O2 errors; `400 request_adoption_required`, `request_adoption_invalid`, `request_adoption_unsupported`; `409 request_adoption_conflict`; synchronous post-adoption HTTP errors carry marker-only `{"adopted":true,"delivery":"not_asserted"}` details |
+| POST | `/api/v1/sessions/external` | Register (or idempotently re-register) an externally launched session. `requestAdoption` rejection precedes `executionBinding` rejection. | session descriptor | `201` new / `200` existing | `400 invalid_request` for malformed JSON or missing/invalid required registration fields; `400 request_adoption_invalid` wins when both reserved members are supplied; otherwise `400 execution_binding_invalid`; `409 session_id_conflict` |
 | GET | `/api/v1/sessions/:id` | Fetch one session. | — | `SessionRecord` | `404 session_not_found` |
 | POST | `/api/v1/sessions/:id/complete` | Mark an external session completed. | `{ exitCode?, ... }` | updated record | `404 session_not_found`, `422 not_external_session` |
 | GET | `/api/v1/sessions/:id/events` | Read redacted session events. | `?afterSeq`, `?afterEventId`, `?limit` | `{ events, nextCursor, hasMore }` | `404 session_not_found` |
 | GET | `/api/v1/sessions/:id/log` | Read bounded redacted log previews. | — | `[{ ts, level, message }]` | `404 session_not_found` |
-| POST | `/api/v1/sessions/:id/input` | Forward input to a live session. | `{ data }` | `{ ok, accepted }` | `400`, `404`, `409 session_not_live`, `500 send_input_failed` |
-| POST | `/api/v1/sessions/:id/kill` | Kill a live session. | — | `{ ok, accepted }` | `404`, `409 session_not_live`, `500 kill_failed` |
+| POST | `/api/v1/sessions/:id/input` | Forward input to a live unbound session. Bound input is rejected and must use the adopted route. | `{ data }` | `202 { ok, accepted }` | `400`, `404`, `409 session_not_live`, `500 send_input_failed`; bound requests: `request_adoption_required` or invalid-location `request_adoption_invalid` |
+| POST | `/api/v1/sessions/:id/adopted-input` | Durably adopt input for a bound live session before the runtime side effect. | `{ data, executionBinding, requestAdoption }` | `202 {"adopted":true,"replayed":false,"delivery":"not_asserted"}` first adoption; `200 {"adopted":true,"replayed":true,"delivery":"not_asserted"}` exact replay | O2 errors; `400 request_adoption_required`, `request_adoption_invalid`, `request_adoption_unsupported`; `409 request_adoption_conflict`; synchronous post-adoption HTTP errors retain their concrete code and carry the marker-only adoption details |
+| POST | `/api/v1/sessions/:id/kill` | Kill a live session. A bound kill requires exact O2 proof; adoption is not accepted. | Bound: `{ executionBinding }`; unbound: — | `{ ok, accepted }` | `400 request_adoption_invalid` when adoption is supplied; `404`, `409 session_not_live`, `500 kill_failed` |
 | POST | `/api/v1/sessions/:id/handoffs` | Validate, redact, and offer a `coven.handoff.v1` packet. | packet | `{ handoff, packet, eventCursor, workspace }` | `400`, `404`, `409`, `413 handoff_too_large` |
 | GET | `/api/v1/sessions/:id/handoffs` | Read durable handoffs (`?latest=true` narrows to the latest). | `?latest=true` | `{ handoffs }` | `404` |
 | POST | `/api/v1/sessions/:id/handoffs/:handoffId/claim` | Atomically claim a generation and fence source input. | `{ expectedGeneration, claimant, idempotencyKey, destinationWorkspace }` | `{ handoff, sourceInputFenced }` | `409 handoff_stale_generation`, `handoff_already_claimed`, `transcript_diverged`, `workspace_diverged` |
@@ -85,6 +88,16 @@ snapshot reported by `eventWriter`.
 | GET | `/api/v1/events` | Read paginated redacted events for a session. | `?sessionId` required, `?afterSeq`, `?afterEventId`, `?limit` | `{ events, nextCursor, hasMore }` | `400 invalid_request` |
 
 Event payloads are redacted by default; the raw artifact route requires explicit local raw-artifact persistence. See [STREAM-JSON](/STREAM-JSON) for event payload shapes.
+
+The adopted routes never fall back to legacy mutations. Adoption is durable
+responsibility before a side effect, not proof of delivery or completion.
+The bundled client checks the exact O3 literal in `requestAdoptionContracts`
+before either POST; the capability does not replace the complete exact O2
+proof in each request. Asynchronous terminal or event-persistence failures
+cannot retroactively alter an already returned response.
+Global-key, five-field launch-scope, replay ordering, retention, privacy, and
+static error-field rules are normative only in the
+[request-adoption contract](/API-CONTRACT#psyche-request-adoption-contract-v1).
 
 Handoff routes are local-IPC-only and require the `sessionHandoff`
 capability. They do not authenticate remote callers; a companion needs a
@@ -245,7 +258,7 @@ Full hub request/response shapes live in the [API contract](/API-CONTRACT).
 GET /api/v1/health
 ```
 
-The response provides the active named `apiVersion`, all 14 health
+The response provides the active named `apiVersion`, all 16 health
 `capabilities` fields, and optional daemon metadata (`pid`, `startedAt`, and
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.

@@ -130,7 +130,9 @@ Orchestration component that automatically selects the best-fit harness for a ta
 
 ## Sacrifice
 
-Permanently delete a non-running session and its events. Requires `--yes`.
+Permanently delete an eligible non-running session and its events. Requires
+`--yes`. Sessions with adopted or historical reserved evidence are retained;
+O3 defines no retention/fence release.
 
 ## Session
 

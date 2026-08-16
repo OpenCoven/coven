@@ -803,6 +803,17 @@ fn hint_bar_spans<'a>(app: &App) -> Vec<Span<'a>> {
         ];
     }
 
+    if let Some(session_id) = app.pending_sacrifice_target() {
+        return vec![
+            label(" "),
+            key("sacrifice"),
+            label(" / "),
+            key("reject"),
+            label(" pending sacrifice of session "),
+            key(&session_id_prefix(session_id, 12)),
+        ];
+    }
+
     if app.has_pending_cast_confirmation() {
         return vec![
             label(" "),
@@ -1402,6 +1413,56 @@ pub(super) fn buffer_to_plain_text(buffer: &ratatui::buffer::Buffer) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pending_cast_footer(input: &str) -> String {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let agents = vec![crate::tui::chat::app::AgentInfo {
+            id: "codex".to_string(),
+            label: "codex".to_string(),
+            harness: "codex".to_string(),
+            available: true,
+            supports_chat_resume: true,
+        }];
+        let mut app = App::new_with_state(
+            agents,
+            Some(0),
+            Box::new(crate::tui::chat::client::DaemonChatClient::with_coven_home(
+                std::env::temp_dir(),
+            )),
+            None,
+        );
+        app.input = input.to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        terminal
+            .draw(|frame| render_ui(frame, &mut app))
+            .expect("render pending Cast footer");
+        buffer_to_plain_text(terminal.backend().buffer())
+    }
+
+    #[test]
+    fn pending_cast_sacrifice_footer_names_exact_gate_and_short_target() {
+        let frame = pending_cast_footer("/sacrifice 12345678-90ab-cdef-1234-567890abcdef");
+
+        assert!(
+            frame.contains("sacrifice / reject pending sacrifice of session 12345678-90a"),
+            "{frame}"
+        );
+    }
+
+    #[test]
+    fn pending_cast_generic_footer_preserves_accept_reject_copy() {
+        let frame = pending_cast_footer("publish the package");
+
+        assert!(
+            frame.contains("accept / reject pending Cast confirmation"),
+            "{frame}"
+        );
+        assert!(!frame.contains("sacrifice / reject"), "{frame}");
+    }
 
     #[test]
     fn chat_first_frame_opens_on_transcript_composer_and_status() {

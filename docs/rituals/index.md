@@ -17,7 +17,7 @@ Rituals are Coven's human-friendly session-management verbs. Ritual names are pr
     Restore an archived session, then replay/follow it.
   </Card>
   <Card title="Sacrifice" href="/rituals/sacrifice" icon="flame">
-    Permanently delete a non-running session and its events.
+    Permanently delete an eligible non-running, unadopted session and its events. Adopted/reserved sessions are retained.
   </Card>
   <Card title="Kill" href="/reference/cli-kill" icon="octagon-x">
     Stop a running session's process. Events preserved.
@@ -30,7 +30,7 @@ The three operations on finished sessions have very different consequences:
 
 - **Archive** is reversible and keeps the ledger.
 - **Summon** brings an archived session back into the active list.
-- **Sacrifice** is destructive, refuses live sessions, and requires `--yes` so beginners do not delete work by accident.
+- **Sacrifice** is destructive, refuses live and adopted/reserved sessions, and requires `--yes` so beginners do not delete eligible work by accident.
 
 Plain `delete` would invite muscle-memory mistakes. Plain `hide` would lose the symmetry with **summon**. Ritual names make the intent visible.
 
@@ -40,8 +40,12 @@ Plain `delete` would invite muscle-memory mistakes. Plain `hide` would lose the 
 |---|---|---|---|
 | Archive | yes, refuses live | yes, via summon | no |
 | Summon | n/a | n/a | no |
-| Sacrifice | yes, refuses live | **no** | requires `--yes` |
+| Sacrifice | yes; also refuses adopted/reserved | **no** | requires `--yes` |
 | Kill | only acts on live | events preserved | no (Unix-like CLI only) |
+
+For retained adoption evidence, sacrifice reports: `session adoption evidence
+is retained; sacrifice is unavailable until an approved retention/fence
+contract resolves it`. O3 defines no retention expiry or release.
 
 The session browser surfaces every ritual as a labeled action. On Unix-like
 hosts, the CLI exposes them as explicit verbs (`coven archive <id>`, `coven

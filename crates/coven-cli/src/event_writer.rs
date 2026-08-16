@@ -141,7 +141,10 @@ enum PendingEvent {
         data: String,
         created_at: String,
     },
-    Record(store::EventRecord),
+    Record {
+        record: store::EventRecord,
+        request_adoption_id: Option<String>,
+    },
     Exit {
         session_id: String,
         result: PtyRunResult,
@@ -153,7 +156,7 @@ impl PendingEvent {
     fn session_id(&self) -> &str {
         match self {
             Self::Output { session_id, .. } | Self::Exit { session_id, .. } => session_id,
-            Self::Record(record) => &record.session_id,
+            Self::Record { record, .. } => &record.session_id,
         }
     }
 }
@@ -246,7 +249,8 @@ impl EventWriter {
     /// commit before the boundary event, and the caller waits for the writer's
     /// commit acknowledgement instead of silently dropping the event.
     pub fn record(&self, session_id: &str, kind: &str, payload: serde_json::Value) -> Result<()> {
-        self.reserve_record(session_id, kind, payload)?.commit()
+        self.reserve_record(session_id, kind, payload, None)?
+            .commit()
     }
 
     pub(crate) fn reserve_record(
@@ -254,6 +258,7 @@ impl EventWriter {
         session_id: &str,
         kind: &str,
         payload: serde_json::Value,
+        request_adoption_id: Option<&str>,
     ) -> Result<EventBoundaryReservation> {
         let record = store::EventRecord {
             seq: 0,
@@ -272,7 +277,10 @@ impl EventWriter {
             bytes <= self.shared.capacity_bytes,
             "critical event exceeds event writer capacity"
         );
-        let event = PendingEvent::Record(record);
+        let event = PendingEvent::Record {
+            record,
+            request_adoption_id: request_adoption_id.map(ToOwned::to_owned),
+        };
         let mut queue = self.lock_queue();
         loop {
             if let Some(error) = &queue.failed {
@@ -711,9 +719,17 @@ fn commit_batch(
                     output = Some(output_record(session_id, data, created_at)?);
                 }
             }
-            PendingEvent::Record(record) => {
+            PendingEvent::Record {
+                record,
+                request_adoption_id,
+            } => {
                 flush_output(&transaction, coven_home, &mut output, &mut committed)?;
-                store::insert_event_with_privacy(&transaction, coven_home, record)?;
+                store::insert_event_with_privacy_and_adoption(
+                    &transaction,
+                    coven_home,
+                    record,
+                    request_adoption_id.as_deref(),
+                )?;
                 committed += 1;
             }
             PendingEvent::Exit {
@@ -769,14 +785,17 @@ fn truncation_marker(session_id: &str, truncation: OutputTruncation) -> QueuedEv
     .expect("truncation marker payload is always serializable");
     let bytes = payload_json.len().saturating_add(EVENT_OVERHEAD_BYTES);
     QueuedEvent {
-        event: PendingEvent::Record(store::EventRecord {
-            seq: 0,
-            id: Uuid::new_v4().to_string(),
-            session_id: session_id.to_string(),
-            kind: "output_truncated".to_string(),
-            payload_json,
-            created_at: truncation.created_at,
-        }),
+        event: PendingEvent::Record {
+            record: store::EventRecord {
+                seq: 0,
+                id: Uuid::new_v4().to_string(),
+                session_id: session_id.to_string(),
+                kind: "output_truncated".to_string(),
+                payload_json,
+                created_at: truncation.created_at,
+            },
+            request_adoption_id: None,
+        },
         bytes,
         completion: None,
     }
@@ -826,22 +845,19 @@ fn record_exit(
     created_at: &str,
 ) -> Result<()> {
     if let Some(session) = store::get_session(conn, session_id)? {
-        if session.status == "running" {
-            let persisted_status =
-                if session.conversation_id.is_some() && result.status == "completed" {
-                    "idle"
-                } else {
-                    result.status
-                };
-            store::update_session_status_if_current(
-                conn,
-                session_id,
-                "running",
-                persisted_status,
-                result.exit_code,
-                created_at,
-            )?;
-        }
+        let persisted_status = if session.conversation_id.is_some() && result.status == "completed"
+        {
+            "idle"
+        } else {
+            result.status
+        };
+        store::update_session_terminal_if_active(
+            conn,
+            session_id,
+            persisted_status,
+            result.exit_code,
+            created_at,
+        )?;
     }
     store::insert_event_with_privacy(
         conn,
@@ -1162,14 +1178,17 @@ mod tests {
         let critical_writer = writer.clone();
         let critical = thread::spawn(move || {
             critical_writer.enqueue_critical(
-                PendingEvent::Record(store::EventRecord {
-                    seq: 0,
-                    id: "critical".to_string(),
-                    session_id: "s-1".to_string(),
-                    kind: "tool_result".to_string(),
-                    payload_json: "{}".to_string(),
-                    created_at: "2026-08-04T00:00:02Z".to_string(),
-                }),
+                PendingEvent::Record {
+                    record: store::EventRecord {
+                        seq: 0,
+                        id: "critical".to_string(),
+                        session_id: "s-1".to_string(),
+                        kind: "tool_result".to_string(),
+                        payload_json: "{}".to_string(),
+                        created_at: "2026-08-04T00:00:02Z".to_string(),
+                    },
+                    request_adoption_id: None,
+                },
                 EVENT_OVERHEAD_BYTES,
             )
         });
@@ -1222,14 +1241,14 @@ mod tests {
             queued
                 .iter()
                 .map(|item| match &item.event {
-                    PendingEvent::Record(record) => record.kind.as_str(),
+                    PendingEvent::Record { record, .. } => record.kind.as_str(),
                     _ => "unexpected",
                 })
                 .collect::<Vec<_>>(),
             ["output_truncated", "tool_result"]
         );
         let marker = match &queued[0].event {
-            PendingEvent::Record(record) => {
+            PendingEvent::Record { record, .. } => {
                 serde_json::from_str::<serde_json::Value>(&record.payload_json)?
             }
             _ => unreachable!("first boundary event must be the truncation marker"),
@@ -1262,7 +1281,7 @@ mod tests {
         )?;
 
         assert!(!writer.record_output("s-1", "a".repeat(2048))?);
-        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }), None)?;
         assert!(!writer.record_output("s-1", "b".repeat(3072))?);
         reservation.commit()?;
         assert!(writer.record_output("s-1", "recovered".to_string())?);
@@ -1304,7 +1323,7 @@ mod tests {
         )?;
 
         assert!(!writer.record_output("s-1", "a".repeat(2048))?);
-        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }))?;
+        let reservation = writer.reserve_record("s-1", "input", json!({ "data": "ls\n" }), None)?;
         assert!(!writer.record_output("s-1", "b".repeat(3072))?);
         reservation.cancel();
         assert!(writer.record_output("s-1", "recovered".to_string())?);
@@ -1384,6 +1403,62 @@ mod tests {
             store::get_session(&conn, "s-1")?.unwrap().status,
             "completed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_exit_transitions_created_or_running() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        let mut created = session("created-session");
+        created.status = "created".to_string();
+        store::insert_session(&conn, &created)?;
+        store::insert_session(&conn, &session("running-session"))?;
+        let writer = EventWriter::start(home.path().to_path_buf())?;
+
+        writer.record_exit(
+            "created-session",
+            PtyRunResult {
+                status: "failed",
+                exit_code: Some(1),
+            },
+        )?;
+        writer.record_exit(
+            "running-session",
+            PtyRunResult {
+                status: "completed",
+                exit_code: Some(0),
+            },
+        )?;
+
+        let created = store::get_session(&conn, "created-session")?.expect("created session");
+        assert_eq!(created.status, "failed");
+        assert_eq!(created.exit_code, Some(1));
+        let running = store::get_session(&conn, "running-session")?.expect("running session");
+        assert_eq!(running.status, "completed");
+        assert_eq!(running.exit_code, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_exit_rejects_nonterminal_status() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(STORE_FILE_NAME))?;
+        store::insert_session(&conn, &session("s-1"))?;
+
+        let error = record_exit(
+            &conn,
+            home.path(),
+            "s-1",
+            &PtyRunResult {
+                status: "running",
+                exit_code: None,
+            },
+            "2026-08-04T00:01:00Z",
+        )
+        .expect_err("terminal exit must reject a nonterminal status");
+
+        assert!(error.to_string().contains("terminal session status"));
         Ok(())
     }
 
@@ -1614,7 +1689,13 @@ mod tests {
             payload_json: "{}".to_string(),
             created_at: "2026-08-04T00:00:00Z".to_string(),
         };
-        writer.enqueue_critical(PendingEvent::Record(record), capacity - 1)?;
+        writer.enqueue_critical(
+            PendingEvent::Record {
+                record,
+                request_adoption_id: None,
+            },
+            capacity - 1,
+        )?;
 
         let events = store::list_events(&conn, "s-1")?;
         assert_eq!(
@@ -1778,14 +1859,17 @@ mod tests {
         });
         let (completion, receiver) = mpsc::sync_channel(1);
         lock_queue(&shared).items.push_back(QueuedEvent {
-            event: PendingEvent::Record(store::EventRecord {
-                seq: 0,
-                id: "event".to_string(),
-                session_id: "s-1".to_string(),
-                kind: "error".to_string(),
-                payload_json: "{}".to_string(),
-                created_at: "2026-08-04T00:00:00Z".to_string(),
-            }),
+            event: PendingEvent::Record {
+                record: store::EventRecord {
+                    seq: 0,
+                    id: "event".to_string(),
+                    session_id: "s-1".to_string(),
+                    kind: "error".to_string(),
+                    payload_json: "{}".to_string(),
+                    created_at: "2026-08-04T00:00:00Z".to_string(),
+                },
+                request_adoption_id: None,
+            },
             bytes: EVENT_OVERHEAD_BYTES,
             completion: Some(completion),
         });

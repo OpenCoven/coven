@@ -17,22 +17,27 @@ Classify the row kind before interpreting its status. Synthetic `active` rows ca
 
 | Harness-session status | Ledger-terminal? | Meaning |
 |---|---|---|
-| `created` | No | Ledger row exists before runtime ownership. Stale unowned `created` rows recover to `failed`. |
+| `created` | No | Ledger row exists before runtime ownership. For an adopted launch, an exit may persist authoritative `idle` or a terminal status before activation; the later `created -> running` compare-and-set returns false and preserves it. A definitive runtime-establishment failure conditionally transitions only a still-`created` row to `failed`; transition-persistence failure leaves retained ambiguity. Generic stale recovery moves only unowned, unadopted, unreserved rows to `failed`; a launch adoption or historical attempt reservation excludes the row from that recovery. |
 | `running` | No | Reported live state. Inspect the external flag before inferring daemon runtime ownership. |
-| `idle` | No | A daemon/socket-managed, conversation-grouped session (`conversation_id` present) exited successfully and is waiting for more work. CLI and socket/chat continuation create a new row. |
+| `idle` | No | A daemon/socket-managed, conversation-grouped session (`conversation_id` present) exited successfully and is waiting for more work. For an adopted row, the exit writer may persist `idle` from `created` or `running`; it is authoritative but nonterminal. CLI and socket/chat continuation create a new row. |
 | `completed` | Yes | A direct CLI run persisted a successful harness result (even when `conversation_id` is present), a daemon-managed session without `conversation_id` exited successfully, or an externally registered running session was completed with an absent, `null`, or zero `exitCode`. |
-| `failed` | Yes | Launch or execution failed, or an externally registered running session was completed with a nonzero `exitCode`. |
+| `failed` | Yes | Launch or execution failed, including a persisted adopted runtime-establishment failure, or an externally registered running session was completed with a nonzero `exitCode`. |
 | `killed` | Yes | Terminal in the current ledger. This status is not proof that process termination was acknowledged. |
 | `orphaned` | Yes | Runtime ownership was lost and the outcome remains unresolved. |
 
-Archive visibility is stored separately as `archived_at`; it is not a `SessionRecord.status`. Archiving may hide any non-running session, including one with `created` or `idle` status, without changing that status. Summoning clears `archived_at` and reveals the same status again.
+Archive visibility is stored separately as `archived_at`; it is not a `SessionRecord.status`. Archiving may hide a non-running session, including an adopted/reserved row or one with `created` or `idle` status, without changing status or retention evidence. Summoning clears `archived_at` and reveals the same status again.
 
 ```mermaid
 stateDiagram-v2
-  [*] --> running: socket/chat POST creates a new row
+  [*] --> running: unbound socket/chat POST creates a new row
+  [*] --> created: adopted socket POST commits row + adoption
   [*] --> created: CLI / detached / store path inserts row
   created --> running: execution starts
-  created --> failed: stale unowned recovery
+  created --> idle: adopted daemon exit 0 with conversation_id before activation
+  created --> completed: adopted daemon exit 0 without conversation_id before activation
+  created --> failed: adopted harness exits non-zero before activation
+  created --> failed: adopted runtime establishment fails (conditional CAS)
+  created --> failed: stale unowned, unadopted recovery
   running --> failed: runtime launch fails
   running --> idle: daemon/socket exits 0 with conversation_id
   [*] --> created: CLI --continue creates a sibling row
@@ -43,15 +48,15 @@ stateDiagram-v2
   running --> killed: kill dispatch accepted
   running --> orphaned: daemon-owned runtime ownership is lost
 
-  created --> [*]: coven sacrifice --yes
-  idle --> [*]: coven sacrifice --yes
-  completed --> [*]: coven sacrifice --yes
-  failed --> [*]: coven sacrifice --yes
-  killed --> [*]: coven sacrifice --yes
-  orphaned --> [*]: coven sacrifice --yes
+  created --> [*]: sacrifice eligible unadopted row
+  idle --> [*]: sacrifice eligible unadopted row
+  completed --> [*]: sacrifice eligible unadopted row
+  failed --> [*]: sacrifice eligible unadopted row
+  killed --> [*]: sacrifice eligible unadopted row
+  orphaned --> [*]: sacrifice eligible unadopted row
 ```
 
-The diagram above describes harness-session statuses in the current ledger. On a clean exit, only the daemon/socket-managed path in `daemon.rs` converts a successful harness result to `idle`, and only when `conversation_id` is present. A direct CLI run persists the harness result, normally `completed`, even when its row has `conversation_id`; a daemon-managed row without `conversation_id` also persists as `completed` after a clean exit. Automatic `coven run <harness> --continue` selects the latest non-archived row with both the same project root and the requested harness. Explicit `coven run <harness> --continue <ID>` performs a direct id or conversation lookup and may select an archived row, but rejects a source whose harness differs from the requested harness. Both forms accept any current status and create a fresh, initially unarchived sibling in the same conversation group. The selected source row is unchanged, including its status, exit code, archive overlay, and timestamps. Socket/chat continuation through `POST /api/v1/sessions` also inserts a new row. It shares grouping with a prior conversation only when the caller explicitly supplies the same `conversationId`; a resume hint does not derive that id automatically. Archive and summon are omitted because they only set or clear the separate `archived_at` visibility overlay; they do not create lifecycle states. Archive rejects only `running`, and sacrifice may permanently delete any non-running row whether visible or archived. A `running → killed` ledger transition records accepted kill dispatch, not acknowledged process termination.
+The diagram above describes harness-session statuses in the current ledger. On a clean exit, only the daemon/socket-managed path in `daemon.rs` converts a successful harness result to `idle`, and only when `conversation_id` is present. Its event writer updates either an active `created` or `running` row, so a fast adopted conversational exit can persist `created → idle` before the request handler's activation compare-and-set. A direct CLI run persists the harness result, normally `completed`, even when its row has `conversation_id`; a daemon-managed row without `conversation_id` also persists as `completed` after a clean exit. Automatic `coven run <harness> --continue` selects the latest non-archived row with both the same project root and the requested harness. Explicit `coven run <harness> --continue <ID>` performs a direct id or conversation lookup and may select an archived row, but rejects a source whose harness differs from the requested harness. Both forms accept any current status and create a fresh, initially unarchived sibling in the same conversation group. The selected source row is unchanged, including its status, exit code, archive overlay, and timestamps. Socket/chat continuation through `POST /api/v1/sessions` also inserts a new row. It shares grouping with a prior conversation only when the caller explicitly supplies the same `conversationId`; a resume hint does not derive that id automatically. Archive and summon are omitted because they only set or clear the separate `archived_at` visibility overlay; they do not create lifecycle states. Archive rejects only `running`. Sacrifice can delete only an eligible non-running session without adopted or reserved evidence. A `running → killed` ledger transition records accepted kill dispatch, not acknowledged process termination.
 
 For an externally registered `running` session, `POST /api/v1/sessions/:id/complete` records the caller-owned outcome: an absent, `null`, or zero `exitCode` moves the row to `completed`, while a nonzero `exitCode` moves it to `failed`. This completion path does not give the daemon runtime ownership. External running sessions remain exempt from daemon orphan recovery, and daemon input and kill requests remain rejected.
 
@@ -68,10 +73,40 @@ All launch paths perform the same validation:
 
 The lifecycle around launch depends on the entry point:
 
-- `POST /api/v1/sessions` always inserts a new row as `running` before launching the runtime. The new row shares a prior conversation's grouping only when the caller explicitly supplies the same `conversationId`; a resume hint alone does not derive it. The prior row is unchanged. If PTY spawn or the initial write fails, the daemon transitions the new row to `failed`.
-- A new direct CLI `coven run` inserts a `created` row, transitions it to `running`, and then launches the harness. Automatic continuation selects by the same project root and harness; explicit continuation rejects a harness mismatch. Either form accepts any source status but leaves the source unchanged, including its archive and terminal evidence. Continuation creates a fresh, unarchived sibling with a new id and a stable resume/group key: the source row's `conversation_id` when present, otherwise its id. The harness resumes with that key, and the sibling owns the new `created` → `running` → terminal lifecycle. A detached run remains `created`; stale unowned `created` rows recover to `failed`.
+- Unbound `POST /api/v1/sessions` inserts a new row as `running` before launching the runtime. The new row shares a prior conversation's grouping only when the caller explicitly supplies the same `conversationId`; a resume hint alone does not derive it. The prior row is unchanged. If PTY spawn or the initial write fails, the daemon transitions the new row to `failed`.
+- Adopted `POST /api/v1/adopted-sessions` commits the new row as `created` and its immutable launch-adoption record in the same transaction, before invoking the runtime. Runtime ownership alone may compare-and-set `created` to `running`. The exit writer may first move `created` or `running` to authoritative nonterminal `idle` for a successful conversation-grouped session, terminal `completed` for a successful ungrouped session, or terminal `failed` for a failed exit. A later activation CAS that finds any such winner returns false and does not overwrite it. A definitive runtime-establishment failure separately conditionally compare-and-sets only `created` to `failed`, preserving an `idle` or terminal winner; persistence failure leaves the retained status ambiguous.
+- A new direct CLI `coven run` inserts a `created` row, transitions it to `running`, and then launches the harness. Automatic continuation selects by the same project root and harness; explicit continuation rejects a harness mismatch. Either form accepts any source status but leaves the source unchanged, including its archive and terminal evidence. Continuation creates a fresh, unarchived sibling with a new id and a stable resume/group key: the source row's `conversation_id` when present, otherwise its id. The harness resumes with that key, and the sibling owns the new `created` → `running` → terminal lifecycle. A detached run remains `created`; stale unowned `created` rows recover to `failed` only when no launch-adoption or historical reservation evidence exists.
 
-Once execution starts, output and exit data are written as events, and the terminal status and exit code are persisted when the harness exits.
+An exact adopted-launch replay returns the current persisted `SessionRecord`
+without another runtime launch. It may return `created` during the
+commit-to-runtime window, `running` after activation, `idle` after a successful
+conversational exit, or terminal `completed`, `failed`, `killed`, or
+`orphaned` after expiry, roster, filesystem, harness, or other mutable
+admission state has drifted. Generic stale-created recovery excludes adopted
+launch rows and historical attempt reservations because `created` can be
+durable evidence of that ambiguous window.
+
+After the atomic session-plus-adoption commit, a synchronous definitive
+runtime-establishment failure returns `500 launch_failed` with marker-only
+`{"adopted":true,"delivery":"not_asserted"}` details. If its conditional
+`created -> failed` write succeeds, replay returns `failed`; if authoritative
+`idle` or a terminal status already won, that status remains; if the failed
+transition cannot be persisted, retained evidence remains with an ambiguous
+current status. In all cases exact replay returns the stored status and never
+relaunches.
+
+Adoption evidence survives ordinary status transitions, archive, summon,
+event retention, and daemon restart. O3 does not decide whether a crash after
+adoption commit but before runtime establishment delivered work; it keeps the
+row and adoption for O4/O7 reconciliation and performs no automatic
+redispatch. The marker exists only on synchronous HTTP failures returned after
+commit. Later asynchronous exit-event/status-persistence failures are logged
+and cannot retroactively change an already returned response; neither path
+claims delivery or completion.
+
+Once execution starts, output and exit data are written as events. Harness exit
+persists the exit code and authoritative status: `idle` for a clean
+daemon/socket conversational exit, otherwise the applicable terminal result.
 
 The Rust layer performs the authority checks even when a TypeScript client has already validated the request for UX.
 
@@ -114,6 +149,10 @@ sequenceDiagram
     end
   end
 ```
+
+This sequence is the legacy unbound socket launch. Its
+`launch_failed` response includes `details.sessionId`; adopted synchronous
+postcommit errors use only the adopted ambiguity marker described above.
 
 ## Detached records
 
@@ -161,25 +200,39 @@ Summon does not re-run the original harness prompt. It changes archive state and
 
 ## Sacrifice
 
-Sacrifice permanently deletes a non-running session and cascades deletion to its events:
+Sacrifice permanently deletes an eligible non-running, unadopted session and
+cascades deletion to its events:
 
 ```sh
 coven sacrifice <session-id> --yes
 ```
 
-The command refuses live sessions. The interactive browser asks the user to type `sacrifice` before deletion.
+The command refuses live sessions and any session with an adopted launch,
+adopted input, or historical launch reservation. The retention refusal is:
 
-Use sacrifice only when the session and its logs should be removed from the local ledger.
+```text
+session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it
+```
+
+The interactive browser asks the user to type `sacrifice` before deletion.
+O3 defines no retention expiry or fence-release contract.
+
+Use sacrifice only when an eligible unadopted session and its logs should be
+removed from the local ledger. Archive is the available cleanup action for
+retained adopted/reserved sessions.
 
 ## Orphan recovery
 
-If the daemon starts and finds daemon-owned sessions that were marked `running` from a previous daemon lifetime, those sessions are marked `orphaned`. Externally registered running sessions are exempt because the daemon does not own their lifecycle.
+If the daemon starts and finds daemon-owned sessions that were marked `running` from a previous daemon lifetime, those sessions are marked `orphaned`. Externally registered running sessions are exempt because the daemon does not own their lifecycle. Generic stale-created recovery marks only unowned `created` rows without launch-adoption or historical reservation evidence as `failed`; retained adopted/reserved `created` rows are left unchanged.
 
 An orphaned session means Coven no longer owns a live process for that record. The event log may still be useful, but live input and kill operations should fail.
 
 ## Event durability
 
 Events are append-only records in SQLite. This gives clients a stable replay source even when the original PTY process has exited.
+
+Event-retention operations may prune eligible event history but do not delete
+request-adoption rows or release a retained session for sacrifice.
 
 Do not intentionally write secrets, environment dumps, private URLs, or token-bearing command output into events. Coven cannot guarantee that harness output is secret-free, so users should avoid running untrusted prompts in sensitive repositories.
 

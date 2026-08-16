@@ -732,6 +732,7 @@ impl SessionRuntime for LiveSessionRuntime {
         session_id: &str,
         kind: &str,
         payload: &Value,
+        request_adoption_id: Option<&str>,
         action: &mut dyn FnMut() -> SessionEventBoundaryResult,
     ) -> Option<SessionEventBoundaryResult> {
         let writer = self.event_writer.as_ref()?;
@@ -739,7 +740,7 @@ impl SessionRuntime for LiveSessionRuntime {
             match kind {
                 "input" => {
                     let reservation = writer
-                        .reserve_record(session_id, kind, payload.clone())
+                        .reserve_record(session_id, kind, payload.clone(), request_adoption_id)
                         .map_err(SessionEventBoundaryError::Persistence)?;
                     match action() {
                         Ok(()) => reservation
@@ -5514,6 +5515,7 @@ mod tests {
             session_id: &str,
             kind: &str,
             payload: &Value,
+            request_adoption_id: Option<&str>,
             action: &mut dyn FnMut() -> crate::api::SessionEventBoundaryResult,
         ) -> Option<crate::api::SessionEventBoundaryResult> {
             SessionRuntime::with_session_event_boundary(
@@ -5521,6 +5523,7 @@ mod tests {
                 session_id,
                 kind,
                 payload,
+                request_adoption_id,
                 action,
             )
         }
@@ -5684,6 +5687,7 @@ mod tests {
                 "wedged-session",
                 "input",
                 &payload,
+                None,
                 &mut action,
             )
             .expect("writer-backed runtime handles input boundaries")
@@ -5709,6 +5713,7 @@ mod tests {
                 "wedged-session",
                 "kill",
                 &payload,
+                None,
                 &mut action,
             )
             .expect("writer-backed runtime handles kill boundaries")
