@@ -196,6 +196,7 @@ describe("createCovenClient", () => {
         expectTypeOf(health.capabilities?.events).toEqualTypeOf<unknown>();
         expectTypeOf(health.capabilities?.eventCursor).toEqualTypeOf<unknown>();
         expectTypeOf(health.capabilities?.structuredErrors).toEqualTypeOf<unknown>();
+        expectTypeOf(health.ok).toEqualTypeOf<unknown>();
       },
     );
   });
@@ -1921,10 +1922,77 @@ describe("createCovenClient", () => {
         },
       );
 
-      it("fails on apiVersion before capability when both are invalid", async () => {
+      it.each([
+        ["missing", undefined, false],
+        ["null", null, true],
+        ["false", false, true],
+        ["non-boolean (number)", 1, true],
+        ["non-boolean (string)", "private-health-reflection", true],
+        ["non-boolean (object)", { ok: true }, true],
+        ["non-boolean (array)", [true], true],
+      ])(
+        "sends zero POST requests for %s health.ok",
+        async (_name, healthOk, includeProperty) => {
+          const sessionId = "session-health-fail-closed";
+          const data = "health-leak-guard-input\n";
+          const binding = validBinding();
+          const adoption = validAdoption({
+            key: "psyche:graph-1/node-1/attempt-1/health-leak-guard",
+            requestDigest: DIGEST_D,
+          });
+          const healthBody: Record<string, unknown> = { ...o3Health() };
+          if (includeProperty) {
+            healthBody.ok = healthOk;
+          } else {
+            delete healthBody.ok;
+          }
+          const requests: string[] = [];
+          let error: unknown;
+          await withServer(
+            (req, res) => {
+              requests.push(`${req.method} ${req.url}`);
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify(healthBody));
+            },
+            async (socketPath) => {
+              try {
+                await invokeAdoptedMethod(
+                  createCovenClient(socketPath),
+                  method,
+                  sessionId,
+                  data,
+                  binding,
+                  adoption,
+                );
+              } catch (caught) {
+                error = caught;
+              }
+            },
+          );
+          expect(error).toBeInstanceOf(Error);
+          expect((error as Error).message).toBe("Coven daemon health is not OK");
+          const errorText = String(error);
+          expect(errorText).not.toContain(adoption.key);
+          expect(errorText).not.toContain(adoption.requestDigest);
+          expect(errorText).not.toContain(binding.principalRef);
+          expect(errorText).not.toContain(sessionId);
+          expect(errorText).not.toContain(data);
+          if (typeof healthOk === "string") {
+            expect(errorText).not.toContain(healthOk);
+          }
+          expect(requests.filter((entry) => entry.startsWith("POST"))).toEqual([]);
+          expect(requests).toEqual(["GET /api/v1/health"]);
+        },
+      );
+
+      it("fails on apiVersion before health and capability when all are invalid", async () => {
         const binding = validBinding();
         const adoption = validAdoption();
-        const healthBody = { ...o3Health(null), apiVersion: "coven.daemon.v2" };
+        const healthBody = {
+          ...o3Health(null),
+          apiVersion: "coven.daemon.v2",
+          ok: false,
+        };
         const requests: string[] = [];
         let error: unknown;
         await withServer(
@@ -1952,6 +2020,38 @@ describe("createCovenClient", () => {
         expect((error as Error).message).toBe(
           "Coven daemon API version is not supported",
         );
+        expect(requests).toEqual(["GET /api/v1/health"]);
+      });
+
+      it("fails on health.ok before capability when both are invalid", async () => {
+        const binding = validBinding();
+        const adoption = validAdoption();
+        const healthBody = { ...o3Health(null), ok: false };
+        const requests: string[] = [];
+        let error: unknown;
+        await withServer(
+          (req, res) => {
+            requests.push(`${req.method} ${req.url}`);
+            res.setHeader("Content-Type", "application/json");
+            res.end(JSON.stringify(healthBody));
+          },
+          async (socketPath) => {
+            try {
+              await invokeAdoptedMethod(
+                createCovenClient(socketPath),
+                method,
+                "session-health-precedence",
+                "health-precedence-input\n",
+                binding,
+                adoption,
+              );
+            } catch (caught) {
+              error = caught;
+            }
+          },
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toBe("Coven daemon health is not OK");
         expect(requests).toEqual(["GET /api/v1/health"]);
       });
 

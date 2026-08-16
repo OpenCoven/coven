@@ -50,11 +50,12 @@ class ApiContractDocsTests(unittest.TestCase):
     }
     MISSING = object()
     O3_API_VERSION_CLAUSE = (
-        "First it requires `health.apiVersion` to be the\n"
-        "exact string `coven.daemon.v1`."
+        "First it requires `health.apiVersion`\n"
+        "to be the exact string `coven.daemon.v1`."
     )
+    O3_HEALTH_OK_CLAUSE = "Second it requires `health.ok === true`."
     O3_CAPABILITY_CLAUSE = (
-        "Only after that check passes does it require\n"
+        "Only after both checks pass does it require\n"
         "`health.capabilities.requestAdoptionContracts` to be an array "
         "containing the\n"
         "exact `psyche.request_adoption.v1` string."
@@ -201,12 +202,14 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         documents[path] += (
             "\n\n## Checker decoy\n"
             "First it requires `health.apiVersion` to be the exact string "
-            "`coven.daemon.v1`. Only after that check passes does it require "
+            "`coven.daemon.v1`. Second it requires `health.ok === true`. "
+            "Only after both checks pass does it require "
             "`health.capabilities.requestAdoptionContracts` to be an array "
             "containing the exact `psyche.request_adoption.v1` string. Any "
-            "health, API-version, or capability failure sends zero POST requests "
-            "and never falls back to a legacy mutation. Every adopted request "
-            "must still carry a complete, exact O2 `executionBinding` proof.\n"
+            "health transport, API-version, health-ok, or capability failure "
+            "sends zero POST requests and never falls back to a legacy mutation. "
+            "Every adopted request must still carry a complete, exact O2 "
+            "`executionBinding` proof.\n"
         )
 
     def health_example_cases(
@@ -1068,7 +1071,11 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
 
     def test_every_o3_negotiation_surface_requires_api_version_first(self) -> None:
         ordered_clauses = (
-            self.O3_API_VERSION_CLAUSE + "\n" + self.O3_CAPABILITY_CLAUSE
+            self.O3_API_VERSION_CLAUSE
+            + "\n"
+            + self.O3_HEALTH_OK_CLAUSE
+            + "\n"
+            + self.O3_CAPABILITY_CLAUSE
         )
         mutations = (
             (
@@ -1092,8 +1099,13 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             (
                 "reversed",
                 ordered_clauses,
-                self.O3_CAPABILITY_CLAUSE + "\n" + self.O3_API_VERSION_CLAUSE,
-                "must check health.apiVersion before requestAdoptionContracts",
+                self.O3_HEALTH_OK_CLAUSE
+                + "\n"
+                + self.O3_API_VERSION_CLAUSE
+                + "\n"
+                + self.O3_CAPABILITY_CLAUSE,
+                "must check health.apiVersion before health.ok and health.ok "
+                "before requestAdoptionContracts",
             ),
         )
         for path, surface in module.O3_NEGOTIATION_SURFACES.items():
@@ -1109,6 +1121,94 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                     errors = module.validate_o3_document_structures(changed)
                     self.assertIn(
                         f"{path}: O3 negotiation claim {diagnostic}",
+                        errors,
+                    )
+
+    def test_every_o3_negotiation_surface_requires_exact_affirmative_health_ok(
+        self,
+    ) -> None:
+        mutations = (
+            (
+                "missing",
+                "`health.ok === true`",
+                "`health.status === true`",
+            ),
+            (
+                "negated",
+                self.O3_HEALTH_OK_CLAUSE,
+                "Second it does not require `health.ok === true`.",
+            ),
+            (
+                "truthy",
+                self.O3_HEALTH_OK_CLAUSE,
+                "Second it accepts any truthy `health.ok` value.",
+            ),
+            (
+                "coerced",
+                "`health.ok === true`",
+                "`Boolean(health.ok) === true`",
+            ),
+            (
+                "loose equality",
+                "`health.ok === true`",
+                "`health.ok == true`",
+            ),
+        )
+        for path in module.O3_NEGOTIATION_SURFACES:
+            for mutation, old, new in mutations:
+                with self.subTest(path=path, mutation=mutation):
+                    changed = self.o3_structure_documents()
+                    self.mutate_o3_negotiation_claim(changed, path, old, new)
+
+                    errors = module.validate_o3_document_structures(changed)
+                    self.assertIn(
+                        f"{path}: O3 negotiation claim must require exact "
+                        "health.ok === true",
+                        errors,
+                    )
+
+    def test_every_o3_negotiation_surface_orders_all_three_gates(self) -> None:
+        ordered_clauses = (
+            self.O3_API_VERSION_CLAUSE
+            + "\n"
+            + self.O3_HEALTH_OK_CLAUSE
+            + "\n"
+            + self.O3_CAPABILITY_CLAUSE
+        )
+        mutations = (
+            (
+                "health before version",
+                self.O3_HEALTH_OK_CLAUSE
+                + "\n"
+                + self.O3_API_VERSION_CLAUSE
+                + "\n"
+                + self.O3_CAPABILITY_CLAUSE,
+            ),
+            (
+                "capability before health",
+                self.O3_API_VERSION_CLAUSE
+                + "\n"
+                + self.O3_CAPABILITY_CLAUSE
+                + "\n"
+                + self.O3_HEALTH_OK_CLAUSE,
+            ),
+        )
+        for path in module.O3_NEGOTIATION_SURFACES:
+            for mutation, replacement in mutations:
+                with self.subTest(path=path, mutation=mutation):
+                    changed = self.o3_structure_documents()
+                    self.mutate_o3_negotiation_claim(
+                        changed,
+                        path,
+                        ordered_clauses,
+                        replacement,
+                    )
+
+                    errors = module.validate_o3_document_structures(changed)
+                    self.assertIn(
+                        f"{path}: O3 negotiation claim must check "
+                        "health.apiVersion before health.ok and health.ok before "
+                        "requestAdoptionContracts",
                         errors,
                     )
 
@@ -1193,7 +1293,25 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                 set(module.O3_NEGOTIATION_SURFACES),
                 " The client checks `requestAdoptionContracts` before "
                 "`health.apiVersion`.",
-                "must check health.apiVersion before requestAdoptionContracts",
+                "must check health.apiVersion before health.ok and health.ok "
+                "before requestAdoptionContracts",
+            ),
+            (
+                set(module.O3_NEGOTIATION_SURFACES),
+                " The client does not require `health.ok === true`.",
+                "must require exact health.ok === true",
+            ),
+            (
+                set(module.O3_NEGOTIATION_SURFACES),
+                " A truthy or Boolean-coerced `health.ok` value is sufficient.",
+                "must require exact health.ok === true",
+            ),
+            (
+                set(module.O3_NEGOTIATION_SURFACES),
+                " The client checks `requestAdoptionContracts` before "
+                "`health.ok`.",
+                "must check health.apiVersion before health.ok and health.ok "
+                "before requestAdoptionContracts",
             ),
             (
                 set(module.O3_NEGOTIATION_SURFACES),
@@ -2467,12 +2585,22 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                 "must require the exact health.apiVersion coven.daemon.v1",
             ),
             (
-                "with a missing, malformed, or unsupported\n"
-                "capability advertisement fails on the capability check instead",
+                "and exact `health.ok === true` with a missing,\n"
+                "malformed, or unsupported capability advertisement fails on "
+                "the capability\ncheck instead",
                 "with any capability advertisement proceeds to POST",
-                "with a missing, malformed, or unsupported capability "
-                "advertisement fails on the capability check instead",
+                "and exact `health.ok === true` with a missing, malformed, or "
+                "unsupported capability advertisement fails on the capability "
+                "check instead",
                 "must gate on requestAdoptionContracts",
+            ),
+            (
+                "with missing, null, false, or\nnon-boolean `health.ok` fails "
+                "on the health check before capability inspection",
+                "with any truthy `health.ok` proceeds to capability inspection",
+                "with missing, null, false, or non-boolean `health.ok` fails "
+                "on the health check before capability inspection",
+                "must require exact health.ok === true",
             ),
             (
                 "never falls back",

@@ -15,12 +15,11 @@ export const PSYCHE_REQUEST_ADOPTION_V1 = "psyche.request_adoption.v1" as const;
 /**
  * Named daemon API contract required for the O3 adopted mutations
  * (`launchAdoptedSession`, `sendAdoptedInput`). `GET /api/v1/health` must
- * advertise this exact string before either method is authorized to
- * negotiate the request-adoption capability, let alone POST. This is
+ * advertise this exact string before either method checks `ok === true`,
+ * negotiates the request-adoption capability, or sends a POST. This is
  * intentionally a separate, narrower gate than any general per-route health
- * check: a daemon can be reachable and otherwise healthy while still
- * pre-dating (or mismatching) the named contract these two mutations depend
- * on.
+ * check: a daemon can be reachable while still pre-dating (or mismatching)
+ * the named contract these two mutations depend on.
  */
 const COVEN_DAEMON_API_VERSION_V1 = "coven.daemon.v1" as const;
 
@@ -901,11 +900,11 @@ function normalizeEventRecords(value: unknown): CovenEventRecord[] {
 }
 
 function requireRequestAdoptionCapability(health: CovenHealthResponse): void {
-  // Gate on the named daemon API contract before even looking at the
+  // Gate on the named daemon API contract before health truth or the
   // request-adoption capability. This must be an exact-string comparison: a
   // missing/null/non-string value, a case mismatch, a near-match (e.g. a
   // trailing character or a different vN suffix), or any other unsupported
-  // value all fail here, before capability negotiation and before any POST.
+  // value all fail here, before the remaining negotiation and before any POST.
   // The comparison is intentionally static (no coercion, no trim, no
   // case-fold) so a daemon can never talk its way into adopted-mutation
   // authorization by advertising a similar-looking version string. The
@@ -914,6 +913,9 @@ function requireRequestAdoptionCapability(health: CovenHealthResponse): void {
   // arbitrary data back to a caller that logs it.
   if (health.apiVersion !== COVEN_DAEMON_API_VERSION_V1) {
     throw new Error("Coven daemon API version is not supported");
+  }
+  if (health.ok !== true) {
+    throw new Error("Coven daemon health is not OK");
   }
   const contracts = health.capabilities?.requestAdoptionContracts;
   if (

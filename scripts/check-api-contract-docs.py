@@ -386,8 +386,11 @@ O3_API_VERSION_GATE_FRAGMENTS = (
     "First it requires health.apiVersion to be the exact string "
     "coven.daemon.v1.",
 )
+O3_HEALTH_OK_GATE_FRAGMENTS = (
+    "Second it requires health.ok === true.",
+)
 O3_REQUEST_ADOPTION_GATE_FRAGMENTS = (
-    "Only after that check passes does it require "
+    "Only after both checks pass does it require "
     "health.capabilities.requestAdoptionContracts to be an array containing "
     "the exact psyche.request_adoption.v1 string.",
 )
@@ -396,31 +399,35 @@ O3_PROOF_BOUNDARY_FRAGMENTS = (
     "executionBinding proof",
 )
 O3_NO_FALLBACK_FRAGMENTS = (
-    "Any health, API-version, or capability failure sends zero POST requests "
-    "and never falls back to a legacy mutation.",
+    "Any health transport, API-version, health-ok, or capability failure sends "
+    "zero POST requests and never falls back to a legacy mutation.",
 )
 
 O3_NEGOTIATION_REQUIRED_FRAGMENTS = {
     "docs/API-CONTRACT.md": {
         "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "health_ok": O3_HEALTH_OK_GATE_FRAGMENTS,
         "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
         "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
         "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/reference/api.md": {
         "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "health_ok": O3_HEALTH_OK_GATE_FRAGMENTS,
         "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
         "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
         "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/reference/api-contract.md": {
         "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "health_ok": O3_HEALTH_OK_GATE_FRAGMENTS,
         "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
         "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
         "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
     },
     "docs/daemon/socket-api.md": {
         "api_version": O3_API_VERSION_GATE_FRAGMENTS,
+        "health_ok": O3_HEALTH_OK_GATE_FRAGMENTS,
         "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS,
         "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
         "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
@@ -429,13 +436,19 @@ O3_NEGOTIATION_REQUIRED_FRAGMENTS = {
         "api_version": O3_API_VERSION_GATE_FRAGMENTS
         + (
             "A missing, null, non-string, wrong-case, near-match, or otherwise "
-            "unsupported health.apiVersion fails closed on its own, before the "
-            "capability is even inspected",
+            "unsupported health.apiVersion fails closed on its own, before "
+            "health.ok or the capability is inspected",
+        ),
+        "health_ok": O3_HEALTH_OK_GATE_FRAGMENTS
+        + (
+            "A valid health.apiVersion with missing, null, false, or non-boolean "
+            "health.ok fails on the health check before capability inspection",
         ),
         "gate": O3_REQUEST_ADOPTION_GATE_FRAGMENTS
         + (
-            "a valid health.apiVersion with a missing, malformed, or unsupported "
-            "capability advertisement fails on the capability check instead",
+            "a valid health.apiVersion and exact health.ok === true with a "
+            "missing, malformed, or unsupported capability advertisement fails "
+            "on the capability check instead",
         ),
         "proof": O3_PROOF_BOUNDARY_FRAGMENTS,
         "no_fallback": O3_NO_FALLBACK_FRAGMENTS,
@@ -2162,24 +2175,49 @@ def o3_claim_negates_api_version_gate(claim: str) -> bool:
     return False
 
 
-def o3_claim_orders_api_version_before_request_adoption(claim: str) -> bool:
+def o3_claim_weakens_health_ok_gate(claim: str) -> bool:
+    normalized = normalized_markdown_text(claim, lowercase=True)
+    for statement in re.split(r"(?<=[.;!?])\s+", normalized):
+        if "health.ok" not in statement:
+            continue
+        if re.search(
+            r"\b(?:do|does|did|must)\s+not\s+"
+            r"(?:check|inspect|require|verify|gate)\b|"
+            r"\bwithout\s+(?:checking|inspecting|requiring|verifying|gating)\b|"
+            r"\bhealth\.ok\b[^.;]{0,80}\b(?:need\s+not|is\s+not\s+required)\b|"
+            r"\btruthy\b|\bcoerc(?:e|es|ed|ing|ion)\b|\bboolean\s*\(|"
+            r"\bhealth\.ok\s*(?:==(?!=)|!=|!==)\s*true\b",
+            statement,
+        ):
+            return True
+    return False
+
+
+def o3_claim_orders_required_gates(claim: str) -> bool:
     normalized = normalized_markdown_text(claim, lowercase=True)
     if re.search(
         r"\brequestadoptioncontracts\b[^.;]{0,160}"
-        r"\b(?:before|first)\b[^.;]{0,160}\b(?:health\.)?apiversion\b|"
+        r"\b(?:before|first)\b[^.;]{0,160}"
+        r"\b(?:(?:health\.)?apiversion|health\.ok)\b|"
+        r"\bhealth\.ok\b[^.;]{0,160}\b(?:before|first)\b"
+        r"[^.;]{0,160}\b(?:health\.)?apiversion\b|"
         r"\b(?:health\.)?apiversion\b[^.;]{0,160}\b(?:only\s+)?after\b"
+        r"[^.;]{0,160}\b(?:requestadoptioncontracts|health\.ok)\b|"
+        r"\bhealth\.ok\b[^.;]{0,160}\b(?:only\s+)?after\b"
         r"[^.;]{0,160}\brequestadoptioncontracts\b",
         normalized,
     ):
         return False
     api_version_index = normalized.find("health.apiversion")
+    health_ok_index = normalized.find("health.ok === true")
     request_adoption_index = normalized.find(
         "health.capabilities.requestadoptioncontracts"
     )
     return (
         api_version_index >= 0
+        and health_ok_index >= 0
         and request_adoption_index >= 0
-        and api_version_index < request_adoption_index
+        and api_version_index < health_ok_index < request_adoption_index
     )
 
 
@@ -2250,6 +2288,15 @@ def validate_o3_negotiation_claims(
                 f"{path}: O3 negotiation claim must require the exact "
                 f"health.apiVersion {surface.api_version_literal}"
             )
+        health_ok_gate_is_valid = (
+            o3_claim_contains_fragments(claim, assertions["health_ok"])
+            and not o3_claim_weakens_health_ok_gate(claim)
+        )
+        if not health_ok_gate_is_valid:
+            errors.append(
+                f"{path}: O3 negotiation claim must require exact "
+                "health.ok === true"
+            )
         request_adoption_gate_is_valid = o3_claim_contains_fragments(
             claim, assertions["gate"]
         ) and not o3_claim_negates_request_adoption_gate(claim)
@@ -2265,12 +2312,13 @@ def validate_o3_negotiation_claims(
             )
         if (
             api_version_gate_is_valid
+            and health_ok_gate_is_valid
             and request_adoption_gate_is_valid
-            and not o3_claim_orders_api_version_before_request_adoption(claim)
+            and not o3_claim_orders_required_gates(claim)
         ):
             errors.append(
                 f"{path}: O3 negotiation claim must check health.apiVersion "
-                "before requestAdoptionContracts"
+                "before health.ok and health.ok before requestAdoptionContracts"
             )
         if o3_claim_positively_gates_on_execution_binding(claim):
             errors.append(

@@ -944,7 +944,7 @@ impl LiveSessionRuntime {
                 publish(killer)?;
                 Ok(piped)
             })?;
-            return piped.activate(|input, process_tree| {
+            let activation = piped.activate(|input, process_tree| {
                 self.register_kind_with_registration(
                     launch.id.clone(),
                     LiveSessionKind::Pty,
@@ -955,6 +955,7 @@ impl LiveSessionRuntime {
                 launch_admission.release();
                 Ok(())
             });
+            return self.classify_piped_activation_result(&launch.id, activation);
         }
 
         // Interactive claude launches hit the workspace trust dialog (not
@@ -1013,6 +1014,19 @@ impl LiveSessionRuntime {
         match self.sessions.lock() {
             Ok(sessions) => sessions.contains_key(session_id),
             Err(_) => true,
+        }
+    }
+
+    fn classify_piped_activation_result(
+        &self,
+        session_id: &str,
+        activation: Result<()>,
+    ) -> Result<()> {
+        match activation {
+            Err(_) if self.runtime_ownership_retained_or_ambiguous(session_id) => {
+                Err(anyhow::Error::new(RuntimeOwnershipRetainedError))
+            }
+            result => result,
         }
     }
 
@@ -5583,6 +5597,115 @@ mod tests {
         assert!(
             !runtime.sessions.lock().unwrap().contains_key(session_id),
             "confirmed cleanup left a live registry handle"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_piped_activation_with_retained_registry_has_typed_ownership() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "private-retained-piped-session";
+        runtime.register(
+            session_id.to_string(),
+            Box::new(std::io::sink()),
+            Box::new(FailingKiller("private-piped-cleanup-error")),
+        )?;
+
+        let error = runtime
+            .classify_piped_activation_result(
+                session_id,
+                Err(anyhow::anyhow!(
+                    "private-piped-prompt-error; cleanup failure: private-piped-cleanup-error"
+                )),
+            )
+            .expect_err("retained piped ownership must have a typed disposition");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_some(),
+            "returned anyhow error lost its retained-ownership disposition: {error:#}"
+        );
+        assert!(
+            runtime.sessions.lock().unwrap().contains_key(session_id),
+            "retained piped runtime disappeared from the live registry"
+        );
+        let diagnostic = format!("{error:#}");
+        for private in [
+            session_id,
+            "private-piped-prompt-error",
+            "private-piped-cleanup-error",
+        ] {
+            assert!(
+                !diagnostic.contains(private),
+                "retained-ownership error leaked private fixture data"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_piped_activation_with_ambiguous_registry_has_typed_ownership() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let registry = Arc::clone(&runtime.sessions);
+        let poisoned = std::thread::spawn(move || {
+            let _guard = registry.lock().unwrap();
+            panic!("poison the registry for deterministic ambiguity");
+        })
+        .join();
+        assert!(poisoned.is_err(), "registry poison fixture did not panic");
+
+        let error = runtime
+            .classify_piped_activation_result(
+                "private-ambiguous-piped-session",
+                Err(anyhow::anyhow!("private-ambiguous-piped-cleanup-error")),
+            )
+            .expect_err("ambiguous piped ownership must have a typed disposition");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_some(),
+            "ambiguous registry returned an ordinary launch error: {error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "runtime ownership may remain after launch cleanup"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_piped_activation_after_definitive_cleanup_is_ordinary() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "definitively-cleaned-piped-session";
+        let killer = RecordingKiller::default();
+        let killed = Arc::clone(&killer.killed);
+        runtime.register(
+            session_id.to_string(),
+            Box::new(std::io::sink()),
+            Box::new(killer),
+        )?;
+        SessionRuntime::kill_session(&runtime, session_id)?;
+
+        let error = runtime
+            .classify_piped_activation_result(
+                session_id,
+                Err(anyhow::anyhow!("piped prompt delivery failed")),
+            )
+            .expect_err("the prompt failure must survive definitive cleanup");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_none(),
+            "confirmed piped cleanup must remain an ordinary launch error"
+        );
+        assert_eq!(error.to_string(), "piped prompt delivery failed");
+        assert!(*killed.lock().unwrap(), "cleanup kill was not invoked");
+        assert!(
+            !runtime.sessions.lock().unwrap().contains_key(session_id),
+            "confirmed piped cleanup left a live registry handle"
         );
         Ok(())
     }

@@ -129,24 +129,28 @@ sending a dependent request. Capabilities advertise availability and never grant
 | `sendAdoptedInput` | `POST /api/v1/sessions/:id/adopted-input` | `202 {"adopted":true,"replayed":false,"delivery":"not_asserted"}` | `200 {"adopted":true,"replayed":true,"delivery":"not_asserted"}` |
 
 Before either mutation, the client calls `GET /api/v1/health` and negotiates
-in a fixed, two-step order. First it requires `health.apiVersion` to be the
-exact string `coven.daemon.v1`.
-Only after that check passes does it require
+in a fixed, three-step order. First it requires `health.apiVersion`
+to be the exact string `coven.daemon.v1`.
+Second it requires `health.ok === true`.
+Only after both checks pass does it require
 `health.capabilities.requestAdoptionContracts` to be an array containing the
 exact `psyche.request_adoption.v1` string.
 A missing, null, non-string, wrong-case, near-match, or otherwise unsupported
-`health.apiVersion` fails closed on its own, before the capability is even
-inspected; a valid `health.apiVersion` with a missing, malformed, or unsupported
-capability advertisement fails on the capability check instead.
-Any health, API-version, or capability failure sends zero POST requests and
-never falls back to a legacy mutation. That O3 capability advertises the
-composite adopted-route contract; the client does not independently gate these
-adopted methods on `executionBindingContracts`. It does not replace proof:
-every adopted request must still carry a complete, exact O2 `executionBinding`
-proof. Non-2xx daemon responses surface as `CovenApiError` with their HTTP
-status and response body. Adoption asserts durable responsibility, not
-delivery or completion; the normative shape, errors, ordering, and retention
-rules live only in the canonical
+`health.apiVersion` fails closed on its own, before `health.ok` or the capability
+is inspected. A valid `health.apiVersion` with missing, null, false, or
+non-boolean `health.ok` fails on the health check before capability inspection;
+a valid `health.apiVersion` and exact `health.ok === true` with a missing,
+malformed, or unsupported capability advertisement fails on the capability
+check instead.
+Any health transport, API-version, health-ok, or capability failure sends zero
+POST requests and never falls back to a legacy mutation. That O3 capability
+advertises the composite adopted-route contract; the client does not independently gate
+these adopted methods on `executionBindingContracts`. It
+does not replace proof: every adopted request must still carry a complete,
+exact O2 `executionBinding` proof. Non-2xx daemon responses surface as
+`CovenApiError` with their HTTP status and response body. Adoption asserts
+durable responsibility, not delivery or completion; the normative shape,
+errors, ordering, and retention rules live only in the canonical
 [request-adoption contract](../../docs/API-CONTRACT.md#psyche-request-adoption-contract-v1).
 
 ## Development notes

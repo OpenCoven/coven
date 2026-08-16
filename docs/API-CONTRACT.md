@@ -1447,19 +1447,21 @@ those checks.
 ```
 
 Before every adopted launch or input, the bundled client completes health
-negotiation in a fixed order. First it requires `health.apiVersion` to be the
-exact string `coven.daemon.v1`.
-Only after that check passes does it require
+negotiation in a fixed three-step order. First it requires `health.apiVersion`
+to be the exact string `coven.daemon.v1`.
+Second it requires `health.ok === true`.
+Only after both checks pass does it require
 `health.capabilities.requestAdoptionContracts` to be an array containing the
 exact `psyche.request_adoption.v1` string.
-Any health, API-version, or capability failure sends zero POST requests and
-never falls back to a legacy mutation. That O3 capability advertises the
-composite adopted-route contract; the client does not independently gate these
-adopted methods on `executionBindingContracts`. It does not replace proof:
-every adopted request must still carry a complete, exact O2 `executionBinding`
-proof, which the Rust authority validates along with all per-operation
-admission checks. Capabilities advertise availability; they never grant
-permission or prove a request.
+Missing, null, false, and non-boolean `health.ok` values all fail locally.
+Any health transport, API-version, health-ok, or capability failure sends zero
+POST requests and never falls back to a legacy mutation. That O3 capability
+advertises the composite adopted-route contract; the client does not independently gate
+these adopted methods on `executionBindingContracts`. It
+does not replace proof: every adopted request must still carry a complete,
+exact O2 `executionBinding` proof, which the Rust authority validates along
+with all per-operation admission checks. Capabilities advertise availability;
+they never grant permission or prove a request.
 
 ### O4-O8 exclusions
 
@@ -2148,22 +2150,25 @@ for the complete precedence and static field paths.
 ## Recommended client handshake
 
 1. Call `GET /api/v1/health`.
-2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.structuredErrors === true`.
-3. Verify `capabilities.sessions === true` before session requests and
+2. Verify `apiVersion === "coven.daemon.v1"` exactly.
+3. Require `ok === true`; do not coerce or accept truthy values.
+4. Verify `capabilities.structuredErrors === true`.
+5. Verify `capabilities.sessions === true` before session requests and
    `capabilities.events === true` before event requests.
-4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
-5. Check `capabilities.sessionLaunchPolicy === true` before sending
+6. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
+7. Check `capabilities.sessionLaunchPolicy === true` before sending
    `launchPolicy`; a missing, false, or malformed value means unsupported.
-6. For an integration that negotiates a standalone O2 operation such as bound
+8. For an integration that negotiates a standalone O2 operation such as bound
    kill, use `capabilities.executionBindingContracts` and require
    `"psyche.execution_binding.v1"`.
-7. Before every adopted launch or input, require
+9. Before every adopted launch or input, and only after steps 2 and 3 pass,
+   require
    `capabilities.requestAdoptionContracts` to be an array containing the exact
    `"psyche.request_adoption.v1"` literal; this O3 value advertises the
    composite route contract. The bundled adopted client checks this field, not
    `executionBindingContracts`, and never falls back. Still send the complete
    exact O2 proof on every request.
-8. Only then depend on the documented `v1` sessions/events shapes.
+10. Only then depend on the documented `v1` sessions/events shapes.
 
 ## Scope boundary
 

@@ -116,18 +116,20 @@ affected session stream, inserted before the next accepted event.
 If a client requires a capability the daemon does not advertise, the client should fail loudly with a remediation hint (`upgrade Coven to >= N`).
 
 Before either adopted route, the bundled client calls `GET /api/v1/health` and
-negotiates in a fixed order. First it requires `health.apiVersion` to be the
-exact string `coven.daemon.v1`.
-Only after that check passes does it require
+negotiates in a fixed three-step order. First it requires `health.apiVersion`
+to be the exact string `coven.daemon.v1`.
+Second it requires `health.ok === true`.
+Only after both checks pass does it require
 `health.capabilities.requestAdoptionContracts` to be an array containing the
 exact `psyche.request_adoption.v1` string.
-Any health, API-version, or capability failure sends zero POST requests and
-never falls back to a legacy mutation. That O3 capability advertises the
-composite adopted-route contract; the client does not independently gate these
-adopted methods on `executionBindingContracts`. It does not replace proof:
-every adopted request must still carry a complete, exact O2 `executionBinding`
-proof. The separate `executionBindingContracts` field remains the additive
-discovery surface for standalone O2 support.
+Missing, null, false, and non-boolean `health.ok` values all fail locally.
+Any health transport, API-version, health-ok, or capability failure sends zero
+POST requests and never falls back to a legacy mutation. That O3 capability
+advertises the composite adopted-route contract; the client does not independently gate
+these adopted methods on `executionBindingContracts`. It
+does not replace proof: every adopted request must still carry a complete,
+exact O2 `executionBinding` proof. The separate `executionBindingContracts`
+field remains the additive discovery surface for standalone O2 support.
 
 | Route | First adoption | Exact replay | Adoption errors |
 |---|---|---|---|

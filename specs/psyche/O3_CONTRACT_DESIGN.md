@@ -589,6 +589,8 @@ Health adds:
 
 ```json
 {
+  "ok": true,
+  "apiVersion": "coven.daemon.v1",
   "capabilities": {
     "requestAdoptionContracts": ["psyche.request_adoption.v1"]
   }
@@ -609,11 +611,16 @@ wire-compatible. Existing bound launch/input client methods are retained only
 as explicit legacy methods for pre-O3 daemons. Adopted methods use only the
 dedicated O3 routes, and O3 daemons reject bound operations on legacy routes.
 
-Every adopted client method completes health negotiation before POST. An
-absent field, non-array value, array without
-`psyche.request_adoption.v1`, or health failure stops locally with no request
-sent. Capability presence authorizes use of the wire shape only; O2 proof and
-all per-operation admission checks still apply.
+Every adopted client method completes health negotiation before POST in this
+exact order: first require `apiVersion === "coven.daemon.v1"`, second require
+`ok === true` without coercion, and only then require
+`capabilities.requestAdoptionContracts` to be an array containing the exact
+`psyche.request_adoption.v1` string. Missing, null, false, truthy non-boolean,
+or otherwise non-true `ok` values stop locally. Any health, API-version,
+health-ok, or O3-capability failure sends zero POST requests and never falls
+back to a legacy mutation. Capability presence authorizes use of the wire shape
+only; every adopted request still carries its complete, exact O2
+`executionBinding` proof, and all per-operation admission checks still apply.
 
 ## 8. Verification matrix
 
@@ -723,8 +730,11 @@ all per-operation admission checks still apply.
 - O3-capable bound launch/input requires adoption, while an explicitly legacy
   client fails closed instead of silently bypassing it;
 - health and TypeScript fixtures are additive;
-- adopted client methods send no POST when capability negotiation is absent,
-  malformed, unsupported, or fails;
+- adopted client methods check exact `apiVersion` first, exact `ok === true`
+  second, and exact O3 capability third before POST; missing, null, false,
+  truthy, coerced, malformed, unsupported, or failed health negotiation sends
+  zero POST requests, retains the per-request exact O2 proof requirement, and
+  never falls back to a legacy mutation;
 - adopted methods use dedicated routes that pre-O3 daemons reject, proving a
   daemon replacement after health negotiation cannot downgrade to an
   unadopted side effect;
