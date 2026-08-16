@@ -95,9 +95,11 @@ mod tests {
     const CHILD_MODE_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_MODE";
     const CHILD_HOME_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_HOME";
     const CHILD_KEY_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_KEY";
+    const CHILD_SCOPE_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_SCOPE";
     const CHILD_READY_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_READY";
     const CHILD_RELEASE_ENV: &str = "COVEN_ADOPTION_GATE_CHILD_RELEASE";
     const CHILD_TEST_NAME: &str = "adoption_gate::tests::subprocess_child_holds_gate";
+    const CHILD_SCOPE_FIELD_SEPARATOR: char = ',';
     static NEXT_SCRATCH_ID: AtomicU64 = AtomicU64::new(0);
 
     struct ScratchDir {
@@ -152,6 +154,31 @@ mod tests {
 
     fn request_key() -> &'static str {
         "psyche/request:key"
+    }
+
+    /// A launch attempt scope disjoint from `scope_fields()`, used to prove that a
+    /// held scope lock never contends against an unrelated attempt scope.
+    fn disjoint_scope_fields() -> [&'static str; 5] {
+        [
+            "principal-23",
+            "project-29",
+            "graph-31",
+            "node-37",
+            "attempt-41",
+        ]
+    }
+
+    fn encode_scope_for_child(scope: &[&str]) -> String {
+        scope
+            .to_vec()
+            .join(&CHILD_SCOPE_FIELD_SEPARATOR.to_string())
+    }
+
+    fn decode_scope_from_child(value: &str) -> Vec<String> {
+        value
+            .split(CHILD_SCOPE_FIELD_SEPARATOR)
+            .map(str::to_owned)
+            .collect()
     }
 
     fn lock_file_name_matches(name: &str, kind: &str) -> bool {
@@ -284,6 +311,78 @@ mod tests {
     }
 
     #[test]
+    fn different_keys_same_scope_contend_while_disjoint_scope_proceeds() -> Result<()> {
+        // Proves the launch attempt *scope* lock, not the request *key* lock,
+        // serializes concurrent launches with different keys: a contender using a
+        // different key on the same scope must block, while the same different key
+        // on a disjoint scope must proceed immediately.
+        let scratch = ScratchDir::new("scope-not-key")?;
+        let home = scratch.path().join("home");
+        let scope = scope_fields();
+        let disjoint_scope = disjoint_scope_fields();
+        let key_a = "psyche/request:key-a";
+        let key_b = "psyche/request:key-b";
+
+        let first = AdoptionGate::acquire(&home, key_a, Some(&scope))?;
+
+        // Digest-only lock filenames and no leaked raw key/scope values.
+        let directory = home.join(LOCK_DIR);
+        let scope_path = lock_path(&directory, "scope", &scope);
+        assert_lock_contended(&scope_path)?;
+        let scope_name = scope_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(lock_file_name_matches(scope_name, "scope"), "{scope_name}");
+        for raw in [
+            key_a, key_b, scope[0], scope[1], scope[2], scope[3], scope[4],
+        ] {
+            assert!(
+                !scope_path.display().to_string().contains(raw),
+                "scope path leaked {raw}: {}",
+                scope_path.display()
+            );
+        }
+
+        // The same different key on a disjoint scope must proceed immediately while A
+        // is held: it is the scope, not the key, that serializes here. This runs
+        // before the same-scope contender below so the two `key_b` acquisitions never
+        // race for `key_b`'s own key-lock, which would confound the result.
+        let disjoint = AdoptionGate::acquire(&home, key_b, Some(&disjoint_scope))?;
+        drop(disjoint);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let home_for_thread = home.clone();
+        let barrier_for_thread = Arc::clone(&barrier);
+        let contender = thread::spawn(move || -> Result<()> {
+            barrier_for_thread.wait();
+            let _guard = AdoptionGate::acquire(&home_for_thread, key_b, Some(&scope))?;
+            acquired_tx
+                .send(())
+                .expect("notify different-key same-scope acquisition");
+            Ok(())
+        });
+
+        barrier.wait();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "a different key on the same attempt scope must block while the scope is held"
+        );
+
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(2))
+            .context("different-key same-scope contender must acquire after release")?;
+        contender
+            .join()
+            .expect("different-key same-scope contender thread")?;
+        Ok(())
+    }
+
+    #[test]
     fn launch_locks_are_acquired_in_sorted_full_path_order() -> Result<()> {
         let scratch = ScratchDir::new("sorted-paths")?;
         let directory = scratch.path().join("locks");
@@ -387,6 +486,110 @@ mod tests {
     }
 
     #[test]
+    fn child_process_different_key_same_scope_blocks_and_disjoint_scope_proceeds() -> Result<()> {
+        // Cross-process variant of `different_keys_same_scope_contend_while_disjoint_scope_proceeds`:
+        // a real child process holds key-a + scope S; this process contends with
+        // key-b + scope S (must wait) and key-b + disjoint scope T (must proceed).
+        let scratch = ScratchDir::new("child-scope-not-key")?;
+        let home = scratch.path().join("home");
+        let ready = scratch.path().join("child-ready");
+        let release = scratch.path().join("child-release");
+        let scope = scope_fields();
+        let disjoint_scope = disjoint_scope_fields();
+        let key_a = "psyche/request:key-a";
+        let key_b = "psyche/request:key-b";
+
+        let child = Command::new(std::env::current_exe().context("current test executable")?)
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(CHILD_TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_MODE_ENV, "hold")
+            .env(CHILD_HOME_ENV, &home)
+            .env(CHILD_KEY_ENV, key_a)
+            .env(CHILD_SCOPE_ENV, encode_scope_for_child(&scope))
+            .env(CHILD_READY_ENV, &ready)
+            .env(CHILD_RELEASE_ENV, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("spawn adoption gate child test")?;
+
+        wait_for_path(&ready, Duration::from_secs(5))?;
+
+        // Digest-only lock filenames and no leaked raw key/scope values, even for the
+        // cross-process different-key/same-scope contention path.
+        let directory = home.join(LOCK_DIR);
+        let scope_path = lock_path(&directory, "scope", &scope);
+        assert_lock_contended(&scope_path)?;
+        let scope_name = scope_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap();
+        assert!(lock_file_name_matches(scope_name, "scope"), "{scope_name}");
+        for raw in [
+            key_a, key_b, scope[0], scope[1], scope[2], scope[3], scope[4],
+        ] {
+            assert!(
+                !scope_path.display().to_string().contains(raw),
+                "scope path leaked {raw}: {}",
+                scope_path.display()
+            );
+        }
+
+        // Different key AND a disjoint scope must proceed immediately while the child
+        // holds key-a + scope S. This runs before the same-scope contender below so
+        // the two `key_b` acquisitions never race for `key_b`'s own key-lock, which
+        // would confound the result.
+        let disjoint = AdoptionGate::acquire(&home, key_b, Some(&disjoint_scope))?;
+        drop(disjoint);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let home_for_thread = home.clone();
+        let barrier_for_thread = Arc::clone(&barrier);
+        let contender = thread::spawn(move || -> Result<()> {
+            barrier_for_thread.wait();
+            let _guard = AdoptionGate::acquire(&home_for_thread, key_b, Some(&scope))?;
+            acquired_tx
+                .send(())
+                .expect("different-key same-scope child contention acquired");
+            Ok(())
+        });
+
+        barrier.wait();
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "different-key same-scope acquisition must wait while the child process holds the scope"
+        );
+
+        fs::write(&release, b"release")
+            .with_context(|| format!("write child release marker {}", release.display()))?;
+        acquired_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("different-key same-scope acquisition should finish after child release")?;
+        contender
+            .join()
+            .expect("different-key same-scope child contention thread")?;
+
+        let output = child
+            .wait_with_output()
+            .context("wait for adoption gate child test")?;
+        if !output.status.success() {
+            bail!(
+                "child test failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore]
     fn subprocess_child_holds_gate() -> Result<()> {
         if std::env::var_os(CHILD_MODE_ENV).is_none() {
@@ -403,8 +606,14 @@ mod tests {
         let release = PathBuf::from(
             std::env::var_os(CHILD_RELEASE_ENV).expect("child test must receive a release marker"),
         );
+        let scope = std::env::var(CHILD_SCOPE_ENV)
+            .ok()
+            .map(|value| decode_scope_from_child(&value));
+        let scope_refs: Option<Vec<&str>> = scope
+            .as_ref()
+            .map(|fields| fields.iter().map(String::as_str).collect());
 
-        let _guard = AdoptionGate::acquire(&home, &key, None)?;
+        let _guard = AdoptionGate::acquire(&home, &key, scope_refs.as_deref())?;
         fs::write(&ready, b"ready")
             .with_context(|| format!("write child ready marker {}", ready.display()))?;
         wait_for_path(&release, Duration::from_secs(10))?;

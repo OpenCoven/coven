@@ -213,13 +213,38 @@ mod tests {
     }
 
     #[test]
-    fn key_allows_every_supported_punctuation_character() {
-        for punctuation in [".", "_", ":", "/", "-"] {
-            let key = format!("Az09{punctuation}tail");
+    fn key_allows_every_ascii_byte_in_the_allowed_set() {
+        // Build the expected allowed byte list independently of `valid_key`'s
+        // implementation, straight from the contract text in
+        // `specs/psyche/O3_CONTRACT_DESIGN.md` §8.1: A-Z, a-z, 0-9, plus exactly
+        // `.`, `_`, `:`, `/`, `-`. This must not merely re-derive or call into the
+        // validator under test.
+        let mut allowed: Vec<u8> = Vec::new();
+        allowed.extend(b'A'..=b'Z');
+        allowed.extend(b'a'..=b'z');
+        allowed.extend(b'0'..=b'9');
+        allowed.extend([b'.', b'_', b':', b'/', b'-']);
+        assert_eq!(
+            allowed.len(),
+            26 + 26 + 10 + 5,
+            "expected allowed byte count to match the independently constructed ranges"
+        );
+
+        for byte in allowed {
+            let key = (byte as char).to_string();
             let mut value = valid_value();
             value["key"] = json!(key.clone());
-            let parsed = parse(&value).expect("allowed punctuation should parse");
-            assert_eq!(parsed.key, key);
+            let parsed = parse(&value).unwrap_or_else(|error| {
+                panic!(
+                    "expected allowed byte {byte:#04x} ({key:?}) to parse as a valid \
+                     one-character key: {error}"
+                )
+            });
+            assert_eq!(
+                parsed.key.as_bytes(),
+                &[byte],
+                "byte {byte:#04x} must round-trip byte-exact"
+            );
         }
     }
 
