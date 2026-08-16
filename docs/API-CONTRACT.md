@@ -1317,9 +1317,11 @@ absent-adoption fallback.
 ### Lifecycle, ambiguity, and retention
 
 An adopted launch transaction commits both the `created` session and adoption
-before runtime work. Runtime ownership alone may compare-and-set
-`created -> running`. The daemon exit writer may instead move `created` or
-`running` to the authoritative persisted exit status: a successful
+before runtime work. Immediately after cancellation ownership registration and
+before initial stream or piped prompt delivery, the runtime invokes its
+ownership callback exactly once to compare-and-set `created -> running`. The
+daemon exit writer may instead move `created` or `running` to the authoritative
+persisted exit status: a successful
 conversation-grouped row (`conversation_id` present) becomes nonterminal
 `idle`, a successful ungrouped row becomes terminal `completed`, and a failed
 exit becomes terminal `failed`. If that status wins before activation, the
@@ -1339,10 +1341,12 @@ relaunching. If persisting the `failed` transition itself fails, the session
 and adoption remain retained but the lifecycle state remains ambiguous; replay
 still returns whatever status is stored and performs no runtime work.
 
-The interval after adoption commit and before established runtime ownership
-is intentionally visible as `created`. O3 does not claim whether a crash in
-that interval delivered work. It retains the evidence for O4 lookup/fencing
-and O7 reconciliation and performs no automatic redispatch.
+The interval after adoption commit and before established runtime ownership is
+intentionally visible as `created`. Once cancellation ownership is registered,
+`running` publication precedes initial prompt delivery. If that publication
+fails, the response is post-adoption ambiguity and replay never relaunches; O3
+does not add O4 recovery behavior. It retains the evidence for O4
+lookup/fencing and O7 reconciliation and performs no automatic redispatch.
 
 Request-adoption rows are immutable and append-only. They survive normal
 session status updates, archive, summon, event retention, and daemon restart.

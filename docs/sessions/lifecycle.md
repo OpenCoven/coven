@@ -81,14 +81,16 @@ For the unbound socket path, the daemon inserts a new row as `running` before la
 
 Adopted `POST /api/v1/adopted-sessions` instead commits a `created` row and
 its launch adoption in one transaction before runtime work. Runtime ownership
-uses a `created -> running` compare-and-set. The exit writer may first move
-`created` or `running` to authoritative nonterminal `idle` for a successful
-conversation-grouped session, terminal `completed` for a successful ungrouped
-session, or terminal `failed` for a failed exit. A later activation CAS that
-finds one of those statuses returns false and never overwrites it. A definitive
-runtime-establishment failure separately conditionally compare-and-sets only
-`created -> failed`, preserving an `idle` or terminal winner; persistence
-failure leaves retained ambiguity. The synchronous failure remains
+invokes a terminal-safe `created -> running` compare-and-set exactly once,
+immediately after cancellation registration and before initial prompt delivery.
+The exit writer may first move `created` or `running` to authoritative
+nonterminal `idle` for a successful conversation-grouped session, terminal
+`completed` for a successful ungrouped session, or terminal `failed` for a
+failed exit. A later activation CAS that finds one of those statuses returns
+false and never overwrites it. A definitive runtime-establishment failure
+separately conditionally compare-and-sets only `created -> failed`, preserving
+an `idle` or terminal winner; publication failure leaves retained ambiguity
+and never authorizes relaunch. The synchronous failure remains
 `500 launch_failed` with marker-only
 `{"adopted":true,"delivery":"not_asserted"}` details. Exact replay returns the
 current persisted row—`created`, `running`, `idle`, or terminal `completed`,

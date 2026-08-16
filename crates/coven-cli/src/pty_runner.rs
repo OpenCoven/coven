@@ -3777,6 +3777,20 @@ const PIPED_CHILD_WAIT_PENDING: u8 = 0;
 const PIPED_CHILD_REAPED: u8 = 1;
 const PIPED_CHILD_WAIT_FAILED: u8 = 2;
 
+/// Privacy-safe disposition for a piped launch whose cleanup did not prove
+/// child-process quiescence. Callers may preserve killable runtime ownership
+/// without exposing either the prompt-delivery or cleanup failure.
+#[derive(Debug)]
+pub(crate) struct PipedLaunchCleanupRetainedError;
+
+impl std::fmt::Display for PipedLaunchCleanupRetainedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("piped runtime ownership may remain after launch cleanup")
+    }
+}
+
+impl std::error::Error for PipedLaunchCleanupRetainedError {}
+
 struct PipedPromptDelivery {
     stdin: Option<std::process::ChildStdin>,
     prompt: Option<Vec<u8>>,
@@ -3991,9 +4005,16 @@ fn cleanup_piped_launch_failure(
     primary: anyhow::Error,
     process_tree: &SharedStrictChildProcessTree,
 ) -> anyhow::Error {
-    match process_tree.terminate_and_wait(PIPED_PROMPT_REAP_TIMEOUT) {
+    piped_launch_cleanup_error(
+        primary,
+        process_tree.terminate_and_wait(PIPED_PROMPT_REAP_TIMEOUT),
+    )
+}
+
+fn piped_launch_cleanup_error(primary: anyhow::Error, cleanup: Result<()>) -> anyhow::Error {
+    match cleanup {
         Ok(()) => primary,
-        Err(cleanup) => anyhow::anyhow!("{primary:#}; cleanup failure: {cleanup:#}"),
+        Err(_) => anyhow::Error::new(PipedLaunchCleanupRetainedError),
     }
 }
 
@@ -5434,6 +5455,81 @@ mod tests {
             wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
             "failed prompt delivery left child {child_pid} running"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_piped_cleanup_has_typed_privacy_safe_disposition() {
+        let primary = anyhow::anyhow!("private primary prompt failure");
+        let cleanup = Err(anyhow::anyhow!("private cleanup failure"));
+
+        let error = piped_launch_cleanup_error(primary, cleanup);
+
+        assert!(
+            error
+                .downcast_ref::<PipedLaunchCleanupRetainedError>()
+                .is_some(),
+            "cleanup ambiguity lost its typed disposition: {error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "piped runtime ownership may remain after launch cleanup"
+        );
+        let diagnostic = format!("{error:#}");
+        for private in ["private primary prompt failure", "private cleanup failure"] {
+            assert!(
+                !diagnostic.contains(private),
+                "typed cleanup disposition leaked private failure data"
+            );
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn definitive_piped_cleanup_is_ordinary_while_exit_callback_is_delayed() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("delayed-callback.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "close-stdin",
+            &pid_file.to_string_lossy(),
+            None,
+            vec![b'x'; 1024 * 1024],
+        )?;
+        let (callback_tx, callback_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let observer = DetachedPtyObserver {
+            on_output: Box::new(|_| {}),
+            on_exit: Box::new(move |result| {
+                let _ = callback_tx.send(result);
+                let _ = release_rx.recv();
+            }),
+        };
+
+        let session = spawn_piped_with_observer(&command, Some(observer), false)?;
+        let child_pid = await_piped_descendant_pid(&pid_file)?;
+        let error = match session.activate(|_input, process_tree| Ok(process_tree)) {
+            Ok(_) => anyhow::bail!("closed stdin unexpectedly accepted the launch prompt"),
+            Err(error) => error,
+        };
+        let result = callback_rx.recv_timeout(Duration::from_secs(2))?;
+
+        assert_eq!(result.status, "failed", "{result:?}");
+        assert!(
+            error
+                .downcast_ref::<PipedLaunchCleanupRetainedError>()
+                .is_none(),
+            "definitive child cleanup became ambiguous while on_exit was delayed"
+        );
+        assert!(
+            format!("{error:#}").contains("failed writing harness prompt to stdin"),
+            "ordinary primary error was not preserved: {error:#}"
+        );
+        assert!(
+            wait_for_piped_process_exit(child_pid, Duration::from_secs(2)),
+            "definitive cleanup left child {child_pid} running"
+        );
+        release_tx.send(())?;
         Ok(())
     }
 

@@ -447,14 +447,15 @@ An adopted launch follows this order:
 8. Insert the session with status `created` and insert its adoption row in the
    same transaction, then commit. `created` is the O1 state for a durable row
    without established runtime ownership.
-9. Pass the acquired `WriterLease` into
-   `SessionRuntime::launch_session_with_writer`; the runtime retains it for the
-   session lifetime exactly as in the current launch path.
-10. Runtime exit persistence may transition `created` or `running` to its
-   authoritative terminal state. After runtime establishment succeeds, use a
-   compare-and-set transition `created -> running`; if the row is already
-   terminal, terminal wins and is never overwritten. When establishment
-   definitively fails, use a compare-and-set transition `created -> failed`.
+9. Pass the acquired `WriterLease` and a terminal-safe ownership-publication
+   callback into the adopted runtime launch. The runtime retains the writer for
+   the session lifetime exactly as in the current launch path.
+10. Immediately after cancellation ownership is registered, and before any
+    initial stream or piped prompt delivery, the runtime invokes the callback
+    exactly once to compare-and-set `created -> running`. Runtime exit
+    persistence may already have moved `created` to `idle` or a terminal state;
+    that winner is never overwritten. When establishment definitively fails
+    before the callback, use a compare-and-set transition `created -> failed`.
 
 If maintenance acquisition fails, Coven repeats adoption resolution while it
 still owns the `AdoptionGate`, then returns the maintenance error only when no
@@ -469,11 +470,12 @@ replay during the commit-to-runtime window truthfully returns `created`, never
 a false `running`. Those mutable checks apply only to a new side effect. Shape,
 contract, exact stored identity, and conflict checks always apply.
 
-If runtime ownership is established but the `created -> running` persistence
-transition fails, Coven returns a post-adoption error marked
+If runtime ownership is established but its immediate `created -> running`
+publication fails, Coven returns a post-adoption error marked
 `{"adopted":true,"delivery":"not_asserted"}` and does not relaunch on replay.
-That interval is retained for O7 reconciliation; O3 does not invent a false
-terminal or running state.
+The registered runtime remains post-adoption ambiguity unless its launch-path
+cleanup proves quiescence. O3 does not invent a false terminal or running state
+and leaves reconciliation to O7.
 
 Every synchronous request error produced after the session/adoption
 transaction commits carries the same redacted adoption marker, including
@@ -677,11 +679,12 @@ only; every adopted request still carries its complete, exact O2
   strings whose filesystem/harness targets later drift do not hide replay or
   conflict;
 - concurrent replay during commit-to-runtime returns truthful `created`, and
-  only established runtime ownership transitions it to `running`;
+  established runtime ownership publishes `running` immediately after
+  cancellation registration and before initial prompt delivery;
 - stale-created recovery leaves adopted/reserved `created` rows unchanged
   beyond the normal TTL;
-- deterministic exit-before-launch-return tests prove terminal status wins
-  over the later `created -> running` compare-and-set;
+- deterministic exit-before-registration-publication tests prove terminal
+  status wins over the later `created -> running` compare-and-set;
 - replay after restart returns the same session without runtime launch;
 - replay of a failed or terminal adopted session returns that session without
   relaunch;

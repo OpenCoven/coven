@@ -285,6 +285,19 @@ pub enum SessionEventBoundaryError {
 
 pub type SessionEventBoundaryResult = std::result::Result<(), SessionEventBoundaryError>;
 
+/// Privacy-safe post-adoption disposition for established runtime ownership
+/// whose immediate `created -> running` publication could not be persisted.
+#[derive(Debug)]
+pub(crate) struct RuntimeOwnershipPublicationError;
+
+impl std::fmt::Display for RuntimeOwnershipPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("established runtime ownership could not be published")
+    }
+}
+
+impl std::error::Error for RuntimeOwnershipPublicationError {}
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -294,6 +307,34 @@ pub trait SessionRuntime {
     ) -> Result<()> {
         drop(writer);
         self.launch_session(launch)
+    }
+    /// Launch a durably adopted session and publish runtime ownership at the
+    /// implementation's exact establishment boundary.
+    ///
+    /// The default preserves fake/runtime adapter behavior by publishing after
+    /// a successful launch return, or before propagating the typed disposition
+    /// that says cleanup may have retained ownership. Live runtimes override
+    /// this to publish immediately after cancellation registration and before
+    /// initial prompt delivery.
+    fn launch_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let result = match writer {
+            Some(writer) => self.launch_session_with_writer(launch, writer),
+            None => self.launch_session(launch),
+        };
+        let retained = result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+                .is_some()
+        });
+        if result.is_ok() || retained {
+            ownership_established()?;
+        }
+        result
     }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
@@ -2595,42 +2636,62 @@ fn launch_adopted_session(
         &now,
     )?;
     tx.commit()?;
-    // A replay may now observe durable `created`; runtime ownership alone may
-    // compare-and-set that row to `running`.
+    // A replay may now observe durable `created`. The adopted runtime invokes
+    // the terminal-safe publication callback at its exact ownership boundary.
     drop(adoption_gate);
 
-    let launch_result = match writer {
-        Some(writer) => runtime.launch_session_with_writer(&launch, writer),
-        None => runtime.launch_session(&launch),
+    let mut ownership_callback_invoked = false;
+    let mut ownership_publication_failed = false;
+    let mut publish_runtime_ownership = || -> Result<()> {
+        if ownership_callback_invoked {
+            ownership_publication_failed = true;
+            return Err(anyhow::Error::new(RuntimeOwnershipPublicationError));
+        }
+        ownership_callback_invoked = true;
+        match store::update_session_status_if_current(
+            &conn,
+            &record.id,
+            "created",
+            "running",
+            None,
+            &current_timestamp(),
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                ownership_publication_failed = true;
+                Err(anyhow::Error::new(RuntimeOwnershipPublicationError))
+            }
+        }
     };
+    let launch_result =
+        runtime.launch_adopted_session(&launch, writer, &mut publish_runtime_ownership);
     if let Err(error) = launch_result {
+        if ownership_publication_failed
+            || error
+                .downcast_ref::<RuntimeOwnershipPublicationError>()
+                .is_some()
+        {
+            return post_adoption_error(
+                500,
+                "launch_failed",
+                "Session runtime status could not be persisted after adoption.",
+            );
+        }
         // A retained-ownership error means the runtime registry may still own
         // a killable handle, so `failed` would incorrectly fence cleanup.
-        if error
+        let ownership_retained = error
             .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
-            .is_some()
-        {
-            if store::update_session_status_if_current(
-                &conn,
-                &record.id,
-                "created",
-                "running",
-                None,
-                &current_timestamp(),
-            )
-            .is_err()
-            {
-                return post_adoption_error(
-                    500,
-                    "launch_failed",
-                    "Session runtime status could not be persisted after adoption.",
-                );
-            }
-        } else {
+            .is_some();
+        if !ownership_retained {
+            let expected = if ownership_callback_invoked {
+                "running"
+            } else {
+                "created"
+            };
             let _ = store::update_session_status_if_current(
                 &conn,
                 &record.id,
-                "created",
+                expected,
                 "failed",
                 None,
                 &current_timestamp(),
@@ -2643,16 +2704,7 @@ fn launch_adopted_session(
         );
     }
 
-    if store::update_session_status_if_current(
-        &conn,
-        &record.id,
-        "created",
-        "running",
-        None,
-        &current_timestamp(),
-    )
-    .is_err()
-    {
+    if !ownership_callback_invoked {
         return post_adoption_error(
             500,
             "launch_failed",
@@ -11847,6 +11899,97 @@ mod tests {
     }
 
     #[test]
+    fn adopted_launch_publishes_running_once_before_blocked_runtime_and_remains_killable(
+    ) -> anyhow::Result<()> {
+        for (launch_mode, harness, key) in [
+            ("stream", "claude", "blocked-stream-publication"),
+            ("nonInteractive", "codex", "blocked-piped-publication"),
+        ] {
+            let temp = tempfile::tempdir()?;
+            seed_familiars_toml(temp.path())?;
+            let project_root = temp.path().join("repo");
+            std::fs::create_dir_all(&project_root)?;
+            let binding = root_binding("sage");
+            let mut body = adopted_launch_body(&project_root, "sage", binding.clone(), key);
+            body["launchMode"] = json!(launch_mode);
+            body["harness"] = json!(harness);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let runtime = std::sync::Arc::new(BlockingEstablishedRuntime {
+                launches: std::sync::atomic::AtomicUsize::new(0),
+                callbacks: std::sync::atomic::AtomicUsize::new(0),
+                kills: std::sync::atomic::AtomicUsize::new(0),
+                entered: Mutex::new(Some(entered_tx)),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            });
+            let request_home = temp.path().to_path_buf();
+            let request_body = body.clone();
+            let request_runtime = std::sync::Arc::clone(&runtime);
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = response_tx.send(post_adopted_launch(
+                    &request_home,
+                    &request_body,
+                    request_runtime.as_ref(),
+                ));
+            });
+
+            let session_id = entered_rx.recv_timeout(std::time::Duration::from_secs(2))?;
+            let conn = store::open_store(&store_path(temp.path()))?;
+            assert_eq!(
+                store::get_session(&conn, &session_id)?
+                    .context("blocked adopted session")?
+                    .status,
+                "running",
+                "{launch_mode} ownership was not published before delivery blocked"
+            );
+            assert_eq!(runtime.callback_count(), 1);
+            assert!(matches!(
+                response_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+
+            let kill = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/{session_id}/kill"),
+                temp.path(),
+                None,
+                Some(&json!({ "executionBinding": binding }).to_string()),
+                runtime.as_ref(),
+            )?;
+            assert_eq!(kill.status, 202, "{launch_mode}: {}", kill.body);
+            assert_eq!(runtime.kill_count(), 1);
+            let response = response_rx.recv_timeout(std::time::Duration::from_secs(2))??;
+            assert_eq!(response.status, 201, "{launch_mode}: {}", response.body);
+            let launch_status = serde_json::from_str::<Value>(&response.body)?["status"]
+                .as_str()
+                .context("launch response status")?
+                .to_string();
+            assert!(
+                launch_status == "running" || launch_status == "killed",
+                "concurrent launch read returned {launch_status}"
+            );
+            assert_eq!(
+                store::get_session(&conn, &session_id)?
+                    .context("killed blocked session")?
+                    .status,
+                "killed"
+            );
+            assert_eq!(runtime.launch_count(), 1);
+            assert_eq!(runtime.callback_count(), 1);
+
+            let replay_runtime = ConcurrentRecordingRuntime::default();
+            let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+            assert_eq!(replay.status, 200, "{launch_mode}: {}", replay.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&replay.body)?["status"],
+                "killed"
+            );
+            assert_eq!(replay_runtime.launch_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn adopted_launch_retained_ownership_persists_running_and_replays_without_relaunch(
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
@@ -12090,6 +12233,7 @@ mod tests {
         let runtime = StatusPersistenceFailRuntime {
             coven_home: temp.path().to_path_buf(),
             launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
             fail_runtime: false,
             retain_runtime_ownership: false,
         };
@@ -12102,6 +12246,7 @@ mod tests {
             json!({"adopted": true, "delivery": "not_asserted"})
         );
         assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 1);
         assert_eq!(adoption_row_count(temp.path())?, 1);
         let conn = store::open_store(&store_path(temp.path()))?;
         let session = store::list_sessions(&conn)?
@@ -12135,6 +12280,7 @@ mod tests {
         let runtime = StatusPersistenceFailRuntime {
             coven_home: temp.path().to_path_buf(),
             launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
             fail_runtime: true,
             retain_runtime_ownership: false,
         };
@@ -12153,6 +12299,7 @@ mod tests {
         assert_eq!(sessions[0].status, "created");
         assert_eq!(adoption_row_count(temp.path())?, 1);
         assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 0);
         Ok(())
     }
 
@@ -12172,6 +12319,7 @@ mod tests {
         let runtime = StatusPersistenceFailRuntime {
             coven_home: temp.path().to_path_buf(),
             launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
             fail_runtime: false,
             retain_runtime_ownership: true,
         };
@@ -12194,6 +12342,7 @@ mod tests {
         assert_eq!(sessions[0].status, "created");
         assert_eq!(adoption_row_count(temp.path())?, 1);
         assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 1);
 
         let replay_runtime = ConcurrentRecordingRuntime::default();
         let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
@@ -14936,6 +15085,69 @@ mod tests {
         release: Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
+    struct BlockingEstablishedRuntime {
+        launches: std::sync::atomic::AtomicUsize,
+        callbacks: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        entered: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl BlockingEstablishedRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn callback_count(&self) -> usize {
+            self.callbacks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn kill_count(&self) -> usize {
+            self.kills.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for BlockingEstablishedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            anyhow::bail!("adopted launch used the legacy runtime entrypoint")
+        }
+
+        fn launch_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            drop(writer);
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.callbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ownership_established()?;
+            if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+                let _ = entered.send(launch.id.clone());
+            }
+            let (released, ready) = &self.released;
+            let mut released = released.lock().expect("release lock");
+            while !*released {
+                released = ready.wait(released).expect("release wait");
+            }
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (released, ready) = &self.released;
+            *released.lock().expect("release lock") = true;
+            ready.notify_all();
+            Ok(())
+        }
+    }
+
     impl CommitWindowRuntime {
         fn launch_count(&self) -> usize {
             self.launches.load(std::sync::atomic::Ordering::SeqCst)
@@ -15079,6 +15291,7 @@ mod tests {
     struct StatusPersistenceFailRuntime {
         coven_home: PathBuf,
         launches: std::sync::atomic::AtomicUsize,
+        callbacks: std::sync::atomic::AtomicUsize,
         fail_runtime: bool,
         retain_runtime_ownership: bool,
     }
@@ -15086,6 +15299,10 @@ mod tests {
     impl StatusPersistenceFailRuntime {
         fn launch_count(&self) -> usize {
             self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn callback_count(&self) -> usize {
+            self.callbacks.load(std::sync::atomic::Ordering::SeqCst)
         }
     }
 
@@ -15110,6 +15327,27 @@ mod tests {
                 anyhow::bail!("runtime failed while status persistence was blocked");
             }
             Ok(())
+        }
+
+        fn launch_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            drop(writer);
+            let result = self.launch_session(launch);
+            let retained = result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+                    .is_some()
+            });
+            if result.is_ok() || retained {
+                self.callbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ownership_established()?;
+            }
+            result
         }
 
         fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
