@@ -258,6 +258,12 @@ CREATE UNIQUE INDEX request_adoptions_launch_session
 ON request_adoptions(session_id)
 WHERE operation = 'launch';
 
+-- Non-unique, covers *all* rows (launch and input) so retention preflight
+-- (`session_has_request_adoption`) and the `sessions(id)` ON DELETE RESTRICT
+-- foreign key check can seek instead of scanning the append-only ledger.
+CREATE INDEX request_adoptions_session
+ON request_adoptions(session_id);
+
 ALTER TABLE events ADD COLUMN request_adoption_id TEXT
     REFERENCES request_adoptions(id) ON DELETE RESTRICT;
 

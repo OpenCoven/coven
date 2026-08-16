@@ -1351,6 +1351,8 @@ fn ensure_request_adoption_indexes_and_triggers(conn: &Connection) -> Result<()>
             WHERE operation = 'launch';
          CREATE UNIQUE INDEX IF NOT EXISTS request_adoptions_launch_session
             ON request_adoptions(session_id) WHERE operation = 'launch';
+         CREATE INDEX IF NOT EXISTS request_adoptions_session
+            ON request_adoptions(session_id);
          CREATE UNIQUE INDEX IF NOT EXISTS events_request_adoption
             ON events(request_adoption_id) WHERE request_adoption_id IS NOT NULL;
 
@@ -8845,6 +8847,31 @@ END;
         Ok(())
     }
 
+    /// `request_adoptions_session` must exist as a plain, non-unique index
+    /// over every row (launch and input) so retention lookups can seek
+    /// instead of scanning the append-only ledger. It must not introduce any
+    /// new uniqueness constraint; `request_adoptions_launch_session` remains
+    /// the sole (partial, launch-only) unique index on this column.
+    fn assert_request_adoptions_session_index_is_non_unique(conn: &Connection) -> Result<()> {
+        let mut statement = conn.prepare("PRAGMA index_list(request_adoptions)")?;
+        let mut found = false;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        for row in rows {
+            let (name, unique) = row?;
+            if name == "request_adoptions_session" {
+                found = true;
+                assert_eq!(
+                    unique, 0,
+                    "request_adoptions_session must not be a unique index"
+                );
+            }
+        }
+        assert!(found, "request_adoptions_session index is missing");
+        Ok(())
+    }
+
     fn assert_sql_error_contains(result: rusqlite::Result<usize>, expected: &str) {
         let error = result.expect_err("raw SQL mutation must fail");
         assert!(
@@ -8897,6 +8924,7 @@ END;
             "request_adoptions_key",
             "request_adoptions_launch_attempt",
             "request_adoptions_launch_session",
+            "request_adoptions_session",
             "events_request_adoption",
             "events_request_adoption_integrity",
             "events_request_adoption_update_integrity",
@@ -8910,6 +8938,7 @@ END;
                 "missing schema object {required}: {schema_objects:?}"
             );
         }
+        assert_request_adoptions_session_index_is_non_unique(&conn)?;
 
         assert!(table_columns(&conn, "events")?
             .iter()
@@ -9019,6 +9048,7 @@ END;
         let conn = open_initialized_store(&path)?;
         let rows = raw_adoption_rows(&conn)?;
         assert_eq!(rows.len(), 2);
+        assert_request_adoptions_session_index_is_non_unique(&conn)?;
         for (row, binding, created_at) in [
             (&rows[0], &first, "2026-08-01T00:00:00Z"),
             (&rows[1], &second, "2026-08-01T00:00:02Z"),
@@ -9048,6 +9078,7 @@ END;
         let reopened = open_initialized_store(&path)?;
         assert_eq!(raw_adoption_rows(&reopened)?, rows);
         assert_event_adoption_foreign_key(&reopened)?;
+        assert_request_adoptions_session_index_is_non_unique(&reopened)?;
         Ok(())
     }
 
@@ -9102,6 +9133,7 @@ END;
             let rows = raw_adoption_rows(&conn)?;
             assert_eq!(rows.len(), 2);
             assert_event_adoption_foreign_key(&conn)?;
+            assert_request_adoptions_session_index_is_non_unique(&conn)?;
             rows
         };
         initialize_store(&path)?;
@@ -9110,6 +9142,7 @@ END;
             let rows = raw_adoption_rows(&conn)?;
             assert_eq!(rows.len(), 3);
             assert_event_adoption_foreign_key(&conn)?;
+            assert_request_adoptions_session_index_is_non_unique(&conn)?;
             rows
         };
         for existing in &before {
@@ -9135,6 +9168,91 @@ END;
         let reopened = open_initialized_store(&path)?;
         assert_eq!(raw_adoption_rows(&reopened)?, after);
         assert_event_adoption_foreign_key(&reopened)?;
+        assert_request_adoptions_session_index_is_non_unique(&reopened)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_adoptions_session_lookup_uses_index_not_full_scan() -> Result<()> {
+        // Regression test for the retention preflight / ON DELETE RESTRICT
+        // foreign key check holding SQLite writer time proportional to the
+        // size of the append-only `request_adoptions` ledger. Build a
+        // realistically sized ledger of unrelated input adoptions (the
+        // partial unique `request_adoptions_launch_session` index does not
+        // cover `operation = 'input'` rows) plus a single target session and
+        // assert the exact retention query plans through
+        // `request_adoptions_session` rather than scanning the table.
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+        let binding = execution_binding_fixture();
+
+        const NOISE_ROWS: usize = 500;
+        for i in 0..NOISE_ROWS {
+            let session_id = format!("noise-session-{i}");
+            let mut session = session_record(&session_id, "2026-08-01T00:00:00Z");
+            session.execution_binding = Some(binding.clone());
+            insert_session(&conn, &session)?;
+            insert_input_adoption(
+                &conn,
+                &format!("noise-adoption-{i}"),
+                &session_id,
+                &request_adoption_fixture(&format!("noise-key-{i}"), &digest_fixture('c')),
+                &binding,
+                "2026-08-01T00:00:00Z",
+            )?;
+        }
+
+        let target_session_id = "target-session";
+        let mut target = session_record(target_session_id, "2026-08-01T00:00:00Z");
+        target.execution_binding = Some(binding.clone());
+        insert_session(&conn, &target)?;
+        insert_input_adoption(
+            &conn,
+            "target-adoption",
+            target_session_id,
+            &request_adoption_fixture("target-key", &digest_fixture('c')),
+            &binding,
+            "2026-08-01T00:00:00Z",
+        )?;
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| row
+                .get::<_, i64>(0),)?,
+            (NOISE_ROWS + 1) as i64,
+            "test fixture must build a realistically sized append-only ledger"
+        );
+
+        // The exact query used by `session_has_request_adoption` (retention
+        // preflight, exercised on every session delete via the `sessions(id)`
+        // ON DELETE RESTRICT foreign key check).
+        let mut statement = conn.prepare(
+            "EXPLAIN QUERY PLAN \
+             SELECT EXISTS(SELECT 1 FROM request_adoptions WHERE session_id=?1)",
+        )?;
+        let plan: Vec<String> = statement
+            .query_map([target_session_id], |row| row.get::<_, String>(3))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        assert!(!plan.is_empty(), "query plan must not be empty");
+        let plan_text = plan.join(" | ").to_ascii_uppercase();
+
+        assert!(
+            plan_text.contains("REQUEST_ADOPTIONS_SESSION"),
+            "retention lookup must use the request_adoptions_session index: {plan_text}"
+        );
+        assert!(
+            !plan_text.contains("SCAN REQUEST_ADOPTIONS")
+                && !plan_text.contains("SCAN TABLE REQUEST_ADOPTIONS"),
+            "retention lookup must not fall back to a full table scan: {plan_text}"
+        );
+
+        // The production helper must observe the same result the query plan
+        // was checked against, for both a bound and an unbound session.
+        assert!(session_has_request_adoption(&conn, target_session_id)?);
+        assert!(!session_has_request_adoption(
+            &conn,
+            "never-adopted-session"
+        )?);
+
         Ok(())
     }
 
