@@ -65,7 +65,7 @@ where
         for agent in registered.values() {
             let mut tool_names = BTreeSet::new();
             for tool in &agent.tools {
-                let name = tool.definition().name;
+                let name = tool.definition.name.clone();
                 if !tool_names.insert(name.clone()) {
                     return Err(ConfigError::DuplicateTool {
                         agent: agent.id.clone(),
@@ -212,7 +212,11 @@ where
                 agent_name: current.name.clone(),
                 instructions: current.instructions.clone(),
                 items: model_items.clone(),
-                tools: current.tools.iter().map(|tool| tool.definition()).collect(),
+                tools: current
+                    .tools
+                    .iter()
+                    .map(|tool| tool.definition.clone())
+                    .collect(),
                 handoffs: current
                     .handoffs
                     .iter()
@@ -417,7 +421,7 @@ where
                 let tool = current
                     .tools
                     .iter()
-                    .find(|tool| tool.definition().name == call.name)
+                    .find(|tool| tool.definition.name == call.name)
                     .ok_or_else(|| {
                         self.fail(
                             &current.id,
@@ -439,20 +443,21 @@ where
                     tool: call.name.clone(),
                     call_id: call.id.clone(),
                 });
-                let output = tool
-                    .execute(call.arguments, context)
-                    .await
-                    .map_err(|source| {
-                        self.fail(
-                            &current.id,
-                            RunFailureKind::Tool,
-                            RunError::ToolFailed {
-                                agent: current.id.clone(),
-                                tool: call.name.clone(),
-                                source,
-                            },
-                        )
-                    })?;
+                let output =
+                    tool.tool
+                        .execute(call.arguments, context)
+                        .await
+                        .map_err(|source| {
+                            self.fail(
+                                &current.id,
+                                RunFailureKind::Tool,
+                                RunError::ToolFailed {
+                                    agent: current.id.clone(),
+                                    tool: call.name.clone(),
+                                    source,
+                                },
+                            )
+                        })?;
                 let result_item = RunItem::ToolResult {
                     agent: current.id.clone(),
                     call_id: call.id.clone(),

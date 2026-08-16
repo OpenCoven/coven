@@ -86,6 +86,30 @@ impl Tool<()> for AddTool {
     }
 }
 
+struct CountingDefinitionTool {
+    definition_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool<()> for CountingDefinitionTool {
+    fn definition(&self) -> ToolDefinition {
+        self.definition_calls.fetch_add(1, Ordering::SeqCst);
+        ToolDefinition::new(
+            "counted",
+            "Counts definition calls",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        )
+    }
+
+    async fn execute(&self, _arguments: Value, _context: &()) -> Result<Value, BoxError> {
+        Ok(json!({ "ok": true }))
+    }
+}
+
 struct RejectInput;
 
 #[async_trait]
@@ -155,6 +179,33 @@ async fn executes_tools_and_returns_the_final_output() {
         RunItem::ToolResult { output, .. } if output == &json!({ "sum": 5 })
     )));
     assert_eq!(model.requests().len(), 2);
+}
+
+#[tokio::test]
+async fn caches_tool_definitions_across_turns() {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "counted",
+            json!({}),
+        ))]),
+        ModelResponse::final_output("Done."),
+    ]));
+    let definition_calls = Arc::new(AtomicUsize::new(0));
+    let agent = Agent::new("math", "Math", "Use the calculator.", model).with_tool(Arc::new(
+        CountingDefinitionTool {
+            definition_calls: definition_calls.clone(),
+        },
+    ));
+    let runner = Runner::new([agent]).unwrap();
+
+    let result = runner
+        .run("math", "Run the counted tool.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.turns, 2);
+    assert_eq!(definition_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

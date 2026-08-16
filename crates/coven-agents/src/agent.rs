@@ -2,7 +2,7 @@ use std::{fmt, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{InputGuardrail, Model, OutputGuardrail, Tool};
+use crate::{InputGuardrail, Model, OutputGuardrail, Tool, ToolDefinition};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -57,6 +57,14 @@ impl Handoff {
     }
 }
 
+pub(crate) struct AgentTool<C>
+where
+    C: Sync,
+{
+    pub(crate) tool: Arc<dyn Tool<C>>,
+    pub(crate) definition: ToolDefinition,
+}
+
 pub struct Agent<C>
 where
     C: Sync,
@@ -65,7 +73,7 @@ where
     pub(crate) name: String,
     pub(crate) instructions: String,
     pub(crate) model: Arc<dyn Model<C>>,
-    pub(crate) tools: Vec<Arc<dyn Tool<C>>>,
+    pub(crate) tools: Vec<AgentTool<C>>,
     pub(crate) handoffs: Vec<Handoff>,
     pub(crate) input_guardrails: Vec<Arc<dyn InputGuardrail<C>>>,
     pub(crate) output_guardrails: Vec<Arc<dyn OutputGuardrail<C>>>,
@@ -106,7 +114,8 @@ where
     }
 
     pub fn with_tool(mut self, tool: Arc<dyn Tool<C>>) -> Self {
-        self.tools.push(tool);
+        let definition = tool.definition();
+        self.tools.push(AgentTool { tool, definition });
         self
     }
 
