@@ -1917,14 +1917,44 @@ fn run_new_user_start_here() -> Result<()> {
     run_doctor(false)
 }
 
+/// Comma-separated list of harnesses the guided prompt should offer: every
+/// configured harness whose executable is present, with the default first so
+/// pressing enter is obviously the same choice. Falls back to the default id
+/// alone when the harness set cannot be read.
+fn guided_harness_options(default_harness: &str) -> String {
+    let available = crate::harness::configured_harnesses()
+        .map(|harnesses| {
+            harnesses
+                .into_iter()
+                .filter(|harness| harness.available)
+                .map(|harness| harness.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    format_guided_harness_options(default_harness, available)
+}
+
+fn format_guided_harness_options(default_harness: &str, mut ids: Vec<String>) -> String {
+    if !ids.iter().any(|id| id == default_harness) {
+        ids.push(default_harness.to_string());
+    }
+    ids.sort_by_key(|id| (id != default_harness, id.clone()));
+    ids.join(", ")
+}
+
 fn run_guided_harness_session() -> Result<()> {
     let primary_strong = theme::fg(theme::PRIMARY_STRONG);
     let reset = theme::reset();
     println!("{primary_strong}Run an agent in this project{reset}");
     println!("Coven will create a session record, validate the project root, then attach to the harness.\n");
     let default_harness = default_harness_id().unwrap_or_else(|| "codex".to_string());
-    let harness_prompt =
-        format!("Harness [default: {default_harness}; options: codex, claude, copilot]: ");
+    // The options were a fixed "codex, claude, copilot" string, so the default
+    // shown could be a harness the list did not contain, and an installed
+    // adapter recipe never appeared at all. Offer what is actually launchable.
+    let harness_prompt = format!(
+        "Harness [default: {default_harness}; options: {}]: ",
+        guided_harness_options(&default_harness)
+    );
     let harness =
         prompt_for_optional_line(&harness_prompt)?.unwrap_or_else(|| default_harness.to_string());
     let prompt = prompt_for_required_line("Task for the agent: ")?;
@@ -2324,6 +2354,42 @@ pub(crate) fn move_magical_tui_selection(current: usize, direction: MagicalTuiMo
 #[cfg(test)]
 pub(crate) fn render_frame_plain_for_test(selection: usize) -> String {
     render_magical_tui_frame_plain(selection)
+}
+
+#[cfg(test)]
+mod guided_harness_option_tests {
+    use super::format_guided_harness_options;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn lists_the_default_first_then_the_rest_alphabetically() {
+        assert_eq!(
+            format_guided_harness_options("claude", ids(&["copilot", "codex", "claude"])),
+            "claude, codex, copilot"
+        );
+    }
+
+    #[test]
+    fn includes_installed_adapter_recipes() {
+        assert_eq!(
+            format_guided_harness_options("codex", ids(&["codex", "hermes"])),
+            "codex, hermes",
+            "an installed recipe is launchable, so the prompt must offer it"
+        );
+    }
+
+    #[test]
+    fn always_contains_the_default_it_advertises() {
+        // The prompt used to print a fixed option list that could omit the
+        // very default it told the user to accept.
+        assert_eq!(
+            format_guided_harness_options(crate::engine::ENGINE_HARNESS_ID, Vec::new()),
+            crate::engine::ENGINE_HARNESS_ID
+        );
+    }
 }
 
 #[cfg(test)]
