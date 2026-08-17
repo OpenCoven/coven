@@ -23,7 +23,9 @@ use super::cast::{
     CAST_QUEST_PHASE_SKIPPED_KIND, CAST_QUEST_PHASE_STARTED_KIND, CAST_QUEST_STARTED_KIND,
     PHASE_PROMPT_HINT,
 };
-use super::chat::client::{ChatClient, ChatEventQuery, DaemonChatClient, LaunchRequest};
+use super::chat::client::{
+    consume_event_pages, ChatClient, DaemonChatClient, EventPageControl, LaunchRequest,
+};
 use super::{is_key_press, sessions};
 use crate::{
     archive_session_command, attach_session, coven_home_dir, coven_store_path, current_timestamp,
@@ -1450,16 +1452,7 @@ fn attach_via_daemon(
         maybe_spawn_cast_input_forwarder(coven_home_dir()?, session.id.clone());
     }
 
-    let replay_history = if is_live {
-        Vec::new()
-    } else {
-        client.list_events(ChatEventQuery {
-            session_id: &session.id,
-            after_seq: None,
-            limit: None,
-        })?
-    };
-
+    let mut replay_state = cast::CastAttachReplayState::default();
     let mut observer = TranscriptObserver::new(io::stdout());
     let exit = if is_live {
         let mut pacer = SleepPacer::new(Duration::from_millis(250));
@@ -1473,7 +1466,17 @@ fn attach_via_daemon(
         // For completed sessions, drain the historical event log once. The
         // follower observer renders the transcript exactly as it did on the
         // original run and reports the exit when it lands in the replay.
-        replay_completed_session(&replay_history, &mut observer)
+        let mut exit = None;
+        let stream = consume_event_pages(&mut client, &session.id, |records| {
+            if let Some(page_exit) =
+                replay_completed_session(records, &mut observer, &mut replay_state)
+            {
+                exit = Some(page_exit);
+            }
+            Ok(EventPageControl::Continue)
+        })?;
+        debug_assert!(stream.completed);
+        exit
     };
 
     if is_live {
@@ -1499,7 +1502,7 @@ fn attach_via_daemon(
         // standard attach outcome — the quest is the user's foreground
         // activity now. Completed quests fall through to the
         // detect-and-inform note that Phase 7 introduced.
-        if let Some(reconstructed) = cast::reconstruct_quest(&replay_history) {
+        if let Some(reconstructed) = replay_state.take_reconstructed_quest() {
             if !reconstructed.is_complete && reconstructed.quest.current_index().is_some() {
                 println!();
                 println!(
@@ -1516,13 +1519,12 @@ fn attach_via_daemon(
             }
         }
 
-        if let Some(note) =
-            cast::find_cast_summary(&replay_history).and_then(|s| format_summary_note(&s))
-        {
+        if let Some(note) = replay_state.summary().and_then(format_summary_note) {
             notes.push(note);
         }
-        if let Some(note) = cast::find_cast_quest_info(&replay_history)
-            .and_then(|info| cast::format_quest_attach_note(&info))
+        if let Some(note) = replay_state
+            .quest_info()
+            .and_then(cast::format_quest_attach_note)
         {
             notes.push(note);
         }
@@ -1569,9 +1571,11 @@ fn attach_via_daemon(
 fn replay_completed_session(
     records: &[store::EventRecord],
     observer: &mut dyn FollowerObserver,
+    replay_state: &mut cast::CastAttachReplayState,
 ) -> Option<CastSessionExit> {
     let mut exit = None;
     for record in records {
+        replay_state.observe(record);
         let decoded = cast::follow::decode_event(record);
         match &decoded {
             cast::follow::CastFollowEvent::Output(chunk) => observer.on_output(chunk),
@@ -2439,8 +2443,9 @@ mod attach_tests {
         ];
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
+        let mut replay_state = cast::CastAttachReplayState::default();
 
-        let exit = replay_completed_session(&records, &mut observer);
+        let exit = replay_completed_session(&records, &mut observer, &mut replay_state);
 
         let rendered = String::from_utf8(buffer.into_inner()).unwrap();
         assert!(
@@ -2469,8 +2474,9 @@ mod attach_tests {
         ];
         let mut buffer: Cursor<Vec<u8>> = Cursor::new(Vec::new());
         let mut observer = TranscriptObserver::new(&mut buffer);
+        let mut replay_state = cast::CastAttachReplayState::default();
 
-        let exit = replay_completed_session(&records, &mut observer);
+        let exit = replay_completed_session(&records, &mut observer, &mut replay_state);
 
         assert!(
             exit.is_none(),
