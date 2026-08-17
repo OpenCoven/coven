@@ -95,6 +95,16 @@ Failed or interrupted runs remain observable through the caller and observer,
 but are not written as successful conversation history. Durable resumability
 requires a separate run-state journal and is deferred.
 
+A failed run returns `RunFailure`, which pairs the `RunError` with the
+transcript the run had produced when it failed, plus the turn and handoff
+counts. A tool that fails mid-turn does not invalidate the user message,
+assistant message, and completed tool results that preceded it, so discarding
+them would destroy work the caller cannot reconstruct: the conversation could
+not be rendered, logged, or retried. `RunFailure` therefore returns those items
+instead. Because the runner still refuses to append them to the session, a
+partial transcript can never become durable history by accident; persisting one
+is an explicit caller decision.
+
 Session load and append are separate operations. Session-store implementations
 must serialize writers per session id or implement optimistic concurrency
 control; the runner does not merge concurrent turns.
@@ -102,6 +112,11 @@ control; the runner does not merge concurrent turns.
 Observers receive names, ids, counts, and state transitions, not prompts,
 arguments, outputs, or model reasoning. Sensitive payload capture must be an
 explicit adapter policy.
+
+Every run emits exactly one `RunStarted` event followed by exactly one terminal
+`RunCompleted` or `RunFailed` event. This holds even when the starting agent is
+unregistered, so observers that open per-run state on the start event always
+receive a matching close.
 
 ## Non-goals
 
