@@ -4595,7 +4595,18 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
         );
     }
 
-    let requested_limit = limit.unwrap_or(MAX_EVENTS_LIMIT);
+    let requested_limit_raw = limit.unwrap_or(MAX_EVENTS_LIMIT);
+    let requested_limit = match usize::try_from(requested_limit_raw) {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            return api_error(
+                400,
+                "invalid_request",
+                "limit must be a positive integer.",
+                Some(json!({ "limit": requested_limit_raw })),
+            );
+        }
+    };
     let opts = store::EventsQueryOptions {
         after_seq,
         after_event_id,
@@ -4606,7 +4617,7 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
         .context("failed to start bounded event page read")?;
     let initial_after_rowid = store::resolve_event_after_rowid(&transaction, session_id, &opts)?;
     let (response, _) = bounded_events_response_from_source(
-        requested_limit as usize,
+        requested_limit,
         initial_after_rowid,
         |after_rowid, candidate_limit| {
             store::list_event_candidates(&transaction, session_id, after_rowid, candidate_limit)
