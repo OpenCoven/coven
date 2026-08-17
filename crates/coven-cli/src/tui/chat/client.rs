@@ -396,21 +396,25 @@ fn safe_request_may_retry(error: &ClientError) -> bool {
     )
 }
 
+fn io_operation_is_connect_phase(operation: &str) -> bool {
+    operation.starts_with("failed to connect to Coven daemon ")
+        || (operation.starts_with("failed to configure nonblocking Coven daemon ")
+            && operation.ends_with(" writes"))
+}
+
+fn error_is_connect_phase(error: &ClientError) -> bool {
+    match error {
+        ClientError::Io { operation, .. } => io_operation_is_connect_phase(operation),
+        _ => false,
+    }
+}
+
 fn mutation_was_definitely_not_sent(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::Io {
-            operation: "failed to connect to Coven daemon socket"
-                | "failed to connect to Coven daemon pipe"
-                | "failed to configure nonblocking Coven daemon socket writes"
-                | "failed to configure nonblocking Coven daemon pipe writes",
-            ..
-        }
-            // Same connect-time-only guarantee as above: no mutation bytes
-            // can have reached the daemon yet, so a single retry against the
-            // rediscovered/renegotiated endpoint cannot duplicate the send.
-            | ClientError::DaemonInstanceChanged
-    )
+    error_is_connect_phase(error)
+        // Same connect-time-only guarantee as above: no mutation bytes
+        // can have reached the daemon yet, so a single retry against the
+        // rediscovered/renegotiated endpoint cannot duplicate the send.
+        || matches!(error, ClientError::DaemonInstanceChanged)
 }
 
 fn mutation_outcome_is_ambiguous(error: &ClientError) -> bool {
