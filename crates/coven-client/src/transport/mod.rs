@@ -7,7 +7,7 @@ pub(crate) const MAX_RESPONSE_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Matches the Coven daemon's own Unix-socket/named-pipe request body cap
 /// (`MAX_SOCKET_BODY_BYTES` in `coven-cli`). Rejecting oversized bodies here,
 /// before any I/O, avoids ever sending a request the daemon is guaranteed to
-/// answer with a structured 413 -- or, worse, reset the connection on before
+/// answer with a structured 413 -- or, worse, reset the connection before
 /// that 413 can be read back, turning a structured error into a bare I/O
 /// error.
 pub(crate) const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
