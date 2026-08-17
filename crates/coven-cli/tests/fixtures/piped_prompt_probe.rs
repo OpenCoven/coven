@@ -45,11 +45,20 @@ fn required_arg(name: &str) -> String {
 
 fn main() {
     match required_arg("mode").as_str() {
-        "duplex" => {
+        mode @ ("duplex" | "duplex-contained") => {
             let output_bytes = required_arg("first")
                 .parse::<usize>()
                 .expect("output byte count");
             let receipt = required_arg("second");
+            if mode == "duplex-contained" {
+                Command::new(env::current_exe().expect("current executable"))
+                    .arg("output-child-short")
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn contained duplex descendant");
+            }
             // Fail a regressed parent-side duplex deadlock in bounded time.
             // The repaired launcher finishes comfortably before this guard.
             thread::spawn(|| {
@@ -123,6 +132,18 @@ fn main() {
             // the group leader exits successfully.
             thread::sleep(Duration::from_millis(50));
         }
+        "root-exit-short-output-descendant" => {
+            let pid_file = required_arg("first");
+            let child = Command::new(env::current_exe().expect("current executable"))
+                .arg("output-child-short")
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn short inherited-output descendant");
+            fs::write(pid_file, child.id().to_string()).expect("write descendant pid");
+            thread::sleep(Duration::from_millis(50));
+        }
         "root-exit-closed-descendant" => {
             let pid_file = required_arg("first");
             let child = Command::new(env::current_exe().expect("current executable"))
@@ -143,6 +164,16 @@ fn main() {
             io::stderr().flush().expect("flush stderr tick");
             thread::sleep(Duration::from_millis(5));
         },
+        "output-child-short" => {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                io::stdout().write_all(b"stdout-tick\n").expect("stdout tick");
+                io::stdout().flush().expect("flush stdout tick");
+                io::stderr().write_all(b"stderr-tick\n").expect("stderr tick");
+                io::stderr().flush().expect("flush stderr tick");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         mode => panic!("unsupported probe mode {mode}"),
     }
 }

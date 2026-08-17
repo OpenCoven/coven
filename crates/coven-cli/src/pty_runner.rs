@@ -767,25 +767,27 @@ fn move_codex_prompt_to_stdin(
 
 #[cfg(windows)]
 fn write_stdin_prompt(child: &mut std::process::Child, prompt: Option<&[u8]>) -> Result<()> {
-    let Some(prompt) = prompt else {
-        return Ok(());
-    };
-    let result = (|| -> Result<()> {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("piped harness did not expose stdin for its prompt")?;
-        stdin
-            .write_all(prompt)
-            .context("failed writing harness prompt to stdin")?;
-        stdin.flush().context("failed flushing harness prompt")?;
-        Ok(())
-    })();
+    let result = write_stdin_prompt_bytes(child, prompt);
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
     }
     result
+}
+
+#[cfg(any(windows, test))]
+fn write_stdin_prompt_bytes(child: &mut std::process::Child, prompt: Option<&[u8]>) -> Result<()> {
+    let Some(prompt) = prompt else {
+        return Ok(());
+    };
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("piped harness did not expose stdin for its prompt")?;
+    stdin
+        .write_all(prompt)
+        .context("failed writing harness prompt to stdin")?;
+    stdin.flush().context("failed flushing harness prompt")
 }
 
 const CODEX_JSON_ACTIVITY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -3176,6 +3178,21 @@ pub fn run_piped_attached_observed(
     command: &HarnessCommand,
     observer: AttachedOutputObserver,
 ) -> Result<PtyRunResult> {
+    run_piped_attached_observed_with_writers(
+        command,
+        observer,
+        Box::new(io::stdout()),
+        Box::new(io::stderr()),
+    )
+}
+
+#[cfg(any(windows, test))]
+fn run_piped_attached_observed_with_writers(
+    command: &HarnessCommand,
+    observer: AttachedOutputObserver,
+    stdout_writer: Box<dyn Write + Send>,
+    stderr_writer: Box<dyn Write + Send>,
+) -> Result<PtyRunResult> {
     let mut child_command = std::process::Command::new(&command.program);
     child_command
         .args(&command.args)
@@ -3188,28 +3205,39 @@ pub fn run_piped_attached_observed(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     command.apply_environment(&mut child_command);
-    let mut child = child_command.spawn().with_context(|| {
-        format!(
-            "failed to spawn harness `{}` in observed piped mode",
-            command.program()
-        )
-    })?;
-    write_stdin_prompt(&mut child, command.stdin_prompt.as_deref())?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("observed piped harness did not expose stdout")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("observed piped harness did not expose stderr")?;
+    let (mut child, mut process_tree) = spawn_strict_child_process_tree(&mut child_command)
+        .with_context(|| {
+            format!(
+                "failed to spawn harness `{}` in observed piped mode",
+                command.program()
+            )
+        })?;
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("observed piped harness did not expose stdout");
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdout);
+            process_tree.terminate(&mut child);
+            let _ = child.wait();
+            anyhow::bail!("observed piped harness did not expose stderr");
+        }
+    };
     let observer = Arc::new(Mutex::new(observer));
 
+    // Drain both output pipes before writing the prompt. Otherwise a child that
+    // emits more than one pipe capacity before reading stdin can deadlock with
+    // the parent while both sides wait for the other to consume.
     let stdout_observer = Arc::clone(&observer);
     let stdout_forwarder = thread::spawn(move || -> Result<()> {
         let mut reader = stdout;
-        let stdout = io::stdout();
-        let mut writer = stdout.lock();
+        let mut writer = stdout_writer;
         let callback: AttachedOutputObserver = Box::new(move |chunk| {
             let mut observer = stdout_observer
                 .lock()
@@ -3221,8 +3249,7 @@ pub fn run_piped_attached_observed(
     let stderr_observer = observer;
     let stderr_forwarder = thread::spawn(move || -> Result<()> {
         let mut reader = stderr;
-        let stderr = io::stderr();
-        let mut writer = stderr.lock();
+        let mut writer = stderr_writer;
         let callback: AttachedOutputObserver = Box::new(move |chunk| {
             let mut observer = stderr_observer
                 .lock()
@@ -3232,13 +3259,58 @@ pub fn run_piped_attached_observed(
         copy_attached_output(&mut reader, &mut writer, Some(callback))
     });
 
-    let status = child.wait().context("failed waiting for piped harness")?;
+    let prompt_result = write_stdin_prompt_bytes(&mut child, command.stdin_prompt.as_deref());
+    if prompt_result.is_err() {
+        let termination_result = process_tree
+            .terminate_tree()
+            .context("failed terminating observed piped harness after prompt delivery failure");
+        let wait_result = child
+            .wait()
+            .context("failed waiting for observed piped harness after prompt delivery failure");
+        let stdout_result = stdout_forwarder
+            .join()
+            .map_err(|_| anyhow::anyhow!("stdout forwarding thread panicked"))
+            .and_then(|result| result);
+        let stderr_result = stderr_forwarder
+            .join()
+            .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))
+            .and_then(|result| result);
+        let mut error = prompt_result.expect_err("prompt result was checked as an error");
+        for (context, cleanup) in [
+            ("process-tree termination", termination_result.map(|_| ())),
+            ("direct child wait", wait_result.map(|_| ())),
+            ("stdout drain", stdout_result),
+            ("stderr drain", stderr_result),
+        ] {
+            if let Err(cleanup) = cleanup {
+                error = anyhow::anyhow!("{error:#}; {context} also failed: {cleanup:#}");
+            }
+        }
+        return Err(error);
+    }
+
+    let pre_reap_wait = wait_for_child_exit_without_reaping(&child)
+        .context("failed waiting for observed piped harness root exit");
+    // A wrapper can exit while a descendant still owns stdout or stderr.
+    // Terminate the strictly contained tree before joining either drain so
+    // inherited handles reach EOF without changing the root's recorded status.
+    let containment_cleanup = process_tree
+        .terminate_tree()
+        .context("failed terminating observed piped harness descendants after root exit");
+    let status = child
+        .wait()
+        .context("failed reaping observed piped harness root");
     let stdout_result = stdout_forwarder
         .join()
-        .map_err(|_| anyhow::anyhow!("stdout forwarding thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("stdout forwarding thread panicked"))
+        .and_then(|result| result);
     let stderr_result = stderr_forwarder
         .join()
-        .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))?;
+        .map_err(|_| anyhow::anyhow!("stderr forwarding thread panicked"))
+        .and_then(|result| result);
+    pre_reap_wait?;
+    containment_cleanup?;
+    let status = status?;
     stdout_result?;
     stderr_result?;
     Ok(PtyRunResult {
@@ -5629,6 +5701,41 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn observed_piped_drains_output_before_delivering_large_prompt() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let receipt = temp_dir.path().join("observed-prompt.bin");
+        let prompt = vec![b'p'; 128 * 1024];
+        let output_bytes = 128 * 1024;
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "duplex-contained",
+            &output_bytes.to_string(),
+            Some(&receipt),
+            prompt.clone(),
+        )?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_output = Arc::clone(&observed);
+
+        let result = run_piped_attached_observed_with_writers(
+            &command,
+            Box::new(move |chunk| {
+                observed_output.lock().unwrap().extend(chunk);
+                Ok(())
+            }),
+            Box::new(io::sink()),
+            Box::new(io::sink()),
+        )?;
+
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert_eq!(std::fs::read(receipt)?, prompt);
+        let output = observed.lock().unwrap();
+        assert_eq!(output.len(), output_bytes);
+        assert!(output.iter().all(|byte| *byte == b'o'));
+        Ok(())
+    }
+
     #[cfg(any(unix, windows))]
     #[test]
     fn piped_root_exit_reaps_closed_pipe_descendant_before_completion() -> anyhow::Result<()> {
@@ -5708,6 +5815,48 @@ mod tests {
         assert!(
             wait_for_piped_process_exit(descendant_pid, Duration::from_secs(2)),
             "natural root exit left inherited-output descendant {descendant_pid} running"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn observed_piped_root_exit_terminates_inherited_output_descendant() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir
+            .path()
+            .join("observed-inherited-output-descendant.pid");
+        let command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "root-exit-short-output-descendant",
+            &pid_file.to_string_lossy(),
+            None,
+            Vec::new(),
+        )?;
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_output = Arc::clone(&observed);
+        let started = Instant::now();
+
+        let result = run_piped_attached_observed_with_writers(
+            &command,
+            Box::new(move |chunk| {
+                observed_output.fetch_add(chunk.len(), Ordering::AcqRel);
+                Ok(())
+            }),
+            Box::new(io::sink()),
+            Box::new(io::sink()),
+        )?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "observed runner waited for descendant-owned output handles"
+        );
+        assert_eq!(result.status, "completed", "{result:?}");
+        assert_eq!(result.exit_code, Some(0), "{result:?}");
+        assert!(observed.load(Ordering::Acquire) > 0);
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::from_secs(2)),
+            "observed runner left inherited-output descendant {descendant_pid} running"
         );
         Ok(())
     }
