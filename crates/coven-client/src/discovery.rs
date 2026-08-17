@@ -2144,7 +2144,7 @@ fn validate_owner_only_windows_named_pipe_until(
     use windows_sys::Win32::{
         Foundation::{ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT},
         Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            Authorization::{GetNamedSecurityInfoW, SE_KERNEL_OBJECT},
             DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
         },
         System::Pipes::WaitNamedPipeW,
@@ -2162,12 +2162,12 @@ fn validate_owner_only_windows_named_pipe_until(
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
-        // `\\.\pipe` is queried by name as a file object; status files instead
-        // use GetSecurityInfo on their already-open file handle below.
+        // Named pipes are kernel objects. Status files instead use
+        // GetSecurityInfo on their already-open file handles below.
         let status = unsafe {
             GetNamedSecurityInfoW(
                 object_path.as_mut_ptr(),
-                SE_FILE_OBJECT,
+                SE_KERNEL_OBJECT,
                 OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                 &mut owner,
                 ptr::null_mut(),
@@ -2383,9 +2383,9 @@ fn classify_windows_status_file_handle(
 pub(crate) fn validate_owner_only_windows_pipe_handle(
     handle: std::os::windows::io::RawHandle,
 ) -> Result<(), ClientError> {
-    use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
+    use windows_sys::Win32::Security::Authorization::SE_KERNEL_OBJECT;
 
-    validate_owner_only_windows_handle(handle, SE_FILE_OBJECT, "connected Coven daemon pipe")
+    validate_owner_only_windows_handle(handle, SE_KERNEL_OBJECT, "connected Coven daemon pipe")
 }
 
 #[cfg(windows)]
