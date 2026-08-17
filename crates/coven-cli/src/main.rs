@@ -876,6 +876,8 @@ enum DaemonCommand {
     Stop,
     #[command(hide = true)]
     Serve {
+        #[arg(long, hide = true)]
+        managed_started_at: Option<String>,
         #[arg(
             long,
             value_name = "ADDR",
@@ -3635,17 +3637,23 @@ fn run_daemon_command(command: DaemonCommand) -> Result<()> {
                 println!("Coven daemon: was not running");
             }
         }
-        DaemonCommand::Serve { tcp, allow_host } => {
+        DaemonCommand::Serve {
+            managed_started_at,
+            tcp,
+            allow_host,
+        } => {
+            let started_at = managed_started_at.unwrap_or_else(current_timestamp);
             #[cfg(unix)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
+                daemon::serve_forever(&home, started_at, tcp.as_deref(), &allow_host)?;
             }
             #[cfg(windows)]
             {
-                daemon::serve_forever(&home, current_timestamp(), tcp.as_deref(), &allow_host)?;
+                daemon::serve_forever(&home, started_at, tcp.as_deref(), &allow_host)?;
             }
             #[cfg(not(any(unix, windows)))]
             {
+                let _ = started_at;
                 let _ = tcp;
                 let _ = allow_host;
                 anyhow::bail!(
@@ -7243,6 +7251,7 @@ mod tests {
             pid: 4242,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             socket: "/tmp/coven.sock".to_string(),
+            process_creation_time: None,
         }
     }
 
@@ -7731,6 +7740,7 @@ mod tests {
             pid: 42,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             socket: socket.clone(),
+            process_creation_time: None,
         }));
 
         let redactor = DoctorJsonPathRedactor::new(&report);
@@ -7764,6 +7774,7 @@ mod tests {
                 pid: 42,
                 started_at: "2026-01-01T00:00:00Z".to_string(),
                 socket: "/tmp/coven-home/coven.sock".to_string(),
+                process_creation_time: None,
             })),
             repos: vec![],
             harnesses: vec![make_harness_with_hint("codex", true, "npm i -g codex")],
@@ -7791,6 +7802,7 @@ mod tests {
             pid: 42,
             started_at: "2026-01-01T00:00:00Z".to_string(),
             socket: "/tmp/coven-home/coven.sock".to_string(),
+            process_creation_time: None,
         }));
 
         let mut bad_repo = make_doctor_report();

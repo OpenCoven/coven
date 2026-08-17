@@ -68,11 +68,29 @@ pub(crate) struct CastQuestAttachInfo {
 /// quest title and progress so they can re-run `/quest <goal>` if they
 /// want to continue. Full state rebuild (replay handoffs, render the next
 /// card) is deferred to a later phase.
+#[cfg(test)]
 pub(crate) fn find_cast_quest_info(events: &[store::EventRecord]) -> Option<CastQuestAttachInfo> {
     let started = events
         .iter()
         .rev()
         .find(|event| event.kind == CAST_QUEST_STARTED_KIND)?;
+    Some(decode_quest_info(
+        started,
+        events
+            .iter()
+            .filter(|event| event.kind == CAST_QUEST_PHASE_COMPLETED_KIND)
+            .count(),
+        events
+            .iter()
+            .any(|event| event.kind == CAST_QUEST_COMPLETED_KIND),
+    ))
+}
+
+fn decode_quest_info(
+    started: &store::EventRecord,
+    completed_phases: usize,
+    is_complete: bool,
+) -> CastQuestAttachInfo {
     let payload = serde_json::from_str::<Value>(&started.payload_json).unwrap_or(Value::Null);
     let title = payload
         .get("title")
@@ -90,21 +108,14 @@ pub(crate) fn find_cast_quest_info(events: &[store::EventRecord]) -> Option<Cast
         .get("phases")
         .and_then(Value::as_array)
         .map(|arr| arr.len());
-    let completed_phases = events
-        .iter()
-        .filter(|event| event.kind == CAST_QUEST_PHASE_COMPLETED_KIND)
-        .count();
-    let is_complete = events
-        .iter()
-        .any(|event| event.kind == CAST_QUEST_COMPLETED_KIND);
-    Some(CastQuestAttachInfo {
+    CastQuestAttachInfo {
         title,
         goal,
         harness,
         total_phases,
         completed_phases,
         is_complete,
-    })
+    }
 }
 
 /// Replayed quest state plus the anchor session id we attached to. The
@@ -118,6 +129,75 @@ pub(crate) struct ReconstructedQuest {
     pub(crate) anchor_session_id: String,
 }
 
+#[derive(Default)]
+pub(crate) struct CastAttachReplayState {
+    summary: Option<CastAttachSummary>,
+    quest_info: Option<CastQuestAttachInfo>,
+    reconstructed_quest: Option<ReconstructedQuest>,
+    completed_phases: usize,
+    quest_is_complete: bool,
+    saw_reconstruction_start: bool,
+}
+
+impl CastAttachReplayState {
+    pub(crate) fn observe(&mut self, event: &store::EventRecord) {
+        match event.kind.as_str() {
+            CAST_SUMMARY_KIND => {
+                self.summary = Some(decode_summary(event));
+            }
+            CAST_QUEST_STARTED_KIND => {
+                self.quest_info = Some(decode_quest_info(
+                    event,
+                    self.completed_phases,
+                    self.quest_is_complete,
+                ));
+                if !self.saw_reconstruction_start {
+                    self.saw_reconstruction_start = true;
+                    self.reconstructed_quest = reconstruct_quest_start(event);
+                }
+            }
+            CAST_QUEST_PHASE_COMPLETED_KIND => {
+                self.completed_phases = self.completed_phases.saturating_add(1);
+                if let Some(info) = self.quest_info.as_mut() {
+                    info.completed_phases = self.completed_phases;
+                }
+                if let Some(quest) = self.reconstructed_quest.as_mut() {
+                    apply_quest_event(quest, event);
+                }
+            }
+            CAST_QUEST_COMPLETED_KIND => {
+                self.quest_is_complete = true;
+                if let Some(info) = self.quest_info.as_mut() {
+                    info.is_complete = true;
+                }
+                if let Some(quest) = self.reconstructed_quest.as_mut() {
+                    apply_quest_event(quest, event);
+                }
+            }
+            CAST_QUEST_PHASE_STARTED_KIND
+            | CAST_QUEST_PHASE_EDITED_KIND
+            | CAST_QUEST_PHASE_SKIPPED_KIND => {
+                if let Some(quest) = self.reconstructed_quest.as_mut() {
+                    apply_quest_event(quest, event);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn summary(&self) -> Option<&CastAttachSummary> {
+        self.summary.as_ref()
+    }
+
+    pub(crate) fn quest_info(&self) -> Option<&CastQuestAttachInfo> {
+        self.quest_info.as_ref()
+    }
+
+    pub(crate) fn take_reconstructed_quest(&mut self) -> Option<ReconstructedQuest> {
+        self.reconstructed_quest.take()
+    }
+}
+
 /// Replay `cast.quest.*` events from an anchor session to rebuild a
 /// `Quest` in the state it was in when the user last interacted with it.
 ///
@@ -125,11 +205,17 @@ pub(crate) struct ReconstructedQuest {
 /// payload (the session is not a quest anchor). The reconstructor is
 /// best-effort: malformed event payloads and out-of-range indices are
 /// skipped silently so a corrupt event log never blocks the resume path.
+#[cfg(test)]
 pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<ReconstructedQuest> {
-    let started = events
-        .iter()
-        .find(|event| event.kind == CAST_QUEST_STARTED_KIND)?;
-    let payload = serde_json::from_str::<Value>(&started.payload_json).ok()?;
+    let mut replay = CastAttachReplayState::default();
+    for event in events {
+        replay.observe(event);
+    }
+    replay.take_reconstructed_quest()
+}
+
+fn reconstruct_quest_start(event: &store::EventRecord) -> Option<ReconstructedQuest> {
+    let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
     let goal = payload.get("goal").and_then(Value::as_str)?.to_string();
     let default_harness = payload
         .get("harness")
@@ -149,91 +235,80 @@ pub(crate) fn reconstruct_quest(events: &[store::EventRecord]) -> Option<Reconst
             }
         }
     }
-    let mut is_complete = false;
-
-    for event in events {
-        match event.kind.as_str() {
-            kind if kind == CAST_QUEST_PHASE_STARTED_KIND => {
-                // Phase 10 defensive: if Cast crashed between dispatch and
-                // advance, the anchor will hold a `phase_started` event
-                // without a matching `phase_completed`. Mark the phase
-                // Running so resume can show "this phase was already
-                // started". When a `phase_completed` later in the log
-                // exists, `advance` below overwrites the status to
-                // Complete and the Running mark becomes invisible.
-                let payload =
-                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
-                let idx = payload.get("index").and_then(Value::as_u64);
-                let session_id = payload
-                    .get("session_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                if let Some(idx) = idx {
-                    let _ = mark_phase_running(&mut quest, idx as usize, session_id);
-                }
-            }
-            kind if kind == CAST_QUEST_PHASE_EDITED_KIND => {
-                let payload =
-                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
-                let idx = payload.get("index").and_then(Value::as_u64);
-                let sub_prompt = payload.get("sub_prompt").and_then(Value::as_str);
-                if let (Some(idx), Some(text)) = (idx, sub_prompt) {
-                    let _ = set_phase_sub_prompt(&mut quest, idx as usize, text.to_string());
-                }
-            }
-            kind if kind == CAST_QUEST_PHASE_COMPLETED_KIND => {
-                let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
-                    continue;
-                };
-                let Some(idx) = payload
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|v| v as usize)
-                else {
-                    continue;
-                };
-                if quest.current_index() != Some(idx) {
-                    continue;
-                }
-                let summary = QuestPhaseSummary {
-                    session_id: payload
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    exit_status: payload
-                        .get("exit_status")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned),
-                    exit_code: payload
-                        .get("exit_code")
-                        .and_then(Value::as_i64)
-                        .map(|v| v as i32),
-                    carried_context: Vec::new(),
-                };
-                advance(&mut quest, summary);
-            }
-            kind if kind == CAST_QUEST_PHASE_SKIPPED_KIND => {
-                let payload =
-                    serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
-                let idx = payload.get("index").and_then(Value::as_u64);
-                let reason = payload.get("reason").and_then(Value::as_str);
-                if let (Some(idx), Some(reason)) = (idx, reason) {
-                    let _ = skip_phase(&mut quest, idx as usize, reason.to_string());
-                }
-            }
-            kind if kind == CAST_QUEST_COMPLETED_KIND => {
-                is_complete = true;
-            }
-            _ => {}
-        }
-    }
-
     Some(ReconstructedQuest {
         quest,
-        is_complete,
-        anchor_session_id: started.session_id.clone(),
+        is_complete: false,
+        anchor_session_id: event.session_id.clone(),
     })
+}
+
+fn apply_quest_event(reconstructed: &mut ReconstructedQuest, event: &store::EventRecord) {
+    let quest = &mut reconstructed.quest;
+    match event.kind.as_str() {
+        kind if kind == CAST_QUEST_PHASE_STARTED_KIND => {
+            let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+            let idx = payload.get("index").and_then(Value::as_u64);
+            let session_id = payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if let Some(idx) = idx {
+                let _ = mark_phase_running(quest, idx as usize, session_id);
+            }
+        }
+        kind if kind == CAST_QUEST_PHASE_EDITED_KIND => {
+            let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+            let idx = payload.get("index").and_then(Value::as_u64);
+            let sub_prompt = payload.get("sub_prompt").and_then(Value::as_str);
+            if let (Some(idx), Some(text)) = (idx, sub_prompt) {
+                let _ = set_phase_sub_prompt(quest, idx as usize, text.to_string());
+            }
+        }
+        kind if kind == CAST_QUEST_PHASE_COMPLETED_KIND => {
+            let Ok(payload) = serde_json::from_str::<Value>(&event.payload_json) else {
+                return;
+            };
+            let Some(idx) = payload
+                .get("index")
+                .and_then(Value::as_u64)
+                .map(|v| v as usize)
+            else {
+                return;
+            };
+            if quest.current_index() != Some(idx) {
+                return;
+            }
+            let summary = QuestPhaseSummary {
+                session_id: payload
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                exit_status: payload
+                    .get("exit_status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                exit_code: payload
+                    .get("exit_code")
+                    .and_then(Value::as_i64)
+                    .map(|v| v as i32),
+                carried_context: Vec::new(),
+            };
+            advance(quest, summary);
+        }
+        kind if kind == CAST_QUEST_PHASE_SKIPPED_KIND => {
+            let payload = serde_json::from_str::<Value>(&event.payload_json).unwrap_or(Value::Null);
+            let idx = payload.get("index").and_then(Value::as_u64);
+            let reason = payload.get("reason").and_then(Value::as_str);
+            if let (Some(idx), Some(reason)) = (idx, reason) {
+                let _ = skip_phase(quest, idx as usize, reason.to_string());
+            }
+        }
+        kind if kind == CAST_QUEST_COMPLETED_KIND => {
+            reconstructed.is_complete = true;
+        }
+        _ => {}
+    }
 }
 
 /// One-line note for the attach outcome card describing the quest this

@@ -24,6 +24,29 @@ Recommended handshake:
 3. Call `GET /api/v1/capabilities` if using control-plane actions.
 4. Use versioned `/api/v1/...` routes only.
 
+Rust integrations should use the owner-adjacent `coven-client` crate for this
+handshake and daemon framing. Discover `DaemonEndpoint` from the chosen Coven
+home, pass it to `DaemonClient::new`, and use its typed `/api/v1` operations.
+It does not accept URLs, arbitrary socket paths, or arbitrary request paths:
+Unix discovery requires the current user's private `coven.sock`, and Windows
+discovery derives and validates only the daemon's owner-only named pipe. The
+client accepts a recorded legacy Windows pipe only from a validated private
+`daemon.json`, allowing an upgrade to reconnect without accepting arbitrary
+pipe names. It performs health negotiation before dependent calls and returns
+structured daemon errors with their code, message, and details intact.
+The negotiated capabilities are tied to the connected daemon's peer
+fingerprint. Endpoint replacement invalidates the cache before request bytes
+are sent; callers must negotiate again, and mutations are never replayed
+automatically.
+
+The `coven.daemon.v1` session routes use their historical raw-byte behavior,
+not URL-component decoding. `engine/42` is a valid raw path remainder and a
+literal `%2F` remains literal. The typed client sends representable ids
+verbatim. Path targets reject empty ids, whitespace, control characters, and
+`?`; the events query rejects empty ids, whitespace, control characters, and
+`&`; detail ids that collide with a nested session route are also unavailable.
+Do not add percent-encoding without a future named protocol version.
+
 ```mermaid
 sequenceDiagram
   participant Client

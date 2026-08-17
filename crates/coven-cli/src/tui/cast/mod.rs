@@ -25,8 +25,8 @@ use anyhow::Result;
 use crate::harness;
 
 pub(crate) use attach::{
-    find_cast_quest_info, find_cast_summary, format_quest_attach_note, format_summary_note,
-    reconstruct_quest, ReconstructedQuest,
+    find_cast_summary, format_quest_attach_note, format_summary_note, CastAttachReplayState,
+    ReconstructedQuest,
 };
 pub(crate) use follow::{follow_until_exit, CastSessionExit, FollowerObserver, FollowerPacer};
 pub(crate) use gate::{evaluate_gate, GateOutcome, SACRIFICE_CONFIRM_WORD};

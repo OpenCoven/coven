@@ -26,6 +26,8 @@ use crate::{
 };
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
+const EVENT_CANDIDATE_BATCH_LIMIT: usize = 16;
+const MAX_EVENT_CANDIDATE_BYTES: usize = coven_client::MAX_RESPONSE_BODY_BYTES;
 pub const COVEN_API_ROUTE_VERSION: &str = "v1";
 pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
 pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -958,7 +960,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
             get_session_artifact(coven_home, path, q)
         }
         ("GET", path) if path.starts_with("/sessions/") => {
-            let session_id = path.trim_start_matches("/sessions/");
+            let session_id = path.strip_prefix("/sessions/").unwrap_or(path);
             let conn = store::open_store(&store_path(coven_home))?;
             match store::get_session(&conn, session_id)? {
                 Some(session) => json_response(200, &session),
@@ -4583,7 +4585,7 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
         None => None,
     };
 
-    let conn = store::open_store(&store_path(coven_home))?;
+    let mut conn = store::open_store(&store_path(coven_home))?;
     if store::get_session(&conn, session_id)?.is_none() {
         return api_error(
             404,
@@ -4593,27 +4595,236 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
         );
     }
 
+    let requested_limit = limit.unwrap_or(MAX_EVENTS_LIMIT);
     let opts = store::EventsQueryOptions {
         after_seq,
         after_event_id,
-        limit,
+        limit: None,
     };
-
-    let events = store::list_events_with_options(&conn, session_id, &opts)?;
-    let next_cursor = events.last().map(|e| EventCursor { after_seq: e.seq });
-    let has_more = if let Some(lim) = limit {
-        events.len() as i64 == lim
-    } else {
-        false
-    };
-
-    json_response(
-        200,
-        &EventsResponse {
-            events,
-            next_cursor,
-            has_more,
+    let transaction = conn
+        .transaction()
+        .context("failed to start bounded event page read")?;
+    let initial_after_rowid = store::resolve_event_after_rowid(&transaction, session_id, &opts)?;
+    let (response, _) = bounded_events_response_from_source(
+        requested_limit as usize,
+        initial_after_rowid,
+        |after_rowid, candidate_limit| {
+            store::list_event_candidates(&transaction, session_id, after_rowid, candidate_limit)
         },
+        |seq| store::get_event_by_seq(&transaction, session_id, seq),
+    )?;
+    transaction
+        .commit()
+        .context("failed to finish bounded event page read")?;
+    Ok(response)
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct BoundedEventsResponseStats {
+    candidate_batches: usize,
+    candidates_examined: usize,
+    events_loaded: usize,
+    peak_candidate_batch: usize,
+    peak_loaded_event_bytes: usize,
+}
+
+fn bounded_events_response_from_source<FCandidates, FLoad>(
+    requested_limit: usize,
+    initial_after_rowid: Option<i64>,
+    mut candidates_after: FCandidates,
+    mut load_event: FLoad,
+) -> Result<(ApiResponse, BoundedEventsResponseStats)>
+where
+    FCandidates: FnMut(Option<i64>, usize) -> Result<store::EventCandidatePage>,
+    FLoad: FnMut(i64) -> Result<Option<store::EventRecord>>,
+{
+    const EVENTS_PREFIX: &str = r#"{"events":["#;
+
+    let max_body_bytes = coven_client::MAX_RESPONSE_BODY_BYTES.saturating_sub(1);
+    let mut stats = BoundedEventsResponseStats::default();
+    let mut events_json = String::new();
+    let mut accepted = 0_usize;
+    let mut scan_after = initial_after_rowid;
+    let mut last_seq = None;
+    let mut has_more = false;
+
+    'candidate_pages: loop {
+        let remaining_with_probe = requested_limit.saturating_sub(accepted).saturating_add(1);
+        let candidate_limit = remaining_with_probe.clamp(1, EVENT_CANDIDATE_BATCH_LIMIT);
+        let page = candidates_after(scan_after, candidate_limit)?;
+        stats.candidate_batches = stats.candidate_batches.saturating_add(1);
+        stats.peak_candidate_batch = stats.peak_candidate_batch.max(page.candidates.len());
+        if page.candidates.is_empty() {
+            break;
+        }
+        let source_exhausted = page.candidates.len() < candidate_limit;
+
+        for candidate in page.candidates {
+            stats.candidates_examined = stats.candidates_examined.saturating_add(1);
+            if accepted >= requested_limit {
+                has_more = true;
+                break 'candidate_pages;
+            }
+            if candidate.allocation_bytes > MAX_EVENT_CANDIDATE_BYTES {
+                if accepted == 0 {
+                    return Ok((oversized_event_response(&candidate)?, stats));
+                }
+                has_more = true;
+                break 'candidate_pages;
+            }
+
+            let separator_bytes = usize::from(accepted > 0);
+            let fixed_bytes = EVENTS_PREFIX
+                .len()
+                .saturating_add(events_json.len())
+                .saturating_add(separator_bytes)
+                .saturating_add(events_response_tail(Some(candidate.seq), false).len());
+            let event_json_budget = max_body_bytes.saturating_sub(fixed_bytes);
+            if candidate
+                .encoded_lower_bound_bytes
+                .is_some_and(|lower_bound| lower_bound > event_json_budget)
+            {
+                if accepted == 0 {
+                    return Ok((oversized_event_response(&candidate)?, stats));
+                }
+                has_more = true;
+                break 'candidate_pages;
+            }
+
+            let event = load_event(candidate.seq)?.with_context(|| {
+                format!(
+                    "event {} disappeared from the bounded event read snapshot",
+                    candidate.seq
+                )
+            })?;
+            let loaded_bytes = event_record_allocation_bytes(&event)?;
+            stats.events_loaded = stats.events_loaded.saturating_add(1);
+            stats.peak_loaded_event_bytes = stats.peak_loaded_event_bytes.max(loaded_bytes);
+            if loaded_bytes > MAX_EVENT_CANDIDATE_BYTES {
+                if accepted == 0 {
+                    return Ok((oversized_event_response(&candidate)?, stats));
+                }
+                has_more = true;
+                break 'candidate_pages;
+            }
+            let Some(encoded_event) = serialize_event_with_limit(&event, event_json_budget)? else {
+                if accepted == 0 {
+                    return Ok((oversized_event_response(&candidate)?, stats));
+                }
+                has_more = true;
+                break 'candidate_pages;
+            };
+            if accepted > 0 {
+                events_json.push(',');
+            }
+            events_json.push_str(&encoded_event);
+            accepted += 1;
+            last_seq = Some(candidate.seq);
+            scan_after = Some(candidate.seq);
+        }
+
+        if source_exhausted {
+            break;
+        }
+    }
+
+    let mut body = String::with_capacity(
+        EVENTS_PREFIX.len() + events_json.len() + events_response_tail(last_seq, has_more).len(),
+    );
+    body.push_str(EVENTS_PREFIX);
+    body.push_str(&events_json);
+    body.push_str(&events_response_tail(last_seq, has_more));
+    debug_assert!(body.len() < coven_client::MAX_RESPONSE_BODY_BYTES);
+    Ok((
+        ApiResponse {
+            status: 200,
+            content_type: "application/json",
+            body,
+        },
+        stats,
+    ))
+}
+
+fn events_response_tail(last_seq: Option<i64>, has_more: bool) -> String {
+    match last_seq {
+        Some(seq) => format!(r#"],"nextCursor":{{"afterSeq":{seq}}},"hasMore":{has_more}}}"#),
+        None => format!(r#"],"nextCursor":null,"hasMore":{has_more}}}"#),
+    }
+}
+
+fn event_record_allocation_bytes(event: &store::EventRecord) -> Result<usize> {
+    [
+        event.id.len(),
+        event.session_id.len(),
+        event.kind.len(),
+        event.payload_json.len(),
+        event.created_at.len(),
+    ]
+    .into_iter()
+    .try_fold(0_usize, |total, field| {
+        total
+            .checked_add(field)
+            .context("loaded event allocation size overflowed")
+    })
+}
+
+struct LimitedJsonWriter {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl LimitedJsonWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(64 * 1024)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for LimitedJsonWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "event exceeded encoded response budget",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialize_event_with_limit(event: &store::EventRecord, limit: usize) -> Result<Option<String>> {
+    let mut writer = LimitedJsonWriter::new(limit);
+    if let Err(error) = serde_json::to_writer(&mut writer, event) {
+        if writer.exceeded {
+            return Ok(None);
+        }
+        return Err(error).context("failed to serialize events API response");
+    }
+    String::from_utf8(writer.bytes)
+        .map(Some)
+        .context("serialized event response was not UTF-8")
+}
+
+fn oversized_event_response(candidate: &store::EventCandidate) -> Result<ApiResponse> {
+    let details = match candidate.event_id.as_deref() {
+        Some(event_id) => json!({ "eventId": event_id, "seq": candidate.seq }),
+        None => json!({ "seq": candidate.seq }),
+    };
+    api_error(
+        413,
+        "event_response_too_large",
+        "The next event is too large for the daemon transport response limit.",
+        Some(details),
     )
 }
 
@@ -8533,8 +8744,8 @@ pub(crate) fn decoded_query_param(query: &str, key: &str) -> Option<String> {
 }
 
 fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
-    path.trim_start_matches("/sessions/")
-        .strip_suffix(suffix)
+    path.strip_prefix("/sessions/")
+        .and_then(|rest| rest.strip_suffix(suffix))
         .unwrap_or_default()
 }
 
@@ -8713,6 +8924,68 @@ mod tests {
                 .join(format!("{fingerprint}.db")),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn session_action_routes_preserve_the_raw_v1_remainder() {
+        assert_eq!(
+            session_action_id("/sessions/engine/42/input", "/input"),
+            "engine/42"
+        );
+        assert_eq!(
+            session_action_id("/sessions/engine%2F42/kill", "/kill"),
+            "engine%2F42"
+        );
+    }
+
+    #[test]
+    fn nested_session_routes_preserve_raw_v1_components() {
+        let (session_id, handoff_id) =
+            handoff_route_parts("/sessions/engine/42/handoffs/handoff%2Fid/claim", "/claim")
+                .expect("structurally valid handoff route");
+        assert_eq!(session_id, "engine/42");
+        assert_eq!(handoff_id, "handoff%2Fid");
+    }
+
+    /// An opaque id that itself begins with `/sessions/` (e.g. because a
+    /// caller doubled the collection prefix) must survive as one structural
+    /// removal, not collapse through repeated matches of the same prefix.
+    /// `trim_start_matches` strips *every* leading occurrence of the pattern,
+    /// so `"/sessions//sessions/victim/input"` would previously resolve to
+    /// the unrelated id `"victim"` instead of the literal `"/sessions/victim"`.
+    #[test]
+    fn session_action_routes_do_not_collapse_a_repeated_sessions_prefix() {
+        assert_eq!(
+            session_action_id("/sessions//sessions/victim/input", "/input"),
+            "/sessions/victim"
+        );
+        assert_eq!(
+            session_action_id("/sessions//sessions/victim/kill", "/kill"),
+            "/sessions/victim"
+        );
+        assert_eq!(
+            session_action_id("/sessions//sessions/victim/complete", "/complete"),
+            "/sessions/victim"
+        );
+        assert_eq!(
+            session_action_id("/sessions//sessions/victim/events", "/events"),
+            "/sessions/victim"
+        );
+        assert_eq!(
+            session_action_id("/sessions//sessions/victim/handoffs", "/handoffs"),
+            "/sessions/victim"
+        );
+    }
+
+    #[test]
+    fn nested_session_routes_do_not_collapse_a_repeated_sessions_prefix() {
+        let (session_id, handoff_id) = handoff_route_parts(
+            "/sessions//sessions/victim/handoffs/handoff-id/claim",
+            "/claim",
+        )
+        .expect("structurally valid handoff route");
+        assert_eq!(session_id, "/sessions/victim");
+        assert_eq!(handoff_id, "handoff-id");
     }
 
     #[test]
@@ -9220,6 +9493,7 @@ mod tests {
                 .join("coven.sock")
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
 
         let response = handle_request("GET", "/health", temp_dir.path(), Some(daemon))?;
@@ -15575,6 +15849,140 @@ mod tests {
         Ok(())
     }
 
+    /// Regression coverage for the `/sessions/` route-prefix bug: an opaque
+    /// session id that itself begins with `/sessions/` (e.g. a caller that
+    /// doubles the collection prefix, or a raw v1 id chosen adversarially)
+    /// must be treated as one structural id, never re-stripped down to a
+    /// shorter, unrelated, and possibly real session id. A real session
+    /// named "victim" is seeded so a retargeting bug would otherwise let
+    /// these requests silently act on it instead of 404ing.
+    #[test]
+    fn session_routes_do_not_retarget_a_real_session_via_repeated_prefix() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "victim")?;
+        let wrapped_id = "/sessions/victim";
+        let expected_detail = json!({ "sessionId": wrapped_id }).to_string();
+        let expected_fragment = &expected_detail[1..expected_detail.len() - 1];
+
+        // GET detail
+        let detail = handle_request("GET", "/sessions//sessions/victim", temp_dir.path(), None)?;
+        assert_eq!(detail.status, 404);
+        assert!(detail.body.contains(r#""code":"session_not_found""#));
+        assert!(detail.body.contains(expected_fragment));
+        assert!(!detail.body.contains(r#""title":"hello from coven""#));
+
+        // POST input
+        let input = handle_request_with_body(
+            "POST",
+            "/sessions//sessions/victim/input",
+            temp_dir.path(),
+            None,
+            Some(r#"{ "data": "ls\n" }"#),
+        )?;
+        assert_eq!(input.status, 404);
+        assert!(input.body.contains(r#""code":"session_not_found""#));
+        assert!(input.body.contains(expected_fragment));
+
+        // POST kill
+        let kill = handle_request(
+            "POST",
+            "/sessions//sessions/victim/kill",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(kill.status, 404);
+        assert!(kill.body.contains(r#""code":"session_not_found""#));
+        assert!(kill.body.contains(expected_fragment));
+
+        // POST complete
+        let complete = handle_request(
+            "POST",
+            "/sessions//sessions/victim/complete",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(complete.status, 404);
+        assert!(complete.body.contains(r#""code":"session_not_found""#));
+        assert!(complete.body.contains(expected_fragment));
+
+        // GET events
+        let events = handle_request(
+            "GET",
+            "/sessions//sessions/victim/events",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(events.status, 404);
+        assert!(events.body.contains(r#""code":"session_not_found""#));
+        assert!(events.body.contains(expected_fragment));
+
+        // GET handoffs (list)
+        let handoffs = handle_request(
+            "GET",
+            "/sessions//sessions/victim/handoffs",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(handoffs.status, 404);
+        assert!(handoffs.body.contains(r#""code":"session_not_found""#));
+        assert!(handoffs.body.contains(expected_fragment));
+
+        // POST handoff claim (nested route). A well-formed request body is
+        // required to get past request validation to the not-found check.
+        let claim = handle_request_with_body(
+            "POST",
+            "/sessions//sessions/victim/handoffs/some-handoff/claim",
+            temp_dir.path(),
+            None,
+            Some(
+                &json!({
+                    "expectedGeneration": 1,
+                    "claimant": "tester",
+                    "idempotencyKey": "key-1",
+                    "destinationWorkspace": {
+                        "repositoryId": null,
+                        "commit": null,
+                        "branch": null,
+                        "dirty": false,
+                        "touchedFiles": [],
+                        "portable": true,
+                    }
+                })
+                .to_string(),
+            ),
+        )?;
+        assert_eq!(claim.status, 404);
+        assert!(claim.body.contains(r#""code":"handoff_not_found""#));
+
+        // GET artifact (nested route). Raw artifact persistence is disabled
+        // by default, so this fails closed on that gate before the session
+        // lookup — but the id in the failure details must still be the
+        // preserved, unretargeted wrapped id.
+        let artifact = handle_request(
+            "GET",
+            "/sessions//sessions/victim/artifacts/some-artifact?raw=1",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(artifact.status, 403);
+        assert!(artifact.body.contains(r#""code":"raw_artifacts_disabled""#));
+        assert!(artifact.body.contains(expected_fragment));
+
+        Ok(())
+    }
+
+    /// A leading slash embedded in the raw remainder (i.e. the id begins
+    /// with `/`) must also survive intact rather than being consumed by a
+    /// prefix-trim pass.
+    #[test]
+    fn session_detail_preserves_a_leading_slash_in_the_raw_remainder() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let response = handle_request("GET", "/sessions//leading-slash-id", temp_dir.path(), None)?;
+        assert_eq!(response.status, 404);
+        assert!(response.body.contains(r#""sessionId":"/leading-slash-id""#));
+        Ok(())
+    }
+
     fn assert_direct_event_truncation_episodes(
         coven_home: &std::path::Path,
         session_id: &str,
@@ -16036,6 +16444,213 @@ mod tests {
     }
 
     #[test]
+    fn raw_external_session_ids_round_trip_through_nested_session_routes() -> anyhow::Result<()> {
+        let (temp, workspace) = portable_handoff_fixture()?;
+        std::fs::write(
+            temp.path().join("privacy.toml"),
+            "persist_raw_artifacts = true\n",
+        )?;
+        let cases = ["engine/42", "engine%2F42"];
+
+        for (index, session_id) in cases.into_iter().enumerate() {
+            let registration = json!({
+                "id": session_id,
+                "projectRoot": temp.path().join("repo").to_string_lossy(),
+                "harness": "engine",
+            })
+            .to_string();
+            let registered = handle_request_with_body(
+                "POST",
+                "/api/v1/sessions/external",
+                temp.path(),
+                None,
+                Some(&registration),
+            )?;
+            assert_eq!(
+                registered.status, 201,
+                "registration failed for {session_id:?}: {}",
+                registered.body
+            );
+
+            let mut packet = handoff_packet();
+            packet["meta"]["sessionId"] = Value::String(session_id.to_owned());
+            let offered = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/handoffs"),
+                temp.path(),
+                None,
+                Some(&packet.to_string()),
+            )?;
+            assert_eq!(
+                offered.status, 201,
+                "handoff creation failed for {session_id:?}: {}",
+                offered.body
+            );
+            let offered: Value = serde_json::from_str(&offered.body)?;
+            let handoff_id = offered["handoff"]["id"].as_str().unwrap();
+            let generation = offered["handoff"]["generation"].as_i64().unwrap();
+            let claim = json!({
+                "expectedGeneration": generation,
+                "claimant": format!("device:{index}"),
+                "idempotencyKey": format!("claim:{index}"),
+                "destinationWorkspace": workspace,
+            });
+            let claimed = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/handoffs/{handoff_id}/claim"),
+                temp.path(),
+                None,
+                Some(&claim.to_string()),
+            )?;
+            assert_eq!(
+                claimed.status, 200,
+                "handoff claim failed for {session_id:?}: {}",
+                claimed.body
+            );
+            let acknowledged = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/handoffs/{handoff_id}/ack"),
+                temp.path(),
+                None,
+                Some(&json!({ "claimant": format!("device:{index}") }).to_string()),
+            )?;
+            assert_eq!(
+                acknowledged.status, 200,
+                "handoff acknowledgement failed for {session_id:?}: {}",
+                acknowledged.body
+            );
+            let continued = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/handoffs/{handoff_id}/continuations"),
+                temp.path(),
+                None,
+                Some(&json!({ "destination": format!("device:{index}") }).to_string()),
+            )?;
+            assert_eq!(
+                continued.status, 201,
+                "handoff continuation failed for {session_id:?}: {}",
+                continued.body
+            );
+            let continued: Value = serde_json::from_str(&continued.body)?;
+            assert_eq!(continued["provenance"]["sourceSessionId"], session_id);
+
+            let event_id = format!("event-nested-route-{index}");
+            let artifact_id = format!("artifact-{index}%2Fraw");
+            let kind = "input";
+            let plaintext = json!({ "secret": format!("nested-route-{index}") }).to_string();
+            let encrypted = SensitiveArtifactStore::load(temp.path())?.encrypt(
+                session_id,
+                &event_id,
+                kind,
+                plaintext.as_bytes(),
+            )?;
+            let conn = store::open_store(&store_path(temp.path()))?;
+            store::insert_event(
+                &conn,
+                &store::EventRecord {
+                    seq: 0,
+                    id: event_id.clone(),
+                    session_id: session_id.to_owned(),
+                    kind: kind.to_owned(),
+                    payload_json: r#"{"secret":"[REDACTED]"}"#.to_owned(),
+                    created_at: "2026-08-16T00:00:00Z".to_owned(),
+                },
+            )?;
+            store::insert_sensitive_artifact(
+                &conn,
+                &store::SensitiveArtifactRecord {
+                    id: artifact_id.clone(),
+                    session_id: session_id.to_owned(),
+                    event_id,
+                    kind: kind.to_owned(),
+                    nonce: encrypted.nonce,
+                    ciphertext: encrypted.ciphertext,
+                    created_at: "2026-08-16T00:00:00Z".to_owned(),
+                    expires_at: "9999-01-01T00:00:00Z".to_owned(),
+                },
+            )?;
+            drop(conn);
+            let artifact = handle_request(
+                "GET",
+                &format!("/api/v1/sessions/{session_id}/artifacts/{artifact_id}?raw=1"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(
+                artifact.status, 200,
+                "artifact access failed for {session_id:?}: {}",
+                artifact.body
+            );
+            let artifact: Value = serde_json::from_str(&artifact.body)?;
+            assert_eq!(artifact["sessionId"], session_id);
+            assert_eq!(artifact["artifactId"], artifact_id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn percent_sequences_in_nested_session_routes_remain_literal_v1_bytes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let raw_session_ids = ["engine%", "engine%2", "engine%GG", "%FF"];
+
+        for session_id in raw_session_ids {
+            let routes = [
+                (
+                    format!("/api/v1/sessions/{session_id}/handoffs/handoff%252Fid/claim"),
+                    json!({
+                        "expectedGeneration": 1,
+                        "claimant": "device:test",
+                        "idempotencyKey": "claim:test",
+                        "destinationWorkspace": {
+                            "repositoryId": null,
+                            "commit": null,
+                            "branch": null,
+                            "dirty": false,
+                            "touchedFiles": [],
+                            "portable": false,
+                        },
+                    })
+                    .to_string(),
+                ),
+                (
+                    format!("/api/v1/sessions/{session_id}/handoffs/handoff%252Fid/ack"),
+                    json!({ "claimant": "device:test" }).to_string(),
+                ),
+                (
+                    format!("/api/v1/sessions/{session_id}/handoffs/handoff%252Fid/continuations"),
+                    json!({ "destination": "device:test" }).to_string(),
+                ),
+            ];
+            for (route, body) in routes {
+                let response =
+                    handle_request_with_body("POST", &route, temp.path(), None, Some(&body))?;
+                assert_eq!(
+                    response.status, 404,
+                    "literal v1 handoff route changed meaning for {session_id:?}: {route}: {}",
+                    response.body
+                );
+                let body: Value = serde_json::from_str(&response.body)?;
+                assert_eq!(body["error"]["code"], "handoff_not_found");
+            }
+
+            let artifact = handle_request(
+                "GET",
+                &format!("/api/v1/sessions/{session_id}/artifacts/artifact%252Fid?raw=1"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(
+                artifact.status, 403,
+                "literal v1 artifact route changed meaning for {session_id:?}: {}",
+                artifact.body
+            );
+            let body: Value = serde_json::from_str(&artifact.body)?;
+            assert_eq!(body["error"]["code"], "raw_artifacts_disabled");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn handoff_claim_fails_closed_when_transcript_or_workspace_diverges() -> anyhow::Result<()> {
         let (temp, workspace) = portable_handoff_fixture()?;
         let offered = handle_request_with_body(
@@ -16147,6 +16762,304 @@ mod tests {
     }
 
     #[test]
+    fn events_response_trims_a_page_before_the_transport_body_cap() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let data = "x".repeat(crate::daemon::MAX_SOCKET_BODY_BYTES / 2 + 32 * 1024);
+        for index in 1..=2 {
+            store::insert_event(
+                &conn,
+                &store::EventRecord {
+                    seq: 0,
+                    id: format!("large-event-{index}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: json!({ "data": data.clone() }).to_string(),
+                    created_at: "2026-05-19T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+        drop(conn);
+
+        let first = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=2",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(first.status, 200);
+        assert!(first.body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+        let first: EventsResponse = serde_json::from_str(&first.body)?;
+        assert_eq!(first.events.len(), 1);
+        assert!(first.has_more);
+        let cursor = first.next_cursor.expect("trimmed page cursor").after_seq;
+
+        let second = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&limit=2&afterSeq={cursor}"),
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(second.status, 200);
+        assert!(second.body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+        let second: EventsResponse = serde_json::from_str(&second.body)?;
+        assert_eq!(second.events.len(), 1);
+        assert!(!second.has_more);
+        Ok(())
+    }
+
+    #[test]
+    fn individually_oversized_event_returns_a_small_explicit_error() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        store::insert_event(
+            &conn,
+            &store::EventRecord {
+                seq: 0,
+                id: "oversized-event".to_string(),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: json!({
+                    "data": "x".repeat(crate::daemon::MAX_SOCKET_BODY_BYTES)
+                })
+                .to_string(),
+                created_at: "2026-05-19T00:00:00Z".to_string(),
+            },
+        )?;
+        drop(conn);
+
+        let response = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=1",
+            temp_dir.path(),
+            None,
+        )?;
+
+        assert_eq!(response.status, 413);
+        assert!(response.body.len() < crate::daemon::MAX_SOCKET_BODY_BYTES);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "event_response_too_large");
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_corrupt_db_event_is_rejected_before_payload_materialization() -> anyhow::Result<()>
+    {
+        assert!(
+            rusqlite::version_number() >= 3_043_000,
+            "the bundled SQLite must provide metadata-only octet_length()"
+        );
+        let scratch_root = std::env::current_dir()?.join("target");
+        std::fs::create_dir_all(&scratch_root)?;
+        let temp_dir = tempfile::Builder::new()
+            .prefix("oversized-event-regression-")
+            .tempdir_in(scratch_root)?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let path = store_path(temp_dir.path());
+        let conn = store::open_initialized_store(&path)?;
+        store::insert_event(
+            &conn,
+            &store::EventRecord {
+                seq: 0,
+                id: "before".to_owned(),
+                session_id: "session-1".to_owned(),
+                kind: "output".to_owned(),
+                payload_json: r#"{"data":"before"}"#.to_owned(),
+                created_at: "2026-05-19T00:00:00Z".to_owned(),
+            },
+        )?;
+        conn.execute(
+            "INSERT INTO events(
+                 id, session_id, kind, payload_json, created_at, redaction_status
+             ) VALUES(
+                 'oversized-corrupt', 'session-1', 'output',
+                 CAST(zeroblob(?1) AS TEXT), '2026-05-19T00:00:01Z', 'redacted'
+             )",
+            [i64::try_from(MAX_EVENT_CANDIDATE_BYTES + 1)?],
+        )?;
+        store::insert_event(
+            &conn,
+            &store::EventRecord {
+                seq: 0,
+                id: "after".to_owned(),
+                session_id: "session-1".to_owned(),
+                kind: "output".to_owned(),
+                payload_json: r#"{"data":"after"}"#.to_owned(),
+                created_at: "2026-05-19T00:00:02Z".to_owned(),
+            },
+        )?;
+        let before_seq =
+            conn.query_row("SELECT rowid FROM events WHERE id = 'before'", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        let oversized_seq = conn.query_row(
+            "SELECT rowid FROM events WHERE id = 'oversized-corrupt'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let after_seq =
+            conn.query_row("SELECT rowid FROM events WHERE id = 'after'", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        drop(conn);
+
+        let conn = store::open_initialized_store(&path)?;
+        // Keep SQLite from returning the corrupt payload. Metadata-only length
+        // inspection remains legal, while any attempt to materialize it fails
+        // with SQLITE_TOOBIG.
+        // SAFETY: `conn` owns a live SQLite connection for the duration of the
+        // call, and sqlite3_limit does not retain the handle.
+        let previous_limit = unsafe {
+            rusqlite::ffi::sqlite3_limit(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_LIMIT_LENGTH,
+                1024 * 1024,
+            )
+        };
+        assert!(previous_limit > 1024 * 1024);
+
+        let candidates = store::list_event_candidates(&conn, "session-1", None, 3)?;
+        assert_eq!(
+            candidates
+                .candidates
+                .iter()
+                .map(|candidate| candidate.seq)
+                .collect::<Vec<_>>(),
+            [before_seq, oversized_seq, after_seq]
+        );
+        assert!(
+            candidates.candidates[1].allocation_bytes > MAX_EVENT_CANDIDATE_BYTES,
+            "the corrupt row must be rejected from byte-length metadata"
+        );
+
+        let loaded = std::cell::RefCell::new(Vec::new());
+        let (first, first_stats) = bounded_events_response_from_source(
+            3,
+            None,
+            |after, limit| store::list_event_candidates(&conn, "session-1", after, limit),
+            |seq| {
+                loaded.borrow_mut().push(seq);
+                store::get_event_by_seq(&conn, "session-1", seq)
+            },
+        )?;
+        assert_eq!(first.status, 200);
+        let first: EventsResponse = serde_json::from_str(&first.body)?;
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.id.as_str())
+                .collect::<Vec<_>>(),
+            ["before"]
+        );
+        assert_eq!(
+            first
+                .next_cursor
+                .expect("cursor before oversized row")
+                .after_seq,
+            before_seq
+        );
+        assert!(first.has_more);
+        assert_eq!(first_stats.events_loaded, 1);
+        assert_eq!(*loaded.borrow(), [before_seq]);
+
+        let (second, second_stats) = bounded_events_response_from_source(
+            3,
+            Some(before_seq),
+            |after, limit| store::list_event_candidates(&conn, "session-1", after, limit),
+            |seq| {
+                loaded.borrow_mut().push(seq);
+                store::get_event_by_seq(&conn, "session-1", seq)
+            },
+        )?;
+        assert_eq!(second.status, 413);
+        let second: Value = serde_json::from_str(&second.body)?;
+        assert_eq!(second["error"]["code"], "event_response_too_large");
+        assert_eq!(second["error"]["details"]["eventId"], "oversized-corrupt");
+        assert_eq!(second["error"]["details"]["seq"], oversized_seq);
+        assert_eq!(second_stats.events_loaded, 0);
+        assert_eq!(
+            *loaded.borrow(),
+            [before_seq],
+            "listing must not ask SQLite to retrieve the oversized payload"
+        );
+        assert!(
+            store::get_event_by_seq(&conn, "session-1", oversized_seq).is_err(),
+            "the low SQLite length limit proves the corrupt payload cannot be materialized"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn events_response_does_not_materialize_a_thousand_large_candidates() -> anyhow::Result<()> {
+        use std::cell::Cell;
+
+        const TOTAL_EVENTS: i64 = 1_000;
+        const LARGE_EVENT_BYTES: usize = 2_200_000;
+        let candidate_queries = Cell::new(0_usize);
+        let loaded_events = Cell::new(0_usize);
+
+        let (response, stats) = bounded_events_response_from_source(
+            TOTAL_EVENTS as usize,
+            None,
+            |after_seq, limit| {
+                candidate_queries.set(candidate_queries.get() + 1);
+                let first = after_seq.unwrap_or(0) + 1;
+                let candidates = (first..=TOTAL_EVENTS)
+                    .take(limit)
+                    .map(|seq| store::EventCandidate {
+                        seq,
+                        event_id: Some(format!("large-event-{seq}")),
+                        allocation_bytes: LARGE_EVENT_BYTES,
+                        encoded_lower_bound_bytes: Some(LARGE_EVENT_BYTES),
+                    })
+                    .collect();
+                Ok(store::EventCandidatePage { candidates })
+            },
+            |seq| {
+                loaded_events.set(loaded_events.get() + 1);
+                let mut payload_json = String::with_capacity(LARGE_EVENT_BYTES);
+                payload_json.push_str(r#"{"data":""#);
+                payload_json.extend(std::iter::repeat_n(
+                    'x',
+                    LARGE_EVENT_BYTES - r#"{"data":""#.len() - 2,
+                ));
+                payload_json.push_str(r#""}"#);
+                Ok(Some(store::EventRecord {
+                    seq,
+                    id: format!("large-event-{seq}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json,
+                    created_at: "2026-05-19T00:00:00Z".to_string(),
+                }))
+            },
+        )?;
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.len() < coven_client::MAX_RESPONSE_BODY_BYTES);
+        let body: EventsResponse = serde_json::from_str(&response.body)?;
+        assert_eq!(body.events.len(), 1);
+        assert!(body.has_more);
+        assert_eq!(body.next_cursor.expect("bounded cursor").after_seq, 1);
+        assert_eq!(candidate_queries.get(), 1);
+        assert_eq!(stats.candidate_batches, 1);
+        assert_eq!(stats.peak_candidate_batch, EVENT_CANDIDATE_BATCH_LIMIT);
+        assert_eq!(stats.candidates_examined, 2);
+        assert_eq!(stats.events_loaded, 1);
+        assert_eq!(loaded_events.get(), 1);
+        assert!(
+            stats.events_loaded < TOTAL_EVENTS as usize,
+            "large candidates must be rejected by metadata before aggregate allocation"
+        );
+        assert!(stats.peak_loaded_event_bytes <= MAX_EVENT_CANDIDATE_BYTES);
+        Ok(())
+    }
+
+    #[test]
     fn events_endpoint_supports_after_seq_cursor() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         insert_test_session(temp_dir.path(), "session-1")?;
@@ -16202,6 +17115,74 @@ mod tests {
         assert_eq!(limited.status, 200);
         assert_eq!(body["events"].as_array().unwrap().len(), 2);
         assert_eq!(body["hasMore"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_preserves_cursor_order_across_candidate_batches() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        for index in 1..=40 {
+            store::insert_event(
+                &conn,
+                &store::EventRecord {
+                    seq: 0,
+                    id: format!("event-{index}"),
+                    session_id: "session-1".to_string(),
+                    kind: "output".to_string(),
+                    payload_json: json!({ "data": index }).to_string(),
+                    created_at: "2026-05-19T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+        drop(conn);
+
+        let first = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=30",
+            temp_dir.path(),
+            None,
+        )?;
+        let first: EventsResponse = serde_json::from_str(&first.body)?;
+        assert_eq!(first.events.len(), 30);
+        assert!(first.has_more);
+        assert!(first
+            .events
+            .windows(2)
+            .all(|pair| pair[0].seq < pair[1].seq));
+        let cursor = first.next_cursor.expect("first page cursor").after_seq;
+
+        let second = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&limit=30&afterSeq={cursor}"),
+            temp_dir.path(),
+            None,
+        )?;
+        let second: EventsResponse = serde_json::from_str(&second.body)?;
+        assert_eq!(second.events.len(), 10);
+        assert!(!second.has_more);
+        assert!(second
+            .events
+            .windows(2)
+            .all(|pair| pair[0].seq < pair[1].seq));
+        assert!(second
+            .events
+            .first()
+            .is_some_and(|event| event.seq > cursor));
+
+        let ids = first
+            .events
+            .into_iter()
+            .chain(second.events)
+            .map(|event| event.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (1..=40)
+                .map(|index| format!("event-{index}"))
+                .collect::<Vec<_>>()
+        );
         Ok(())
     }
 
@@ -21127,6 +22108,114 @@ tier = 0
             "idempotent re-register should return 200"
         );
 
+        Ok(())
+    }
+
+    #[test]
+    fn v1_session_routes_keep_raw_remainders_and_percent_bytes_distinct() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        for session_id in ["engine/42", "engine%2F42"] {
+            let registration = json!({
+                "id": session_id,
+                "projectRoot": temp.path().to_string_lossy(),
+                "harness": "engine",
+            })
+            .to_string();
+            let registered = handle_request_with_body(
+                "POST",
+                "/api/v1/sessions/external",
+                temp.path(),
+                None,
+                Some(&registration),
+            )?;
+            assert_eq!(registered.status, 201, "register {session_id:?}");
+
+            let detail = handle_request(
+                "GET",
+                &format!("/api/v1/sessions/{session_id}"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(detail.status, 200, "detail {session_id:?}: {}", detail.body);
+            let detail: serde_json::Value = serde_json::from_str(&detail.body)?;
+            assert_eq!(detail["id"], session_id);
+
+            let input = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/input"),
+                temp.path(),
+                None,
+                Some(r#"{"data":"hello"}"#),
+            )?;
+            assert_eq!(input.status, 202, "input {session_id:?}: {}", input.body);
+
+            let nested_events = handle_request(
+                "GET",
+                &format!("/api/v1/sessions/{session_id}/events"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(
+                nested_events.status, 200,
+                "nested events {session_id:?}: {}",
+                nested_events.body
+            );
+
+            let events = handle_request(
+                "GET",
+                &format!("/api/v1/events?sessionId={session_id}"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(events.status, 200, "events {session_id:?}: {}", events.body);
+
+            let kill = handle_request(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/kill"),
+                temp.path(),
+                None,
+            )?;
+            assert_eq!(kill.status, 422, "kill {session_id:?}: {}", kill.body);
+
+            let completed = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/sessions/{session_id}/complete"),
+                temp.path(),
+                None,
+                Some(r#"{"exitCode":0}"#),
+            )?;
+            assert_eq!(
+                completed.status, 200,
+                "complete {session_id:?}: {}",
+                completed.body
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn external_session_registration_rejects_empty_ids() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        for session_id in ["", " \t "] {
+            let registration = json!({
+                "id": session_id,
+                "projectRoot": temp.path().to_string_lossy(),
+                "harness": "engine",
+            })
+            .to_string();
+
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/sessions/external",
+                temp.path(),
+                None,
+                Some(&registration),
+            )?;
+            assert_eq!(
+                response.status, 400,
+                "unsafe external session id was registered: {session_id:?}"
+            );
+        }
         Ok(())
     }
 
