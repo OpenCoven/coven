@@ -593,15 +593,11 @@ fn settings_source() -> PathSource {
 }
 
 fn user_home_source(home: Option<&Path>) -> PathSource {
-    let Some(home) = home else {
-        return PathSource::Default;
-    };
-    let matches_home = ["HOME", "USERPROFILE"]
+    let environment_homes = ["HOME", "USERPROFILE"]
         .into_iter()
         .filter_map(std::env::var_os)
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .any(|candidate| candidate == home);
+        .map(PathBuf::from);
     let drive_and_path = std::env::var_os("HOMEDRIVE")
         .filter(|value| !value.is_empty())
         .zip(std::env::var_os("HOMEPATH").filter(|value| !value.is_empty()))
@@ -609,7 +605,22 @@ fn user_home_source(home: Option<&Path>) -> PathSource {
             drive.push(path);
             PathBuf::from(drive)
         });
-    if matches_home || drive_and_path.is_some_and(|candidate| candidate == home) {
+    user_home_source_from_candidates(
+        home,
+        !cfg!(windows),
+        environment_homes.chain(drive_and_path),
+    )
+}
+
+fn user_home_source_from_candidates(
+    home: Option<&Path>,
+    resolver_uses_environment: bool,
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> PathSource {
+    let Some(home) = home.filter(|_| resolver_uses_environment) else {
+        return PathSource::Default;
+    };
+    if candidates.into_iter().any(|candidate| candidate == home) {
         PathSource::Environment
     } else {
         PathSource::Default
@@ -674,6 +685,16 @@ mod tests {
         assert_eq!(surfaces.len(), 1);
         assert!(matches!(surfaces[0].status, PathStatus::Unresolved));
         assert!(matches!(surfaces[0].source, PathSource::Environment));
+    }
+
+    #[test]
+    fn native_profile_home_is_default_even_when_environment_matches() {
+        let home = Path::new("/native-profile");
+
+        assert_eq!(
+            user_home_source_from_candidates(Some(home), false, [home.to_path_buf()].into_iter()),
+            PathSource::Default
+        );
     }
 
     #[cfg(unix)]
