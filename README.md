@@ -311,8 +311,10 @@ curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
 
 1. Call `GET /api/v1/health`
 2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.structuredErrors === true`
-3. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination
-4. Only then depend on the documented `v1` sessions/events shapes
+3. Check `capabilities.sessions === true` before using session endpoints and
+   `capabilities.events === true` before reading events
+4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination
+5. Only then depend on the documented `v1` sessions/events shapes
 
 All API errors use a structured `{ "error": { "code", "message", "details" } }` envelope. Branch on `error.code`, never on `error.message`.
 

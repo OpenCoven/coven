@@ -221,6 +221,71 @@ fn process_is_alive(pid: u32) -> bool {
     result == WAIT_TIMEOUT
 }
 
+fn legacy_pipe_name(coven_home: &Path) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    coven_home.to_string_lossy().hash(&mut hasher);
+    format!("coven-daemon-{:016x}.sock", hasher.finish())
+}
+
+fn lowercase_hash_pipe_name(coven_home: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let canonical = std::fs::canonicalize(coven_home).unwrap_or_else(|_| coven_home.to_path_buf());
+    let mut path = canonical.to_string_lossy().replace('/', "\\");
+    let mut is_unc = path.starts_with(r"\\");
+    if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+        path = format!(r"\\{unc_path}");
+        is_unc = true;
+    } else if let Some(path_without_prefix) = path.strip_prefix(r"\\?\") {
+        path = path_without_prefix.to_owned();
+    }
+    let mut components = Vec::new();
+    if is_unc {
+        components.push("unc".to_owned());
+    }
+    for component in path.split('\\') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop();
+            }
+            component => components.push(component.to_ascii_lowercase()),
+        }
+    }
+    let mut digest = Sha256::new();
+    digest.update(b"coven.daemon.pipe.v1\0");
+    digest.update(components.join("\\").as_bytes());
+    let digest = digest.finalize();
+    let suffix = digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("coven-daemon-v1-{suffix}.sock")
+}
+
+fn write_inherited_legacy_status(coven_home: &Path, pid: u32, socket: &str) -> Result<()> {
+    std::fs::create_dir_all(coven_home)?;
+    std::fs::write(
+        coven_home.join("daemon.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "pid": pid,
+            "startedAt": "2026-04-27T10:00:00Z",
+            "socket": socket,
+        }))?,
+    )?;
+    Ok(())
+}
+
+fn run_daemon_command(coven_home: &Path, args: &[&str]) -> Result<Output> {
+    Ok(Command::new(env!("CARGO_BIN_EXE_coven"))
+        .arg("daemon")
+        .args(args)
+        .env("COVEN_HOME", coven_home)
+        .output()?)
+}
+
 fn prepend_path(dir: &Path) -> OsString {
     let mut paths = vec![dir.to_path_buf()];
     if let Some(existing) = std::env::var_os("PATH") {
@@ -286,7 +351,17 @@ fn wait_for_daemon_status(coven_home: &Path, path: &OsString) -> Result<serde_js
             .output()?;
         Ok(status.status.success())
     })?;
-    Ok(serde_json::from_slice(&std::fs::read(status_path)?)?)
+    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(status_path)?)?;
+    let creation_time = status["processCreationTime"]
+        .as_str()
+        .context("managed Windows daemon status omitted its process creation time")?
+        .parse::<u64>()
+        .context("managed Windows daemon status had an invalid process creation time")?;
+    anyhow::ensure!(
+        creation_time != 0,
+        "managed Windows daemon status had a zero process creation time"
+    );
+    Ok(status)
 }
 
 fn send_launch_request(
@@ -319,6 +394,130 @@ fn send_launch_request(
     )?;
     stream.flush()?;
     Ok(stream)
+}
+
+#[test]
+fn inherited_legacy_status_with_dead_pid_does_not_wedge_lifecycle_commands() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let coven_home = temp.path().join("coven-home");
+    std::fs::create_dir_all(&coven_home)?;
+    let pipe_name = lowercase_hash_pipe_name(&coven_home);
+    let mut exited = Command::new("cmd.exe")
+        .args(["/C", "exit", "/B", "0"])
+        .spawn()?;
+    let exited_pid = exited.id();
+    assert!(exited.wait()?.success());
+    let _guard = DaemonGuard {
+        coven_home: coven_home.clone(),
+    };
+
+    write_inherited_legacy_status(&coven_home, exited_pid, &pipe_name)?;
+    let status = run_daemon_command(&coven_home, &["status", "--json"])?;
+    assert_success("status with dead inherited legacy record", &status);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["status"], "stopped");
+    assert!(!coven_home.join("daemon.json").exists());
+
+    write_inherited_legacy_status(&coven_home, exited_pid, &pipe_name)?;
+    let stop = run_daemon_command(&coven_home, &["stop"])?;
+    assert_success("stop with dead inherited legacy record", &stop);
+    assert!(!coven_home.join("daemon.json").exists());
+
+    write_inherited_legacy_status(&coven_home, exited_pid, &pipe_name)?;
+    let mut start = Command::new(env!("CARGO_BIN_EXE_coven"));
+    start
+        .args(["daemon", "start"])
+        .env("COVEN_HOME", &coven_home);
+    let start = captured_output_with_timeout(
+        "start after dead inherited legacy record",
+        &mut start,
+        &coven_home,
+    )?;
+    assert_success("start after dead inherited legacy record", &start);
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let migrated = wait_for_daemon_status(&coven_home, &path)?;
+    assert_ne!(migrated["socket"], pipe_name);
+    assert!(
+        migrated["socket"]
+            .as_str()
+            .is_some_and(|socket| socket.starts_with("coven-daemon-v2-")),
+        "new daemon did not migrate to its filesystem-identity pipe: {migrated}"
+    );
+    let stop = run_daemon_command(&coven_home, &["stop"])?;
+    assert_success("stop daemon after stale start recovery", &stop);
+
+    write_inherited_legacy_status(&coven_home, exited_pid, &pipe_name)?;
+    let mut restart = Command::new(env!("CARGO_BIN_EXE_coven"));
+    restart
+        .args(["daemon", "restart"])
+        .env("COVEN_HOME", &coven_home);
+    let restart = captured_output_with_timeout(
+        "restart after dead inherited legacy record",
+        &mut restart,
+        &coven_home,
+    )?;
+    assert_success("restart after dead inherited legacy record", &restart);
+    wait_for_daemon_status(&coven_home, &path)?;
+    let stop = run_daemon_command(&coven_home, &["stop"])?;
+    assert_success("stop daemon after stale restart recovery", &stop);
+    Ok(())
+}
+
+#[test]
+fn inherited_legacy_status_with_live_pid_is_preserved_by_lifecycle_commands() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let coven_home = temp.path().join("coven-home");
+    let pipe_name = legacy_pipe_name(&coven_home);
+    write_inherited_legacy_status(&coven_home, std::process::id(), &pipe_name)?;
+
+    let status = run_daemon_command(&coven_home, &["status", "--json"])?;
+    assert_success("status with live inherited legacy PID", &status);
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(status["status"], "stale");
+
+    for command in [&["start"][..], &["stop"][..], &["restart"][..]] {
+        let output = run_daemon_command(&coven_home, command)?;
+        assert!(
+            !output.status.success(),
+            "daemon {} unexpectedly replaced a live inherited legacy PID",
+            command[0]
+        );
+        assert!(coven_home.join("daemon.json").exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn inherited_legacy_status_rejects_cross_profile_and_arbitrary_records() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let coven_home = temp.path().join("coven-home");
+    let other_home = temp.path().join("other-profile");
+    let redirected = [
+        legacy_pipe_name(&other_home),
+        "other-daemon.sock".to_owned(),
+    ];
+
+    for pipe_name in redirected {
+        write_inherited_legacy_status(&coven_home, u32::MAX, &pipe_name)?;
+        let status = run_daemon_command(&coven_home, &["status", "--json"])?;
+        assert!(
+            !status.status.success(),
+            "status accepted redirected inherited record {pipe_name}"
+        );
+        assert!(coven_home.join("daemon.json").exists());
+    }
+
+    let same_profile = legacy_pipe_name(&coven_home);
+    std::fs::write(
+        coven_home.join("daemon.json"),
+        format!(
+            r#"{{"pid":"ambiguous","startedAt":"2026-04-27T10:00:00Z","socket":"{same_profile}"}}"#
+        ),
+    )?;
+    let status = run_daemon_command(&coven_home, &["status", "--json"])?;
+    assert!(!status.status.success());
+    assert!(coven_home.join("daemon.json").exists());
+    Ok(())
 }
 
 #[test]

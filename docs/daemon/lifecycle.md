@@ -26,6 +26,9 @@ coven daemon start
 ```
 
 Start creates `COVEN_HOME` when needed, binds the local daemon transport, records daemon metadata, and returns after the daemon is reachable.
+The launched daemon is the sole publisher of `daemon.json`; the launcher passes
+one canonical start timestamp and verifies that same identity through health
+before reporting success.
 
 Run this after install:
 
@@ -77,6 +80,19 @@ coven daemon stop
 ```
 
 Stop the daemon before uninstalling Coven, moving `COVEN_HOME`, changing service-manager configuration, or replacing a source-built binary.
+
+On Unix, status, stop, and restart are bound to the selected profile. The
+recorded `daemon.json` socket must exactly equal the canonical
+`<COVEN_HOME>/coven.sock`; Coven never derives the selected home from the
+recorded socket. Copying daemon status between profiles therefore cannot make
+one profile connect to or shut down another.
+
+On Windows, new status records also contain `processCreationTime`, a decimal
+64-bit FILETIME string. Lifecycle commands compare it with the connected or
+live process so a reused PID is never treated as the recorded daemon. Legacy
+records without this field remain supported when owner-validated,
+profile-bound pipe health authenticates the daemon; otherwise cleanup fails
+closed.
 
 ## First session after daemon start
 

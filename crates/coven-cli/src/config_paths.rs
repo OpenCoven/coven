@@ -212,13 +212,12 @@ fn append_home_surfaces(
         cwd,
     );
     #[cfg(windows)]
-    push_path(
-        surfaces,
-        "state.daemon_ipc",
-        &crate::daemon::windows_pipe_path(home),
-        source,
-        cwd,
-    );
+    match crate::daemon::windows_pipe_path(home) {
+        Ok(path) => push_path(surfaces, "state.daemon_ipc", &path, source, cwd),
+        Err(_) => {
+            push_terminal_with_source(surfaces, "state.daemon_ipc", PathStatus::Unresolved, source)
+        }
+    }
     push_path(
         surfaces,
         "state.familiar_manifest",

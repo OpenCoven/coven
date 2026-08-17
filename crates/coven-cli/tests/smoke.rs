@@ -147,6 +147,189 @@ fn daemon_start_is_idempotent_when_daemon_is_already_running() -> anyhow::Result
 }
 
 #[test]
+fn managed_daemon_identity_matches_health_across_restart_and_stop() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+
+    let start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
+    assert_success("managed daemon start", &start);
+    let first = wait_for_daemon_identity(&coven_home)?;
+
+    let restart = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
+    assert_success("managed daemon restart", &restart);
+    let restarted = wait_for_daemon_identity(&coven_home)?;
+    assert_ne!(
+        first.get("pid"),
+        restarted.get("pid"),
+        "restart must replace the launched daemon process"
+    );
+    assert_ne!(
+        first.get("startedAt"),
+        restarted.get("startedAt"),
+        "restart must publish a new canonical daemon identity"
+    );
+
+    let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
+    assert_success("managed daemon stop", &stop);
+    assert!(
+        !coven_home.join("daemon.json").exists(),
+        "stop must remove the launched daemon's status"
+    );
+    assert!(
+        !coven_home.join("coven.sock").exists(),
+        "stop must remove the launched daemon's socket"
+    );
+    Ok(())
+}
+
+#[test]
+fn daemon_restart_uses_only_platform_safe_base_fallback() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let selected_home = temp_dir.path().join("coven-home");
+    fs::create_dir(&selected_home)?;
+    let coven_home = fs::canonicalize(selected_home)?;
+    let fixture = temp_dir.path().join("base-daemon");
+    compile_unix_base_daemon_fixture(&fixture)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+    let _daemon_guard = DaemonGuard {
+        coven: coven.clone(),
+        coven_home: coven_home.clone(),
+        path: path.clone(),
+    };
+    let mut unrelated = ChildGuard::spawn(
+        Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+
+    let mut spoofed = spawn_base_daemon(
+        &fixture,
+        &coven_home,
+        &unrelated.id().to_string(),
+        "base",
+        false,
+    )?;
+    wait_for_base_daemon_status(&coven_home, unrelated.id())?;
+    let rejected = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
+    assert_failure(
+        "restart with BASE health claiming an unrelated PID",
+        &rejected,
+    );
+    assert!(
+        spoofed.is_running()?,
+        "identity rejection signaled the connected BASE fixture"
+    );
+    assert!(
+        unrelated.is_running()?,
+        "identity rejection signaled an unrelated process"
+    );
+    spoofed.terminate()?;
+    fs::remove_file(coven_home.join("daemon.json"))?;
+    fs::remove_file(coven_home.join("coven.sock"))?;
+    let _ = fs::remove_file(coven_home.join("base-requests.log"));
+
+    let mut incompatible = spawn_base_daemon(&fixture, &coven_home, "self", "incompatible", false)?;
+    let incompatible_pid = incompatible.id();
+    wait_for_base_daemon_status(&coven_home, incompatible_pid)?;
+    let rejected = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
+    assert_failure("restart with non-BASE health capabilities", &rejected);
+    assert!(
+        incompatible.is_running()?,
+        "fallback signaled a daemon without BASE health capabilities"
+    );
+    incompatible.terminate()?;
+    fs::remove_file(coven_home.join("daemon.json"))?;
+    fs::remove_file(coven_home.join("coven.sock"))?;
+    let _ = fs::remove_file(coven_home.join("base-requests.log"));
+
+    let mut base = spawn_base_daemon(&fixture, &coven_home, "self", "base", true)?;
+    let base_pid = base.id();
+    wait_for_base_daemon_status(&coven_home, base_pid)?;
+    let restart = run_coven(&coven, &coven_home, &path, &["daemon", "restart"])?;
+
+    #[cfg(target_os = "linux")]
+    {
+        if !restart.status.success() {
+            eprintln!(
+                "BASE requests before restart failure:\n{}",
+                fs::read_to_string(coven_home.join("base-requests.log")).unwrap_or_default()
+            );
+        }
+        assert_success("restart from BASE daemon", &restart);
+        wait_for_child_exit(&mut base, "BASE daemon")?;
+        let replacement = wait_for_daemon_identity(&coven_home)?;
+        assert_ne!(replacement["pid"].as_u64(), Some(u64::from(base_pid)));
+        assert!(
+            unrelated.is_running()?,
+            "BASE fallback signaled an unrelated process"
+        );
+        let requests = fs::read_to_string(coven_home.join("base-requests.log"))?;
+        assert_eq!(
+            requests.lines().collect::<Vec<_>>(),
+            vec![
+                "POST /api/v1/internal/lifecycle/shutdown HTTP/1.1",
+                "GET /health HTTP/1.1",
+            ],
+            "restart must prefer the authenticated shutdown route before BASE fallback"
+        );
+
+        let stop = run_coven(&coven, &coven_home, &path, &["daemon", "stop"])?;
+        assert_success("stop replacement daemon", &stop);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_failure(
+            "restart from a BASE daemon without identity-bound signaling",
+            &restart,
+        );
+        assert_stderr_contains(
+            "legacy BASE restart upgrade guidance",
+            &restart,
+            "upgrade Coven",
+        );
+        assert_stderr_contains(
+            "legacy BASE restart manual recovery guidance",
+            &restart,
+            "restart the daemon manually",
+        );
+        assert!(
+            base.is_running()?,
+            "fail-closed legacy fallback signaled the BASE daemon"
+        );
+        assert!(
+            unrelated.is_running()?,
+            "fail-closed legacy fallback signaled an unrelated process"
+        );
+        let requests = fs::read_to_string(coven_home.join("base-requests.log"))?;
+        assert_eq!(
+            requests.lines().collect::<Vec<_>>(),
+            vec![
+                "POST /api/v1/internal/lifecycle/shutdown HTTP/1.1",
+                "GET /health HTTP/1.1",
+            ],
+            "upgrade refusal must still authenticate BASE health after an exact 404"
+        );
+        base.terminate()?;
+        fs::remove_file(coven_home.join("daemon.json"))?;
+        fs::remove_file(coven_home.join("coven.sock"))?;
+    }
+
+    unrelated.terminate()?;
+    Ok(())
+}
+
+#[test]
 fn daemon_stop_terminates_live_piped_session_descendants() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -1595,6 +1778,43 @@ struct DaemonStatusRestoreGuard {
     contents: String,
 }
 
+struct ChildGuard {
+    child: std::process::Child,
+}
+
+impl ChildGuard {
+    fn spawn(command: &mut Command) -> anyhow::Result<Self> {
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn is_running(&mut self) -> anyhow::Result<bool> {
+        Ok(self.child.try_wait()?.is_none())
+    }
+
+    fn terminate(&mut self) -> anyhow::Result<()> {
+        if self.child.try_wait()?.is_none() {
+            self.child.kill()?;
+        }
+        let _ = self.child.wait()?;
+        Ok(())
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
 impl Drop for DaemonStatusRestoreGuard {
     fn drop(&mut self) {
         let _ = fs::write(&self.path, &self.contents);
@@ -1770,6 +1990,56 @@ printf 'fake codex complete: %s\n' "$*"
     Ok(())
 }
 
+fn compile_unix_base_daemon_fixture(output: &Path) -> anyhow::Result<()> {
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/unix_base_daemon.rs");
+    let compile = Command::new("rustc")
+        .args(["--edition=2021", "-o"])
+        .arg(output)
+        .arg(source)
+        .output()?;
+    assert_success("compile BASE daemon fixture", &compile);
+    Ok(())
+}
+
+fn spawn_base_daemon(
+    fixture: &Path,
+    coven_home: &Path,
+    reported_pid: &str,
+    health_style: &str,
+    relative_socket: bool,
+) -> anyhow::Result<ChildGuard> {
+    let mut command = Command::new(fixture);
+    command
+        .arg(coven_home)
+        .arg("2026-08-16T12:00:00Z")
+        .arg(reported_pid)
+        .arg(health_style)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if relative_socket {
+        command.env("COVEN_TEST_BASE_RECORDED_SOCKET", "relative");
+    }
+    ChildGuard::spawn(&mut command)
+}
+
+fn wait_for_base_daemon_status(coven_home: &Path, expected_pid: u32) -> anyhow::Result<()> {
+    wait_until("BASE daemon status", || {
+        let status_path = coven_home.join("daemon.json");
+        if !status_path.exists() || !coven_home.join("coven.sock").exists() {
+            return Ok(false);
+        }
+        let status: Value = serde_json::from_str(&fs::read_to_string(status_path)?)?;
+        Ok(status["pid"].as_u64() == Some(u64::from(expected_pid)))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_child_exit(child: &mut ChildGuard, label: &str) -> anyhow::Result<()> {
+    wait_until(&format!("{label} exit"), || Ok(!child.is_running()?))
+}
+
 fn write_fake_copilot(fake_bin: &Path) -> anyhow::Result<()> {
     let copilot = fake_bin.join("copilot");
     fs::write(
@@ -1848,6 +2118,31 @@ fn wait_for_daemon_health(coven_home: &Path) -> anyhow::Result<()> {
         let (status, body) = unix_http_request(coven_home, "GET", "/health", None)?;
         Ok(status == 200 && body.contains(r#""ok":true"#))
     })
+}
+
+fn wait_for_daemon_identity(coven_home: &Path) -> anyhow::Result<Value> {
+    let mut identity = None;
+    wait_until("daemon status and health identity agreement", || {
+        let status_path = coven_home.join("daemon.json");
+        if !status_path.exists() || !coven_home.join("coven.sock").exists() {
+            return Ok(false);
+        }
+        let status: Value = serde_json::from_str(&fs::read_to_string(status_path)?)?;
+        let (http_status, body) = unix_http_request(coven_home, "GET", "/health", None)?;
+        if http_status != 200 {
+            return Ok(false);
+        }
+        let health: Value = serde_json::from_str(&body)?;
+        let Some(daemon) = health.get("daemon") else {
+            return Ok(false);
+        };
+        if daemon != &status {
+            return Ok(false);
+        }
+        identity = Some(status);
+        Ok(true)
+    })?;
+    identity.ok_or_else(|| anyhow::anyhow!("daemon identity was not captured"))
 }
 
 fn daemon_status_pid(coven_home: &Path) -> anyhow::Result<u64> {

@@ -18,7 +18,8 @@ use crate::{
 };
 
 use super::client::{
-    ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
+    validated_event_page_cursor, ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient,
+    LaunchRequest, EVENT_PAGES_PER_POLL, EVENT_PAGE_LIMIT,
 };
 use super::persistence;
 use super::render::collapse_session_overlay_indices;
@@ -1798,33 +1799,46 @@ impl App {
         if self.event_poll_paused_for_api_mismatch {
             return false;
         }
-        match self.client.list_events(ChatEventQuery {
-            session_id: &session_id,
-            after_seq: self.last_event_seq,
-            limit: Some(200),
-        }) {
-            Ok(events) => {
-                self.reset_event_poll_failures();
-                let mut changed = false;
-                for event in events {
-                    // If `push_event_message` swapped the active session
-                    // mid-batch (e.g. stale-id recovery auto-relaunched
-                    // into a new session and reset `last_event_seq` to
-                    // None), stop processing this batch. Continuing
-                    // would advance `last_event_seq` to one of the OLD
-                    // session's seqs, causing the next poll for the NEW
-                    // session to query with a cursor that filters out
-                    // the new session's own events.
-                    if self.active_session_id.as_deref() != Some(session_id.as_str()) {
-                        break;
-                    }
-                    self.last_event_seq = Some(event.seq);
-                    self.push_event_message(&event);
-                    changed = true;
-                }
-                changed
+        let mut changed = false;
+        let mut pages = 0;
+        loop {
+            let requested_after_seq = self.last_event_seq;
+            let page = match self.client.list_event_page(ChatEventQuery {
+                session_id: &session_id,
+                after_seq: requested_after_seq,
+                limit: Some(EVENT_PAGE_LIMIT),
+            }) {
+                Ok(page) => page,
+                Err(error) => return self.record_event_poll_failure(error) || changed,
+            };
+            if let Err(error) = validated_event_page_cursor(requested_after_seq, &page) {
+                return self.record_event_poll_failure(error) || changed;
             }
-            Err(error) => self.record_event_poll_failure(error),
+            self.reset_event_poll_failures();
+            let has_more = page.has_more;
+            pages += 1;
+            for event in page.events {
+                // If `push_event_message` swapped the active session
+                // mid-batch (e.g. stale-id recovery auto-relaunched
+                // into a new session and reset `last_event_seq` to
+                // None), stop processing this batch. Continuing
+                // would advance `last_event_seq` to one of the OLD
+                // session's seqs, causing the next poll for the NEW
+                // session to query with a cursor that filters out
+                // the new session's own events.
+                if self.active_session_id.as_deref() != Some(session_id.as_str()) {
+                    return changed;
+                }
+                self.last_event_seq = Some(event.seq);
+                self.push_event_message(&event);
+                changed = true;
+            }
+            if self.active_session_id.as_deref() != Some(session_id.as_str())
+                || !has_more
+                || pages >= EVENT_PAGES_PER_POLL
+            {
+                return changed;
+            }
         }
     }
 
@@ -3490,6 +3504,7 @@ mod tests {
         launched: Rc<RefCell<Vec<LaunchRequest>>>,
         sessions: Rc<RefCell<Vec<SessionRecord>>>,
         events: Rc<RefCell<Vec<EventRecord>>>,
+        event_limits: Rc<RefCell<Vec<Option<i64>>>>,
         daemon_status: Rc<RefCell<ChatDaemonStatus>>,
         event_error: Rc<RefCell<Option<String>>>,
         launch_error: Rc<RefCell<Option<String>>>,
@@ -3542,15 +3557,21 @@ mod tests {
                 query.session_id,
                 query.after_seq.unwrap_or(0)
             ));
+            self.event_limits.borrow_mut().push(query.limit);
             if let Some(error) = self.event_error.borrow().clone() {
                 return Err(anyhow::anyhow!(error));
             }
+            let limit = query
+                .limit
+                .and_then(|limit| usize::try_from(limit).ok())
+                .unwrap_or(usize::MAX);
             Ok(self
                 .events
                 .borrow()
                 .iter()
                 .filter(|event| event.session_id == query.session_id)
                 .filter(|event| query.after_seq.map(|seq| event.seq > seq).unwrap_or(true))
+                .take(limit)
                 .cloned()
                 .collect())
         }
@@ -6581,6 +6602,48 @@ mod tests {
         assert_eq!(
             app.last_event_seq, None,
             "active-session swap during a batch must stop the loop from advancing the cursor past the swap"
+        );
+    }
+
+    #[test]
+    fn poll_session_events_drains_more_than_513_events_in_bounded_pages() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.active_session_id = Some("session-1".to_string());
+        mirror
+            .events
+            .borrow_mut()
+            .extend((1..=514).map(|seq| EventRecord {
+                seq,
+                id: format!("event-{seq}"),
+                session_id: "session-1".to_string(),
+                kind: "output".to_string(),
+                payload_json: serde_json::json!({ "data": format!("{seq}\n") }).to_string(),
+                created_at: "2026-05-19T00:00:00Z".to_string(),
+            }));
+
+        assert!(app.poll_session_events());
+
+        assert_eq!(app.last_event_seq, Some(514));
+        assert_eq!(
+            mirror
+                .calls
+                .borrow()
+                .iter()
+                .filter(|call| call.starts_with("events:session-1:"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "events:session-1:0".to_string(),
+                "events:session-1:512".to_string(),
+            ]
+        );
+        assert_eq!(
+            &*mirror.event_limits.borrow(),
+            &[
+                Some(crate::tui::chat::client::EVENT_PAGE_LIMIT),
+                Some(crate::tui::chat::client::EVENT_PAGE_LIMIT),
+            ]
         );
     }
 
