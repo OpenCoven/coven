@@ -1528,12 +1528,27 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
     #[cfg(windows)]
-    set_windows_owner_only_security(coven_home)?;
+    set_windows_owner_only_security(coven_home, WindowsOwnerOnlyPathKind::Directory)?;
     Ok(())
 }
 
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WindowsOwnerOnlyPathKind {
+    File,
+    Directory,
+}
+
+#[cfg(any(windows, test))]
+const fn windows_owner_only_dacl_sddl(kind: WindowsOwnerOnlyPathKind) -> &'static str {
+    match kind {
+        WindowsOwnerOnlyPathKind::File => "D:P(A;;GA;;;OW)",
+        WindowsOwnerOnlyPathKind::Directory => "D:P(A;OICI;GA;;;OW)",
+    }
+}
+
 #[cfg(windows)]
-fn set_windows_owner_only_security(path: &Path) -> Result<()> {
+fn set_windows_owner_only_security(path: &Path, kind: WindowsOwnerOnlyPathKind) -> Result<()> {
     use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::Security::{
         Authorization::{
@@ -1544,7 +1559,7 @@ fn set_windows_owner_only_security(path: &Path) -> Result<()> {
         PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    let descriptor_sddl: Vec<u16> = OsStr::new("D:P(A;;GA;;;OW)")
+    let descriptor_sddl: Vec<u16> = OsStr::new(windows_owner_only_dacl_sddl(kind))
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -2146,7 +2161,7 @@ fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
         file.sync_all()
             .context("failed to sync temporary daemon status")?;
         drop(file);
-        set_windows_owner_only_security(&temporary_path)?;
+        set_windows_owner_only_security(&temporary_path, WindowsOwnerOnlyPathKind::File)?;
 
         let temporary: Vec<u16> = OsStr::new(&temporary_path)
             .encode_wide()
@@ -5331,6 +5346,56 @@ mod tests {
     #[cfg(unix)]
     static DAEMON_TERMINATION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_daemon_status_socket(coven_home: &Path) -> String {
+        daemon_startup_status_socket(coven_home).expect("derive test daemon endpoint")
+    }
+
+    fn write_test_daemon_status_text(coven_home: &Path, contents: &str) -> Result<()> {
+        #[cfg(windows)]
+        {
+            ensure_private_coven_home(coven_home)?;
+            write_windows_status(&daemon_status_path(coven_home), contents)
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::write(daemon_status_path(coven_home), contents)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_inherited_windows_status(coven_home: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT},
+            OWNER_SECURITY_INFORMATION,
+        };
+
+        let status_path = daemon_status_path(coven_home);
+        std::fs::write(&status_path, contents)?;
+        let owner = current_windows_user_sid()?;
+        let mut status_path: Vec<u16> = status_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                status_path.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("failed to set test daemon status owner: Windows error {status}");
+        }
+        Ok(())
+    }
+
     #[test]
     fn windows_status_probe_passes_a_finite_timeout_to_the_shared_client() {
         let observed_timeout = std::cell::Cell::new(None);
@@ -5541,9 +5606,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 42,
             started_at: "2026-08-16T00:00:00Z".to_owned(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -5648,6 +5711,18 @@ mod tests {
         assert_eq!(
             owner_only_pipe_sddl("S-1-5-21-42"),
             "O:S-1-5-21-42D:(A;;GA;;;OW)"
+        );
+    }
+
+    #[test]
+    fn owner_only_windows_path_dacl_inherits_only_from_directories() {
+        assert_eq!(
+            windows_owner_only_dacl_sddl(WindowsOwnerOnlyPathKind::File),
+            "D:P(A;;GA;;;OW)"
+        );
+        assert_eq!(
+            windows_owner_only_dacl_sddl(WindowsOwnerOnlyPathKind::Directory),
+            "D:P(A;OICI;GA;;;OW)"
         );
     }
 
@@ -8698,11 +8773,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: temp_dir
-                .path()
-                .join("coven.sock")
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
 
@@ -8868,7 +8939,7 @@ mod tests {
             socket,
             process_creation_time: None,
         };
-        std::fs::write(daemon_status_path(coven_home), serde_json::to_vec(&status)?)?;
+        write_inherited_windows_status(coven_home, serde_json::to_vec(&status)?)?;
         Ok(status)
     }
 
@@ -8969,9 +9040,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
 
@@ -9064,6 +9133,24 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn ensure_private_coven_home_preserves_access_to_existing_children() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let existing_dir = temp_dir.path().join("repo");
+        let existing_file = existing_dir.join("existing.txt");
+        std::fs::create_dir(&existing_dir)?;
+        std::fs::write(&existing_file, "before")?;
+
+        ensure_private_coven_home(temp_dir.path())?;
+
+        assert!(existing_dir.is_dir());
+        std::fs::write(&existing_file, "after")?;
+        assert_eq!(std::fs::read_to_string(&existing_file)?, "after");
+        std::fs::write(temp_dir.path().join("new.txt"), "new")?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn bind_api_socket_refuses_symlinked_socket_path() -> Result<()> {
@@ -9108,7 +9195,7 @@ mod tests {
     fn read_status_still_errors_on_corrupt_daemon_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::create_dir_all(temp_dir.path())?;
-        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+        write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
 
         let error = read_status(temp_dir.path()).expect_err("read_status should remain strict");
 
@@ -9124,9 +9211,9 @@ mod tests {
     fn read_status_rejects_oversized_metadata_without_parsing_or_removing_it() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status_path = daemon_status_path(temp_dir.path());
-        std::fs::write(
-            &status_path,
-            vec![b' '; coven_client::MAX_DAEMON_STATUS_BYTES + 1],
+        write_test_daemon_status_text(
+            temp_dir.path(),
+            &" ".repeat(coven_client::MAX_DAEMON_STATUS_BYTES + 1),
         )?;
 
         let error = read_status(temp_dir.path()).expect_err("oversized daemon status must fail");
@@ -9148,7 +9235,7 @@ mod tests {
     fn background_server_status_clears_corrupt_metadata_without_daemon() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::create_dir_all(temp_dir.path())?;
-        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+        write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
 
         let state = background_server_status_with_controller(
             temp_dir.path(),
@@ -9211,19 +9298,14 @@ mod tests {
         }
 
         let temp_dir = tempfile::tempdir()?;
-        let socket = daemon_socket_path(temp_dir.path())
-            .to_string_lossy()
-            .into_owned();
+        let socket = test_daemon_status_socket(temp_dir.path());
         let malformed = serde_json::json!({
             "pid": 12345,
             "startedAt": "2026-08-16T15:30:00Z",
             "socket": socket,
             "processCreationTime": "not-a-filetime",
         });
-        std::fs::write(
-            daemon_status_path(temp_dir.path()),
-            serde_json::to_vec(&malformed)?,
-        )?;
+        write_test_daemon_status_text(temp_dir.path(), &malformed.to_string())?;
 
         let unavailable = background_server_status_locked_with_controller(
             temp_dir.path(),
@@ -9261,9 +9343,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -9291,9 +9371,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -9319,9 +9397,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -9382,9 +9458,7 @@ mod tests {
             &DaemonStatus {
                 pid: 12345,
                 started_at: "2026-04-27T10:00:00Z".to_owned(),
-                socket: daemon_socket_path(temp_dir.path())
-                    .to_string_lossy()
-                    .into_owned(),
+                socket: test_daemon_status_socket(temp_dir.path()),
                 process_creation_time: None,
             },
         )?;
@@ -9715,9 +9789,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -9743,9 +9815,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -9804,9 +9874,7 @@ mod tests {
         let status = DaemonStatus {
             pid: std::process::id(),
             started_at: "2026-08-16T15:30:00Z".to_owned(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: Some(WindowsProcessCreationTime::new(41)?),
         };
         write_status(temp_dir.path(), &status)?;
@@ -9872,13 +9940,13 @@ mod tests {
         let old = DaemonStatus {
             pid: 12345,
             started_at: "old".to_owned(),
-            socket: daemon_socket_path(&home).to_string_lossy().into_owned(),
+            socket: test_daemon_status_socket(&home),
             process_creation_time: None,
         };
         let replacement = DaemonStatus {
             pid: 54321,
             started_at: "new".to_owned(),
-            socket: daemon_socket_path(&home).to_string_lossy().into_owned(),
+            socket: test_daemon_status_socket(&home),
             process_creation_time: None,
         };
         write_status(&home, &old)?;
@@ -10094,14 +10162,12 @@ mod tests {
         for corrupt in [false, true] {
             let temp_dir = tempfile::tempdir()?;
             if corrupt {
-                std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+                write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
             }
             let recovered = DaemonStatus {
                 pid: 12345,
                 started_at: "old".to_string(),
-                socket: daemon_socket_path(temp_dir.path())
-                    .to_string_lossy()
-                    .into_owned(),
+                socket: test_daemon_status_socket(temp_dir.path()),
                 process_creation_time: None,
             };
             let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -10179,9 +10245,7 @@ mod tests {
         }
 
         let temp_dir = tempfile::tempdir()?;
-        let socket = daemon_socket_path(temp_dir.path())
-            .to_string_lossy()
-            .into_owned();
+        let socket = test_daemon_status_socket(temp_dir.path());
         let corrupt = DaemonStatus {
             pid: 11111,
             started_at: "corrupt".to_string(),
@@ -10224,9 +10288,7 @@ mod tests {
         let recovered = DaemonStatus {
             pid: 22222,
             started_at: "authenticated".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         let controller = RecoveringLifecycleStopController {
@@ -10253,7 +10315,7 @@ mod tests {
         for corrupt in [false, true] {
             let temp_dir = tempfile::tempdir()?;
             if corrupt {
-                std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+                write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
             }
             let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
             let started = std::sync::Arc::new(std::sync::Mutex::new(0));
@@ -10390,9 +10452,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -10592,9 +10652,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_owned(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
             process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
@@ -10670,9 +10728,7 @@ mod tests {
             let status = DaemonStatus {
                 pid: 54321,
                 started_at,
-                socket: daemon_socket_path(coven_home)
-                    .to_string_lossy()
-                    .into_owned(),
+                socket: test_daemon_status_socket(coven_home),
                 process_creation_time: None,
             };
             write_status(coven_home, &status)?;
@@ -11500,10 +11556,7 @@ mod tests {
             socket: pipe_name,
             process_creation_time: None,
         };
-        std::fs::write(
-            daemon_status_path(temp_dir.path()),
-            serde_json::to_vec(&status)?,
-        )?;
+        write_inherited_windows_status(temp_dir.path(), serde_json::to_vec(&status)?)?;
 
         let home = temp_dir.path().to_path_buf();
         let server_status = status.clone();
