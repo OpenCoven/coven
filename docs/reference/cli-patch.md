@@ -31,9 +31,10 @@ If the stored path becomes invalid, pass a fresh `--repo <path>` to replace it.
 ## Harness selection
 
 `--harness` accepts the same ids as `coven run`: the bundled harnesses `codex`,
-`claude`, and `copilot`, plus any adapter recipe installed on this machine (see
-`coven adapter list`). An unknown id reports the configured harnesses and the
-installable recipes instead of failing with a shorter, stale list.
+`claude`, `copilot`, and `coven-code`, plus any adapter recipe installed on this
+machine (see `coven adapter list`). An unknown id reports the configured
+harnesses and the installable recipes instead of failing with a shorter, stale
+list.
 
 Without `--harness`, Coven picks the first *available* bundled harness in the
 order `codex`, `claude`, `copilot`. Adapter recipes are never auto-selected —

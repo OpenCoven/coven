@@ -2944,7 +2944,7 @@ fn run_patch(
                 .id,
         ),
         None if non_interactive => anyhow::bail!(
-            "--harness is required with --non-interactive; add `--harness codex` (or claude, or copilot)"
+            "--harness is required with --non-interactive; add `--harness <configured-harness-id>`"
         ),
         None => choose_default_harness()?,
     };
