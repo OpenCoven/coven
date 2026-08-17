@@ -1,0 +1,38 @@
+<h2>Website logo treatment</h2>
+<p class="subtitle">Both options use the new crown. Choose how it should appear in navigation, hero accents, and the footer.</p>
+
+<div class="cards">
+  <div class="card" data-choice="square-tile" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:24px;background:#f4f1ec">
+      <div style="background:#17151d;border:1px solid #34303d;border-radius:12px;padding:18px 22px;display:flex;align-items:center;gap:14px;color:white">
+        <img src="new-logo.svg" alt="" style="width:58px;height:58px;border-radius:8px">
+        <div>
+          <div style="font:700 20px/1.1 system-ui">OpenCoven</div>
+          <div style="font:13px/1.4 system-ui;color:#aaa4b4">Knowledge is freedom.</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A. Full black-square logo</h3>
+      <p>Strictly consistent with README, package, favicon, and social identity assets.</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="standalone-mark" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:24px;background:#f4f1ec">
+      <div style="background:#17151d;border:1px solid #34303d;border-radius:12px;padding:18px 22px;display:flex;align-items:center;gap:14px;color:white">
+        <svg viewBox="0 0 2047 2047" aria-hidden="true" style="width:58px;height:58px;color:white">
+          <use href="new-logo.svg#mark"></use>
+        </svg>
+        <div>
+          <div style="font:700 20px/1.1 system-ui">OpenCoven</div>
+          <div style="font:13px/1.4 system-ui;color:#aaa4b4">Knowledge is freedom.</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B. Standalone white crown</h3>
+      <p>Keeps website chrome lighter while all exported identity assets retain the black-square treatment.</p>
+    </div>
+  </div>
+</div>
