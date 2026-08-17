@@ -817,13 +817,13 @@ implementation merged in
 `b15f8f8bae1587601e2627af83f9b9e66c384266`.
 
 The final implementation head passed 140 focused O3 Rust tests, 2,188 serial
-`coven` binary tests with 3 ignored, 29 hosted Linux smoke tests, 323 OpenClaw
-tests plus TypeScript typecheck, and 114 adversarial API-documentation checker
-tests. Formatting, Clippy, diff, privacy, secret, and branch-history leak guards
-also passed. The hosted
+`coven` binary tests with 3 ignored, the hosted Linux Rust smoke suite, 323
+OpenClaw tests plus TypeScript typecheck, and 114 adversarial API-documentation
+checker tests. Formatting, Clippy, diff, privacy, secret, and branch-history
+leak guards also passed. The hosted
 [PR checks](https://github.com/OpenCoven/coven/pull/753/checks) for CI run ID
-`31979839399` completed all 13 jobs successfully; the Windows Rust leg passed
-on rerun after its known intermittent daemon-lifecycle timeout.
+`31979839399` concluded successfully after the Windows Rust leg passed on rerun
+following its known intermittent daemon-lifecycle timeout.
 
 This evidence closes only O3. It adds no adoption lookup,
 `proven-not-adopted`/`unknown` disposition, fence or generation (O4), recovery

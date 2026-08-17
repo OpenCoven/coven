@@ -21,11 +21,11 @@ records the merged immutable binding and mismatch-correlation implementation
 (PR #732). [O3 request-adoption design](./O3_CONTRACT_DESIGN.md) records the
 merged durable idempotent adoption implementation for bound launch/input plus
 launch attempt uniqueness (PR #753,
-`b15f8f8bae1587601e2627af83f9b9e66c384266`; all 13 hosted CI jobs
-successful). Lookup/fencing, cancellation acknowledgement, scheduler
-behavior, cross-phase reconciliation, and artifact binding remain separate
-O4-O8 planned work; W5/G4 still require the full classified conformance
-profile.
+`b15f8f8bae1587601e2627af83f9b9e66c384266`; hosted CI run ID
+`31979839399` concluded successfully after rerun). Lookup/fencing,
+cancellation acknowledgement, scheduler behavior, cross-phase reconciliation,
+and artifact binding remain separate O4-O8 planned work; W5/G4 still require
+the full classified conformance profile.
 
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
 runtime for a Coven, with durable intent and orchestration, evidence-first
