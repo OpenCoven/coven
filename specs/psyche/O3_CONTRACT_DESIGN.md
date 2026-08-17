@@ -1,7 +1,8 @@
 # Psyche O3 Request Adoption Contract Design
 
-**Status:** Approved 2026-08-15 for test-first implementation planning. Not
-implemented.
+**Status:** Implemented 2026-08-17 in
+[PR #753](https://github.com/OpenCoven/coven/pull/753) at
+`b15f8f8bae1587601e2627af83f9b9e66c384266`.
 
 **Depends on:** O2, merged in PR #732 at
 `a45cbbfac8d8be6a02c52cf06982c78dc4854a53` (issue #728).
@@ -11,8 +12,8 @@ durable adoption for bound session launch and input requests, plus launch-only
 one-attempt/one-session uniqueness. This design resolves C-S4 and C-M2 at the
 Coven contract boundary and supplies the durable idempotent-adoption substrate
 for C-M3. Full C-M3 lost-response recovery still depends on O4 lookup/fencing
-and O7 crash recovery. This design does not authorize production changes until
-an exact-file, test-first child plan is approved.
+and O7 crash recovery. The merged implementation remains bounded to this O3
+contract and does not authorize those later objectives.
 
 ## 1. Purpose
 
@@ -800,7 +801,7 @@ O5 cancellation acknowledgement, O6 artifact/result binding, O7 crash
 recovery, and O8's complete denial taxonomy remain separate. O3 does not claim
 G4, G6, real Psyche adapter conformance, or production child dispatch.
 
-## 12. Approval and completion gates
+## 12. Approval and completion evidence
 
 The O3 design is approved when:
 
@@ -808,11 +809,26 @@ The O3 design is approved when:
 2. its issue records the approval commit and review evidence; and
 3. no production implementation is included in the approval change.
 
-O3 implementation is complete only when:
+O3 implementation completed through issue
+[#741](https://github.com/OpenCoven/coven/issues/741), the test-first child plan
+merged in [PR #746](https://github.com/OpenCoven/coven/pull/746), and the
+implementation merged in
+[PR #753](https://github.com/OpenCoven/coven/pull/753) at
+`b15f8f8bae1587601e2627af83f9b9e66c384266`.
 
-1. an implementation issue exists;
-2. an exact-file, test-first child plan is approved;
-3. all §8 tests and repository gates pass;
-4. implementation and API documentation merge through a green PR;
-5. the issue and Bead record merge and verification receipts; and
-6. no O4-O8 behavior or production child dispatch is represented as complete.
+The final implementation head passed 140 focused O3 Rust tests, 2,188 serial
+`coven` binary tests with 3 ignored, 29 hosted Linux smoke tests, 323 OpenClaw
+tests plus TypeScript typecheck, and 114 adversarial API-documentation checker
+tests. Formatting, Clippy, diff, privacy, secret, and branch-history leak guards
+also passed. The hosted
+[PR checks](https://github.com/OpenCoven/coven/pull/753/checks) for CI run ID
+`31979839399` completed all 13 jobs successfully; the Windows Rust leg passed
+on rerun after its known intermittent daemon-lifecycle timeout.
+
+This evidence closes only O3. It adds no adoption lookup,
+`proven-not-adopted`/`unknown` disposition, fence or generation (O4), recovery
+or cancellation acknowledgement (O5), scheduler behavior (O6), automatic
+reconciliation or redispatch (O7), artifact binding (O8), real Psyche adapter
+conformance, or production child dispatch. Issue #741 and Bead
+`coven-psy-o3` receive the same bounded receipts only after this evidence
+update is visible on `main`.

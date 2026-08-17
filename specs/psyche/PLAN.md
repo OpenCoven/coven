@@ -16,13 +16,15 @@ append-only O1.1 evidence note. This closes only C-S1 vocabulary and C-S8
 documentation. C-S3-C-S6 and C-S9-C-S12 remain separate work, while G4, G6,
 and production child dispatch remain blocked.
 
-**O2 complete / O3 approved:** [O2 contract design](./O2_CONTRACT_DESIGN.md)
+**O2 and O3 complete / O4 pending:** [O2 contract design](./O2_CONTRACT_DESIGN.md)
 records the merged immutable binding and mismatch-correlation implementation
-(PR #732). [O3 request-adoption design](./O3_CONTRACT_DESIGN.md) freezes
-durable idempotent adoption for bound launch/input plus launch attempt
-uniqueness, but is not yet implemented. Lookup/fencing, cancellation
-acknowledgement, artifact binding, and cross-phase recovery remain separate
-O4-O7 planned work; W5/G4 still require the full classified conformance
+(PR #732). [O3 request-adoption design](./O3_CONTRACT_DESIGN.md) records the
+merged durable idempotent adoption implementation for bound launch/input plus
+launch attempt uniqueness (PR #753,
+`b15f8f8bae1587601e2627af83f9b9e66c384266`; all 13 hosted CI jobs
+successful). Lookup/fencing, cancellation acknowledgement, scheduler
+behavior, cross-phase reconciliation, and artifact binding remain separate
+O4-O8 planned work; W5/G4 still require the full classified conformance
 profile.
 
 **Goal:** Build Psyche as the clean-room, local-first, surface-neutral familiar
