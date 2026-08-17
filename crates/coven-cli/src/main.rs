@@ -512,7 +512,10 @@ enum Command {
         issue: Vec<String>,
         #[arg(long, help = "Override the repo path for this run")]
         repo: Option<PathBuf>,
-        #[arg(long, help = "Harness to use: codex, claude, or copilot")]
+        #[arg(
+            long,
+            help = "Harness to use: codex, claude, or copilot, or any adapter recipe you installed (`coven adapter list`). Defaults to the first available of codex, claude, copilot."
+        )]
         harness: Option<String>,
         #[arg(
             long,
@@ -2931,9 +2934,17 @@ fn run_patch(
         }
     };
     let harness_id = match harness {
-        Some(harness) => patch::HarnessId::parse(&harness)?,
+        // The configured-harness set is the authority, exactly as it is for
+        // `coven run`: an unknown id fails here with the data-driven message
+        // that names every configured harness and installable recipe, and the
+        // availability check stays at launch so `--dry-run` still plans
+        // against a harness that is not installed yet.
+        Some(harness) => patch::HarnessId::validated(
+            session_launch::validate_harness(&harness, session_launch::HarnessCheck::Configured)?
+                .id,
+        ),
         None if non_interactive => anyhow::bail!(
-            "--harness is required with --non-interactive; add `--harness codex` (or claude, or copilot)"
+            "--harness is required with --non-interactive; add `--harness <configured-harness-id>`"
         ),
         None => choose_default_harness()?,
     };
@@ -3084,15 +3095,28 @@ fn confirm_yes(prompt: &str) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES" | "Yes"))
 }
 
+/// Bundled harnesses `coven patch` auto-selects from, in preference order.
+/// Only the publicly supported set is auto-selected; a trusted adapter recipe
+/// still runs a patch, but the operator has to name it with `--harness`.
+const PATCH_DEFAULT_HARNESS_PREFERENCE: [&str; 3] = ["codex", "claude", "copilot"];
+
 fn choose_default_harness() -> Result<patch::HarnessId> {
-    let harnesses = harness::built_in_harnesses();
-    if harnesses.iter().any(|h| h.id == "codex" && h.available) {
-        return Ok(patch::HarnessId::Codex);
-    }
-    if harnesses.iter().any(|h| h.id == "claude" && h.available) {
-        return Ok(patch::HarnessId::ClaudeCode);
-    }
-    anyhow::bail!("no supported harness is available; run `coven doctor` for setup guidance")
+    let harnesses = harness::configured_harnesses()?;
+    pick_patch_default_harness(&harnesses).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no supported harness is available; install {}, then run `coven doctor` for setup guidance",
+            PATCH_DEFAULT_HARNESS_PREFERENCE.join(", ")
+        )
+    })
+}
+
+fn pick_patch_default_harness(harnesses: &[harness::HarnessSummary]) -> Option<patch::HarnessId> {
+    PATCH_DEFAULT_HARNESS_PREFERENCE.iter().find_map(|id| {
+        harnesses
+            .iter()
+            .find(|harness| harness.id == *id && harness.available)
+            .map(|harness| patch::HarnessId::validated(&harness.id))
+    })
 }
 
 fn pick_default_harness(harnesses: &[harness::HarnessSummary]) -> Option<String> {
@@ -3523,12 +3547,19 @@ fn credentials_lines(
 
 /// Return the canonical authentication or local-status command for a harness.
 /// Running this command is not proof that a provider turn will succeed.
-fn auth_setup_hint_for_harness(harness_id: &str) -> &'static str {
+///
+/// Every branch must return a command the user can actually paste: doctor
+/// renders this inside backticks, so prose like "see harness docs" reads as a
+/// command that does not exist. Harnesses outside the bundled set arrive
+/// through an adapter manifest, and `coven adapter doctor <id>` is their
+/// canonical local-status command — it reports readiness and prints the
+/// adapter's own install/authentication hint.
+fn auth_setup_hint_for_harness(harness_id: &str) -> String {
     match harness_id {
-        "codex" => "codex login",
-        "claude" => "claude doctor",
-        "copilot" => "copilot login",
-        _ => "see harness docs",
+        "codex" => "codex login".to_string(),
+        "claude" => "claude doctor".to_string(),
+        "copilot" => "copilot login".to_string(),
+        other => format!("coven adapter doctor {other}"),
     }
 }
 
@@ -7461,6 +7492,87 @@ mod tests {
         );
     }
 
+    #[test]
+    fn patch_default_harness_falls_back_to_copilot() {
+        // Copilot is a bundled supported harness, so a machine that only has
+        // Copilot installed must still get a `coven patch` default instead of
+        // "no supported harness is available".
+        let harnesses = vec![
+            make_harness("codex", false),
+            make_harness("claude", false),
+            make_harness("copilot", true),
+        ];
+        assert_eq!(
+            pick_patch_default_harness(&harnesses).map(|id| id.as_str().to_string()),
+            Some("copilot".to_string()),
+            "copilot must be an auto-selectable patch default"
+        );
+    }
+
+    #[test]
+    fn patch_default_harness_prefers_codex_then_claude_then_copilot() {
+        let all_available = vec![
+            make_harness("codex", true),
+            make_harness("claude", true),
+            make_harness("copilot", true),
+        ];
+        assert_eq!(
+            pick_patch_default_harness(&all_available).map(|id| id.as_str().to_string()),
+            Some("codex".to_string())
+        );
+
+        let no_codex = vec![
+            make_harness("codex", false),
+            make_harness("claude", true),
+            make_harness("copilot", true),
+        ];
+        assert_eq!(
+            pick_patch_default_harness(&no_codex).map(|id| id.as_str().to_string()),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
+    fn patch_does_not_auto_select_an_adapter_recipe() {
+        // Adapter recipes stay opt-in: available or not, they are never picked
+        // for the user, only named explicitly with `--harness`.
+        let harnesses = vec![
+            make_harness("codex", false),
+            make_harness("claude", false),
+            make_harness("copilot", false),
+            make_harness("hermes", true),
+        ];
+        assert_eq!(
+            pick_patch_default_harness(&harnesses).map(|id| id.as_str().to_string()),
+            None,
+            "an installed adapter recipe must not become the implicit patch default"
+        );
+    }
+
+    #[test]
+    fn patch_harness_help_matches_the_ids_patch_accepts() {
+        use clap::CommandFactory;
+
+        // The help promised `copilot` while the parser rejected it. Keep the
+        // advertised set and the auto-selected set in one place so they cannot
+        // drift apart again.
+        let mut cmd = Cli::command();
+        let patch = cmd
+            .find_subcommand_mut("patch")
+            .expect("patch subcommand exists");
+        let help = patch.render_long_help().to_string();
+        for id in PATCH_DEFAULT_HARNESS_PREFERENCE {
+            assert!(
+                help.contains(id),
+                "patch --harness help must name `{id}`:\n{help}"
+            );
+        }
+        assert!(
+            help.contains("coven adapter list"),
+            "patch --harness help must point at installed adapter recipes:\n{help}"
+        );
+    }
+
     // --- credentials_lines unit tests ---
 
     fn make_harness_with_hint(
@@ -7514,6 +7626,39 @@ mod tests {
             !lines[0].contains("[!!]"),
             "non-blocking auth guidance must not look like a blocking failure: {}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn every_auth_setup_hint_is_a_runnable_command() {
+        // doctor renders this hint inside backticks. Adapter harnesses used to
+        // land on the prose fallback "see harness docs", which reads as a
+        // command that does not exist.
+        assert_eq!(auth_setup_hint_for_harness("codex"), "codex login");
+        assert_eq!(auth_setup_hint_for_harness("claude"), "claude doctor");
+        assert_eq!(auth_setup_hint_for_harness("copilot"), "copilot login");
+        for id in ["grok", "hermes", "opencode", "some-local-adapter"] {
+            let hint = auth_setup_hint_for_harness(id);
+            assert_eq!(hint, format!("coven adapter doctor {id}"));
+            assert!(
+                !hint.contains("see harness docs"),
+                "hint must be runnable, got: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_line_for_an_adapter_harness_offers_adapter_doctor() {
+        let lines = credentials_lines(None, &[make_harness_with_hint("hermes", true, "")]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("`coven adapter doctor hermes`")),
+            "got: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("see harness docs")),
+            "got: {lines:#?}"
         );
     }
 

@@ -54,26 +54,25 @@ impl fmt::Display for VerificationProfile {
     }
 }
 
+/// The harness a patch run launches.
+///
+/// This carries an id the configured-harness set has already accepted; it does
+/// not decide membership itself. `session_launch::validate_harness` is the sole
+/// authority for which harnesses exist, so `coven patch` supports exactly what
+/// `coven run` supports — the bundled set plus any trusted adapter recipe the
+/// operator installed — instead of a second, narrower allowlist that drifts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HarnessId {
-    Codex,
-    ClaudeCode,
-}
+pub struct HarnessId(String);
 
 impl HarnessId {
-    pub fn parse(value: &str) -> anyhow::Result<Self> {
-        match value {
-            "codex" => Ok(Self::Codex),
-            "claude" => Ok(Self::ClaudeCode),
-            other => anyhow::bail!("unknown harness `{other}`; expected `codex` or `claude`"),
-        }
+    /// Wrap an id that `session_launch::validate_harness` already resolved
+    /// against the configured harness set.
+    pub fn validated(id: impl Into<String>) -> Self {
+        Self(id.into())
     }
 
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::ClaudeCode => "claude",
-        }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -238,7 +237,7 @@ mod tests {
                 untracked_files: vec![],
             },
             issue: issue.to_string(),
-            harness_id: HarnessId::Codex,
+            harness_id: HarnessId::validated("codex"),
             verification_profile: VerificationProfile::Auto,
             non_interactive: false,
             dry_run: false,
@@ -422,11 +421,15 @@ $ <command>\n\
     }
 
     #[test]
-    fn parses_harness_ids() -> anyhow::Result<()> {
-        assert_eq!(HarnessId::parse("codex")?, HarnessId::Codex);
-        assert_eq!(HarnessId::parse("claude")?, HarnessId::ClaudeCode);
-        assert!(HarnessId::parse("shell").is_err());
-        Ok(())
+    fn harness_id_carries_any_validated_id_verbatim() {
+        // No second allowlist lives here: whatever the configured-harness set
+        // accepted reaches the plan and the launch unchanged, so a bundled
+        // harness and a trusted adapter recipe travel the same path.
+        for id in ["codex", "claude", "copilot", "hermes"] {
+            let harness = HarnessId::validated(id);
+            assert_eq!(harness.as_str(), id);
+            assert_eq!(harness.to_string(), id);
+        }
     }
 
     #[test]

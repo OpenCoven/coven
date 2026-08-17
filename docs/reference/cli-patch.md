@@ -28,6 +28,18 @@ When a non-dry-run patch session launches, Coven records the canonical OpenClaw 
 
 If the stored path becomes invalid, pass a fresh `--repo <path>` to replace it.
 
+## Harness selection
+
+`--harness` accepts the same ids as `coven run`: the bundled harnesses `codex`,
+`claude`, `copilot`, and `coven-code`, plus any adapter recipe installed on this
+machine (see `coven adapter list`). An unknown id reports the configured
+harnesses and the installable recipes instead of failing with a shorter, stale
+list.
+
+Without `--harness`, Coven picks the first *available* bundled harness in the
+order `codex`, `claude`, `copilot`. Adapter recipes are never auto-selected —
+name one explicitly to use it.
+
 ## Safety
 
 The OpenClaw patch flow does not commit or push. It records a Coven session, launches the selected harness in the chosen repo, runs verification after the harness exits, and reports changed files plus verification status.
