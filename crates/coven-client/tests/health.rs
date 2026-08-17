@@ -481,6 +481,22 @@ fn preserves_structured_daemon_error_fields() {
 
 #[cfg(unix)]
 #[test]
+fn preserves_http_status_for_an_unstructured_daemon_error() {
+    let home = TestHome::new();
+    let server = serve_once(&home.path, 502, "upstream unavailable".to_owned());
+    let endpoint = DaemonEndpoint::discover(&home.path).expect("discover owner-local socket");
+    let mut client = DaemonClient::new(endpoint);
+
+    let error = client
+        .health()
+        .expect_err("preserve unstructured daemon status");
+
+    assert!(matches!(error, ClientError::HttpStatus(502)));
+    server.join().expect("server thread");
+}
+
+#[cfg(unix)]
+#[test]
 fn discovers_only_an_owner_local_unix_socket() {
     use std::os::unix::{fs::PermissionsExt, net::UnixListener};
 

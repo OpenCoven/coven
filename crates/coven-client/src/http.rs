@@ -196,8 +196,12 @@ impl DaemonClient {
 }
 
 fn daemon_error(status: u16, body: Vec<u8>) -> Result<ClientError, ClientError> {
-    let body = String::from_utf8(body).map_err(ClientError::InvalidUtf8)?;
-    let value: Value = serde_json::from_str(&body).map_err(ClientError::InvalidJson)?;
+    let Ok(body) = String::from_utf8(body) else {
+        return Ok(ClientError::HttpStatus(status));
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&body) else {
+        return Ok(ClientError::HttpStatus(status));
+    };
     let Some(error) = value.get("error") else {
         return Ok(ClientError::HttpStatus(status));
     };

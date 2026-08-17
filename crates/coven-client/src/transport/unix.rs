@@ -296,15 +296,14 @@ fn connect_with_deadline(
     deadline: Instant,
     bind_process_identity: bool,
 ) -> Result<(UnixStream, PeerIdentity), ClientError> {
-    const OPERATION: &str = "failed to connect to Coven daemon socket";
     let socket_identity = validated_socket_identity(endpoint)?;
     let socket =
         Socket::new(Domain::UNIX, Type::STREAM, None).map_err(|source| ClientError::Io {
-            operation: OPERATION,
+            operation: UNIX_CONNECT_OPERATION,
             source,
         })?;
     let address = SockAddr::unix(endpoint.socket()).map_err(|source| ClientError::Io {
-        operation: OPERATION,
+        operation: UNIX_CONNECT_OPERATION,
         source,
     })?;
     connect_operation_with_deadline(deadline, |remaining| {
