@@ -2140,14 +2140,19 @@ fn validate_owner_only_windows_named_pipe_until(
     object_label: &str,
     deadline: std::time::Instant,
 ) -> Result<(), ClientError> {
-    use std::{os::windows::ffi::OsStrExt, ptr};
-    use windows_sys::Win32::{
-        Foundation::{ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT},
-        Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_KERNEL_OBJECT},
-            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    use std::{
+        os::windows::{
+            ffi::OsStrExt,
+            io::{AsRawHandle, FromRawHandle},
         },
-        System::Pipes::WaitNamedPipeW,
+        ptr,
+    };
+    use windows_sys::Win32::{
+        Foundation::{
+            ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
+            INVALID_HANDLE_VALUE,
+        },
+        Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, READ_CONTROL},
     };
 
     let mut object_path: Vec<u16> = object_path
@@ -2159,31 +2164,26 @@ fn validate_owner_only_windows_named_pipe_until(
             .checked_duration_since(std::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| windows_pipe_security_timeout(object_label))?;
-        let mut owner = ptr::null_mut();
-        let mut dacl = ptr::null_mut();
-        let mut descriptor = ptr::null_mut();
-        // Named pipes are kernel objects. Status files instead use
-        // GetSecurityInfo on their already-open file handles below.
-        let status = unsafe {
-            GetNamedSecurityInfoW(
+        let handle = unsafe {
+            CreateFileW(
                 object_path.as_mut_ptr(),
-                SE_KERNEL_OBJECT,
-                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                &mut owner,
+                READ_CONTROL,
+                0,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
-                &mut dacl,
-                ptr::null_mut(),
-                &mut descriptor,
             )
         };
-        let descriptor = LocalAllocation(descriptor);
-        if status == 0 {
-            return validate_owner_only_windows_owner_and_dacl(owner, dacl, object_label);
+        if handle != INVALID_HANDLE_VALUE {
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            return validate_owner_only_windows_pipe_handle(file.as_raw_handle());
         }
-        drop(descriptor);
-        if status != ERROR_PIPE_BUSY {
+        let source = std::io::Error::last_os_error();
+        let code = source.raw_os_error();
+        if code != Some(ERROR_PIPE_BUSY as i32) {
             return Err(ClientError::Discovery(format!(
-                "cannot inspect owner-only {object_label}: Windows error {status}"
+                "cannot inspect owner-only {object_label}: {source}"
             )));
         }
 
@@ -2193,20 +2193,23 @@ fn validate_owner_only_windows_named_pipe_until(
             .ok_or_else(|| windows_pipe_security_timeout(object_label))?;
         let wait_millis = finite_windows_security_wait_millis(remaining)
             .ok_or_else(|| windows_pipe_security_timeout(object_label))?;
-        if unsafe { WaitNamedPipeW(object_path.as_ptr(), wait_millis) } == 0 {
-            let source = std::io::Error::last_os_error();
-            if source.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32)
+        if unsafe {
+            windows_sys::Win32::System::Pipes::WaitNamedPipeW(object_path.as_ptr(), wait_millis)
+        } == 0
+        {
+            let wait_error = std::io::Error::last_os_error();
+            if wait_error.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32)
                 || std::time::Instant::now() >= deadline
             {
                 return Err(windows_pipe_security_timeout(object_label));
             }
-            let code = source.raw_os_error();
-            if code != Some(ERROR_PIPE_BUSY as i32)
-                && code != Some(windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND as i32)
-                && code != Some(windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND as i32)
+            let wait_code = wait_error.raw_os_error();
+            if wait_code != Some(ERROR_PIPE_BUSY as i32)
+                && wait_code != Some(ERROR_FILE_NOT_FOUND as i32)
+                && wait_code != Some(ERROR_PATH_NOT_FOUND as i32)
             {
                 return Err(ClientError::Discovery(format!(
-                    "cannot inspect owner-only {object_label}: {source}"
+                    "cannot inspect owner-only {object_label}: {wait_error}"
                 )));
             }
             std::thread::sleep(
