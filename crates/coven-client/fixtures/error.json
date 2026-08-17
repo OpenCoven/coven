@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "session_not_live",
+    "message": "Session is not live.",
+    "details": {
+      "sessionId": "session-1"
+    }
+  }
+}

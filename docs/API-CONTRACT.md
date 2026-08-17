@@ -39,6 +39,47 @@ proof of `coven.daemon.v1` support.
 - Events include a monotonic `seq` cursor for incremental reads.
 - Event payloads are redacted by default before API display.
 
+### Reusable Rust client
+
+Rust integrations should use `coven-client` rather than compose HTTP over the
+daemon transport themselves. Construct a `DaemonEndpoint` only through
+`DaemonEndpoint::discover(coven_home)`, then pass it to `DaemonClient::new`.
+The public client accepts no URLs or arbitrary socket/pipe paths, exposes only
+known `/api/v1/*` operations, caps response bodies at 4 MiB, and negotiates
+health before dependent operations. Negotiation is bound to a transport peer
+fingerprint. If the daemon endpoint is replaced, the next dependent operation
+fails before sending request bytes and clears the cached negotiation. Call
+`health` again, re-check capabilities, and then decide whether to retry; the
+client never replays a mutation automatically.
+
+On Unix, discovery accepts only the current user's private
+`<COVEN_HOME>/coven.sock`. On Windows, it derives only Coven's owner-only pipe
+for the supplied private Coven home, then verifies that the pipe owner is the
+current user and that its DACL is exactly Coven's owner-rights `GENERIC_ALL`
+rule. During an upgrade, it may use a legacy pipe recorded in the private
+`daemon.json` only when the file and recorded pipe pass the same owner-only
+validation and the name matches Coven's fixed pipe-name shape. The daemon
+status must also match the historical deterministic pipe name for the selected
+`COVEN_HOME`; copying a protected status file between profiles is rejected.
+The daemon remains responsible for creating that descriptor.
+`ClientError::Daemon` preserves the HTTP status and `error.code`,
+`error.message`, and `error.details` from a structured daemon failure.
+
+`coven.daemon.v1` session routing predates URL-component semantics. The daemon
+does not percent-decode session ids: path routes consume the raw remainder
+between `/sessions/` and an action suffix, and `GET /events` reads the raw
+`sessionId` query value up to the next `&`. A literal `%2F` therefore names
+`%2F`, while `engine/42` remains a reachable id. Changing those bytes under the
+same named contract would retarget mixed-version mutations.
+
+The typed client emits representable ids verbatim. It rejects empty ids,
+whitespace, control characters, and `?` in path-routed ids because the
+inherited HTTP request line cannot preserve them; the events query rejects
+empty ids, whitespace, control characters, and `&`. Session detail ids that
+collide with inherited nested route suffixes (`/handoffs`, `/log`, `/events`,
+or `/artifacts/`) are not exposed by that typed operation. These are inherited
+`v1` routing limitations, not a new id grammar.
+
 ## `GET /api/v1/health`
 
 `GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities:
@@ -69,7 +110,8 @@ proof of `coven.daemon.v1` support.
   "daemon": {
     "pid": 12345,
     "startedAt": "2026-05-09T06:43:00Z",
-    "socket": "<local IPC endpoint>"
+    "socket": "<local IPC endpoint>",
+    "processCreationTime": "134157822123456789"
   },
   "eventWriter": {
     "state": "healthy",
@@ -89,6 +131,10 @@ proof of `coven.daemon.v1` support.
   }
 }
 ```
+
+`processCreationTime` is an optional Windows-only process fingerprint. It is a
+decimal string so the full 64-bit FILETIME survives JSON consumers; clients
+must continue to accept records and health responses that omit it.
 
 If the daemon metadata is unavailable, `daemon` may be `null`. When present,
 `daemon.socket` reports the active local IPC endpoint. The `hub` block reports
@@ -597,6 +643,11 @@ Registers a session that is already running outside the daemon (for example, the
 | `harness`        | string | Yes      | Harness identifier (e.g. `"coven-code"`). Must be non-empty after trimming.|
 | `title`          | string | No       | Display title. Defaults to `"External session"` when absent or empty.      |
 | `transcriptPath` | string | No       | Absolute path to the external session's transcript file. Stored as-is; the daemon does not read or validate the path. |
+
+Session ids use the inherited raw `v1` routing described under
+[Reusable Rust client](#reusable-rust-client). Do not percent-encode them while
+claiming `coven.daemon.v1`; doing so changes the id selected by an existing
+daemon.
 
 ### Responses
 
