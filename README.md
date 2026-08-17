@@ -89,7 +89,7 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 
 - **🏠 Project-root boundaries** — Every launch is tied to an explicit repository or project root. The daemon rejects working directories that escape the declared boundary.
 - **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Hermes and OpenCode, while Grok Build is an experimental opt-in recipe.
-- **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, restored, or sacrificed without memorizing IDs.
+- **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, or restored without memorizing IDs; eligible non-running, unadopted work can also be sacrificed.
 - **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
 - **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned local IPC contract (`coven.daemon.v1`).
 - **🗄️ SQLite-backed history** — Session metadata and event logs survive daemon restarts.
@@ -271,13 +271,13 @@ verbs:
 > the `sessions show/events/log` subcommands) accept a unique prefix of the id
 > (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
 
-> **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, refuses live sessions, and requires `--yes` so beginners don't delete work by accident.
+> **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, applies only to eligible non-running sessions without adopted/reserved evidence, and requires `--yes`.
 
 | Ritual        | Reversible? | Works on             | Description                                                  |
 | ------------- | ----------- | -------------------- | ------------------------------------------------------------ |
 | **Archive**   | ✅ Yes      | Non-running sessions | Hides from active list; all events preserved                 |
 | **Summon**    | N/A         | Archived sessions    | Restores to active list                                      |
-| **Sacrifice** | ❌ No       | Non-running sessions | Permanently deletes session and all events; requires `--yes` |
+| **Sacrifice** | ❌ No       | Eligible non-running, unadopted sessions | Permanently deletes session and all events; adopted/reserved evidence is retained; requires `--yes` |
 | **Rejoin**    | N/A         | Live sessions        | Reattaches to running session                                |
 
 ---
@@ -563,7 +563,7 @@ A macOS-first system diagnostics and relief tool built into the CLI. It shows CP
 
 **Q: What does "Sacrifice" mean?**
 
-Sacrifice is Coven's intentionally explicit verb for permanently deleting a session and all its event history. It requires `--yes` on the command line so beginners don't accidentally delete work. Archive + Summon are the reversible alternatives for non-destructive session management.
+Sacrifice is Coven's intentionally explicit verb for permanently deleting an eligible non-running session and all its event history. It requires `--yes`. Sessions with adopted or historical reserved evidence are retained; O3 defines no retention/fence release. Archive + Summon are the reversible alternatives.
 
 **Q: What is `COVEN_HOME`?**
 
@@ -616,7 +616,7 @@ coven doctor
 | Daemon won't start                          | Run `coven daemon restart`; check `$COVEN_HOME` ownership and permissions              |
 | Session browser shows a table, not a UI     | Terminal isn't interactive; use `coven sessions --manage` to force the browser         |
 | `cwd` rejected at launch                    | The working directory resolves outside the project root; use a path inside it          |
-| Stale "running" sessions after daemon crash | Run `coven daemon restart` to mark dead sessions `orphaned`, then archive or sacrifice them via `coven sessions --all` |
+| Stale "running" sessions after daemon crash | Run `coven daemon restart` to mark dead sessions `orphaned`, then archive them; sacrifice is only for eligible rows without adopted/reserved evidence |
 | Sessions feel slow / daemon sluggish        | Run `coven pc status` to check system pressure; `coven pc top --n 10` for CPU culprits |
 | `coven attach` won't accept input           | The session is not live; attach replays logs for completed or archived sessions        |
 | Secret scan fails                           | Remove the secret from your working tree; rotate it if it entered git history          |

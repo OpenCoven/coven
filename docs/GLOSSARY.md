@@ -145,7 +145,9 @@ reversible.
 
 ## Sacrifice
 
-Permanently delete a non-running session and its events.
+Permanently delete an eligible non-running session and its events. Any
+launch/input adoption or historical launch reservation makes the session
+ineligible and retained; O3 defines no retention/fence release.
 
 ## Session
 

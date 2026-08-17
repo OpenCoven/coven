@@ -3,7 +3,7 @@ summary: "Recovering live sessions that no longer respond."
 read_when:
   - A session stopped responding
 title: "A session is stuck"
-description: "What to do when a Coven session looks stuck: how to attach, inspect the PTY, read the event log, and decide between archive and sacrifice."
+description: "What to do when a Coven session looks stuck: attach, inspect the PTY, read the event log, and choose archive or an eligible sacrifice safely."
 ---
 
 A session can look stuck because the harness is still running, the daemon lost
@@ -75,15 +75,18 @@ Summon restores an archived session:
 coven summon <session-id>
 ```
 
-Sacrifice permanently deletes a non-running session and its events. It requires
-an explicit confirmation flag:
+Sacrifice permanently deletes only an eligible non-running session without
+adopted or historical reserved evidence. It requires an explicit confirmation
+flag:
 
 ```sh
 coven sacrifice <session-id> --yes
 ```
 
-Do not sacrifice live work. The CLI refuses running sessions, but you should
-still check `coven sessions --plain --all` first.
+Do not sacrifice live work. Check `coven sessions --plain --all` first. If the
+session has adopted/reserved evidence, keep it and archive it instead; Coven
+reports `session adoption evidence is retained; sacrifice is unavailable until
+an approved retention/fence contract resolves it`. No release exists in O3.
 
 ## When the harness is the issue
 

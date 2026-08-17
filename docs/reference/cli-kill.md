@@ -32,13 +32,17 @@ event. The session record and its append-only event log are kept.
 session `<session-id>` is not running (status: completed); only running sessions can be killed
 ```
 
-After a kill, the session shows up as `killed` in `coven sessions`. Clean it up
-like any other finished session:
+After a kill, the session shows up as `killed` in `coven sessions`. Archive is
+always available. Sacrifice is available only if the killed session is an
+eligible non-running session without adopted/reserved evidence:
 
 ```bash
 coven archive <session-id>
 coven sacrifice <session-id> --yes
 ```
+
+A killed adopted/reserved session remains retained; kill does not release its
+evidence, and O3 defines no retention/fence release.
 
 ## Stale "running" sessions
 

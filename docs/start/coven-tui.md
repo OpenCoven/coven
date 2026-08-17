@@ -83,11 +83,14 @@ The prompt bar accepts three input shapes interchangeably:
    /help
    ```
 
-3. **Arrow-key navigation** — `↑` / `↓` cycle through the **Commands rail** on the launcher (a windowed list of slash commands, 6 visible at a time with a `N of 14` scroll hint). Pressing `Enter` with an **empty** prompt dispatches the selected slash command; pressing `Enter` with text dispatches the typed spell through Cast.
+3. **Arrow-key navigation** — `↑` / `↓` cycle through the **Commands rail** on the launcher (a windowed list of slash commands, 6 visible at a time with a one-based `N of 15` scroll hint). Pressing `Enter` with an **empty** prompt dispatches the selected slash command; pressing `Enter` with text dispatches the typed spell through Cast.
 
 ## Legacy slash command reference
 
-The launcher exposes 14 slash commands in the Commands rail. The Cast parser additionally accepts harness-direct verbs (`/codex`, `/claude`) and natural-language equivalents (e.g. `sessions`, `doctor`, `help`, `quit`).
+The launcher exposes 15 slash commands in the Commands rail, in the order shown
+below. The Cast parser additionally accepts harness-direct verbs (`/codex`,
+`/claude`) and natural-language equivalents (e.g. `sessions`, `doctor`, `help`,
+`quit`).
 
 | Command | What it does |
 |---|---|
@@ -96,6 +99,7 @@ The launcher exposes 14 slash commands in the Commands rail. The Cast parser add
 | `/tui` | Re-render this launcher palette explicitly. |
 | `/doctor` | Check store, project, and harness readiness (`coven doctor`). |
 | `/daemon` | Report whether the local Coven daemon is awake (`coven daemon status`). |
+| `/status` | Show sessions, familiars, skills, research, and hub status at a glance (`coven status`). |
 | `/run <harness> "<task>"` | Launch a project-scoped session. Same as `coven run`. |
 | `/patch` | Open the guided OpenClaw repair room. |
 | `/sessions` | Open the session browser (active sessions only). |
@@ -103,7 +107,7 @@ The launcher exposes 14 slash commands in the Commands rail. The Cast parser add
 | `/attach <session-id>` | Attach to (or replay) a session. |
 | `/summon <session-id>` | Restore an archived session, then follow it. |
 | `/archive <session-id>` | Hide a non-running session while preserving events. |
-| `/sacrifice <session-id>` | Permanently delete a non-running session. Asks you to type `sacrifice` to confirm. |
+| `/sacrifice <session-id>` | Permanently delete an eligible non-running session. Adopted or reserved sessions are retained. Asks you to type `sacrifice` to confirm. |
 | `/quit` (alias `/exit`) | Close the TUI cleanly. Equivalent to `Ctrl+C` or `Esc` at the root. |
 
 ## Legacy keyboard shortcuts
@@ -125,7 +129,7 @@ The TUI resizes safely. Terminals as small as 80×24 remain usable; the launcher
 
 ## Legacy session browser actions
 
-Selecting a session and pressing `Enter` shows contextual actions. Each one is gated by session state — actions that are not safe for the current state are hidden, not greyed out, so the menu never offers a destructive verb you cannot run.
+Selecting a session and pressing `Enter` shows contextual actions. Rejoin, View Log, Summon, and Archive are gated purely by session state — actions that are not safe for the current state are hidden, not greyed out. Sacrifice is shown for every non-running row without pre-querying adoption; it is never hidden for an ineligible row. Its retention gate runs when you act on it, not when the menu renders.
 
 | Action | Available when | Effect |
 |---|---|---|
@@ -133,7 +137,7 @@ Selecting a session and pressing `Enter` shows contextual actions. Each one is g
 | **View Log** | session is not `running` | Replay the event log (read-only). |
 | **Summon** | `archived_at` is set | Restore to the active list and replay/follow. |
 | **Archive** | session is not `running` and not archived | Hide from the active list; events preserved. |
-| **Sacrifice** | session is not `running` | Permanent delete; requires typed confirmation. |
+| **Sacrifice** | session is not `running` | Before the typed `sacrifice` confirmation, a store retention check runs; an adopted or reserved row returns the canonical `AdoptionRetentionError` denial instead and is left untouched. Once confirmed, the final delete repeats the retention and liveness checks and only removes a still-non-running row, closing the race window rather than trusting that earlier read. |
 
 The map between actions and CLI verbs is documented in [Session lifecycle](/SESSION-LIFECYCLE).
 

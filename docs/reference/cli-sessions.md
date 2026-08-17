@@ -77,7 +77,8 @@ coven sacrifice <session-id> --yes
 
 Archive hides a non-running session from active lists while preserving its
 record. Summon restores an archived session and replays it. Sacrifice is the
-permanent delete path.
+permanent delete path only for an eligible non-running session without adopted
+or reserved evidence; retained sessions should be archived instead.
 
 ## Related
 

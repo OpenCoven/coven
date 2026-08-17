@@ -106,7 +106,7 @@ Because Coven refuses to own credentials, **the user** is responsible for:
 
 - Running each harness's own `login` / `doctor` flow at least once before expecting `coven run` to succeed.
 - Rotating provider tokens through the harness CLI when needed.
-- Treating any harness output that prints a credential (because you asked it to) as ledger-recorded — clean it up with [`coven sacrifice`](/SESSION-LIFECYCLE#sacrifice) if needed.
+- Treating any harness output that prints a credential (because you asked it to) as ledger-recorded. Rotate or revoke the credential immediately. An eligible non-running session without adoption evidence may be removed with [`coven sacrifice`](/SESSION-LIFECYCLE#sacrifice); adopted/reserved sessions are retained and O3 provides no sacrifice release, so do not rely on deletion as the containment plan.
 
 
 ## Related

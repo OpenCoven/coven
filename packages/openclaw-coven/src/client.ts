@@ -10,6 +10,18 @@ import { lstatIfExists, pathIsInside } from "./path-utils.js";
  * but never interprets. See `specs/psyche/O2_CONTRACT_DESIGN.md`.
  */
 export const PSYCHE_EXECUTION_BINDING_V1 = "psyche.execution_binding.v1" as const;
+export const PSYCHE_REQUEST_ADOPTION_V1 = "psyche.request_adoption.v1" as const;
+
+/**
+ * Named daemon API contract required for the O3 adopted mutations
+ * (`launchAdoptedSession`, `sendAdoptedInput`). `GET /api/v1/health` must
+ * advertise this exact string before either method checks `ok === true`,
+ * negotiates the request-adoption capability, or sends a POST. This is
+ * intentionally a separate, narrower gate than any general per-route health
+ * check: a daemon can be reachable while still pre-dating (or mismatching)
+ * the named contract these two mutations depend on.
+ */
+const COVEN_DAEMON_API_VERSION_V1 = "coven.daemon.v1" as const;
 
 export type CovenExecutionBindingParent = {
   sessionId: string;
@@ -32,6 +44,18 @@ export type CovenExecutionBinding = {
   expiresAt: string;
   parent: CovenExecutionBindingParent | null;
   delegationDigest: string | null;
+};
+
+export type CovenRequestAdoption = {
+  contract: typeof PSYCHE_REQUEST_ADOPTION_V1;
+  key: string;
+  requestDigest: string;
+};
+
+export type CovenAdoptionResult = {
+  adopted: true;
+  replayed: boolean;
+  delivery: "not_asserted";
 };
 
 export type CovenSessionRecord = {
@@ -61,6 +85,7 @@ export type CovenHealthCapabilities = {
   eventCursor?: unknown;
   structuredErrors?: unknown;
   executionBindingContracts?: unknown;
+  requestAdoptionContracts?: unknown;
 };
 
 export type CovenHealthResponse = {
@@ -123,9 +148,19 @@ export type LaunchCovenSessionInput = {
   executionBinding?: CovenExecutionBinding;
 };
 
+export type LaunchAdoptedCovenSessionInput = LaunchCovenSessionInput & {
+  familiarId: string;
+  executionBinding: CovenExecutionBinding;
+  requestAdoption: CovenRequestAdoption;
+};
+
 export interface CovenClient {
   health(signal?: AbortSignal): Promise<CovenHealthResponse>;
   launchSession(input: LaunchCovenSessionInput, signal?: AbortSignal): Promise<CovenSessionRecord>;
+  launchAdoptedSession(
+    input: LaunchAdoptedCovenSessionInput,
+    signal?: AbortSignal,
+  ): Promise<CovenSessionRecord>;
   getSession(sessionId: string, signal?: AbortSignal): Promise<CovenSessionRecord>;
   listEvents(
     sessionId: string,
@@ -140,6 +175,13 @@ export interface CovenClient {
     executionBinding: CovenExecutionBinding,
     signal?: AbortSignal,
   ): Promise<void>;
+  sendAdoptedInput(
+    sessionId: string,
+    data: string,
+    executionBinding: CovenExecutionBinding,
+    requestAdoption: CovenRequestAdoption,
+    signal?: AbortSignal,
+  ): Promise<CovenAdoptionResult>;
   killBoundSession(
     sessionId: string,
     executionBinding: CovenExecutionBinding,
@@ -168,6 +210,11 @@ type RequestOptions = {
 type HttpResponse = {
   status: number;
   body: string;
+};
+
+type JsonHttpResponse<T> = {
+  status: number;
+  body: T;
 };
 
 type JsonRecord = Record<string, unknown>;
@@ -457,16 +504,23 @@ function requestOverSocket(options: RequestOptions): Promise<HttpResponse> {
   });
 }
 
-async function requestJson<T>(options: RequestOptions): Promise<T> {
+async function requestJsonWithStatus<T>(options: RequestOptions): Promise<JsonHttpResponse<T>> {
   const response = await requestOverSocket(options);
   if (response.status < 200 || response.status >= 300) {
     throw new CovenApiError(response.status, response.body);
   }
   try {
-    return JSON.parse(response.body || "null") as T;
+    return {
+      status: response.status,
+      body: JSON.parse(response.body || "null") as T,
+    };
   } catch (error) {
     throw new CovenApiError(response.status, `Invalid JSON response: ${String(error)}`);
   }
+}
+
+async function requestJson<T>(options: RequestOptions): Promise<T> {
+  return (await requestJsonWithStatus<T>(options)).body;
 }
 
 function requireRecord(value: unknown, label: string): JsonRecord {
@@ -516,6 +570,8 @@ const EXECUTION_BINDING_KEYS = [
 ] as const;
 
 const EXECUTION_BINDING_PARENT_KEYS = ["attemptId", "graphId", "nodeId", "sessionId"] as const;
+const REQUEST_ADOPTION_KEYS = ["contract", "key", "requestDigest"] as const;
+const ADOPTION_RESULT_KEYS = ["adopted", "delivery", "replayed"] as const;
 
 // Opaque, Psyche-defined fields: 1-255 bytes drawn only from
 // [A-Za-z0-9._:/-]. Values are never trimmed or case-folded — a rejected
@@ -560,6 +616,82 @@ function validOpaque(value: string): boolean {
 
 function validDigest(value: string): boolean {
   return DIGEST_REGEX.test(value);
+}
+
+function snapshotRequestAdoption(value: unknown): JsonRecord {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("requestAdoption must be a plain object");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("requestAdoption must be a plain object");
+  }
+
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const ownKeys = Reflect.ownKeys(descriptors);
+  const actualStringKeys = ownKeys.filter((key): key is string => typeof key === "string").sort();
+  const expectedKeys = [...REQUEST_ADOPTION_KEYS].sort();
+  if (
+    ownKeys.length !== expectedKeys.length ||
+    actualStringKeys.length !== expectedKeys.length ||
+    actualStringKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error("requestAdoption has missing or unknown fields");
+  }
+
+  const snapshot: JsonRecord = {};
+  for (const key of REQUEST_ADOPTION_KEYS) {
+    const descriptor = descriptors[key];
+    if (!descriptor?.enumerable || !("value" in descriptor)) {
+      throw new Error("requestAdoption must contain only own enumerable data properties");
+    }
+    snapshot[key] = descriptor.value;
+  }
+  return snapshot;
+}
+
+function normalizeRequestAdoption(value: unknown): CovenRequestAdoption {
+  const snapshot = snapshotRequestAdoption(value);
+  const contract = requireBindingString(snapshot, "contract", "requestAdoption");
+  if (contract !== PSYCHE_REQUEST_ADOPTION_V1) {
+    throw new Error("requestAdoption.contract is unsupported");
+  }
+  const key = requireBindingString(snapshot, "key", "requestAdoption");
+  if (!validOpaque(key)) {
+    throw new Error("requestAdoption.key is invalid");
+  }
+  const requestDigest = requireBindingString(snapshot, "requestDigest", "requestAdoption");
+  if (!validDigest(requestDigest)) {
+    throw new Error("requestAdoption.requestDigest is invalid");
+  }
+  return {
+    contract,
+    key,
+    requestDigest,
+  };
+}
+
+function normalizeAdoptionResult(value: unknown): CovenAdoptionResult {
+  if (!isJsonRecord(value)) {
+    throw new Error("Coven adoption result is invalid");
+  }
+  const ownKeys = Reflect.ownKeys(value);
+  const actual = ownKeys.filter((key): key is string => typeof key === "string").sort();
+  if (
+    ownKeys.length !== ADOPTION_RESULT_KEYS.length ||
+    actual.length !== ADOPTION_RESULT_KEYS.length ||
+    actual.some((key, index) => key !== ADOPTION_RESULT_KEYS[index]) ||
+    value.adopted !== true ||
+    typeof value.replayed !== "boolean" ||
+    value.delivery !== "not_asserted"
+  ) {
+    throw new Error("Coven adoption result is invalid");
+  }
+  return {
+    adopted: true,
+    replayed: value.replayed,
+    delivery: "not_asserted",
+  };
 }
 
 const DAYS_IN_MONTH = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -696,6 +828,11 @@ function normalizeExecutionBinding(value: unknown): CovenExecutionBinding {
 function normalizeHealthResponse(value: unknown): CovenHealthResponse {
   const record = requireRecord(value, "Coven health");
   const capabilities = isJsonRecord(record.capabilities) ? record.capabilities : undefined;
+  const requestAdoptionContracts = capabilities
+    ? Object.hasOwn(capabilities, "requestAdoptionContracts")
+      ? capabilities.requestAdoptionContracts
+      : capabilities.request_adoption_contracts
+    : undefined;
   return {
     apiVersion: record.apiVersion,
     covenVersion: record.covenVersion ?? record.coven_version,
@@ -707,6 +844,7 @@ function normalizeHealthResponse(value: unknown): CovenHealthResponse {
           structuredErrors: capabilities.structuredErrors ?? capabilities.structured_errors,
           executionBindingContracts:
             capabilities.executionBindingContracts ?? capabilities.execution_binding_contracts,
+          requestAdoptionContracts,
         }
       : undefined,
     ok: record.ok,
@@ -761,20 +899,106 @@ function normalizeEventRecords(value: unknown): CovenEventRecord[] {
   return envelope.events.map(normalizeEventRecord);
 }
 
+function requireRequestAdoptionCapability(health: CovenHealthResponse): void {
+  // Gate on the named daemon API contract before health truth or the
+  // request-adoption capability. This must be an exact-string comparison: a
+  // missing/null/non-string value, a case mismatch, a near-match (e.g. a
+  // trailing character or a different vN suffix), or any other unsupported
+  // value all fail here, before the remaining negotiation and before any POST.
+  // The comparison is intentionally static (no coercion, no trim, no
+  // case-fold) so a daemon can never talk its way into adopted-mutation
+  // authorization by advertising a similar-looking version string. The
+  // thrown message is a fixed literal and never includes the received
+  // value, so a malicious/buggy daemon cannot use this error to smuggle
+  // arbitrary data back to a caller that logs it.
+  if (health.apiVersion !== COVEN_DAEMON_API_VERSION_V1) {
+    throw new Error("Coven daemon API version is not supported");
+  }
+  if (health.ok !== true) {
+    throw new Error("Coven daemon health is not OK");
+  }
+  const contracts = health.capabilities?.requestAdoptionContracts;
+  if (
+    !Array.isArray(contracts) ||
+    !contracts.some((contract) => contract === PSYCHE_REQUEST_ADOPTION_V1)
+  ) {
+    throw new Error("Coven daemon does not support request adoption");
+  }
+}
+
+function snapshotAdoptedLaunchInput(
+  input: LaunchAdoptedCovenSessionInput,
+): LaunchAdoptedCovenSessionInput {
+  const projectRoot = input.projectRoot;
+  const cwd = input.cwd;
+  const harness = input.harness;
+  const prompt = input.prompt;
+  const title = input.title;
+  const model = input.model;
+  const launchMode = input.launchMode;
+  const launchPolicySnapshot = input.launchPolicy;
+  const conversationSnapshot = input.conversation;
+  const conversationId = input.conversationId;
+  const familiarId = input.familiarId;
+  if (typeof familiarId !== "string" || !validOpaque(familiarId)) {
+    throw new Error("familiarId is invalid");
+  }
+  const callerFamiliarId = input.callerFamiliarId;
+  const executionBindingSnapshot = input.executionBinding;
+  const requestAdoptionSnapshot = input.requestAdoption;
+
+  let launchPolicy: CovenLaunchPolicy | undefined;
+  if (launchPolicySnapshot !== undefined) {
+    const approval = launchPolicySnapshot.approval;
+    const sandbox = launchPolicySnapshot.sandbox;
+    const addDirsSnapshot = launchPolicySnapshot.addDirs;
+    launchPolicy = {
+      approval,
+      sandbox,
+      addDirs: addDirsSnapshot === undefined ? undefined : [...addDirsSnapshot],
+    };
+  }
+  const conversation =
+    conversationSnapshot === undefined
+      ? undefined
+      : {
+          mode: conversationSnapshot.mode,
+          id: conversationSnapshot.id,
+        };
+
+  return {
+    projectRoot,
+    cwd,
+    harness,
+    prompt,
+    title,
+    model,
+    launchMode,
+    launchPolicy,
+    conversation,
+    conversationId,
+    familiarId,
+    callerFamiliarId,
+    executionBinding: normalizeExecutionBinding(executionBindingSnapshot),
+    requestAdoption: normalizeRequestAdoption(requestAdoptionSnapshot),
+  };
+}
+
 export function createCovenClient(
   socketPath: string,
   clientOptions: { socketRoot?: string } = {},
 ): CovenClient {
+  const health = (signal?: AbortSignal) =>
+    requestJson<unknown>({
+      socketPath,
+      socketRoot: clientOptions.socketRoot,
+      method: "GET",
+      path: `${COVEN_API_BASE_PATH}/health`,
+      signal,
+    }).then(normalizeHealthResponse);
+
   return {
-    health(signal) {
-      return requestJson<unknown>({
-        socketPath,
-        socketRoot: clientOptions.socketRoot,
-        method: "GET",
-        path: `${COVEN_API_BASE_PATH}/health`,
-        signal,
-      }).then(normalizeHealthResponse);
-    },
+    health,
     async launchSession(input, signal) {
       // Snapshot `executionBinding` exactly once: it may be a getter, and
       // re-reading it later (e.g. implicitly during JSON.stringify) could
@@ -820,6 +1044,23 @@ export function createCovenClient(
         body,
         signal,
       }).then(normalizeSessionRecord);
+    },
+    async launchAdoptedSession(input, signal) {
+      const body = snapshotAdoptedLaunchInput(input);
+      const daemonHealth = await health(signal);
+      requireRequestAdoptionCapability(daemonHealth);
+      const response = await requestJsonWithStatus<unknown>({
+        socketPath,
+        socketRoot: clientOptions.socketRoot,
+        method: "POST",
+        path: `${COVEN_API_BASE_PATH}/adopted-sessions`,
+        body,
+        signal,
+      });
+      if (response.status !== 201 && response.status !== 200) {
+        throw new Error("Coven adopted launch response status is invalid");
+      }
+      return normalizeSessionRecord(response.body);
     },
     getSession(sessionId, signal) {
       return requestJson<unknown>({
@@ -884,6 +1125,32 @@ export function createCovenClient(
         signal,
       });
     },
+    async sendAdoptedInput(sessionId, data, executionBinding, requestAdoption, signal) {
+      const path = `${COVEN_API_BASE_PATH}/sessions/${encodeURIComponent(sessionId)}/adopted-input`;
+      const body = {
+        data,
+        executionBinding: normalizeExecutionBinding(executionBinding),
+        requestAdoption: normalizeRequestAdoption(requestAdoption),
+      };
+      const daemonHealth = await health(signal);
+      requireRequestAdoptionCapability(daemonHealth);
+      const response = await requestJsonWithStatus<unknown>({
+        socketPath,
+        socketRoot: clientOptions.socketRoot,
+        method: "POST",
+        path,
+        body,
+        signal,
+      });
+      if (response.status !== 202 && response.status !== 200) {
+        throw new Error("Coven adoption result is invalid");
+      }
+      const result = normalizeAdoptionResult(response.body);
+      if (result.replayed !== (response.status === 200)) {
+        throw new Error("Coven adoption result is invalid");
+      }
+      return result;
+    },
     async killBoundSession(sessionId, executionBinding, signal) {
       const binding = normalizeExecutionBinding(executionBinding);
       await requestJson<unknown>({
@@ -904,4 +1171,6 @@ export const __testing = {
   normalizeHealthResponse,
   normalizeSessionRecord,
   normalizeExecutionBinding,
+  normalizeRequestAdoption,
+  normalizeAdoptionResult,
 };

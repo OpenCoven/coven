@@ -39,7 +39,13 @@ coven sacrifice <session-id> --yes
 
 In a terminal, `coven sessions` opens the human session browser so you can select work and choose **Rejoin**, **View Log**, **Summon**, **Archive**, or **Sacrifice** without copying IDs. Use `coven sessions --plain` for scripts or table output.
 
-Session rituals use Coven language while staying safe: archive hides old work without deleting it, summon restores archived work, and sacrifice permanently deletes only after explicit `--yes` confirmation.
+Session rituals use Coven language while staying safe: archive hides old work
+without deleting it, summon restores archived work, and sacrifice permanently
+deletes only an eligible non-running session without retained launch/input
+adoption or historical reservation evidence, after explicit `--yes`
+confirmation. An adopted/reserved denial is permanent in O3; only a future
+approved retention/fence contract could define a release. See the canonical
+[sacrifice reference](../../docs/reference/cli-sacrifice.md).
 
 ## Status
 

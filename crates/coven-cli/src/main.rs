@@ -31,6 +31,11 @@ mod engine_install;
 mod eval_loop;
 mod event_writer;
 mod execution_binding;
+#[rustfmt::skip]
+#[allow(dead_code)]
+mod request_adoption;
+#[allow(dead_code)]
+mod adoption_gate;
 mod executor_node;
 mod familiar_identity;
 mod handoff;
@@ -477,13 +482,15 @@ enum Command {
         #[arg(help = "Session id, or a unique prefix of one (list ids with `coven sessions`)")]
         session_id: String,
     },
-    #[command(about = "Permanently delete a non-running session and its events")]
+    #[command(
+        about = "Permanently delete an eligible non-running session and its events; adopted or reserved sessions are retained"
+    )]
     Sacrifice {
         #[arg(
             help = "Session id, or a unique prefix of one (list ids with `coven sessions --all`)"
         )]
         session_id: String,
-        #[arg(long, help = "Confirm permanent deletion")]
+        #[arg(long, help = "Confirm permanent deletion of an eligible session")]
         yes: bool,
     },
     #[command(about = "Kill a running session's process (its event log is kept)")]
@@ -3147,13 +3154,12 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         },
     )?;
 
-    store::update_session_status(
-        &conn,
-        &record.id,
-        RUNNING_SESSION_STATUS,
-        None,
-        &current_timestamp(),
-    )?;
+    // Build the harness command before activation: it has no side effects, so
+    // constructing it can't race with sacrifice deleting the row out from
+    // under us. The harness itself is only spawned once the shared CAS helper
+    // confirms this row is still `created` and flips it to `running`; if the
+    // row was sacrificed or is otherwise non-`created`, the helper bails
+    // before `run_harness_attached` ever runs.
     let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
     let command = pty_runner::build_harness_command(
         &selected_harness.id,
@@ -3161,7 +3167,9 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &request.repo.root,
         launch_mode,
     )?;
-    let result = run_harness_attached(&command, launch_mode, false)?;
+    let result = activate_direct_launch_with_runner(&conn, &record.id, || {
+        run_harness_attached(&command, launch_mode, false)
+    })?;
     store::update_session_status(
         &conn,
         &record.id,
@@ -3856,6 +3864,42 @@ fn continuation_sibling_record(
     })
 }
 
+/// Shared CAS gate for every local launch path (direct `coven run`/`coven
+/// launch` and patch-repair sessions): flips a `created` row to `running`
+/// and only then invokes `runner` to spawn the harness. If sacrifice (or
+/// anything else) has already moved or deleted the row, activation fails and
+/// `runner` is never called, so an untracked harness can't outlive its row.
+fn activate_direct_launch_with_runner<T>(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    runner: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let activated = store::update_session_status_if_current(
+        conn,
+        session_id,
+        DEFAULT_SESSION_STATUS,
+        RUNNING_SESSION_STATUS,
+        None,
+        &current_timestamp(),
+    )?;
+    if !activated {
+        match store::get_session(conn, session_id)? {
+            Some(session) => bail!(
+                "launch session `{session_id}` could not be activated from \
+                 `{DEFAULT_SESSION_STATUS}` to `{RUNNING_SESSION_STATUS}` because its status is \
+                 `{}`; harness was not started",
+                session.status
+            ),
+            None => bail!(
+                "launch session `{session_id}` could not be activated from \
+                 `{DEFAULT_SESSION_STATUS}` to `{RUNNING_SESSION_STATUS}` because its row no \
+                 longer exists; harness was not started"
+            ),
+        }
+    }
+    runner()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     harness_id: &str,
@@ -4154,13 +4198,7 @@ fn run_session(
         return Ok(());
     }
 
-    store::update_session_status(
-        &conn,
-        &record.id,
-        RUNNING_SESSION_STATUS,
-        None,
-        &current_timestamp(),
-    )?;
+    activate_direct_launch_with_runner(&conn, &record.id, || Ok(()))?;
 
     // Native stream-json harnesses pipe their JSONL events through ours between
     // the init/result frames we already emit. Codex's declared non-stream
@@ -4692,6 +4730,7 @@ fn sacrifice_session_command(session_id: &str, yes: bool) -> Result<()> {
             "session `{session_id}` is still running; do not sacrifice live work — kill it first with `coven kill {session_id}` ({STALE_RUNNING_HINT})"
         );
     }
+    store::ensure_session_sacrificable(&conn, session_id)?;
     confirm_sacrifice(session_id, yes)?;
 
     store::sacrifice_session(&conn, session_id)?;
@@ -4704,7 +4743,7 @@ fn confirm_sacrifice(session_id: &str, yes: bool) -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "sacrifice permanently deletes session `{session_id}` and its events; rerun with --yes to confirm"
+            "sacrifice permanently deletes eligible non-running session `{session_id}` and its events; adopted or reserved sessions are retained; rerun with --yes to confirm"
         )
     }
 }
@@ -5689,6 +5728,152 @@ mod tests {
     }
 
     #[test]
+    fn direct_launch_update_session_status_if_current_rejects_deleted_row_without_runner(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = store::open_store(&temp.path().join("store.sqlite3"))?;
+        let session = test_session_record(
+            "deleted-before-activation",
+            DEFAULT_SESSION_STATUS,
+            "codex",
+            "Direct launch",
+            None,
+        );
+        store::insert_session(&conn, &session)?;
+        store::sacrifice_session(&conn, &session.id)?;
+        let runner_invoked = std::cell::Cell::new(false);
+
+        let error = activate_direct_launch_with_runner(&conn, &session.id, || {
+            runner_invoked.set(true);
+            Ok(())
+        })
+        .expect_err("a deleted launch row must fail activation");
+
+        assert!(
+            error.to_string().contains("harness was not started"),
+            "{error:#}"
+        );
+        assert!(!runner_invoked.get());
+        assert!(store::get_session(&conn, &session.id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_launch_update_session_status_if_current_rejects_terminal_row_without_runner(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = store::open_store(&temp.path().join("store.sqlite3"))?;
+        let session = test_session_record(
+            "terminal-before-activation",
+            DEFAULT_SESSION_STATUS,
+            "codex",
+            "Direct launch",
+            None,
+        );
+        store::insert_session(&conn, &session)?;
+        store::update_session_status(
+            &conn,
+            &session.id,
+            FAILED_SESSION_STATUS,
+            Some(17),
+            "2026-08-16T08:00:00Z",
+        )?;
+        let runner_invoked = std::cell::Cell::new(false);
+
+        let error = activate_direct_launch_with_runner(&conn, &session.id, || {
+            runner_invoked.set(true);
+            Ok(())
+        })
+        .expect_err("a terminal launch row must fail activation");
+
+        assert!(
+            error.to_string().contains("harness was not started"),
+            "{error:#}"
+        );
+        assert!(!runner_invoked.get());
+        let retained = store::get_session(&conn, &session.id)?.expect("terminal row retained");
+        assert_eq!(retained.status, FAILED_SESSION_STATUS);
+        assert_eq!(retained.exit_code, Some(17));
+        Ok(())
+    }
+
+    /// `launch_patch_session` now activates through the exact same
+    /// `activate_direct_launch_with_runner(&conn, &record.id, || ...)` call
+    /// shape as direct launches, instead of a zero-row-blind
+    /// `store::update_session_status(...running...)`. These two tests pin
+    /// that shape for a patch-launch-style row (harness `codex`, title
+    /// `Patch <repo>`, freshly inserted at `DEFAULT_SESSION_STATUS`) so a
+    /// future regression back to the blind update is caught even without
+    /// spawning a real harness.
+    #[test]
+    fn launch_patch_session_activation_rejects_sacrificed_row_without_runner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = store::open_store(&temp.path().join("store.sqlite3"))?;
+        let session = test_session_record(
+            "patch-sacrificed-before-activation",
+            DEFAULT_SESSION_STATUS,
+            "codex",
+            "Patch openclaw",
+            None,
+        );
+        store::insert_session(&conn, &session)?;
+        // Simulate sacrifice racing the patch launch after the row is
+        // created but before the harness would have been spawned.
+        store::sacrifice_session(&conn, &session.id)?;
+        let runner_invoked = std::cell::Cell::new(false);
+
+        let error = activate_direct_launch_with_runner(&conn, &session.id, || {
+            runner_invoked.set(true);
+            Ok(())
+        })
+        .expect_err("a sacrificed patch launch row must fail activation");
+
+        assert!(
+            error.to_string().contains("harness was not started"),
+            "{error:#}"
+        );
+        assert!(
+            !runner_invoked.get(),
+            "run_harness_attached must not run for an untracked patch session"
+        );
+        assert!(store::get_session(&conn, &session.id)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn launch_patch_session_activation_flips_status_before_invoking_runner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = store::open_store(&temp.path().join("store.sqlite3"))?;
+        let session = test_session_record(
+            "patch-created-then-activated",
+            DEFAULT_SESSION_STATUS,
+            "codex",
+            "Patch openclaw",
+            None,
+        );
+        store::insert_session(&conn, &session)?;
+
+        let observed_status_when_runner_ran = activate_direct_launch_with_runner(
+            &conn,
+            &session.id,
+            || -> Result<Option<String>> {
+                // The CAS flip to `running` must be durable before the
+                // harness runner is ever invoked.
+                Ok(store::get_session(&conn, &session.id)?.map(|s| s.status))
+            },
+        )?;
+
+        assert_eq!(
+            observed_status_when_runner_ran.as_deref(),
+            Some(RUNNING_SESSION_STATUS),
+            "runner observed status before activation committed"
+        );
+        let after = store::get_session(&conn, &session.id)?.expect("row retained");
+        assert_eq!(after.status, RUNNING_SESSION_STATUS);
+        Ok(())
+    }
+
+    #[test]
     fn joined_prompt_rejects_empty_prompt() {
         let error = joined_prompt(&[" ".to_string(), "\t".to_string()]).unwrap_err();
 
@@ -6644,8 +6829,31 @@ mod tests {
 
     #[test]
     fn sacrifice_requires_explicit_yes() {
-        assert!(confirm_sacrifice("session-1", false).is_err());
+        let err = confirm_sacrifice("session-1", false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sacrifice permanently deletes eligible non-running session `session-1` and its events; adopted or reserved sessions are retained; rerun with --yes to confirm"
+        );
         assert!(confirm_sacrifice("session-1", true).is_ok());
+    }
+
+    #[test]
+    fn sacrifice_help_qualifies_adoption_retention() {
+        use clap::CommandFactory;
+
+        let mut command = Cli::command();
+        let sacrifice = command
+            .find_subcommand_mut("sacrifice")
+            .expect("sacrifice subcommand exists");
+        let about = sacrifice
+            .get_about()
+            .expect("sacrifice subcommand has about text")
+            .to_string();
+
+        assert_eq!(
+            about,
+            "Permanently delete an eligible non-running session and its events; adopted or reserved sessions are retained"
+        );
     }
 
     #[test]

@@ -23,6 +23,38 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CovenApiError, createCovenClient } from "./client.js";
 
+const REQUEST_ADOPTION_CONTRACT = "psyche.request_adoption.v1" as const;
+const EXECUTION_BINDING_CONTRACT = "psyche.execution_binding.v1" as const;
+const DIGEST_A = `sha256:${"a".repeat(64)}`;
+const DIGEST_B = `sha256:${"b".repeat(64)}`;
+const DIGEST_C = `sha256:${"c".repeat(64)}`;
+
+function validBinding() {
+  return {
+    contract: EXECUTION_BINDING_CONTRACT,
+    principalRef: "principal:operator",
+    familiarId: "sage",
+    familiarSnapshotDigest: DIGEST_A,
+    projectDigest: DIGEST_B,
+    graphId: "graph-1",
+    nodeId: "node-1",
+    attemptId: "attempt-1",
+    requestDigest: DIGEST_C,
+    policyRevision: "policy:7",
+    expiresAt: "2099-01-01T00:00:00Z",
+    parent: null,
+    delegationDigest: null,
+  };
+}
+
+function validAdoption() {
+  return {
+    contract: REQUEST_ADOPTION_CONTRACT,
+    key: "psyche:graph-1/node-1/attempt-1/request-1",
+    requestDigest: DIGEST_C,
+  };
+}
+
 const FIXTURES_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "fixtures",
@@ -85,6 +117,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
             eventCursor: "sequence",
             structuredErrors: true,
             executionBindingContracts: ["psyche.execution_binding.v1"],
+            requestAdoptionContracts: [REQUEST_ADOPTION_CONTRACT],
           });
           expect(health.daemon).toMatchObject({
             pid: expect.any(Number),
@@ -109,6 +142,7 @@ describe("Coven daemon API compatibility — v2026.4", () => {
           expect(health.daemon).toBeNull();
           expect(health.capabilities).toMatchObject({
             executionBindingContracts: ["psyche.execution_binding.v1"],
+            requestAdoptionContracts: [REQUEST_ADOPTION_CONTRACT],
           });
         },
       );
@@ -390,6 +424,99 @@ describe("Coven daemon API compatibility — v2026.4", () => {
   // ---------------------------------------------------------------------------
 
   describe("incompatible daemon state", () => {
+    it("cannot downgrade an adopted launch when the daemon is replaced after health", async () => {
+      const binding = validBinding();
+      const adoption = validAdoption();
+      let routeTable: "o3" | "pre-o3" = "o3";
+      let legacyMutationCount = 0;
+      let adoptedRequest:
+        | { method: string | undefined; path: string | undefined; body: unknown }
+        | undefined;
+
+      await withServer(
+        (req, res) => {
+          if (routeTable === "o3") {
+            expect(req.method).toBe("GET");
+            expect(req.url).toBe("/api/v1/health");
+            routeTable = "pre-o3";
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                ok: true,
+                apiVersion: "coven.daemon.v1",
+                capabilities: {
+                  sessions: true,
+                  events: true,
+                  requestAdoptionContracts: [REQUEST_ADOPTION_CONTRACT],
+                },
+                daemon: null,
+              }),
+            );
+            return;
+          }
+
+          if (
+            req.method === "POST" &&
+            (req.url === "/api/v1/sessions" || req.url?.endsWith("/input"))
+          ) {
+            legacyMutationCount += 1;
+          }
+          let body = "";
+          req.on("data", (chunk: string) => {
+            body += chunk;
+          });
+          req.on("end", () => {
+            adoptedRequest = {
+              method: req.method,
+              path: req.url,
+              body: body ? JSON.parse(body) : undefined,
+            };
+            res.statusCode = 404;
+            res.setHeader("Content-Type", "application/json");
+            res.end(
+              JSON.stringify({
+                error: {
+                  code: "invalid_request",
+                  message: "unknown route",
+                },
+              }),
+            );
+          });
+        },
+        async (socketPath) => {
+          await expect(
+            createCovenClient(socketPath).launchAdoptedSession({
+              projectRoot: "/repo",
+              cwd: "/repo",
+              harness: "codex",
+              prompt: "Fix tests",
+              title: "Fix tests",
+              familiarId: "sage",
+              executionBinding: binding,
+              requestAdoption: adoption,
+            }),
+          ).rejects.toMatchObject({ status: 404 });
+        },
+      );
+
+      expect(routeTable).toBe("pre-o3");
+      expect(legacyMutationCount).toBe(0);
+      expect(adoptedRequest).toEqual({
+        method: "POST",
+        path: "/api/v1/adopted-sessions",
+        body: {
+          projectRoot: "/repo",
+          cwd: "/repo",
+          harness: "codex",
+          prompt: "Fix tests",
+          title: "Fix tests",
+          familiarId: "sage",
+          executionBinding: binding,
+          requestAdoption: adoption,
+        },
+      });
+    });
+
     it("throws a CovenApiError when the daemon returns a non-2xx status on session launch", async () => {
       await withServer(
         (_req, res) => {

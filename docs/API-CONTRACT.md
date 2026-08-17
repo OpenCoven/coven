@@ -63,7 +63,8 @@ proof of `coven.daemon.v1` support.
     "afsMount": false,
     "afsCommit": true,
     "afsCommitDryRun": true,
-    "executionBindingContracts": ["psyche.execution_binding.v1"]
+    "executionBindingContracts": ["psyche.execution_binding.v1"],
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
   },
   "daemon": {
     "pid": 12345,
@@ -124,7 +125,8 @@ durability.
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
 | `afsCommit` | boolean | AFS deltas can be materialized into a Git branch. |
 | `afsCommitDryRun` | boolean | AFS commit accepts the side-effect-free `dryRun` contract. |
-| `executionBindingContracts` | string array | Psyche execution-binding contract names this daemon accepts. Currently `["psyche.execution_binding.v1"]`. A client that requires binding must confirm `"psyche.execution_binding.v1"` is present before sending a bound launch; an unknown or missing required value fails before any dependent request, per the existing fail-closed negotiation rule. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
+| `executionBindingContracts` | string array | Psyche execution-binding contract names this daemon accepts. Currently `["psyche.execution_binding.v1"]`. This remains the additive O2 capability field, including for O2-only bound kill integrations. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
+| `requestAdoptionContracts` | string array | Psyche request-adoption contract names accepted by the dedicated adopted launch/input routes. Currently `["psyche.request_adoption.v1"]`. This O3 value advertises the composite adopted-route contract, including its mandatory per-request exact O2 proof. The bundled adopted client checks this exact value before POST and does not independently gate those methods on `executionBindingContracts`; absence, malformed data, or an unsupported value fails locally without legacy fallback. See [Psyche request-adoption contract (`v1`)](#psyche-request-adoption-contract-v1). |
 
 ## Structured error envelope
 
@@ -179,11 +181,11 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `session_not_live`     | 409         | Session exists but is not running.               |
 | `project_root_violation`| 400        | Reserved. Cwd-outside-root currently emits `invalid_request` with the violation message in the body; promoting to its own code would let clients branch without parsing prose. |
 | `pty_spawn_failed`     | 500         | Reserved. PTY spawn failures currently emit `launch_failed`; promoting to its own code would let clients distinguish "the PTY couldn't open" (likely a host issue) from "the harness CLI errored at startup" (likely an auth/config issue). |
-| `launch_failed`        | 500         | Daemon accepted the launch payload but the runtime (PTY/pipe spawn, initial-message write, harness CLI startup) failed. `details.sessionId` is the row that was inserted and marked `failed`. |
+| `launch_failed`        | 500         | Daemon accepted the launch payload but runtime establishment or immediate launch-status persistence failed. A legacy unbound launch includes `details.sessionId` for its inserted row. A synchronous adopted postcommit failure instead has marker-only details `{"adopted":true,"delivery":"not_asserted"}`; its conditional `created -> failed` transition may lose to an authoritative `idle` or terminal status, or itself fail to persist. |
 | `maintenance_locked`   | 423         | A valid repository maintenance owner is draining or holds the common-directory gate. `details.owner` carries its fenced generation and deadline. |
 | `maintenance_state_invalid` | 423  | The repository maintenance protocol contains malformed or ambiguous state. Coven fails closed rather than launching a writer. |
 | `maintenance_gate_unavailable` | 423 | Coven could not establish a repository maintenance writer intent. |
-| `send_input_failed`    | 500         | Daemon accepted the input payload but the runtime write failed (closed pipe, killed process, IO error). `details.sessionId` is the affected session. |
+| `send_input_failed`    | 500         | Daemon accepted the input payload but the runtime write failed (closed pipe, killed process, IO error). Legacy input includes `details.sessionId`; a synchronous adopted postcommit failure instead has marker-only details `{"adopted":true,"delivery":"not_asserted"}`. |
 | `kill_failed`          | 500         | Daemon accepted the kill request but the runtime signal/kill call failed (permission, missing process, IO error). `details.sessionId` is the affected session. |
 | `runtime_unavailable`  | 503         | The session runtime is unavailable.              |
 | `internal_error`       | 500         | Unexpected internal error.                       |
@@ -206,11 +208,19 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `session_id_conflict`  | 409         | `POST /sessions/external`: a daemon-managed (non-external) session with the supplied id already exists. |
 | `not_external_session` | 422         | `POST /sessions/:id/complete`: the session exists but is not an external session. Use `POST /sessions/:id/kill` for daemon-managed sessions. |
 | `external_session_not_killable` | 422 | `POST /sessions/:id/kill`: the session is external and not managed by the daemon; use `POST /sessions/:id/complete` instead. |
-| `execution_binding_invalid` | 400   | `executionBinding` (or its nested `parent`) is malformed, missing a required member, or carries an unknown/extra member; a launch cross-field rule (root/child) or the canonical-familiar-presence rule (bound launch omits top-level `familiarId`) fails; or an external-session registration request supplies `executionBinding` at all. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
-| `execution_binding_unsupported` | 400 | `executionBinding.contract` is present but is not `psyche.execution_binding.v1`. |
-| `execution_binding_required` | 400 | A bound session's `POST /sessions/:id/input` or `POST /sessions/:id/kill` omits `executionBinding` or supplies an incomplete proof. |
-| `execution_binding_expired` | 409  | Launch, or bound input, references an `executionBinding.expiresAt` that has already elapsed. Bound kill is explicitly exempt from this check. |
-| `execution_binding_mismatch` | 409 | A bound request's `executionBinding` proof, once parsed, byte-differs from the session's stored binding on at least one field, including parent correlation. This also covers a bound launch whose `executionBinding.familiarId` does not exact-match the canonical `FamiliarContext.id` resolved from top-level `familiarId`. `details.fields` names only the first mismatched field path, never a value. |
+| `execution_binding_invalid` | 400   | A launch-time `executionBinding` (or its nested `parent`) is malformed, missing a required member, or carries an unknown/extra member; a bound-mutation proof is malformed or carries an unknown/extra member; a launch cross-field rule (root/child) or canonical-familiar-presence rule fails; or an external-session registration supplies `executionBinding` at all. Missing/incomplete proof members on adopted input, legacy bound input, and bound kill instead use `execution_binding_required`. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1). |
+| `execution_binding_unsupported` | 400 | A complete binding has a string `executionBinding.contract` value other than `psyche.execution_binding.v1`. A malformed member type is `execution_binding_invalid` at the parser container instead. |
+| `execution_binding_required` | 400 | Adopted input, legacy bound input, or bound kill omits `executionBinding` or supplies an incomplete proof. An absent proof or missing root member names `executionBinding`; a missing member inside non-null `parent` names the parser's `executionBinding.parent` container path. |
+| `execution_binding_expired` | 409  | A genuinely new adopted launch/input, whose adoption is absent after replay/conflict prechecks, references an elapsed `executionBinding.expiresAt`. Exact adopted launch/input replay and bound kill are explicitly exempt. |
+| `execution_binding_mismatch` | 409 | A complete, syntactically valid bound request proof byte-differs from the stored binding on at least one field, including parent correlation. Malformed shape, contract, or digest is invalid/unsupported rather than a mismatch. This also covers a bound launch whose `executionBinding.familiarId` does not exact-match the canonical `FamiliarContext.id` resolved from top-level `familiarId`. `details.fields` names only the first mismatched field path, never a value. |
+| `request_adoption_required` | 400 | An adopted route omitted `requestAdoption`, or a legacy bound launch/input omitted it after O2 validation. Supplying `requestAdoption` where the legacy route forbids it is instead `request_adoption_invalid` at `requestAdoption`. |
+| `request_adoption_invalid` | 400 | `requestAdoption` has the wrong shape or syntax, is used at an invalid location (including a legacy bound route that supplies it), lacks a binding, or its launch digest differs from the binding digest. |
+| `request_adoption_unsupported` | 400 | `requestAdoption.contract` is not `psyche.request_adoption.v1`. |
+| `request_adoption_conflict` | 409 | A global request key or five-field launch attempt scope is already retained for a non-identical identity. |
+| `event_preflight_failed` | 500 | A new adopted input could not check event-writer capacity before adoption. Details are omitted. |
+| `input_lease_release_failed` | 500 | The adopted-input lease could not be released after adoption. Details are the marker-only adopted postcommit shape. |
+| `input_coordination_failed` | 500 | Runtime input coordination failed after adoption. Details are the marker-only adopted postcommit shape. |
+| `event_persistence_failed` | 500 | The adopted input event could not be persisted after adoption. Details are the marker-only adopted postcommit shape. |
 
 ## Capability catalog shape (`v1`)
 
@@ -495,12 +505,15 @@ exact requested write set, and Rust validation remain the authority boundary.
 }
 ```
 
-A launch may additionally carry a top-level `executionBinding` object (and, for
-a delegated launch, `callerFamiliarId`) to bind the session to an opaque
-Psyche-owned `psyche.execution_binding.v1` identity. This is entirely optional
-and additive: a launch that omits `executionBinding` behaves exactly as it
-does today. See [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
-for the full request/response shape, validation, and error rules.
+An unbound launch that omits `executionBinding` behaves as before. A bound
+launch is no longer accepted on this legacy route: it must use
+`POST /api/v1/adopted-sessions` with both `executionBinding` and
+`requestAdoption`. After binding shape/relationship validation, omitting
+`requestAdoption` here returns `request_adoption_required`; supplying it at
+this forbidden legacy location returns `request_adoption_invalid` at
+`requestAdoption`. See
+[Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
+and [Psyche request-adoption contract (`v1`)](#psyche-request-adoption-contract-v1).
 
 ## Session record shape (`v1`)
 
@@ -510,6 +523,7 @@ Endpoints that return this shape:
 
 - `GET /api/v1/sessions` → `SessionRecord[]`
 - `POST /api/v1/sessions` → `SessionRecord`
+- `POST /api/v1/adopted-sessions` → `SessionRecord`
 - `GET /api/v1/sessions/:id` → `SessionRecord`
 - `POST /api/v1/sessions/external` → `SessionRecord`
 - `POST /api/v1/sessions/:id/complete` → `SessionRecord`
@@ -548,11 +562,11 @@ Classify the row kind before interpreting `status`. Synthetic `active` rows can 
 
 | Harness-session status | Terminal? | Meaning |
 |---|---|---|
-| `created` | No | Ledger row exists before runtime ownership. Stale unowned `created` rows recover to `failed`. |
+| `created` | No | Ledger row exists before runtime ownership. On an adopted launch, an authoritative runtime exit may move it directly to `idle` or a terminal status before activation; the later `created -> running` compare-and-set then returns false and does not overwrite that winner. A definitive runtime-establishment failure conditionally moves only a still-`created` row to `failed`; failure to persist that transition leaves retained ambiguity. Stale unowned rows without launch-adoption or historical reservation evidence recover to `failed`. |
 | `running` | No | Reported live state. Inspect `external` to determine whether Coven owns and supervises the runtime. |
-| `idle` | No | Reusable conversational session is waiting for more work. |
+| `idle` | No | Reusable daemon/socket conversational session is waiting for more work after a successful exit. For an adopted row, the exit writer may persist `idle` from either `created` or `running`; `idle` is authoritative but nonterminal. |
 | `completed` | Yes | Harness session completed successfully. |
-| `failed` | Yes | Launch or execution failed. |
+| `failed` | Yes | Launch or execution failed, including a successfully persisted adopted `created -> failed` runtime-establishment transition. |
 | `killed` | Yes | Terminal in the current ledger. This status is not proof that process termination was acknowledged. |
 | `orphaned` | Yes | Runtime ownership was lost and the outcome remains unresolved. |
 
@@ -592,7 +606,8 @@ Registers a session that is already running outside the daemon (for example, the
 | `200`  | An external session with this id was already registered (idempotent re-register). Body: the existing `SessionRecord`. |
 | `409`  | `session_id_conflict` — a daemon-managed (non-external) session with this id already exists. The daemon refuses to alias it. |
 | `400`  | `invalid_request` — malformed JSON or a required field is missing or blank.                        |
-| `400`  | `execution_binding_invalid` — the request supplies `executionBinding` at all. Coven does not supervise an externally registered runtime and cannot honor bound-operation guarantees for it; this is checked before any other field is read. `details.fields` is `["executionBinding"]`. |
+| `400`  | `request_adoption_invalid` — the request supplies `requestAdoption` at all. External registration is not an adoption location. This check runs immediately after JSON parsing and wins when both reserved fields are supplied. `details.fields` is `["requestAdoption"]`. |
+| `400`  | `execution_binding_invalid` — after the request-adoption check, the request supplies `executionBinding` at all. Coven does not supervise an externally registered runtime and cannot honor bound-operation guarantees for it. This check still precedes every registration field. `details.fields` is `["executionBinding"]`. |
 
 On success the response body is the full `SessionRecord` as described in [Session record shape (`v1`)](#session-record-shape-v1), with `external: true` and `status: "running"`.
 
@@ -626,15 +641,22 @@ Marks an externally-registered session finished. The daemon updates the session 
 
 ## Psyche execution binding contract (`v1`)
 
-Coven binds a session at launch to an immutable, opaque `psyche.execution_binding.v1`
-tuple that Psyche defines and Coven never interprets beyond syntax, contract
-identity, and expiry. Coven persists the tuple unchanged and exact-compares
-it, byte for byte, on every subsequent bound mutating request (input, kill)
-that must prove it. This is a mismatch-correlation guarantee only — it
-detects a proof drawn from, or matching, a different attempt's tuple. It is
-**not** authentication, and it is **not** a uniqueness or replay guarantee:
-two sessions may be launched with byte-identical `executionBinding` objects
-and both succeed. See [Non-goals](#non-goals) below and the normative design,
+Coven binds a session at launch to an immutable, opaque
+`psyche.execution_binding.v1` tuple that Psyche defines. On every route that
+treats the value as an O2 binding/proof, Coven validates the closed shape,
+syntax, and contract identity. It validates expiry only for a genuinely new
+adopted launch/input after exact replay and retained-conflict prechecks; exact
+adopted replay and kill do not reject an elapsed tuple. (A reserved
+`executionBinding` member on legacy unbound input is stripped without O2
+validation, as documented below.) Coven persists an accepted launch tuple
+unchanged and exact-compares it, byte for byte, on every subsequent bound
+mutating request (input, kill) that must prove it. This is a
+mismatch-correlation guarantee only — it detects a proof drawn from, or
+matching, a different attempt's tuple. O2 by itself is **not** authentication
+and did not provide uniqueness or replay protection. The additive O3
+request-adoption contract now supplies those guarantees for bound launch and
+input without changing O2's byte-exact proof semantics. See
+[Non-goals](#non-goals) below and the normative O2 design,
 `specs/psyche/O2_CONTRACT_DESIGN.md`.
 
 ### Contract identity and field naming
@@ -713,9 +735,11 @@ typed field values under `execution_binding`: `null` for an unbound session
 
 ### Field semantics
 
-Every field is opaque to Coven except syntax, contract identity, and expiry,
-which Coven validates. Coven never interprets principal, familiar, graph,
-node, attempt, policy, or delegation meaning.
+Every field is opaque to Coven. It validates syntax and contract identity on
+every proof-bearing path; it validates non-expiry only for a genuinely new,
+absent adoption on the dedicated launch/input routes, after replay/conflict
+resolution. Coven never interprets principal, familiar, graph, node, attempt,
+policy, or delegation meaning.
 
 | Field | Nullable | Coven's obligation |
 |---|---:|---|
@@ -727,10 +751,10 @@ node, attempt, policy, or delegation meaning.
 | `graphId` | No | Opaque ID syntax; store and exact-compare. |
 | `nodeId` | No | Opaque ID syntax; store and exact-compare. |
 | `attemptId` | No | Opaque ID syntax; store and exact-compare. |
-| `requestDigest` | No | Digest syntax; store and exact-compare on bound input/kill. No uniqueness or conflict detection over this field. |
+| `requestDigest` | No | Digest syntax; store and exact-compare on bound input/kill. O2 itself defines no uniqueness or conflict detection over this field. |
 | `policyRevision` | No | Opaque revision syntax; store and exact-compare. Coven never evaluates policy. |
-| `expiresAt` | No | Canonical UTC RFC 3339 whole-second timestamp; Coven checks syntax and, at launch and for bound input, that it has not already elapsed. |
-| `parent` | Yes | `null` for a root binding; a complete 4-field object for a child binding. Coven checks existence and exact-match against the referenced parent session's stored fields; it never infers graph topology. |
+| `expiresAt` | No | Canonical UTC RFC 3339 whole-second timestamp. Coven always checks syntax. Only a genuinely new adopted launch/input whose adoption remains absent after replay/conflict prechecks must also be unexpired; exact adopted replay and kill are exempt. |
+| `parent` | Yes | `null` for a root binding; a complete 4-field object for a child binding. Coven checks referenced-session existence, a stored non-null binding, and exact familiar/graph/node/attempt correlation. It does not check parent status or liveness and never infers graph topology. |
 | `delegationDigest` | Yes | `null` for a root binding; a digest for a child binding. Store and exact-compare. Coven never authorizes delegation. |
 
 ### Exact-object membership and no normalization
@@ -821,26 +845,35 @@ members — there is no open/extensible schema at either level:
 
 ### Field path conventions in error `details`
 
-`details.fields` always names exactly one static field path, never a value
-or digest. Two distinct conventions apply, matching the actual daemon
-behavior:
+`details.fields` always names exactly one static field path, never a value or
+digest. The parser and exact comparator deliberately use different path
+classes:
 
-- **Shape/contract/cross-field violations** (`execution_binding_invalid`,
-  `execution_binding_unsupported`, `execution_binding_required`) name the
-  fully-qualified path from the request root, e.g. `executionBinding.contract`,
-  `executionBinding.parent`, `executionBinding.parent.sessionId`,
-  `executionBinding.delegationDigest`. `callerFamiliarId` is named bare
-  because it is a top-level launch field, not a member of `executionBinding`.
-- **Exact-match mismatches** (`execution_binding_mismatch`) name a top-level
-  `executionBinding` field with its full path (e.g.
-  `executionBinding.familiarId`, `executionBinding.graphId`,
-  `executionBinding.delegationDigest`), but name a nested `parent`
-  correlation mismatch bare — `parent`, `parent.sessionId`, `parent.graphId`,
-  `parent.nodeId`, `parent.attemptId` — never
-  `executionBinding.parent.sessionId`. `callerFamiliarId` mismatches are
-  likewise named bare. This bare-`parent.*`/`callerFamiliarId` convention is
-  normative for mismatch details and applies identically to launch parent
-  correlation and to bound input/kill proof comparison.
+- **Absent/incomplete mutation proof** (`execution_binding_required`) applies
+  to adopted input, legacy bound input, and bound kill. An entirely absent
+  proof or any missing root member reports the parser's
+  `executionBinding` container path. A missing member inside a non-null
+  `parent` reports `executionBinding.parent`. The parser does not invent a
+  missing leaf such as `executionBinding.parent.sessionId`. Launch-time
+  missing membership is instead `execution_binding_invalid`, using those same
+  container paths.
+- **Malformed shape, contract, syntax, or launch cross-field data** is
+  `execution_binding_invalid` or `execution_binding_unsupported`. Unknown or
+  extra root/parent membership reports `executionBinding` or
+  `executionBinding.parent`; an unsupported, otherwise string contract reports
+  `executionBinding.contract`; a complete object with an invalid digest reports
+  its static leaf such as `executionBinding.requestDigest`. A decoded type error
+  may report its parser container. `callerFamiliarId` is bare because it is a
+  top-level launch field.
+- **Exact-match mismatch** (`execution_binding_mismatch`) is possible only
+  after the supplied proof has a complete, accepted shape, contract, and
+  syntax. Top-level binding mismatches use full paths such as
+  `executionBinding.familiarId`, `executionBinding.graphId`, and
+  `executionBinding.delegationDigest`. Nested parent mismatches are bare —
+  `parent`, `parent.sessionId`, `parent.graphId`, `parent.nodeId`, or
+  `parent.attemptId` — never `executionBinding.parent.sessionId`.
+  `callerFamiliarId` mismatches are likewise bare. A malformed contract or
+  digest is invalid/unsupported, not an exact mismatch.
 
 ### Persistence and API behavior
 
@@ -863,8 +896,14 @@ behavior:
 
 ### Bound input and kill
 
-`POST /api/v1/sessions/:id/input` on a bound session requires the complete,
-exact `executionBinding` object alongside the existing `data` payload:
+On an O3 daemon, bound input is accepted only at
+`POST /api/v1/sessions/:id/adopted-input`, with a complete exact
+`executionBinding`, `requestAdoption`, and the existing `data` payload. The
+legacy `POST /api/v1/sessions/:id/input` route returns
+`request_adoption_required` only when a valid bound request omits
+`requestAdoption`; if that forbidden member is supplied, the route returns
+`request_adoption_invalid` at `requestAdoption`. The O2 proof portion carried
+by adopted input has this shape:
 
 ```json
 {
@@ -886,6 +925,9 @@ exact `executionBinding` object alongside the existing `data` payload:
   }
 }
 ```
+
+This fragment is not a complete O3 request by itself; the adopted route also
+requires the closed `requestAdoption` object documented below.
 
 `POST /api/v1/sessions/:id/kill` on a bound session, which today carries no
 body, gains a JSON body carrying only the binding:
@@ -910,19 +952,26 @@ body, gains a JSON body carrying only the binding:
 }
 ```
 
-For both routes:
+For adopted input, legacy bound input, and bound kill (after kill's earlier
+reserved-O3 check):
 
-- A missing or incomplete proof fails closed: `400 execution_binding_required`,
-  `details.fields: ["executionBinding"]` (or the specific missing member's
-  path).
-- A malformed proof shape fails as `400 execution_binding_invalid`; an
-  unrecognized `contract` value fails as `400 execution_binding_unsupported`.
-- A present, well-formed proof that byte-differs from the stored binding on
-  any field fails as `409 execution_binding_mismatch`, naming only the first
-  mismatched field path per the conventions above.
-- **Input** additionally rejects an expired binding: `409 execution_binding_expired`,
-  `details.fields: ["executionBinding.expiresAt"]`. Input never proceeds
-  against an expired binding.
+- A missing or incomplete proof fails closed as
+  `400 execution_binding_required`. An absent proof or missing root member
+  reports `details.fields: ["executionBinding"]`; a missing nested parent member
+  reports `["executionBinding.parent"]`.
+- A malformed proof shape or digest fails as
+  `400 execution_binding_invalid`; an unrecognized `contract` value fails as
+  `400 execution_binding_unsupported`. These shape/contract/syntax failures are
+  not exact mismatches.
+- Only a complete, well-formed proof that byte-differs from the stored binding
+  fails as `409 execution_binding_mismatch`, naming the first mismatched field
+  path per the conventions above.
+- **A genuinely new adopted input** whose adoption is still absent after
+  replay/conflict prechecks additionally rejects an expired binding:
+  `409 execution_binding_expired`,
+  `details.fields: ["executionBinding.expiresAt"]`. An exact already-adopted
+  input instead replays with `200` after expiry—even if the session is now
+  `idle` or terminal—and performs no delivery.
 - **Kill is explicitly exempt from the expiry check.** An exact-matching
   proof whose `expiresAt` has already elapsed still succeeds, because kill
   only narrows authority (stops a running attempt) and preserves operator
@@ -937,69 +986,52 @@ For both routes:
   nothing to return, only nothing to prove. Coven defines correlation here,
   not authentication — read access is unchanged from today.
 
-Once the proof is required, an unbound session's kill precedence and body
-handling are completely unaffected: no proof check runs, the body (if any)
-is never parsed, and the existing status/liveness gate and response are
-unchanged from before O2. An unbound session's input precedence is unaffected
-for every field except the now-reserved `executionBinding` key: no proof
-check runs, and every other field's existing status/liveness gate, body
-shape, and response are unchanged from before O2, but an `executionBinding`
-key present in the input body — even a malformed one, since no validation
-ever runs against it here — is always stripped before it reaches the writer,
-runtime, or persisted event; see [Metadata isolation](#metadata-isolation)
-below. Legacy unbound launches and kills that never mention
-`executionBinding` behave identically to their pre-O2 shape; legacy unbound
-input behaves identically too, unless the caller happens to send an
-`executionBinding` key, which is now silently removed rather than passed
-through unchanged.
+An unbound session still runs no O2 proof check. Unbound kill preserves its
+existing status/liveness and runtime semantics, but its body is now parsed
+best-effort far enough to reject the reserved `requestAdoption` member; parse
+failures and every other body field remain ignored. Unbound input checks
+liveness before parsing its body. If live, it rejects `requestAdoption` rather
+than treating it as legacy payload data; every other field keeps its prior
+shape and precedence except the now-reserved `executionBinding` key. That key
+is always stripped before the writer, runtime, or persisted event, even when
+malformed, because no proof validation runs for an unbound target. See
+[Metadata isolation](#metadata-isolation) below. Legacy unbound launch, input,
+and kill requests that supply no O3 metadata otherwise retain their prior
+behavior.
 
 #### Operation precedence
 
-**Launch** (`POST /api/v1/sessions`):
+Bound launch and input use the dedicated O3 routes. Their complete
+replay-before-mutable ordering is normative in
+[Request ordering and durable side effects](#request-ordering-and-durable-side-effects).
+The legacy launch/input routes validate O2 before applying the O3 route rule;
+they never create a bound session or deliver bound input. Legacy bound launch
+parses the closed binding and checks its root/child relationship plus raw
+top-level familiar correlation; it has no stored proof to exact-compare and
+does no parent lookup before rejecting the legacy location. Legacy bound input
+runs session lookup and JSON parsing first, then parses and exact-compares the
+complete O2 proof. An absent/incomplete proof returns
+`execution_binding_required` at `executionBinding` or
+`executionBinding.parent`; malformed shape/contract/digest and an exact
+mismatch retain their distinct O2 errors. Only after a valid exact proof does
+an absent `requestAdoption` return `400 request_adoption_required` at
+`requestAdoption`; supplying that forbidden member instead returns
+`400 request_adoption_invalid` at the same path. A live unbound input checks
+liveness before body parsing and rejects a supplied `requestAdoption` as an
+unbound relationship at `details.fields: ["executionBinding"]`; it is not
+ignored.
 
-1. Existing JSON body parsing, `projectRoot`/`cwd` resolution, and harness
-   validation, unchanged from today.
-2. `executionBinding` contract identity, shape, expiry, and root/child
-   cross-field validation, if `executionBinding` is present.
-3. Existing familiar resolution (`resolve_familiar`), unchanged from today.
-4. Canonical familiar-equality check and, for a child binding, parent lookup
-   and exact correlation.
-5. Existing maintenance-gate check, unchanged from today.
-6. Atomic session-row insert, including `execution_binding_json` if present.
-
-No session row is created, and no existing session state is mutated, unless
-every step through 5 succeeds. For an unbound launch, steps 2 and 4 do not
-apply and the remaining precedence is unchanged from today.
-
-**Input and kill** (`POST /api/v1/sessions/:id/input`,
-`POST /api/v1/sessions/:id/kill`):
-
-1. Existing session lookup by id (`404 session_not_found` if absent),
-   unchanged from today. A missing session wins over a malformed proof: an
-   unparseable `executionBinding` against a nonexistent session still
-   reports `session_not_found`.
-2. If the session is bound, require and parse the request's
-   `executionBinding` (`execution_binding_required` if missing/incomplete,
-   `execution_binding_invalid` if malformed, or `execution_binding_unsupported`
-   if its contract is unknown).
-3. Exact comparison of the parsed binding against the stored binding
-   (`execution_binding_mismatch` on any field difference — this wins even
-   over a not-live or external-session response that would otherwise apply
-   later).
-4. For input only, expiry check (`execution_binding_expired`); kill has no
-   expiry check, per its explicit exception above.
-5. Existing status/liveness and external-session checks, unchanged from
-   today.
-6. The runtime action itself (deliver input, or send kill).
-
-For an unbound session, steps 2-4 are skipped entirely and existing
-precedence (steps 1 and 5) is unchanged. Step 6 is unchanged for kill, whose
-body is never parsed for an unbound session; for input, step 6 is unchanged
-for every field except that a now-reserved `executionBinding` key, if
-present in the body, is always stripped before the runtime call and the
-persisted event, even though it is never validated — see
-[Metadata isolation](#metadata-isolation) below. No runtime action occurs
-unless every required prior step succeeds.
+Bound kill remains on `POST /api/v1/sessions/:id/kill`: session lookup occurs
+first, followed by body parsing and the reserved O3 check. Any parsed
+`requestAdoption` member returns `400 request_adoption_invalid` with
+`details.fields: ["requestAdoption"]` before O2 proof, status, or external
+processing—even when the O2 proof is malformed or the target is unbound and
+terminal. A bound kill without that member then requires and exact-compares
+the complete O2 proof before status/external checks and runtime kill; expiry is
+deliberately skipped. A malformed bound body is `400 invalid_request` with the
+route `sessionId`. An unbound body is parsed only to find the reserved O3
+member; parse failures and all other fields remain ignored, preserving the O2
+kill semantics.
 
 #### Metadata isolation
 
@@ -1021,12 +1053,19 @@ including error paths:
   path (an unbound session never runs the proof steps). A malformed
   `executionBinding` value is stripped the same as a well-formed one; it is
   never a validation error here.
-- **Kill:** the binding proof exists solely to satisfy the exact-match and
-  (non-)expiry checks above. It is never passed to the runtime's kill call,
-  which continues to take only the session id, and the persisted kill event
-  remains the pre-O2 shape — a bare `{"status": "killed"}` marker, no binding
-  fields. This holds for both bound and unbound sessions; an unbound kill's
-  body, if any, is never even parsed, so no stripping step applies there.
+- **Kill:** the binding proof exists solely to satisfy the exact-match check;
+  kill deliberately performs no expiry check. The proof is never passed to the
+  runtime's kill call, which continues to take only the session id, and the
+  persisted kill event remains the pre-O2 shape — a bare
+  `{"status": "killed"}` marker, no binding fields. This holds for both bound
+  and unbound sessions. An unbound kill body is parsed only enough to reject
+  `requestAdoption`; every other member remains ignored, so no
+  metadata-stripping step applies.
+
+The O3 `requestAdoption` object is likewise API-only metadata and is never
+passed through as input data. Adopted-operation isolation and the internal
+event-correlation boundary are specified in
+[Metadata isolation and privacy](#metadata-isolation-and-privacy).
 
 ### Health negotiation
 
@@ -1041,12 +1080,14 @@ additively (see [Capability fields](#capability-fields)):
 }
 ```
 
-A client requiring execution binding must confirm
-`"psyche.execution_binding.v1"` is present before sending a bound launch. An
-unknown or missing required contract value fails before any dependent
-request, per the existing fail-closed rule. Legacy and unbound sessions
-remain fully compatible: a launch that omits `executionBinding` behaves
-exactly as it does today.
+`executionBindingContracts` remains the additive discovery field for
+standalone O2 support, including bound kill. Adopted launch and input instead
+negotiate the exact `psyche.request_adoption.v1` value through
+`requestAdoptionContracts` and use the dedicated routes. That O3 value
+advertises the composite route contract, but every POST still carries the
+complete exact O2 proof. The bundled adopted client does not independently
+gate those methods on this O2 array. Legacy unbound sessions remain fully
+compatible.
 
 Externally registered (non-Coven-owned) sessions must reject any
 `executionBinding` supplied at registration time (see
@@ -1058,27 +1099,29 @@ guarantees for it.
 
 | Code | Status | Condition |
 |---|---:|---|
-| `execution_binding_invalid` | 400 | Malformed, missing a required field, or contains an unknown/extra member in `executionBinding` or its nested `parent`; fails a root/child cross-field or canonical-familiar-presence rule at launch; malformed binding proof (including an unknown/extra member) on bound input/kill; or an externally registered session's registration request supplies `executionBinding` at all. |
-| `execution_binding_unsupported` | 400 | `contract` is not `psyche.execution_binding.v1`. |
-| `execution_binding_required` | 400 | Bound input or kill omits or supplies incomplete binding proof. |
-| `execution_binding_expired` | 409 | Launch or input references a binding whose `expiresAt` has elapsed. Kill is exempt (see above). |
-| `execution_binding_mismatch` | 409 | Any exact-match check fails, including parent correlation, canonical-familiar correlation, or a bound input/kill proof that byte-differs from the stored binding. This includes a child launch whose `parent.sessionId` exists but carries a `null` stored `execution_binding` — details name only `parent.sessionId` in that case. |
+| `execution_binding_invalid` | 400 | A launch binding is malformed, missing a required root/nested member, or contains an unknown/extra member; a launch root/child or canonical-familiar-presence rule fails; a mutation proof has malformed shape/contract-member type/digest or an unknown/extra member; or external registration supplies `executionBinding`. Missing/incomplete mutation proof membership uses `execution_binding_required`, not this code. |
+| `execution_binding_unsupported` | 400 | A complete binding has a string `contract` literal other than `psyche.execution_binding.v1`; malformed member type is `execution_binding_invalid`. |
+| `execution_binding_required` | 400 | Adopted input, legacy bound input, or bound kill omits the proof or supplies incomplete root/nested membership. Details use `executionBinding` for an absent proof/missing root member and `executionBinding.parent` for a missing nested parent member. |
+| `execution_binding_expired` | 409 | A genuinely new adopted launch/input whose adoption remains absent after replay/conflict prechecks references an elapsed binding. Exact adopted replay and kill are exempt. |
+| `execution_binding_mismatch` | 409 | A complete, shape-valid proof or launch correlation fails exact comparison. This includes parent/canonical-familiar correlation and a child launch whose `parent.sessionId` exists but has a `null` stored binding. Malformed shape, contract, or digest never reaches mismatch comparison. |
 | `session_not_found` | 404 | The current session, or a child launch's referenced `parent.sessionId`, does not exist at all. Unchanged from existing behavior (see [Stable error codes](#stable-error-codes)). |
 
-`details.fields` names only the mismatched/invalid field path (e.g.
-`executionBinding.graphId`, `parent.attemptId`); it never includes field
-values or digests. No broader denial taxonomy is introduced by this
-contract.
+`details.fields` names only the parser container/static path or first mismatch
+path; it never includes field values or digests. In particular, missing proof
+members use `executionBinding` or `executionBinding.parent`, while a
+shape-valid exact mismatch may use `executionBinding.graphId` or the bare
+`parent.attemptId`. No broader denial taxonomy is introduced by this contract.
 
 ### Non-goals
 
-This contract defines only the immutable launch/correlation core:
+O2 defines only the immutable launch/correlation core. Its original
+non-goals remain true when O2 is considered alone; O3 adds request adoption
+without changing the binding's meaning:
 
-- No adoption key, uniqueness index, single-use/replay protection, or
-  lookup-by-binding route. Two sessions may be launched with byte-identical
-  `executionBinding` objects, including identical `requestDigest` values,
-  and both succeed — a repeated valid proof is indistinguishable from a
-  replay or duplicate adoption under this contract.
+- An `executionBinding` alone is not an adoption key and does not make a
+  request idempotent. Current bound launch/input therefore also require O3
+  metadata; legacy O2-only bound mutations are rejected.
+- O2 still defines no lookup-by-binding route.
 - No return-or-fence lookup semantics and no cancellation acknowledgement.
 - No content-addressed artifact binding and no crash-matrix recovery proofs
   beyond deterministic persistence and restart round-trip.
@@ -1087,6 +1130,359 @@ This contract defines only the immutable launch/correlation core:
   enumeration, or delegation authorization — `callerFamiliarId` is
   correlation metadata only, never a delegation-authority decision.
 - No production child/subagent dispatch.
+
+## Psyche request-adoption contract (`v1`)
+
+`psyche.request_adoption.v1` makes Coven durably responsible for a bound
+launch or input before its runtime side effect. Adoption means that Coven has
+committed immutable evidence and will not automatically execute that request
+again. It does **not** mean input delivery, runtime establishment, process
+completion, or any terminal outcome succeeded. O3 deliberately reports
+delivery as `not_asserted`.
+
+### Closed request shape and byte rules
+
+Adopted requests carry this exact object under `requestAdoption`:
+
+```json
+{
+  "contract": "psyche.request_adoption.v1",
+  "key": "psyche:graph-1/node-1/attempt-1/request-1",
+  "requestDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+}
+```
+
+The object is closed: all three members are required, and any missing,
+unknown, or extra member is `request_adoption_invalid`.
+
+| Field | Exact rule |
+|---|---|
+| `contract` | Must equal `psyche.request_adoption.v1` byte-for-byte. |
+| `key` | 1 to 255 ASCII bytes; every byte must match `[A-Za-z0-9._:/-]`. |
+| `requestDigest` | Exactly `sha256:` followed by 64 lowercase hexadecimal characters (71 ASCII bytes total). |
+
+Coven performs no trimming, case folding, Unicode normalization, or semantic
+interpretation. Accepted values are stored and compared byte-for-byte. Psyche
+owns canonical request serialization and digest computation; Coven checks
+syntax and equality only. Request adoption is neither authentication nor
+content attestation.
+
+For launch, `requestAdoption.requestDigest` must exact-match
+`executionBinding.requestDigest`. For input, it identifies the input request
+and is independent of the immutable launch digest in `executionBinding`.
+
+### Adopted routes, compatibility, and responses
+
+| Method and path | Required body metadata | First adoption | Exact replay |
+|---|---|---|---|
+| `POST /api/v1/adopted-sessions` | The normal launch fields plus a complete `psyche.execution_binding.v1` `executionBinding` and the closed `requestAdoption` object. Root/child and familiar correlation remain required. | `201` with the full `SessionRecord`. | `200` with the current persisted `SessionRecord`. |
+| `POST /api/v1/sessions/:id/adopted-input` | `data` as a string, the complete exact O2 `executionBinding` proof, and the closed `requestAdoption` object. | `202` with the exact first-adoption shape below. | `200` with the exact replay shape below. |
+
+The first successful adopted-input response is exactly:
+
+```json
+{
+  "adopted": true,
+  "replayed": false,
+  "delivery": "not_asserted"
+}
+```
+
+An exact adopted-input replay is exactly:
+
+```json
+{
+  "adopted": true,
+  "replayed": true,
+  "delivery": "not_asserted"
+}
+```
+
+An adopted-launch replay returns the session's current persisted record without
+changing it. It may be `created` during the commit-to-runtime window, `running`
+after activation, `idle` after a successful conversational exit, or terminal
+(`completed`, `failed`, `killed`, or `orphaned`). Replay neither fabricates a
+status nor relaunches.
+
+An exact adopted-input replay returns the `200` replay body above before expiry
+or liveness checks. It therefore still returns `200` after
+`executionBinding.expiresAt` has elapsed and after the session becomes `idle` or
+terminal; it never calls the runtime again.
+
+On an O3 daemon, bound operations cannot bypass adoption:
+
+- `POST /api/v1/sessions` and `POST /api/v1/sessions/:id/input` reject a
+  bound request that omits adoption with `400 request_adoption_required` at
+  `details.fields: ["requestAdoption"]`, after the route's O2 validation.
+  Supplying `requestAdoption` on those legacy bound routes is instead
+  `400 request_adoption_invalid` at the same static path.
+- Existing unbound launch and input behavior remains compatible when the
+  request omits both O2 and O3 metadata. An unbound request that supplies
+  `requestAdoption` is `400 request_adoption_invalid` at
+  `details.fields: ["executionBinding"]`; it receives no O3 idempotency
+  guarantee.
+- Bound kill remains on `POST /api/v1/sessions/:id/kill` and still requires
+  only its exact O2 proof. Kill is not an O3 adoption operation, and a
+  `requestAdoption` member there is `400 request_adoption_invalid` at
+  `details.fields: ["requestAdoption"]` before proof or status processing.
+- `POST /api/v1/sessions/external` rejects `requestAdoption` with
+  `request_adoption_invalid`; Coven cannot adopt a side effect for a runtime
+  it does not own. This check precedes the external route's
+  `executionBinding` rejection, so request adoption wins when both are present.
+- The dedicated route names are a downgrade discriminator. A pre-O3 daemon
+  returns its normal unknown-route response; a client must not retry a legacy
+  mutation or silently discard adoption metadata.
+
+### Global key and launch-attempt uniqueness
+
+`requestAdoption.key` is globally unique within one Coven store across
+operation kinds, sessions, projects, and contract versions. A retained row is
+an exact replay only when all identity members match:
+
+- request-adoption contract;
+- operation kind (`launch` or `input`);
+- request digest;
+- complete byte-exact execution binding;
+- input session id for input; and
+- the complete launch attempt scope for launch.
+
+Reusing a key for a different digest, operation, session, binding, or attempt
+is `request_adoption_conflict`; retained identity is never overwritten.
+
+A launch also has a unique five-field attempt scope:
+
+```text
+executionBinding.principalRef
+executionBinding.projectDigest
+executionBinding.graphId
+executionBinding.nodeId
+executionBinding.attemptId
+```
+
+These five byte-exact values are the complete O3 attempt identity.
+`requestDigest`, familiar fields, parent fields, and `delegationDigest` are
+intentionally excluded: changing them for the same attempt must conflict
+rather than create a second session. The same key plus the exact complete
+identity is replay. A different key for the same scope conflicts at
+`executionBinding.attemptId`; a different `attemptId` under a new key may
+create a new session.
+
+Store migration retains a non-replay-addressable launch reservation for every
+pre-O3 bound session. Each reservation occupies the same five-field scope.
+Duplicate historical scopes fail startup closed; migration never chooses a
+winner.
+
+### Request ordering and durable side effects
+
+Replay and retained conflict evidence outrank mutable admission drift.
+Structural JSON member/type parsing occurs first, followed by the closed O2
+and O3 shapes, contract identities, syntax, exact O2 proof comparison, and
+launch digest equality. Filesystem canonicalization, current harness and
+familiar availability, parent existence/exact correlation, binding expiry,
+maintenance, capacity, handoff fences, and runtime liveness are mutable checks
+and do not hide an exact replay or retained conflict. Parent status/liveness is
+not an admission check.
+
+For adopted launch:
+
+1. Validate structural O2/O3 data without performing mutable filesystem,
+   roster, harness, parent, maintenance, or runtime work.
+2. Resolve the global key and five-field scope read-only. Return `200` for an
+   exact replay or `409` for conflict.
+3. Acquire the process-independent adoption gate for digests of the key and
+   attempt scope, then repeat replay/conflict resolution.
+4. For a genuinely new request only, run project/cwd, harness, expiry,
+   familiar, parent existence/exact-correlation, and maintenance admission.
+5. In an `IMMEDIATE` transaction, repeat authoritative replay/conflict
+   resolution, revalidate the same child-parent existence/correlation, and
+   commit the new `created` `SessionRecord` and launch adoption together.
+6. Only after commit, invoke the runtime.
+
+For adopted input, the daemon first looks up the target session, parses O2,
+O3, and `data`, and exact-matches the O2 proof. It then resolves the key,
+acquires the key adoption gate, and repeats resolution. Only a genuinely new
+input proceeds through expiry, liveness, event-capacity, and handoff checks.
+An `IMMEDIATE` transaction repeats resolution and commits the input lease and
+adoption together. Runtime input and event persistence happen only after that
+commit.
+
+The authoritative replay/conflict check is therefore repeated after gate
+acquisition and again in the committing transaction. A waiter cannot return a
+mutable-admission error after another request wins and commits. Exact replay
+may return after expiry, familiar removal, project/cwd or harness drift,
+maintenance changes, or an `idle`/terminal transition because it performs no
+new side effect. Store corruption is an internal error, never an
+absent-adoption fallback.
+
+### Lifecycle, ambiguity, and retention
+
+An adopted launch transaction commits both the `created` session and adoption
+before runtime work. Immediately after cancellation ownership registration and
+before initial stream or piped prompt delivery, the runtime invokes its
+ownership callback exactly once to compare-and-set `created -> running`. The
+daemon exit writer may instead move `created` or `running` to the authoritative
+persisted exit status: a successful
+conversation-grouped row (`conversation_id` present) becomes nonterminal
+`idle`, a successful ungrouped row becomes terminal `completed`, and a failed
+exit becomes terminal `failed`. If that status wins before activation, the
+later `created -> running` compare-and-set returns false and must not overwrite
+it; a false compare-and-set is not a persistence error. Existing authoritative
+terminal states such as `killed` or `orphaned` are likewise not rewritten by
+that activation CAS. Generic stale-created recovery excludes every session
+with a launch adoption or historical attempt reservation.
+
+If runtime establishment returns a definitive failure after that atomic
+commit, the request handler conditionally compare-and-sets
+`created -> failed`. An authoritative `idle` or terminal status that already
+won is not overwritten. The synchronous response remains `500 launch_failed`
+with the post-adoption ambiguity marker, and exact replay returns the row's
+current stored status—`created`, `running`, `idle`, or terminal—without
+relaunching. If persisting the `failed` transition itself fails, the session
+and adoption remain retained but the lifecycle state remains ambiguous; replay
+still returns whatever status is stored and performs no runtime work.
+
+The interval after adoption commit and before established runtime ownership is
+intentionally visible as `created`. Once cancellation ownership is registered,
+`running` publication precedes initial prompt delivery. If that publication
+fails, the response is post-adoption ambiguity and replay never relaunches; O3
+does not add O4 recovery behavior. It retains the evidence for O4
+lookup/fencing and O7 reconciliation and performs no automatic redispatch.
+
+Request-adoption rows are immutable and append-only. They survive normal
+session status updates, archive, summon, event retention, and daemon restart.
+Sessions with any adopted or historical reserved evidence cannot be
+sacrificed. O3 defines no expiry or release mechanism for that evidence.
+
+Only a synchronous HTTP failure returned after adoption commits receives the
+concrete post-adoption code with `error.details` set exactly to:
+
+```json
+{
+  "adopted": true,
+  "delivery": "not_asserted"
+}
+```
+
+That marker means the caller must not interpret the failure as safe
+non-adoption. Exact replay reports the retained adoption and never invokes the
+runtime again; it makes no delivery or completion claim, and O3 has no
+automatic redispatch path. Asynchronous output, exit-event, or authoritative
+exit-status persistence can fail after an HTTP response has already returned.
+Such failures are logged while the session/adoption evidence remains retained;
+they cannot retroactively add this marker to, or otherwise update, the
+completed response.
+
+### Metadata isolation and privacy
+
+`executionBinding` and `requestAdoption` are consumed by the API layer. They
+are stripped before runtime launch/input, input-capacity accounting, and
+persisted event payload construction. Input event correlation uses an
+internal nullable SQL column named `request_adoption_id`; that identifier is
+never serialized in the public `EventRecord`, event payload, or harness
+input. No public adoption-record response object or internal ledger id is
+exposed.
+
+O3 errors use static field paths only. The mapping is:
+
+| Condition | `error.details.fields` |
+|---|---|
+| Missing adoption on an adopted route or legacy bound launch/input | `["requestAdoption"]` |
+| Non-object adoption or an object with a missing/extra member | `["requestAdoption"]` |
+| Malformed/non-string contract or unsupported contract literal | `["requestAdoption.contract"]` |
+| Malformed key or global key-identity conflict | `["requestAdoption.key"]` |
+| Malformed digest or launch/O2 digest mismatch | `["requestAdoption.requestDigest"]` |
+| Different key already owns the same five-field launch scope | `["executionBinding.attemptId"]` |
+| Adoption on an unbound launch/input relationship, including a legacy unbound route | `["executionBinding"]` |
+| Adoption on a legacy bound launch/input, kill, or external registration | `["requestAdoption"]` |
+
+Messages and details never disclose an adoption key, digest, binding value,
+input data, or a session id learned from the adoption ledger. Existing
+non-adoption errors may still echo a caller-supplied route session id as
+documented; O3 never turns retained private ledger data into an error oracle.
+Adoption-gate filenames and diagnostics likewise use only cryptographic
+digests, never caller values.
+
+### O3 error matrix
+
+The adopted routes also return the generic and O2 errors documented above.
+The complete O3 adoption/phase-specific surface is:
+
+| Code | Status | Phase and condition | Exact message and details |
+|---|---:|---|---|
+| `request_adoption_required` | 400 | Pre-adoption: an adopted route omitted `requestAdoption`, or a bound launch/input attempted the legacy route without it. | `Bound operation requires requestAdoption.` with `{"fields":["requestAdoption"]}`. |
+| `request_adoption_invalid` | 400 | Pre-adoption: non-object, missing/extra member, malformed contract/key/digest, invalid cross-field use, adoption without binding, launch digest mismatch, or adoption at a kill/external/legacy location. | `Request adoption is invalid.` with the static `fields` path above. |
+| `request_adoption_unsupported` | 400 | Pre-adoption: `requestAdoption.contract` is not `psyche.request_adoption.v1`. | `Request adoption is invalid.` with `{"fields":["requestAdoption.contract"]}`. |
+| `request_adoption_conflict` | 409 | Pre-side-effect: a global key or launch attempt scope is retained under a non-identical identity. | `Request adoption conflicts with retained evidence.` with `{"fields":["requestAdoption.key"]}` or `{"fields":["executionBinding.attemptId"]}`. |
+| `event_preflight_failed` | 500 | Pre-adoption input: event-writer capacity could not be checked. | `Input event capacity could not be checked.`; details are omitted. |
+| `launch_failed` | 500 | Post-adoption launch: runtime establishment failed; the `created -> running` status update returned a persistence error; or the committed session could not be reread. A false activation CAS because `idle` or a terminal status already won is successful preservation, not this error. | Respectively `Session runtime launch failed after adoption.`, `Session runtime status could not be persisted after adoption.`, or `Session state could not be read after adoption.`; details are exactly `{"adopted":true,"delivery":"not_asserted"}`. |
+| `session_not_live` | 409 | Pre-adoption input if the stored status is not live, or post-adoption if the runtime reports not-live after adoption. | Before commit: `Session is not live.` with `{"sessionId":"<route id>"}`. After commit: `Session runtime was not live after input adoption.` with the marker-only adopted details. |
+| `send_input_failed` | 500 | Post-adoption input: the runtime input call failed for a reason other than the typed not-live condition. | `Session runtime input failed after adoption.` with the marker-only adopted details. |
+| `input_coordination_failed` | 500 | Post-adoption input: session input coordination failed. | `Session input coordination failed after adoption.` with the marker-only adopted details. |
+| `event_persistence_failed` | 500 | Post-adoption input: synchronous input-event persistence failed. | `Session input event persistence failed after adoption.` with the marker-only adopted details. |
+| `input_lease_release_failed` | 500 | Post-adoption input: runtime/event work returned successfully but lease release failed. | `Session input lease could not be released after adoption.` with the marker-only adopted details. |
+
+New adopted input may also fail before commit with `413 input_too_large`
+(`Input payload exceeds the daemon event writer capacity.`) or
+`409 session_handoff_active`
+(`Session input is fenced by a committed handoff takeover.`); each carries
+`{"sessionId":"<route id>"}`. These are ordinary admission failures, not
+post-adoption markers.
+
+Decoding and structural member/type errors precede O2/O3 semantic validation.
+For a structurally valid adopted request, exact proof, replay, and conflict
+resolution precede mutable expiry, roster, parent existence/exact correlation,
+runtime liveness, maintenance, capacity, and handoff checks. Parent status is
+not inspected. A genuinely new request still must pass every applicable
+mutable admission check before adoption commits; exact replay performs none of
+those checks.
+
+### Health negotiation and fail-closed clients
+
+`GET /api/v1/health` advertises accepted adoption contracts additively:
+
+```json
+{
+  "apiVersion": "coven.daemon.v1",
+  "capabilities": {
+    "executionBindingContracts": ["psyche.execution_binding.v1"],
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
+  }
+}
+```
+
+Before every adopted launch or input, the bundled client completes health
+negotiation in a fixed three-step order. First it requires `health.apiVersion`
+to be the exact string `coven.daemon.v1`.
+Second it requires `health.ok === true`.
+Only after both checks pass does it require
+`health.capabilities.requestAdoptionContracts` to be an array containing the
+exact `psyche.request_adoption.v1` string.
+Missing, null, false, and non-boolean `health.ok` values all fail locally.
+Any health transport, API-version, health-ok, or capability failure sends zero
+POST requests and never falls back to a legacy mutation. That O3 capability
+advertises the composite adopted-route contract; the client does not independently gate
+these adopted methods on `executionBindingContracts`. It
+does not replace proof: every adopted request must still carry a complete,
+exact O2 `executionBinding` proof, which the Rust authority validates along
+with all per-operation admission checks. Capabilities advertise availability;
+they never grant permission or prove a request.
+
+### O4-O8 exclusions
+
+O3 exposes durable adoption and replay/conflict behavior only:
+
+- No adoption lookup route or public ledger query exists.
+- No `proven-not-adopted`, `unknown`, fence, or generation disposition exists.
+- No retention expiry, retention/fence release, or pruning mechanism exists.
+- No redispatch or recovery endpoint exists, and ambiguous post-adoption work
+  is never executed automatically.
+- No cancellation acknowledgement is added; kill remains outside adoption.
+- No content-addressed artifact binding is added.
+- No production child dispatch, descendant enumeration, graph traversal, or
+  delegation authorization is added.
+
+Those are later O4-O8 responsibilities. O3 must not be interpreted as shipping
+any of them.
 
 ## Event record shape and cursor pagination (`v1`)
 
@@ -1728,17 +2124,18 @@ Shared non-success responses use the structured error envelope:
 ```
 
 The session lookup (and its `404 session_not_found`) always runs first, even
-against a bound session with a malformed or missing proof. Only after that
-lookup succeeds does a bound session (one launched with `executionBinding`)
-additionally require a complete, exact-matching `executionBinding` proof in
-the request body, checked before the existing `409 session_not_live` and
-external-session checks above; see
+against a bound session with a malformed or missing proof. On legacy bound
+input, JSON and the complete O2 proof are then validated before the route's O3
+location rule: absent/incomplete proof is `execution_binding_required`,
+malformed shape/contract/digest retains its invalid/unsupported error, and only
+a complete valid-but-different proof is `execution_binding_mismatch`. After an
+exact proof, absent `requestAdoption` is `request_adoption_required`; supplying
+that forbidden member is `request_adoption_invalid` at `requestAdoption`. The
+legacy route never reaches liveness or input delivery. Bound kill rejects a
+supplied `requestAdoption` first, then requires the same complete exact O2 proof
+before the existing `409 session_not_live` and external checks. See
 [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
-for the request shape, precedence, and the additional
-`execution_binding_required`/`execution_binding_invalid`/
-`execution_binding_unsupported`/`execution_binding_expired`/
-`execution_binding_mismatch` error responses that apply only to bound
-sessions.
+for the complete precedence and static field paths.
 
 ## comux and OpenClaw bridge compatibility
 
@@ -1757,17 +2154,31 @@ sessions.
 ## Recommended client handshake
 
 1. Call `GET /api/v1/health`.
-2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.structuredErrors === true`.
-3. Verify `capabilities.sessions === true` before session requests and
+2. Verify `apiVersion === "coven.daemon.v1"` exactly.
+3. Require `ok === true`; do not coerce or accept truthy values.
+4. Verify `capabilities.structuredErrors === true`.
+5. Verify `capabilities.sessions === true` before session requests and
    `capabilities.events === true` before event requests.
-4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
-5. Check `capabilities.sessionLaunchPolicy === true` before sending
+6. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination.
+7. Check `capabilities.sessionLaunchPolicy === true` before sending
    `launchPolicy`; a missing, false, or malformed value means unsupported.
-6. Check `capabilities.executionBindingContracts` includes
-   `"psyche.execution_binding.v1"` before sending a bound `executionBinding`
-   launch, input, or kill.
-7. Only then depend on the documented `v1` sessions/events shapes.
+8. For an integration that negotiates a standalone O2 operation such as bound
+   kill, use `capabilities.executionBindingContracts` and require
+   `"psyche.execution_binding.v1"`.
+9. Before every adopted launch or input, and only after steps 2 and 3 pass,
+   require
+   `capabilities.requestAdoptionContracts` to be an array containing the exact
+   `"psyche.request_adoption.v1"` literal; this O3 value advertises the
+   composite route contract. The bundled adopted client checks this field, not
+   `executionBindingContracts`, and never falls back. Still send the complete
+   exact O2 proof on every request.
+10. Only then depend on the documented `v1` sessions/events shapes.
 
 ## Scope boundary
 
-The `coven.daemon.v1` contract covers daemon health, capability discovery, action routing, sessions, events, live input, live kill, travel-mode profile/delta reconciliation, scheduler decision/recovery routes, and the Psyche execution binding contract described above. Do not treat route names outside this document as reserved API until they are implemented and documented here.
+The `coven.daemon.v1` contract covers daemon health, capability discovery,
+action routing, sessions, events, live input, live kill, travel-mode
+profile/delta reconciliation, scheduler decision/recovery routes, and the
+Psyche execution-binding and request-adoption contracts described above. Do
+not treat route names outside this document as reserved API until they are
+implemented and documented here.

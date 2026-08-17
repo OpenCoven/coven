@@ -159,7 +159,9 @@ fn list_sessions_plain(include_archived: bool) -> Result<()> {
             "  coven summon <session-id>       # restore archived session, then replay/follow"
         );
         eprintln!("  coven archive <session-id>      # hide from active list, keep events");
-        eprintln!("  coven sacrifice <session-id> --yes  # permanently delete non-running session");
+        eprintln!(
+            "  coven sacrifice <session-id> --yes  # delete eligible non-running session; adopted/reserved sessions are retained"
+        );
     }
 
     Ok(())
@@ -369,8 +371,10 @@ pub(crate) fn run_browser_action(
         SessionBrowserActionKind::Summon => summon_session_command(&session.id),
         SessionBrowserActionKind::Archive => archive_session_command(&session.id),
         SessionBrowserActionKind::Sacrifice => {
+            let conn = store::open_store(&coven_store_path()?)?;
+            store::ensure_session_sacrificable(&conn, &session.id)?;
             let confirmation = prompt_for_required_line(&format!(
-                "Type `sacrifice` to permanently delete `{}` and its events: ",
+                "Type `sacrifice` to delete eligible non-running session `{}` and its events (adopted/reserved sessions are retained): ",
                 first_chars(&session.id, 12)
             ))?;
             if confirmation != "sacrifice" {
@@ -424,7 +428,7 @@ pub(crate) fn session_browser_actions(session: &store::SessionRecord) -> Vec<Ses
         actions.push(SessionBrowserAction {
             key: "x",
             label: "Sacrifice",
-            help: "Permanent delete after typed confirm",
+            help: "Delete eligible non-running; adopted/reserved sessions are retained",
             kind: SessionBrowserActionKind::Sacrifice,
         });
     }
@@ -647,4 +651,41 @@ pub(crate) fn render_browser_frame_plain_for_test(
     selected_action: usize,
 ) -> String {
     render_session_browser_frame_plain(sessions, selected_session, selected_action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sacrifice_action_qualifies_adoption_retention() {
+        let session = store::SessionRecord {
+            id: "session-1".to_string(),
+            project_root: "/repo".to_string(),
+            harness: "codex".to_string(),
+            title: "Done".to_string(),
+            status: "completed".to_string(),
+            exit_code: Some(0),
+            archived_at: None,
+            created_at: "2026-08-16T00:00:00Z".to_string(),
+            updated_at: "2026-08-16T00:00:00Z".to_string(),
+            conversation_id: None,
+            familiar_id: None,
+            execution_binding: None,
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        };
+
+        let sacrifice = session_browser_actions(&session)
+            .into_iter()
+            .find(|action| action.kind == SessionBrowserActionKind::Sacrifice)
+            .expect("completed sessions expose sacrifice");
+
+        assert_eq!(
+            sacrifice.help,
+            "Delete eligible non-running; adopted/reserved sessions are retained"
+        );
+    }
 }

@@ -149,6 +149,11 @@ pub struct HealthCapabilities {
     /// empty rather than failing deserialization.
     #[serde(default)]
     pub execution_binding_contracts: Vec<String>,
+    /// Exact request-adoption contracts accepted by dedicated adopted
+    /// launch/input routes. Additive: absent/older wire payloads default to
+    /// empty rather than failing deserialization.
+    #[serde(default)]
+    pub request_adoption_contracts: Vec<String>,
 }
 
 /// `afsMount`: a backend name, or `false`.
@@ -280,6 +285,19 @@ pub enum SessionEventBoundaryError {
 
 pub type SessionEventBoundaryResult = std::result::Result<(), SessionEventBoundaryError>;
 
+/// Privacy-safe post-adoption disposition for established runtime ownership
+/// whose immediate `created -> running` publication could not be persisted.
+#[derive(Debug)]
+pub(crate) struct RuntimeOwnershipPublicationError;
+
+impl std::fmt::Display for RuntimeOwnershipPublicationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("established runtime ownership could not be published")
+    }
+}
+
+impl std::error::Error for RuntimeOwnershipPublicationError {}
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -290,6 +308,34 @@ pub trait SessionRuntime {
         drop(writer);
         self.launch_session(launch)
     }
+    /// Launch a durably adopted session and publish runtime ownership at the
+    /// implementation's exact establishment boundary.
+    ///
+    /// The default preserves fake/runtime adapter behavior by publishing after
+    /// a successful launch return, or before propagating the typed disposition
+    /// that says cleanup may have retained ownership. Live runtimes override
+    /// this to publish immediately after cancellation registration and before
+    /// initial prompt delivery.
+    fn launch_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        let result = match writer {
+            Some(writer) => self.launch_session_with_writer(launch, writer),
+            None => self.launch_session(launch),
+        };
+        let retained = result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+                .is_some()
+        });
+        if result.is_ok() || retained {
+            ownership_established()?;
+        }
+        result
+    }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
@@ -298,6 +344,7 @@ pub trait SessionRuntime {
         _session_id: &str,
         _kind: &str,
         _payload: &Value,
+        _request_adoption_id: Option<&str>,
         _action: &mut dyn FnMut() -> SessionEventBoundaryResult,
     ) -> Option<SessionEventBoundaryResult> {
         None
@@ -386,6 +433,7 @@ pub(crate) fn health_response_for_authority(
             afs_commit: true,
             afs_commit_dry_run: true,
             execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
+            request_adoption_contracts: vec![crate::request_adoption::CONTRACT.to_string()],
         },
         daemon,
         hub: None,
@@ -847,7 +895,14 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         ("GET", "/sessions") => list_sessions_response(coven_home, query),
         ("POST", "/sessions") => launch_session(coven_home, body, runtime, authority),
+        ("POST", "/adopted-sessions") => {
+            launch_adopted_session(coven_home, body, runtime, authority)
+        }
         ("POST", "/sessions/external") => register_external_session(coven_home, body),
+        ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/adopted-input") => {
+            let session_id = session_action_id(path, "/adopted-input");
+            record_adopted_input(coven_home, session_id, body, runtime)
+        }
         ("POST", path) if path.starts_with("/sessions/") && path.ends_with("/complete") => {
             let session_id = session_action_id(path, "/complete");
             complete_external_session(coven_home, session_id, body)
@@ -1925,6 +1980,40 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    if let Some(value) = payload.get("executionBinding") {
+        let binding = match crate::execution_binding::parse(value) {
+            Ok(binding) => binding,
+            Err(error) => return execution_binding_error(error),
+        };
+        let raw_caller_familiar_id = raw_caller_familiar_id(&payload);
+        if let Err(field) = validate_binding_relationship(&binding, raw_caller_familiar_id) {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Execution binding is invalid.",
+                Some(json!({ "fields": [field] })),
+            );
+        }
+        let raw_familiar_id = raw_top_level_familiar_id(&payload);
+        if raw_familiar_id.is_none_or(|value| value.is_empty() || value.trim() != value) {
+            return api_error(
+                400,
+                "execution_binding_invalid",
+                "Execution binding is invalid.",
+                Some(json!({ "fields": ["familiarId"] })),
+            );
+        }
+        if raw_familiar_id != Some(binding.familiar_id.as_str()) {
+            return execution_binding_mismatch("executionBinding.familiarId");
+        }
+        if payload.get("requestAdoption").is_some() {
+            return request_adoption_invalid("requestAdoption");
+        }
+        return request_adoption_required();
+    }
+    if payload.get("requestAdoption").is_some() {
+        return request_adoption_invalid("executionBinding");
+    }
     if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
         return api_error(
             403,
@@ -2199,6 +2288,455 @@ fn launch_session(
     json_response(201, &record)
 }
 
+fn validate_adopted_launch_structure(payload: &Value) -> Result<()> {
+    let object = payload
+        .as_object()
+        .context("request body must be a JSON object")?;
+    for field in ["projectRoot", "harness", "prompt"] {
+        if object
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .is_none()
+        {
+            anyhow::bail!("request body requires string field `{field}`");
+        }
+    }
+    for field in [
+        "cwd",
+        "model",
+        "title",
+        "conversationId",
+        "familiarId",
+        "callerFamiliarId",
+        "launchMode",
+    ] {
+        if object.get(field).is_some_and(|value| !value.is_string()) {
+            anyhow::bail!("request body field `{field}` must be a string");
+        }
+    }
+    if let Some(conversation) = object.get("conversation").filter(|value| !value.is_null()) {
+        let conversation = conversation
+            .as_object()
+            .context("conversation must be an object with `mode` and `id` fields")?;
+        for field in ["mode", "id"] {
+            if !conversation.get(field).is_some_and(Value::is_string) {
+                anyhow::bail!("conversation.{field} must be a string");
+            }
+        }
+    }
+    if let Some(policy) = object.get("launchPolicy") {
+        let policy = policy
+            .as_object()
+            .context("launchPolicy must be an object")?;
+        for field in ["approval", "sandbox"] {
+            if !policy.get(field).is_some_and(Value::is_string) {
+                anyhow::bail!("launchPolicy.{field} must be a string");
+            }
+        }
+        if let Some(add_dirs) = policy.get("addDirs") {
+            let add_dirs = add_dirs
+                .as_array()
+                .context("launchPolicy.addDirs must be an array of strings")?;
+            if add_dirs.iter().any(|value| !value.is_string()) {
+                anyhow::bail!("launchPolicy.addDirs must be an array of strings");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn request_adoption_error(error: crate::request_adoption::ValidationError) -> Result<ApiResponse> {
+    use crate::request_adoption::ValidationError;
+    let (code, path) = match error {
+        ValidationError::Unsupported { path } => ("request_adoption_unsupported", path),
+        ValidationError::Missing { path } | ValidationError::Invalid { path } => {
+            ("request_adoption_invalid", path)
+        }
+    };
+    api_error(
+        400,
+        code,
+        "Request adoption is invalid.",
+        Some(json!({ "fields": [path] })),
+    )
+}
+
+fn request_adoption_invalid(field: &'static str) -> Result<ApiResponse> {
+    api_error(
+        400,
+        "request_adoption_invalid",
+        "Request adoption is invalid.",
+        Some(json!({ "fields": [field] })),
+    )
+}
+
+fn request_adoption_required() -> Result<ApiResponse> {
+    api_error(
+        400,
+        "request_adoption_required",
+        "Bound operation requires requestAdoption.",
+        Some(json!({ "fields": ["requestAdoption"] })),
+    )
+}
+
+fn adoption_conflict(field: &'static str) -> Result<ApiResponse> {
+    api_error(
+        409,
+        "request_adoption_conflict",
+        "Request adoption conflicts with retained evidence.",
+        Some(json!({ "fields": [field] })),
+    )
+}
+
+fn post_adoption_error(status: u16, code: &str, message: &str) -> Result<ApiResponse> {
+    api_error(
+        status,
+        code,
+        message,
+        Some(json!({ "adopted": true, "delivery": "not_asserted" })),
+    )
+}
+
+fn adopted_launch_resolution(
+    conn: &rusqlite::Connection,
+    adoption: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<ApiResponse>> {
+    match store::resolve_launch_adoption(conn, adoption, binding)? {
+        store::AdoptionResolution::Absent => Ok(None),
+        store::AdoptionResolution::Replay { session, .. } => {
+            Ok(Some(json_response(200, &session)?))
+        }
+        store::AdoptionResolution::Conflict { field } => Ok(Some(adoption_conflict(field)?)),
+    }
+}
+
+fn adopted_launch_read_resolution(
+    conn: &mut rusqlite::Connection,
+    adoption: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<ApiResponse>> {
+    // Consume the transaction before returning so no read snapshot crosses
+    // into the adoption gate or mutable admission work.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    let resolution = adopted_launch_resolution(&tx, adoption, binding);
+    tx.rollback()
+        .context("failed to close adopted launch read transaction")?;
+    resolution
+}
+
+fn launch_adopted_session(
+    coven_home: &Path,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+    authority: RequestAuthority,
+) -> Result<ApiResponse> {
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if let Err(error) = validate_adopted_launch_structure(&payload) {
+        return api_error(400, "invalid_request", &error.to_string(), None);
+    }
+
+    let Some(adoption_value) = payload.get("requestAdoption") else {
+        return request_adoption_required();
+    };
+    let Some(binding_value) = payload.get("executionBinding") else {
+        return request_adoption_invalid("executionBinding");
+    };
+    let binding = match crate::execution_binding::parse(binding_value) {
+        Ok(binding) => binding,
+        Err(error) => return execution_binding_error(error),
+    };
+    let adoption = match crate::request_adoption::parse(adoption_value) {
+        Ok(adoption) => adoption,
+        Err(error) => return request_adoption_error(error),
+    };
+    if adoption.request_digest != binding.request_digest {
+        return request_adoption_invalid("requestAdoption.requestDigest");
+    }
+
+    let raw_caller_familiar_id = raw_caller_familiar_id(&payload);
+    if let Err(field) = validate_binding_relationship(&binding, raw_caller_familiar_id) {
+        return api_error(
+            400,
+            "execution_binding_invalid",
+            "Execution binding is invalid.",
+            Some(json!({ "fields": [field] })),
+        );
+    }
+    let raw_familiar_id = raw_top_level_familiar_id(&payload);
+    if raw_familiar_id.is_none_or(|value| value.is_empty() || value.trim() != value) {
+        return api_error(
+            400,
+            "execution_binding_invalid",
+            "Execution binding is invalid.",
+            Some(json!({ "fields": ["familiarId"] })),
+        );
+    }
+    if raw_familiar_id != Some(binding.familiar_id.as_str()) {
+        return execution_binding_mismatch("executionBinding.familiarId");
+    }
+
+    // Replay and retained conflicts are immutable evidence, so resolve them
+    // before consulting any mutable launch admission state.
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    if let Some(response) = adopted_launch_read_resolution(&mut conn, &adoption, &binding)? {
+        return Ok(response);
+    }
+
+    let attempt_scope = [
+        binding.principal_ref.as_str(),
+        binding.project_digest.as_str(),
+        binding.graph_id.as_str(),
+        binding.node_id.as_str(),
+        binding.attempt_id.as_str(),
+    ];
+    let adoption_gate = crate::adoption_gate::AdoptionGate::acquire(
+        coven_home,
+        &adoption.key,
+        Some(&attempt_scope),
+    )?;
+    if let Some(response) = adopted_launch_read_resolution(&mut conn, &adoption, &binding)? {
+        return Ok(response);
+    }
+
+    // The gate, but no SQLite writer transaction, remains held across mutable
+    // filesystem, harness, roster, parent, and maintenance admission.
+    if payload.get("launchPolicy").is_some() && !authority.allows_session_launch_policy() {
+        return api_error(
+            403,
+            "forbidden",
+            "launchPolicy is accepted only over the owner-gated local IPC transport.",
+            None,
+        );
+    }
+    let mut launch = match session_launch_from_payload(&payload) {
+        Ok(launch) => launch,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    if let Err(error) = binding.validate_not_expired(Utc::now()) {
+        return execution_binding_error(error);
+    }
+    let familiar_ctx =
+        match session_launch::resolve_familiar(coven_home, launch.familiar_id.as_deref()) {
+            Ok(familiar_ctx) => familiar_ctx,
+            Err(session_launch::FamiliarError::Unknown { .. }) => {
+                return api_error(
+                    400,
+                    "unknown_familiar",
+                    "Familiar was not found.",
+                    Some(json!({ "fields": ["familiarId"] })),
+                );
+            }
+            Err(session_launch::FamiliarError::LookupFailed(_)) => {
+                return api_error(
+                    500,
+                    "familiar_lookup_failed",
+                    "Familiar lookup failed.",
+                    None,
+                );
+            }
+        };
+    let Some(familiar) = familiar_ctx.as_ref() else {
+        return api_error(
+            400,
+            "execution_binding_invalid",
+            "Bound launch requires familiarId.",
+            Some(json!({ "fields": ["familiarId"] })),
+        );
+    };
+    if binding.familiar_id != familiar.id {
+        return execution_binding_mismatch("executionBinding.familiarId");
+    }
+    launch.familiar_id = Some(familiar.id.clone());
+
+    if let Some(parent) = binding.parent.as_ref() {
+        if let Err(response) =
+            correlate_child_parent(&conn, parent, raw_caller_familiar_id.as_str())?
+        {
+            return Ok(response);
+        }
+        parent_correlation_advisory_check_completed_failpoint();
+    }
+
+    let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
+        &launch.project_root,
+    ))
+    .and_then(|gate| match gate {
+        Some(gate) => gate
+            .acquire_writer(format!("daemon-session-{}", launch.id), "session")
+            .map(Some),
+        None => Ok(None),
+    }) {
+        Ok(writer) => writer,
+        Err(error) => {
+            if let Some(response) = adopted_launch_read_resolution(&mut conn, &adoption, &binding)?
+            {
+                return Ok(response);
+            }
+            let gate_error = error.downcast_ref::<crate::maintenance_gate::GateError>();
+            let (code, details) = match gate_error {
+                Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => (
+                    "maintenance_locked",
+                    Some(json!({ "owner": owner, "sessionId": launch.id })),
+                ),
+                Some(_) => (
+                    "maintenance_state_invalid",
+                    Some(json!({ "sessionId": launch.id })),
+                ),
+                None => (
+                    "maintenance_gate_unavailable",
+                    Some(json!({ "sessionId": launch.id })),
+                ),
+            };
+            return api_error(423, code, &error.to_string(), details);
+        }
+    };
+    #[cfg(test)]
+    if writer.is_some() {
+        adopted_launch_maintenance_acquired_test_hook();
+    }
+
+    let now = current_timestamp();
+    let record = session_launch::new_session_record(session_launch::NewSessionParams {
+        id: launch.id.clone(),
+        project_root: launch.project_root.clone(),
+        harness: launch.harness.clone(),
+        title: launch.title.clone(),
+        status: "created".to_string(),
+        now: now.clone(),
+        conversation_id: launch.conversation_id.clone(),
+        familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
+        execution_binding: Some(binding.clone()),
+        labels: Vec::new(),
+        visibility: None,
+    });
+    // The final resolution, child revalidation, and both inserts form the only
+    // writer transaction in the adopted admission path.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(response) = adopted_launch_resolution(&tx, &adoption, &binding)? {
+        return Ok(response);
+    }
+    if let Some(parent) = binding.parent.as_ref() {
+        if let Err(response) = correlate_child_parent(&tx, parent, raw_caller_familiar_id.as_str())?
+        {
+            return Ok(response);
+        }
+    }
+    store::insert_session(&tx, &record)?;
+    store::insert_launch_adoption(
+        &tx,
+        &Uuid::new_v4().to_string(),
+        &record.id,
+        &adoption,
+        &binding,
+        &now,
+    )?;
+    tx.commit()?;
+    // A replay may now observe durable `created`. The adopted runtime invokes
+    // the terminal-safe publication callback at its exact ownership boundary.
+    drop(adoption_gate);
+
+    let mut ownership_callback_invoked = false;
+    let mut ownership_publication_failed = false;
+    let mut publish_runtime_ownership = || -> Result<()> {
+        if ownership_callback_invoked {
+            ownership_publication_failed = true;
+            return Err(anyhow::Error::new(RuntimeOwnershipPublicationError));
+        }
+        ownership_callback_invoked = true;
+        match store::update_session_status_if_current(
+            &conn,
+            &record.id,
+            "created",
+            "running",
+            None,
+            &current_timestamp(),
+        ) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                ownership_publication_failed = true;
+                Err(anyhow::Error::new(RuntimeOwnershipPublicationError))
+            }
+        }
+    };
+    let launch_result =
+        runtime.launch_adopted_session(&launch, writer, &mut publish_runtime_ownership);
+    if let Err(error) = launch_result {
+        if ownership_publication_failed
+            || error
+                .downcast_ref::<RuntimeOwnershipPublicationError>()
+                .is_some()
+        {
+            return post_adoption_error(
+                500,
+                "launch_failed",
+                "Session runtime status could not be persisted after adoption.",
+            );
+        }
+        // A retained-ownership error means the runtime registry may still own
+        // a killable handle, so `failed` would incorrectly fence cleanup.
+        let ownership_retained = error
+            .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+            .is_some();
+        if !ownership_retained {
+            let expected = if ownership_callback_invoked {
+                "running"
+            } else {
+                "created"
+            };
+            let _ = store::update_session_status_if_current(
+                &conn,
+                &record.id,
+                expected,
+                "failed",
+                None,
+                &current_timestamp(),
+            );
+        }
+        return post_adoption_error(
+            500,
+            "launch_failed",
+            "Session runtime launch failed after adoption.",
+        );
+    }
+
+    if !ownership_callback_invoked {
+        return post_adoption_error(
+            500,
+            "launch_failed",
+            "Session runtime status could not be persisted after adoption.",
+        );
+    }
+
+    if let (Some(caller_id), Some(callee_id)) = (&launch.caller_familiar_id, &launch.familiar_id) {
+        if let Err(_error) = crate::coven_calls::emit_running(
+            coven_home,
+            caller_id,
+            callee_id,
+            &launch.prompt,
+            Some(record.id.as_str()),
+        ) {
+            eprintln!("[coven-calls] warn: failed to record adopted delegation");
+        }
+    }
+
+    let persisted = match store::get_session(&conn, &record.id) {
+        Ok(Some(persisted)) => persisted,
+        Ok(None) | Err(_) => {
+            return post_adoption_error(
+                500,
+                "launch_failed",
+                "Session state could not be read after adoption.",
+            );
+        }
+    };
+    json_response(201, &persisted)
+}
+
 /// Maps a shape/contract/expiry violation from `execution_binding::parse` (or
 /// `validate_not_expired`) onto the O2 error codes (§7): `Missing`/`Invalid`
 /// become `400 execution_binding_invalid`, `Unsupported` becomes
@@ -2319,6 +2857,41 @@ fn parent_correlation_advisory_check_completed_failpoint() {
 #[inline(always)]
 fn parent_correlation_advisory_check_completed_failpoint() {}
 
+#[cfg(test)]
+/// Runs a one-shot callback after a real maintenance writer is acquired and
+/// before the authoritative SQLite transaction begins.
+fn adopted_launch_maintenance_acquired_test_hook() {
+    let callback =
+        tests::ADOPTED_LAUNCH_MAINTENANCE_ACQUIRED_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+#[cfg(test)]
+fn adopted_input_before_gate_test_hook() {
+    let callback = tests::ADOPTED_INPUT_BEFORE_GATE_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn adopted_input_before_gate_test_hook() {}
+
+#[cfg(test)]
+fn adopted_input_precommit_test_hook() {
+    let callback = tests::ADOPTED_INPUT_PRECOMMIT_HOOK.with(|hook| hook.borrow_mut().take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn adopted_input_precommit_test_hook() {}
+
 /// A bound-mutation proof failure (issue #728 Task 4, §4). Distinct from
 /// [`crate::execution_binding::ValidationError`] because an absent
 /// `executionBinding` field, or one missing a required member, must map to
@@ -2338,6 +2911,30 @@ enum BoundProofError {
     Mismatch { path: &'static str },
 }
 
+/// Parses and shape-validates the `executionBinding` proof carried by a
+/// bound-mutation request, independent of any stored session binding. This
+/// is the structural half of `require_bound_proof` — closed shape,
+/// contract, and per-field syntax only — factored out so routes that must
+/// validate O2 shape *before* deciding whether a target session is bound
+/// (issue #728 Task 6, §4) can run it without a `stored` binding to compare
+/// against. See `BoundProofError` for how parse outcomes map onto the O2
+/// error taxonomy.
+fn parse_execution_binding_proof(
+    payload: &Value,
+) -> std::result::Result<crate::execution_binding::ExecutionBinding, BoundProofError> {
+    let Some(value) = payload.get("executionBinding") else {
+        return Err(BoundProofError::Required {
+            path: "executionBinding",
+        });
+    };
+    crate::execution_binding::parse(value).map_err(|error| match error {
+        crate::execution_binding::ValidationError::Missing { path } => {
+            BoundProofError::Required { path }
+        }
+        other => BoundProofError::Validation(other),
+    })
+}
+
 /// Parses and exact-matches the `executionBinding` proof required by a
 /// bound input/kill request against the session's `stored` binding. See
 /// `BoundProofError` for how parse outcomes map onto the O2 error taxonomy.
@@ -2345,17 +2942,7 @@ fn require_bound_proof(
     payload: &Value,
     stored: &crate::execution_binding::ExecutionBinding,
 ) -> std::result::Result<crate::execution_binding::ExecutionBinding, BoundProofError> {
-    let Some(value) = payload.get("executionBinding") else {
-        return Err(BoundProofError::Required {
-            path: "executionBinding",
-        });
-    };
-    let supplied = crate::execution_binding::parse(value).map_err(|error| match error {
-        crate::execution_binding::ValidationError::Missing { path } => {
-            BoundProofError::Required { path }
-        }
-        other => BoundProofError::Validation(other),
-    })?;
+    let supplied = parse_execution_binding_proof(payload)?;
     if let Some(path) = stored.first_mismatch_path(&supplied) {
         return Err(BoundProofError::Mismatch { path });
     }
@@ -2511,6 +3098,9 @@ fn register_external_session(coven_home: &Path, body: Option<&str>) -> Result<Ap
         Ok(payload) => payload,
         Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
     };
+    if payload.get("requestAdoption").is_some() {
+        return request_adoption_invalid("requestAdoption");
+    }
     // Task 3 (#728, §6): reject any executionBinding at all, before reading
     // any registration field. Coven does not supervise an externally
     // registered runtime and cannot honor bound-operation guarantees for it.
@@ -3150,6 +3740,275 @@ fn required_string(payload: &Value, field: &str) -> Result<String> {
         .with_context(|| format!("request body requires string field `{field}`"))
 }
 
+fn adopted_input_response(status: u16, replayed: bool) -> Result<ApiResponse> {
+    json_response(
+        status,
+        &json!({
+            "adopted": true,
+            "replayed": replayed,
+            "delivery": "not_asserted",
+        }),
+    )
+}
+
+fn adopted_input_resolution(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    adoption: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<ApiResponse>> {
+    match store::resolve_input_adoption(conn, session_id, adoption, binding)? {
+        store::AdoptionResolution::Absent => Ok(None),
+        store::AdoptionResolution::Replay { .. } => Ok(Some(adopted_input_response(200, true)?)),
+        store::AdoptionResolution::Conflict { field } => Ok(Some(adoption_conflict(field)?)),
+    }
+}
+
+fn adopted_input_read_resolution(
+    conn: &mut rusqlite::Connection,
+    session_id: &str,
+    adoption: &crate::request_adoption::RequestAdoption,
+    binding: &crate::execution_binding::ExecutionBinding,
+) -> Result<Option<ApiResponse>> {
+    let transaction = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
+    let resolution = adopted_input_resolution(&transaction, session_id, adoption, binding);
+    transaction
+        .rollback()
+        .context("failed to close adopted input read transaction")?;
+    resolution
+}
+
+fn session_handoff_active_response(session_id: &str) -> Result<ApiResponse> {
+    api_error(
+        409,
+        "session_handoff_active",
+        "Session input is fenced by a committed handoff takeover.",
+        Some(json!({ "sessionId": session_id })),
+    )
+}
+
+fn acquire_input_adoption_gate(
+    coven_home: &Path,
+    request_key: &str,
+) -> Result<crate::adoption_gate::AdoptionGate> {
+    // Serialize only same-home/key acquisition inside this process so two
+    // first-open contenders cannot race lock-file creation. The OS-backed gate
+    // remains the cross-process authority and is held after this guard drops.
+    type ProcessGate = std::sync::Weak<Mutex<()>>;
+    type ProcessGateKey = (PathBuf, String);
+    static PROCESS_GATES: OnceLock<Mutex<BTreeMap<ProcessGateKey, ProcessGate>>> = OnceLock::new();
+    let digest = Sha256::digest(request_key.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let process_gate_key = (coven_home.to_path_buf(), digest);
+    let process_gate = {
+        let process_gates = PROCESS_GATES.get_or_init(|| Mutex::new(BTreeMap::new()));
+        let mut gates = process_gates
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        match gates.get(&process_gate_key).and_then(ProcessGate::upgrade) {
+            Some(gate) => gate,
+            None => {
+                let gate = std::sync::Arc::new(Mutex::new(()));
+                gates.insert(process_gate_key, std::sync::Arc::downgrade(&gate));
+                gate
+            }
+        }
+    };
+    let _process_guard = process_gate
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    crate::adoption_gate::AdoptionGate::acquire(coven_home, request_key, None)
+}
+
+fn record_adopted_input(
+    coven_home: &Path,
+    session_id: &str,
+    body: Option<&str>,
+    runtime: &dyn SessionRuntime,
+) -> Result<ApiResponse> {
+    let mut conn = store::open_store(&store_path(coven_home))?;
+    let Some(session) = store::get_session(&conn, session_id)? else {
+        return api_error(
+            404,
+            "session_not_found",
+            "Session was not found.",
+            Some(json!({ "sessionId": session_id })),
+        );
+    };
+
+    let payload = match parse_body(body) {
+        Ok(payload) => payload,
+        Err(error) => return api_error(400, "invalid_request", &error.to_string(), None),
+    };
+    // Adopted-input structural precedence (issue #728 Task 6, §4): O2 shape,
+    // then O3 shape, then `data`, all run before any relationship/admission
+    // check (bound vs. unbound target, exact O2 proof comparison). This
+    // must hold regardless of whether the target session turns out to be
+    // bound or unbound — an unbound target's malformed O2/O3/data still
+    // fails closed on the structural error, not the relationship error, so
+    // no runtime/store/gate work happens on a structurally invalid request.
+    let supplied_binding = match parse_execution_binding_proof(&payload) {
+        Ok(binding) => binding,
+        Err(error) => return bound_proof_error_response(error),
+    };
+    let Some(adoption_value) = payload.get("requestAdoption") else {
+        return request_adoption_required();
+    };
+    let adoption = match crate::request_adoption::parse(adoption_value) {
+        Ok(adoption) => adoption,
+        Err(error) => return request_adoption_error(error),
+    };
+    let Some(data) = payload.get("data").and_then(Value::as_str) else {
+        return api_error(
+            400,
+            "invalid_request",
+            "input payload requires string field `data`",
+            None,
+        );
+    };
+    let action_payload = json!({ "data": data });
+
+    // Relationship/admission (§4, step 4): only a structurally valid O2 +
+    // O3 + `data` request reaches this point. An unbound target is always
+    // an invalid adoption location, named at `executionBinding` exactly as
+    // before; a bound target must exact-match the stored proof.
+    let Some(stored_binding) = session.execution_binding.as_ref() else {
+        return request_adoption_invalid("executionBinding");
+    };
+    if let Some(path) = stored_binding.first_mismatch_path(&supplied_binding) {
+        return execution_binding_mismatch(path);
+    }
+
+    if let Some(response) =
+        adopted_input_read_resolution(&mut conn, session_id, &adoption, &supplied_binding)?
+    {
+        return Ok(response);
+    }
+
+    adopted_input_before_gate_test_hook();
+    let adoption_gate = acquire_input_adoption_gate(coven_home, &adoption.key)?;
+    if let Some(response) =
+        adopted_input_read_resolution(&mut conn, session_id, &adoption, &supplied_binding)?
+    {
+        return Ok(response);
+    }
+
+    if let Err(error) = supplied_binding.validate_not_expired(Utc::now()) {
+        return execution_binding_error(error);
+    }
+    if session.status != "running" {
+        return session_not_live_response(session_id);
+    }
+    match runtime.can_record_session_event(session_id, "input", &action_payload) {
+        Some(Ok(true)) | None => {}
+        Some(Ok(false)) => {
+            return api_error(
+                413,
+                "input_too_large",
+                "Input payload exceeds the daemon event writer capacity.",
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+        Some(Err(_)) => {
+            return api_error(
+                500,
+                "event_preflight_failed",
+                "Input event capacity could not be checked.",
+                None,
+            );
+        }
+    }
+    if store::session_input_handoff_fenced(&conn, session_id)? {
+        return session_handoff_active_response(session_id);
+    }
+    adopted_input_precommit_test_hook();
+
+    let committed = store::acquire_session_input_lease_and_adopt(
+        &mut conn,
+        session_id,
+        &adoption,
+        &supplied_binding,
+        &current_timestamp(),
+    )?;
+    let (adoption_id, lease_id) = match committed {
+        store::InputAdoptionResult::Adopted {
+            adoption_id,
+            lease_id,
+        } => (adoption_id, lease_id),
+        store::InputAdoptionResult::Replay => return adopted_input_response(200, true),
+        store::InputAdoptionResult::Conflict => {
+            return adoption_conflict("requestAdoption.key");
+        }
+        store::InputAdoptionResult::NotLive => return session_not_live_response(session_id),
+        store::InputAdoptionResult::HandoffFenced => {
+            return session_handoff_active_response(session_id);
+        }
+    };
+    drop(adoption_gate);
+
+    let mut action = || {
+        runtime
+            .send_input(session_id, &action_payload)
+            .map_err(SessionEventBoundaryError::Runtime)
+    };
+    let boundary = perform_direct_session_event(
+        runtime,
+        &conn,
+        coven_home,
+        DirectSessionEvent {
+            session_id,
+            kind: "input",
+            payload: action_payload.clone(),
+            request_adoption_id: Some(&adoption_id),
+        },
+        &mut action,
+    );
+    let release = store::release_session_input_lease(&conn, &lease_id);
+
+    match boundary {
+        Ok(()) => match release {
+            Ok(()) => adopted_input_response(202, false),
+            Err(_) => post_adoption_error(
+                500,
+                "input_lease_release_failed",
+                "Session input lease could not be released after adoption.",
+            ),
+        },
+        Err(SessionEventBoundaryError::Runtime(error)) => {
+            let (status, code, message) = if error
+                .downcast_ref::<crate::daemon::NotLiveError>()
+                .is_some()
+            {
+                (
+                    409,
+                    "session_not_live",
+                    "Session runtime was not live after input adoption.",
+                )
+            } else {
+                (
+                    500,
+                    "send_input_failed",
+                    "Session runtime input failed after adoption.",
+                )
+            };
+            post_adoption_error(status, code, message)
+        }
+        Err(SessionEventBoundaryError::Coordination(_)) => post_adoption_error(
+            500,
+            "input_coordination_failed",
+            "Session input coordination failed after adoption.",
+        ),
+        Err(SessionEventBoundaryError::Persistence(_)) => post_adoption_error(
+            500,
+            "event_persistence_failed",
+            "Session input event persistence failed after adoption.",
+        ),
+    }
+}
+
 fn record_input(
     coven_home: &Path,
     session_id: &str,
@@ -3165,8 +4024,6 @@ fn record_input(
             Some(json!({ "sessionId": session_id })),
         );
     };
-    let is_bound = session.execution_binding.is_some();
-
     // Same structured-error pattern as `launch_session`: malformed JSON
     // or runtime send failures must NOT propagate to the accept loop
     // (that crashes the daemon process). Parse errors → 400; runtime
@@ -3182,27 +4039,22 @@ fn record_input(
 
     let payload = if let Some(stored_binding) = session.execution_binding.as_ref() {
         // Bound precedence (issue #728 Task 4, §4.2): session lookup, body
-        // parse, then complete exact-match proof (including the input-only
-        // expiry rejection) all run *before* the existing status/liveness
-        // gate. This deliberately reorders the unbound flow below: a bound
-        // caller with no/incomplete/malformed/mismatched/expired proof must
-        // fail closed on the proof itself, never learning session liveness
-        // from the response.
+        // parse, then complete exact-match proof all run before O3 rejects the
+        // legacy route. This deliberately reorders the unbound flow below: a
+        // malformed or mismatched bound proof still fails closed before the
+        // adoption-location error.
         let payload = match parse_body(body) {
             Ok(payload) => payload,
             Err(error) => return parse_error_response(error),
         };
-        let supplied = match require_bound_proof(&payload, stored_binding) {
-            Ok(supplied) => supplied,
+        match require_bound_proof(&payload, stored_binding) {
+            Ok(_) => {}
             Err(error) => return bound_proof_error_response(error),
-        };
-        if let Err(error) = supplied.validate_not_expired(Utc::now()) {
-            return execution_binding_error(error);
         }
-        if session.status != "running" {
-            return session_not_live_response(session_id);
+        if payload.get("requestAdoption").is_some() {
+            return request_adoption_invalid("requestAdoption");
         }
-        payload
+        return request_adoption_required();
     } else {
         // Unbound precedence is unchanged: liveness is checked before the
         // body is even parsed.
@@ -3210,41 +4062,31 @@ fn record_input(
             return session_not_live_response(session_id);
         }
         match parse_body(body) {
-            Ok(payload) => payload,
+            Ok(payload) => {
+                if payload.get("requestAdoption").is_some() {
+                    return request_adoption_invalid("executionBinding");
+                }
+                payload
+            }
             Err(error) => return parse_error_response(error),
         }
     };
     // Validate `data` shape here (client error) instead of letting the
     // runtime surface it as a 500. Required field, must be a string.
-    let Some(data) = payload.get("data").and_then(Value::as_str) else {
+    if payload.get("data").and_then(Value::as_str).is_none() {
         return api_error(
             400,
             "invalid_request",
             "input payload requires string field `data`",
             Some(json!({ "sessionId": session_id })),
         );
-    };
-    // Metadata isolation (issue #728 Task 4, §4.4): `executionBinding` is
-    // reserved proof metadata that must never reach writer capacity checks,
-    // the runtime, or the persisted event — on a bound session because it
-    // has already served its purpose (the exact-match proof above), and on
-    // an *unbound* session because the key is reserved regardless of
-    // whether a proof was ever required. An unbound session never runs the
-    // proof steps, so a malformed or incomplete `executionBinding` here is
-    // never validated or rejected — it is simply stripped, unvalidated,
-    // alongside a well-formed one. Every other field's shape and precedence
-    // is unaffected: this only ever removes the single reserved key,
-    // preserving the caller's exact payload (and legacy unbound behavior)
-    // otherwise.
-    let action_payload = if is_bound {
-        json!({ "data": data })
-    } else {
-        let mut sanitized = payload.clone();
-        if let Value::Object(fields) = &mut sanitized {
-            fields.remove("executionBinding");
-        }
-        sanitized
-    };
+    }
+    // The only legacy input that reaches execution is unbound. Preserve its
+    // payload while stripping the reserved O2 proof key as before.
+    let mut action_payload = payload.clone();
+    if let Value::Object(fields) = &mut action_payload {
+        fields.remove("executionBinding");
+    }
     match runtime.can_record_session_event(session_id, "input", &action_payload) {
         Some(Ok(true)) | None => {}
         Some(Ok(false)) => {
@@ -3276,9 +4118,12 @@ fn record_input(
         runtime,
         &conn,
         coven_home,
-        session_id,
-        "input",
-        action_payload.clone(),
+        DirectSessionEvent {
+            session_id,
+            kind: "input",
+            payload: action_payload.clone(),
+            request_adoption_id: None,
+        },
         &mut action,
     ) {
         Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
@@ -3331,6 +4176,26 @@ fn kill_session(
         );
     };
 
+    let parsed_payload = match parse_body(body) {
+        Ok(payload) => Some(payload),
+        Err(error) if session.execution_binding.is_some() => {
+            return api_error(
+                400,
+                "invalid_request",
+                &error.to_string(),
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+        Err(_) => None,
+    };
+    if parsed_payload
+        .as_ref()
+        .and_then(|payload| payload.get("requestAdoption"))
+        .is_some()
+    {
+        return request_adoption_invalid("requestAdoption");
+    }
+
     if let Some(stored_binding) = session.execution_binding.as_ref() {
         // Bound precedence (issue #728 Task 4, §4.3): session lookup, body
         // parse, then complete exact-match proof, run *before* the existing
@@ -3338,23 +4203,13 @@ fn kill_session(
         // does NOT reject an elapsed `expiresAt` — an exact-matching but
         // expired proof is still accepted, so a caller can always tear down
         // a session it can prove it owns.
-        let payload = match parse_body(body) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return api_error(
-                    400,
-                    "invalid_request",
-                    &error.to_string(),
-                    Some(json!({ "sessionId": session_id })),
-                );
-            }
-        };
+        let payload = parsed_payload.expect("bound kill body was parsed above");
         if let Err(error) = require_bound_proof(&payload, stored_binding) {
             return bound_proof_error_response(error);
         }
     }
-    // Unbound sessions preserve existing precedence/behavior entirely: the
-    // body (if any) is never parsed or validated for a kill request.
+    // Unbound kill bodies are parsed only to reject the reserved O3 member;
+    // every other body shape remains unvalidated and ignored.
 
     if session.status != "running" {
         return session_not_live_response(session_id);
@@ -3381,9 +4236,12 @@ fn kill_session(
         runtime,
         &conn,
         coven_home,
-        session_id,
-        "kill",
-        kill_payload,
+        DirectSessionEvent {
+            session_id,
+            kind: "kill",
+            payload: kill_payload,
+            request_adoption_id: None,
+        },
         &mut action,
     ) {
         Ok(()) => json_response(202, &json!({ "ok": true, "accepted": true })),
@@ -3880,7 +4738,18 @@ fn insert_event(
     kind: &str,
     payload: Value,
 ) -> Result<()> {
-    store::insert_event_with_privacy(
+    insert_event_with_adoption(conn, coven_home, session_id, kind, payload, None)
+}
+
+fn insert_event_with_adoption(
+    conn: &rusqlite::Connection,
+    coven_home: &Path,
+    session_id: &str,
+    kind: &str,
+    payload: Value,
+    request_adoption_id: Option<&str>,
+) -> Result<()> {
+    store::insert_event_with_privacy_and_adoption(
         conn,
         coven_home,
         &store::EventRecord {
@@ -3894,6 +4763,7 @@ fn insert_event(
                 .context("failed to serialize event payload")?,
             created_at: current_timestamp(),
         },
+        request_adoption_id,
     )
 }
 
@@ -3911,21 +4781,45 @@ fn record_direct_session_event(
     }
 }
 
+struct DirectSessionEvent<'a> {
+    session_id: &'a str,
+    kind: &'a str,
+    payload: Value,
+    request_adoption_id: Option<&'a str>,
+}
+
 fn perform_direct_session_event(
     runtime: &dyn SessionRuntime,
     conn: &rusqlite::Connection,
     coven_home: &Path,
-    session_id: &str,
-    kind: &str,
-    payload: Value,
+    event: DirectSessionEvent<'_>,
     action: &mut dyn FnMut() -> SessionEventBoundaryResult,
 ) -> SessionEventBoundaryResult {
-    match runtime.with_session_event_boundary(session_id, kind, &payload, action) {
+    let DirectSessionEvent {
+        session_id,
+        kind,
+        payload,
+        request_adoption_id,
+    } = event;
+    match runtime.with_session_event_boundary(
+        session_id,
+        kind,
+        &payload,
+        request_adoption_id,
+        action,
+    ) {
         Some(result) => result,
         None => {
             action()?;
-            insert_event(conn, coven_home, session_id, kind, payload)
-                .map_err(SessionEventBoundaryError::Persistence)
+            insert_event_with_adoption(
+                conn,
+                coven_home,
+                session_id,
+                kind,
+                payload,
+                request_adoption_id,
+            )
+            .map_err(SessionEventBoundaryError::Persistence)
         }
     }
 }
@@ -7715,6 +8609,12 @@ mod tests {
         /// silent no-op for every test that never installs one.
         pub(super) static PARENT_CORRELATION_FAILPOINT: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
             std::cell::RefCell::new(None);
+        pub(super) static ADOPTED_LAUNCH_MAINTENANCE_ACQUIRED_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+        pub(super) static ADOPTED_INPUT_BEFORE_GATE_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+        pub(super) static ADOPTED_INPUT_PRECOMMIT_HOOK:
+            std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
     }
 
     /// RAII installer for [`PARENT_CORRELATION_FAILPOINT`]. Clears the hook
@@ -7732,6 +8632,67 @@ mod tests {
     impl Drop for ParentCorrelationFailpointGuard {
         fn drop(&mut self) {
             PARENT_CORRELATION_FAILPOINT.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    struct AdoptedLaunchMaintenanceAcquiredHookGuard;
+
+    impl AdoptedLaunchMaintenanceAcquiredHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            ADOPTED_LAUNCH_MAINTENANCE_ACQUIRED_HOOK
+                .with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for AdoptedLaunchMaintenanceAcquiredHookGuard {
+        fn drop(&mut self) {
+            ADOPTED_LAUNCH_MAINTENANCE_ACQUIRED_HOOK.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    struct AdoptedInputBeforeGateHookGuard;
+
+    impl AdoptedInputBeforeGateHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            ADOPTED_INPUT_BEFORE_GATE_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for AdoptedInputBeforeGateHookGuard {
+        fn drop(&mut self) {
+            ADOPTED_INPUT_BEFORE_GATE_HOOK.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    struct AdoptedInputPrecommitHookGuard;
+
+    impl AdoptedInputPrecommitHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            ADOPTED_INPUT_PRECOMMIT_HOOK.with(|cell| *cell.borrow_mut() = Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for AdoptedInputPrecommitHookGuard {
+        fn drop(&mut self) {
+            ADOPTED_INPUT_PRECOMMIT_HOOK.with(|cell| *cell.borrow_mut() = None);
+        }
+    }
+
+    struct LaunchAdoptionKeyMissHookGuard;
+
+    impl LaunchAdoptionKeyMissHookGuard {
+        fn install(hook: impl FnOnce() + 'static) -> Self {
+            store::set_launch_adoption_key_miss_test_hook(Some(Box::new(hook)));
+            Self
+        }
+    }
+
+    impl Drop for LaunchAdoptionKeyMissHookGuard {
+        fn drop(&mut self) {
+            store::set_launch_adoption_key_miss_test_hook(None);
         }
     }
 
@@ -7791,6 +8752,37 @@ mod tests {
         let decoded: HealthResponse = serde_json::from_value(payload)?;
         assert!(!decoded.capabilities.afs_commit_dry_run);
         assert!(!decoded.capabilities.session_launch_policy);
+        Ok(())
+    }
+
+    #[test]
+    fn health_request_adoption_contracts_are_additive_and_defaulted() -> anyhow::Result<()> {
+        let current = health_response(None);
+        let mut payload = serde_json::to_value(&current)?;
+
+        assert_eq!(
+            payload["capabilities"]["requestAdoptionContracts"],
+            json!([crate::request_adoption::CONTRACT])
+        );
+        assert_eq!(
+            payload["capabilities"]["executionBindingContracts"],
+            json!([crate::execution_binding::CONTRACT])
+        );
+        assert!(
+            payload["daemon"].is_null(),
+            "daemon metadata must retain its null variant"
+        );
+
+        payload["capabilities"]
+            .as_object_mut()
+            .expect("capabilities object")
+            .remove("requestAdoptionContracts");
+        let decoded: HealthResponse = serde_json::from_value(payload)?;
+        assert!(decoded.capabilities.request_adoption_contracts.is_empty());
+        assert_eq!(
+            decoded.capabilities.execution_binding_contracts,
+            vec![crate::execution_binding::CONTRACT.to_string()]
+        );
         Ok(())
     }
 
@@ -9654,12 +10646,10 @@ mod tests {
     }
 
     #[test]
-    fn bound_root_launch_maintenance_lock_does_not_open_store_before_the_gate() -> anyhow::Result<()>
-    {
-        // Regression (#728 Task 3): a root-bound launch (no `parent` to look
-        // up) must preserve the existing maintenance-before-store-open
-        // precedence exactly like an unbound launch, and must not create the
-        // store as a side effect of a rejected admission.
+    fn adopted_root_launch_maintenance_lock_commits_no_evidence() -> anyhow::Result<()> {
+        // O3 opens the ledger for replay/conflict resolution before mutable
+        // maintenance admission, but a maintenance denial must still commit
+        // neither a session nor an adoption.
         let temp_dir = tempfile::tempdir()?;
         seed_familiars_toml(temp_dir.path())?;
         let project_root = temp_dir.path().join("repo");
@@ -9678,10 +10668,9 @@ mod tests {
         assert_eq!(response.status, 423, "{}", response.body);
         assert!(response.body.contains(r#""code":"maintenance_locked""#));
         assert!(runtime.launches.borrow().is_empty());
-        assert!(
-            !store_path(temp_dir.path()).exists(),
-            "a maintenance-rejected root-bound launch must not initialize the store"
-        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        assert_eq!(adoption_row_count(temp_dir.path())?, 0);
         owner.release()?;
         Ok(())
     }
@@ -10123,6 +11112,1554 @@ mod tests {
         })
     }
 
+    fn request_adoption(key: &str, request_digest: &str) -> Value {
+        json!({
+            "contract": crate::request_adoption::CONTRACT,
+            "key": key,
+            "requestDigest": request_digest,
+        })
+    }
+
+    fn adopted_launch_body(
+        project_root: &Path,
+        familiar_id: &str,
+        binding: Value,
+        key: &str,
+    ) -> Value {
+        let request_digest = binding["requestDigest"]
+            .as_str()
+            .expect("binding request digest")
+            .to_string();
+        json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "hello adopted coven",
+            "familiarId": familiar_id,
+            "executionBinding": binding,
+            "requestAdoption": request_adoption(key, &request_digest),
+        })
+    }
+
+    fn post_adopted_launch(
+        coven_home: &Path,
+        body: &Value,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_runtime(
+            "POST",
+            "/api/v1/adopted-sessions",
+            coven_home,
+            None,
+            Some(&body.to_string()),
+            runtime,
+        )
+    }
+
+    fn adoption_row_count(coven_home: &Path) -> anyhow::Result<usize> {
+        let conn = store::open_store(&store_path(coven_home))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| {
+            row.get(0)
+        })?;
+        Ok(count.try_into()?)
+    }
+
+    fn assert_adoption_error(
+        response: &ApiResponse,
+        status: u16,
+        code: &str,
+        field: &str,
+    ) -> anyhow::Result<()> {
+        assert_eq!(response.status, status, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], code, "{}", response.body);
+        assert_eq!(
+            body["error"]["details"],
+            json!({ "fields": [field] }),
+            "{}",
+            response.body
+        );
+        Ok(())
+    }
+
+    fn persist_committed_adopted_session(
+        coven_home: &Path,
+        id: &str,
+        project_root: &Path,
+        status: &str,
+        created_at: &str,
+        binding_value: &Value,
+        adoption_value: &Value,
+    ) -> anyhow::Result<()> {
+        let binding = crate::execution_binding::parse(binding_value)
+            .expect("committed fixture binding must parse");
+        let adoption = crate::request_adoption::parse(adoption_value)
+            .expect("committed fixture adoption must parse");
+        let mut conn = store::open_store(&store_path(coven_home))?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let record = store::SessionRecord {
+            id: id.to_string(),
+            project_root: project_root.to_string_lossy().into_owned(),
+            harness: "codex".to_string(),
+            title: "committed adopted launch".to_string(),
+            status: status.to_string(),
+            exit_code: None,
+            archived_at: None,
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            conversation_id: None,
+            familiar_id: Some(binding.familiar_id.clone()),
+            execution_binding: Some(binding.clone()),
+            labels: Vec::new(),
+            visibility: "private".to_string(),
+            external: false,
+            transcript_path: None,
+        };
+        store::insert_session(&tx, &record)?;
+        store::insert_launch_adoption(
+            &tx,
+            &format!("adoption-{id}"),
+            id,
+            &adoption,
+            &binding,
+            created_at,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_first_root_and_child_commit_once() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+
+        let root_body =
+            adopted_launch_body(&project_root, "cody", root_binding("cody"), "launch-root");
+        let root = post_adopted_launch(temp.path(), &root_body, &runtime)?;
+        assert_eq!(root.status, 201, "{}", root.body);
+        let root_record: Value = serde_json::from_str(&root.body)?;
+        assert_eq!(root_record["status"], "running");
+
+        let mut child = child_binding(
+            "sage",
+            root_record["id"].as_str().expect("root session id"),
+            "graph-1",
+            "node-1",
+            "attempt-1",
+        );
+        child["attemptId"] = json!("attempt-child");
+        let mut child_body = adopted_launch_body(&project_root, "sage", child, "launch-child");
+        child_body["callerFamiliarId"] = json!("cody");
+        let child = post_adopted_launch(temp.path(), &child_body, &runtime)?;
+        assert_eq!(child.status, 201, "{}", child.body);
+        let child_record: Value = serde_json::from_str(&child.body)?;
+        assert_eq!(child_record["status"], "running");
+        assert_ne!(root_record["id"], child_record["id"]);
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert_eq!(store::list_sessions(&conn)?.len(), 2);
+        assert_eq!(adoption_row_count(temp.path())?, 2);
+        assert_eq!(runtime.launches.borrow().len(), 2);
+        assert_eq!(crate::coven_calls::load_calls(temp.path())?.len(), 1);
+
+        let replay = post_adopted_launch(temp.path(), &child_body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["id"],
+            child_record["id"]
+        );
+        assert_eq!(runtime.launches.borrow().len(), 2);
+        assert_eq!(crate::coven_calls::load_calls(temp.path())?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_sequential_replay_returns_current_persisted_session() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "sequential-replay",
+        );
+
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        let id = first_body["id"].as_str().expect("session id");
+        let conn = store::open_store(&store_path(temp.path()))?;
+        store::update_session_status(&conn, id, "completed", Some(0), &current_timestamp())?;
+
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let replay_body: Value = serde_json::from_str(&replay.body)?;
+        assert_eq!(replay_body["id"], first_body["id"]);
+        assert_eq!(replay_body["status"], "completed");
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_snapshot_precheck_replays_exact_winner_and_fresh_conflict(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = root_binding("sage");
+        let body = adopted_launch_body(&project_root, "sage", binding.clone(), "snapshot-precheck");
+        let adoption = body["requestAdoption"].clone();
+        let hook_home = temp.path().to_path_buf();
+        let hook_project = project_root.clone();
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_observed = std::sync::Arc::clone(&hook_ran);
+        let _hook = LaunchAdoptionKeyMissHookGuard::install(move || {
+            hook_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            persist_committed_adopted_session(
+                &hook_home,
+                "snapshot-precheck-winner",
+                &hook_project,
+                "created",
+                &current_timestamp(),
+                &binding,
+                &adoption,
+            )
+            .expect("commit exact winner between launch-adoption reads");
+            std::fs::write(hook_home.join("familiars.toml"), "")
+                .expect("make mutable admission fail after the concurrent commit");
+        });
+        let runtime = ConcurrentRecordingRuntime::default();
+
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert!(hook_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let replay_body: Value = serde_json::from_str(&replay.body)?;
+        assert_eq!(replay_body["id"], "snapshot-precheck-winner");
+        assert_eq!(replay_body["status"], "created");
+        assert_eq!(runtime.launch_count(), 0);
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+
+        let mut nonidentical = body;
+        nonidentical["requestAdoption"]["key"] = json!("snapshot-precheck-other-key");
+        let conflict = post_adopted_launch(temp.path(), &nonidentical, &runtime)?;
+        assert_adoption_error(
+            &conflict,
+            409,
+            "request_adoption_conflict",
+            "executionBinding.attemptId",
+        )?;
+        assert_eq!(runtime.launch_count(), 0);
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_runtime_retains_maintenance_writer_until_explicit_release(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        assert!(maintenance.status()?.writers.is_empty());
+        let runtime = RetainingWriterRuntime::default();
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "retained-maintenance-writer",
+        );
+
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        assert_eq!(runtime.launch_count(), 1);
+        let retained_status = maintenance.status()?;
+        assert_eq!(retained_status.writers.len(), 1);
+        assert_eq!(
+            retained_status.writers[0].id,
+            format!(
+                "daemon-session-{}",
+                first_body["id"].as_str().context("first session id")?
+            )
+        );
+        assert_eq!(retained_status.writers[0].kind, "session");
+
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["id"],
+            first_body["id"]
+        );
+        assert_eq!(runtime.launch_count(), 1);
+        let replay_status = maintenance.status()?;
+        assert_eq!(replay_status.writers.len(), 1);
+        assert_eq!(
+            replay_status.writers[0].generation,
+            retained_status.writers[0].generation
+        );
+        assert_eq!(replay_status.writers[0].id, retained_status.writers[0].id);
+        assert_eq!(
+            replay_status.writers[0].kind,
+            retained_status.writers[0].kind
+        );
+
+        runtime.release_writer()?;
+        assert!(maintenance.status()?.writers.is_empty());
+        let owner = maintenance.acquire_owner("after-retained-writer")?;
+        owner.assert_held()?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_transaction_replay_releases_acquired_maintenance_writer() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let binding = root_binding("sage");
+        let body =
+            adopted_launch_body(&project_root, "sage", binding.clone(), "transaction-replay");
+        let adoption = body["requestAdoption"].clone();
+        let hook_home = temp.path().to_path_buf();
+        let hook_project = project_root.clone();
+        let hook_maintenance = maintenance.clone();
+        let writer_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_writer_observed = std::sync::Arc::clone(&writer_observed);
+        let _hook = AdoptedLaunchMaintenanceAcquiredHookGuard::install(move || {
+            let status = hook_maintenance
+                .status()
+                .expect("inspect acquired maintenance writer");
+            assert_eq!(status.writers.len(), 1);
+            hook_writer_observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            persist_committed_adopted_session(
+                &hook_home,
+                "transaction-replay-winner",
+                &hook_project,
+                "created",
+                &current_timestamp(),
+                &binding,
+                &adoption,
+            )
+            .expect("commit transaction-time replay winner");
+        });
+        let runtime = ConcurrentRecordingRuntime::default();
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        assert!(writer_observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(runtime.launch_count(), 0);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let stored = store::get_session(&conn, "transaction-replay-winner")?
+            .context("transaction replay winner")?;
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?,
+            serde_json::to_value(&stored)?
+        );
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert!(maintenance.status()?.writers.is_empty());
+        let owner = maintenance.acquire_owner("after-transaction-replay")?;
+        owner.assert_held()?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_transaction_conflict_releases_acquired_maintenance_writer(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "transaction-conflict",
+        );
+        let mut winner_binding = root_binding("sage");
+        winner_binding["requestDigest"] = json!(digest('f'));
+        let winner_adoption = request_adoption("transaction-conflict", &digest('f'));
+        let hook_home = temp.path().to_path_buf();
+        let hook_project = project_root.clone();
+        let hook_maintenance = maintenance.clone();
+        let _hook = AdoptedLaunchMaintenanceAcquiredHookGuard::install(move || {
+            assert_eq!(
+                hook_maintenance
+                    .status()
+                    .expect("inspect acquired maintenance writer")
+                    .writers
+                    .len(),
+                1
+            );
+            persist_committed_adopted_session(
+                &hook_home,
+                "transaction-conflict-winner",
+                &hook_project,
+                "created",
+                &current_timestamp(),
+                &winner_binding,
+                &winner_adoption,
+            )
+            .expect("commit transaction-time conflict winner");
+        });
+        let runtime = ConcurrentRecordingRuntime::default();
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+        assert_eq!(runtime.launch_count(), 0);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert!(maintenance.status()?.writers.is_empty());
+        let owner = maintenance.acquire_owner("after-transaction-conflict")?;
+        owner.assert_held()?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_concurrent_exact_requests_create_and_launch_once() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "concurrent-replay",
+        );
+        let home = temp.path().to_path_buf();
+        let runtime = std::sync::Arc::new(ConcurrentRecordingRuntime::default());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let home = home.clone();
+            let body = body.clone();
+            let runtime = std::sync::Arc::clone(&runtime);
+            let start = std::sync::Arc::clone(&start);
+            threads.push(std::thread::spawn(
+                move || -> anyhow::Result<ApiResponse> {
+                    start.wait();
+                    post_adopted_launch(&home, &body, runtime.as_ref())
+                },
+            ));
+        }
+        start.wait();
+        let responses = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("adopted launch thread"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        let mut statuses = responses
+            .iter()
+            .map(|response| response.status)
+            .collect::<Vec<_>>();
+        statuses.sort_unstable();
+        assert_eq!(statuses, vec![200, 201]);
+        let ids = responses
+            .iter()
+            .map(|response| {
+                serde_json::from_str::<Value>(&response.body).expect("response json")["id"].clone()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids[0], ids[1]);
+        assert_eq!(runtime.launch_count(), 1);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_concurrent_replay_observes_committed_created() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "created-window",
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let runtime = std::sync::Arc::new(CommitWindowRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        });
+        let home = temp.path().to_path_buf();
+        let first_body = body.clone();
+        let first_runtime = std::sync::Arc::clone(&runtime);
+        let first = std::thread::spawn(move || {
+            post_adopted_launch(&home, &first_body, first_runtime.as_ref())
+        });
+
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .context("first launch must enter runtime after commit")?;
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "created"
+        );
+        assert_eq!(replay_runtime.launch_count(), 0);
+
+        release_tx.send(())?;
+        let first = first.join().expect("first adopted launch thread")?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first.body)?["status"],
+            "running"
+        );
+        assert_eq!(runtime.launch_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_replay_and_conflict_precede_mutable_drift() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        let cwd = project_root.join("nested");
+        std::fs::create_dir_all(&cwd)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let runtime = RecordingRuntime::default();
+        let mut body =
+            adopted_launch_body(&project_root, "sage", root_binding("sage"), "mutable-drift");
+        body["cwd"] = json!(cwd);
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let owner = maintenance.acquire_owner("test-maintenance")?;
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        owner.release()?;
+        std::fs::write(temp.path().join("familiars.toml"), "")?;
+        let moved_project = temp.path().join("repo-moved");
+        std::fs::rename(&project_root, &moved_project)?;
+
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let mut changed_targets = body.clone();
+        changed_targets["projectRoot"] = json!(temp.path().join("missing-project"));
+        changed_targets["cwd"] = json!("missing-cwd");
+        changed_targets["harness"] = json!("no-such-harness-xyzzy");
+        let replay = post_adopted_launch(temp.path(), &changed_targets, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+
+        let mut conflict = changed_targets.clone();
+        conflict["executionBinding"]["requestDigest"] = json!(digest('f'));
+        conflict["requestAdoption"]["requestDigest"] = json!(digest('f'));
+        let conflict = post_adopted_launch(temp.path(), &conflict, &runtime)?;
+        assert_adoption_error(
+            &conflict,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+
+        for field in ["projectRoot", "cwd", "harness"] {
+            let mut malformed = body.clone();
+            malformed[field] = json!(42);
+            let response = post_adopted_launch(temp.path(), &malformed, &runtime)?;
+            assert_eq!(response.status, 400, "{field}: {}", response.body);
+            let response_body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(response_body["error"]["code"], "invalid_request");
+        }
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_child_replay_precedes_parent_removal() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let parent_binding =
+            crate::execution_binding::parse(&root_binding("cody")).expect("fixture parent binding");
+        insert_bound_session(temp.path(), "mutable-parent", "cody", Some(parent_binding))?;
+        let binding = child_binding("sage", "mutable-parent", "graph-1", "node-1", "attempt-1");
+        let mut body = adopted_launch_body(&project_root, "sage", binding, "parent-removal-replay");
+        body["callerFamiliarId"] = json!("cody");
+        let runtime = RecordingRuntime::default();
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        conn.execute("DELETE FROM sessions WHERE id = 'mutable-parent'", [])?;
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(runtime.launches.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_maintenance_waiter_returns_committed_winner_without_sqlite_lock(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        maintenance.status()?;
+        let maintenance_lock_path = project_root
+            .join(".git")
+            .join("coven-maintenance-gate")
+            .join("lock");
+        let maintenance_lock = crate::state_lock::open_lock_file(&maintenance_lock_path)?;
+        fs2::FileExt::lock_exclusive(&maintenance_lock)?;
+
+        let binding = root_binding("sage");
+        let body =
+            adopted_launch_body(&project_root, "sage", binding.clone(), "maintenance-winner");
+        let adoption = body["requestAdoption"].clone();
+        let home = temp.path().to_path_buf();
+        let request_body = body.clone();
+        let runtime = std::sync::Arc::new(ConcurrentRecordingRuntime::default());
+        let request_runtime = std::sync::Arc::clone(&runtime);
+        let request = std::thread::spawn(move || {
+            post_adopted_launch(&home, &request_body, request_runtime.as_ref())
+        });
+
+        let lock_dir = temp.path().join("request-adoption-locks");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut gate_held = false;
+        while std::time::Instant::now() < deadline && !gate_held {
+            if let Ok(entries) = std::fs::read_dir(&lock_dir) {
+                for entry in entries.flatten() {
+                    let probe = crate::state_lock::open_lock_file(&entry.path())?;
+                    match fs2::FileExt::try_lock_exclusive(&probe) {
+                        Ok(()) => {
+                            fs2::FileExt::unlock(&probe)?;
+                        }
+                        Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                            gate_held = true;
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            if !gate_held {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        anyhow::ensure!(gate_held, "request must hold its adoption gate");
+
+        persist_committed_adopted_session(
+            temp.path(),
+            "maintenance-winner-session",
+            &project_root,
+            "created",
+            &current_timestamp(),
+            &binding,
+            &adoption,
+        )?;
+
+        let response = request.join().expect("maintenance waiter thread")?;
+        fs2::FileExt::unlock(&maintenance_lock)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["id"], "maintenance-winner-session");
+        assert_eq!(response_body["status"], "created");
+        assert_eq!(runtime.launch_count(), 0);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_expired_committed_created_survives_reap_restart_and_replay(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["expiresAt"] = json!("2020-01-01T00:00:00Z");
+        let adoption = request_adoption(
+            "crash-before-runtime",
+            binding["requestDigest"].as_str().expect("request digest"),
+        );
+        persist_committed_adopted_session(
+            temp.path(),
+            "committed-created",
+            &project_root,
+            "created",
+            "2020-01-01T00:00:00Z",
+            &binding,
+            &adoption,
+        )?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert_eq!(
+            store::mark_stale_created_sessions_failed(
+                &conn,
+                "2026-01-01T00:00:00Z",
+                &current_timestamp(),
+            )?,
+            0
+        );
+        drop(conn);
+
+        let body = adopted_launch_body(&project_root, "sage", binding, "crash-before-runtime");
+        let runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let replay_body: Value = serde_json::from_str(&replay.body)?;
+        assert_eq!(replay_body["id"], "committed-created");
+        assert_eq!(replay_body["status"], "created");
+        assert_eq!(runtime.launch_count(), 0);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_terminal_exit_wins_running_cas_and_replay_never_relaunches(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = TerminalAdoptedRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "terminal-before-return",
+        );
+
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        assert_eq!(first_body["status"], "completed");
+        assert_eq!(first_body["exit_code"], 0);
+        let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "completed"
+        );
+        assert_eq!(runtime.launch_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_publishes_running_once_before_blocked_runtime_and_remains_killable(
+    ) -> anyhow::Result<()> {
+        for (launch_mode, harness, key) in [
+            ("stream", "claude", "blocked-stream-publication"),
+            ("nonInteractive", "codex", "blocked-piped-publication"),
+        ] {
+            let temp = tempfile::tempdir()?;
+            seed_familiars_toml(temp.path())?;
+            let project_root = temp.path().join("repo");
+            std::fs::create_dir_all(&project_root)?;
+            let binding = root_binding("sage");
+            let mut body = adopted_launch_body(&project_root, "sage", binding.clone(), key);
+            body["launchMode"] = json!(launch_mode);
+            body["harness"] = json!(harness);
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let runtime = std::sync::Arc::new(BlockingEstablishedRuntime {
+                launches: std::sync::atomic::AtomicUsize::new(0),
+                callbacks: std::sync::atomic::AtomicUsize::new(0),
+                kills: std::sync::atomic::AtomicUsize::new(0),
+                entered: Mutex::new(Some(entered_tx)),
+                released: (Mutex::new(false), std::sync::Condvar::new()),
+            });
+            let request_home = temp.path().to_path_buf();
+            let request_body = body.clone();
+            let request_runtime = std::sync::Arc::clone(&runtime);
+            let (response_tx, response_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = response_tx.send(post_adopted_launch(
+                    &request_home,
+                    &request_body,
+                    request_runtime.as_ref(),
+                ));
+            });
+
+            let session_id = entered_rx.recv_timeout(std::time::Duration::from_secs(2))?;
+            let conn = store::open_store(&store_path(temp.path()))?;
+            assert_eq!(
+                store::get_session(&conn, &session_id)?
+                    .context("blocked adopted session")?
+                    .status,
+                "running",
+                "{launch_mode} ownership was not published before delivery blocked"
+            );
+            assert_eq!(runtime.callback_count(), 1);
+            assert!(matches!(
+                response_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ));
+
+            let kill = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/{session_id}/kill"),
+                temp.path(),
+                None,
+                Some(&json!({ "executionBinding": binding }).to_string()),
+                runtime.as_ref(),
+            )?;
+            assert_eq!(kill.status, 202, "{launch_mode}: {}", kill.body);
+            assert_eq!(runtime.kill_count(), 1);
+            let response = response_rx.recv_timeout(std::time::Duration::from_secs(2))??;
+            assert_eq!(response.status, 201, "{launch_mode}: {}", response.body);
+            let launch_status = serde_json::from_str::<Value>(&response.body)?["status"]
+                .as_str()
+                .context("launch response status")?
+                .to_string();
+            assert!(
+                launch_status == "running" || launch_status == "killed",
+                "concurrent launch read returned {launch_status}"
+            );
+            assert_eq!(
+                store::get_session(&conn, &session_id)?
+                    .context("killed blocked session")?
+                    .status,
+                "killed"
+            );
+            assert_eq!(runtime.launch_count(), 1);
+            assert_eq!(runtime.callback_count(), 1);
+
+            let replay_runtime = ConcurrentRecordingRuntime::default();
+            let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+            assert_eq!(replay.status, 200, "{launch_mode}: {}", replay.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&replay.body)?["status"],
+                "killed"
+            );
+            assert_eq!(replay_runtime.launch_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_ownership_persists_running_and_replays_without_relaunch(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("private-retained-project");
+        std::fs::create_dir_all(&project_root)?;
+        let mut binding = root_binding("sage");
+        binding["principalRef"] = json!("principal:private-retained");
+        binding["familiarSnapshotDigest"] = json!(digest('f'));
+        binding["projectDigest"] = json!(digest('d'));
+        binding["graphId"] = json!("private-retained-graph");
+        binding["nodeId"] = json!("private-retained-node");
+        binding["attemptId"] = json!("private-retained-attempt");
+        binding["requestDigest"] = json!(digest('e'));
+        binding["policyRevision"] = json!("policy:private-retained");
+        let key = "private-retained-adoption-key";
+        let prompt = "private-retained-initial-input";
+        let mut body = adopted_launch_body(&project_root, "sage", binding.clone(), key);
+        body["prompt"] = json!(prompt);
+        let runtime = RetainedOwnershipRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            winning_status: None,
+        };
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            response_body["error"]["message"],
+            "Session runtime launch failed after adoption."
+        );
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "running");
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+        let private_project = project_root.to_string_lossy().into_owned();
+        let private_binding = binding.to_string();
+        for private in [
+            sessions[0].id.as_str(),
+            key,
+            binding["familiarSnapshotDigest"]
+                .as_str()
+                .expect("snapshot digest"),
+            binding["projectDigest"].as_str().expect("project digest"),
+            binding["requestDigest"].as_str().expect("request digest"),
+            "principal:private-retained",
+            "private-retained-graph",
+            "private-retained-node",
+            "private-retained-attempt",
+            "policy:private-retained",
+            private_binding.as_str(),
+            prompt,
+            private_project.as_str(),
+        ] {
+            assert!(
+                !response.body.contains(private),
+                "post-adoption response leaked private fixture data"
+            );
+        }
+
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        let replay_body: Value = serde_json::from_str(&replay.body)?;
+        assert_eq!(replay_body["id"], sessions[0].id);
+        assert_eq!(replay_body["status"], "running");
+        assert_eq!(replay_runtime.launch_count(), 0);
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_ownership_does_not_overwrite_idle_or_terminal_winner(
+    ) -> anyhow::Result<()> {
+        for winning_status in ["idle", "completed"] {
+            let temp = tempfile::tempdir()?;
+            seed_familiars_toml(temp.path())?;
+            let project_root = temp.path().join("repo");
+            std::fs::create_dir_all(&project_root)?;
+            let body = adopted_launch_body(
+                &project_root,
+                "sage",
+                root_binding("sage"),
+                &format!("retained-{winning_status}-winner"),
+            );
+            let runtime = RetainedOwnershipRuntime {
+                coven_home: temp.path().to_path_buf(),
+                launches: std::sync::atomic::AtomicUsize::new(0),
+                kills: std::sync::atomic::AtomicUsize::new(0),
+                winning_status: Some(winning_status),
+            };
+
+            let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+            assert_eq!(response.status, 500, "{winning_status}: {}", response.body);
+            let conn = store::open_store(&store_path(temp.path()))?;
+            let session = store::list_sessions(&conn)?
+                .into_iter()
+                .next()
+                .context("retained winner session")?;
+            assert_eq!(session.status, winning_status);
+            assert_eq!(runtime.launch_count(), 1);
+
+            let replay_runtime = ConcurrentRecordingRuntime::default();
+            let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+            assert_eq!(replay.status, 200, "{winning_status}: {}", replay.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&replay.body)?["status"],
+                winning_status
+            );
+            assert_eq!(replay_runtime.launch_count(), 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_running_session_remains_killable() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = root_binding("sage");
+        let body = adopted_launch_body(&project_root, "sage", binding.clone(), "retained-killable");
+        let runtime = RetainedOwnershipRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            kills: std::sync::atomic::AtomicUsize::new(0),
+            winning_status: None,
+        };
+
+        let launch = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(launch.status, 500, "{}", launch.body);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let session = store::list_sessions(&conn)?
+            .into_iter()
+            .next()
+            .context("retained running session")?;
+        assert_eq!(session.status, "running");
+        let kill_body = json!({ "executionBinding": binding }).to_string();
+
+        let kill = handle_request_with_runtime(
+            "POST",
+            &format!("/sessions/{}/kill", session.id),
+            temp.path(),
+            None,
+            Some(&kill_body),
+            &runtime,
+        )?;
+        assert_eq!(kill.status, 202, "{}", kill.body);
+        assert_eq!(runtime.kill_count(), 1);
+        assert_eq!(
+            store::get_session(&conn, &session.id)?
+                .context("killed retained session")?
+                .status,
+            "killed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_runtime_failure_is_redacted_persisted_and_not_relaunched(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding = root_binding("sage");
+        let key = "private-runtime-failure-key";
+        let secret_digest = binding["requestDigest"]
+            .as_str()
+            .expect("request digest")
+            .to_string();
+        let body = adopted_launch_body(&project_root, "sage", binding.clone(), key);
+        let runtime = FailingAdoptedRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            secret: format!("{key} {secret_digest} {}", binding),
+            observed: Mutex::new(Vec::new()),
+        };
+
+        let failed = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let failed_body: Value = serde_json::from_str(&failed.body)?;
+        assert_eq!(failed_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            failed_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        for secret in [key, secret_digest.as_str()] {
+            assert!(!failed.body.contains(secret), "leaked {secret}");
+        }
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "failed");
+        let event_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        assert_eq!(event_count, 0);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+        assert!(runtime
+            .observed
+            .lock()
+            .expect("observed launch")
+            .iter()
+            .all(|debug| !debug.contains(key) && !debug.contains(&secret_digest)));
+
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "failed"
+        );
+        assert_eq!(replay_runtime.launch_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_running_persistence_failure_is_marked_and_never_relaunched(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "status-persistence-failure",
+        );
+        let runtime = StatusPersistenceFailRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
+            fail_runtime: false,
+            retain_runtime_ownership: false,
+        };
+
+        let failed = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let failed_body: Value = serde_json::from_str(&failed.body)?;
+        assert_eq!(
+            failed_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 1);
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let session = store::list_sessions(&conn)?
+            .into_iter()
+            .next()
+            .context("created session remains")?;
+        assert_eq!(session.status, "created");
+
+        let replay =
+            post_adopted_launch(temp.path(), &body, &ConcurrentRecordingRuntime::default())?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "created"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_failed_status_persistence_still_returns_exact_marker() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "failed-status-persistence",
+        );
+        let runtime = StatusPersistenceFailRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
+            fail_runtime: true,
+            retain_runtime_ownership: false,
+        };
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "created");
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_retained_status_persistence_failure_is_marked_and_never_relaunched(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let body = adopted_launch_body(
+            &project_root,
+            "sage",
+            root_binding("sage"),
+            "retained-status-persistence",
+        );
+        let runtime = StatusPersistenceFailRuntime {
+            coven_home: temp.path().to_path_buf(),
+            launches: std::sync::atomic::AtomicUsize::new(0),
+            callbacks: std::sync::atomic::AtomicUsize::new(0),
+            fail_runtime: false,
+            retain_runtime_ownership: true,
+        };
+
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(response.status, 500, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "launch_failed");
+        assert_eq!(
+            response_body["error"]["message"],
+            "Session runtime status could not be persisted after adoption."
+        );
+        assert_eq!(
+            response_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let sessions = store::list_sessions(&conn)?;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].status, "created");
+        assert_eq!(adoption_row_count(temp.path())?, 1);
+        assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(runtime.callback_count(), 1);
+
+        let replay_runtime = ConcurrentRecordingRuntime::default();
+        let replay = post_adopted_launch(temp.path(), &body, &replay_runtime)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&replay.body)?["status"],
+            "created"
+        );
+        assert_eq!(replay_runtime.launch_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_conflict_matrix_and_new_attempt() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+        let body = adopted_launch_body(&project_root, "sage", root_binding("sage"), "conflict-key");
+        let first = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        let retained_id = serde_json::from_str::<Value>(&first.body)?["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut changed_digest = body.clone();
+        changed_digest["executionBinding"]["requestDigest"] = json!(digest('f'));
+        changed_digest["requestAdoption"]["requestDigest"] = json!(digest('f'));
+        let response = post_adopted_launch(temp.path(), &changed_digest, &runtime)?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+
+        let mut changed_binding = body.clone();
+        changed_binding["executionBinding"]["attemptId"] = json!("different-attempt");
+        let response = post_adopted_launch(temp.path(), &changed_binding, &runtime)?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+
+        let mut changed_key = body.clone();
+        changed_key["requestAdoption"]["key"] = json!("different-key-same-scope");
+        let response = post_adopted_launch(temp.path(), &changed_key, &runtime)?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "executionBinding.attemptId",
+        )?;
+        for secret in [
+            "conflict-key",
+            "different-key-same-scope",
+            retained_id.as_str(),
+            digest('c').as_str(),
+        ] {
+            assert!(!response.body.contains(secret), "leaked {secret}");
+        }
+
+        let mut new_attempt = body.clone();
+        new_attempt["executionBinding"]["attemptId"] = json!("attempt-2");
+        new_attempt["requestAdoption"]["key"] = json!("new-attempt-key");
+        let response = post_adopted_launch(temp.path(), &new_attempt, &runtime)?;
+        assert_eq!(response.status, 201, "{}", response.body);
+        assert_eq!(runtime.launches.borrow().len(), 2);
+        assert_eq!(adoption_row_count(temp.path())?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_global_key_conflicts_with_input_operation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let binding_value = root_binding("sage");
+        let binding =
+            crate::execution_binding::parse(&binding_value).expect("fixture binding parses");
+        insert_bound_session(temp.path(), "input-session", "sage", Some(binding.clone()))?;
+        let adoption = crate::request_adoption::parse(&request_adoption(
+            "cross-operation-key",
+            &binding.request_digest,
+        ))
+        .expect("input adoption parses");
+        let conn = store::open_store(&store_path(temp.path()))?;
+        store::insert_input_adoption(
+            &conn,
+            "input-adoption",
+            "input-session",
+            &adoption,
+            &binding,
+            &current_timestamp(),
+        )?;
+        let body = adopted_launch_body(&project_root, "sage", binding_value, "cross-operation-key");
+
+        let response =
+            post_adopted_launch(temp.path(), &body, &ConcurrentRecordingRuntime::default())?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_validates_adoption_relationship_before_mutable_admission(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let missing_project = temp.path().join("missing-project");
+        let runtime = RecordingRuntime::default();
+        let mut body = adopted_launch_body(
+            &missing_project,
+            "missing-familiar",
+            root_binding("missing-familiar"),
+            "bad key with spaces",
+        );
+        body["harness"] = json!("missing-harness");
+        body["executionBinding"]["expiresAt"] = json!("2020-01-01T00:00:00Z");
+        let response = post_adopted_launch(temp.path(), &body, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption.key",
+        )?;
+        assert!(runtime.launches.borrow().is_empty());
+        let conn = store::open_store(&store_path(temp.path()))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        assert_eq!(adoption_row_count(temp.path())?, 0);
+
+        let mut mismatched = adopted_launch_body(
+            &missing_project,
+            "sage",
+            root_binding("sage"),
+            "digest-mismatch",
+        );
+        mismatched["requestAdoption"]["requestDigest"] = json!(digest('f'));
+        let response = post_adopted_launch(temp.path(), &mismatched, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption.requestDigest",
+        )?;
+
+        let mut unsupported = adopted_launch_body(
+            &missing_project,
+            "sage",
+            root_binding("sage"),
+            "unsupported-contract",
+        );
+        unsupported["requestAdoption"]["contract"] = json!("psyche.request_adoption.v2");
+        let response = post_adopted_launch(temp.path(), &unsupported, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_unsupported",
+            "requestAdoption.contract",
+        )?;
+
+        seed_familiars_toml(temp.path())?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let git = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&project_root)
+            .status()?;
+        assert!(git.success());
+        let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
+        let owner = maintenance.acquire_owner("precedence-owner")?;
+        let child = child_binding("sage", "missing-parent", "graph-1", "node-1", "attempt-1");
+        let mut invalid_child =
+            adopted_launch_body(&project_root, "sage", child, "invalid child key");
+        invalid_child["callerFamiliarId"] = json!("cody");
+        let response = post_adopted_launch(temp.path(), &invalid_child, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption.key",
+        )?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_route_requires_request_adoption_and_execution_binding() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let runtime = RecordingRuntime::default();
+
+        let missing_adoption = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "bound legacy shape",
+            "familiarId": "sage",
+            "executionBinding": root_binding("sage"),
+        });
+        let response = post_adopted_launch(temp.path(), &missing_adoption, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_required",
+            "requestAdoption",
+        )?;
+
+        let unbound_with_adoption = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "unbound",
+            "requestAdoption": request_adoption("unbound-key", &digest('c')),
+        });
+        let response = post_adopted_launch(temp.path(), &unbound_with_adoption, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "executionBinding",
+        )?;
+        assert!(runtime.launches.borrow().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bound_legacy_launch_requires_adoption_and_never_executes() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("missing-project");
+        let runtime = RecordingRuntime::default();
+        let body = json!({
+            "projectRoot": project_root,
+            "harness": "no-such-harness",
+            "prompt": "legacy bound launch",
+            "familiarId": "sage",
+            "executionBinding": root_binding("sage"),
+        });
+        let response = handle_request_with_runtime(
+            "POST",
+            "/api/v1/sessions",
+            temp.path(),
+            None,
+            Some(&body.to_string()),
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_required",
+            "requestAdoption",
+        )?;
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(!store_path(temp.path()).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_launch_rejects_adoption_on_legacy_unbound_and_external_routes() -> anyhow::Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root)?;
+        let adoption = request_adoption("wrong-route", &digest('c'));
+        let runtime = RecordingRuntime::default();
+        let unbound = json!({
+            "projectRoot": project_root,
+            "harness": "codex",
+            "prompt": "unbound",
+            "requestAdoption": adoption,
+        });
+        let response = handle_request_with_runtime(
+            "POST",
+            "/api/v1/sessions",
+            temp.path(),
+            None,
+            Some(&unbound.to_string()),
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "executionBinding",
+        )?;
+
+        let external = json!({
+            "id": "external-1",
+            "projectRoot": project_root,
+            "harness": "codex",
+            "requestAdoption": request_adoption("external-key", &digest('c')),
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/sessions/external",
+            temp.path(),
+            None,
+            Some(&external.to_string()),
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption",
+        )?;
+        assert!(runtime.launches.borrow().is_empty());
+        Ok(())
+    }
+
     #[test]
     fn bound_launch_does_not_leak_the_unknown_familiar_id() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -10139,14 +12676,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 400, "{}", response.body);
         assert!(
@@ -10221,14 +12751,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 201, "{}", response.body);
         let response: Value = serde_json::from_str(&response.body)?;
@@ -10369,14 +12892,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 201, "{}", response.body);
         let response: Value = serde_json::from_str(&response.body)?;
@@ -10641,6 +13157,29 @@ mod tests {
         .to_string()
     }
 
+    fn post_adopted_bound_body(
+        coven_home: &Path,
+        body: &str,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        let mut payload: Value = serde_json::from_str(body)?;
+        if payload.get("requestAdoption").is_none() {
+            let request_digest = payload
+                .get("executionBinding")
+                .and_then(|binding| binding.get("requestDigest"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| digest('c'));
+            let key_digest = Sha256::digest(body.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            payload["requestAdoption"] =
+                request_adoption(&format!("api-test:{key_digest}"), &request_digest);
+        }
+        post_adopted_launch(coven_home, &payload, runtime)
+    }
+
     fn run_bound_launch(
         temp_dir: &tempfile::TempDir,
         project_root: &Path,
@@ -10649,14 +13188,7 @@ mod tests {
     ) -> anyhow::Result<(ApiResponse, RecordingRuntime)> {
         let runtime = RecordingRuntime::default();
         let body = bound_launch_body(project_root, familiar_id, binding);
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
         Ok((response, runtime))
     }
 
@@ -11060,14 +13592,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 201, "{}", response.body);
         assert_eq!(runtime.launches.borrow().len(), 1);
@@ -11110,14 +13635,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 201, "{}", response.body);
         assert_eq!(runtime.launches.borrow().len(), 1);
@@ -11157,14 +13675,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11194,14 +13705,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 404, "{}", response.body);
         let body: Value = serde_json::from_str(&response.body)?;
@@ -11244,14 +13748,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11285,14 +13782,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11326,14 +13816,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11367,14 +13850,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11408,14 +13884,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_binding_error(
             &response,
@@ -11586,14 +14055,7 @@ mod tests {
                 .expect("concurrent parent delete");
         });
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         // Caught by the in-transaction revalidation, which reports the
         // parent exactly like a launch against an always-missing parent
@@ -11608,6 +14070,7 @@ mod tests {
         // The parent row was removed by the failpoint itself, and no child
         // row was ever admitted: the store ends up with zero rows.
         assert_no_row_and_no_launch(temp_dir.path(), &runtime)?;
+        assert_eq!(adoption_row_count(temp_dir.path())?, 0);
         Ok(())
     }
 
@@ -11824,22 +14287,28 @@ mod tests {
     }
 
     #[test]
-    fn bound_launch_allows_two_identical_root_bindings() -> anyhow::Result<()> {
+    fn bound_launch_exact_replay_reuses_one_session() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         seed_familiars_toml(temp_dir.path())?;
         let project_root = temp_dir.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let binding = root_binding("sage");
 
-        for _ in 0..2 {
-            let (response, runtime) =
-                run_bound_launch(&temp_dir, &project_root, "sage", binding.clone())?;
-            assert_eq!(response.status, 201, "{}", response.body);
-            assert_eq!(runtime.launches.borrow().len(), 1);
-        }
+        let (first, first_runtime) =
+            run_bound_launch(&temp_dir, &project_root, "sage", binding.clone())?;
+        assert_eq!(first.status, 201, "{}", first.body);
+        assert_eq!(first_runtime.launches.borrow().len(), 1);
+        let (replay, replay_runtime) = run_bound_launch(&temp_dir, &project_root, "sage", binding)?;
+        assert_eq!(replay.status, 200, "{}", replay.body);
+        assert_eq!(replay_runtime.launches.borrow().len(), 0);
+        assert_eq!(
+            serde_json::from_str::<Value>(&first.body)?["id"],
+            serde_json::from_str::<Value>(&replay.body)?["id"]
+        );
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
-        assert_eq!(store::list_sessions(&conn)?.len(), 2);
+        assert_eq!(store::list_sessions(&conn)?.len(), 1);
+        assert_eq!(adoption_row_count(temp_dir.path())?, 1);
         Ok(())
     }
 
@@ -11871,14 +14340,7 @@ mod tests {
         })
         .to_string();
 
-        let response = handle_request_with_runtime(
-            "POST",
-            "/sessions",
-            temp_dir.path(),
-            None,
-            Some(&body),
-            &runtime,
-        )?;
+        let response = post_adopted_bound_body(temp_dir.path(), &body, &runtime)?;
 
         assert_eq!(response.status, 409, "{}", response.body);
         assert!(
@@ -12533,6 +14995,370 @@ mod tests {
         kills: std::cell::RefCell<Vec<String>>,
     }
 
+    #[derive(Default)]
+    struct ConcurrentRecordingRuntime {
+        launches: Mutex<Vec<SessionLaunch>>,
+    }
+
+    impl ConcurrentRecordingRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.lock().expect("launches lock").len()
+        }
+    }
+
+    impl SessionRuntime for ConcurrentRecordingRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .lock()
+                .expect("launches lock")
+                .push(launch.clone());
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RetainingWriterRuntime {
+        launches: std::sync::atomic::AtomicUsize,
+        writer: Mutex<Option<crate::maintenance_gate::WriterLease>>,
+    }
+
+    impl RetainingWriterRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn release_writer(&self) -> anyhow::Result<()> {
+            let writer = self
+                .writer
+                .lock()
+                .expect("retained writer lock")
+                .take()
+                .context("runtime did not retain a maintenance writer")?;
+            drop(writer);
+            Ok(())
+        }
+    }
+
+    impl SessionRuntime for RetainingWriterRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("adopted git launch did not transfer its maintenance writer")
+        }
+
+        fn launch_session_with_writer(
+            &self,
+            _launch: &SessionLaunch,
+            writer: crate::maintenance_gate::WriterLease,
+        ) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut retained = self.writer.lock().expect("retained writer lock");
+            anyhow::ensure!(
+                retained.is_none(),
+                "runtime received a second maintenance writer"
+            );
+            *retained = Some(writer);
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CommitWindowRuntime {
+        launches: std::sync::atomic::AtomicUsize,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct BlockingEstablishedRuntime {
+        launches: std::sync::atomic::AtomicUsize,
+        callbacks: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        entered: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        released: (Mutex<bool>, std::sync::Condvar),
+    }
+
+    impl BlockingEstablishedRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn callback_count(&self) -> usize {
+            self.callbacks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn kill_count(&self) -> usize {
+            self.kills.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for BlockingEstablishedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            anyhow::bail!("adopted launch used the legacy runtime entrypoint")
+        }
+
+        fn launch_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            drop(writer);
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.callbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ownership_established()?;
+            if let Some(entered) = self.entered.lock().expect("entered lock").take() {
+                let _ = entered.send(launch.id.clone());
+            }
+            let (released, ready) = &self.released;
+            let mut released = released.lock().expect("release lock");
+            while !*released {
+                released = ready.wait(released).expect("release wait");
+            }
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (released, ready) = &self.released;
+            *released.lock().expect("release lock") = true;
+            ready.notify_all();
+            Ok(())
+        }
+    }
+
+    impl CommitWindowRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for CommitWindowRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entered.send(()).context("announce runtime entry")?;
+            self.release
+                .lock()
+                .expect("release lock")
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .context("wait for runtime release")?;
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TerminalAdoptedRuntime {
+        coven_home: PathBuf,
+        launches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TerminalAdoptedRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for TerminalAdoptedRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let conn = store::open_store(&store_path(&self.coven_home))?;
+            store::update_session_status(
+                &conn,
+                &launch.id,
+                "completed",
+                Some(0),
+                &current_timestamp(),
+            )
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RetainedOwnershipRuntime {
+        coven_home: PathBuf,
+        launches: std::sync::atomic::AtomicUsize,
+        kills: std::sync::atomic::AtomicUsize,
+        winning_status: Option<&'static str>,
+    }
+
+    impl RetainedOwnershipRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn kill_count(&self) -> usize {
+            self.kills.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for RetainedOwnershipRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(status) = self.winning_status {
+                let conn = store::open_store(&store_path(&self.coven_home))?;
+                store::update_session_status(
+                    &conn,
+                    &launch.id,
+                    status,
+                    None,
+                    &current_timestamp(),
+                )?;
+            }
+            Err(anyhow::Error::new(
+                crate::daemon::RuntimeOwnershipRetainedError,
+            ))
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FailingAdoptedRuntime {
+        launches: std::sync::atomic::AtomicUsize,
+        secret: String,
+        observed: Mutex<Vec<String>>,
+    }
+
+    impl FailingAdoptedRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for FailingAdoptedRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.observed
+                .lock()
+                .expect("observed lock")
+                .push(format!("{launch:?}"));
+            anyhow::bail!("{}", self.secret)
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct StatusPersistenceFailRuntime {
+        coven_home: PathBuf,
+        launches: std::sync::atomic::AtomicUsize,
+        callbacks: std::sync::atomic::AtomicUsize,
+        fail_runtime: bool,
+        retain_runtime_ownership: bool,
+    }
+
+    impl StatusPersistenceFailRuntime {
+        fn launch_count(&self) -> usize {
+            self.launches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn callback_count(&self) -> usize {
+            self.callbacks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for StatusPersistenceFailRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            self.launches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let conn = store::open_store(&store_path(&self.coven_home))?;
+            conn.execute_batch(
+                "CREATE TRIGGER adopted_launch_test_block_status
+                 BEFORE UPDATE OF status ON sessions
+                 BEGIN
+                   SELECT RAISE(FAIL, 'blocked adopted launch status persistence');
+                 END;",
+            )?;
+            if self.retain_runtime_ownership {
+                return Err(anyhow::Error::new(
+                    crate::daemon::RuntimeOwnershipRetainedError,
+                ));
+            }
+            if self.fail_runtime {
+                anyhow::bail!("runtime failed while status persistence was blocked");
+            }
+            Ok(())
+        }
+
+        fn launch_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            drop(writer);
+            let result = self.launch_session(launch);
+            let retained = result.as_ref().err().is_some_and(|error| {
+                error
+                    .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+                    .is_some()
+            });
+            if result.is_ok() || retained {
+                self.callbacks
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ownership_established()?;
+            }
+            result
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     struct WriterBackedRuntime {
         writer: crate::event_writer::EventWriter,
         inputs: std::cell::RefCell<Vec<String>>,
@@ -12615,20 +15441,22 @@ mod tests {
             session_id: &str,
             kind: &str,
             payload: &Value,
+            request_adoption_id: Option<&str>,
             action: &mut dyn FnMut() -> SessionEventBoundaryResult,
         ) -> Option<SessionEventBoundaryResult> {
             Some(match kind {
                 "input" => {
-                    let reservation =
-                        match self
-                            .writer
-                            .reserve_record(session_id, kind, payload.clone())
-                        {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                return Some(Err(SessionEventBoundaryError::Persistence(error)));
-                            }
-                        };
+                    let reservation = match self.writer.reserve_record(
+                        session_id,
+                        kind,
+                        payload.clone(),
+                        request_adoption_id,
+                    ) {
+                        Ok(reservation) => reservation,
+                        Err(error) => {
+                            return Some(Err(SessionEventBoundaryError::Persistence(error)));
+                        }
+                    };
                     match action() {
                         Ok(()) => reservation
                             .commit()
@@ -18786,7 +21614,7 @@ tier = 0
     // #728 Task 4) ---------------------------------------------------------
 
     #[test]
-    fn bound_input_strips_proof_from_runtime_and_event() -> anyhow::Result<()> {
+    fn adopted_input_strips_proof_and_adoption_from_runtime_and_event() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let stored = crate::execution_binding::parse(&root_binding("sage"))
             .expect("fixture root binding should parse");
@@ -18795,12 +21623,13 @@ tier = 0
         let body = json!({
             "data": "hello",
             "executionBinding": root_binding("sage"),
+            "requestAdoption": request_adoption("bound-input-key", &digest('d')),
         })
         .to_string();
 
         let response = handle_request_with_runtime(
             "POST",
-            "/sessions/bound-input/input",
+            "/sessions/bound-input/adopted-input",
             temp_dir.path(),
             None,
             Some(&body),
@@ -19326,11 +22155,16 @@ tier = 0
         let stored =
             crate::execution_binding::parse(&expired).expect("expired binding still parses");
         insert_bound_session(temp_dir.path(), "bound-expired", "sage", Some(stored))?;
-        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": expired,
+            "requestAdoption": request_adoption("bound-expired-key", &digest('d')),
+        })
+        .to_string();
 
         let response = handle_request_with_body(
             "POST",
-            "/sessions/bound-expired/input",
+            "/sessions/bound-expired/adopted-input",
             temp_dir.path(),
             None,
             Some(&body),
@@ -19358,11 +22192,16 @@ tier = 0
             Some(stored),
         )?;
         let runtime = RecordingRuntime::default();
-        let body = json!({ "data": "hello", "executionBinding": expired }).to_string();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": expired,
+            "requestAdoption": request_adoption("bound-expired-no-leak-key", &digest('d')),
+        })
+        .to_string();
 
         let response = handle_request_with_runtime(
             "POST",
-            "/sessions/bound-expired-no-leak/input",
+            "/sessions/bound-expired-no-leak/adopted-input",
             temp_dir.path(),
             None,
             Some(&body),
@@ -19580,12 +22419,10 @@ tier = 0
         assert_eq!(
             runtime.kills.borrow().as_slice(),
             &["unbound-kill-body"],
-            "an unbound session's kill body is never inspected, matching pre-O2 behavior"
+            "executionBinding-shaped kill metadata remains ignored on an unbound session"
         );
-        // Confirmation (issue #728 Task 6, finding 4): kill never parses the
-        // body for an unbound session at all, so there is no payload
-        // boundary to enforce — the persisted event keeps its pre-O2
-        // `{"status":"killed"}` shape regardless of what the caller sent.
+        // Apart from rejecting the reserved O3 member, kill has no payload
+        // boundary: the event keeps its pre-O2 `{"status":"killed"}` shape.
         let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
         let events = crate::store::list_events(&conn, "unbound-kill-body")?;
         let kill_event = events
@@ -19786,7 +22623,7 @@ tier = 0
     }
 
     #[test]
-    fn bound_input_writer_capacity_sees_stripped_payload() -> anyhow::Result<()> {
+    fn adopted_input_writer_capacity_sees_stripped_payload() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let stored = crate::execution_binding::parse(&root_binding("sage"))
             .expect("fixture root binding should parse");
@@ -19794,11 +22631,16 @@ tier = 0
         let runtime = CapacityObservingRuntime {
             payloads: std::cell::RefCell::new(Vec::new()),
         };
-        let body = json!({ "data": "hello", "executionBinding": root_binding("sage") }).to_string();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": root_binding("sage"),
+            "requestAdoption": request_adoption("bound-capacity-key", &digest('d')),
+        })
+        .to_string();
 
         let response = handle_request_with_runtime(
             "POST",
-            "/sessions/bound-capacity/input",
+            "/sessions/bound-capacity/adopted-input",
             temp_dir.path(),
             None,
             Some(&body),
@@ -19811,6 +22653,1371 @@ tier = 0
             &[json!({ "data": "hello" })],
             "writer capacity preflight must see only `data`, never `executionBinding`"
         );
+        Ok(())
+    }
+
+    fn adopted_input_body(binding: Value, key: &str, request_digest: &str) -> Value {
+        json!({
+            "data": "hello",
+            "executionBinding": binding,
+            "requestAdoption": request_adoption(key, request_digest),
+        })
+    }
+
+    fn post_adopted_input(
+        coven_home: &Path,
+        session_id: &str,
+        body: &Value,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_runtime(
+            "POST",
+            &format!("/api/v1/sessions/{session_id}/adopted-input"),
+            coven_home,
+            None,
+            Some(&body.to_string()),
+            runtime,
+        )
+    }
+
+    fn assert_adopted_input_response(
+        response: &ApiResponse,
+        status: u16,
+        replayed: bool,
+    ) -> anyhow::Result<()> {
+        assert_eq!(response.status, status, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?,
+            json!({
+                "adopted": true,
+                "replayed": replayed,
+                "delivery": "not_asserted",
+            }),
+            "{}",
+            response.body
+        );
+        Ok(())
+    }
+
+    fn input_ledger_counts(coven_home: &Path, session_id: &str) -> anyhow::Result<(i64, i64, i64)> {
+        let conn = store::open_store(&store_path(coven_home))?;
+        Ok((
+            conn.query_row(
+                "SELECT COUNT(*) FROM request_adoptions
+                 WHERE operation = 'input' AND session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?,
+            conn.query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE kind = 'input' AND session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?,
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_input_leases WHERE session_id = ?1",
+                [session_id],
+                |row| row.get(0),
+            )?,
+        ))
+    }
+
+    struct AdoptedInputRuntime {
+        inputs: std::sync::atomic::AtomicUsize,
+        payloads: Mutex<Vec<Value>>,
+        capacity_payloads: Mutex<Vec<Value>>,
+        capacity_allowed: bool,
+        failure: Option<String>,
+        write_during_runtime: Option<PathBuf>,
+    }
+
+    impl Default for AdoptedInputRuntime {
+        fn default() -> Self {
+            Self {
+                inputs: std::sync::atomic::AtomicUsize::new(0),
+                payloads: Mutex::new(Vec::new()),
+                capacity_payloads: Mutex::new(Vec::new()),
+                capacity_allowed: true,
+                failure: None,
+                write_during_runtime: None,
+            }
+        }
+    }
+
+    impl AdoptedInputRuntime {
+        fn input_count(&self) -> usize {
+            self.inputs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl SessionRuntime for AdoptedInputRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
+            self.inputs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.payloads
+                .lock()
+                .expect("payload lock")
+                .push(payload.clone());
+            if let Some(coven_home) = self.write_during_runtime.as_ref() {
+                let conn = store::open_store(&store_path(coven_home))?;
+                conn.execute(
+                    "UPDATE sessions SET updated_at = updated_at WHERE id = ?1",
+                    [session_id],
+                )?;
+            }
+            if let Some(message) = self.failure.as_ref() {
+                anyhow::bail!("{message}");
+            }
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn can_record_session_event(
+            &self,
+            _session_id: &str,
+            _kind: &str,
+            payload: &Value,
+        ) -> Option<Result<bool>> {
+            self.capacity_payloads
+                .lock()
+                .expect("capacity payload lock")
+                .push(payload.clone());
+            Some(Ok(self.capacity_allowed))
+        }
+    }
+
+    #[test]
+    fn adopted_input_request_adoption_event_correlation_is_internal() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(temp.path(), "adopted-input-first", "sage", Some(binding))?;
+        let runtime = AdoptedInputRuntime::default();
+        let body = adopted_input_body(
+            binding_value.clone(),
+            "adopted-input-first-key",
+            &digest('d'),
+        );
+
+        let response = post_adopted_input(temp.path(), "adopted-input-first", &body, &runtime)?;
+
+        assert_adopted_input_response(&response, 202, false)?;
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(
+            runtime.payloads.lock().expect("payload lock").as_slice(),
+            &[json!({ "data": "hello" })]
+        );
+        assert_eq!(
+            runtime
+                .capacity_payloads
+                .lock()
+                .expect("capacity payload lock")
+                .as_slice(),
+            &[json!({ "data": "hello" })]
+        );
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-first")?,
+            (1, 1, 0)
+        );
+
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let (adoption_id, event_adoption_id, payload_json): (String, String, String) = conn
+            .query_row(
+                "SELECT adoption.id, event.request_adoption_id, event.payload_json
+                 FROM request_adoptions AS adoption
+                 JOIN events AS event ON event.request_adoption_id = adoption.id
+                 WHERE adoption.operation = 'input' AND adoption.session_id = ?1",
+                ["adopted-input-first"],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        assert_eq!(event_adoption_id, adoption_id);
+        assert_eq!(payload_json, r#"{"data":"hello"}"#);
+
+        let public = handle_request(
+            "GET",
+            "/events?sessionId=adopted-input-first",
+            temp.path(),
+            None,
+        )?;
+        let public_body: Value = serde_json::from_str(&public.body)?;
+        let public_events = public_body["events"]
+            .as_array()
+            .expect("public events response array");
+        assert_eq!(public_events.len(), 1);
+        assert!(public_events[0].get("request_adoption_id").is_none());
+        assert!(public_events[0].get("requestAdoptionId").is_none());
+        for forbidden in [
+            "requestAdoption",
+            "executionBinding",
+            "adopted-input-first-key",
+            digest('d').as_str(),
+            adoption_id.as_str(),
+        ] {
+            assert!(
+                !public.body.contains(forbidden),
+                "public event leaked {forbidden}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_event_writer_preserves_internal_correlation() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(temp.path(), "adopted-input-writer", "sage", Some(binding))?;
+        let writer = crate::event_writer::EventWriter::start(temp.path().to_path_buf())?;
+        let runtime = WriterBackedRuntime::new(writer);
+        let body = adopted_input_body(binding_value, "adopted-input-writer-key", &digest('d'));
+
+        let response = post_adopted_input(temp.path(), "adopted-input-writer", &body, &runtime)?;
+
+        assert_adopted_input_response(&response, 202, false)?;
+        assert_eq!(
+            runtime.inputs.borrow().as_slice(),
+            &["adopted-input-writer:hello"]
+        );
+        let conn = store::open_store(&store_path(temp.path()))?;
+        let correlated: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM events AS event
+             JOIN request_adoptions AS adoption
+               ON adoption.id = event.request_adoption_id
+             WHERE event.session_id = 'adopted-input-writer'
+               AND event.kind = 'input'
+               AND adoption.operation = 'input'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(correlated, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_sequential_terminal_and_restart_replay_is_read_only() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(temp.path(), "adopted-input-replay", "sage", Some(binding))?;
+        let runtime = AdoptedInputRuntime::default();
+        let body = adopted_input_body(binding_value, "adopted-input-replay-key", &digest('d'));
+
+        let first = post_adopted_input(temp.path(), "adopted-input-replay", &body, &runtime)?;
+        assert_adopted_input_response(&first, 202, false)?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        store::update_session_status(
+            &conn,
+            "adopted-input-replay",
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?;
+        drop(conn);
+
+        store::initialize_store(&store_path(temp.path()))?;
+        let replay_runtime = AdoptedInputRuntime::default();
+        let replay =
+            post_adopted_input(temp.path(), "adopted-input-replay", &body, &replay_runtime)?;
+        assert_adopted_input_response(&replay, 200, true)?;
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(replay_runtime.input_count(), 0);
+        assert!(replay_runtime
+            .capacity_payloads
+            .lock()
+            .expect("capacity payload lock")
+            .is_empty());
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-replay")?,
+            (1, 1, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_expired_binding_exact_replay_precedes_expiry() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = expired_root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-expired-replay",
+            "sage",
+            Some(binding.clone()),
+        )?;
+        let adoption_value = request_adoption("adopted-input-expired-replay-key", &digest('d'));
+        let adoption = crate::request_adoption::parse(&adoption_value)?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        store::insert_input_adoption(
+            &conn,
+            "adopted-input-expired-replay-id",
+            "adopted-input-expired-replay",
+            &adoption,
+            &binding,
+            &current_timestamp(),
+        )?;
+        drop(conn);
+        let runtime = AdoptedInputRuntime::default();
+        let body = json!({
+            "data": "hello",
+            "executionBinding": binding_value,
+            "requestAdoption": adoption_value,
+        });
+
+        let replay =
+            post_adopted_input(temp.path(), "adopted-input-expired-replay", &body, &runtime)?;
+
+        assert_adopted_input_response(&replay, 200, true)?;
+        assert_eq!(runtime.input_count(), 0);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-expired-replay")?,
+            (1, 0, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_concurrent_replay_runs_once() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-concurrent",
+            "sage",
+            Some(binding),
+        )?;
+        let body = adopted_input_body(binding_value, "adopted-input-concurrent-key", &digest('d'));
+        let runtime = std::sync::Arc::new(AdoptedInputRuntime::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let home = temp.path().to_path_buf();
+            let body = body.clone();
+            let runtime = std::sync::Arc::clone(&runtime);
+            let barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(
+                move || -> anyhow::Result<ApiResponse> {
+                    barrier.wait();
+                    post_adopted_input(&home, "adopted-input-concurrent", &body, runtime.as_ref())
+                },
+            ));
+        }
+        barrier.wait();
+        let mut responses = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("request thread"))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        responses.sort_by_key(|response| response.status);
+
+        assert_adopted_input_response(&responses[0], 200, true)?;
+        assert_adopted_input_response(&responses[1], 202, false)?;
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-concurrent")?,
+            (1, 1, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_global_key_conflicts_are_static_and_redacted() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first_value = root_binding("sage");
+        let mut second_value = root_binding("sage");
+        second_value["attemptId"] = json!("attempt-2");
+        let first_binding = crate::execution_binding::parse(&first_value)?;
+        let second_binding = crate::execution_binding::parse(&second_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-conflict-1",
+            "sage",
+            Some(first_binding.clone()),
+        )?;
+        insert_bound_session(
+            temp.path(),
+            "retained-hidden-session",
+            "sage",
+            Some(second_binding.clone()),
+        )?;
+        let runtime = AdoptedInputRuntime::default();
+        let first_body = adopted_input_body(first_value.clone(), "private-input-key", &digest('d'));
+        let first = post_adopted_input(
+            temp.path(),
+            "adopted-input-conflict-1",
+            &first_body,
+            &runtime,
+        )?;
+        assert_adopted_input_response(&first, 202, false)?;
+
+        let changed_digest =
+            adopted_input_body(first_value.clone(), "private-input-key", &digest('e'));
+        let changed_session =
+            adopted_input_body(second_value.clone(), "private-input-key", &digest('d'));
+        for (session_id, body) in [
+            ("adopted-input-conflict-1", changed_digest),
+            ("retained-hidden-session", changed_session),
+        ] {
+            let response = post_adopted_input(temp.path(), session_id, &body, &runtime)?;
+            assert_adoption_error(
+                &response,
+                409,
+                "request_adoption_conflict",
+                "requestAdoption.key",
+            )?;
+            for secret in [
+                "private-input-key",
+                "retained-hidden-session",
+                digest('d').as_str(),
+                digest('e').as_str(),
+                second_binding.attempt_id.as_str(),
+            ] {
+                assert!(!response.body.contains(secret), "conflict leaked {secret}");
+            }
+        }
+
+        let launch_adoption = crate::request_adoption::parse(&request_adoption(
+            "private-launch-key",
+            &second_binding.request_digest,
+        ))?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        store::insert_launch_adoption(
+            &conn,
+            "private-launch-adoption-id",
+            "retained-hidden-session",
+            &launch_adoption,
+            &second_binding,
+            &current_timestamp(),
+        )?;
+        drop(conn);
+        let cross_operation = adopted_input_body(first_value, "private-launch-key", &digest('d'));
+        let response = post_adopted_input(
+            temp.path(),
+            "adopted-input-conflict-1",
+            &cross_operation,
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            409,
+            "request_adoption_conflict",
+            "requestAdoption.key",
+        )?;
+        for secret in [
+            "private-launch-key",
+            "private-launch-adoption-id",
+            "retained-hidden-session",
+            second_binding.request_digest.as_str(),
+        ] {
+            assert!(!response.body.contains(secret), "conflict leaked {secret}");
+        }
+        assert_eq!(runtime.input_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_validates_o3_location_and_legacy_compatibility() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-validation",
+            "sage",
+            Some(binding),
+        )?;
+        insert_test_session(temp.path(), "legacy-unbound-input")?;
+        let runtime = RecordingRuntime::default();
+
+        let missing = json!({
+            "data": "hello",
+            "executionBinding": binding_value,
+        });
+        let response =
+            post_adopted_input(temp.path(), "adopted-input-validation", &missing, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_required",
+            "requestAdoption",
+        )?;
+
+        let mut malformed =
+            adopted_input_body(root_binding("sage"), "malformed-input-key", &digest('d'));
+        malformed["requestAdoption"]["extra"] = json!(true);
+        let response = post_adopted_input(
+            temp.path(),
+            "adopted-input-validation",
+            &malformed,
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption",
+        )?;
+
+        let legacy_bound = json!({
+            "data": "hello",
+            "executionBinding": root_binding("sage"),
+        });
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/adopted-input-validation/input",
+            temp.path(),
+            None,
+            Some(&legacy_bound.to_string()),
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_required",
+            "requestAdoption",
+        )?;
+
+        let legacy_bound_with_adoption = adopted_input_body(
+            root_binding("sage"),
+            "wrong-legacy-bound-location",
+            &digest('d'),
+        );
+        let response = handle_request_with_runtime(
+            "POST",
+            "/sessions/adopted-input-validation/input",
+            temp.path(),
+            None,
+            Some(&legacy_bound_with_adoption.to_string()),
+            &runtime,
+        )?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption",
+        )?;
+
+        let unbound_adopted = adopted_input_body(
+            root_binding("sage"),
+            "unbound-adopted-input-key",
+            &digest('d'),
+        );
+        for route in ["adopted-input", "input"] {
+            let response = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/legacy-unbound-input/{route}"),
+                temp.path(),
+                None,
+                Some(&unbound_adopted.to_string()),
+                &runtime,
+            )?;
+            assert_adoption_error(
+                &response,
+                400,
+                "request_adoption_invalid",
+                "executionBinding",
+            )?;
+        }
+
+        let unbound = handle_request_with_runtime(
+            "POST",
+            "/sessions/legacy-unbound-input/input",
+            temp.path(),
+            None,
+            Some(r#"{"data":"legacy","other":"preserved"}"#),
+            &runtime,
+        )?;
+        assert_eq!(unbound.status, 202, "{}", unbound.body);
+        assert_eq!(
+            runtime.input_payloads.borrow().last(),
+            Some(&json!({"data":"legacy","other":"preserved"}))
+        );
+        Ok(())
+    }
+
+    /// Adopted input runs no runtime, no ledger write, and never acquires
+    /// the adoption gate lock directory when the request is rejected before
+    /// admission — proving a structural failure (O2, O3, or `data`) never
+    /// reaches the mutable side of the route (issue #728 Task 6, §4).
+    fn assert_no_adopted_input_side_effects(
+        coven_home: &Path,
+        session_id: &str,
+        runtime: &RecordingRuntime,
+    ) -> anyhow::Result<()> {
+        assert!(
+            runtime.input_payloads.borrow().is_empty(),
+            "structural rejection must never reach the runtime"
+        );
+        assert_eq!(
+            input_ledger_counts(coven_home, session_id)?,
+            (0, 0, 0),
+            "structural rejection must never write an adoption/event/lease row"
+        );
+        assert!(
+            !coven_home.join("request-adoption-locks").exists(),
+            "structural rejection must never acquire the adoption gate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_mixed_invalid_o2_and_o3_returns_o2_static_error() -> anyhow::Result<()> {
+        // Issue #728 Task 6, §4: when both O2 and O3 are structurally
+        // invalid (and `data` is invalid too), the response must be O2's
+        // static shape error — O2 is validated first in the adopted-input
+        // route, before O3 or `data` are even inspected.
+        let temp = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&root_binding("sage"))?;
+        insert_bound_session(temp.path(), "mixed-invalid-o2-o3", "sage", Some(binding))?;
+        let runtime = RecordingRuntime::default();
+
+        let mut binding_value = root_binding("sage");
+        binding_value["extra"] = json!(true); // O2: unknown root member (Invalid)
+        let mut body = adopted_input_body(binding_value, "mixed-invalid-o2-o3-key", &digest('d'));
+        body["requestAdoption"]["extra"] = json!(true); // O3 also invalid
+        body["data"] = json!(7); // data also invalid
+
+        let response = post_adopted_input(temp.path(), "mixed-invalid-o2-o3", &body, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            "executionBinding",
+        )?;
+        assert_no_adopted_input_side_effects(temp.path(), "mixed-invalid-o2-o3", &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_valid_o2_invalid_o3_and_data_returns_o3_error() -> anyhow::Result<()> {
+        // Issue #728 Task 6, §4: a structurally valid O2 with an invalid O3
+        // and invalid `data` must return the O3 error — O3 precedes `data`.
+        let temp = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&root_binding("sage"))?;
+        insert_bound_session(
+            temp.path(),
+            "valid-o2-invalid-o3-data",
+            "sage",
+            Some(binding),
+        )?;
+        let runtime = RecordingRuntime::default();
+
+        let mut body = adopted_input_body(
+            root_binding("sage"),
+            "valid-o2-invalid-o3-data-key",
+            &digest('d'),
+        );
+        body["requestAdoption"]["extra"] = json!(true); // O3 invalid (unknown member)
+        body["data"] = json!(42); // data also invalid (non-string)
+
+        let response =
+            post_adopted_input(temp.path(), "valid-o2-invalid-o3-data", &body, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption",
+        )?;
+        assert_no_adopted_input_side_effects(temp.path(), "valid-o2-invalid-o3-data", &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_invalid_data_precedes_mismatched_stored_proof() -> anyhow::Result<()> {
+        // Issue #728 Task 6, §4: valid O2 + O3 shape with invalid `data`
+        // must return the `data` error even when the (structurally valid)
+        // supplied O2 does not exactly match the session's stored proof —
+        // `data` validation precedes the relationship-level exact-match
+        // comparison.
+        let temp = tempfile::tempdir()?;
+        let stored = crate::execution_binding::parse(&root_binding("sage"))?;
+        insert_bound_session(temp.path(), "data-precedes-mismatch", "sage", Some(stored))?;
+        let runtime = RecordingRuntime::default();
+
+        let mut mismatched_binding = root_binding("sage");
+        mismatched_binding["graphId"] = json!("graph-does-not-match");
+        let mut body = adopted_input_body(
+            mismatched_binding,
+            "data-precedes-mismatch-key",
+            &digest('d'),
+        );
+        body.as_object_mut()
+            .expect("body is an object")
+            .remove("data");
+
+        let response = post_adopted_input(temp.path(), "data-precedes-mismatch", &body, &runtime)?;
+        assert_eq!(response.status, 400, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "invalid_request");
+        assert_no_adopted_input_side_effects(temp.path(), "data-precedes-mismatch", &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_missing_o3_after_invalid_o2_returns_o2_error() -> anyhow::Result<()> {
+        // Issue #728 Task 6, §4: precedence must hold even when O3 is
+        // entirely absent (not merely malformed) — an invalid O2 still
+        // wins over the O3 `required` short-circuit, since O2 is validated
+        // first regardless of what O3 does or doesn't contain.
+        let temp = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&root_binding("sage"))?;
+        insert_bound_session(temp.path(), "missing-o3-invalid-o2", "sage", Some(binding))?;
+        let runtime = RecordingRuntime::default();
+
+        let mut binding_value = root_binding("sage");
+        binding_value["extra"] = json!(true);
+        let body = json!({ "data": "hello", "executionBinding": binding_value });
+
+        let response = post_adopted_input(temp.path(), "missing-o3-invalid-o2", &body, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            "executionBinding",
+        )?;
+        assert_no_adopted_input_side_effects(temp.path(), "missing-o3-invalid-o2", &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_unbound_target_structural_failures_precede_relationship_error(
+    ) -> anyhow::Result<()> {
+        // Issue #728 Task 6, §4: an unbound target must still run full
+        // structural O2/O3/data validation before the relationship
+        // (bound-vs-unbound) check. Only a structurally valid request may
+        // reach the documented `request_adoption_invalid` at
+        // `executionBinding`.
+        let temp = tempfile::tempdir()?;
+        insert_test_session(temp.path(), "unbound-structural")?;
+        let runtime = RecordingRuntime::default();
+
+        // (a) malformed O2 + valid O3 + valid data -> O2 error.
+        let mut malformed_binding = root_binding("sage");
+        malformed_binding["extra"] = json!(true);
+        let body_a = adopted_input_body(malformed_binding, "unbound-structural-a", &digest('d'));
+        let response = post_adopted_input(temp.path(), "unbound-structural", &body_a, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "execution_binding_invalid",
+            "executionBinding",
+        )?;
+
+        // (b) valid O2 shape + malformed O3 + valid data -> O3 error.
+        let mut body_b =
+            adopted_input_body(root_binding("sage"), "unbound-structural-b", &digest('d'));
+        body_b["requestAdoption"]["extra"] = json!(true);
+        let response = post_adopted_input(temp.path(), "unbound-structural", &body_b, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "requestAdoption",
+        )?;
+
+        // (c) valid O2 + valid O3 + invalid data -> data error.
+        let mut body_c =
+            adopted_input_body(root_binding("sage"), "unbound-structural-c", &digest('d'));
+        body_c["data"] = json!(false);
+        let response = post_adopted_input(temp.path(), "unbound-structural", &body_c, &runtime)?;
+        assert_eq!(response.status, 400, "{}", response.body);
+        let response_body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(response_body["error"]["code"], "invalid_request");
+
+        assert_no_adopted_input_side_effects(temp.path(), "unbound-structural", &runtime)?;
+
+        // (d) fully structurally valid O2 + O3 + data on an unbound target
+        // -> the documented relationship error, unchanged, only now proven
+        // to be reached after (a)-(c) would have failed closed first.
+        let body_d = adopted_input_body(root_binding("sage"), "unbound-structural-d", &digest('d'));
+        let response = post_adopted_input(temp.path(), "unbound-structural", &body_d, &runtime)?;
+        assert_adoption_error(
+            &response,
+            400,
+            "request_adoption_invalid",
+            "executionBinding",
+        )?;
+        assert_no_adopted_input_side_effects(temp.path(), "unbound-structural", &runtime)?;
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_metadata_on_kill_is_invalid_before_o2_or_status() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&root_binding("sage"))?;
+        insert_bound_session(temp.path(), "bound-kill-adoption", "sage", Some(binding))?;
+        insert_test_session_with_status(temp.path(), "terminal-kill-adoption", "completed")?;
+        let runtime = RecordingRuntime::default();
+        let adoption = request_adoption("kill-metadata-key", &digest('d'));
+
+        for (session_id, body) in [
+            (
+                "bound-kill-adoption",
+                json!({"executionBinding": "malformed", "requestAdoption": adoption.clone()}),
+            ),
+            (
+                "terminal-kill-adoption",
+                json!({"requestAdoption": adoption.clone()}),
+            ),
+        ] {
+            let response = handle_request_with_runtime(
+                "POST",
+                &format!("/sessions/{session_id}/kill"),
+                temp.path(),
+                None,
+                Some(&body.to_string()),
+                &runtime,
+            )?;
+            assert_adoption_error(
+                &response,
+                400,
+                "request_adoption_invalid",
+                "requestAdoption",
+            )?;
+        }
+        assert!(runtime.kills.borrow().is_empty());
+        assert_eq!(adoption_row_count(temp.path())?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_precommit_denials_write_no_adoption() -> anyhow::Result<()> {
+        let binding_value = root_binding("sage");
+
+        let terminal = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session_with_options(
+            terminal.path(),
+            "adopted-input-terminal-denial",
+            "sage",
+            Some(binding),
+            "completed",
+            false,
+        )?;
+        let terminal_runtime = AdoptedInputRuntime::default();
+        let response = post_adopted_input(
+            terminal.path(),
+            "adopted-input-terminal-denial",
+            &adopted_input_body(
+                binding_value.clone(),
+                "adopted-input-terminal-denial-key",
+                &digest('d'),
+            ),
+            &terminal_runtime,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?["error"]["code"],
+            "session_not_live"
+        );
+        assert_eq!(
+            input_ledger_counts(terminal.path(), "adopted-input-terminal-denial")?,
+            (0, 0, 0)
+        );
+
+        let capacity = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            capacity.path(),
+            "adopted-input-capacity-denial",
+            "sage",
+            Some(binding),
+        )?;
+        let capacity_runtime = AdoptedInputRuntime {
+            capacity_allowed: false,
+            ..AdoptedInputRuntime::default()
+        };
+        let response = post_adopted_input(
+            capacity.path(),
+            "adopted-input-capacity-denial",
+            &adopted_input_body(
+                binding_value.clone(),
+                "adopted-input-capacity-denial-key",
+                &digest('d'),
+            ),
+            &capacity_runtime,
+        )?;
+        assert_eq!(response.status, 413, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?["error"]["code"],
+            "input_too_large"
+        );
+        assert_eq!(
+            input_ledger_counts(capacity.path(), "adopted-input-capacity-denial")?,
+            (0, 0, 0)
+        );
+
+        let handoff = tempfile::tempdir()?;
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            handoff.path(),
+            "adopted-input-handoff-denial",
+            "sage",
+            Some(binding),
+        )?;
+        let mut conn = store::open_store(&store_path(handoff.path()))?;
+        let offered = store::create_handoff(
+            &mut conn,
+            "adopted-input-handoff",
+            "adopted-input-handoff-denial",
+            "{}",
+            "{}",
+            &current_timestamp(),
+        )?;
+        store::claim_handoff(
+            &mut conn,
+            &offered.id,
+            offered.generation,
+            "destination",
+            "claim-key",
+            &current_timestamp(),
+        )?;
+        drop(conn);
+        let handoff_runtime = AdoptedInputRuntime::default();
+        let response = post_adopted_input(
+            handoff.path(),
+            "adopted-input-handoff-denial",
+            &adopted_input_body(
+                binding_value,
+                "adopted-input-handoff-denial-key",
+                &digest('d'),
+            ),
+            &handoff_runtime,
+        )?;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?["error"]["code"],
+            "session_handoff_active"
+        );
+        assert_eq!(
+            input_ledger_counts(handoff.path(), "adopted-input-handoff-denial")?,
+            (0, 0, 0)
+        );
+        assert_eq!(terminal_runtime.input_count(), 0);
+        assert_eq!(capacity_runtime.input_count(), 0);
+        assert_eq!(handoff_runtime.input_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_transaction_rechecks_handoff_after_precheck() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-handoff-race",
+            "sage",
+            Some(binding),
+        )?;
+        let mut conn = store::open_store(&store_path(temp.path()))?;
+        let offered = store::create_handoff(
+            &mut conn,
+            "adopted-input-handoff-race-offer",
+            "adopted-input-handoff-race",
+            "{}",
+            "{}",
+            &current_timestamp(),
+        )?;
+        drop(conn);
+        let home = temp.path().to_path_buf();
+        let _hook = AdoptedInputPrecommitHookGuard::install(move || {
+            let mut conn = store::open_store(&store_path(&home)).expect("open race store");
+            store::claim_handoff(
+                &mut conn,
+                &offered.id,
+                offered.generation,
+                "race-destination",
+                "race-claim-key",
+                &current_timestamp(),
+            )
+            .expect("claim after precheck");
+        });
+        let runtime = AdoptedInputRuntime::default();
+
+        let response = post_adopted_input(
+            temp.path(),
+            "adopted-input-handoff-race",
+            &adopted_input_body(
+                binding_value,
+                "adopted-input-handoff-race-key",
+                &digest('d'),
+            ),
+            &runtime,
+        )?;
+
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&response.body)?["error"]["code"],
+            "session_handoff_active"
+        );
+        assert_eq!(runtime.input_count(), 0);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-handoff-race")?,
+            (0, 0, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_transaction_rechecks_liveness_after_precheck() -> anyhow::Result<()> {
+        for terminal_status in ["completed", "failed"] {
+            let temp = tempfile::tempdir()?;
+            let session_id = format!("adopted-input-{terminal_status}-race");
+            let binding_value = root_binding("sage");
+            let binding = crate::execution_binding::parse(&binding_value)?;
+            insert_bound_session(temp.path(), &session_id, "sage", Some(binding))?;
+            let key = format!("{session_id}-key");
+            let body = adopted_input_body(binding_value, &key, &digest('d'));
+            let home = temp.path().to_path_buf();
+            let hook_session_id = session_id.clone();
+            let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_flag = std::sync::Arc::clone(&hook_ran);
+            let _hook = AdoptedInputPrecommitHookGuard::install(move || {
+                let conn = store::open_store(&store_path(&home)).expect("open liveness race store");
+                store::update_session_status(
+                    &conn,
+                    &hook_session_id,
+                    terminal_status,
+                    None,
+                    &current_timestamp(),
+                )
+                .expect("transition session after outer liveness precheck");
+                hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let runtime = AdoptedInputRuntime::default();
+
+            let response = post_adopted_input(temp.path(), &session_id, &body, &runtime)?;
+
+            assert!(hook_ran.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(response, session_not_live_response(&session_id)?);
+            assert_eq!(runtime.input_count(), 0);
+            assert_eq!(input_ledger_counts(temp.path(), &session_id)?, (0, 0, 0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_transaction_treats_deleted_session_as_not_live() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let session_id = "adopted-input-deleted-race";
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(temp.path(), session_id, "sage", Some(binding))?;
+        let body = adopted_input_body(
+            binding_value,
+            "adopted-input-deleted-race-key",
+            &digest('d'),
+        );
+        let home = temp.path().to_path_buf();
+        let _hook = AdoptedInputPrecommitHookGuard::install(move || {
+            let conn = store::open_store(&store_path(&home)).expect("open deletion race store");
+            assert_eq!(
+                conn.execute(
+                    "DELETE FROM sessions WHERE id = ?1",
+                    ["adopted-input-deleted-race"],
+                )
+                .expect("delete session after outer liveness precheck"),
+                1
+            );
+        });
+        let runtime = AdoptedInputRuntime::default();
+
+        let response = post_adopted_input(temp.path(), session_id, &body, &runtime)?;
+
+        assert_eq!(response, session_not_live_response(session_id)?);
+        assert_eq!(runtime.input_count(), 0);
+        assert_eq!(input_ledger_counts(temp.path(), session_id)?, (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_liveness_precedes_handoff_when_both_race() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let session_id = "adopted-input-liveness-handoff-race";
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(temp.path(), session_id, "sage", Some(binding))?;
+        let mut conn = store::open_store(&store_path(temp.path()))?;
+        let offered = store::create_handoff(
+            &mut conn,
+            "adopted-input-liveness-handoff-offer",
+            session_id,
+            "{}",
+            "{}",
+            &current_timestamp(),
+        )?;
+        drop(conn);
+        let body = adopted_input_body(
+            binding_value,
+            "adopted-input-liveness-handoff-key",
+            &digest('d'),
+        );
+        let home = temp.path().to_path_buf();
+        let _hook = AdoptedInputPrecommitHookGuard::install(move || {
+            let mut conn = store::open_store(&store_path(&home)).expect("open combined race store");
+            store::claim_handoff(
+                &mut conn,
+                &offered.id,
+                offered.generation,
+                "race-destination",
+                "race-claim-key",
+                &current_timestamp(),
+            )
+            .expect("claim handoff after outer precheck");
+            store::update_session_status(
+                &conn,
+                "adopted-input-liveness-handoff-race",
+                "completed",
+                Some(0),
+                &current_timestamp(),
+            )
+            .expect("complete session after outer liveness precheck");
+        });
+        let runtime = AdoptedInputRuntime::default();
+
+        let response = post_adopted_input(temp.path(), session_id, &body, &runtime)?;
+
+        assert_eq!(response, session_not_live_response(session_id)?);
+        assert_eq!(runtime.input_count(), 0);
+        assert_eq!(input_ledger_counts(temp.path(), session_id)?, (0, 0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_postcommit_failures_are_retained_redacted_and_not_retried(
+    ) -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-runtime-failure",
+            "sage",
+            Some(binding),
+        )?;
+        let key = "private-runtime-input-key";
+        let body = adopted_input_body(binding_value.clone(), key, &digest('d'));
+        let secret = format!("{key} {} {} hello", digest('d'), binding_value);
+        let runtime = AdoptedInputRuntime {
+            failure: Some(secret.clone()),
+            ..AdoptedInputRuntime::default()
+        };
+
+        let failed = post_adopted_input(
+            temp.path(),
+            "adopted-input-runtime-failure",
+            &body,
+            &runtime,
+        )?;
+
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let failed_body: Value = serde_json::from_str(&failed.body)?;
+        assert_eq!(failed_body["error"]["code"], "send_input_failed");
+        assert_eq!(
+            failed_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        for forbidden in [
+            key,
+            digest('d').as_str(),
+            "hello",
+            "adopted-input-runtime-failure",
+            secret.as_str(),
+        ] {
+            assert!(
+                !failed.body.contains(forbidden),
+                "failure leaked {forbidden}"
+            );
+        }
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-runtime-failure")?,
+            (1, 0, 0)
+        );
+
+        let replay_runtime = AdoptedInputRuntime::default();
+        let replay = post_adopted_input(
+            temp.path(),
+            "adopted-input-runtime-failure",
+            &body,
+            &replay_runtime,
+        )?;
+        assert_adopted_input_response(&replay, 200, true)?;
+        assert_eq!(replay_runtime.input_count(), 0);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-runtime-failure")?,
+            (1, 0, 0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_event_and_cleanup_failure_preserves_event_error() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-event-failure",
+            "sage",
+            Some(binding),
+        )?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        conn.execute_batch(
+            "CREATE TRIGGER adopted_input_test_fail_event
+             BEFORE INSERT ON events BEGIN
+               SELECT RAISE(FAIL, 'blocked adopted input event');
+             END;
+             CREATE TRIGGER adopted_input_test_fail_release
+             BEFORE DELETE ON session_input_leases BEGIN
+               SELECT RAISE(FAIL, 'blocked adopted input lease release');
+             END;",
+        )?;
+        drop(conn);
+        let runtime = AdoptedInputRuntime::default();
+        let body = adopted_input_body(
+            binding_value,
+            "adopted-input-event-failure-key",
+            &digest('d'),
+        );
+
+        let failed =
+            post_adopted_input(temp.path(), "adopted-input-event-failure", &body, &runtime)?;
+
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let failed_body: Value = serde_json::from_str(&failed.body)?;
+        assert_eq!(failed_body["error"]["code"], "event_persistence_failed");
+        assert_eq!(
+            failed_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-event-failure")?,
+            (1, 0, 1)
+        );
+
+        let replay_runtime = AdoptedInputRuntime::default();
+        let replay = post_adopted_input(
+            temp.path(),
+            "adopted-input-event-failure",
+            &body,
+            &replay_runtime,
+        )?;
+        assert_adopted_input_response(&replay, 200, true)?;
+        assert_eq!(replay_runtime.input_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_lease_release_failure_is_marked_and_not_retried() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-release-failure",
+            "sage",
+            Some(binding),
+        )?;
+        let conn = store::open_store(&store_path(temp.path()))?;
+        conn.execute_batch(
+            "CREATE TRIGGER adopted_input_test_fail_release_only
+             BEFORE DELETE ON session_input_leases BEGIN
+               SELECT RAISE(FAIL, 'blocked adopted input lease release');
+             END;",
+        )?;
+        drop(conn);
+        let runtime = AdoptedInputRuntime::default();
+        let body = adopted_input_body(
+            binding_value,
+            "adopted-input-release-failure-key",
+            &digest('d'),
+        );
+
+        let failed = post_adopted_input(
+            temp.path(),
+            "adopted-input-release-failure",
+            &body,
+            &runtime,
+        )?;
+
+        assert_eq!(failed.status, 500, "{}", failed.body);
+        let failed_body: Value = serde_json::from_str(&failed.body)?;
+        assert_eq!(failed_body["error"]["code"], "input_lease_release_failed");
+        assert_eq!(
+            failed_body["error"]["details"],
+            json!({"adopted": true, "delivery": "not_asserted"})
+        );
+        assert_eq!(runtime.input_count(), 1);
+        assert_eq!(
+            input_ledger_counts(temp.path(), "adopted-input-release-failure")?,
+            (1, 1, 1)
+        );
+
+        let replay_runtime = AdoptedInputRuntime::default();
+        let replay = post_adopted_input(
+            temp.path(),
+            "adopted-input-release-failure",
+            &body,
+            &replay_runtime,
+        )?;
+        assert_adopted_input_response(&replay, 200, true)?;
+        assert_eq!(replay_runtime.input_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn adopted_input_holds_no_sqlite_writer_across_gate_or_runtime() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let binding_value = root_binding("sage");
+        let binding = crate::execution_binding::parse(&binding_value)?;
+        insert_bound_session(
+            temp.path(),
+            "adopted-input-short-writers",
+            "sage",
+            Some(binding),
+        )?;
+        let hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_flag = std::sync::Arc::clone(&hook_ran);
+        let home = temp.path().to_path_buf();
+        let _hook = AdoptedInputBeforeGateHookGuard::install(move || {
+            let conn = store::open_store(&store_path(&home)).expect("open concurrent writer");
+            conn.execute(
+                "UPDATE sessions SET updated_at = updated_at
+                 WHERE id = 'adopted-input-short-writers'",
+                [],
+            )
+            .expect("no SQLite writer may span adoption gate acquisition");
+            hook_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        let runtime = AdoptedInputRuntime {
+            write_during_runtime: Some(temp.path().to_path_buf()),
+            ..AdoptedInputRuntime::default()
+        };
+
+        let response = post_adopted_input(
+            temp.path(),
+            "adopted-input-short-writers",
+            &adopted_input_body(
+                binding_value,
+                "adopted-input-short-writers-key",
+                &digest('d'),
+            ),
+            &runtime,
+        )?;
+
+        assert_adopted_input_response(&response, 202, false)?;
+        assert!(hook_ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(runtime.input_count(), 1);
         Ok(())
     }
 }

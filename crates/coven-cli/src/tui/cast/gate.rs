@@ -23,7 +23,11 @@ use super::intent::CastIntent;
 use super::plan::CastPlan;
 use super::safety::{CastRisk, SafetyDecision};
 
-const SACRIFICE_CONFIRM_WORD: &str = "sacrifice";
+/// The exact, case-sensitive word Cast requires before it will delete a
+/// session. Shared with the chat TUI so its pending-confirmation resolver
+/// enforces the same typed-word gate the interactive shell prompt does
+/// (rather than falling through to the generic accept/yes/y path).
+pub(crate) const SACRIFICE_CONFIRM_WORD: &str = "sacrifice";
 
 /// What the gate decided about the plan. The dispatcher branches on this
 /// before any side effect.
@@ -102,7 +106,8 @@ where
         .map(short_id)
         .unwrap_or_else(|| "<unknown>".to_string());
     let prompt = format!(
-        "Cast: this will permanently delete session `{session_id_short}` and its events.\n\
+        "Cast: If eligible, this will permanently delete eligible non-running session `{session_id_short}` and its events. \
+         Adopted or reserved sessions are retained.\n\
          Type `{word}` to confirm (anything else cancels): "
     );
     let answer = reader(&prompt)?;
@@ -296,6 +301,22 @@ mod tests {
         let outcome = evaluate_gate(&plan, &mut scripted.reader()).unwrap();
 
         assert_eq!(outcome, GateOutcome::Proceed);
+    }
+
+    #[test]
+    fn cast_sacrifice_confirmation_does_not_promise_ineligible_deletion() {
+        let plan = sacrifice_plan("abcdef123456");
+        let mut scripted = ScriptedReader::new(&["sacrifice"]);
+
+        let outcome = evaluate_gate(&plan, &mut scripted.reader()).unwrap();
+
+        assert_eq!(outcome, GateOutcome::Proceed);
+        assert_eq!(
+            scripted.prompts_seen[0],
+            "Cast: If eligible, this will permanently delete eligible non-running session \
+             `abcdef123456` and its events. Adopted or reserved sessions are retained.\n\
+             Type `sacrifice` to confirm (anything else cancels): "
+        );
     }
 
     #[test]

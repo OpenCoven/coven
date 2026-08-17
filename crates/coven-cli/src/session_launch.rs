@@ -168,9 +168,11 @@ pub struct NewSessionParams {
     pub project_root: String,
     pub harness: String,
     pub title: String,
-    /// `created` on CLI foreground paths (the run loop advances it),
-    /// `running` on the daemon path (the runtime launch already happened by
-    /// the time the row is read back).
+    /// `created` until runtime ownership is established, including adopted
+    /// daemon launches; the owning runtime then immediately compare-and-sets
+    /// it to `running` after cancellation registration and before initial
+    /// prompt delivery. Direct daemon launches may still arrive here as
+    /// `running` when ownership was established before persistence.
     pub status: String,
     /// Row creation time; also used as `updated_at`.
     pub now: String,

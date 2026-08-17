@@ -94,6 +94,19 @@ impl std::fmt::Display for NotLiveError {
 
 impl std::error::Error for NotLiveError {}
 
+/// Privacy-safe launch disposition: runtime ownership may still be registered
+/// after cleanup failed, so callers must preserve an active, killable state.
+#[derive(Debug)]
+pub(crate) struct RuntimeOwnershipRetainedError;
+
+impl std::fmt::Display for RuntimeOwnershipRetainedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("runtime ownership may remain after launch cleanup")
+    }
+}
+
+impl std::error::Error for RuntimeOwnershipRetainedError {}
+
 #[derive(Default)]
 pub struct LiveSessionRuntime {
     coven_home: Option<PathBuf>,
@@ -708,7 +721,7 @@ static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
-        self.launch_session_inner(launch, None)
+        self.launch_session_inner(launch, None, None)
     }
 
     fn launch_session_with_writer(
@@ -716,7 +729,16 @@ impl SessionRuntime for LiveSessionRuntime {
         launch: &SessionLaunch,
         writer: crate::maintenance_gate::WriterLease,
     ) -> Result<()> {
-        self.launch_session_inner(launch, Some(writer))
+        self.launch_session_inner(launch, Some(writer), None)
+    }
+
+    fn launch_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.launch_session_inner(launch, writer, Some(ownership_established))
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -732,6 +754,7 @@ impl SessionRuntime for LiveSessionRuntime {
         session_id: &str,
         kind: &str,
         payload: &Value,
+        request_adoption_id: Option<&str>,
         action: &mut dyn FnMut() -> SessionEventBoundaryResult,
     ) -> Option<SessionEventBoundaryResult> {
         let writer = self.event_writer.as_ref()?;
@@ -739,7 +762,7 @@ impl SessionRuntime for LiveSessionRuntime {
             match kind {
                 "input" => {
                     let reservation = writer
-                        .reserve_record(session_id, kind, payload.clone())
+                        .reserve_record(session_id, kind, payload.clone(), request_adoption_id)
                         .map_err(SessionEventBoundaryError::Persistence)?;
                     match action() {
                         Ok(()) => reservation
@@ -827,6 +850,7 @@ impl LiveSessionRuntime {
         &self,
         launch: &SessionLaunch,
         writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
     ) -> Result<()> {
         anyhow::ensure!(
             !self.shutting_down.load(Ordering::Acquire),
@@ -869,6 +893,16 @@ impl LiveSessionRuntime {
                 launch_options,
             )?
         };
+        self.launch_prepared_session(launch, writer, command, ownership_established)
+    }
+
+    fn launch_prepared_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        command: pty_runner::HarnessCommand,
+        mut ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<()> {
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
         let observer = Some(observer);
@@ -897,7 +931,7 @@ impl LiveSessionRuntime {
                 publish(killer)?;
                 Ok(piped)
             })?;
-            piped.activate(|input, process_tree| {
+            let activation = piped.activate(|input, process_tree| {
                 self.register_kind_with_registration(
                     launch.id.clone(),
                     LiveSessionKind::Stream,
@@ -906,32 +940,15 @@ impl LiveSessionRuntime {
                     registration,
                 )?;
                 launch_admission.release();
-                Ok(())
-            })?;
-            // Register cancellation ownership before sending the launch's
-            // first stream-json user message. A child that stops reading can
-            // still block this per-session input lock, but daemon shutdown or
-            // /kill owns an independent strict process-tree handle and can
-            // interrupt the write without waiting for that lock.
-            if !launch.prompt.is_empty() {
-                if let Err(error) = SessionRuntime::send_input(
-                    self,
-                    &launch.id,
-                    &json!({ "data": launch.prompt.as_str() }),
-                ) {
-                    let cleanup = SessionRuntime::kill_session(self, &launch.id).err();
-                    let primary = error.context(format!(
-                        "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
-                        launch.harness
-                    ));
-                    return match cleanup {
-                        Some(cleanup) => Err(anyhow::anyhow!(
-                            "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
-                        )),
-                        None => Err(primary),
-                    };
-                }
-            }
+                publish_established_runtime_ownership(&mut ownership_established)
+            });
+            self.classify_piped_activation_result(activation)?;
+            // Cancellation registration and adopted `running` publication
+            // both precede the first stream-json user message. A child that
+            // stops reading can still block this per-session input lock, but
+            // daemon shutdown or /kill owns an independent strict process-tree
+            // handle and can interrupt the write without waiting for that lock.
+            self.deliver_initial_stream_prompt(launch)?;
             return Ok(());
         }
 
@@ -948,7 +965,7 @@ impl LiveSessionRuntime {
                 publish(killer)?;
                 Ok(piped)
             })?;
-            return piped.activate(|input, process_tree| {
+            let activation = piped.activate(|input, process_tree| {
                 self.register_kind_with_registration(
                     launch.id.clone(),
                     LiveSessionKind::Pty,
@@ -957,8 +974,9 @@ impl LiveSessionRuntime {
                     registration,
                 )?;
                 launch_admission.release();
-                Ok(())
+                publish_established_runtime_ownership(&mut ownership_established)
             });
+            return self.classify_piped_activation_result(activation);
         }
 
         // Interactive claude launches hit the workspace trust dialog (not
@@ -985,7 +1003,52 @@ impl LiveSessionRuntime {
             registration,
         )?;
         launch_admission.release();
+        publish_established_runtime_ownership(&mut ownership_established)
+    }
+
+    fn deliver_initial_stream_prompt(&self, launch: &SessionLaunch) -> Result<()> {
+        if launch.prompt.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) =
+            SessionRuntime::send_input(self, &launch.id, &json!({ "data": launch.prompt.as_str() }))
+        {
+            let cleanup = SessionRuntime::kill_session(self, &launch.id);
+            let primary = error.context(format!(
+                "stream-mode launch of `{}` failed: child closed stdin before the initial message landed (auth/setup error?)",
+                launch.harness
+            ));
+            return match cleanup {
+                Err(_cleanup) if self.runtime_ownership_retained_or_ambiguous(&launch.id) => {
+                    Err(anyhow::Error::new(RuntimeOwnershipRetainedError))
+                }
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "{primary:#}; failed to terminate the rejected stream launch: {cleanup:#}"
+                )),
+                Ok(()) => Err(primary),
+            };
+        }
         Ok(())
+    }
+
+    fn runtime_ownership_retained_or_ambiguous(&self, session_id: &str) -> bool {
+        match self.sessions.lock() {
+            Ok(sessions) => sessions.contains_key(session_id),
+            Err(_) => true,
+        }
+    }
+
+    fn classify_piped_activation_result(&self, activation: Result<()>) -> Result<()> {
+        match activation {
+            Err(error)
+                if error
+                    .downcast_ref::<pty_runner::PipedLaunchCleanupRetainedError>()
+                    .is_some() =>
+            {
+                Err(anyhow::Error::new(RuntimeOwnershipRetainedError))
+            }
+            result => result,
+        }
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -1075,6 +1138,15 @@ impl LiveSessionRuntime {
             return Err(error);
         }
         Ok(())
+    }
+}
+
+fn publish_established_runtime_ownership(
+    ownership_established: &mut Option<&mut dyn FnMut() -> Result<()>>,
+) -> Result<()> {
+    match ownership_established.take() {
+        Some(publish) => publish(),
+        None => Ok(()),
     }
 }
 
@@ -5047,6 +5119,158 @@ mod tests {
     }
 
     #[cfg(any(unix, windows))]
+    fn assert_adopted_publication_precedes_blocked_delivery(stream: bool) -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let session_id = if stream {
+            "adopted-blocked-stream"
+        } else {
+            "adopted-blocked-piped"
+        };
+        let mut row = session_record(session_id);
+        row.status = "created".to_string();
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        crate::store::insert_session(&conn, &row)?;
+        drop(conn);
+
+        let pid_file = temp_dir.path().join(if stream {
+            "blocked-stream.pid"
+        } else {
+            "blocked-piped.pid"
+        });
+        let command = if stream {
+            daemon_shutdown_descendant_fixture(temp_dir.path(), &pid_file)
+        } else {
+            pty_runner::piped_prompt_probe_command(
+                temp_dir.path(),
+                "never-read",
+                &pid_file.to_string_lossy(),
+                None,
+                vec![b'x'; 4 * 1024 * 1024],
+            )?
+        };
+        let launch = crate::api::SessionLaunch {
+            id: session_id.to_string(),
+            project_root: temp_dir.path().to_string_lossy().into_owned(),
+            cwd: temp_dir.path().to_string_lossy().into_owned(),
+            harness: if stream { "claude" } else { "codex" }.to_string(),
+            model: None,
+            launch_mode: if stream {
+                crate::harness::HarnessLaunchMode::Stream
+            } else {
+                crate::harness::HarnessLaunchMode::NonInteractive
+            },
+            launch_policy: None,
+            prompt: if stream {
+                "x".repeat(4 * 1024 * 1024)
+            } else {
+                "piped prompt is carried by the prepared command".to_string()
+            },
+            title: "blocked adopted ownership publication".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: None,
+            caller_familiar_id: None,
+        };
+        let runtime = Arc::new(LiveSessionRuntime::with_coven_home(
+            temp_dir.path().to_path_buf(),
+        ));
+        let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let callback_count = Arc::clone(&callbacks);
+        let callback_home = temp_dir.path().to_path_buf();
+        let callback_id = session_id.to_string();
+        let (published_tx, published_rx) = std::sync::mpsc::channel();
+        let launch_runtime = Arc::clone(&runtime);
+        let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut publish_running = || -> Result<()> {
+                callback_count.fetch_add(1, Ordering::SeqCst);
+                let conn = crate::store::open_store(&callback_home.join(crate::STORE_FILE_NAME))?;
+                let changed = crate::store::update_session_status_if_current(
+                    &conn,
+                    &callback_id,
+                    "created",
+                    "running",
+                    None,
+                    &chrono::Utc::now().to_rfc3339(),
+                )?;
+                anyhow::ensure!(changed, "created row did not publish running");
+                let _ = published_tx.send(());
+                Ok(())
+            };
+            let result = launch_runtime.launch_prepared_session(
+                &launch,
+                None,
+                command,
+                Some(&mut publish_running),
+            );
+            let _ = launch_tx.send(result);
+        });
+
+        let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
+        published_rx.recv_timeout(Duration::from_secs(2))?;
+        let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
+        assert_eq!(
+            crate::store::get_session(&conn, session_id)?
+                .context("blocked adopted session")?
+                .status,
+            "running"
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(matches!(
+            launch_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+
+        let kill = crate::api::handle_request_with_runtime(
+            "POST",
+            &format!("/sessions/{session_id}/kill"),
+            temp_dir.path(),
+            None,
+            None,
+            runtime.as_ref(),
+        )?;
+        assert_eq!(kill.status, 202, "{}", kill.body);
+        let launch_error = launch_rx
+            .recv_timeout(Duration::from_secs(2))?
+            .expect_err("kill must interrupt blocked initial delivery");
+        assert!(
+            !launch_error.to_string().is_empty(),
+            "blocked launch returned an empty cancellation error"
+        );
+        assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            crate::store::get_session(&conn, session_id)?
+                .context("killed adopted session")?
+                .status,
+            "killed"
+        );
+        await_daemon_shutdown_descendant_exit(
+            child_pid,
+            if stream {
+                "blocked adopted stream cancellation"
+            } else {
+                "blocked adopted piped cancellation"
+            },
+        )?;
+        Ok(())
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn adopted_stream_registration_publishes_running_before_blocked_prompt_and_is_killable(
+    ) -> Result<()> {
+        assert_adopted_publication_precedes_blocked_delivery(true)
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn adopted_piped_registration_publishes_running_before_blocked_prompt_and_is_killable(
+    ) -> Result<()> {
+        assert_adopted_publication_precedes_blocked_delivery(false)
+    }
+
+    #[cfg(any(unix, windows))]
     #[test]
     fn concurrent_api_kill_during_prompt_delivery_preserves_killed_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -5453,6 +5677,195 @@ mod tests {
         }
     }
 
+    struct FailingWriter(&'static str);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, self.0))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn stream_launch_fixture(id: &str, prompt: &str) -> crate::api::SessionLaunch {
+        crate::api::SessionLaunch {
+            id: id.to_string(),
+            project_root: "/private-project-fixture".to_string(),
+            cwd: "/private-project-fixture".to_string(),
+            harness: "private-harness-fixture".to_string(),
+            model: None,
+            launch_mode: crate::harness::HarnessLaunchMode::Stream,
+            launch_policy: None,
+            prompt: prompt.to_string(),
+            title: "private-title-fixture".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: None,
+            caller_familiar_id: None,
+        }
+    }
+
+    #[test]
+    fn failed_initial_stream_input_with_failed_cleanup_retains_typed_ownership() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "private-retained-session-fixture";
+        let prompt = "private-initial-input-fixture";
+        let input_error = "private-input-error-fixture";
+        let cleanup_error = "private-cleanup-error-fixture";
+        runtime.register_kind(
+            session_id.to_string(),
+            LiveSessionKind::Stream,
+            Box::new(FailingWriter(input_error)),
+            Box::new(FailingKiller(cleanup_error)),
+        )?;
+
+        let error = runtime
+            .deliver_initial_stream_prompt(&stream_launch_fixture(session_id, prompt))
+            .expect_err("failed cleanup must report retained runtime ownership");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_some(),
+            "returned anyhow error lost its retained-ownership disposition: {error:#}"
+        );
+        assert!(
+            runtime.sessions.lock().unwrap().contains_key(session_id),
+            "failed cleanup discarded the live runtime handle"
+        );
+        let diagnostic = format!("{error:#}");
+        for private in [
+            session_id,
+            prompt,
+            input_error,
+            cleanup_error,
+            "private-harness-fixture",
+            "private-project-fixture",
+        ] {
+            assert!(
+                !diagnostic.contains(private),
+                "retained-ownership error leaked private fixture data"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_initial_stream_input_with_successful_cleanup_is_definitive() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "definitively-cleaned-session";
+        let killer = RecordingKiller::default();
+        let killed = Arc::clone(&killer.killed);
+        runtime.register_kind(
+            session_id.to_string(),
+            LiveSessionKind::Stream,
+            Box::new(FailingWriter("initial input failed")),
+            Box::new(killer),
+        )?;
+
+        let error = runtime
+            .deliver_initial_stream_prompt(&stream_launch_fixture(session_id, "initial input"))
+            .expect_err("initial input failure must be returned after cleanup");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_none(),
+            "confirmed cleanup must remain an ordinary launch error"
+        );
+        assert!(*killed.lock().unwrap(), "cleanup kill was not invoked");
+        assert!(
+            !runtime.sessions.lock().unwrap().contains_key(session_id),
+            "confirmed cleanup left a live registry handle"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ordinary_piped_error_stays_ordinary_while_registry_callback_is_delayed() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "delayed-registry-cleanup";
+        runtime.register(
+            session_id.to_string(),
+            Box::new(std::io::sink()),
+            Box::new(RecordingKiller::default()),
+        )?;
+
+        let error = runtime
+            .classify_piped_activation_result(Err(anyhow::anyhow!(
+                "ordinary definitive prompt failure"
+            )))
+            .expect_err("ordinary prompt failure must survive classification");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_none(),
+            "registry timing overrode the authoritative cleanup disposition: {error:#}"
+        );
+        assert_eq!(error.to_string(), "ordinary definitive prompt failure");
+        assert!(
+            runtime.sessions.lock().unwrap().contains_key(session_id),
+            "fixture must model an exit callback delayed before registry removal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn typed_piped_cleanup_disposition_translates_exactly_and_privately() {
+        let runtime = LiveSessionRuntime::default();
+
+        let error = runtime
+            .classify_piped_activation_result(Err(anyhow::Error::new(
+                pty_runner::PipedLaunchCleanupRetainedError,
+            )))
+            .expect_err("typed piped cleanup failure must translate");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_some(),
+            "typed pty cleanup disposition did not translate exactly: {error:#}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "runtime ownership may remain after launch cleanup"
+        );
+    }
+
+    #[test]
+    fn failed_piped_activation_after_definitive_cleanup_is_ordinary() -> Result<()> {
+        let runtime = LiveSessionRuntime::default();
+        let session_id = "definitively-cleaned-piped-session";
+        let killer = RecordingKiller::default();
+        let killed = Arc::clone(&killer.killed);
+        runtime.register(
+            session_id.to_string(),
+            Box::new(std::io::sink()),
+            Box::new(killer),
+        )?;
+        SessionRuntime::kill_session(&runtime, session_id)?;
+        let error = runtime
+            .classify_piped_activation_result(Err(anyhow::anyhow!("piped prompt delivery failed")))
+            .expect_err("the prompt failure must survive definitive cleanup");
+
+        assert!(
+            error
+                .downcast_ref::<RuntimeOwnershipRetainedError>()
+                .is_none(),
+            "confirmed piped cleanup must remain an ordinary launch error"
+        );
+        assert_eq!(error.to_string(), "piped prompt delivery failed");
+        assert!(*killed.lock().unwrap(), "cleanup kill was not invoked");
+        assert!(
+            !runtime.sessions.lock().unwrap().contains_key(session_id),
+            "confirmed piped cleanup left a live registry handle"
+        );
+        Ok(())
+    }
+
     struct CountingFailingKiller {
         attempts: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -5514,6 +5927,7 @@ mod tests {
             session_id: &str,
             kind: &str,
             payload: &Value,
+            request_adoption_id: Option<&str>,
             action: &mut dyn FnMut() -> crate::api::SessionEventBoundaryResult,
         ) -> Option<crate::api::SessionEventBoundaryResult> {
             SessionRuntime::with_session_event_boundary(
@@ -5521,6 +5935,7 @@ mod tests {
                 session_id,
                 kind,
                 payload,
+                request_adoption_id,
                 action,
             )
         }
@@ -5684,6 +6099,7 @@ mod tests {
                 "wedged-session",
                 "input",
                 &payload,
+                None,
                 &mut action,
             )
             .expect("writer-backed runtime handles input boundaries")
@@ -5709,6 +6125,7 @@ mod tests {
                 "wedged-session",
                 "kill",
                 &payload,
+                None,
                 &mut action,
             )
             .expect("writer-backed runtime handles kill boundaries")

@@ -47,7 +47,9 @@ GET /api/v1/health
     "afs": true,
     "afsMount": false,
     "afsCommit": true,
-    "afsCommitDryRun": true
+    "afsCommitDryRun": true,
+    "executionBindingContracts": ["psyche.execution_binding.v1"],
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
   },
   "daemon": {
     "pid": 31415,
@@ -57,10 +59,11 @@ GET /api/v1/health
 }
 ```
 
-This example contains all 14 health capability fields: `sessions`, `events`,
+This example contains all 16 health capability fields: `sessions`, `events`,
 `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
 `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
-`afsCommit`, and `afsCommitDryRun`.
+`afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and
+`requestAdoptionContracts`.
 
 `sessionLaunchPolicy` is `true` only on owner-gated local IPC. TCP health
 reports it as `false`, and TCP returns `403 forbidden` for any session request
@@ -88,14 +91,17 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `GET /api/v1/capabilities` | Discover routable capabilities and owning adapters. |
 | `POST /api/v1/actions` | Send a known intent through the control plane. |
 | `GET /api/v1/sessions` | List sessions. |
-| `POST /api/v1/sessions` | Launch a session. `launchPolicy` requires owner-gated local IPC and `sessionLaunchPolicy: true`; TCP rejects the field. |
+| `POST /api/v1/sessions` | Launch an unbound session. A structurally valid bound `executionBinding` that omits `requestAdoption` is `request_adoption_required`; supplying it there is `request_adoption_invalid` instead, and no session is created either way. `launchPolicy` requires owner-gated local IPC and `sessionLaunchPolicy: true`. |
+| `POST /api/v1/adopted-sessions` | Adopt and launch a bound session: `201 SessionRecord` first, `200 SessionRecord` exact replay. |
+| `POST /api/v1/sessions/external` | Register an external session. `requestAdoption` is rejected before `executionBinding` when both are present. |
 | `GET /api/v1/sessions/:id` | Fetch one session. |
 | `GET /api/v1/events?sessionId=...` | Read session events. |
 | `GET /api/v1/memory` | List familiar memory summaries with opaque ids. |
 | `GET /api/v1/memory/overview` | Read memory totals and capability state. |
 | `GET /api/v1/memory/:id` | Read validated markdown content for a list id. |
-| `POST /api/v1/sessions/:id/input` | Forward input to a live session. |
-| `POST /api/v1/sessions/:id/kill` | Kill a live session. |
+| `POST /api/v1/sessions/:id/input` | Forward input to a live unbound session; `requestAdoption` is rejected rather than ignored. A bound request with valid exact O2 proof but no adoption is `request_adoption_required`. |
+| `POST /api/v1/sessions/:id/adopted-input` | Adopt bound input: `202 {"adopted":true,"replayed":false,"delivery":"not_asserted"}` first; `200 {"adopted":true,"replayed":true,"delivery":"not_asserted"}` replay. |
+| `POST /api/v1/sessions/:id/kill` | Kill a live session. Any `requestAdoption` is invalid before O2 proof or status processing; bound kill otherwise uses exact O2 proof. |
 | `POST /api/v1/sessions/:id/handoffs` | Offer a redacted, generation-fenced handoff. |
 | `GET /api/v1/sessions/:id/handoffs` | Read stored handoff state. |
 | `POST /api/v1/sessions/:id/handoffs/:handoffId/claim` | Claim a handoff generation. |
@@ -114,6 +120,64 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 | `DELETE /api/v1/afs/sessions/:id/mount` | Unmount. Idempotent. |
 
 Detailed shapes live in the [API reference](/reference/api).
+
+The two adopted routes require complete `executionBinding` and closed
+`requestAdoption` metadata. Their O3-specific errors are
+`request_adoption_required`, `request_adoption_invalid`,
+`request_adoption_unsupported`, and `request_adoption_conflict`. A synchronous
+HTTP error returned after adoption keeps its concrete code and sets
+`error.details` to the marker-only
+`{"adopted":true,"delivery":"not_asserted"}` shape. Asynchronous terminal or
+event-persistence failures are logged while retained evidence remains; they
+cannot update a response that already returned. The marker makes no delivery
+or completion claim.
+
+Before either adopted POST, the bundled client calls `GET /api/v1/health` and
+negotiates in a fixed three-step order. First it requires `health.apiVersion`
+to be the exact string `coven.daemon.v1`.
+Second it requires `health.ok === true`.
+Only after both checks pass does it require
+`health.capabilities.requestAdoptionContracts` to be an array containing the
+exact `psyche.request_adoption.v1` string.
+Missing, null, false, and non-boolean `health.ok` values all fail locally.
+Any health transport, API-version, health-ok, or capability failure sends zero
+POST requests and never falls back to a legacy mutation. That O3 capability
+advertises the composite adopted-route contract; the client does not independently gate
+these adopted methods on `executionBindingContracts`. It
+does not replace proof: every adopted request must still carry a complete,
+exact O2 `executionBinding` proof for Rust to validate. Both health fields
+remain additive capabilities.
+
+Legacy precedence is route-specific. Bound launch first parses and validates
+the closed `executionBinding` shape and root/child relationship; a malformed
+or unsupported binding keeps its own O2 error code there rather than becoming
+an adoption error. Only a structurally valid binding then reaches the O3
+check: missing adoption returns `400 request_adoption_required` with
+`details.fields: ["requestAdoption"]`, while supplied adoption at that
+forbidden legacy location is `400 request_adoption_invalid` at the same path,
+and no session is created either way. Bound input performs session lookup,
+JSON parsing, and complete exact O2 proof validation first — a malformed,
+unsupported, or mismatched proof likewise keeps its own O2 error rather than
+being flattened into an adoption error; missing adoption then returns
+`400 request_adoption_required` with `details.fields: ["requestAdoption"]`,
+while supplied adoption on that legacy route is `400 request_adoption_invalid`
+at the same path. Live unbound input checks liveness before parsing, then
+rejects supplied adoption at
+`details.fields: ["executionBinding"]`; it is not ignored. Kill looks up the
+session and parses the body, then rejects any `requestAdoption` at
+`details.fields: ["requestAdoption"]` before O2 proof, status, or external
+processing. Even unbound kill bodies are parsed best-effort for that reserved
+member; malformed bodies and other fields remain ignored. Bound kill otherwise
+keeps exact O2 proof, no-expiry, status, external, and runtime ordering.
+
+External registration checks `requestAdoption` immediately after JSON parsing,
+then `executionBinding`, then registration fields. Consequently
+`request_adoption_invalid` at `["requestAdoption"]` wins when both reserved
+members are supplied; otherwise `execution_binding_invalid` at
+`["executionBinding"]` preserves the O2 external-registration rule. See the
+canonical [request-adoption contract](/API-CONTRACT#psyche-request-adoption-contract-v1)
+for the complete errors, messages, identity, ordering, privacy, retention, and
+exclusions.
 
 Agent-filesystem routes are gated by the `afs` capability, and are **same-user
 local IPC** operations for the same reason session handoff is: they expose a

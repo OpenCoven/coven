@@ -13,7 +13,7 @@ use crate::{
         self, build_plan, parse_spell,
         plan::{CastHarnessSource, CastPlan},
         safety::{CastRisk, SafetyDecision},
-        CastHarness, CastIntent,
+        CastHarness, CastIntent, SACRIFICE_CONFIRM_WORD,
     },
 };
 
@@ -750,6 +750,25 @@ impl App {
         self.auto_retry_consumed = false;
 
         if self.pending_cast_confirmation.is_some() {
+            // A pending confirmation normally routes every keystroke through
+            // `resolve_pending_cast_confirmation` below, which only
+            // understands accept/reject words. For a pending *sacrifice*
+            // specifically, that means `/clear`/`/cls` would otherwise be
+            // swallowed as an unrecognized word (falling to the "type
+            // accept/reject" nudge) instead of clearing anything — leaving
+            // the destructive plan armed for a later bare `sacrifice`.
+            // Recognize the exact local `/clear`/`/cls` forms here, before
+            // resolving the pending confirmation, and route them through
+            // the normal slash-command path so `clear_transcript` disarms
+            // the pending plan (see `clear_transcript`'s
+            // `pending_sacrifice_target` check) and clears the transcript.
+            // Non-sacrifice pending plans (e.g. patch/adopt confirmations)
+            // keep the existing generic accept/reject handling untouched.
+            if self.pending_sacrifice_target().is_some() && is_local_clear_command(&raw) {
+                let result = self.handle_slash_command(&raw);
+                self.scroll_to_bottom();
+                return Some(result);
+            }
             let result = self.resolve_pending_cast_confirmation(&raw);
             self.scroll_to_bottom();
             return Some(result);
@@ -810,6 +829,9 @@ impl App {
     /// long-lived stream sessions so the next claude turn cold-starts a
     /// fresh process.
     pub(super) fn clear_transcript(&mut self) {
+        if self.pending_sacrifice_target().is_some() {
+            self.pending_cast_confirmation = None;
+        }
         self.messages.clear();
         self.scroll_offset = 0;
         self.harness_conversation_ids.clear();
@@ -1015,9 +1037,16 @@ impl App {
         match &plan.decision {
             SafetyDecision::Proceed => self.execute_cast_plan(plan),
             SafetyDecision::Confirm { suggestion, .. } => {
-                self.push_system_message(&format!(
-                    "Confirmation required before launch. Type accept to proceed or reject to cancel. {suggestion}"
-                ));
+                let confirm_hint = if matches!(plan.intent, CastIntent::SacrificeSession { .. }) {
+                    format!(
+                        "Confirmation required before deletion. Type {SACRIFICE_CONFIRM_WORD} \
+                         (exact, lowercase) to proceed or reject to cancel."
+                    )
+                } else {
+                    "Confirmation required before launch. Type accept to proceed or reject to cancel."
+                        .to_string()
+                };
+                self.push_system_message(&format!("{confirm_hint} {suggestion}"));
                 self.pending_cast_confirmation = Some(plan);
                 SlashCommandResult::Handled
             }
@@ -1132,7 +1161,42 @@ impl App {
     }
 
     fn resolve_pending_cast_confirmation(&mut self, raw: &str) -> SlashCommandResult {
-        let normalized = raw.trim().to_ascii_lowercase();
+        let trimmed = raw.trim();
+        let normalized = trimmed.to_ascii_lowercase();
+
+        // Sacrifice is permanent deletion, so it gets its own case-sensitive,
+        // exact-word gate instead of the generic accept/yes/y path. Anything
+        // other than the exact lowercase word — including the generic
+        // confirm words, `Sacrifice`, or unrelated text — falls through to
+        // the pending/rejection handling below and never deletes.
+        let is_sacrifice_pending = matches!(
+            self.pending_cast_confirmation
+                .as_ref()
+                .map(|plan| &plan.intent),
+            Some(CastIntent::SacrificeSession { .. })
+        );
+        if is_sacrifice_pending {
+            if trimmed == SACRIFICE_CONFIRM_WORD {
+                if let Some(mut plan) = self.pending_cast_confirmation.take() {
+                    plan.decision = SafetyDecision::Proceed;
+                    self.push_system_message("Accepted Cast confirmation.");
+                    return self.execute_cast_plan(plan);
+                }
+            }
+            match normalized.as_str() {
+                "reject" | "cancel" | "no" | "n" => {
+                    self.pending_cast_confirmation = None;
+                    self.push_system_message("Rejected Cast confirmation.");
+                }
+                _ => {
+                    self.push_system_message(&format!(
+                        "A Cast confirmation is pending. Type {SACRIFICE_CONFIRM_WORD} (exact, lowercase) to proceed or reject to cancel."
+                    ));
+                }
+            }
+            return SlashCommandResult::Handled;
+        }
+
         match normalized.as_str() {
             "accept" | "approve" | "yes" | "y" => {
                 if let Some(mut plan) = self.pending_cast_confirmation.take() {
@@ -1234,6 +1298,17 @@ impl App {
 
     pub(super) fn has_pending_cast_confirmation(&self) -> bool {
         self.pending_cast_confirmation.is_some()
+    }
+
+    pub(super) fn pending_sacrifice_target(&self) -> Option<&str> {
+        match self
+            .pending_cast_confirmation
+            .as_ref()
+            .map(|plan| &plan.intent)
+        {
+            Some(CastIntent::SacrificeSession { session_id }) => Some(session_id),
+            _ => None,
+        }
     }
 
     pub(super) fn cancel_pending_cast_confirmation(&mut self) -> bool {
@@ -2833,6 +2908,19 @@ fn split_first_arg(input: &str) -> Option<(&str, &str)> {
     (!first.is_empty() && !rest.is_empty()).then_some((first, rest))
 }
 
+/// Same tokenization/case rules as [`is_chat_local_slash`] (first
+/// whitespace-split token, lowercased), narrowed to the `/clear`/`/cls`
+/// forms so `handle_input` can recognize them ahead of a pending sacrifice
+/// confirmation without duplicating or drifting from the general parser.
+fn is_local_clear_command(input: &str) -> bool {
+    let command = input
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(command.as_str(), "/clear" | "/cls")
+}
+
 fn is_chat_local_slash(input: &str) -> bool {
     let command = input
         .split_whitespace()
@@ -3368,7 +3456,9 @@ where
 mod tests {
     use super::*;
     use crate::store::{EventRecord, SessionRecord};
-    use crate::tui::chat::client::{ChatClient, ChatDaemonStatus, ChatEventQuery, LaunchRequest};
+    use crate::tui::chat::client::{
+        ChatClient, ChatDaemonStatus, ChatEventQuery, DaemonChatClient, LaunchRequest,
+    };
     use crate::tui::chat::persistence;
     use std::cell::RefCell;
     use std::path::Path;
@@ -7012,8 +7102,14 @@ mod tests {
             .calls
             .borrow()
             .contains(&"sacrifice:session-1".to_string()));
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content.contains("Type sacrifice")),
+            "sacrifice confirmation prompt must spell out the exact required word"
+        );
 
-        app.input = "accept".to_string();
+        app.input = "sacrifice".to_string();
         app.cursor_pos = app.input.len();
         app.handle_input();
 
@@ -7026,6 +7122,251 @@ mod tests {
             .messages
             .iter()
             .any(|message| message.content.contains("Sacrificed session session-1")));
+    }
+
+    #[test]
+    fn sacrifice_confirmation_rejects_generic_accept_yes_and_y() {
+        for rejected_word in ["accept", "yes", "y"] {
+            let client = RecordingChatClient::with_session(test_session(
+                "session-1",
+                "codex",
+                "Existing",
+                "completed",
+            ));
+            let (mut app, mirror) = app_with_client(client);
+            app.refresh_sessions();
+            app.show_session_overlay = true;
+            app.input = "/sacrifice session-1".to_string();
+            app.cursor_pos = app.input.len();
+            app.handle_input();
+
+            app.input = rejected_word.to_string();
+            app.cursor_pos = app.input.len();
+            app.handle_input();
+
+            assert!(
+                !mirror
+                    .calls
+                    .borrow()
+                    .contains(&"sacrifice:session-1".to_string()),
+                "`{rejected_word}` must not trigger deletion"
+            );
+            assert!(
+                app.pending_cast_confirmation.is_some(),
+                "`{rejected_word}` must leave the sacrifice confirmation pending, not cancel it"
+            );
+            assert!(
+                app.sessions.iter().any(|s| s.id == "session-1"),
+                "`{rejected_word}` must not silently drop the session from the overlay list"
+            );
+            assert!(
+                app.messages
+                    .iter()
+                    .any(|message| message.content.contains("confirmation is pending")),
+                "`{rejected_word}` should re-prompt for the pending confirmation, not silently accept it"
+            );
+        }
+    }
+
+    #[test]
+    fn sacrifice_confirmation_rejects_mixed_case_word() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        app.input = "Sacrifice".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(!mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+        assert!(
+            app.pending_cast_confirmation.is_some(),
+            "case-sensitive `Sacrifice` must not satisfy the typed-word gate"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Type sacrifice")));
+    }
+
+    #[test]
+    fn clear_transcript_cancels_pending_sacrifice_without_deleting_target() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(app.pending_cast_confirmation.is_some());
+
+        app.clear_transcript();
+
+        assert!(app.pending_cast_confirmation.is_none());
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+
+        app.input = "sacrifice".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(!mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+    }
+
+    /// `handle_input` used to resolve any pending confirmation (including
+    /// sacrifice) before ever reaching the local slash-command dispatch, so
+    /// typing `/clear`/`/cls` during a pending sacrifice fell into
+    /// `resolve_pending_cast_confirmation`'s accept/reject word gate instead
+    /// of calling `clear_transcript` — the destructive plan stayed armed.
+    /// These tests exercise the real `handle_input` entry point (setting
+    /// `app.input` the way a keystroke would) rather than calling
+    /// `clear_transcript` directly, so a regression back to the old
+    /// resolve-first ordering is caught.
+    #[test]
+    fn handle_input_slash_clear_disarms_pending_sacrifice_before_resolving_confirmation() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(app.pending_cast_confirmation.is_some());
+
+        app.input = "/clear".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            app.pending_cast_confirmation.is_none(),
+            "/clear must disarm a pending sacrifice via handle_input"
+        );
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Chat cleared.")));
+
+        // A stale bare "sacrifice" typed after /clear must not resurrect
+        // the disarmed plan and delete the old target.
+        app.input = "sacrifice".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(!mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+    }
+
+    #[test]
+    fn handle_input_slash_cls_disarms_pending_sacrifice_before_resolving_confirmation() {
+        let client = RecordingChatClient::with_session(test_session(
+            "session-1",
+            "codex",
+            "Existing",
+            "completed",
+        ));
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "/sacrifice session-1".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(app.pending_cast_confirmation.is_some());
+
+        app.input = "/cls".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            app.pending_cast_confirmation.is_none(),
+            "/cls must disarm a pending sacrifice via handle_input"
+        );
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("Chat cleared.")));
+
+        app.input = "sacrifice".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(!mirror
+            .calls
+            .borrow()
+            .contains(&"sacrifice:session-1".to_string()));
+        assert!(mirror
+            .sessions
+            .borrow()
+            .iter()
+            .any(|session| session.id == "session-1"));
+    }
+
+    #[test]
+    fn handle_input_slash_clear_preserves_generic_pending_confirmation_handling() {
+        let client = RecordingChatClient::default();
+        let (mut app, mirror) = app_with_client(client);
+        app.input = "publish the package".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+        assert!(app.pending_cast_confirmation.is_some());
+
+        // The sacrifice-only special case in `handle_input` must not touch
+        // a non-sacrifice pending confirmation: `/clear` still falls
+        // through to the generic accept/reject word gate unchanged.
+        app.input = "/clear".to_string();
+        app.cursor_pos = app.input.len();
+        app.handle_input();
+
+        assert!(
+            app.pending_cast_confirmation.is_some(),
+            "/clear must not silently disarm a non-sacrifice pending confirmation"
+        );
+        assert!(mirror.launched.borrow().is_empty());
+        assert!(app
+            .messages
+            .iter()
+            .any(|message| message.content.contains("confirmation is pending")));
     }
 
     #[test]
@@ -7048,7 +7389,7 @@ mod tests {
         app.input = "/sacrifice session-1".to_string();
         app.cursor_pos = app.input.len();
         app.handle_input();
-        app.input = "accept".to_string();
+        app.input = "sacrifice".to_string();
         app.cursor_pos = app.input.len();
         app.handle_input();
 
@@ -7084,33 +7425,52 @@ mod tests {
     }
 
     #[test]
-    fn failed_sacrifice_keeps_the_session_in_the_overlay_list() {
-        // The mirror removal only applies on success: a failed sacrifice
-        // must not eat the row from the overlay.
-        let client = RecordingChatClient::with_session(test_session(
-            "session-1",
-            "codex",
-            "Existing",
-            "completed",
-        ));
-        let (mut app, _) = app_with_client(client);
-        app.refresh_sessions();
+    fn failed_sacrifice_keeps_the_session_in_the_overlay_list() -> anyhow::Result<()> {
+        const DENIAL: &str = "session adoption evidence is retained; sacrifice is unavailable until an approved retention/fence contract resolves it";
+        let home = tempfile::tempdir()?;
+        let conn = store::open_store(&home.path().join(crate::STORE_FILE_NAME))?;
+        let session = test_session("session-1", "codex", "Existing", "completed");
+        store::insert_session(&conn, &session)?;
+        conn.execute(
+            "INSERT INTO request_adoptions (
+                id, adoption_key, contract, operation, request_digest, session_id,
+                execution_binding_json, adopted_at
+             ) VALUES (
+                'retained-input', 'input-key', 'psyche.request_adoption.v1', 'input',
+                'sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd',
+                'session-1', '{}', '2026-05-19T00:00:00Z'
+             )",
+            [],
+        )?;
+        drop(conn);
 
-        app.input = "/sacrifice nope".to_string();
+        let mut app = App::new_with_state(
+            vec![agent("codex", true)],
+            Some(0),
+            Box::new(DaemonChatClient::with_coven_home(home.path().to_path_buf())),
+            Some(home.path().to_path_buf()),
+        );
+        app.messages.clear();
+        app.sessions = vec![session];
+        app.rebuild_session_overlay_entries();
+        app.show_session_overlay = true;
+
+        app.input = "/sacrifice session-1".to_string();
         app.cursor_pos = app.input.len();
         app.handle_input();
-        app.input = "accept".to_string();
+        app.input = "sacrifice".to_string();
         app.cursor_pos = app.input.len();
         app.handle_input();
 
         assert!(app
             .messages
             .iter()
-            .any(|message| message.content.contains("Sacrifice failed")));
+            .any(|message| message.content == format!("Sacrifice failed: {DENIAL}")));
         assert!(
             app.sessions.iter().any(|s| s.id == "session-1"),
             "failed sacrifice must leave the overlay list untouched"
         );
+        Ok(())
     }
 
     #[test]
