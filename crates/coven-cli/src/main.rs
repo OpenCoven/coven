@@ -3523,12 +3523,19 @@ fn credentials_lines(
 
 /// Return the canonical authentication or local-status command for a harness.
 /// Running this command is not proof that a provider turn will succeed.
-fn auth_setup_hint_for_harness(harness_id: &str) -> &'static str {
+///
+/// Every branch must return a command the user can actually paste: doctor
+/// renders this inside backticks, so prose like "see harness docs" reads as a
+/// command that does not exist. Harnesses outside the bundled set arrive
+/// through an adapter manifest, and `coven adapter doctor <id>` is their
+/// canonical local-status command — it reports readiness and prints the
+/// adapter's own install/authentication hint.
+fn auth_setup_hint_for_harness(harness_id: &str) -> String {
     match harness_id {
-        "codex" => "codex login",
-        "claude" => "claude doctor",
-        "copilot" => "copilot login",
-        _ => "see harness docs",
+        "codex" => "codex login".to_string(),
+        "claude" => "claude doctor".to_string(),
+        "copilot" => "copilot login".to_string(),
+        other => format!("coven adapter doctor {other}"),
     }
 }
 
@@ -7514,6 +7521,39 @@ mod tests {
             !lines[0].contains("[!!]"),
             "non-blocking auth guidance must not look like a blocking failure: {}",
             lines[0]
+        );
+    }
+
+    #[test]
+    fn every_auth_setup_hint_is_a_runnable_command() {
+        // doctor renders this hint inside backticks. Adapter harnesses used to
+        // land on the prose fallback "see harness docs", which reads as a
+        // command that does not exist.
+        assert_eq!(auth_setup_hint_for_harness("codex"), "codex login");
+        assert_eq!(auth_setup_hint_for_harness("claude"), "claude doctor");
+        assert_eq!(auth_setup_hint_for_harness("copilot"), "copilot login");
+        for id in ["grok", "hermes", "opencode", "some-local-adapter"] {
+            let hint = auth_setup_hint_for_harness(id);
+            assert_eq!(hint, format!("coven adapter doctor {id}"));
+            assert!(
+                !hint.contains("see harness docs"),
+                "hint must be runnable, got: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn credentials_line_for_an_adapter_harness_offers_adapter_doctor() {
+        let lines = credentials_lines(None, &[make_harness_with_hint("hermes", true, "")]);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("`coven adapter doctor hermes`")),
+            "got: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("see harness docs")),
+            "got: {lines:#?}"
         );
     }
 
