@@ -11574,19 +11574,22 @@ mod tests {
         let home = temp_dir.path().to_path_buf();
         let server_status = status.clone();
         let server = thread::spawn(move || {
-            let validation = listener.incoming().next().expect("accept").expect("stream");
-            drop(validation);
-            for _ in 0..2 {
+            // Legacy discovery authenticates status with health, opens a
+            // metadata-only connection to validate the pipe ACL, then the
+            // caller performs its own health negotiation.
+            for serves_health in [true, false, true] {
                 let conn = listener.incoming().next().expect("accept").expect("stream");
-                handle_http_stream(
-                    &conn,
-                    &conn,
-                    &home,
-                    Some(server_status.clone()),
-                    &LiveSessionRuntime::default(),
-                    None,
-                    HostGuard::Disabled,
-                )?;
+                if serves_health {
+                    handle_http_stream(
+                        &conn,
+                        &conn,
+                        &home,
+                        Some(server_status.clone()),
+                        &LiveSessionRuntime::default(),
+                        None,
+                        HostGuard::Disabled,
+                    )?;
+                }
             }
             Ok::<_, anyhow::Error>(())
         });
