@@ -5,8 +5,8 @@ use std::{
 
 use crate::{
     Agent, AgentId, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition, ModelAction,
-    ModelRequest, NoopObserver, RunError, RunEvent, RunFailureKind, RunItem, RunObserver,
-    SessionStore,
+    ModelRequest, NoopObserver, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
+    RunObserver, SessionStore,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,17 @@ pub struct RunResult {
     pub new_items: Vec<RunItem>,
     pub turns: usize,
     pub handoffs: usize,
+}
+
+/// Transcript and counters accumulated by a run in progress.
+///
+/// The run loop records into this so the caller-facing wrapper can attach the
+/// partial transcript to a failure instead of dropping it with the error.
+#[derive(Debug, Default)]
+struct RunProgress {
+    items: Vec<RunItem>,
+    turns: usize,
+    handoffs: usize,
 }
 
 pub struct Runner<C>
@@ -117,14 +128,58 @@ where
         error
     }
 
+    /// Runs `starting_agent` to a final output.
+    ///
+    /// Every run emits exactly one `RunStarted` event followed by exactly one
+    /// terminal `RunCompleted` or `RunFailed` event, including when the
+    /// starting agent is unregistered, so observers can pair per-run state.
+    ///
+    /// A failure returns [`RunFailure`], which carries the transcript the run
+    /// produced before it failed. A tool that fails mid-turn does not erase the
+    /// user message, assistant message, and tool calls that preceded it, so
+    /// those items are handed back rather than dropped. The runner never
+    /// appends a failed run's items to the session store.
     pub async fn run(
         &self,
         starting_agent: impl Into<AgentId>,
         input: impl Into<String>,
         context: &C,
         options: RunOptions,
+    ) -> Result<RunResult, RunFailure> {
+        let mut progress = RunProgress::default();
+
+        self.run_loop(
+            starting_agent.into(),
+            input.into(),
+            context,
+            options,
+            &mut progress,
+        )
+        .await
+        .map_err(|error| RunFailure {
+            error,
+            new_items: progress.items,
+            turns: progress.turns,
+            handoffs: progress.handoffs,
+        })
+    }
+
+    async fn run_loop(
+        &self,
+        starting_agent: AgentId,
+        input: String,
+        context: &C,
+        options: RunOptions,
+        progress: &mut RunProgress,
     ) -> Result<RunResult, RunError> {
-        let starting_agent = starting_agent.into();
+        self.observer.on_event(&RunEvent::RunStarted {
+            starting_agent: starting_agent.clone(),
+        });
+
+        progress.items.push(RunItem::UserMessage {
+            content: input.clone(),
+        });
+
         let mut current = self.agents.get(&starting_agent).cloned().ok_or_else(|| {
             self.fail(
                 &starting_agent,
@@ -132,11 +187,6 @@ where
                 RunError::UnknownStartingAgent(starting_agent.clone()),
             )
         })?;
-        let input = input.into();
-
-        self.observer.on_event(&RunEvent::RunStarted {
-            starting_agent: starting_agent.clone(),
-        });
 
         for guardrail in &current.input_guardrails {
             let verdict = guardrail.check(&input, context).await.map_err(|source| {
@@ -172,9 +222,6 @@ where
             }
         }
 
-        let mut new_items = vec![RunItem::UserMessage {
-            content: input.clone(),
-        }];
         let mut model_items = match (&options.session_id, &self.session) {
             (Some(session_id), Some(session)) => {
                 let mut items = session.load(session_id).await.map_err(|source| {
@@ -187,7 +234,7 @@ where
                         },
                     )
                 })?;
-                items.extend(new_items.clone());
+                items.extend(progress.items.iter().cloned());
                 items
             }
             (Some(_), None) => {
@@ -197,11 +244,12 @@ where
                     RunError::SessionUnavailable,
                 ));
             }
-            (None, _) => new_items.clone(),
+            (None, _) => progress.items.clone(),
         };
-        let mut handoff_count = 0;
 
         for turn in 1..=options.max_turns {
+            progress.turns = turn;
+
             self.observer.on_event(&RunEvent::ModelRequested {
                 agent: current.id.clone(),
                 turn,
@@ -247,7 +295,7 @@ where
                     agent: current.id.clone(),
                     content: message.clone(),
                 };
-                new_items.push(item.clone());
+                progress.items.push(item.clone());
                 model_items.push(item);
             }
 
@@ -300,7 +348,7 @@ where
 
                 if let (Some(session_id), Some(session)) = (&options.session_id, &self.session) {
                     session
-                        .append(session_id, &new_items)
+                        .append(session_id, &progress.items)
                         .await
                         .map_err(|source| {
                             self.fail(
@@ -317,14 +365,14 @@ where
                 self.observer.on_event(&RunEvent::RunCompleted {
                     final_agent: current.id.clone(),
                     turns: turn,
-                    handoffs: handoff_count,
+                    handoffs: progress.handoffs,
                 });
                 return Ok(RunResult {
                     final_output: output,
                     final_agent: current.id.clone(),
-                    new_items,
+                    new_items: std::mem::take(&mut progress.items),
                     turns: turn,
-                    handoffs: handoff_count,
+                    handoffs: progress.handoffs,
                 });
             }
 
@@ -344,8 +392,8 @@ where
                         },
                     ));
                 }
-                handoff_count += 1;
-                if handoff_count > options.max_handoffs {
+                progress.handoffs += 1;
+                if progress.handoffs > options.max_handoffs {
                     return Err(self.fail(
                         &current.id,
                         RunFailureKind::Limit,
@@ -396,7 +444,7 @@ where
                     to: target.id.clone(),
                     name: handoff.name.clone(),
                 };
-                new_items.push(item.clone());
+                progress.items.push(item.clone());
                 model_items.push(item);
                 self.observer.on_event(&RunEvent::Handoff {
                     from: current.id.clone(),
@@ -436,7 +484,7 @@ where
                     agent: current.id.clone(),
                     call: call.clone(),
                 };
-                new_items.push(call_item.clone());
+                progress.items.push(call_item.clone());
                 model_items.push(call_item);
                 self.observer.on_event(&RunEvent::ToolStarted {
                     agent: current.id.clone(),
@@ -464,7 +512,7 @@ where
                     tool: call.name.clone(),
                     output,
                 };
-                new_items.push(result_item.clone());
+                progress.items.push(result_item.clone());
                 model_items.push(result_item);
                 self.observer.on_event(&RunEvent::ToolCompleted {
                     agent: current.id.clone(),
