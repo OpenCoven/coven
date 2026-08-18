@@ -2197,7 +2197,7 @@ pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
     #[cfg(windows)]
     {
         let Some(json) = coven_client::read_windows_daemon_status_for_lifecycle(coven_home)
-            .map_err(anyhow::Error::new)?
+            .map_err(windows_status_read_error)?
         else {
             return Ok(None);
         };
@@ -2235,7 +2235,7 @@ fn read_status_until(
             coven_home,
             deadline.instant,
         )
-        .map_err(anyhow::Error::new)?
+        .map_err(windows_status_read_error)?
         else {
             return Ok(None);
         };
@@ -2248,6 +2248,19 @@ fn read_status_until(
         let status = read_status(coven_home)?;
         deadline.remaining("reading Coven daemon lifecycle status")?;
         Ok(status)
+    }
+}
+
+#[cfg(windows)]
+fn windows_status_read_error(error: coven_client::ClientError) -> anyhow::Error {
+    match error {
+        coven_client::ClientError::InvalidJson(source) => {
+            anyhow::Error::new(DaemonStatusParseError {
+                source,
+                process_creation_time_present: false,
+            })
+        }
+        error => anyhow::Error::new(error),
     }
 }
 
@@ -11561,6 +11574,8 @@ mod tests {
         let home = temp_dir.path().to_path_buf();
         let server_status = status.clone();
         let server = thread::spawn(move || {
+            let validation = listener.incoming().next().expect("accept").expect("stream");
+            drop(validation);
             for _ in 0..2 {
                 let conn = listener.incoming().next().expect("accept").expect("stream");
                 handle_http_stream(
