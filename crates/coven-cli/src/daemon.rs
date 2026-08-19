@@ -1528,27 +1528,15 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
     #[cfg(windows)]
-    set_windows_owner_only_security(coven_home, WindowsOwnerOnlyPathKind::Directory)?;
+    set_windows_owner_only_directory_security(coven_home)?;
     Ok(())
 }
 
 #[cfg(any(windows, test))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowsOwnerOnlyPathKind {
-    File,
-    Directory,
-}
-
-#[cfg(any(windows, test))]
-const fn windows_owner_only_dacl_sddl(kind: WindowsOwnerOnlyPathKind) -> &'static str {
-    match kind {
-        WindowsOwnerOnlyPathKind::File => "D:P(A;;GA;;;OW)",
-        WindowsOwnerOnlyPathKind::Directory => "D:P(A;OICI;GA;;;OW)",
-    }
-}
+const WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL: &str = "D:P(A;OICI;GA;;;OW)";
 
 #[cfg(windows)]
-fn set_windows_owner_only_security(path: &Path, kind: WindowsOwnerOnlyPathKind) -> Result<()> {
+fn set_windows_owner_only_directory_security(path: &Path) -> Result<()> {
     use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
     use windows_sys::Win32::Security::{
         Authorization::{
@@ -1559,7 +1547,7 @@ fn set_windows_owner_only_security(path: &Path, kind: WindowsOwnerOnlyPathKind) 
         PROTECTED_DACL_SECURITY_INFORMATION,
     };
 
-    let descriptor_sddl: Vec<u16> = OsStr::new(windows_owner_only_dacl_sddl(kind))
+    let descriptor_sddl: Vec<u16> = OsStr::new(WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
@@ -2138,59 +2126,11 @@ pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
 
 #[cfg(windows)]
 fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
-    use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    let temporary_path =
-        status_path.with_file_name(format!(".daemon-status-{}.tmp", uuid::Uuid::new_v4()));
-    let write_result = (|| -> Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .with_context(|| {
-                format!(
-                    "failed to create temporary daemon status {}",
-                    temporary_path.display()
-                )
-            })?;
-        file.write_all(format!("{json}\n").as_bytes())
-            .context("failed to write temporary daemon status")?;
-        file.sync_all()
-            .context("failed to sync temporary daemon status")?;
-        drop(file);
-        set_windows_owner_only_security(&temporary_path, WindowsOwnerOnlyPathKind::File)?;
-
-        let temporary: Vec<u16> = OsStr::new(&temporary_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let destination: Vec<u16> = OsStr::new(status_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        if unsafe {
-            MoveFileExW(
-                temporary.as_ptr(),
-                destination.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            ) == 0
-        } {
-            return Err(std::io::Error::last_os_error()).with_context(|| {
-                format!(
-                    "failed to atomically replace daemon status {}",
-                    status_path.display()
-                )
-            });
-        }
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
-    write_result
+    let coven_home = status_path
+        .parent()
+        .context("daemon status path has no Coven home")?;
+    coven_client::write_owner_only_windows_daemon_status(coven_home, json.as_bytes())
+        .map_err(anyhow::Error::new)
 }
 
 pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
@@ -5728,13 +5668,9 @@ mod tests {
     }
 
     #[test]
-    fn owner_only_windows_path_dacl_inherits_only_from_directories() {
+    fn owner_only_windows_directory_dacl_inherits_to_children() {
         assert_eq!(
-            windows_owner_only_dacl_sddl(WindowsOwnerOnlyPathKind::File),
-            "D:P(A;;GA;;;OW)"
-        );
-        assert_eq!(
-            windows_owner_only_dacl_sddl(WindowsOwnerOnlyPathKind::Directory),
+            WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL,
             "D:P(A;OICI;GA;;;OW)"
         );
     }

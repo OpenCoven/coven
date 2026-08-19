@@ -4,6 +4,8 @@ mod http;
 #[cfg(unix)]
 mod lifecycle;
 mod models;
+#[cfg(windows)]
+mod status;
 mod transport;
 
 pub use discovery::DaemonEndpoint;
@@ -25,6 +27,9 @@ pub use models::{Health, HealthCapabilities, ReadEndpoint, WriteEndpoint, PROTOC
 #[cfg(unix)]
 #[doc(hidden)]
 pub use models::{LifecycleDaemonStatus, UnixDaemonShutdown};
+#[cfg(windows)]
+#[doc(hidden)]
+pub use status::write_owner_only_windows_daemon_status;
 #[doc(hidden)]
 pub const MAX_DAEMON_STATUS_BYTES: usize = discovery::MAX_DAEMON_STATUS_BYTES;
 #[doc(hidden)]
