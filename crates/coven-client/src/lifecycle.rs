@@ -94,11 +94,11 @@ pub fn shutdown_unix_daemon(
     if canonicalize_profile_binding(&endpoint, &mut canonical_expected, None).is_err() {
         return Ok(UnixDaemonShutdown::IdentityMismatch);
     }
-    let body = serde_json::to_vec(&serde_json::json!({
-        "apiVersion": PROTOCOL_VERSION,
-        "daemon": expected,
-    }))
-    .map_err(ClientError::InvalidJson)?;
+let body = serde_json::to_vec(&serde_json::json!({
+    "apiVersion": PROTOCOL_VERSION,
+    "daemon": &canonical_expected,
+}))
+.map_err(ClientError::InvalidJson)?
     let pending = match request_retaining_connection(
         &endpoint,
         "POST",
