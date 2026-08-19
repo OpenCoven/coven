@@ -80,10 +80,24 @@ pub(crate) fn open_lock_file_in(
     let mut options = cap_std::fs::OpenOptions::new();
     options.create(true).truncate(false).read(true).write(true);
     options.follow(FollowSymlinks::No);
-    let file = dir
-        .open_with(name, &options)
-        .with_context(|| format!("failed to open state lock {}", display_path.display()))?
-        .into_std();
+    let name = name.as_ref();
+    let mut attempts = 0;
+    let file = loop {
+        match dir.open_with(name, &options) {
+            Ok(file) => break file.into_std(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && attempts < 2 => {
+                // The no-follow create path can transiently lose a race with
+                // another process creating this same lock entry.
+                attempts += 1;
+                std::thread::yield_now();
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to open state lock {}", display_path.display())
+                })
+            }
+        }
+    };
     validate_lock_file(&file, display_path)?;
     #[cfg(unix)]
     {

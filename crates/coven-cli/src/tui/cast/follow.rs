@@ -14,7 +14,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::store;
-use crate::tui::chat::client::{ChatClient, ChatEventQuery};
+use crate::tui::chat::client::{
+    validated_event_page_cursor, ChatClient, ChatEventQuery, EVENT_PAGES_PER_POLL, EVENT_PAGE_LIMIT,
+};
 
 /// A monotonic cursor over a session's event stream. The cursor only ever
 /// advances forward; passing the cursor back to the daemon as `afterSeq`
@@ -109,14 +111,14 @@ pub(crate) fn decode_event(record: &store::EventRecord) -> CastFollowEvent {
     }
 }
 
-/// Decoded follower batch returned by a single poll. Carries the cursor
-/// the caller should use for the next request (or save in case it
-/// reconnects after a crash).
+/// Decoded follower batch returned by a bounded poll burst. Carries the cursor
+/// for the next request and reports whether continuation work remains.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CastFollowBatch {
     pub(crate) events: Vec<CastFollowEvent>,
     pub(crate) cursor: CastFollowCursor,
     pub(crate) exit: Option<CastSessionExit>,
+    pub(crate) continuation_pending: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -158,6 +160,7 @@ pub(crate) fn follow_until_exit(
     pacer: &mut dyn FollowerPacer,
 ) -> Result<CastSessionExit> {
     let mut cursor = CastFollowCursor::new();
+    let mut pending_exit = None;
     loop {
         let batch = poll_once(client, session_id, cursor)?;
         cursor = batch.cursor;
@@ -171,7 +174,12 @@ pub(crate) fn follow_until_exit(
             }
         }
         if let Some(exit) = batch.exit {
-            return Ok(exit);
+            pending_exit = Some(exit);
+        }
+        if !batch.continuation_pending {
+            if let Some(exit) = pending_exit.take() {
+                return Ok(exit);
+            }
         }
         pacer.between_polls()?;
     }
@@ -180,38 +188,49 @@ pub(crate) fn follow_until_exit(
 /// Poll the daemon once for events past `cursor`, decode them, and return
 /// a typed batch. The returned cursor reflects the maximum seq seen — pass
 /// it back on the next call to avoid re-fetching events. If an `exit`
-/// event lands in this batch, `batch.exit` is populated; the caller should
-/// stop polling.
+/// event lands in this batch, `batch.exit` is populated. A continuation may
+/// still need another bounded poll before the caller returns that exit.
 pub(crate) fn poll_once(
     client: &mut dyn ChatClient,
     session_id: &str,
     cursor: CastFollowCursor,
 ) -> Result<CastFollowBatch> {
-    let records = client.list_events(ChatEventQuery {
-        session_id,
-        after_seq: cursor.after_seq(),
-        limit: None,
-    })?;
-
     let mut new_cursor = cursor;
-    let mut events = Vec::with_capacity(records.len());
+    let mut events = Vec::new();
     let mut exit = None;
-    for record in records {
-        new_cursor.advance(record.seq);
-        let decoded = decode_event(&record);
-        if let CastFollowEvent::Exit { status, exit_code } = &decoded {
-            exit = Some(CastSessionExit {
-                status: status.clone(),
-                exit_code: *exit_code,
-            });
+    let mut pages = 0;
+    let continuation_pending = loop {
+        let requested_after_seq = new_cursor.after_seq();
+        let page = client.list_event_page(ChatEventQuery {
+            session_id,
+            after_seq: requested_after_seq,
+            limit: Some(EVENT_PAGE_LIMIT),
+        })?;
+        validated_event_page_cursor(requested_after_seq, &page)?;
+        let has_more = page.has_more;
+        pages += 1;
+
+        for record in page.events {
+            new_cursor.advance(record.seq);
+            let decoded = decode_event(&record);
+            if let CastFollowEvent::Exit { status, exit_code } = &decoded {
+                exit = Some(CastSessionExit {
+                    status: status.clone(),
+                    exit_code: *exit_code,
+                });
+            }
+            events.push(decoded);
         }
-        events.push(decoded);
-    }
+        if !has_more || pages >= EVENT_PAGES_PER_POLL {
+            break has_more;
+        }
+    };
 
     Ok(CastFollowBatch {
         events,
         cursor: new_cursor,
         exit,
+        continuation_pending,
     })
 }
 
@@ -232,6 +251,7 @@ mod tests {
     struct StubClient {
         batches: RefCell<Vec<Vec<store::EventRecord>>>,
         queries: RefCell<Vec<(Option<i64>, String)>>,
+        limits: RefCell<Vec<Option<i64>>>,
     }
 
     impl StubClient {
@@ -239,6 +259,7 @@ mod tests {
             Self {
                 batches: RefCell::new(batches),
                 queries: RefCell::new(Vec::new()),
+                limits: RefCell::new(Vec::new()),
             }
         }
     }
@@ -267,6 +288,7 @@ mod tests {
             self.queries
                 .borrow_mut()
                 .push((query.after_seq, query.session_id.to_string()));
+            self.limits.borrow_mut().push(query.limit);
             let mut batches = self.batches.borrow_mut();
             if batches.is_empty() {
                 Ok(vec![])
@@ -293,6 +315,73 @@ mod tests {
 
         fn sacrifice_session(&mut self, _session_id: &str) -> Result<()> {
             unimplemented!("not exercised in follower tests")
+        }
+    }
+
+    struct GeneratedReplayClient {
+        final_seq: i64,
+        queries: RefCell<Vec<Option<i64>>>,
+    }
+
+    impl GeneratedReplayClient {
+        fn new(final_seq: i64) -> Self {
+            Self {
+                final_seq,
+                queries: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChatClient for GeneratedReplayClient {
+        fn daemon_status(&mut self) -> Result<ChatDaemonStatus> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn launch_session(&mut self, _request: LaunchRequest) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn get_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {
+            self.queries.borrow_mut().push(query.after_seq);
+            let first = query.after_seq.unwrap_or(0) + 1;
+            if first > self.final_seq {
+                return Ok(Vec::new());
+            }
+            let limit = query.limit.unwrap_or(EVENT_PAGE_LIMIT).max(1);
+            let last = self
+                .final_seq
+                .min(first.saturating_add(limit).saturating_sub(1));
+            Ok((first..=last)
+                .map(|seq| output_event(seq, &format!("{seq}\n")))
+                .collect())
+        }
+
+        fn send_input(&mut self, _session_id: &str, _data: &str) -> Result<()> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn kill_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn archive_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn summon_session(&mut self, _session_id: &str) -> Result<store::SessionRecord> {
+            unimplemented!("not exercised in generated replay tests")
+        }
+
+        fn sacrifice_session(&mut self, _session_id: &str) -> Result<()> {
+            unimplemented!("not exercised in generated replay tests")
         }
     }
 
@@ -566,6 +655,166 @@ mod tests {
             Some(2),
             "the second poll must request events after seq 2 to avoid replaying a/b"
         );
+    }
+
+    #[test]
+    fn follow_until_exit_drains_more_than_one_bounded_event_page_without_gaps() {
+        let first_page = (1..=512)
+            .map(|seq| output_event(seq, &format!("{seq}\n")))
+            .collect();
+        let second_page = vec![
+            output_event(513, "513\n"),
+            exit_event(514, "completed", Some(0)),
+        ];
+        let mut client = StubClient::new(vec![first_page, second_page]);
+        let mut observer = RecordingObserver::default();
+        let mut pacer = CountingPacer { remaining: 1 };
+
+        let exit = follow_until_exit(&mut client, "session-1", &mut observer, &mut pacer).unwrap();
+
+        assert_eq!(exit.exit_code, Some(0));
+        assert_eq!(observer.output.len(), 513);
+        assert_eq!(observer.output.first().map(String::as_str), Some("1\n"));
+        assert_eq!(observer.output.last().map(String::as_str), Some("513\n"));
+        assert_eq!(
+            &*client.queries.borrow(),
+            &[
+                (None, "session-1".to_string()),
+                (Some(512), "session-1".to_string()),
+            ]
+        );
+        assert!(client
+            .limits
+            .borrow()
+            .iter()
+            .all(|limit| *limit == Some(crate::tui::chat::client::EVENT_PAGE_LIMIT)));
+        assert_eq!(
+            pacer.remaining, 1,
+            "continuation pages must drain immediately without an idle sleep"
+        );
+    }
+
+    #[test]
+    fn completed_replay_streams_many_pages_with_one_page_of_peak_buffering() {
+        const FULL_PAGES: i64 = 24;
+        let final_seq = FULL_PAGES * 512 + 1;
+        let mut client = GeneratedReplayClient::new(final_seq);
+        let mut expected_seq = 1;
+
+        let stats =
+            crate::tui::chat::client::consume_event_pages(&mut client, "session-1", |events| {
+                for event in events {
+                    assert_eq!(event.seq, expected_seq);
+                    expected_seq += 1;
+                }
+                Ok(crate::tui::chat::client::EventPageControl::Continue)
+            })
+            .unwrap();
+
+        assert!(stats.completed);
+        assert_eq!(stats.pages, FULL_PAGES as usize + 1);
+        assert_eq!(stats.events, final_seq as usize);
+        assert_eq!(stats.peak_buffered_events, 512);
+        assert!(
+            stats.events > stats.peak_buffered_events * 20,
+            "the stream must not retain an aggregate transcript allocation"
+        );
+        assert_eq!(expected_seq, final_seq + 1);
+        assert_eq!(client.queries.borrow().len(), stats.pages);
+        for (index, query) in client.queries.borrow().iter().enumerate() {
+            let expected_cursor = (index != 0).then_some(index as i64 * 512);
+            assert_eq!(*query, expected_cursor);
+        }
+    }
+
+    #[test]
+    fn completed_replay_page_consumer_can_cancel_without_fetching_another_page() {
+        let first_page = (1..=512).map(|seq| output_event(seq, "chunk\n")).collect();
+        let second_page = vec![output_event(513, "must not be fetched\n")];
+        let mut client = StubClient::new(vec![first_page, second_page]);
+
+        let stats = crate::tui::chat::client::consume_event_pages(&mut client, "session-1", |_| {
+            Ok(crate::tui::chat::client::EventPageControl::Cancel)
+        })
+        .unwrap();
+
+        assert!(!stats.completed);
+        assert_eq!(stats.pages, 1);
+        assert_eq!(stats.events, 512);
+        assert_eq!(client.queries.borrow().len(), 1);
+    }
+
+    #[test]
+    fn exit_on_a_full_page_still_drains_the_remaining_cursor_page() {
+        let mut first_page = (1..=511)
+            .map(|seq| output_event(seq, &format!("{seq}\n")))
+            .collect::<Vec<_>>();
+        first_page.push(exit_event(512, "completed", Some(0)));
+        let post_exit = store::EventRecord {
+            seq: 513,
+            id: "event-513".to_string(),
+            session_id: "session-1".to_string(),
+            kind: "cast.summary".to_string(),
+            payload_json: "{}".to_string(),
+            created_at: "2026-05-19T00:00:00Z".to_string(),
+        };
+        let mut client = StubClient::new(vec![first_page, vec![post_exit]]);
+        let mut observer = RecordingObserver::default();
+        let mut pacer = CountingPacer { remaining: 1 };
+
+        let exit = follow_until_exit(&mut client, "session-1", &mut observer, &mut pacer).unwrap();
+
+        assert_eq!(exit.status, "completed");
+        assert_eq!(observer.others, vec!["cast.summary"]);
+        assert_eq!(client.queries.borrow().len(), 2);
+        assert_eq!(client.queries.borrow()[1].0, Some(512));
+    }
+
+    #[test]
+    fn follower_returns_to_its_pacer_after_bounded_continuation_work() {
+        let pages = (0..9)
+            .map(|page| {
+                let first = page * 512 + 1;
+                (first..first + 512)
+                    .map(|seq| output_event(seq, "chunk\n"))
+                    .collect()
+            })
+            .collect();
+        let mut client = StubClient::new(pages);
+        let mut observer = RecordingObserver::default();
+        let mut pacer = CountingPacer { remaining: 0 };
+
+        let error = follow_until_exit(&mut client, "session-1", &mut observer, &mut pacer)
+            .expect_err("pacer cancellation must be observed between bounded page bursts");
+
+        assert!(error.to_string().contains("idled too many times"));
+        assert_eq!(client.queries.borrow().len(), 8);
+        assert_eq!(observer.output.len(), 8 * 512);
+    }
+
+    #[test]
+    fn exit_does_not_bypass_bounded_continuation_cancellation() {
+        let pages = (0..9)
+            .map(|page| {
+                let first = page * 512 + 1;
+                let mut events = (first..first + 512)
+                    .map(|seq| output_event(seq, "chunk\n"))
+                    .collect::<Vec<_>>();
+                if page == 0 {
+                    events[0] = exit_event(first, "completed", Some(0));
+                }
+                events
+            })
+            .collect();
+        let mut client = StubClient::new(pages);
+        let mut observer = RecordingObserver::default();
+        let mut pacer = CountingPacer { remaining: 0 };
+
+        let error = follow_until_exit(&mut client, "session-1", &mut observer, &mut pacer)
+            .expect_err("post-exit continuation must retain cancellation opportunities");
+
+        assert!(error.to_string().contains("idled too many times"));
+        assert_eq!(client.queries.borrow().len(), 8);
     }
 
     #[test]

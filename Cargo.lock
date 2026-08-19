@@ -785,6 +785,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "coven-afs",
+ "coven-client",
  "coven-runtime-spec",
  "coven-threads-core",
  "crossterm",
@@ -825,6 +826,20 @@ dependencies = [
  "widestring",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "coven-client"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "siphasher",
+ "socket2",
+ "thiserror 2.0.18",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

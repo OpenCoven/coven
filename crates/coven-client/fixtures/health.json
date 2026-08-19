@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "apiVersion": "coven.daemon.v1",
+  "covenVersion": "0.1.0",
+  "capabilities": {
+    "sessions": true,
+    "events": true,
+    "eventCursor": "sequence",
+    "structuredErrors": true
+  }
+}

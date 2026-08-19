@@ -1463,13 +1463,32 @@ description = "..."
     #[test]
     #[cfg(not(windows))]
     fn opened_memory_record_rechecks_logical_restore_state() -> Result<()> {
-        let test_root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/memory-reader-tests");
+        let test_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
         fs::create_dir_all(&test_root)?;
         let test_root = fs::canonicalize(test_root)?;
         let temp = tempfile::Builder::new()
-            .prefix("reader")
+            .prefix("coven-memory-reader-")
             .tempdir_in(test_root)?;
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+            let current = fs::metadata(temp.path())?;
+            if current.uid() != unsafe { libc::geteuid() }
+                || current.gid() != unsafe { libc::getegid() }
+            {
+                let path = CString::new(temp.path().as_os_str().as_bytes())?;
+                if unsafe { libc::chown(path.as_ptr(), libc::geteuid(), libc::getegid()) } != 0 {
+                    return Err(io::Error::last_os_error().into());
+                }
+            }
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))?;
+            let metadata = fs::metadata(temp.path())?;
+            assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
         let workspace = temp.path().join("workspace");
         fs::create_dir_all(&workspace)?;
         fs::write(
@@ -1489,14 +1508,39 @@ description = "..."
             crate::memory_import::MemoryImportSourceKind::Native,
             &sources,
         )?;
-        crate::memory_import::apply_import_plan(temp.path(), &plan, &sources)?;
+        {
+            let report = crate::memory_import::apply_import_plan(temp.path(), &plan, &sources)
+                .context("apply memory-reader fixture")?;
+            assert_eq!(
+                report.status,
+                crate::memory_import::ImportPlanStatus::Verified
+            );
+        }
+        {
+            use fs2::FileExt;
+
+            let lock_path = temp
+                .path()
+                .join(crate::memory_import::MIGRATIONS_DIRECTORY)
+                .join("sage")
+                .join(".migration.lock");
+            let lock = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .context("open memory-reader migration lock")?;
+            lock.try_lock_exclusive()
+                .context("reacquire released memory-reader migration lock")?;
+            FileExt::unlock(&lock).context("release memory-reader migration lock")?;
+        }
         let root = MemoryRoot::open(temp.path())?.expect("memory root exists");
         let record = root
             .enumerate_metadata()?
             .into_iter()
             .next()
             .expect("applied memory is visible");
-        crate::memory_import::restore_import_bundle_for_test(temp.path(), "sage", &plan.bundle_id)?;
+        crate::memory_import::restore_import_bundle_for_test(temp.path(), "sage", &plan.bundle_id)
+            .context("restore memory-reader fixture")?;
 
         let error = read_record_content(&root, &record)
             .expect_err("restored memory must not be read from a stale record");
