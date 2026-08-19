@@ -51,6 +51,11 @@ class ClassifyTest(unittest.TestCase):
     def test_npm_wrapper_only(self):
         self.assertTrue(self.classify('crates/coven-cli/src/wrapper.rs')['npm_packaging'])
 
+    def test_npm_bin_wrapper_only(self):
+        result = self.classify('npm/coven/bin/coven.js')
+        self.assertTrue(result['npm_packaging'])
+        self.assertFalse(result['rust'])
+
     def test_engine_install(self):
         result = self.classify('crates/coven-cli/src/engine_install.rs')
         self.assertTrue(result['rust'])
