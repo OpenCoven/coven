@@ -130,15 +130,28 @@ impl std::fmt::Display for RunFailure {
 }
 
 impl std::error::Error for RunFailure {
-    /// Forwards to the underlying error's source so chain-printing callers see
-    /// the cause once rather than the wrapper's identical message twice.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.error.source()
+        Some(&self.error)
     }
 }
 
-impl From<RunFailure> for RunError {
-    fn from(failure: RunFailure) -> Self {
-        failure.error
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_failure_exposes_the_wrapped_error_as_its_source() {
+        let failure = RunFailure {
+            error: RunError::SessionUnavailable,
+            new_items: Vec::new(),
+            turns: 0,
+            handoffs: 0,
+        };
+
+        let source = std::error::Error::source(&failure).expect("wrapped RunError source");
+        assert_eq!(
+            source.to_string(),
+            "session id was provided but no session store is configured"
+        );
     }
 }
