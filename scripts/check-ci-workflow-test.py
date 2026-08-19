@@ -17,7 +17,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n  changes:\n", CI_TEXT)
         self.assertIn("\n  pr-gate:\n", CI_TEXT)
         self.assertIn("name: PR gate", CI_TEXT)
-        self.assertIn("if: ${{ always() && github.event_name == 'pull_request' }}", CI_TEXT)
+        self.assertIn(
+            "if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}",
+            CI_TEXT,
+        )
 
     def test_ci_contains_expected_jobs(self) -> None:
         for job_name in [

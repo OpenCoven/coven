@@ -441,7 +441,7 @@ jobs:
 
   pr-gate:
     name: PR gate
-    if: ${{ always() && github.event_name == 'pull_request' }}
+    if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:
