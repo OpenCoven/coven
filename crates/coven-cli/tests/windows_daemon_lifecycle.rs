@@ -266,9 +266,13 @@ fn lowercase_hash_pipe_name(coven_home: &Path) -> String {
 }
 
 fn write_inherited_legacy_status(coven_home: &Path, pid: u32, socket: &str) -> Result<()> {
-    std::fs::create_dir_all(coven_home)?;
+    let status_path = coven_home.join("daemon.json");
+    if !status_path.exists() {
+        let initialized = run_daemon_command(coven_home, &["status", "--json"])?;
+        assert_success("initialize owner-only Coven home", &initialized);
+    }
     std::fs::write(
-        coven_home.join("daemon.json"),
+        status_path,
         serde_json::to_vec(&serde_json::json!({
             "pid": pid,
             "startedAt": "2026-04-27T10:00:00Z",
