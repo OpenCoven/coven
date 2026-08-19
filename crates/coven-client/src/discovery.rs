@@ -2589,9 +2589,11 @@ fn open_validated_windows_status_file(
 
 #[cfg(windows)]
 fn windows_status_file_share_mode() -> u32 {
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
 
-    FILE_SHARE_READ | FILE_SHARE_DELETE
+    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
 }
 
 #[cfg(windows)]

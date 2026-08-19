@@ -699,6 +699,14 @@ mod tests {
         listener
     }
 
+    #[cfg(unix)]
+    fn retire_test_daemon_socket(home: &std::path::Path, label: &str) -> std::io::Result<()> {
+        std::fs::rename(
+            daemon::daemon_socket_path(home),
+            home.join(format!(".retired-coven-socket-{label}")),
+        )
+    }
+
     /// Reads a request from a connection that may be a pre-write
     /// `DaemonInstanceChanged` probe: the transport connects, confirms the
     /// peer/socket identity no longer matches what was negotiated, and
@@ -750,7 +758,7 @@ mod tests {
         let mut cached = DaemonClient::new(endpoint);
         cached.health()?;
         old_server.join().unwrap();
-        std::fs::remove_file(daemon::daemon_socket_path(&home))?;
+        retire_test_daemon_socket(&home, "legacy")?;
 
         let listener = bind_test_daemon(&home);
         listener.set_nonblocking(true)?;
@@ -947,7 +955,7 @@ mod tests {
         cached.health()?;
         original_server.join().unwrap();
 
-        std::fs::remove_file(daemon::daemon_socket_path(home))?;
+        retire_test_daemon_socket(home, "original")?;
         Ok((cached, status, health))
     }
 
@@ -1027,7 +1035,7 @@ mod tests {
         let mut cached = DaemonClient::new(endpoint);
         cached.health()?;
         original_server.join().unwrap();
-        std::fs::remove_file(daemon::daemon_socket_path(&home))?;
+        retire_test_daemon_socket(&home, "incapable")?;
 
         let replacement = bind_test_daemon(&home);
         replacement.set_nonblocking(true)?;
@@ -1258,8 +1266,8 @@ mod tests {
             assert_eq!(read_request_path(&mut health_stream), "/api/v1/health");
 
             drop(first_replacement);
-            std::fs::remove_file(daemon::daemon_socket_path(&home_for_thread))
-                .expect("remove first replacement socket");
+            retire_test_daemon_socket(&home_for_thread, "first-replacement")
+                .expect("retire first replacement socket");
             let second_replacement = bind_test_daemon(&home_for_thread);
 
             write_response(&mut health_stream, 200, &health);
