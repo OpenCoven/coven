@@ -125,6 +125,52 @@ jobs:
           NATIVE_PACKAGE_SET: post-intel
         run: node scripts/release-npm-platform-matrix.mjs "$NATIVE_PACKAGE_SET" >> "$GITHUB_OUTPUT"
 
+  performance-baseline:
+    name: Release performance baseline
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [verify, verify-tag]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-05-20
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-release-perf-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-release-perf-
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Build coven
+        run: cargo build -p coven-cli --locked
+      - name: Validate benchmark runner
+        run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
+      - name: Collect release baseline artifact
+        run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
+      - name: Collect concurrent runtime baseline artifact
+        continue-on-error: true
+        run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
+      - name: Collect deterministic TUI scheduling metric
+        run: |
+          set -o pipefail
+          cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: coven-release-performance-${{ needs.verify-tag.outputs.release_tag }}
+          path: |
+            coven-perf.json
+            coven-chaos.json
+            coven-tui-metrics.txt
+          if-no-files-found: error
+
   build-platform:
     name: Build ${{ matrix.npm-target }}
     runs-on: ${{ matrix.runner }}
@@ -215,7 +261,7 @@ jobs:
   npm-publish:
     name: npm publish
     runs-on: ubuntu-latest
-    needs: [build-platform, npm-dry-run, verify-tag]
+    needs: [build-platform, npm-dry-run, performance-baseline, verify-tag]
     # OIDC trusted publishing: id-token:write lets the job mint a short-lived OIDC token
     # that `npm publish --provenance` exchanges with the npm registry for a one-shot
     # publish credential. No NPM_TOKEN secret is read or written.
