@@ -2526,6 +2526,25 @@ fn stream_codex_json_with_timeouts<F>(
     command: &HarnessCommand,
     activity_timeout: Duration,
     post_exit_drain_timeout: Duration,
+    on_assistant: F,
+) -> Result<CodexJsonRunResult>
+where
+    F: FnMut(&str) -> Result<()>,
+{
+    stream_codex_json_with_budgets(
+        command,
+        activity_timeout,
+        activity_timeout,
+        post_exit_drain_timeout,
+        on_assistant,
+    )
+}
+
+fn stream_codex_json_with_budgets<F>(
+    command: &HarnessCommand,
+    startup_timeout: Duration,
+    activity_timeout: Duration,
+    post_exit_drain_timeout: Duration,
     mut on_assistant: F,
 ) -> Result<CodexJsonRunResult>
 where
@@ -2681,6 +2700,7 @@ where
 
     let mut state = CodexJsonState::default();
     let mut last_activity = Instant::now();
+    let mut waiting_for_initial_activity = true;
     let mut status = None;
     let mut direct_child_exited = false;
     let mut post_exit_deadline = None;
@@ -2762,14 +2782,19 @@ where
             }
             remaining
         } else {
-            let remaining = activity_timeout
+            let timeout = if waiting_for_initial_activity {
+                startup_timeout
+            } else {
+                activity_timeout
+            };
+            let remaining = timeout
                 .checked_sub(last_activity.elapsed())
                 .unwrap_or_default();
             if remaining.is_zero() {
                 state.protocol_error.get_or_insert_with(|| {
                     format!(
                         "Codex produced no machine-readable activity for {} seconds; the process was terminated",
-                        activity_timeout.as_secs()
+                        timeout.as_secs()
                     )
                 });
                 status = Some(terminate_and_wait_for_supervised_child(
@@ -2785,7 +2810,10 @@ where
         match receiver.recv_timeout(remaining.min(CODEX_CHILD_POLL_INTERVAL)) {
             Ok(CodexRunnerMessage::Stdout(CodexStdoutMessage::Line(line))) => {
                 match handle_codex_json_line(&line, &mut state, &mut on_assistant) {
-                    Ok(true) => last_activity = Instant::now(),
+                    Ok(true) => {
+                        last_activity = Instant::now();
+                        waiting_for_initial_activity = false;
+                    }
                     Ok(false) => {}
                     Err(error) => {
                         let _ = terminate_and_wait_for_supervised_child(
@@ -5825,32 +5853,67 @@ mod tests {
         let pid_file = temp_dir
             .path()
             .join("observed-inherited-output-descendant.pid");
-        let command = piped_prompt_probe_command(
+        let mut command = piped_prompt_probe_command(
             temp_dir.path(),
             "root-exit-short-output-descendant",
             &pid_file.to_string_lossy(),
             None,
             Vec::new(),
         )?;
+        command.env_overrides.push((
+            "COVEN_TEST_PIPED_STARTUP_DELAY_MS".to_owned(),
+            Some("1500".to_owned()),
+        ));
         let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed_output = Arc::clone(&observed);
-        let started = Instant::now();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let runner = thread::spawn(move || {
+            let result = run_piped_attached_observed_with_writers(
+                &command,
+                Box::new(move |chunk| {
+                    observed_output.fetch_add(chunk.len(), Ordering::AcqRel);
+                    Ok(())
+                }),
+                Box::new(io::sink()),
+                Box::new(io::sink()),
+            );
+            let _ = result_tx.send(result);
+        });
+        let descendant_pid = match await_piped_descendant_pid(&pid_file) {
+            Ok(pid) => pid,
+            Err(error) => {
+                let early = result_rx.recv_timeout(Duration::from_secs(5));
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                return Err(error.context(format!(
+                    "observed runner failed before fixture readiness; result: {early:?}"
+                )));
+            }
+        };
+        let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let late = result_rx.recv_timeout(Duration::from_secs(5));
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                anyhow::bail!(
+                    "observed runner did not finish post-exit cleanup within one second; late result: {late:?}"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                anyhow::bail!("observed runner disconnected without a result");
+            }
+        };
+        runner
+            .join()
+            .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+        let result = result?;
 
-        let result = run_piped_attached_observed_with_writers(
-            &command,
-            Box::new(move |chunk| {
-                observed_output.fetch_add(chunk.len(), Ordering::AcqRel);
-                Ok(())
-            }),
-            Box::new(io::sink()),
-            Box::new(io::sink()),
-        )?;
-        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
-
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "observed runner waited for descendant-owned output handles"
-        );
         assert_eq!(result.status, "completed", "{result:?}");
         assert_eq!(result.exit_code, Some(0), "{result:?}");
         assert!(observed.load(Ordering::Acquire) > 0);
@@ -6172,6 +6235,21 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    fn await_fixture_file(path: &Path, timeout: Duration) -> anyhow::Result<()> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        anyhow::bail!(
+            "fixture did not publish readiness marker {}",
+            path.display()
+        )
     }
 
     #[cfg(unix)]
@@ -6997,6 +7075,8 @@ mod tests {
     /// ("Text file busy") — a real CI flake, not a theoretical one.
     #[cfg(unix)]
     static FAKE_CLAUDE_SPAWN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(unix)]
+    const CODEX_JSON_TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[cfg(unix)]
     fn fake_claude_spawn_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -7042,10 +7122,16 @@ printf '%s\n' '{"type":"turn.completed"}'
         };
         let mut assistant = Vec::new();
 
-        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |text| {
-            assistant.push(text.to_string());
-            Ok(())
-        })?;
+        let outcome = stream_codex_json_with_budgets(
+            &command,
+            CODEX_JSON_TEST_STARTUP_TIMEOUT,
+            Duration::from_secs(1),
+            CODEX_POST_EXIT_DRAIN_TIMEOUT,
+            |text| {
+                assistant.push(text.to_string());
+                Ok(())
+            },
+        )?;
 
         assert_eq!(
             std::fs::read_to_string(temp_dir.path().join("args.txt"))?,
@@ -7071,6 +7157,7 @@ printf '%s\n' '{"type":"turn.completed"}'
             &fake_codex,
             r#"#!/bin/sh
 echo $$ > child.pid
+printf '%s\n' '{"type":"thread.started","thread_id":"timeout-ready"}'
 exec sleep 10
 "#,
         )?;
@@ -7090,26 +7177,27 @@ exec sleep 10
             env_overrides: Vec::new(),
         };
 
-        // The activity budget must outlive shell startup so the script can
-        // record its pid before the runner kills the group; a 25ms budget
-        // loses that race deterministically on macOS (~180ms cold start).
-        let started = Instant::now();
-        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |_| Ok(()))?;
+        // The first frame is a readiness barrier; the child is silent after it,
+        // so the one-second activity timeout still exercises termination.
+        let outcome = stream_codex_json_with_budgets(
+            &command,
+            CODEX_JSON_TEST_STARTUP_TIMEOUT,
+            Duration::from_secs(1),
+            CODEX_POST_EXIT_DRAIN_TIMEOUT,
+            |_| Ok(()),
+        )?;
 
-        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(outcome
             .error
             .as_deref()
             .is_some_and(|error| error.contains("terminated")));
-        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))?;
-        let pid = pid.trim();
-        let alive = std::process::Command::new("kill")
-            .args(["-0", pid])
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        assert!(!alive, "timed-out child {pid} should be reaped");
+        let pid = std::fs::read_to_string(temp_dir.path().join("child.pid"))?
+            .trim()
+            .parse::<u32>()?;
+        assert!(
+            wait_for_piped_process_exit(pid, Duration::from_secs(2)),
+            "timed-out child {pid} should be reaped"
+        );
         Ok(())
     }
 
@@ -7185,36 +7273,23 @@ exit 0
             env_overrides: Vec::new(),
         };
 
-        let started = Instant::now();
-        let outcome = stream_codex_json_with_timeouts(
+        let outcome = stream_codex_json_with_budgets(
             &command,
+            CODEX_JSON_TEST_STARTUP_TIMEOUT,
             Duration::from_secs(1),
             Duration::from_millis(25),
             |_| Ok(()),
         )?;
 
-        assert!(started.elapsed() < Duration::from_secs(2));
         assert!(outcome
             .error
             .as_deref()
             .is_some_and(|error| error.contains("without an assistant message")));
-        let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?;
-        let pid = pid.trim();
-        let mut alive = true;
-        for _ in 0..20 {
-            alive = std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if !alive {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+        let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?
+            .trim()
+            .parse::<u32>()?;
         assert!(
-            !alive,
+            wait_for_piped_process_exit(pid, Duration::from_secs(2)),
             "descendant {pid} should be reaped with its process group"
         );
         Ok(())
@@ -7255,10 +7330,16 @@ exit 23
         };
         let mut assistant = Vec::new();
 
-        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |text| {
-            assistant.push(text.to_string());
-            Ok(())
-        })?;
+        let outcome = stream_codex_json_with_budgets(
+            &command,
+            CODEX_JSON_TEST_STARTUP_TIMEOUT,
+            Duration::from_secs(1),
+            CODEX_POST_EXIT_DRAIN_TIMEOUT,
+            |text| {
+                assistant.push(text.to_string());
+                Ok(())
+            },
+        )?;
 
         assert_eq!(assistant, vec!["reply before wrapper failure"]);
         assert_eq!(outcome.process.status, "failed");
@@ -7267,23 +7348,11 @@ exit 23
             .error
             .as_deref()
             .is_some_and(|error| error.contains("Codex exited with 23")));
-        let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?;
-        let pid = pid.trim();
-        let mut alive = true;
-        for _ in 0..20 {
-            alive = std::process::Command::new("kill")
-                .args(["-0", pid])
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false);
-            if !alive {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
-        }
+        let pid = std::fs::read_to_string(temp_dir.path().join("descendant.pid"))?
+            .trim()
+            .parse::<u32>()?;
         assert!(
-            !alive,
+            wait_for_piped_process_exit(pid, Duration::from_secs(2)),
             "closed-pipe descendant {pid} should be reaped with its process group"
         );
         Ok(())
@@ -7320,7 +7389,13 @@ exit 0
             env_overrides: Vec::new(),
         };
 
-        let outcome = stream_codex_json_with_timeout(&command, Duration::from_secs(1), |_| Ok(()))?;
+        let outcome = stream_codex_json_with_budgets(
+            &command,
+            CODEX_JSON_TEST_STARTUP_TIMEOUT,
+            Duration::from_secs(1),
+            CODEX_POST_EXIT_DRAIN_TIMEOUT,
+            |_| Ok(()),
+        )?;
 
         assert_eq!(outcome.process.status, "failed");
         assert_eq!(outcome.process.exit_code, Some(1));
@@ -7554,8 +7629,10 @@ exit 0
         std::fs::write(
             &fake_harness,
             r#"#!/bin/sh
+sleep 2
+printf 'ready\n' > stream.ready
 printf '%s\n' '{"type":"assistant","session_id":"native","message":{"role":"assistant","content":[]}}'
-sleep 3 &
+sleep 5 &
 exit 17
 "#,
         )?;
@@ -7563,22 +7640,57 @@ exit 17
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake_harness, permissions)?;
 
-        let started = Instant::now();
-        let code = stream_harness_with_program(
-            fake_harness.to_str().unwrap(),
-            temp_dir.path(),
-            Vec::new(),
-            false,
-            "streamy",
-            "ledger-current",
-            &mut Vec::new(),
-        )?;
+        let program = fake_harness.to_string_lossy().into_owned();
+        let cwd = temp_dir.path().to_path_buf();
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let runner = thread::spawn(move || {
+            let result = stream_harness_with_program(
+                &program,
+                &cwd,
+                Vec::new(),
+                false,
+                "streamy",
+                "ledger-current",
+                &mut Vec::new(),
+            );
+            let _ = result_tx.send(result);
+        });
+        if let Err(error) = await_fixture_file(
+            &temp_dir.path().join("stream.ready"),
+            Duration::from_secs(10),
+        ) {
+            let early = result_rx.recv_timeout(Duration::from_secs(6));
+            runner
+                .join()
+                .map_err(|_| anyhow::anyhow!("native stream runner panicked"))?;
+            return Err(error.context(format!(
+                "native stream failed before fixture readiness; result: {early:?}"
+            )));
+        }
+        let code = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let late = result_rx.recv_timeout(Duration::from_secs(6));
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("native stream runner panicked"))?;
+                anyhow::bail!(
+                    "native stream did not finish post-exit cleanup within two seconds; late result: {late:?}"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("native stream runner panicked"))?;
+                anyhow::bail!("native stream runner disconnected without a result");
+            }
+        };
+        runner
+            .join()
+            .map_err(|_| anyhow::anyhow!("native stream runner panicked"))?;
+        let code = code?;
 
         assert_eq!(code, 17);
-        assert!(
-            started.elapsed() < Duration::from_millis(1500),
-            "native stream waited for a descendant-held stdout pipe"
-        );
         Ok(())
     }
 

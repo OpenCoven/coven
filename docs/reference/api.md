@@ -49,9 +49,10 @@ The health `capabilities` object currently contains all 16 fields:
 `sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
 always `false` over TCP; Host and Origin allowlists do not elevate TCP
 authority. `daemon` is either `null` or
-`{ pid, startedAt, socket }`, where the socket is under
+`{ pid, startedAt, socket, processCreationTime? }`, where the socket is under
 the active local IPC endpoint; the optional `hub` field is a control-plane
-summary.
+summary. `processCreationTime` is a Windows-only decimal string containing the
+full 64-bit process FILETIME fingerprint.
 The optional `eventWriter` field reports the daemon-owned persistence queue,
 including its state, exact queued events/bytes, capacity, dropped output,
 connection, transaction, commit, and last-error counters.

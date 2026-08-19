@@ -433,6 +433,19 @@ pub struct EventsQueryOptions {
     pub limit: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventCandidate {
+    pub(crate) seq: i64,
+    pub(crate) event_id: Option<String>,
+    pub(crate) allocation_bytes: usize,
+    pub(crate) encoded_lower_bound_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EventCandidatePage {
+    pub(crate) candidates: Vec<EventCandidate>,
+}
+
 fn load_ward_audit_schema_state(conn: &Connection) -> Result<String> {
     use coven_threads_core::WARD_AUDIT_SCHEMA_STATE_SQL;
 
@@ -4410,27 +4423,160 @@ pub fn event_kind_exists(conn: &Connection, session_id: &str, kind: &str) -> Res
     Ok(exists)
 }
 
+pub(crate) fn resolve_event_after_rowid(
+    conn: &Connection,
+    session_id: &str,
+    opts: &EventsQueryOptions,
+) -> Result<Option<i64>> {
+    if let Some(seq) = opts.after_seq {
+        return Ok(Some(seq));
+    }
+    let Some(event_id) = opts.after_event_id.as_ref() else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT rowid FROM events WHERE id = ?1 AND session_id = ?2 LIMIT 1",
+        params![event_id, session_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .context("failed to resolve event cursor by event id")
+}
+
+pub(crate) fn list_event_candidates(
+    conn: &Connection,
+    session_id: &str,
+    after_rowid: Option<i64>,
+    limit: usize,
+) -> Result<EventCandidatePage> {
+    const ERROR_EVENT_ID_MAX_BYTES: i64 = 512;
+
+    if limit == 0 {
+        return Ok(EventCandidatePage {
+            candidates: Vec::new(),
+        });
+    }
+    let limit = i64::try_from(limit).context("event candidate limit exceeded SQLite range")?;
+    let (sql, params): (&str, Vec<rusqlite::types::Value>) = if let Some(after_rowid) = after_rowid
+    {
+        (
+            "SELECT
+                rowid,
+                CASE WHEN octet_length(id) <= ?3 THEN id ELSE NULL END,
+                octet_length(id),
+                octet_length(session_id),
+                octet_length(kind),
+                octet_length(payload_json),
+                octet_length(created_at),
+                redaction_status = 'legacy'
+             FROM events
+             WHERE session_id = ?1 AND rowid > ?2
+             ORDER BY rowid ASC
+             LIMIT ?4",
+            vec![
+                session_id.to_owned().into(),
+                after_rowid.into(),
+                ERROR_EVENT_ID_MAX_BYTES.into(),
+                limit.into(),
+            ],
+        )
+    } else {
+        (
+            "SELECT
+                rowid,
+                CASE WHEN octet_length(id) <= ?2 THEN id ELSE NULL END,
+                octet_length(id),
+                octet_length(session_id),
+                octet_length(kind),
+                octet_length(payload_json),
+                octet_length(created_at),
+                redaction_status = 'legacy'
+             FROM events
+             WHERE session_id = ?1
+             ORDER BY rowid ASC
+             LIMIT ?3",
+            vec![
+                session_id.to_owned().into(),
+                ERROR_EVENT_ID_MAX_BYTES.into(),
+                limit.into(),
+            ],
+        )
+    };
+    let mut statement = conn
+        .prepare(sql)
+        .context("failed to prepare bounded event candidate query")?;
+    let mut rows = statement
+        .query(rusqlite::params_from_iter(params))
+        .context("failed to query bounded event candidates")?;
+    let mut candidates = Vec::with_capacity(usize::try_from(limit).unwrap_or_default());
+    while let Some(row) = rows
+        .next()
+        .context("failed to read bounded event candidate")?
+    {
+        let mut allocation_bytes = 0_usize;
+        for column in 2..=6 {
+            let field_bytes: i64 = row
+                .get(column)
+                .context("event candidate contained an invalid field length")?;
+            let field_bytes = usize::try_from(field_bytes)
+                .context("event candidate contained a negative or oversized field length")?;
+            allocation_bytes = allocation_bytes
+                .checked_add(field_bytes)
+                .context("event candidate allocation size overflowed")?;
+        }
+        let is_legacy_redaction: bool = row
+            .get(7)
+            .context("event candidate contained an invalid redaction status")?;
+        candidates.push(EventCandidate {
+            seq: row.get(0).context("event candidate had no sequence")?,
+            event_id: row
+                .get(1)
+                .context("event candidate had an invalid bounded id")?,
+            allocation_bytes,
+            encoded_lower_bound_bytes: (!is_legacy_redaction).then_some(allocation_bytes),
+        });
+    }
+    Ok(EventCandidatePage { candidates })
+}
+
+pub(crate) fn get_event_by_seq(
+    conn: &Connection,
+    session_id: &str,
+    seq: i64,
+) -> Result<Option<EventRecord>> {
+    conn.query_row(
+        "SELECT rowid AS seq, id, session_id, kind, payload_json, created_at, redaction_status
+         FROM events
+         WHERE session_id = ?1 AND rowid = ?2",
+        params![session_id, seq],
+        event_record_from_row,
+    )
+    .optional()
+    .context("failed to load bounded event candidate")
+}
+
+fn event_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRecord> {
+    let mut record = EventRecord {
+        seq: row.get(0)?,
+        id: row.get(1)?,
+        session_id: row.get(2)?,
+        kind: row.get(3)?,
+        payload_json: row.get(4)?,
+        created_at: row.get(5)?,
+    };
+    let redaction_status: String = row.get(6)?;
+    if redaction_status == "legacy" {
+        record.payload_json = privacy::redact_payload_json(&record.payload_json);
+    }
+    Ok(record)
+}
+
 pub fn list_events_with_options(
     conn: &Connection,
     session_id: &str,
     opts: &EventsQueryOptions,
 ) -> Result<Vec<EventRecord>> {
-    use rusqlite::OptionalExtension;
-
-    // Resolve the cursor to a rowid lower bound.
-    let after_rowid: Option<i64> = if let Some(seq) = opts.after_seq {
-        Some(seq)
-    } else if let Some(ref event_id) = opts.after_event_id {
-        conn.query_row(
-            "SELECT rowid FROM events WHERE id = ?1 AND session_id = ?2 LIMIT 1",
-            params![event_id, session_id],
-            |row| row.get::<_, i64>(0),
-        )
-        .optional()
-        .context("failed to resolve event cursor by event id")?
-    } else {
-        None
-    };
+    let after_rowid = resolve_event_after_rowid(conn, session_id, opts)?;
 
     // The query is built dynamically based on which optional parameters are
     // present.  All user-provided values are bound via parameterized placeholders
@@ -4453,34 +4599,18 @@ pub fn list_events_with_options(
         .prepare(&sql)
         .context("failed to prepare event list query")?;
 
-    let map_row = |row: &rusqlite::Row<'_>| {
-        let mut record = EventRecord {
-            seq: row.get(0)?,
-            id: row.get(1)?,
-            session_id: row.get(2)?,
-            kind: row.get(3)?,
-            payload_json: row.get(4)?,
-            created_at: row.get(5)?,
-        };
-        let redaction_status: String = row.get(6)?;
-        if redaction_status == "legacy" {
-            record.payload_json = privacy::redact_payload_json(&record.payload_json);
-        }
-        Ok(record)
-    };
-
     let events = match (after_rowid, opts.limit) {
         (Some(after), Some(limit)) => statement
-            .query_map(params![session_id, after, limit], map_row)
+            .query_map(params![session_id, after, limit], event_record_from_row)
             .context("failed to query events")?,
         (Some(after), None) => statement
-            .query_map(params![session_id, after], map_row)
+            .query_map(params![session_id, after], event_record_from_row)
             .context("failed to query events")?,
         (None, Some(limit)) => statement
-            .query_map(params![session_id, limit], map_row)
+            .query_map(params![session_id, limit], event_record_from_row)
             .context("failed to query events")?,
         (None, None) => statement
-            .query_map(params![session_id], map_row)
+            .query_map(params![session_id], event_record_from_row)
             .context("failed to query events")?,
     }
     .collect::<std::result::Result<Vec<_>, _>>()

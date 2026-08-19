@@ -15,6 +15,14 @@ Treat a missing, false, or malformed required capability as unsupported and
 fail before sending the dependent request. Clients should ignore unknown
 additive capabilities.
 
+Cache negotiation only while it remains bound to the same daemon instance.
+Local clients should fingerprint the connected Unix peer and socket identity,
+or the Windows named-pipe server process and creation identity, during health.
+Before sending any dependent request, verify the new connection has the same
+fingerprint. If the endpoint was replaced, send no dependent bytes, discard
+the cache, and negotiate again. Never automatically replay a mutation; a read
+retry, if offered, must be explicit and bounded.
+
 For example, a client must require `capabilities.sessionLaunchPolicy === true`
 before adding `launchPolicy` to `POST /api/v1/sessions`. The capability says
 the daemon understands that request shape; it does not grant filesystem

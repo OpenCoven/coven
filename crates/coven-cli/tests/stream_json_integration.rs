@@ -900,6 +900,9 @@ fn codex_json_sigterm_reaps_descendants_and_marks_ledger_failed() {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
+    const STARTUP_BUDGET: Duration = Duration::from_secs(30);
+    const CLEANUP_BUDGET: Duration = Duration::from_secs(2);
+
     let temp_dir = tempfile::tempdir().expect("failed to create temp dir");
     let coven_home = temp_dir.path().join("coven-home");
     fs::create_dir_all(&coven_home).expect("failed to create coven home");
@@ -946,7 +949,7 @@ while :; do sleep 1; done
         .expect("failed to spawn coven binary");
 
     let descendant_path = project_root.join("descendant.pid");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + STARTUP_BUDGET;
     while !descendant_path.exists() && Instant::now() < deadline {
         if let Some(status) = coven.try_wait().expect("failed polling coven") {
             panic!("coven exited before Codex fixture was ready: {status}");
@@ -1010,7 +1013,8 @@ while :; do sleep 1; done
         .trim()
         .to_string();
     let mut alive = true;
-    for _ in 0..80 {
+    let cleanup_deadline = Instant::now() + CLEANUP_BUDGET;
+    while Instant::now() < cleanup_deadline {
         alive = Command::new("kill")
             .args(["-0", &descendant_pid])
             .stderr(Stdio::null())

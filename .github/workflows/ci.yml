@@ -8,123 +8,60 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  rust:
-    name: Rust checks
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - name: Install native link dependencies (Linux only)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
-      # fmt/clippy only on Linux to keep Windows leg focused on build+test
-      - name: Check formatting
-        if: runner.os == 'Linux'
-        run: cargo fmt --check
-      - name: Clippy
-        if: runner.os == 'Linux'
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace --locked
-      # `coven-afs`'s `mount` feature is opt-in, so every step above compiles
-      # the workspace *without* `crates/coven-afs/src/nfs.rs` — the NFSv3
-      # export, its ownership mapping, and the file-handle authentication that
-      # is the access-control boundary for a mounted session (DESIGN.md §7).
-      # That module went unbuilt by CI from #680 until `coven-aof`, so PRs
-      # changing it received green checks computed without it.
-      #
-      # Linux only: the export calls `libc::getuid`/`getgid`, which do not
-      # exist on Windows — `nfsserve` gates its own `fs_util` the same way.
-      # Excluding Windows is the honest fix; weakening the module to compile
-      # there would trade real coverage for a green badge.
-      - name: Clippy (coven-afs mount feature)
-        if: runner.os == 'Linux'
-        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
-      - name: Test (coven-afs mount feature)
-        if: runner.os == 'Linux'
-        run: cargo test -p coven-afs --features mount --locked
-
-  afs-mount-macos:
-    name: AFS mount backend (macOS)
-    # macOS is the only platform that advertises a mount backend
-    # (`afsMount: "nfs"`), and the `Rust checks` matrix does not include it.
-    # A separate job rather than a third matrix entry: this needs to build one
-    # crate, not the workspace, and the mount steps in that job are already
-    # conditioned on `runner.os == 'Linux'` for reasons that do not apply here.
-    #
-    # This does not close a *compile* gap. `crates/coven-cli/src/afs_mount.rs`
-    # uses `cfg!(target_os = "macos")` — the macro, so both branches type-check
-    # on Linux — and its helpers are `cfg(unix)`, which Linux covers. What is
-    # missing is Darwin behaviour: the nfsserve stack, the uid/gid mapping in
-    # `nfs.rs`, and the only place `mount_nfs` can actually run.
-    runs-on: macos-26
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - name: Clippy (coven-afs mount feature)
-        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
-      - name: Test (coven-afs mount feature)
-        run: cargo test -p coven-afs --features mount --locked
-      # Informational. `coven-x77` found that macOS refuses `open()` on network
-      # volumes for processes without privacy consent, and a runner is exactly
-      # such a process — so this may well be refused. Recording which stage
-      # refuses turns a standing guess into an answer; it must never gate a PR.
-      - name: Probe a real mount (informational)
-        continue-on-error: true
-        run: ./scripts/afs-mount-smoke.sh
-
-  performance-baseline:
-    name: CLI performance baseline
+  changes:
+    name: Classify changes
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      rust: ${{ steps.classify.outputs.rust }}
+      afs: ${{ steps.classify.outputs.afs }}
+      channels: ${{ steps.classify.outputs.channels }}
+      openclaw: ${{ steps.classify.outputs.openclaw }}
+      npm_packaging: ${{ steps.classify.outputs.npm_packaging }}
+      engine: ${{ steps.classify.outputs.engine }}
+      workflow: ${{ steps.classify.outputs.workflow }}
+      cargo_metadata: ${{ steps.classify.outputs.cargo_metadata }}
     steps:
       - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-node@v7
         with:
-          node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
-      - name: Build coven
-        run: cargo build -p coven-cli --locked
-      - name: Validate benchmark runner
-        run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
-      - name: Collect non-gating baseline artifact
-        run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
-      # Trend collection only, and intermittently unable to run 32 concurrent
-      # sessions on a two-core runner (#615) — a live session there can record
-      # no events at all. Collection must not gate merges; the deterministic
-      # unit tests above still do. Drop `continue-on-error` once #615 is fixed.
-      - name: Collect concurrent runtime baseline artifact
-        continue-on-error: true
-        run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
-      - name: Collect deterministic TUI scheduling metric
+          fetch-depth: 0
+      - name: Collect changed paths
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
         run: |
-          set -o pipefail
-          cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
-      - name: Upload baseline artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: coven-cli-performance-baseline
-          path: |
-            coven-perf.json
-            coven-chaos.json
-            coven-tui-metrics.txt
-          if-no-files-found: error
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            range="${PR_BASE_SHA}...${PR_HEAD_SHA}"
+          elif git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            range="${BEFORE_SHA}..${AFTER_SHA}"
+          else
+            empty_tree="$(git hash-object -t tree -w --stdin </dev/null)"
+            range="${empty_tree}..${AFTER_SHA}"
+          fi
+          git diff --name-only --diff-filter=ACMRD "$range" > changed-files.txt
+      - name: Classify changed paths
+        id: classify
+        run: python3 scripts/classify-ci-changes.py --github-output "$GITHUB_OUTPUT" < changed-files.txt
 
-  secret-guard:
-    name: Secret guard
+  policy-guard:
+    name: Policy guard
+    needs: changes
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7.0.1
         with:
@@ -150,10 +87,188 @@ jobs:
             BEFORE_SHA="$(git hash-object -t tree -w --stdin </dev/null)"
           fi
           python scripts/check-coven-privacy.py --range "${BEFORE_SHA}..${AFTER_SHA}"
+      - run: python3 scripts/classify-ci-changes-test.py
+      - run: python3 scripts/check-workflows-test.py
+      - run: python3 scripts/check-ci-workflow-test.py
+      - run: scripts/check-workflows.sh
+
+  rust-lint-linux:
+    name: Rust lint (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-lint-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-lint-
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-test-linux:
+    name: Rust tests (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - run: cargo test --workspace --locked
+
+  rust-test-windows:
+    name: Rust tests (Windows)
+    needs: changes
+    if: ${{ needs.changes.outputs.rust == 'true' }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - run: cargo test --workspace --locked
+
+  afs-mount-linux:
+    name: AFS mount backend (Linux)
+    needs: changes
+    if: ${{ needs.changes.outputs.afs == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-afs-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-afs-
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Clippy (coven-afs mount feature)
+        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
+      - name: Test (coven-afs mount feature)
+        run: cargo test -p coven-afs --features mount --locked
+
+  afs-mount-macos:
+    name: AFS mount backend (macOS)
+    needs: changes
+    if: ${{ github.event_name == 'push' || needs.changes.outputs.afs == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-afs-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-afs-
+      - name: Clippy (coven-afs mount feature)
+        run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
+      - name: Test (coven-afs mount feature)
+        run: cargo test -p coven-afs --features mount --locked
+      - name: Probe a real mount (informational)
+        if: ${{ github.event_name == 'push' }}
+        continue-on-error: true
+        run: ./scripts/afs-mount-smoke.sh
+
+  performance-baseline:
+    name: CLI performance baseline
+    needs: changes
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-perf-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-perf-
+      - name: Install native link dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - name: Build coven
+        run: cargo build -p coven-cli --locked
+      - name: Validate benchmark runner
+        run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
+      - name: Collect non-gating baseline artifact
+        run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
+      - name: Collect concurrent runtime baseline artifact
+        continue-on-error: true
+        run: node scripts/benchmark-chaos.mjs --binary target/debug/coven --output coven-chaos.json
+      - name: Collect deterministic TUI scheduling metric
+        run: |
+          set -o pipefail
+          cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture | tee coven-tui-metrics.txt
+      - name: Upload baseline artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coven-cli-performance-baseline
+          path: |
+            coven-perf.json
+            coven-chaos.json
+            coven-tui-metrics.txt
+          if-no-files-found: error
 
   channels:
     name: Channels package
+    needs: changes
+    if: ${{ needs.changes.outputs.channels == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v7
@@ -170,7 +285,10 @@ jobs:
 
   openclaw-bridge:
     name: OpenClaw bridge
+    needs: changes
+    if: ${{ needs.changes.outputs.openclaw == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v7
@@ -180,6 +298,14 @@ jobs:
         run: |
           corepack enable
           corepack prepare pnpm@10.11.1 --activate
+      - id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-openclaw-${{ hashFiles('packages/openclaw-coven/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-openclaw-
       - run: pnpm install --frozen-lockfile --ignore-scripts
         working-directory: packages/openclaw-coven
       - run: pnpm run build
@@ -187,9 +313,45 @@ jobs:
       - run: pnpm test
         working-directory: packages/openclaw-coven
 
-  npm-onboarding-smoke:
+  npm-onboarding-linux:
+    name: npm onboarding smoke (linux-x64)
+    needs: changes
+    if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      NPM_TARGET: linux-x64
+      RUST_TARGET: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.RUST_TARGET }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-npm-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-npm-
+      - name: Install native link dependencies (Linux only)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      - run: cargo build --release --package coven-cli --target ${{ env.RUST_TARGET }}
+      - run: node scripts/test-cli-prepublish.mjs --target="$NPM_TARGET" --skip-build --skip-secrets-scan
+        env:
+          COVEN_NPM_DRY_RUN_VERSION: 999.0.0
+
+  npm-onboarding-main:
     name: npm onboarding smoke (${{ matrix.npm-target }})
+    needs: changes
+    if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -214,14 +376,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust-target }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-npm-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
-      # The smoke test packages with --skip-build, so it needs every binary the
-      # payload declares — the same set the release builds. Without this the
-      # macOS packages would be assembled without the AFS export helper, which
-      # is precisely the gap this job exists to catch (coven-g2t).
       - name: Build the AFS mount export helper (macOS only)
         if: startsWith(matrix.npm-target, 'macos')
         run: cargo build --release -p coven-afs --features mount --bins --target ${{ matrix.rust-target }}
@@ -231,10 +398,22 @@ jobs:
 
   engine-contract:
     name: engine contract
+    needs: changes
+    if: ${{ github.event_name == 'push' || needs.changes.outputs.engine == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-engine-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-engine-
       - name: Install native link dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - name: Build coven
@@ -250,11 +429,58 @@ jobs:
 
   cargo-deny:
     name: Dependency audit
+    needs: changes
+    if: ${{ github.event_name == 'push' || needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7.0.1
-      # Commit-pinned (v2.0.20): a supply-chain gate must not itself depend on a
-      # mutable action tag. Config lives in deny.toml at the repo root.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check advisories licenses bans sources
+
+  pr-gate:
+    name: PR gate
+    if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+      - changes
+      - policy-guard
+      - rust-lint-linux
+      - rust-test-linux
+      - rust-test-windows
+      - afs-mount-linux
+      - afs-mount-macos
+      - performance-baseline
+      - channels
+      - openclaw-bridge
+      - npm-onboarding-linux
+      - npm-onboarding-main
+      - engine-contract
+      - cargo-deny
+    env:
+      JOB_RESULTS: ${{ toJSON(needs) }}
+    steps:
+      - name: Require successful or intentional skipped jobs
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          jobs = json.loads(os.environ["JOB_RESULTS"])
+          bad = {
+              name: data["result"]
+              for name, data in jobs.items()
+              if data["result"] not in {"success", "skipped"}
+          }
+          for required in ("changes", "policy-guard"):
+              if jobs[required]["result"] != "success":
+                  bad[required] = jobs[required]["result"]
+          if bad:
+              raise SystemExit(
+                  "PR gate rejected job results: "
+                  + ", ".join(f"{name}={result}" for name, result in sorted(bad.items()))
+              )
+          print("PR gate accepted all required and conditional jobs")
+          PY

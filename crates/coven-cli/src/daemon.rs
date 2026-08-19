@@ -35,6 +35,97 @@ pub struct DaemonStatus {
     pub pid: u32,
     pub started_at: String,
     pub socket: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_windows_process_creation_time"
+    )]
+    pub(crate) process_creation_time: Option<WindowsProcessCreationTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WindowsProcessCreationTime(u64);
+
+impl WindowsProcessCreationTime {
+    #[cfg(any(windows, test))]
+    fn new(value: u64) -> Result<Self> {
+        anyhow::ensure!(value != 0, "invalid Windows process creation time: zero");
+        Ok(Self(value))
+    }
+
+    #[cfg(any(windows, test))]
+    fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl Serialize for WindowsProcessCreationTime {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for WindowsProcessCreationTime {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let serialized = value.as_str().ok_or_else(|| {
+            serde::de::Error::custom(
+                "invalid Windows process creation time: expected a decimal string",
+            )
+        })?;
+        let value = serialized.parse::<u64>().map_err(|_| {
+            serde::de::Error::custom(
+                "invalid Windows process creation time: expected an unsigned 64-bit decimal string",
+            )
+        })?;
+        if value == 0 {
+            return Err(serde::de::Error::custom(
+                "invalid Windows process creation time: zero",
+            ));
+        }
+        Ok(Self(value))
+    }
+}
+
+fn deserialize_optional_windows_process_creation_time<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WindowsProcessCreationTime>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Err(serde::de::Error::custom(
+            "invalid Windows process creation time: null",
+        ));
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug)]
+struct DaemonStatusParseError {
+    source: serde_json::Error,
+    process_creation_time_present: bool,
+}
+
+impl std::fmt::Display for DaemonStatusParseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "failed to parse daemon status: {}", self.source)
+    }
+}
+
+impl std::error::Error for DaemonStatusParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,11 +134,16 @@ pub enum DaemonStatusState {
     Stale(DaemonStatus),
 }
 
+#[cfg(any(windows, test))]
 #[derive(Debug, Deserialize)]
 struct DaemonHealthStatus {
     ok: bool,
     daemon: Option<DaemonStatus>,
 }
+
+#[cfg(not(windows))]
+const MAX_DAEMON_STATUS_BYTES: usize = coven_client::MAX_DAEMON_STATUS_BYTES;
+const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpawnSpec {
@@ -1332,26 +1428,35 @@ enum DaemonIpcPlatform {
     Windows,
 }
 
-fn daemon_windows_pipe_name(coven_home: &Path) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    coven_home.to_string_lossy().hash(&mut h);
-    format!("coven-daemon-{:016x}.sock", h.finish())
+fn daemon_windows_pipe_name(coven_home: &Path) -> Result<String> {
+    #[cfg(windows)]
+    {
+        coven_client::owner_only_windows_pipe_name(coven_home).map_err(anyhow::Error::new)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = coven_home;
+        anyhow::bail!("Windows daemon pipe identity is unavailable on this platform")
+    }
 }
 
 fn daemon_startup_status_socket_for_platform(
     coven_home: &Path,
     platform: DaemonIpcPlatform,
-) -> String {
-    match platform {
+) -> Result<String> {
+    Ok(match platform {
         DaemonIpcPlatform::Unix => daemon_socket_path(coven_home)
-            .to_string_lossy()
-            .into_owned(),
-        DaemonIpcPlatform::Windows => daemon_windows_pipe_name(coven_home),
-    }
+            .to_str()
+            .context(
+                "canonical Coven daemon socket is not valid UTF-8; daemon status JSON requires \
+                 UTF-8 paths",
+            )?
+            .to_owned(),
+        DaemonIpcPlatform::Windows => daemon_windows_pipe_name(coven_home)?,
+    })
 }
 
-fn daemon_startup_status_socket(coven_home: &Path) -> String {
+fn daemon_startup_status_socket(coven_home: &Path) -> Result<String> {
     #[cfg(windows)]
     {
         daemon_startup_status_socket_for_platform(coven_home, DaemonIpcPlatform::Windows)
@@ -1411,15 +1516,247 @@ pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 pub(crate) fn ensure_private_coven_home(coven_home: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if let Ok(metadata) = std::fs::symlink_metadata(coven_home) {
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "refusing to use Coven home {}: path is a symlink",
+                coven_home.display()
+            );
+        }
+    }
     std::fs::create_dir_all(coven_home)
         .with_context(|| format!("failed to create Coven home {}", coven_home.display()))?;
+    #[cfg(windows)]
+    set_windows_owner_only_directory_security(coven_home)?;
     Ok(())
 }
 
-pub fn background_server_spec(current_exe: &Path, coven_home: &Path) -> DaemonSpawnSpec {
+#[cfg(any(windows, test))]
+const WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL: &str = "D:P(A;OICI;GA;;;OW)";
+
+#[cfg(windows)]
+fn set_windows_owner_only_directory_security(path: &Path) -> Result<()> {
+    use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+    use windows_sys::Win32::Security::{
+        Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+            SE_FILE_OBJECT,
+        },
+        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let descriptor_sddl: Vec<u16> = OsStr::new(WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        ) == 0
+    } {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to build owner-only Windows security descriptor");
+    }
+    let _descriptor = WindowsLocalAllocation(descriptor);
+    let mut dacl_present = 0;
+    let mut dacl = ptr::null_mut();
+    let mut dacl_defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor,
+            &mut dacl_present,
+            &mut dacl,
+            &mut dacl_defaulted,
+        ) == 0
+    } || dacl_present == 0
+        || dacl.is_null()
+    {
+        anyhow::bail!("owner-only Windows security descriptor did not contain a DACL");
+    }
+
+    let owner = current_windows_user_sid()?;
+    let path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let status = unsafe {
+        SetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner.as_ptr(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        anyhow::bail!("failed to set owner-only security on Coven path: Windows error {status}");
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+struct WindowsTokenBuffer {
+    words: Vec<usize>,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsTokenBuffer {
+    fn new(byte_len: usize) -> Self {
+        let word_len = byte_len.max(1).div_ceil(std::mem::size_of::<usize>());
+        Self {
+            words: vec![0; word_len],
+        }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut std::ffi::c_void {
+        self.words.as_mut_ptr().cast()
+    }
+
+    #[cfg(windows)]
+    fn as_ptr(&self) -> *const std::ffi::c_void {
+        self.words.as_ptr().cast()
+    }
+
+    fn byte_capacity(&self) -> usize {
+        self.words.len() * std::mem::size_of::<usize>()
+    }
+}
+
+#[cfg(windows)]
+const _: () = assert!(
+    std::mem::align_of::<usize>()
+        >= std::mem::align_of::<windows_sys::Win32::Security::TOKEN_USER>()
+);
+
+#[cfg(windows)]
+struct WindowsSid(WindowsTokenBuffer);
+
+#[cfg(windows)]
+impl WindowsSid {
+    fn as_ptr(&self) -> windows_sys::Win32::Security::PSID {
+        self.0.as_ptr().cast_mut()
+    }
+
+    fn to_sddl_string(&self) -> Result<String> {
+        use std::ptr;
+        use widestring::U16CStr;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        let mut string_sid = ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(self.as_ptr(), &mut string_sid) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to serialize current Windows user SID");
+        }
+        let _string_sid = WindowsLocalAllocation(string_sid.cast());
+        unsafe { U16CStr::from_ptr_str(string_sid) }
+            .to_string()
+            .context("current Windows user SID was not valid UTF-16")
+    }
+}
+
+#[cfg(windows)]
+fn current_windows_user_sid() -> Result<WindowsSid> {
+    use std::{mem::size_of, ptr};
+    use windows_sys::Win32::{
+        Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER},
+        Security::{
+            CopySid, GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        },
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+
+    let mut process_token = ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) == 0 } {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect current Windows user");
+    }
+    let _token = WindowsHandle(process_token);
+    let mut bytes = 0;
+    let initial =
+        unsafe { GetTokenInformation(process_token, TokenUser, ptr::null_mut(), 0, &mut bytes) };
+    if initial != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || bytes == 0 {
+        anyhow::bail!("failed to size current Windows user token");
+    }
+    let mut buffer = WindowsTokenBuffer::new(bytes as usize);
+    if unsafe {
+        GetTokenInformation(
+            process_token,
+            TokenUser,
+            buffer.as_mut_ptr(),
+            bytes,
+            &mut bytes,
+        ) == 0
+    } {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to read current Windows user token");
+    }
+    if (bytes as usize) < size_of::<TOKEN_USER>() || bytes as usize > buffer.byte_capacity() {
+        anyhow::bail!("current Windows user token returned an invalid size");
+    }
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    if user.User.Sid.is_null() {
+        anyhow::bail!("current Windows user token had no SID");
+    }
+    let length = unsafe { GetLengthSid(user.User.Sid) } as usize;
+    if length == 0 {
+        anyhow::bail!("current Windows user token had an invalid SID");
+    }
+    let mut sid = WindowsTokenBuffer::new(length);
+    if unsafe { CopySid(length as u32, sid.as_mut_ptr(), user.User.Sid) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to copy current Windows user SID");
+    }
+    Ok(WindowsSid(sid))
+}
+
+#[cfg(windows)]
+struct WindowsHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WindowsHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct WindowsLocalAllocation(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for WindowsLocalAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
+}
+
+pub fn background_server_spec(
+    current_exe: &Path,
+    coven_home: &Path,
+    started_at: &str,
+) -> DaemonSpawnSpec {
     DaemonSpawnSpec {
         program: current_exe.to_path_buf(),
-        args: vec!["daemon".to_string(), "serve".to_string()],
+        args: vec![
+            "daemon".to_string(),
+            "serve".to_string(),
+            "--managed-started-at".to_string(),
+            started_at.to_owned(),
+        ],
         coven_home: coven_home.to_path_buf(),
     }
 }
@@ -1429,19 +1766,30 @@ pub fn start_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    let spec = background_server_spec(current_exe, coven_home);
-    ensure_private_coven_home(coven_home)?;
     prevent_background_server_stdio_handle_leaks()?;
-    let child = background_server_command(&spec)
-        .spawn()
-        .with_context(|| format!("failed to start Coven daemon {}", spec.program.display()))?;
-    let status = DaemonStatus {
-        pid: child.id(),
+    start_background_server_with_spawn(coven_home, current_exe, started_at, |spec| {
+        background_server_command(spec)
+            .spawn()
+            .map(|child| child.id())
+            .with_context(|| format!("failed to start Coven daemon {}", spec.program.display()))
+    })
+}
+
+fn start_background_server_with_spawn(
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+    spawn: impl FnOnce(&DaemonSpawnSpec) -> Result<u32>,
+) -> Result<DaemonStatus> {
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    let spec = background_server_spec(current_exe, &coven_home, &started_at);
+    let pid = spawn(&spec)?;
+    Ok(DaemonStatus {
+        pid,
         started_at,
-        socket: daemon_startup_status_socket(coven_home),
-    };
-    write_status(coven_home, &status)?;
-    Ok(status)
+        socket: daemon_startup_status_socket(&coven_home)?,
+        process_creation_time: None,
+    })
 }
 
 #[cfg(windows)]
@@ -1519,16 +1867,22 @@ pub fn ensure_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<DaemonStatus> {
-    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
-    let status = ensure_background_server_with_controllers(
-        coven_home,
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    deadline.remaining("resolving Coven daemon profile")?;
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
+    let status = ensure_background_server_with_controllers_until(
+        &coven_home,
         current_exe,
         started_at,
         &SystemDaemonStopController,
         &SystemDaemonStartController,
+        deadline,
     )?;
     #[cfg(unix)]
-    cleanup_unreachable_duplicate_daemons(coven_home, status.pid);
+    run_optional_lifecycle_diagnostic(deadline, move |deadline| {
+        report_unreachable_duplicate_daemons(coven_home, status.pid, deadline);
+    });
     Ok(status)
 }
 
@@ -1537,64 +1891,72 @@ pub(crate) fn daemon_lifecycle_lock_path(coven_home: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn cleanup_unreachable_duplicate_daemons(coven_home: &Path, active_pid: u32) {
-    use sysinfo::{Pid, ProcessesToUpdate, Signal, System};
+fn report_unreachable_duplicate_daemons(coven_home: PathBuf, active_pid: u32, deadline: Instant) {
+    use sysinfo::System;
 
-    let mut sys = System::new_all();
-    sys.refresh_all();
-    let candidates: Vec<(Pid, u64, Vec<std::ffi::OsString>)> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            if !process_is_unreachable_duplicate_daemon_candidate(
-                pid.as_u32(),
-                active_pid,
-                process.thread_kind(),
-                process.cmd(),
-                process.environ(),
-                coven_home,
-            ) {
-                return None;
-            }
-            Some((*pid, process.start_time(), process.cmd().to_vec()))
-        })
-        .collect();
-
-    for (pid, start_time, cmd) in candidates {
-        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-        let Some(process) = sys.process(pid) else {
-            continue;
-        };
-        if process.start_time() != start_time
-            || process.cmd() != cmd.as_slice()
-            || !process_is_unreachable_duplicate_daemon_candidate(
-                pid.as_u32(),
-                active_pid,
-                process.thread_kind(),
-                process.cmd(),
-                process.environ(),
-                coven_home,
-            )
-        {
-            continue;
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(0);
+    std::thread::spawn(move || {
+        optional_diagnostic_test_delay();
+        if Instant::now() >= deadline {
+            let _ = finished_tx.send(());
+            return;
         }
-        match process.kill_with(Signal::Term) {
-            Some(true) => append_daemon_recovery_log(
-                coven_home,
-                &format!(
-                    "terminated unreachable duplicate daemon pid={} active_pid={}",
-                    pid.as_u32(),
-                    active_pid
-                ),
-            ),
-            Some(false) | None => append_daemon_recovery_log(
-                coven_home,
-                &format!(
-                    "failed to terminate unreachable duplicate daemon pid={} active_pid={}",
-                    pid.as_u32(),
-                    active_pid
-                ),
-            ),
+        let mut sys = System::new_all();
+        sys.refresh_all();
+        for (pid, process) in sys.processes() {
+            if Instant::now() >= deadline {
+                return;
+            }
+            if process_is_unreachable_duplicate_daemon_candidate(
+                pid.as_u32(),
+                active_pid,
+                process.thread_kind(),
+                process.cmd(),
+                process.environ(),
+                &coven_home,
+            ) {
+                append_daemon_recovery_log(
+                    &coven_home,
+                    &format!(
+                        "preserved unreachable duplicate daemon pid={} active_pid={}: no authenticated lifecycle connection",
+                        pid.as_u32(),
+                        active_pid
+                    ),
+                );
+            }
+        }
+        let _ = finished_tx.send(());
+    });
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if !remaining.is_zero() {
+        let _ = finished_rx.recv_timeout(remaining);
+    }
+}
+
+#[cfg(unix)]
+fn run_optional_lifecycle_diagnostic(
+    deadline: LifecycleDeadline,
+    diagnostic: impl FnOnce(Instant),
+) {
+    if deadline
+        .remaining("running optional daemon diagnostics")
+        .is_ok()
+    {
+        diagnostic(deadline.instant);
+    }
+}
+
+#[cfg(all(unix, test))]
+static OPTIONAL_DIAGNOSTIC_DELAY_MILLIS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(unix)]
+fn optional_diagnostic_test_delay() {
+    #[cfg(test)]
+    {
+        let delay = OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.load(std::sync::atomic::Ordering::SeqCst);
+        if delay != 0 {
+            std::thread::sleep(Duration::from_millis(delay));
         }
     }
 }
@@ -1652,6 +2014,34 @@ fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLoc
     file.lock_exclusive()
         .with_context(|| format!("failed to lock daemon lifecycle {}", lock_path.display()))?;
     Ok(DaemonLifecycleLock { file })
+}
+
+fn acquire_daemon_lifecycle_lock_until(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+) -> Result<DaemonLifecycleLock> {
+    ensure_private_coven_home(coven_home)?;
+    let lock_path = daemon_lifecycle_lock_path(coven_home);
+    let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
+        format!(
+            "failed to open daemon lifecycle lock {}",
+            lock_path.display()
+        )
+    })?;
+    loop {
+        match file.try_lock_exclusive() {
+            Ok(()) => return Ok(DaemonLifecycleLock { file }),
+            Err(error) if crate::state_lock::is_lock_contended(&error) => {
+                let remaining = deadline.remaining("waiting for Coven daemon lifecycle lock")?;
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to lock daemon lifecycle {}", lock_path.display())
+                })
+            }
+        }
+    }
 }
 
 fn try_acquire_daemon_lifecycle_lock_in(
@@ -1716,29 +2106,146 @@ pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
     ensure_private_coven_home(coven_home)?;
     let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
     let status_path = daemon_status_path(coven_home);
-    std::fs::write(&status_path, format!("{json}\n")).context("failed to write daemon status")?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o600)).with_context(
-        || {
-            format!(
-                "failed to set daemon status permissions {}",
-                status_path.display()
-            )
-        },
-    )?;
-    Ok(())
+    #[cfg(windows)]
+    {
+        write_windows_status(&status_path, &json)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::write(&status_path, format!("{json}\n"))
+            .context("failed to write daemon status")?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set daemon status permissions {}",
+                    status_path.display()
+                )
+            })?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
+    let coven_home = status_path
+        .parent()
+        .context("daemon status path has no Coven home")?;
+    coven_client::write_owner_only_windows_daemon_status(coven_home, json.as_bytes())
+        .map_err(anyhow::Error::new)
 }
 
 pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
-    let path = daemon_status_path(coven_home);
-    if !path.exists() {
-        return Ok(None);
+    #[cfg(windows)]
+    {
+        let Some(json) = coven_client::read_windows_daemon_status_for_lifecycle(coven_home)
+            .map_err(windows_status_read_error)?
+        else {
+            return Ok(None);
+        };
+        let status = parse_daemon_status(&json)?;
+        return Ok(Some(status));
     }
 
-    let json = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read daemon status {}", path.display()))?;
-    let status = serde_json::from_str(&json).context("failed to parse daemon status")?;
-    Ok(Some(status))
+    #[cfg(not(windows))]
+    {
+        let path = daemon_status_path(coven_home);
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open daemon status {}", path.display()))
+            }
+        };
+        let json = read_bounded_daemon_status(file).map_err(|error| {
+            anyhow::anyhow!("failed to read daemon status {}: {error:#}", path.display())
+        })?;
+        let status = parse_daemon_status(&json)?;
+        Ok(Some(status))
+    }
+}
+
+fn read_status_until(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    deadline.remaining("reading Coven daemon lifecycle status")?;
+    #[cfg(windows)]
+    {
+        let Some(json) = coven_client::read_windows_daemon_status_for_lifecycle_until(
+            coven_home,
+            deadline.instant,
+        )
+        .map_err(windows_status_read_error)?
+        else {
+            return Ok(None);
+        };
+        let status = parse_daemon_status(&json)?;
+        deadline.remaining("parsing Coven daemon lifecycle status")?;
+        Ok(Some(status))
+    }
+    #[cfg(not(windows))]
+    {
+        let status = read_status(coven_home)?;
+        deadline.remaining("reading Coven daemon lifecycle status")?;
+        Ok(status)
+    }
+}
+
+#[cfg(windows)]
+fn windows_status_read_error(error: coven_client::ClientError) -> anyhow::Error {
+    match error {
+        coven_client::ClientError::InvalidJson(source) => {
+            anyhow::Error::new(DaemonStatusParseError {
+                source,
+                process_creation_time_present: false,
+            })
+        }
+        error => anyhow::Error::new(error),
+    }
+}
+
+fn parse_daemon_status(serialized: &str) -> Result<DaemonStatus> {
+    let process_creation_time_present = serde_json::from_str::<serde_json::Value>(serialized)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.contains_key("processCreationTime"))
+        })
+        .unwrap_or(false);
+    serde_json::from_str(serialized).map_err(|source| {
+        anyhow::Error::new(DaemonStatusParseError {
+            source,
+            process_creation_time_present,
+        })
+    })
+}
+
+pub(crate) fn read_status_synchronized(coven_home: &Path) -> Result<Option<DaemonStatus>> {
+    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
+    read_status(coven_home)
+}
+
+#[cfg(not(windows))]
+fn read_bounded_daemon_status(file: std::fs::File) -> Result<String> {
+    let size = file
+        .metadata()
+        .context("failed to inspect daemon status size")?
+        .len();
+    if size > MAX_DAEMON_STATUS_BYTES as u64 {
+        anyhow::bail!("daemon status exceeded the {MAX_DAEMON_STATUS_BYTES}-byte limit");
+    }
+    let capacity = usize::try_from(size).context("daemon status size was not representable")?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take((MAX_DAEMON_STATUS_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("failed to read bounded daemon status")?;
+    if bytes.len() > MAX_DAEMON_STATUS_BYTES {
+        anyhow::bail!("daemon status exceeded the {MAX_DAEMON_STATUS_BYTES}-byte limit");
+    }
+    String::from_utf8(bytes).context("daemon status was not valid UTF-8")
 }
 
 pub fn clear_status(coven_home: &Path) -> Result<bool> {
@@ -1753,8 +2260,11 @@ pub fn clear_status(coven_home: &Path) -> Result<bool> {
 }
 
 pub fn stop_background_server(coven_home: &Path) -> Result<bool> {
-    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
-    stop_background_server_with_controller(coven_home, &SystemDaemonStopController)
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    deadline.remaining("resolving Coven daemon profile")?;
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
+    stop_background_server_with_controller_until(&coven_home, &SystemDaemonStopController, deadline)
 }
 
 pub fn restart_background_server(
@@ -1762,33 +2272,157 @@ pub fn restart_background_server(
     current_exe: &Path,
     started_at: String,
 ) -> Result<(bool, DaemonStatus)> {
-    let _lock = acquire_daemon_lifecycle_lock(coven_home)?;
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    deadline.remaining("resolving Coven daemon profile")?;
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
+    restart_background_server_with_controllers_until(
+        &coven_home,
+        current_exe,
+        started_at,
+        &SystemDaemonStopController,
+        &SystemDaemonStartController,
+        deadline,
+    )
+}
+
+fn restart_background_server_with_controllers_until(
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+    stop_controller: &dyn DaemonStopController,
+    start_controller: &dyn DaemonStartController,
+    deadline: LifecycleDeadline,
+) -> Result<(bool, DaemonStatus)> {
+    let coven_home = canonical_lifecycle_home(coven_home)?;
     let was_running =
-        stop_background_server_with_controller(coven_home, &SystemDaemonStopController)?;
-    let status = start_background_server(coven_home, current_exe, started_at)?;
-    if !SystemDaemonStartController.wait_for_running_daemon(&status, Duration::from_secs(2)) {
+        stop_background_server_with_controller_until(&coven_home, stop_controller, deadline)?;
+    deadline.remaining("starting Coven daemon")?;
+    let launched =
+        start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+    let Some(status) =
+        start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
+    else {
         anyhow::bail!(
             "started Coven daemon pid {} but its socket did not become ready",
-            status.pid
+            launched.pid
         );
-    }
+    };
+    deadline.remaining("completing Coven daemon restart")?;
     #[cfg(unix)]
-    cleanup_unreachable_duplicate_daemons(coven_home, status.pid);
+    run_optional_lifecycle_diagnostic(deadline, move |deadline| {
+        report_unreachable_duplicate_daemons(coven_home, status.pid, deadline);
+    });
     Ok((was_running, status))
 }
 
 pub fn background_server_status(coven_home: &Path) -> Result<Option<DaemonStatusState>> {
-    background_server_status_with_controller(coven_home, &SystemDaemonStopController)
+    background_server_status_locked_with_controller(coven_home, &SystemDaemonStopController)
+}
+
+fn background_server_status_locked_with_controller(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+) -> Result<Option<DaemonStatusState>> {
+    let deadline = LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?;
+    deadline.remaining("resolving Coven daemon profile")?;
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    let _lock = acquire_daemon_lifecycle_lock_until(&coven_home, deadline)?;
+    background_server_status_with_controller_until(&coven_home, controller, deadline)
 }
 
 trait DaemonStopController {
-    fn signal_term(&self, pid: u32) -> Result<()>;
-    fn pid_is_alive(&self, pid: u32) -> bool;
-    fn wait_for_exit(&self, pid: u32, timeout: Duration) -> bool;
-    fn status_matches_running_daemon(&self, status: &DaemonStatus) -> bool;
-    fn status_from_default_socket(&self, coven_home: &Path) -> Result<Option<DaemonStatus>> {
+    fn stop_verified_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<VerifiedStopOutcome>;
+    fn recorded_process_state(&self, status: &DaemonStatus) -> Result<RecordedProcessState>;
+    fn status_matches_running_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<bool>;
+    fn authenticated_running_status(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>> {
+        self.status_matches_running_daemon(coven_home, status, deadline)
+            .map(|matches| matches.then(|| status.clone()))
+    }
+    fn status_from_default_socket(
+        &self,
+        coven_home: &Path,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>> {
         let _ = coven_home;
+        let _ = deadline;
         Ok(None)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerifiedStopOutcome {
+    Unverified,
+    Exited,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedProcessState {
+    Gone,
+    Matching,
+    #[cfg(any(windows, test))]
+    Mismatched,
+    Unverifiable,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LifecycleDeadline {
+    instant: Instant,
+}
+
+impl LifecycleDeadline {
+    fn after(timeout: Duration) -> Result<Self> {
+        let instant = Instant::now()
+            .checked_add(timeout)
+            .context("daemon lifecycle deadline overflowed")?;
+        Ok(Self { instant })
+    }
+
+    #[cfg(test)]
+    fn from_instant(instant: Instant) -> Self {
+        Self { instant }
+    }
+
+    fn remaining(self, phase: &'static str) -> Result<Duration> {
+        self.remaining_at(Instant::now(), phase)
+    }
+
+    fn remaining_at(self, now: Instant, phase: &'static str) -> Result<Duration> {
+        self.instant
+            .checked_duration_since(now)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| anyhow::anyhow!("timed out {phase}"))
+    }
+}
+
+#[cfg(any(windows, test))]
+fn recorded_windows_process_state(
+    status: &DaemonStatus,
+    live_creation_time: Option<u64>,
+) -> RecordedProcessState {
+    let Some(live_creation_time) = live_creation_time else {
+        return RecordedProcessState::Gone;
+    };
+    match status.process_creation_time {
+        Some(recorded) if recorded.get() == live_creation_time => RecordedProcessState::Matching,
+        Some(_) => RecordedProcessState::Mismatched,
+        None => RecordedProcessState::Unverifiable,
     }
 }
 
@@ -1801,7 +2435,12 @@ trait DaemonStartController {
         current_exe: &Path,
         started_at: String,
     ) -> Result<DaemonStatus>;
-    fn wait_for_running_daemon(&self, status: &DaemonStatus, timeout: Duration) -> bool;
+    fn wait_for_running_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>>;
 }
 
 struct SystemDaemonStartController;
@@ -1816,252 +2455,532 @@ impl DaemonStartController for SystemDaemonStartController {
         start_background_server(coven_home, current_exe, started_at)
     }
 
-    fn wait_for_running_daemon(&self, status: &DaemonStatus, timeout: Duration) -> bool {
+    fn wait_for_running_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>> {
         #[cfg(unix)]
         {
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                if daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+            if !unix_status_matches_selected_home(coven_home, status) {
+                return Ok(None);
             }
-            daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false)
+            loop {
+                let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
+                if let Some(live) = unix_authenticated_daemon_status(coven_home, status, remaining)?
+                {
+                    return Ok(Some(live));
+                }
+                let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
+                std::thread::sleep(remaining.min(Duration::from_millis(50)));
+            }
         }
         #[cfg(windows)]
         {
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                if daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false) {
-                    return true;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false)
+            let _ = coven_home;
+            wait_for_windows_running_daemon_with_identity_probe_until(
+                status,
+                deadline,
+                |pipe_name, deadline| {
+                    Ok(daemon_status_from_windows_pipe_until(pipe_name, deadline)?
+                        .and_then(|live| resolved_windows_daemon_status(status, &live)))
+                },
+            )
+            .map(Some)
         }
         #[cfg(not(any(unix, windows)))]
         {
+            let _ = coven_home;
             let _ = status;
-            let _ = timeout;
-            true
+            let _ = deadline;
+            Ok(Some(status.clone()))
         }
+    }
+}
+
+#[cfg(test)]
+fn wait_for_windows_running_daemon_with_probe<P>(
+    status: &DaemonStatus,
+    timeout: Duration,
+    probe: P,
+) -> Result<bool>
+where
+    P: FnMut(&str, u32, Duration) -> Result<bool>,
+{
+    let deadline = LifecycleDeadline::after(timeout)?;
+    wait_for_windows_running_daemon_with_probe_until(status, deadline, probe)
+}
+
+#[cfg(test)]
+fn wait_for_windows_running_daemon_with_probe_until<P>(
+    status: &DaemonStatus,
+    deadline: LifecycleDeadline,
+    mut probe: P,
+) -> Result<bool>
+where
+    P: FnMut(&str, u32, Duration) -> Result<bool>,
+{
+    wait_for_windows_running_daemon_with_identity_probe_until(
+        status,
+        deadline,
+        |pipe_name, deadline| {
+            probe(
+                pipe_name,
+                status.pid,
+                deadline.remaining("waiting for Coven daemon startup health")?,
+            )
+            .map(|matches| matches.then(|| status.clone()))
+        },
+    )
+    .map(|_| true)
+}
+
+#[cfg(any(windows, test))]
+fn wait_for_windows_running_daemon_with_identity_probe_until<P>(
+    status: &DaemonStatus,
+    deadline: LifecycleDeadline,
+    mut probe: P,
+) -> Result<DaemonStatus>
+where
+    P: FnMut(&str, LifecycleDeadline) -> Result<Option<DaemonStatus>>,
+{
+    loop {
+        deadline.remaining("waiting for Coven daemon startup health")?;
+        if let Some(live) = probe(&status.socket, deadline)? {
+            return Ok(live);
+        }
+        let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
 impl DaemonStopController for SystemDaemonStopController {
-    fn signal_term(&self, pid: u32) -> Result<()> {
+    fn stop_verified_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<VerifiedStopOutcome> {
         #[cfg(unix)]
         {
-            let output = Command::new("kill")
-                .arg("-TERM")
-                .arg(pid.to_string())
-                .stdin(Stdio::null())
-                .output()
-                .with_context(|| format!("failed to signal Coven daemon pid {pid}"))?;
-            if output.status.success() {
-                Ok(())
-            } else {
-                anyhow::bail!(
-                    "failed to signal Coven daemon pid {pid}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
+            if !unix_status_matches_selected_home(coven_home, status) {
+                return Ok(VerifiedStopOutcome::Unverified);
+            }
+            let expected = coven_client::LifecycleDaemonStatus {
+                pid: status.pid,
+                started_at: status.started_at.clone(),
+                socket: status.socket.clone(),
+            };
+            Ok(
+                match coven_client::shutdown_unix_daemon(
+                    coven_home,
+                    &expected,
+                    deadline.remaining("authenticating and stopping Coven daemon")?,
                 )
-            }
+                .map_err(anyhow::Error::new)?
+                {
+                    coven_client::UnixDaemonShutdown::Unavailable
+                    | coven_client::UnixDaemonShutdown::IdentityMismatch => {
+                        VerifiedStopOutcome::Unverified
+                    }
+                    coven_client::UnixDaemonShutdown::Exited => VerifiedStopOutcome::Exited,
+                    coven_client::UnixDaemonShutdown::TimedOut => VerifiedStopOutcome::TimedOut,
+                },
+            )
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::{
-                Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
-                System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE},
+            let _ = coven_home;
+            let Some(process) = coven_client::open_windows_daemon_process_for_stop_until(
+                &status.socket,
+                status.pid,
+                status.process_creation_time.map(|value| value.get()),
+                deadline.instant,
+            )
+            .map_err(anyhow::Error::new)?
+            else {
+                return Ok(VerifiedStopOutcome::Unverified);
             };
-            // SAFETY: Windows API calls; handle is closed immediately.
-            unsafe {
-                let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
-                if handle == INVALID_HANDLE_VALUE || handle == 0 as _ {
-                    // Process already gone — treat as success.
-                    return Ok(());
-                }
-                let rc = TerminateProcess(handle, 1);
-                CloseHandle(handle);
-                if rc == 0 {
-                    anyhow::bail!(
-                        "failed to terminate Coven daemon pid {pid}: {}",
-                        std::io::Error::last_os_error()
-                    );
-                }
-            }
-            Ok(())
+            anyhow::ensure!(
+                process.pid() == status.pid,
+                "verified Windows daemon process identity changed before termination"
+            );
+            Ok(
+                if process
+                    .terminate_and_wait_until(deadline.instant)
+                    .map_err(anyhow::Error::new)?
+                {
+                    VerifiedStopOutcome::Exited
+                } else {
+                    VerifiedStopOutcome::TimedOut
+                },
+            )
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = pid;
-            Ok(())
+            let _ = coven_home;
+            let _ = status;
+            let _ = deadline;
+            Ok(VerifiedStopOutcome::Unverified)
         }
     }
 
-    fn pid_is_alive(&self, pid: u32) -> bool {
+    fn recorded_process_state(&self, status: &DaemonStatus) -> Result<RecordedProcessState> {
         #[cfg(unix)]
         {
-            Command::new("kill")
-                .arg("-0")
-                .arg(pid.to_string())
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|status| status.success())
-                .unwrap_or(false)
+            let pid = status.pid;
+            let pid = libc::pid_t::try_from(pid).context("daemon PID is outside pid_t range")?;
+            if unsafe { libc::kill(pid, 0) } == 0 {
+                return Ok(RecordedProcessState::Matching);
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::ESRCH) => Ok(RecordedProcessState::Gone),
+                // EPERM proves that the PID exists even though it cannot be
+                // inspected or signaled by this process.
+                Some(libc::EPERM) => Ok(RecordedProcessState::Unverifiable),
+                _ => Err(error).with_context(|| format!("failed to inspect daemon pid {pid}")),
+            }
         }
         #[cfg(windows)]
         {
-            use windows_sys::Win32::{
-                Foundation::{CloseHandle, INVALID_HANDLE_VALUE, STILL_ACTIVE},
-                System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION},
-            };
-            // SAFETY: handle is closed immediately after query.
-            unsafe {
-                let handle = OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid);
-                if handle == INVALID_HANDLE_VALUE || handle == 0 as _ {
-                    return false;
-                }
-                let mut exit_code: u32 = 0;
-                let ok = GetExitCodeProcess(handle, &mut exit_code);
-                CloseHandle(handle);
-                ok != 0 && exit_code == STILL_ACTIVE as u32
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = pid;
-            false
-        }
-    }
-
-    fn wait_for_exit(&self, pid: u32, timeout: Duration) -> bool {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            if !self.pid_is_alive(pid) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        !self.pid_is_alive(pid)
-    }
-
-    fn status_matches_running_daemon(&self, status: &DaemonStatus) -> bool {
-        #[cfg(unix)]
-        {
-            daemon_health_reports_pid(&status.socket, status.pid).unwrap_or(false)
-        }
-        #[cfg(windows)]
-        {
-            // On Windows, probe the named pipe health endpoint.
-            daemon_health_reports_pid_windows(&status.socket, status.pid).unwrap_or(false)
+            let live_creation_time = coven_client::windows_process_creation_time(status.pid)
+                .map_err(anyhow::Error::new)?;
+            Ok(recorded_windows_process_state(status, live_creation_time))
         }
         #[cfg(not(any(unix, windows)))]
         {
             let _ = status;
-            true
+            Ok(RecordedProcessState::Gone)
         }
     }
 
-    fn status_from_default_socket(&self, coven_home: &Path) -> Result<Option<DaemonStatus>> {
-        daemon_status_from_default_socket(coven_home)
+    fn status_matches_running_daemon(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<bool> {
+        #[cfg(unix)]
+        {
+            if !unix_status_matches_selected_home(coven_home, status) {
+                return Ok(false);
+            }
+            unix_daemon_health_matches_status(
+                coven_home,
+                status,
+                deadline.remaining("probing Coven daemon health")?,
+            )
+        }
+        #[cfg(windows)]
+        {
+            let _ = coven_home;
+            // On Windows, probe the named pipe health endpoint.
+            Ok(
+                daemon_status_from_windows_pipe_until(&status.socket, deadline)?
+                    .map(|live| windows_status_matches_authenticated_health(status, &live))
+                    .unwrap_or(false),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = coven_home;
+            let _ = status;
+            let _ = deadline;
+            Ok(true)
+        }
+    }
+
+    fn status_from_default_socket(
+        &self,
+        coven_home: &Path,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>> {
+        daemon_status_from_default_socket_until(coven_home, deadline)
+    }
+
+    fn authenticated_running_status(
+        &self,
+        coven_home: &Path,
+        status: &DaemonStatus,
+        deadline: LifecycleDeadline,
+    ) -> Result<Option<DaemonStatus>> {
+        #[cfg(unix)]
+        {
+            if !unix_status_matches_selected_home(coven_home, status) {
+                return Ok(None);
+            }
+            unix_authenticated_daemon_status(
+                coven_home,
+                status,
+                deadline.remaining("probing Coven daemon health")?,
+            )
+        }
+        #[cfg(windows)]
+        {
+            let _ = coven_home;
+            Ok(
+                daemon_status_from_windows_pipe_until(&status.socket, deadline)?
+                    .and_then(|live| resolved_windows_daemon_status(status, &live)),
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = coven_home;
+            let _ = deadline;
+            Ok(Some(status.clone()))
+        }
     }
 }
 
+#[cfg(test)]
 fn stop_background_server_with_controller(
     coven_home: &Path,
     controller: &dyn DaemonStopController,
 ) -> Result<bool> {
-    let status = read_status(coven_home)?;
-    let Some(status) = status else {
+    stop_background_server_with_controller_until(
+        coven_home,
+        controller,
+        LifecycleDeadline::after(Duration::from_secs(2))?,
+    )
+}
+
+fn stop_background_server_with_controller_until(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
+) -> Result<bool> {
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    deadline.remaining("reading Coven daemon lifecycle status")?;
+    let status = status_for_stop_until(&coven_home, controller, deadline)?;
+    let Some(mut status) = status else {
         return Ok(false);
     };
 
-    if !controller.status_matches_running_daemon(&status) {
-        if controller.pid_is_alive(status.pid) {
-            anyhow::bail!(
-                "Coven daemon pid {} could not be verified through its socket; not signaling or clearing daemon status",
-                status.pid
-            );
-        }
-        clear_status_and_socket(coven_home)?;
-        return Ok(true);
-    }
+    let mut retried_recovered_status = false;
+    loop {
+        deadline.remaining("authenticating and stopping Coven daemon")?;
+        match controller
+            .stop_verified_daemon(&coven_home, &status, deadline)
+            .with_context(|| {
+                format!(
+                    "failed to stop Coven daemon pid {}; not clearing daemon status",
+                    status.pid
+                )
+            })? {
+            VerifiedStopOutcome::Unverified => {
+                deadline.remaining("checking Coven daemon process identity")?;
+                let process_state = controller.recorded_process_state(&status).with_context(|| {
+                    format!(
+                        "could not determine whether Coven daemon pid {} is alive with the recorded process identity; not signaling or clearing daemon status",
+                        status.pid
+                    )
+                })?;
+                if matches!(
+                    process_state,
+                    RecordedProcessState::Matching | RecordedProcessState::Unverifiable
+                ) {
+                    anyhow::bail!(
+                        "Coven daemon pid {} could not be verified through its socket; not signaling or clearing daemon status",
+                        status.pid
+                    );
+                }
 
-    match controller.signal_term(status.pid) {
-        Ok(()) => {
-            if !controller.wait_for_exit(status.pid, Duration::from_secs(2)) {
+                let Some(recovered) =
+                    recover_authenticated_status_for_stop(&coven_home, controller, deadline)?
+                else {
+                    break;
+                };
+                if retried_recovered_status {
+                    anyhow::bail!(
+                        "recovered Coven daemon identity changed while stopping; refusing to clear daemon status"
+                    );
+                }
+                status = recovered;
+                retried_recovered_status = true;
+            }
+            VerifiedStopOutcome::Exited => break,
+            VerifiedStopOutcome::TimedOut => {
                 anyhow::bail!(
                     "Coven daemon pid {} did not exit after SIGTERM; not clearing daemon status",
                     status.pid
                 );
             }
         }
-        Err(error) if controller.pid_is_alive(status.pid) => {
-            anyhow::bail!(
-                "failed to stop Coven daemon pid {}; not clearing daemon status: {error}",
-                status.pid
-            );
-        }
-        Err(_) => {}
     }
 
-    clear_status_and_socket(coven_home)?;
+    clear_status_and_socket_until(&coven_home, deadline)?;
     Ok(true)
 }
 
+fn status_for_stop_until(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    let read_result = read_status_until(coven_home, deadline);
+    resolve_status_read_for_stop(coven_home, controller, deadline, read_result)
+}
+
+fn resolve_status_read_for_stop(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
+    read_result: Result<Option<DaemonStatus>>,
+) -> Result<Option<DaemonStatus>> {
+    match read_result {
+        Ok(Some(status)) => Ok(Some(status)),
+        Ok(None) => recover_authenticated_status_for_stop(coven_home, controller, deadline),
+        Err(error) => {
+            let parse_error = is_daemon_status_parse_error(&error);
+            let preserve_if_unresolved =
+                !parse_error || daemon_status_process_creation_time_is_malformed(&error);
+            match recover_authenticated_status_for_stop(coven_home, controller, deadline)? {
+                Some(status) => Ok(Some(status)),
+                None if preserve_if_unresolved => Err(error),
+                None => {
+                    clear_status_and_socket_until(coven_home, deadline)?;
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn recover_authenticated_status_for_stop(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    deadline.remaining("recovering Coven daemon lifecycle status")?;
+    let Some(candidate) = controller
+        .status_from_default_socket(coven_home, deadline)
+        .context("failed to authenticate the default Coven daemon socket")?
+    else {
+        return Ok(None);
+    };
+    let Some(status) = controller.authenticated_running_status(coven_home, &candidate, deadline)?
+    else {
+        anyhow::bail!(
+            "could not authenticate the recovered Coven daemon identity; refusing to stop or start"
+        );
+    };
+    deadline.remaining("publishing recovered Coven daemon status")?;
+    write_status(coven_home, &status)?;
+    deadline.remaining("publishing recovered Coven daemon status")?;
+    Ok(Some(status))
+}
+
+#[cfg(test)]
 fn background_server_status_with_controller(
     coven_home: &Path,
     controller: &dyn DaemonStopController,
 ) -> Result<Option<DaemonStatusState>> {
-    let status = match read_status(coven_home) {
+    background_server_status_with_controller_until(
+        coven_home,
+        controller,
+        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+    )
+}
+
+fn background_server_status_with_controller_until(
+    coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatusState>> {
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    deadline.remaining("reading Coven daemon lifecycle status")?;
+    let status = match read_status_until(&coven_home, deadline) {
         Ok(status) => status,
         Err(error) if is_daemon_status_parse_error(&error) => {
-            return recover_corrupt_status_for_status_command(coven_home);
+            let preserve_if_unresolved = daemon_status_process_creation_time_is_malformed(&error);
+            return recover_corrupt_status_for_status_command(
+                &coven_home,
+                controller,
+                preserve_if_unresolved.then_some(error),
+                deadline,
+            );
         }
         Err(error) => return Err(error),
     };
     let Some(status) = status else {
-        return recover_missing_status_from_default_socket(coven_home, controller);
+        return recover_missing_status_from_default_socket(&coven_home, controller, deadline);
     };
 
-    if controller.status_matches_running_daemon(&status) {
-        return Ok(Some(DaemonStatusState::Running(status)));
+    if let Some(running) =
+        controller.authenticated_running_status(&coven_home, &status, deadline)?
+    {
+        deadline.remaining("verifying Coven daemon health")?;
+        if running != status {
+            deadline.remaining("publishing resolved Coven daemon status")?;
+            write_status(&coven_home, &running)?;
+        }
+        deadline.remaining("publishing resolved Coven daemon status")?;
+        return Ok(Some(DaemonStatusState::Running(running)));
     }
 
-    if controller.pid_is_alive(status.pid) {
+    deadline.remaining("checking Coven daemon process identity")?;
+    let process_state = controller.recorded_process_state(&status).with_context(|| {
+        format!(
+            "could not determine whether Coven daemon pid {} is alive with the recorded process identity; not clearing daemon status",
+            status.pid
+        )
+    })?;
+    deadline.remaining("checking Coven daemon process identity")?;
+    if matches!(
+        process_state,
+        RecordedProcessState::Matching | RecordedProcessState::Unverifiable
+    ) {
         return Ok(Some(DaemonStatusState::Stale(status)));
     }
 
-    if let Some(recovered) = recover_missing_status_from_default_socket(coven_home, controller)? {
+    if let Some(recovered) =
+        recover_missing_status_from_default_socket(&coven_home, controller, deadline)?
+    {
         return Ok(Some(recovered));
     }
 
-    clear_status_and_socket(coven_home)?;
+    clear_status_and_socket_until(&coven_home, deadline)?;
     Ok(None)
 }
 
 fn recover_missing_status_from_default_socket(
     coven_home: &Path,
     controller: &dyn DaemonStopController,
+    deadline: LifecycleDeadline,
 ) -> Result<Option<DaemonStatusState>> {
-    let Some(status) = controller.status_from_default_socket(coven_home)? else {
+    let Some(status) = controller.status_from_default_socket(coven_home, deadline)? else {
         return Ok(None);
     };
 
-    if controller.status_matches_running_daemon(&status) {
-        write_status(coven_home, &status)?;
-        return Ok(Some(DaemonStatusState::Running(status)));
+    if let Some(running) = controller.authenticated_running_status(coven_home, &status, deadline)? {
+        deadline.remaining("verifying recovered Coven daemon health")?;
+        deadline.remaining("publishing recovered Coven daemon status")?;
+        write_status(coven_home, &running)?;
+        deadline.remaining("publishing recovered Coven daemon status")?;
+        return Ok(Some(DaemonStatusState::Running(running)));
     }
 
-    if controller.pid_is_alive(status.pid) {
+    deadline.remaining("checking recovered Coven daemon process identity")?;
+    let process_state = controller.recorded_process_state(&status).with_context(|| {
+        format!(
+            "could not determine whether recovered Coven daemon pid {} still has the recorded process identity",
+            status.pid
+        )
+    })?;
+    deadline.remaining("checking recovered Coven daemon process identity")?;
+    if matches!(
+        process_state,
+        RecordedProcessState::Matching | RecordedProcessState::Unverifiable
+    ) {
         return Ok(Some(DaemonStatusState::Stale(status)));
     }
 
     Ok(None)
 }
 
+#[cfg(test)]
 fn ensure_background_server_with_controllers(
     coven_home: &Path,
     current_exe: &Path,
@@ -2069,49 +2988,97 @@ fn ensure_background_server_with_controllers(
     status_controller: &dyn DaemonStopController,
     start_controller: &dyn DaemonStartController,
 ) -> Result<DaemonStatus> {
-    match background_server_status_with_controller(coven_home, status_controller)? {
+    ensure_background_server_with_controllers_until(
+        coven_home,
+        current_exe,
+        started_at,
+        status_controller,
+        start_controller,
+        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+    )
+}
+
+fn ensure_background_server_with_controllers_until(
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+    status_controller: &dyn DaemonStopController,
+    start_controller: &dyn DaemonStartController,
+    deadline: LifecycleDeadline,
+) -> Result<DaemonStatus> {
+    let coven_home = canonical_lifecycle_home(coven_home)?;
+    match background_server_status_with_controller_until(&coven_home, status_controller, deadline)?
+    {
         Some(DaemonStatusState::Running(status)) => Ok(status),
         Some(DaemonStatusState::Stale(status)) => anyhow::bail!(
             "Coven daemon pid {} is recorded but unreachable; run `coven daemon restart`",
             status.pid
         ),
         None => {
-            let status =
-                start_controller.start_background_server(coven_home, current_exe, started_at)?;
-            if start_controller.wait_for_running_daemon(&status, Duration::from_secs(2)) {
-                Ok(status)
-            } else {
+            deadline.remaining("starting Coven daemon")?;
+            let launched =
+                start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+            deadline.remaining("waiting for Coven daemon startup health")?;
+            let Some(status) =
+                start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
+            else {
                 anyhow::bail!(
                     "started Coven daemon pid {} but its socket did not become ready",
-                    status.pid
+                    launched.pid
                 )
-            }
+            };
+            deadline.remaining("completing Coven daemon startup")?;
+            Ok(status)
         }
     }
 }
 
 fn is_daemon_status_parse_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some())
+    error.chain().any(|cause| {
+        cause.downcast_ref::<serde_json::Error>().is_some()
+            || cause.downcast_ref::<DaemonStatusParseError>().is_some()
+    })
+}
+
+fn daemon_status_process_creation_time_is_malformed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<DaemonStatusParseError>()
+            .is_some_and(|error| error.process_creation_time_present)
+    })
 }
 
 fn recover_corrupt_status_for_status_command(
     coven_home: &Path,
+    controller: &dyn DaemonStopController,
+    unresolved_error: Option<anyhow::Error>,
+    deadline: LifecycleDeadline,
 ) -> Result<Option<DaemonStatusState>> {
-    match daemon_status_from_default_socket(coven_home) {
+    let recovered = match controller.status_from_default_socket(coven_home, deadline) {
         Ok(Some(status)) => {
-            write_status(coven_home, &status)?;
-            Ok(Some(DaemonStatusState::Running(status)))
+            controller.authenticated_running_status(coven_home, &status, deadline)?
         }
-        Ok(None) | Err(_) => {
-            clear_status(coven_home)?;
-            Ok(None)
-        }
+        Ok(None) | Err(_) => None,
+    };
+    if let Some(status) = recovered {
+        deadline.remaining("verifying recovered Coven daemon health")?;
+        deadline.remaining("publishing recovered Coven daemon status")?;
+        write_status(coven_home, &status)?;
+        deadline.remaining("publishing recovered Coven daemon status")?;
+        return Ok(Some(DaemonStatusState::Running(status)));
+    }
+    if let Some(error) = unresolved_error {
+        Err(error)
+    } else {
+        clear_status_and_socket_until(coven_home, deadline)?;
+        Ok(None)
     }
 }
 
 fn clear_status_and_socket(coven_home: &Path) -> Result<()> {
+    let Some(_serve_lock) = try_acquire_serve_lock(coven_home)? else {
+        return Ok(());
+    };
     clear_status(coven_home)?;
     let socket = daemon_socket_path(coven_home);
     if socket.exists() {
@@ -2121,93 +3088,187 @@ fn clear_status_and_socket(coven_home: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+fn clear_status_and_socket_until(coven_home: &Path, deadline: LifecycleDeadline) -> Result<()> {
+    deadline.remaining("cleaning up Coven daemon lifecycle state")?;
+    clear_status_and_socket(coven_home)?;
+    deadline.remaining("cleaning up Coven daemon lifecycle state")?;
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
 fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
-    daemon_status_from_health_socket(&daemon_socket_path(coven_home).to_string_lossy())
+    daemon_status_from_default_socket_until(
+        coven_home,
+        LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+    )
+}
+
+#[cfg(unix)]
+fn daemon_status_from_default_socket_until(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_health_home(
+        coven_home,
+        deadline.remaining("probing default Coven daemon socket")?,
+    )
 }
 
 #[cfg(windows)]
-fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
-    daemon_status_from_windows_pipe(&daemon_windows_pipe_name(coven_home))
+fn daemon_status_from_default_socket_until(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_windows_pipe_until(&daemon_windows_pipe_name(coven_home)?, deadline)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn daemon_status_from_default_socket(coven_home: &Path) -> Result<Option<DaemonStatus>> {
+fn daemon_status_from_default_socket_until(
+    coven_home: &Path,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
     let _ = coven_home;
+    let _ = deadline;
     Ok(None)
 }
 
-#[cfg(windows)]
-fn daemon_health_reports_pid_windows(pipe_name: &str, expected_pid: u32) -> Result<bool> {
-    Ok(daemon_status_from_windows_pipe(pipe_name)?
-        .map(|status| status.pid == expected_pid)
-        .unwrap_or(false))
+#[cfg(any(windows, test))]
+fn windows_status_matches_authenticated_health(
+    recorded: &DaemonStatus,
+    live: &DaemonStatus,
+) -> bool {
+    recorded.pid == live.pid
+        && recorded.started_at == live.started_at
+        && recorded.socket == live.socket
+        && match recorded.process_creation_time {
+            Some(recorded_creation_time) => {
+                live.process_creation_time == Some(recorded_creation_time)
+            }
+            None => true,
+        }
 }
 
-#[cfg(windows)]
-fn daemon_status_from_windows_pipe(pipe_name: &str) -> Result<Option<DaemonStatus>> {
-    use interprocess::{
-        local_socket::{prelude::*, ConnectOptions, GenericNamespaced},
-        ConnectWaitMode,
-    };
-    use std::io::Write;
+#[cfg(any(windows, test))]
+fn resolved_windows_daemon_status(
+    recorded: &DaemonStatus,
+    live: &DaemonStatus,
+) -> Option<DaemonStatus> {
+    windows_status_matches_authenticated_health(recorded, live).then(|| live.clone())
+}
 
-    let name = pipe_name
-        .to_ns_name::<GenericNamespaced>()
-        .context("failed to parse pipe name for health check")?;
-    let mut stream = match ConnectOptions::new()
-        .name(name)
-        .wait_mode(ConnectWaitMode::Timeout(Duration::from_secs(2)))
-        .connect_sync()
-    {
-        Ok(s) => s,
-        Err(_) => return Ok(None),
+#[cfg(test)]
+fn daemon_status_from_windows_probe<P>(pipe_name: &str, probe: P) -> Result<Option<DaemonStatus>>
+where
+    P: FnOnce(
+        &str,
+        Duration,
+    )
+        -> std::result::Result<Option<(u16, Vec<u8>, u32, u64)>, coven_client::ClientError>,
+{
+    daemon_status_from_windows_probe_until(
+        pipe_name,
+        LifecycleDeadline::after(Duration::from_secs(2))?,
+        probe,
+    )
+}
+
+#[cfg(any(windows, test))]
+fn daemon_status_from_windows_probe_until<P>(
+    pipe_name: &str,
+    deadline: LifecycleDeadline,
+    probe: P,
+) -> Result<Option<DaemonStatus>>
+where
+    P: FnOnce(
+        &str,
+        Duration,
+    )
+        -> std::result::Result<Option<(u16, Vec<u8>, u32, u64)>, coven_client::ClientError>,
+{
+    let timeout = deadline.remaining("probing Windows daemon health")?;
+    let Some((response_status, body, server_pid, server_creation_time)) =
+        probe(pipe_name, timeout).map_err(anyhow::Error::new)?
+    else {
+        return Ok(None);
     };
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\nContent-Length: 0\r\n\r\n")
-        .context("failed to write Windows health request")?;
-    stream
-        .flush()
-        .context("failed to flush Windows health request")?;
-    // Windows named pipes do not support read timeouts in interprocess.
-    // Supervise the blocking framed read from another thread so doctor/status
-    // still return deterministically when a daemon accepts but never replies.
-    // Reading to EOF is incorrect for HTTP and used to hang indefinitely when
-    // the daemon kept the pipe instance alive after writing its response.
-    let (_status, body) =
-        read_windows_pipe_http_response(stream, Duration::from_secs(2), MAX_SOCKET_BODY_BYTES)?;
+    anyhow::ensure!(
+        response_status == 200,
+        "Windows daemon health returned HTTP {response_status}"
+    );
     let body: DaemonHealthStatus =
         serde_json::from_slice(&body).context("failed to parse Windows health response")?;
-    if body.ok {
-        Ok(body.daemon)
-    } else {
-        Ok(None)
+    let Some(mut daemon) = body.daemon.filter(|_| body.ok) else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        daemon.socket == pipe_name,
+        "Windows daemon health reported a pipe for a different Coven home"
+    );
+    anyhow::ensure!(
+        daemon.pid == server_pid,
+        "Windows daemon health PID did not match the authenticated pipe server"
+    );
+    match daemon.process_creation_time {
+        Some(reported) => anyhow::ensure!(
+            reported.get() == server_creation_time,
+            "Windows daemon health process creation time did not match the authenticated pipe server"
+        ),
+        None => {
+            daemon.process_creation_time =
+                Some(WindowsProcessCreationTime::new(server_creation_time)?);
+        }
     }
+    Ok(Some(daemon))
+}
+
+#[cfg(all(windows, test))]
+fn daemon_status_from_windows_pipe(pipe_name: &str) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_windows_pipe_with_timeout(pipe_name, Duration::from_secs(2))
+}
+
+#[cfg(all(windows, test))]
+fn daemon_status_from_windows_pipe_with_timeout(
+    pipe_name: &str,
+    timeout: Duration,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_windows_probe_until(
+        pipe_name,
+        LifecycleDeadline::after(timeout)?,
+        |pipe_name, timeout| {
+            coven_client::probe_windows_daemon_health_with_identity(pipe_name, timeout).map(
+                |probe| {
+                    probe.map(|probe| {
+                        (
+                            probe.status,
+                            probe.body,
+                            probe.server_pid,
+                            probe.process_creation_time,
+                        )
+                    })
+                },
+            )
+        },
+    )
 }
 
 #[cfg(windows)]
-pub(crate) fn read_windows_pipe_http_response(
-    mut stream: interprocess::local_socket::Stream,
-    timeout: Duration,
-    max_body_bytes: usize,
-) -> Result<(u16, Vec<u8>)> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("coven-pipe-response".into())
-        .spawn(move || {
-            let result = read_http_response_with_deadline(&mut stream, timeout, max_body_bytes);
-            let _ = tx.send(result);
-        })
-        .context("failed to spawn Windows pipe response reader")?;
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!("timed out reading Coven daemon HTTP response")
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("Coven daemon HTTP response reader stopped unexpectedly")
-        }
-    }
+fn daemon_status_from_windows_pipe_until(
+    pipe_name: &str,
+    deadline: LifecycleDeadline,
+) -> Result<Option<DaemonStatus>> {
+    daemon_status_from_windows_probe_until(pipe_name, deadline, |pipe_name, _| {
+        coven_client::probe_windows_daemon_health_with_identity_until(pipe_name, deadline.instant)
+            .map(|probe| {
+                probe.map(|probe| {
+                    (
+                        probe.status,
+                        probe.body,
+                        probe.server_pid,
+                        probe.process_creation_time,
+                    )
+                })
+            })
+    })
 }
 
 /// Read one HTTP response without relying on the peer closing the transport.
@@ -2216,7 +3277,7 @@ pub(crate) fn read_windows_pipe_http_response(
 /// response. HTTP/1.1 frames the body with Content-Length, so consume exactly
 /// that many bytes. The reader is expected to be nonblocking; WouldBlock is
 /// retried until `timeout` expires.
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub(crate) fn read_http_response_with_deadline<R: Read>(
     reader: &mut R,
     timeout: Duration,
@@ -2273,7 +3334,7 @@ pub(crate) fn read_http_response_with_deadline<R: Read>(
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn response_status(headers: &[u8]) -> Result<u16> {
     let headers =
         std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;
@@ -2286,12 +3347,12 @@ fn response_status(headers: &[u8]) -> Result<u16> {
         .context("daemon HTTP response had an invalid status")
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 fn response_content_length(headers: &[u8]) -> Result<usize> {
     let headers =
         std::str::from_utf8(headers).context("daemon HTTP response headers were not UTF-8")?;
@@ -2309,65 +3370,99 @@ fn response_content_length(headers: &[u8]) -> Result<usize> {
 }
 
 #[cfg(unix)]
-fn daemon_health_reports_pid(socket: &str, expected_pid: u32) -> Result<bool> {
-    Ok(daemon_status_from_health_socket(socket)?
-        .map(|status| status.pid == expected_pid)
-        .unwrap_or(false))
+fn unix_daemon_health_matches_status(
+    coven_home: &Path,
+    expected: &DaemonStatus,
+    timeout: Duration,
+) -> Result<bool> {
+    unix_authenticated_daemon_status(coven_home, expected, timeout).map(|status| status.is_some())
 }
 
 #[cfg(unix)]
-fn daemon_status_from_health_socket(socket: &str) -> Result<Option<DaemonStatus>> {
-    let socket_path = std::path::Path::new(socket);
-    // Fail-closed: refuse to connect to a socket that is not owned by the
-    // current effective uid. A foreign-owned socket could be an attacker's
-    // listener planted at the expected path.
-    if let Ok(metadata) = std::fs::symlink_metadata(socket_path) {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid() only reads the effective uid and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        check_owned_by_current_user(socket_path, metadata.uid(), euid)?;
-    }
-    let mut stream = match UnixStream::connect(socket) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to connect to Coven daemon socket {socket}"));
-        }
-    };
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .context("failed to bound Coven health response time")?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .context("failed to bound Coven health request time")?;
-    stream
-        .write_all(b"GET /health HTTP/1.1\r\nHost: coven\r\n\r\n")
-        .context("failed to write Coven health request")?;
-    stream
-        .shutdown(std::net::Shutdown::Write)
-        .context("failed to finish Coven health request")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read Coven health response")?;
-    let Some((_, body)) = response.split_once("\r\n\r\n") else {
+fn unix_authenticated_daemon_status(
+    coven_home: &Path,
+    expected: &DaemonStatus,
+    timeout: Duration,
+) -> Result<Option<DaemonStatus>> {
+    if !unix_status_matches_selected_home(coven_home, expected) {
         return Ok(None);
-    };
-    let body: DaemonHealthStatus =
-        serde_json::from_str(body).context("failed to parse Coven health response")?;
-    if body.ok {
-        Ok(body.daemon)
-    } else {
-        Ok(None)
     }
+    Ok(coven_client::probe_unix_daemon_health(coven_home, timeout)
+        .map_err(anyhow::Error::new)?
+        .filter(|status| status.pid == expected.pid && status.started_at == expected.started_at)
+        .map(|status| DaemonStatus {
+            pid: status.pid,
+            started_at: status.started_at,
+            socket: status.socket,
+            process_creation_time: None,
+        }))
+}
+
+#[cfg(unix)]
+fn daemon_status_from_health_home(
+    coven_home: &Path,
+    timeout: Duration,
+) -> Result<Option<DaemonStatus>> {
+    Ok(coven_client::probe_unix_daemon_health(coven_home, timeout)
+        .map_err(anyhow::Error::new)?
+        .map(|status| DaemonStatus {
+            pid: status.pid,
+            started_at: status.started_at,
+            socket: status.socket,
+            process_creation_time: None,
+        }))
+}
+
+fn canonical_lifecycle_home(coven_home: &Path) -> Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        coven_client::validate_unix_daemon_path_encoding(coven_home).map_err(anyhow::Error::new)?;
+        ensure_private_coven_home(coven_home)?;
+        coven_client::canonical_unix_daemon_home(coven_home).map_err(anyhow::Error::new)
+    }
+    #[cfg(not(unix))]
+    {
+        ensure_private_coven_home(coven_home)?;
+        Ok(coven_home.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+fn unix_status_matches_selected_home(coven_home: &Path, status: &DaemonStatus) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let selected = daemon_socket_path(coven_home);
+    let recorded = Path::new(&status.socket);
+    if recorded.is_absolute() && recorded == selected {
+        return true;
+    }
+    let same_socket = |candidate: &Path| {
+        let (Ok(selected_canonical), Ok(recorded_canonical)) = (
+            std::fs::canonicalize(&selected),
+            std::fs::canonicalize(candidate),
+        ) else {
+            return false;
+        };
+        if recorded_canonical != selected_canonical {
+            return false;
+        }
+        let (Ok(selected), Ok(recorded)) = (
+            std::fs::metadata(selected_canonical),
+            std::fs::metadata(recorded_canonical),
+        ) else {
+            return false;
+        };
+        selected.dev() == recorded.dev() && selected.ino() == recorded.ino()
+    };
+    if recorded.is_absolute() {
+        return same_socket(recorded);
+    }
+    same_socket(recorded)
+        || selected
+            .parent()
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .any(|base| same_socket(&base.join(recorded)))
 }
 
 // `bind_tcp_listener` plus the accepted-stream handler expose the TCP transport
@@ -2548,7 +3643,7 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             // stale socket — connection refused, or a non-ok health body — may be
             // reclaimed. See OpenCoven/coven#197 and docs/AUTH.md.
             if let Ok(Some(incumbent)) =
-                daemon_status_from_health_socket(&socket_path.to_string_lossy())
+                daemon_status_from_health_home(coven_home, Duration::from_secs(2))
             {
                 anyhow::bail!(
                     "a healthy Coven daemon (pid {}) is already serving {}; refusing to take over",
@@ -2797,8 +3892,9 @@ impl Drop for ShutdownGuard {
 
 #[cfg(unix)]
 fn daemon_status_file_pid(status_path: &Path) -> Option<u32> {
-    std::fs::read_to_string(status_path)
+    std::fs::File::open(status_path)
         .ok()
+        .and_then(|file| read_bounded_daemon_status(file).ok())
         .and_then(|json| serde_json::from_str::<DaemonStatus>(&json).ok())
         .map(|status| status.pid)
 }
@@ -2890,9 +3986,10 @@ pub(crate) fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
 /// Acquire an exclusive, process-lifetime advisory lock so at most one `serve`
 /// process ever runs against a given Coven home.
 ///
-/// `ensure_background_server` already serializes `daemon start`/`stop` and prunes
-/// unreachable duplicates — but a `coven daemon serve` run *directly* (e.g. from
-/// a dev build) bypasses all of that. The socket-takeover guard in
+/// `ensure_background_server` already serializes `daemon start`/`stop` and reports
+/// unreachable duplicates without signaling stale PIDs — but a
+/// `coven daemon serve` run *directly* (e.g. from a dev build) bypasses all of
+/// that. The socket-takeover guard in
 /// `bind_api_socket` only refuses a *healthy* incumbent that answers `/health`;
 /// a daemon that is alive but wedged would have its socket reclaimed, leaving
 /// two processes writing one SQLite store — the loser then fails the
@@ -2935,7 +4032,7 @@ pub(crate) struct ResetDaemonGuard {
     _lifecycle: DaemonLifecycleLock,
     _serve: std::fs::File,
     #[cfg(windows)]
-    _pipe: interprocess::local_socket::Listener,
+    _pipes: Vec<interprocess::local_socket::Listener>,
 }
 
 /// Exclude daemon lifecycle changes for the duration of reset and detect a
@@ -2951,11 +4048,17 @@ pub(crate) fn try_acquire_reset_guard(
         return Ok(None);
     };
     #[cfg(unix)]
-    if unix_daemon_transport_is_occupied(coven_home)? {
-        return Ok(None);
+    {
+        // Reset must fail closed if an owner-credential probe cannot establish
+        // that the socket is unoccupied. This also preserves the historical
+        // daemon-active result for legacy listeners with weaker socket modes.
+        match unix_daemon_transport_is_occupied(coven_home) {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return Ok(None),
+        }
     }
     #[cfg(windows)]
-    let Some(pipe) = try_reserve_windows_daemon_pipe(coven_home)?
+    let Some(pipes) = try_reserve_windows_daemon_pipes(coven_home)?
     else {
         return Ok(None);
     };
@@ -2963,30 +4066,25 @@ pub(crate) fn try_acquire_reset_guard(
         _lifecycle: lifecycle,
         _serve: serve,
         #[cfg(windows)]
-        _pipe: pipe,
+        _pipes: pipes,
     }))
 }
 
 #[cfg(unix)]
 fn unix_daemon_transport_is_occupied(coven_home: &Path) -> Result<bool> {
+    unix_daemon_transport_is_occupied_with_timeout(coven_home, Duration::from_secs(2))
+}
+
+#[cfg(unix)]
+fn unix_daemon_transport_is_occupied_with_timeout(
+    coven_home: &Path,
+    timeout: Duration,
+) -> Result<bool> {
     let socket_path = daemon_socket_path(coven_home);
-    if let Ok(metadata) = std::fs::symlink_metadata(&socket_path) {
-        use std::os::unix::fs::MetadataExt;
-        // SAFETY: geteuid() only reads the effective uid and cannot fail.
-        let euid = unsafe { libc::geteuid() };
-        check_owned_by_current_user(&socket_path, metadata.uid(), euid)?;
-    }
-    match UnixStream::connect(&socket_path) {
-        Ok(_) => Ok(true),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(error).with_context(|| {
+    match coven_client::probe_unix_daemon_health(coven_home, timeout) {
+        Ok(Some(_)) => Ok(true),
+        Ok(None) => Ok(false),
+        Err(error) => Err(anyhow::anyhow!("{error}")).with_context(|| {
             format!(
                 "failed to determine whether daemon socket {} is occupied",
                 socket_path.display()
@@ -2995,39 +4093,59 @@ fn unix_daemon_transport_is_occupied(coven_home: &Path) -> Result<bool> {
     }
 }
 
+#[cfg(any(windows, test))]
+fn reserve_windows_pipe_identities<N, T, F>(
+    pipe_names: &[N],
+    mut reserve: F,
+) -> Result<Option<Vec<T>>>
+where
+    N: AsRef<str>,
+    F: FnMut(&str) -> Result<Option<T>>,
+{
+    let mut reservations = Vec::with_capacity(pipe_names.len());
+    for pipe_name in pipe_names {
+        let Some(reservation) = reserve(pipe_name.as_ref())? else {
+            return Ok(None);
+        };
+        reservations.push(reservation);
+    }
+    Ok(Some(reservations))
+}
+
 #[cfg(windows)]
-fn try_reserve_windows_daemon_pipe(
+fn try_reserve_windows_daemon_pipes(
     coven_home: &Path,
-) -> Result<Option<interprocess::local_socket::Listener>> {
+) -> Result<Option<Vec<interprocess::local_socket::Listener>>> {
     use interprocess::{
         local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
         os::windows::local_socket::ListenerOptionsExt,
     };
 
-    let pipe_name = daemon_windows_pipe_name(coven_home);
-    let name = pipe_name
-        .as_str()
-        .to_ns_name::<GenericNamespaced>()
-        .context("failed to create reset pipe reservation name")?;
-    let security_descriptor = owner_only_pipe_security_descriptor()?;
-    match ListenerOptions::new()
-        .name(name)
-        .security_descriptor(security_descriptor)
-        .create_sync()
-    {
-        Ok(listener) => Ok(Some(listener)),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-            ) =>
+    let pipe_names = coven_client::supported_windows_pipe_names(coven_home)
+        .context("failed to derive reset pipe reservation names")?;
+    reserve_windows_pipe_identities(&pipe_names, |pipe_name| {
+        let name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .context("failed to create reset pipe reservation name")?;
+        let security_descriptor = owner_only_pipe_security_descriptor()?;
+        match ListenerOptions::new()
+            .name(name)
+            .security_descriptor(security_descriptor)
+            .create_sync()
         {
-            Ok(None)
+            Ok(listener) => Ok(Some(listener)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to reserve Windows daemon pipe {pipe_name}")),
         }
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to reserve Windows daemon pipe {pipe_name}"))
-        }
-    }
+    })
 }
 
 pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
@@ -3080,6 +4198,8 @@ pub fn serve_forever(
     allowed_hosts: &[String],
 ) -> Result<()> {
     use std::sync::Arc;
+    let canonical_home = canonical_lifecycle_home(coven_home)?;
+    let coven_home = canonical_home.as_path();
     // `--allow-host` only widens the TCP guard; it is meaningless without `--tcp`.
     // Warn rather than fail so a stray flag doesn't take the daemon down.
     if !allowed_hosts.is_empty() && tcp_addr.is_none() {
@@ -3090,14 +4210,19 @@ pub fn serve_forever(
     // is the authoritative guard against two daemons writing one SQLite store —
     // catching the wedged-but-alive incumbent the socket guard can't, and the
     // direct `daemon serve` path that bypasses ensure_background_server.
-    let _serve_lock = acquire_serve_lock(coven_home)?;
+    let serve_lock = acquire_serve_lock(coven_home)?;
     initialize_daemon_store(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
         socket: daemon_socket_path(coven_home)
-            .to_string_lossy()
-            .into_owned(),
+            .to_str()
+            .context(
+                "canonical Coven daemon socket is not valid UTF-8; daemon status JSON requires \
+                 UTF-8 paths",
+            )?
+            .to_owned(),
+        process_creation_time: None,
     };
     let socket_path = daemon_socket_path(coven_home);
     let status_path = daemon_status_path(coven_home);
@@ -3120,12 +4245,12 @@ pub fn serve_forever(
         .set_nonblocking(true)
         .context("failed to configure interruptible Unix API listener")?;
     write_status(coven_home, &status)?;
-    let _shutdown_guard = ShutdownGuard {
+    let shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
         status_path: status_path.clone(),
         pid: status.pid,
     };
-    let _mobile_gateway =
+    let mobile_gateway =
         crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
     append_daemon_recovery_log(
         coven_home,
@@ -3242,6 +4367,7 @@ pub fn serve_forever(
     // can't bring the daemon down or orphan the socket.
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let shutdown_connections = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
     use std::sync::atomic::Ordering;
     loop {
         if daemon_termination_requested() {
@@ -3270,15 +4396,17 @@ pub fn serve_forever(
 
         if inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT {
             // Backpressure: at capacity, serve this one on the accept thread.
-            if let Err(error) =
-                serve_accepted_connection(stream, coven_home, conn_status, runtime.as_ref())
-            {
-                if !is_client_disconnect(&error) {
-                    eprintln!("coven daemon: unix connection error: {error:#}");
-                    append_daemon_recovery_log(
-                        coven_home,
-                        &format!("unix connection error: {error:#}"),
-                    );
+            match serve_accepted_connection(stream, coven_home, conn_status, runtime.as_ref()) {
+                Ok(Some(stream)) => retain_shutdown_connection(&shutdown_connections, stream),
+                Ok(None) => {}
+                Err(error) => {
+                    if !is_client_disconnect(&error) {
+                        eprintln!("coven daemon: unix connection error: {error:#}");
+                        append_daemon_recovery_log(
+                            coven_home,
+                            &format!("unix connection error: {error:#}"),
+                        );
+                    }
                 }
             }
             continue;
@@ -3288,21 +4416,28 @@ pub fn serve_forever(
         let conn_home = coven_home.to_path_buf();
         let conn_runtime = Arc::clone(&runtime);
         let conn_inflight = Arc::clone(&inflight);
+        let conn_shutdown_connections = Arc::clone(&shutdown_connections);
         let spawn_result = std::thread::Builder::new()
             .name("coven-unix-api".into())
             .spawn(move || {
-                if let Err(error) = serve_accepted_connection(
+                match serve_accepted_connection(
                     stream,
                     &conn_home,
                     conn_status,
                     conn_runtime.as_ref(),
                 ) {
-                    if !is_client_disconnect(&error) {
-                        eprintln!("coven daemon: unix connection error: {error:#}");
-                        append_daemon_recovery_log(
-                            &conn_home,
-                            &format!("unix connection error: {error:#}"),
-                        );
+                    Ok(Some(stream)) => {
+                        retain_shutdown_connection(&conn_shutdown_connections, stream);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if !is_client_disconnect(&error) {
+                            eprintln!("coven daemon: unix connection error: {error:#}");
+                            append_daemon_recovery_log(
+                                &conn_home,
+                                &format!("unix connection error: {error:#}"),
+                            );
+                        }
                     }
                 }
                 conn_inflight.fetch_sub(1, Ordering::Relaxed);
@@ -3352,9 +4487,25 @@ pub fn serve_forever(
     } else {
         Ok(())
     };
-    runtime_shutdown?;
-    tcp_shutdown?;
-    Ok(())
+    let shutdown_result = runtime_shutdown.and(tcp_shutdown);
+    drop(unix_listener);
+    drop(mobile_gateway);
+    drop(shutdown_guard);
+    drop(serve_lock);
+    match shutdown_connections.lock() {
+        Ok(mut connections) => connections.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
+    shutdown_result
+}
+
+#[cfg(unix)]
+fn retain_shutdown_connection(connections: &Mutex<Vec<UnixStream>>, stream: UnixStream) {
+    match connections.lock() {
+        Ok(mut connections) => connections.push(stream),
+        Err(poisoned) => poisoned.into_inner().push(stream),
+    }
+    DAEMON_TERMINATION_REQUESTED.store(true, Ordering::Release);
 }
 
 #[cfg(unix)]
@@ -3378,9 +4529,27 @@ enum HostGuard<'a> {
     Loopback { allowed_hosts: &'a [String] },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LifecycleControl {
+    Disabled,
+    OwnerLocal,
+}
+
+#[derive(Clone, Copy)]
+struct HttpStreamPolicy<'a> {
+    host_guard: HostGuard<'a>,
+    lifecycle: LifecycleControl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HttpStreamOutcome {
+    Complete,
+    HoldForShutdown,
+}
+
 fn handle_http_stream<R, W>(
     read: R,
-    mut write: W,
+    write: W,
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
@@ -3391,8 +4560,41 @@ where
     R: Read,
     W: Write,
 {
+    handle_http_stream_with_lifecycle(
+        read,
+        write,
+        coven_home,
+        status,
+        runtime,
+        max_body_bytes,
+        HttpStreamPolicy {
+            host_guard: guard,
+            lifecycle: LifecycleControl::Disabled,
+        },
+    )
+    .map(|_| ())
+}
+
+fn handle_http_stream_with_lifecycle<R, W>(
+    read: R,
+    mut write: W,
+    coven_home: &Path,
+    status: Option<DaemonStatus>,
+    runtime: &dyn SessionRuntime,
+    max_body_bytes: Option<usize>,
+    policy: HttpStreamPolicy<'_>,
+) -> Result<HttpStreamOutcome>
+where
+    R: Read,
+    W: Write,
+{
+    let HttpStreamPolicy {
+        host_guard: guard,
+        lifecycle,
+    } = policy;
     let mut reader = BufReader::new(read);
     let request_line = read_http_request_line(&mut reader)?;
+    let (method, path) = parse_request_line(&request_line)?;
     let headers = read_http_headers(&mut reader)?;
     // On the TCP transport (loopback-only), defend against browser-driven CSRF
     // and DNS-rebinding: a real CLI/proxy client never sends a cross-origin
@@ -3407,52 +4609,80 @@ where
     if let HostGuard::Loopback { allowed_hosts } = guard {
         let host = headers.host.as_deref();
         if !host_is_loopback(host) && !host_in_allowlist(host, allowed_hosts) {
-            return write_forbidden(
+            write_forbidden(
                 &mut write,
                 "Host header must be a loopback or allowed address.",
-            );
+            )?;
+            return Ok(HttpStreamOutcome::Complete);
         }
         if let Some(origin) = headers.origin.as_deref() {
             if !origin_is_loopback(origin) && !origin_in_allowlist(origin, allowed_hosts) {
-                return write_forbidden(&mut write, "Cross-origin requests are not allowed.");
+                write_forbidden(&mut write, "Cross-origin requests are not allowed.")?;
+                return Ok(HttpStreamOutcome::Complete);
             }
         }
     }
     if let Some(max) = max_body_bytes {
         if headers.content_length > max {
-            return write_payload_too_large(&mut write, max);
+            write_payload_too_large(&mut write, max)?;
+            return Ok(HttpStreamOutcome::Complete);
         }
     }
+    const MAX_LIFECYCLE_REQUEST_BODY_BYTES: usize = 16 * 1024;
+    if lifecycle == LifecycleControl::OwnerLocal
+        && method == "POST"
+        && path == "/api/v1/internal/lifecycle/shutdown"
+        && headers.content_length > MAX_LIFECYCLE_REQUEST_BODY_BYTES
+    {
+        write_payload_too_large(&mut write, MAX_LIFECYCLE_REQUEST_BODY_BYTES)?;
+        return Ok(HttpStreamOutcome::Complete);
+    }
     let body = read_http_body(&mut reader, headers.content_length)?;
-    let (method, path) = parse_request_line(&request_line)?;
+    let lifecycle_response = if lifecycle == LifecycleControl::OwnerLocal
+        && method == "POST"
+        && path == "/api/v1/internal/lifecycle/shutdown"
+    {
+        Some(lifecycle_shutdown_response(
+            status.as_ref(),
+            body.as_deref(),
+        )?)
+    } else {
+        None
+    };
     let local_control = if matches!(guard, HostGuard::Disabled) {
         crate::mobile_memory::gateway::handle_local_control(method, path, body.as_deref())
     } else {
         None
     };
-    let response = match local_control.unwrap_or_else(|| {
-        let authority = match guard {
-            HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
-            HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
-        };
-        crate::api::handle_request_with_runtime_and_authority(
-            method,
-            path,
-            coven_home,
-            status,
-            body.as_deref(),
-            runtime,
-            authority,
-        )
-    }) {
-        Ok(response) => response,
-        Err(error) => {
-            append_daemon_recovery_log(
+    let (response, hold_for_shutdown) = if let Some(response) = lifecycle_response {
+        response
+    } else {
+        let response = match local_control.unwrap_or_else(|| {
+            let authority = match guard {
+                HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
+                HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
+            };
+            crate::api::handle_request_with_runtime_and_authority(
+                method,
+                path,
                 coven_home,
-                &format!("API handler error for {method} {path}: {error:#}"),
-            );
-            return write_internal_server_error(&mut write, &format!("{error:#}"));
-        }
+                status,
+                body.as_deref(),
+                runtime,
+                authority,
+            )
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                append_daemon_recovery_log(
+                    coven_home,
+                    &format!("API handler error for {method} {path}: {error:#}"),
+                );
+                write_internal_server_error(&mut write, &format!("{error:#}"))?;
+                return Ok(HttpStreamOutcome::Complete);
+            }
+        };
+        (response, false)
     };
     let reason = http_reason_phrase(response.status);
     let http = format!(
@@ -3466,7 +4696,86 @@ where
     write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
-    Ok(())
+    if hold_for_shutdown {
+        Ok(HttpStreamOutcome::HoldForShutdown)
+    } else {
+        Ok(HttpStreamOutcome::Complete)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LifecycleShutdownRequest {
+    api_version: String,
+    daemon: DaemonStatus,
+}
+
+fn lifecycle_shutdown_response(
+    status: Option<&DaemonStatus>,
+    body: Option<&str>,
+) -> Result<(crate::api::ApiResponse, bool)> {
+    let request = match body
+        .filter(|body| !body.trim().is_empty())
+        .map(serde_json::from_str::<LifecycleShutdownRequest>)
+    {
+        Some(Ok(request)) => request,
+        Some(Err(error)) => {
+            return Ok((
+                crate::api::api_error(
+                    400,
+                    "invalid_request",
+                    &format!("invalid daemon shutdown request: {error}"),
+                    None,
+                )?,
+                false,
+            ))
+        }
+        None => {
+            return Ok((
+                crate::api::api_error(
+                    400,
+                    "invalid_request",
+                    "daemon shutdown request body is required",
+                    None,
+                )?,
+                false,
+            ))
+        }
+    };
+    let Some(status) = status else {
+        return Ok((
+            crate::api::api_error(
+                409,
+                "daemon_identity_mismatch",
+                "Daemon identity is unavailable; refusing lifecycle shutdown.",
+                None,
+            )?,
+            false,
+        ));
+    };
+    if request.api_version != crate::api::COVEN_API_NAMED_VERSION || request.daemon != *status {
+        return Ok((
+            crate::api::api_error(
+                409,
+                "daemon_identity_mismatch",
+                "Daemon identity did not match; refusing lifecycle shutdown.",
+                None,
+            )?,
+            false,
+        ));
+    }
+    Ok((
+        crate::api::json_response(
+            202,
+            &serde_json::json!({
+                "ok": true,
+                "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+                "capabilities": { "structuredErrors": true },
+                "daemon": status,
+            }),
+        )?,
+        true,
+    ))
 }
 
 fn write_internal_server_error<W: Write>(write: &mut W, message: &str) -> Result<()> {
@@ -3595,7 +4904,7 @@ pub fn serve_next_connection(
     let (stream, _) = listener
         .accept()
         .context("failed to accept API connection")?;
-    serve_accepted_connection(stream, coven_home, status, runtime)
+    serve_accepted_connection(stream, coven_home, status, runtime).map(|_| ())
 }
 
 /// Serve a single already-accepted Unix connection. Split out of
@@ -3608,7 +4917,7 @@ fn serve_accepted_connection(
     coven_home: &Path,
     status: Option<DaemonStatus>,
     runtime: &dyn SessionRuntime,
-) -> Result<()> {
+) -> Result<Option<UnixStream>> {
     stream
         .set_nonblocking(false)
         .context("failed to configure accepted Unix API connection")?;
@@ -3626,15 +4935,19 @@ fn serve_accepted_connection(
     let read = stream.try_clone().context("failed to clone Unix stream")?;
     // Apply a body cap even on local Unix sockets: a buggy or hostile local
     // process should not be able to OOM the daemon with a huge payload.
-    handle_http_stream(
+    let outcome = handle_http_stream_with_lifecycle(
         read,
-        stream,
+        &stream,
         coven_home,
         status,
         runtime,
         Some(MAX_SOCKET_BODY_BYTES),
-        HostGuard::Disabled,
-    )
+        HttpStreamPolicy {
+            host_guard: HostGuard::Disabled,
+            lifecycle: LifecycleControl::OwnerLocal,
+        },
+    )?;
+    Ok((outcome == HttpStreamOutcome::HoldForShutdown).then_some(stream))
 }
 
 fn http_reason_phrase(status: u16) -> &'static str {
@@ -3721,22 +5034,30 @@ fn parse_request_line(line: &str) -> Result<(&str, &str)> {
     Ok((method, path))
 }
 
+#[cfg(any(windows, test))]
+fn owner_only_pipe_sddl(owner_sid: &str) -> String {
+    format!("O:{owner_sid}D:(A;;GA;;;OW)")
+}
+
 #[cfg(windows)]
 fn owner_only_pipe_security_descriptor(
 ) -> Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
     use interprocess::os::windows::security_descriptor::SecurityDescriptor;
     use widestring::U16CString;
 
-    // D:(A;;GA;;;OW) — allow Generic All for the object owner only. This is the
-    // Windows named-pipe equivalent of binding a Unix socket with mode 0600.
-    let sddl = U16CString::from_str("D:(A;;GA;;;OW)")
+    let owner = current_windows_user_sid()?;
+    let owner = owner.to_sddl_string()?;
+    // Explicitly bind the descriptor owner to TokenUser, rather than allowing
+    // Windows to derive it from a configurable TokenOwner. The DACL continues
+    // to grant Generic All solely through the OWNER RIGHTS SID.
+    let sddl = U16CString::from_str(owner_only_pipe_sddl(&owner))
         .context("failed to encode owner-only named pipe security descriptor")?;
     SecurityDescriptor::deserialize(&sddl)
         .context("failed to build owner-only named pipe security descriptor")
 }
 
 #[cfg(windows)]
-pub(crate) fn windows_pipe_name(coven_home: &Path) -> String {
+pub(crate) fn windows_pipe_name(coven_home: &Path) -> Result<String> {
     daemon_windows_pipe_name(coven_home)
 }
 
@@ -3746,8 +5067,8 @@ pub(crate) fn windows_pipe_name(coven_home: &Path) -> String {
 /// diagnostics need the concrete endpoint users can compare against a profile
 /// root without treating the IPC surface as absent.
 #[cfg(windows)]
-pub(crate) fn windows_pipe_path(coven_home: &Path) -> PathBuf {
-    PathBuf::from(r"\\.\pipe").join(daemon_windows_pipe_name(coven_home))
+pub(crate) fn windows_pipe_path(coven_home: &Path) -> Result<PathBuf> {
+    Ok(PathBuf::from(r"\\.\pipe").join(daemon_windows_pipe_name(coven_home)?))
 }
 
 /// Put the Windows daemon itself in a process-lifetime kill-on-close Job.
@@ -3870,12 +5191,18 @@ fn serve_forever_with_lifetime_job_installer(
 
     let _serve_lock = acquire_serve_lock(coven_home)?;
     install_lifetime_job()?;
+    let pipe_name = windows_pipe_name(coven_home)?;
     let status = DaemonStatus {
         pid: std::process::id(),
         started_at: started_at.clone(),
-        socket: windows_pipe_name(coven_home),
+        socket: pipe_name.clone(),
+        process_creation_time: Some(WindowsProcessCreationTime::new(
+            coven_client::windows_process_creation_time(std::process::id())
+                .map_err(anyhow::Error::new)?
+                .context("current Windows daemon process was not live during startup")?,
+        )?),
     };
-    let name = windows_pipe_name(coven_home)
+    let name = pipe_name
         .to_ns_name::<GenericNamespaced>()
         .context("failed to create named pipe name")?;
     let security_descriptor = owner_only_pipe_security_descriptor()?;
@@ -3971,6 +5298,385 @@ fn serve_forever_with_lifetime_job_installer(
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    static DAEMON_TERMINATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_daemon_status_socket(coven_home: &Path) -> String {
+        daemon_startup_status_socket(coven_home).expect("derive test daemon endpoint")
+    }
+
+    fn write_test_daemon_status_text(coven_home: &Path, contents: &str) -> Result<()> {
+        #[cfg(windows)]
+        {
+            ensure_private_coven_home(coven_home)?;
+            write_windows_status(&daemon_status_path(coven_home), contents)
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::write(daemon_status_path(coven_home), contents)?;
+            Ok(())
+        }
+    }
+
+    #[cfg(windows)]
+    fn write_inherited_windows_status(coven_home: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT},
+            OWNER_SECURITY_INFORMATION,
+        };
+
+        let status_path = daemon_status_path(coven_home);
+        std::fs::write(&status_path, contents)?;
+        let owner = current_windows_user_sid()?;
+        let mut status_path: Vec<u16> = status_path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                status_path.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("failed to set test daemon status owner: Windows error {status}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn windows_status_probe_passes_a_finite_timeout_to_the_shared_client() {
+        let observed_timeout = std::cell::Cell::new(None);
+        let status = daemon_status_from_windows_probe("coven-daemon-test.sock", |_, timeout| {
+            observed_timeout.set(Some(timeout));
+            Ok(Some((
+                200,
+                br#"{"ok":true,"daemon":{"pid":42,"startedAt":"2026-08-16T00:00:00Z","socket":"coven-daemon-test.sock"}}"#
+                    .to_vec(),
+                42,
+                134_157_822_123_456_789,
+            )))
+        })
+        .expect("parse successful shared probe response")
+        .expect("running daemon");
+
+        let observed_timeout = observed_timeout.get().expect("finite probe budget");
+        assert!(observed_timeout <= Duration::from_secs(2));
+        assert!(observed_timeout > Duration::from_secs(1));
+        assert_eq!(status.pid, 42);
+        assert_eq!(
+            status.process_creation_time.map(|value| value.get()),
+            Some(134_157_822_123_456_789)
+        );
+    }
+
+    #[test]
+    fn lifecycle_deadline_reuses_one_budget_and_reports_the_expired_phase() {
+        let start = Instant::now();
+        let deadline = LifecycleDeadline::from_instant(start + Duration::from_millis(100));
+
+        assert_eq!(
+            deadline
+                .remaining_at(start + Duration::from_millis(40), "authenticating daemon")
+                .expect("budget remains"),
+            Duration::from_millis(60)
+        );
+        let error = deadline
+            .remaining_at(
+                start + Duration::from_millis(100),
+                "cleaning up daemon status",
+            )
+            .expect_err("the original deadline is exhausted");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out cleaning up daemon status"),
+            "unexpected phase error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_lifecycle_deadline_skips_optional_duplicate_scan_deterministically() {
+        let scanned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let scanned_in_diagnostic = std::sync::Arc::clone(&scanned);
+        let expired = LifecycleDeadline::from_instant(Instant::now());
+
+        run_optional_lifecycle_diagnostic(expired, move |_| {
+            scanned_in_diagnostic.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        assert!(
+            !scanned.load(std::sync::atomic::Ordering::SeqCst),
+            "an optional process scan started after the lifecycle deadline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_returns_within_deadline_when_optional_diagnostic_scan_is_slow() -> Result<()> {
+        struct DiagnosticDelayGuard;
+
+        impl Drop for DiagnosticDelayGuard {
+            fn drop(&mut self) {
+                OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(0, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let _guard = DAEMON_TERMINATION_TEST_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "old".to_owned(),
+            socket: daemon_socket_path(temp_dir.path())
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+        let started = std::sync::Arc::new(std::sync::Mutex::new(0));
+        OPTIONAL_DIAGNOSTIC_DELAY_MILLIS.store(500, std::sync::atomic::Ordering::SeqCst);
+        let _delay_guard = DiagnosticDelayGuard;
+        let deadline = LifecycleDeadline::after(Duration::from_millis(100))?;
+        let started_at = Instant::now();
+
+        let restarted = restart_background_server_with_controllers_until(
+            temp_dir.path(),
+            Path::new("/usr/bin/coven"),
+            "new".to_owned(),
+            &FakeStopController {
+                pid_alive: true,
+                exited_after_signal: true,
+                signal_error: None,
+                verified_daemon: true,
+                signaled: std::sync::Arc::default(),
+            },
+            &FakeStartController {
+                started,
+                running_after_start: true,
+            },
+            deadline,
+        )?;
+
+        assert!(restarted.0);
+        assert!(
+            started_at.elapsed() < Duration::from_millis(250),
+            "optional diagnostic scan delayed restart completion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_windows_health_deadline_never_runs_a_fixed_followup_probe() {
+        let invoked = std::cell::Cell::new(false);
+        let error = daemon_status_from_windows_probe_until(
+            "coven-daemon-test.sock",
+            LifecycleDeadline::from_instant(Instant::now()),
+            |_, _| {
+                invoked.set(true);
+                Ok::<_, coven_client::ClientError>(None)
+            },
+        )
+        .expect_err("an expired outer deadline must stop before probing");
+
+        assert!(!invoked.get());
+        assert!(
+            error
+                .to_string()
+                .contains("timed out probing Windows daemon health"),
+            "unexpected timeout phase: {error:#}"
+        );
+    }
+
+    #[test]
+    fn windows_start_wait_does_not_probe_again_after_its_total_budget() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+        let started = Instant::now();
+
+        let error = wait_for_windows_running_daemon_with_probe(
+            &status,
+            Duration::from_millis(20),
+            |_, _, _| {
+                calls.set(calls.get() + 1);
+                std::thread::sleep(Duration::from_millis(25));
+                Ok(false)
+            },
+        )
+        .expect_err("the single outer start budget must expire");
+
+        assert_eq!(calls.get(), 1, "no fixed post-deadline probe is allowed");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "start readiness materially overshot its 20ms budget"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for Coven daemon startup health"),
+            "unexpected timeout phase: {error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_cleanup_does_not_run_after_the_outer_lifecycle_deadline() -> Result<()> {
+        struct SlowVerifiedStop;
+        impl DaemonStopController for SlowVerifiedStop {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                std::thread::sleep(Duration::from_millis(25));
+                Ok(VerifiedStopOutcome::Exited)
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Gone)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-08-16T00:00:00Z".to_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+        let error = stop_background_server_with_controller_until(
+            temp_dir.path(),
+            &SlowVerifiedStop,
+            LifecycleDeadline::after(Duration::from_millis(10))?,
+        )
+        .expect_err("cleanup must not start after the original stop budget");
+
+        assert!(
+            error
+                .to_string()
+                .contains("timed out cleaning up Coven daemon lifecycle state"),
+            "unexpected timeout phase: {error:#}"
+        );
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    #[test]
+    fn windows_status_probe_preserves_unavailable_as_not_running() {
+        let status = daemon_status_from_windows_probe("coven-daemon-test.sock", |_, _| {
+            Ok::<_, coven_client::ClientError>(None)
+        })
+        .expect("an unavailable owner-safe connection is not an error");
+
+        assert_eq!(status, None);
+    }
+
+    #[test]
+    fn windows_status_probe_rejects_health_identity_not_bound_to_pipe_server() {
+        for (body, server_pid, server_creation_time) in [
+            (
+                br#"{"ok":true,"daemon":{"pid":41,"startedAt":"now","socket":"coven-daemon-test.sock","processCreationTime":"134157822123456789"}}"#.as_slice(),
+                42,
+                134_157_822_123_456_789,
+            ),
+            (
+                br#"{"ok":true,"daemon":{"pid":42,"startedAt":"now","socket":"other-profile.sock","processCreationTime":"134157822123456789"}}"#.as_slice(),
+                42,
+                134_157_822_123_456_789,
+            ),
+            (
+                br#"{"ok":true,"daemon":{"pid":42,"startedAt":"now","socket":"coven-daemon-test.sock","processCreationTime":"134157822123456788"}}"#.as_slice(),
+                42,
+                134_157_822_123_456_789,
+            ),
+        ] {
+            let result = daemon_status_from_windows_probe("coven-daemon-test.sock", |_, _| {
+                Ok(Some((
+                    200,
+                    body.to_vec(),
+                    server_pid,
+                    server_creation_time,
+                )))
+            });
+            assert!(result.is_err(), "accepted unbound health body");
+        }
+    }
+
+    #[test]
+    fn windows_recorded_status_matches_only_its_authenticated_process_identity() -> Result<()> {
+        let legacy = parse_daemon_status(&windows_status_fixture(None))?;
+        let recorded = parse_daemon_status(&windows_status_fixture(Some("134157822123456789")))?;
+        let matching = parse_daemon_status(&windows_status_fixture(Some("134157822123456789")))?;
+        let reused = parse_daemon_status(&windows_status_fixture(Some("134157822123456790")))?;
+
+        assert!(windows_status_matches_authenticated_health(
+            &recorded, &matching
+        ));
+        assert!(!windows_status_matches_authenticated_health(
+            &recorded, &reused
+        ));
+        assert!(
+            windows_status_matches_authenticated_health(&legacy, &matching),
+            "an authenticated health response may resolve a legacy record"
+        );
+        assert_eq!(
+            resolved_windows_daemon_status(&legacy, &matching),
+            Some(matching.clone()),
+            "secure health resolution should migrate the legacy fingerprint"
+        );
+        assert_eq!(resolved_windows_daemon_status(&recorded, &reused), None);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_daemon_token_storage_is_word_aligned_and_covers_requested_bytes() {
+        for requested_bytes in [1, 3, 8, 31, 257] {
+            let mut buffer = WindowsTokenBuffer::new(requested_bytes);
+            assert_eq!(
+                buffer.as_mut_ptr() as usize % std::mem::align_of::<usize>(),
+                0
+            );
+            assert!(buffer.byte_capacity() >= requested_bytes);
+        }
+    }
+
+    #[test]
+    fn named_pipe_sddl_sets_token_user_as_owner_and_preserves_owner_only_dacl() {
+        assert_eq!(
+            owner_only_pipe_sddl("S-1-5-21-42"),
+            "O:S-1-5-21-42D:(A;;GA;;;OW)"
+        );
+    }
+
+    #[test]
+    fn owner_only_windows_directory_dacl_inherits_to_children() {
+        assert_eq!(
+            WINDOWS_OWNER_ONLY_DIRECTORY_DACL_SDDL,
+            "D:P(A;OICI;GA;;;OW)"
+        );
+    }
+
     #[test]
     fn daemon_store_initialization_prepares_request_connections() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
@@ -4010,6 +5716,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn termination_signal_requests_graceful_cleanup_instead_of_immediate_exit() {
+        let _test_lock = DAEMON_TERMINATION_TEST_LOCK
+            .lock()
+            .expect("termination test lock");
         DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
         handle_termination_signal(libc::SIGTERM);
         assert!(daemon_termination_requested());
@@ -4148,6 +5857,113 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn owner_local_lifecycle_shutdown_requires_the_exact_serving_identity() -> Result<()> {
+        let _test_lock = DAEMON_TERMINATION_TEST_LOCK
+            .lock()
+            .expect("termination test lock");
+        let temp = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: daemon_socket_path(temp.path())
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        let wrong = DaemonStatus {
+            pid: 43,
+            ..status.clone()
+        };
+        let body = serde_json::json!({
+            "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+            "daemon": wrong,
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/v1/internal/lifecycle/shutdown HTTP/1.1\r\nHost: coven\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut input = std::io::Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+        DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
+
+        let outcome = handle_http_stream_with_lifecycle(
+            &mut input,
+            &mut output,
+            temp.path(),
+            Some(status),
+            &crate::api::NoopSessionRuntime,
+            Some(MAX_SOCKET_BODY_BYTES),
+            HttpStreamPolicy {
+                host_guard: HostGuard::Disabled,
+                lifecycle: LifecycleControl::OwnerLocal,
+            },
+        )?;
+
+        assert_eq!(outcome, HttpStreamOutcome::Complete);
+        assert!(String::from_utf8(output)?.starts_with("HTTP/1.1 409 Conflict\r\n"));
+        assert!(!daemon_termination_requested());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_local_lifecycle_shutdown_holds_its_authenticated_connection() -> Result<()> {
+        let _test_lock = DAEMON_TERMINATION_TEST_LOCK
+            .lock()
+            .expect("termination test lock");
+        let temp = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: daemon_socket_path(temp.path())
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        let body = serde_json::json!({
+            "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+            "daemon": status,
+        })
+        .to_string();
+        let request = format!(
+            "POST /api/v1/internal/lifecycle/shutdown HTTP/1.1\r\nHost: coven\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        let mut input = std::io::Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+        DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
+
+        let outcome = handle_http_stream_with_lifecycle(
+            &mut input,
+            &mut output,
+            temp.path(),
+            Some(status),
+            &crate::api::NoopSessionRuntime,
+            Some(MAX_SOCKET_BODY_BYTES),
+            HttpStreamPolicy {
+                host_guard: HostGuard::Disabled,
+                lifecycle: LifecycleControl::OwnerLocal,
+            },
+        )?;
+
+        assert_eq!(outcome, HttpStreamOutcome::HoldForShutdown);
+        assert!(String::from_utf8(output)?.starts_with("HTTP/1.1 202 Accepted\r\n"));
+        assert!(
+            !daemon_termination_requested(),
+            "shutdown cannot begin before the authenticated connection is retained"
+        );
+        let (server, _client) = UnixStream::pair()?;
+        let retained = Mutex::new(Vec::new());
+        retain_shutdown_connection(&retained, server);
+        assert!(daemon_termination_requested());
+        assert_eq!(retained.into_inner().expect("retained lock").len(), 1);
+        DAEMON_TERMINATION_REQUESTED.store(false, Ordering::Release);
+        Ok(())
+    }
+
     #[test]
     fn serve_lock_is_exclusive_and_reusable() -> Result<()> {
         let home = tempfile::tempdir()?;
@@ -4163,6 +5979,83 @@ mod tests {
         drop(first);
         let _second =
             acquire_serve_lock(home.path()).expect("lock should be reacquirable once released");
+        Ok(())
+    }
+
+    #[test]
+    fn reset_pipe_reservation_retains_every_supported_identity_until_release() -> Result<()> {
+        struct TrackedReservation(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for TrackedReservation {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let names = ["v2", "v1", "v0"];
+        let attempted = std::cell::RefCell::new(Vec::new());
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reservations = reserve_windows_pipe_identities(&names, |name| {
+            attempted.borrow_mut().push(name.to_owned());
+            Ok(Some(TrackedReservation(released.clone())))
+        })?
+        .expect("all identities were available");
+
+        assert_eq!(&*attempted.borrow(), &names);
+        assert_eq!(released.load(Ordering::SeqCst), 0);
+        drop(reservations);
+        assert_eq!(released.load(Ordering::SeqCst), names.len());
+        Ok(())
+    }
+
+    #[test]
+    fn reset_pipe_reservation_releases_partial_handles_on_legacy_collision() -> Result<()> {
+        struct TrackedReservation(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for TrackedReservation {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let names = ["v2", "v1", "v0"];
+        let attempted = std::cell::Cell::new(0);
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reservations = reserve_windows_pipe_identities(&names, |_| {
+            let index = attempted.get();
+            attempted.set(index + 1);
+            if index == 1 {
+                Ok(None)
+            } else {
+                Ok(Some(TrackedReservation(released.clone())))
+            }
+        })?;
+
+        assert!(reservations.is_none());
+        assert_eq!(attempted.get(), 2);
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reset_transport_probe_bounds_an_unresponsive_socket() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir()?;
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700))?;
+        let socket = daemon_socket_path(home.path());
+        let _listener = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let started = Instant::now();
+
+        let error =
+            unix_daemon_transport_is_occupied_with_timeout(home.path(), Duration::from_millis(50))
+                .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "unexpected probe failure: {error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
         Ok(())
     }
 
@@ -6725,14 +8618,18 @@ mod tests {
         let home = temp.path().to_path_buf();
 
         // Stand up an incumbent daemon: a bound socket plus a thread that answers
-        // a single /health probe, reporting a recognizable pid.
+        // a single /health probe, reporting its authenticated peer pid.
         let incumbent = bind_api_socket(&home).expect("bind incumbent");
-        let socket = daemon_socket_path(&home).to_string_lossy().into_owned();
+        let canonical_home = std::fs::canonicalize(&home).expect("canonicalize home");
+        let socket = daemon_socket_path(&canonical_home)
+            .to_string_lossy()
+            .into_owned();
         let server_home = home.clone();
         let status = DaemonStatus {
-            pid: 4242,
+            pid: std::process::id(),
             started_at: "2026-06-18T00:00:00Z".to_string(),
             socket,
+            process_creation_time: None,
         };
         let server = thread::spawn(move || {
             serve_next_connection(&incumbent, &server_home, Some(status), &NoopSessionRuntime)
@@ -6745,7 +8642,7 @@ mod tests {
         server.join().expect("incumbent server thread");
         let msg = format!("{error:#}");
         assert!(
-            msg.contains("refusing to take over") && msg.contains("4242"),
+            msg.contains("refusing to take over") && msg.contains(&std::process::id().to_string()),
             "unexpected error: {msg}"
         );
     }
@@ -6827,11 +8724,8 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: temp_dir
-                .path()
-                .join("coven.sock")
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
 
         write_status(temp_dir.path(), &status)?;
@@ -6840,6 +8734,236 @@ mod tests {
         assert!(clear_status(temp_dir.path())?);
         assert_eq!(read_status(temp_dir.path())?, None);
         assert!(!clear_status(temp_dir.path())?);
+        Ok(())
+    }
+
+    fn windows_status_fixture(process_creation_time: Option<&str>) -> String {
+        let mut status = serde_json::json!({
+            "pid": 12345,
+            "startedAt": "2026-04-27T10:00:00Z",
+            "socket": "coven-daemon-v1-fixture.sock",
+        });
+        if let Some(process_creation_time) = process_creation_time {
+            status["processCreationTime"] =
+                serde_json::Value::String(process_creation_time.to_owned());
+        }
+        status.to_string()
+    }
+
+    #[test]
+    fn windows_status_creation_time_matches_the_same_live_process() -> Result<()> {
+        let creation_time = 134_157_822_123_456_789_u64;
+        let status =
+            parse_daemon_status(&windows_status_fixture(Some(&creation_time.to_string())))?;
+
+        assert_eq!(
+            recorded_windows_process_state(&status, Some(creation_time)),
+            RecordedProcessState::Matching
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_status_creation_time_detects_a_reused_pid() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(Some("134157822123456789")))?;
+
+        assert_eq!(
+            recorded_windows_process_state(&status, Some(134_157_822_999_999_999)),
+            RecordedProcessState::Mismatched
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_windows_status_without_creation_time_remains_unverifiable() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+
+        assert_eq!(
+            recorded_windows_process_state(&status, Some(134_157_822_123_456_789)),
+            RecordedProcessState::Unverifiable
+        );
+        assert_eq!(
+            recorded_windows_process_state(&status, None),
+            RecordedProcessState::Gone
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_windows_status_creation_time_fails_closed() {
+        for malformed in [
+            serde_json::Value::Null,
+            serde_json::json!(134_157_822_123_456_789_u64),
+            serde_json::json!(""),
+            serde_json::json!("0"),
+            serde_json::json!("-1"),
+            serde_json::json!("not-a-filetime"),
+            serde_json::json!("18446744073709551616"),
+        ] {
+            let mut status: serde_json::Value =
+                serde_json::from_str(&windows_status_fixture(None)).unwrap();
+            status["processCreationTime"] = malformed.clone();
+
+            let error = parse_daemon_status(&status.to_string())
+                .expect_err("malformed process creation time must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid Windows process creation time"),
+                "unexpected error for {malformed}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_process_creation_time_serializes_without_losing_filetime_width() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(Some(&u64::MAX.to_string())))?;
+
+        let serialized = serde_json::to_value(&status)?;
+        assert_eq!(
+            serialized["processCreationTime"],
+            serde_json::Value::String(u64::MAX.to_string())
+        );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reads_stale_windows_status_without_a_live_pipe() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: windows_pipe_name(temp_dir.path())?,
+            process_creation_time: None,
+        };
+
+        write_status(temp_dir.path(), &status)?;
+
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stop_clears_stale_windows_status_without_a_live_pipe() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: windows_pipe_name(temp_dir.path())?,
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+
+        assert!(stop_background_server_with_controller(
+            temp_dir.path(),
+            &FakeStopController {
+                pid_alive: false,
+                exited_after_signal: false,
+                signal_error: Some("No such process".to_string()),
+                verified_daemon: false,
+                signaled: std::sync::Arc::default(),
+            },
+        )?);
+
+        assert_eq!(read_status(temp_dir.path())?, None);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn inherited_legacy_windows_status(
+        coven_home: &Path,
+        pid: u32,
+        socket: Option<String>,
+    ) -> Result<DaemonStatus> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let socket = socket.unwrap_or_else(|| {
+            let mut hasher = DefaultHasher::new();
+            coven_home.to_string_lossy().hash(&mut hasher);
+            format!("coven-daemon-{:016x}.sock", hasher.finish())
+        });
+        let status = DaemonStatus {
+            pid,
+            started_at: "2026-04-27T10:00:00Z".to_owned(),
+            socket,
+            process_creation_time: None,
+        };
+        write_inherited_windows_status(coven_home, serde_json::to_vec(&status)?)?;
+        Ok(status)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_clears_inherited_legacy_status_only_after_pid_is_dead() -> Result<()> {
+        use coven_client::DaemonEndpoint;
+
+        let temp_dir = tempfile::tempdir()?;
+        let mut exited = Command::new("cmd.exe").args(["/C", "exit", "0"]).spawn()?;
+        let exited_pid = exited.id();
+        assert!(exited.wait()?.success());
+        let status = inherited_legacy_windows_status(temp_dir.path(), exited_pid, None)?;
+        assert!(
+            DaemonEndpoint::discover(temp_dir.path()).is_err(),
+            "endpoint discovery must reject an unavailable legacy pipe"
+        );
+
+        let state = background_server_status(temp_dir.path())?;
+
+        assert_eq!(state, None);
+        assert!(!daemon_status_path(temp_dir.path()).exists());
+        assert_ne!(status.socket, windows_pipe_name(temp_dir.path())?);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_preserves_inherited_legacy_status_while_pid_is_alive() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status = inherited_legacy_windows_status(temp_dir.path(), std::process::id(), None)?;
+
+        let state = background_server_status(temp_dir.path())?;
+        assert_eq!(state, Some(DaemonStatusState::Stale(status.clone())));
+        ensure_background_server(
+            temp_dir.path(),
+            Path::new("coven.exe"),
+            "2026-04-27T11:00:00Z".to_owned(),
+        )
+        .expect_err("start must not replace an unavailable legacy record with a live PID");
+        stop_background_server(temp_dir.path())
+            .expect_err("stop must not signal or clear an unverified live PID");
+        restart_background_server(
+            temp_dir.path(),
+            Path::new("coven.exe"),
+            "2026-04-27T11:00:00Z".to_owned(),
+        )
+        .expect_err("restart must not signal or clear an unverified live PID");
+
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn lifecycle_rejects_redirected_inherited_legacy_status_without_clearing() -> Result<()> {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let temp_dir = tempfile::tempdir()?;
+        let other_home = temp_dir.path().join("other-profile");
+        let mut hasher = DefaultHasher::new();
+        other_home.to_string_lossy().hash(&mut hasher);
+        let other_profile = format!("coven-daemon-{:016x}.sock", hasher.finish());
+
+        for socket in [other_profile, "other-daemon.sock".to_owned()] {
+            inherited_legacy_windows_status(temp_dir.path(), 12345, Some(socket))?;
+            let result = background_server_status(temp_dir.path());
+            assert!(result.is_err());
+            assert!(
+                daemon_status_path(temp_dir.path()).exists(),
+                "rejected status must not be cleared"
+            );
+        }
         Ok(())
     }
 
@@ -6867,9 +8991,8 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
 
         write_status(temp_dir.path(), &status)?;
@@ -6903,22 +9026,29 @@ mod tests {
     }
 
     #[test]
-    fn daemon_startup_status_socket_uses_unix_socket_for_unix_platform() {
+    fn daemon_startup_status_socket_uses_unix_socket_for_unix_platform() -> Result<()> {
         let home = Path::new("/tmp/coven-home");
         assert_eq!(
-            daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Unix),
+            daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Unix)?,
             daemon_socket_path(home).to_string_lossy()
         );
+        Ok(())
     }
 
+    #[cfg(windows)]
     #[test]
-    fn daemon_startup_status_socket_uses_named_pipe_for_windows_platform() {
-        let home = Path::new("C:/CovenTest/.coven");
-        let socket = daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Windows);
+    fn daemon_startup_status_socket_uses_named_pipe_for_windows_platform() -> Result<()> {
+        let home = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let socket = daemon_startup_status_socket_for_platform(home, DaemonIpcPlatform::Windows)?;
 
+        assert_eq!(
+            socket,
+            coven_client::owner_only_windows_pipe_name(home).map_err(anyhow::Error::new)?
+        );
         assert!(socket.starts_with("coven-daemon-"), "socket={socket}");
         assert!(socket.ends_with(".sock"), "socket={socket}");
         assert_ne!(socket, daemon_socket_path(home).to_string_lossy());
+        Ok(())
     }
 
     #[cfg(unix)]
@@ -6951,6 +9081,24 @@ mod tests {
             error.to_string().contains("symlink"),
             "error should name the symlink cause, got: {error}"
         );
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ensure_private_coven_home_preserves_access_to_existing_children() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let existing_dir = temp_dir.path().join("repo");
+        let existing_file = existing_dir.join("existing.txt");
+        std::fs::create_dir(&existing_dir)?;
+        std::fs::write(&existing_file, "before")?;
+
+        ensure_private_coven_home(temp_dir.path())?;
+
+        assert!(existing_dir.is_dir());
+        std::fs::write(&existing_file, "after")?;
+        assert_eq!(std::fs::read_to_string(&existing_file)?, "after");
+        std::fs::write(temp_dir.path().join("new.txt"), "new")?;
         Ok(())
     }
 
@@ -6998,7 +9146,7 @@ mod tests {
     fn read_status_still_errors_on_corrupt_daemon_status() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::create_dir_all(temp_dir.path())?;
-        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+        write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
 
         let error = read_status(temp_dir.path()).expect_err("read_status should remain strict");
 
@@ -7011,10 +9159,34 @@ mod tests {
     }
 
     #[test]
+    fn read_status_rejects_oversized_metadata_without_parsing_or_removing_it() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let status_path = daemon_status_path(temp_dir.path());
+        write_test_daemon_status_text(
+            temp_dir.path(),
+            &" ".repeat(coven_client::MAX_DAEMON_STATUS_BYTES + 1),
+        )?;
+
+        let error = read_status(temp_dir.path()).expect_err("oversized daemon status must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("daemon status exceeded the 16384-byte limit"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            status_path.exists(),
+            "an oversized status must be preserved"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn background_server_status_clears_corrupt_metadata_without_daemon() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         std::fs::create_dir_all(temp_dir.path())?;
-        std::fs::write(daemon_status_path(temp_dir.path()), "{not json\n")?;
+        write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
 
         let state = background_server_status_with_controller(
             temp_dir.path(),
@@ -7036,14 +9208,94 @@ mod tests {
     }
 
     #[test]
+    fn malformed_process_creation_time_is_repaired_only_from_authenticated_health() -> Result<()> {
+        struct AuthenticatedRecoveryController {
+            recovered: Option<DaemonStatus>,
+        }
+
+        impl DaemonStopController for AuthenticatedRecoveryController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                panic!("status recovery must not stop a daemon")
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Gone)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                Ok(self.recovered.as_ref() == Some(status))
+            }
+
+            fn status_from_default_socket(
+                &self,
+                _coven_home: &Path,
+                _deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                Ok(self.recovered.clone())
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let socket = test_daemon_status_socket(temp_dir.path());
+        let malformed = serde_json::json!({
+            "pid": 12345,
+            "startedAt": "2026-08-16T15:30:00Z",
+            "socket": socket,
+            "processCreationTime": "not-a-filetime",
+        });
+        write_test_daemon_status_text(temp_dir.path(), &malformed.to_string())?;
+
+        let unavailable = background_server_status_locked_with_controller(
+            temp_dir.path(),
+            &AuthenticatedRecoveryController { recovered: None },
+        );
+        assert!(
+            unavailable.is_err(),
+            "malformed identity without authenticated health must fail closed"
+        );
+        assert!(
+            daemon_status_path(temp_dir.path()).exists(),
+            "malformed identity must be preserved while it cannot be securely resolved"
+        );
+
+        let recovered = DaemonStatus {
+            pid: 54321,
+            started_at: "2026-08-16T15:31:00Z".to_owned(),
+            socket,
+            process_creation_time: Some(WindowsProcessCreationTime::new(134_157_822_123_456_789)?),
+        };
+        let state = background_server_status_locked_with_controller(
+            temp_dir.path(),
+            &AuthenticatedRecoveryController {
+                recovered: Some(recovered.clone()),
+            },
+        )?;
+        assert_eq!(state, Some(DaemonStatusState::Running(recovered.clone())));
+        assert_eq!(read_status(temp_dir.path())?, Some(recovered));
+        Ok(())
+    }
+
+    #[test]
     fn stop_background_server_keeps_status_when_existing_daemon_survives() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
 
@@ -7070,9 +9322,8 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
 
@@ -7097,9 +9348,8 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
         let controller = FakeStopController {
@@ -7120,14 +9370,378 @@ mod tests {
     }
 
     #[test]
+    fn stop_uses_one_verified_process_identity_for_signal_and_wait() -> Result<()> {
+        struct BoundIdentityController {
+            stop_calls: std::sync::Arc<std::sync::Mutex<usize>>,
+        }
+
+        impl DaemonStopController for BoundIdentityController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                *self.stop_calls.lock().unwrap() += 1;
+                Ok(VerifiedStopOutcome::Exited)
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                panic!("verified stop must not reopen a process by PID")
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                panic!("verified stop must bind health and process identity in one operation")
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        write_status(
+            temp_dir.path(),
+            &DaemonStatus {
+                pid: 12345,
+                started_at: "2026-04-27T10:00:00Z".to_owned(),
+                socket: test_daemon_status_socket(temp_dir.path()),
+                process_creation_time: None,
+            },
+        )?;
+        let stop_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+
+        assert!(stop_background_server_with_controller(
+            temp_dir.path(),
+            &BoundIdentityController {
+                stop_calls: stop_calls.clone(),
+            },
+        )?);
+        assert_eq!(*stop_calls.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_relative_status_is_rewritten_to_the_canonical_socket() -> Result<()> {
+        use std::{
+            io::{Read, Write},
+            os::unix::{fs::PermissionsExt, net::UnixListener},
+            time::Instant,
+        };
+
+        fn relative_path(base: &Path, target: &Path) -> PathBuf {
+            let base = base.components().collect::<Vec<_>>();
+            let target = target.components().collect::<Vec<_>>();
+            let shared = base
+                .iter()
+                .zip(&target)
+                .take_while(|(left, right)| left == right)
+                .count();
+            let mut relative = PathBuf::new();
+            for _ in shared..base.len() {
+                relative.push("..");
+            }
+            for component in &target[shared..] {
+                relative.push(component.as_os_str());
+            }
+            relative
+        }
+
+        let current_dir = std::fs::canonicalize(std::env::current_dir()?)?;
+        let test_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .join("c");
+        std::fs::create_dir_all(&test_root)?;
+        let temp_dir = tempfile::tempdir_in(&test_root)?;
+        let coven_home = temp_dir.path().to_path_buf();
+        ensure_private_coven_home(&coven_home)?;
+        let socket = daemon_socket_path(&coven_home);
+        let listener = UnixListener::bind(&socket)?;
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+        let relative_socket = relative_path(&current_dir, &std::fs::canonicalize(&socket)?)
+            .to_string_lossy()
+            .into_owned();
+        let legacy_status = DaemonStatus {
+            pid: std::process::id(),
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: relative_socket,
+            process_creation_time: None,
+        };
+        write_status(&coven_home, &legacy_status)?;
+        listener.set_nonblocking(true)?;
+        let status_for_server = legacy_status.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = String::new();
+                        stream.read_to_string(&mut request)?;
+                        assert!(request.starts_with("GET /health HTTP/1.1\r\n"));
+                        let body = serde_json::json!({
+                            "ok": true,
+                            "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+                            "covenVersion": crate::api::COVEN_VERSION,
+                            "capabilities": {
+                                "sessions": true,
+                                "events": true,
+                                "eventCursor": "sequence",
+                                "structuredErrors": true
+                            },
+                            "daemon": status_for_server,
+                        })
+                        .to_string();
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        )?;
+                        return Ok(());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        });
+
+        let state = background_server_status(&coven_home)?;
+        server.join().expect("relative-status server")?;
+
+        let running = match state {
+            Some(DaemonStatusState::Running(status)) => status,
+            other => anyhow::bail!("relative same-profile status was not running: {other:?}"),
+        };
+        let canonical_socket = std::fs::canonicalize(&socket)?;
+        assert_eq!(Path::new(&running.socket), canonical_socket);
+        let rewritten = read_status(&coven_home)?.expect("rewritten daemon status");
+        assert_eq!(Path::new(&rewritten.socket), canonical_socket);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_profile_status_cannot_select_another_profiles_socket() -> Result<()> {
+        use std::{
+            io::{Read, Write},
+            os::unix::{fs::PermissionsExt, net::UnixListener},
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+            time::Instant,
+        };
+
+        fn serve_shutdown(
+            listener: UnixListener,
+            status: DaemonStatus,
+            contacted: Arc<AtomicBool>,
+        ) -> std::thread::JoinHandle<Result<()>> {
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_millis(500);
+                loop {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            contacted.store(true, Ordering::Release);
+                            let mut request = String::new();
+                            stream.read_to_string(&mut request)?;
+                            let body = serde_json::json!({
+                                "ok": true,
+                                "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+                                "capabilities": { "structuredErrors": true },
+                                "daemon": status,
+                            })
+                            .to_string();
+                            write!(
+                                stream,
+                                "HTTP/1.1 202 Accepted\r\nContent-Length: {}\r\n\r\n{body}",
+                                body.len()
+                            )?;
+                            return Ok(());
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return Ok(());
+                            }
+                            std::thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            })
+        }
+
+        let root = tempfile::tempdir()?;
+        let profile_a = root.path().join("profile-a");
+        let profile_b = root.path().join("profile-b");
+        ensure_private_coven_home(&profile_a)?;
+        ensure_private_coven_home(&profile_b)?;
+        let socket_b = daemon_socket_path(&profile_b);
+        let listener_b = UnixListener::bind(&socket_b)?;
+        std::fs::set_permissions(&socket_b, std::fs::Permissions::from_mode(0o600))?;
+        let status_b = DaemonStatus {
+            pid: std::process::id(),
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: std::fs::canonicalize(&socket_b)?
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        write_status(&profile_a, &status_b)?;
+        let contacted_b = Arc::new(AtomicBool::new(false));
+        let server_b = serve_shutdown(listener_b, status_b, Arc::clone(&contacted_b));
+
+        let cross_profile = stop_background_server(&profile_a);
+        server_b.join().expect("profile B server thread")?;
+
+        assert!(
+            cross_profile.is_err(),
+            "profile A must not accept profile B's copied status"
+        );
+        assert!(
+            !contacted_b.load(Ordering::Acquire),
+            "profile A connected to profile B's daemon"
+        );
+
+        let socket_a = daemon_socket_path(&profile_a);
+        let listener_a = UnixListener::bind(&socket_a)?;
+        std::fs::set_permissions(&socket_a, std::fs::Permissions::from_mode(0o600))?;
+        let status_a = DaemonStatus {
+            pid: std::process::id(),
+            started_at: "2026-08-16T12:01:00Z".to_owned(),
+            socket: std::fs::canonicalize(&socket_a)?
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        write_status(&profile_a, &status_a)?;
+        let contacted_a = Arc::new(AtomicBool::new(false));
+        let server_a = serve_shutdown(listener_a, status_a, Arc::clone(&contacted_a));
+
+        assert!(stop_background_server(&profile_a)?);
+        server_a.join().expect("profile A server thread")?;
+        assert!(
+            contacted_a.load(Ordering::Acquire),
+            "same-profile stop did not reach its daemon"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_verified_stop_never_signals_a_substituted_numeric_pid() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        ensure_private_coven_home(temp_dir.path())?;
+        let mut substituted = Command::new("sleep")
+            .arg("5")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("spawn substituted process")?;
+        let canonical_home = std::fs::canonicalize(temp_dir.path())?;
+        let status = DaemonStatus {
+            pid: substituted.id(),
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: daemon_socket_path(&canonical_home)
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        let listener = UnixListener::bind(daemon_socket_path(temp_dir.path()))?;
+        std::fs::set_permissions(
+            daemon_socket_path(temp_dir.path()),
+            std::fs::Permissions::from_mode(0o600),
+        )?;
+        let server_status = status.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = String::new();
+            stream.read_to_string(&mut request)?;
+            let (code, reason, body) =
+                if request.starts_with("POST /api/v1/internal/lifecycle/shutdown HTTP/1.1\r\n") {
+                    (
+                        202,
+                        "Accepted",
+                        serde_json::json!({
+                            "ok": true,
+                            "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+                            "capabilities": { "structuredErrors": true },
+                            "daemon": server_status,
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    (
+                        200,
+                        "OK",
+                        serde_json::json!({
+                            "ok": true,
+                            "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
+                            "covenVersion": crate::api::COVEN_VERSION,
+                            "capabilities": { "structuredErrors": true },
+                            "daemon": server_status,
+                        })
+                        .to_string(),
+                    )
+                };
+            write!(
+                stream,
+                "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )?;
+            Ok(())
+        });
+
+        let error = SystemDaemonStopController
+            .stop_verified_daemon(
+                &canonical_home,
+                &status,
+                LifecycleDeadline::after(Duration::from_millis(250))?,
+            )
+            .expect_err("the connected peer must not authenticate a substituted numeric PID");
+        server.join().expect("substitute server thread")?;
+        let still_running = substituted.try_wait()?.is_none();
+        if still_running {
+            substituted.kill()?;
+        }
+        let _ = substituted.wait();
+
+        assert!(
+            error.to_string().contains("connected peer pid"),
+            "unexpected identity rejection: {error:#}"
+        );
+        assert!(
+            still_running,
+            "a daemon connection closing must not authorize signaling its stale numeric PID"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn background_server_status_returns_running_for_verified_daemon() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
 
@@ -7152,9 +9766,8 @@ mod tests {
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
 
@@ -7171,6 +9784,259 @@ mod tests {
 
         assert_eq!(state, Some(DaemonStatusState::Stale(status.clone())));
         assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
+    #[test]
+    fn reused_pid_fingerprint_mismatch_is_cleared_without_signaling() -> Result<()> {
+        struct ReusedPidController {
+            stop_calls: std::sync::Arc<std::sync::Mutex<usize>>,
+        }
+
+        impl DaemonStopController for ReusedPidController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                *self.stop_calls.lock().unwrap() += 1;
+                Ok(VerifiedStopOutcome::Unverified)
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Mismatched)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: std::process::id(),
+            started_at: "2026-08-16T15:30:00Z".to_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: Some(WindowsProcessCreationTime::new(41)?),
+        };
+        write_status(temp_dir.path(), &status)?;
+        let stop_calls = std::sync::Arc::new(std::sync::Mutex::new(0));
+        let controller = ReusedPidController {
+            stop_calls: stop_calls.clone(),
+        };
+
+        assert_eq!(
+            background_server_status_locked_with_controller(temp_dir.path(), &controller)?,
+            None
+        );
+        assert!(
+            !daemon_status_path(temp_dir.path()).exists(),
+            "PID reuse must not leave lifecycle commands wedged on stale metadata"
+        );
+        assert_eq!(
+            *stop_calls.lock().unwrap(),
+            0,
+            "status cleanup must never signal a mismatched process identity"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_cleanup_cannot_delete_state_published_by_concurrent_startup() -> Result<()> {
+        struct BlockingDeadStatusController {
+            inspected: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl DaemonStopController for BlockingDeadStatusController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                panic!("status inspection must not stop a daemon")
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Gone)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                self.inspected.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path().to_path_buf();
+        let old = DaemonStatus {
+            pid: 12345,
+            started_at: "old".to_owned(),
+            socket: test_daemon_status_socket(&home),
+            process_creation_time: None,
+        };
+        let replacement = DaemonStatus {
+            pid: 54321,
+            started_at: "new".to_owned(),
+            socket: test_daemon_status_socket(&home),
+            process_creation_time: None,
+        };
+        write_status(&home, &old)?;
+
+        let (inspected_tx, inspected_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let status_home = home.clone();
+        let status_thread = std::thread::spawn(move || {
+            background_server_status_locked_with_controller(
+                &status_home,
+                &BlockingDeadStatusController {
+                    inspected: inspected_tx,
+                    release: std::sync::Mutex::new(release_rx),
+                },
+            )
+        });
+        inspected_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let (attempting_tx, attempting_rx) = std::sync::mpsc::sync_channel(0);
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::sync_channel(0);
+        let startup_home = home.clone();
+        let expected_replacement = replacement.clone();
+        let startup_thread = std::thread::spawn(move || -> Result<()> {
+            attempting_tx.send(())?;
+            let _lock = acquire_daemon_lifecycle_lock(&startup_home)?;
+            acquired_tx.send(())?;
+            write_status(&startup_home, &expected_replacement)
+        });
+        attempting_rx.recv_timeout(Duration::from_secs(2))?;
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(250))
+                .is_err(),
+            "startup acquired daemon.lock while stale cleanup was still inspecting state"
+        );
+
+        release_tx.send(())?;
+        assert_eq!(status_thread.join().unwrap()?, None);
+        acquired_rx.recv_timeout(Duration::from_secs(2))?;
+        startup_thread.join().unwrap()?;
+
+        assert_eq!(read_status(&home)?, Some(replacement));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_cleanup_cannot_delete_state_from_direct_serve_startup() -> Result<()> {
+        struct BlockingDeadStatusController {
+            inspected: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl DaemonStopController for BlockingDeadStatusController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                panic!("status inspection must not stop a daemon")
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Gone)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                self.inspected.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let home = temp_dir.path().to_path_buf();
+        let old = DaemonStatus {
+            pid: 12345,
+            started_at: "old".to_owned(),
+            socket: daemon_socket_path(&home).to_string_lossy().into_owned(),
+            process_creation_time: None,
+        };
+        let replacement = DaemonStatus {
+            pid: 54321,
+            started_at: "direct-serve".to_owned(),
+            socket: daemon_socket_path(&home).to_string_lossy().into_owned(),
+            process_creation_time: None,
+        };
+        write_status(&home, &old)?;
+
+        let (inspected_tx, inspected_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let status_home = home.clone();
+        let status_thread = std::thread::spawn(move || {
+            background_server_status_locked_with_controller(
+                &status_home,
+                &BlockingDeadStatusController {
+                    inspected: inspected_tx,
+                    release: std::sync::Mutex::new(release_rx),
+                },
+            )
+        });
+        inspected_rx.recv_timeout(Duration::from_secs(2))?;
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(0);
+        let startup_home = home.clone();
+        let expected_replacement = replacement.clone();
+        let startup_thread = std::thread::spawn(move || -> Result<()> {
+            let _serve_lock = acquire_serve_lock(&startup_home)?;
+            let _listener = bind_api_socket(&startup_home)?;
+            write_status(&startup_home, &expected_replacement)?;
+            ready_tx.send(())?;
+            finish_rx.recv()?;
+            Ok(())
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2))?;
+
+        release_tx.send(())?;
+        let state = status_thread.join().expect("status thread")?;
+        let status_after_cleanup = read_status(&home).ok().flatten();
+        let socket_survived = daemon_socket_path(&home).exists();
+        finish_tx.send(())?;
+        startup_thread.join().expect("startup thread")?;
+
+        assert_eq!(state, None);
+        assert_eq!(status_after_cleanup, Some(replacement));
+        assert!(
+            socket_survived,
+            "stale cleanup unlinked the direct serve process's bound socket"
+        );
         Ok(())
     }
 
@@ -7203,15 +10069,342 @@ mod tests {
         Ok(())
     }
 
+    struct RecoveringLifecycleStopController {
+        recovered: Option<DaemonStatus>,
+        authenticated: bool,
+        stopped: std::sync::Arc<std::sync::Mutex<Vec<DaemonStatus>>>,
+    }
+
+    impl DaemonStopController for RecoveringLifecycleStopController {
+        fn stop_verified_daemon(
+            &self,
+            _coven_home: &Path,
+            status: &DaemonStatus,
+            _deadline: LifecycleDeadline,
+        ) -> Result<VerifiedStopOutcome> {
+            self.stopped.lock().unwrap().push(status.clone());
+            Ok(VerifiedStopOutcome::Exited)
+        }
+
+        fn recorded_process_state(&self, _status: &DaemonStatus) -> Result<RecordedProcessState> {
+            Ok(RecordedProcessState::Gone)
+        }
+
+        fn status_matches_running_daemon(
+            &self,
+            _coven_home: &Path,
+            status: &DaemonStatus,
+            _deadline: LifecycleDeadline,
+        ) -> Result<bool> {
+            Ok(self.authenticated && self.recovered.as_ref() == Some(status))
+        }
+
+        fn status_from_default_socket(
+            &self,
+            _coven_home: &Path,
+            _deadline: LifecycleDeadline,
+        ) -> Result<Option<DaemonStatus>> {
+            Ok(self.recovered.clone())
+        }
+    }
+
+    #[test]
+    fn restart_recovers_and_stops_live_daemon_when_status_is_missing_or_corrupt() -> Result<()> {
+        for corrupt in [false, true] {
+            let temp_dir = tempfile::tempdir()?;
+            if corrupt {
+                write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
+            }
+            let recovered = DaemonStatus {
+                pid: 12345,
+                started_at: "old".to_string(),
+                socket: test_daemon_status_socket(temp_dir.path()),
+                process_creation_time: None,
+            };
+            let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let started = std::sync::Arc::new(std::sync::Mutex::new(0));
+
+            let (was_running, replacement) = restart_background_server_with_controllers_until(
+                temp_dir.path(),
+                Path::new("/usr/bin/coven"),
+                "new".to_string(),
+                &RecoveringLifecycleStopController {
+                    recovered: Some(recovered.clone()),
+                    authenticated: true,
+                    stopped: stopped.clone(),
+                },
+                &FakeStartController {
+                    started: started.clone(),
+                    running_after_start: true,
+                },
+                LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+            )?;
+
+            assert!(was_running, "recovery mode corrupt={corrupt}");
+            assert_eq!(&*stopped.lock().unwrap(), &[recovered]);
+            assert_eq!(*started.lock().unwrap(), 1);
+            assert_eq!(read_status(temp_dir.path())?, Some(replacement));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_recovers_live_default_socket_after_corrupt_recorded_identity() -> Result<()> {
+        struct ReauthenticatingStopController {
+            recovered: DaemonStatus,
+            stopped: std::sync::Arc<std::sync::Mutex<Vec<DaemonStatus>>>,
+        }
+
+        impl DaemonStopController for ReauthenticatingStopController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                self.stopped.lock().unwrap().push(status.clone());
+                Ok(if status == &self.recovered {
+                    VerifiedStopOutcome::Exited
+                } else {
+                    VerifiedStopOutcome::Unverified
+                })
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                Ok(RecordedProcessState::Gone)
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                Ok(status == &self.recovered)
+            }
+
+            fn status_from_default_socket(
+                &self,
+                _coven_home: &Path,
+                _deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                Ok(Some(self.recovered.clone()))
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let socket = test_daemon_status_socket(temp_dir.path());
+        let corrupt = DaemonStatus {
+            pid: 11111,
+            started_at: "corrupt".to_string(),
+            socket: socket.clone(),
+            process_creation_time: None,
+        };
+        let recovered = DaemonStatus {
+            pid: 22222,
+            started_at: "authenticated".to_string(),
+            socket,
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &corrupt)?;
+        let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let started = std::sync::Arc::new(std::sync::Mutex::new(0));
+
+        restart_background_server_with_controllers_until(
+            temp_dir.path(),
+            Path::new("/usr/bin/coven"),
+            "new".to_string(),
+            &ReauthenticatingStopController {
+                recovered: recovered.clone(),
+                stopped: stopped.clone(),
+            },
+            &FakeStartController {
+                started: started.clone(),
+                running_after_start: true,
+            },
+            LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+        )?;
+
+        assert_eq!(&*stopped.lock().unwrap(), &[corrupt, recovered]);
+        assert_eq!(*started.lock().unwrap(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_recovers_authenticated_default_after_untrusted_status_read() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let recovered = DaemonStatus {
+            pid: 22222,
+            started_at: "authenticated".to_string(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
+        };
+        let controller = RecoveringLifecycleStopController {
+            recovered: Some(recovered.clone()),
+            authenticated: true,
+            stopped: std::sync::Arc::default(),
+        };
+
+        let status = resolve_status_read_for_stop(
+            temp_dir.path(),
+            &controller,
+            LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+            Err(anyhow::anyhow!(
+                "daemon status contained an untrusted profile identity"
+            )),
+        )?;
+
+        assert_eq!(status, Some(recovered));
+        Ok(())
+    }
+
+    #[test]
+    fn restart_without_status_or_live_default_socket_starts_exactly_once() -> Result<()> {
+        for corrupt in [false, true] {
+            let temp_dir = tempfile::tempdir()?;
+            if corrupt {
+                write_test_daemon_status_text(temp_dir.path(), "{not json\n")?;
+            }
+            let stopped = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let started = std::sync::Arc::new(std::sync::Mutex::new(0));
+
+            let (was_running, replacement) = restart_background_server_with_controllers_until(
+                temp_dir.path(),
+                Path::new("/usr/bin/coven"),
+                "new".to_string(),
+                &RecoveringLifecycleStopController {
+                    recovered: None,
+                    authenticated: false,
+                    stopped: stopped.clone(),
+                },
+                &FakeStartController {
+                    started: started.clone(),
+                    running_after_start: true,
+                },
+                LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+            )?;
+
+            assert!(!was_running, "no-daemon mode corrupt={corrupt}");
+            assert!(stopped.lock().unwrap().is_empty());
+            assert_eq!(*started.lock().unwrap(), 1);
+            assert_eq!(read_status(temp_dir.path())?, Some(replacement));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn restart_never_spawns_from_an_unauthenticated_default_socket_status() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let recovered = DaemonStatus {
+            pid: 12345,
+            started_at: "untrusted".to_string(),
+            socket: daemon_socket_path(temp_dir.path())
+                .to_string_lossy()
+                .into_owned(),
+            process_creation_time: None,
+        };
+        let started = std::sync::Arc::new(std::sync::Mutex::new(0));
+
+        let error = restart_background_server_with_controllers_until(
+            temp_dir.path(),
+            Path::new("/usr/bin/coven"),
+            "new".to_string(),
+            &RecoveringLifecycleStopController {
+                recovered: Some(recovered),
+                authenticated: false,
+                stopped: std::sync::Arc::default(),
+            },
+            &FakeStartController {
+                started: started.clone(),
+                running_after_start: true,
+            },
+            LifecycleDeadline::after(DAEMON_LIFECYCLE_TIMEOUT)?,
+        )
+        .expect_err("an unauthenticated recovery candidate must fail closed");
+
+        assert!(error.to_string().contains("authenticate"));
+        assert_eq!(*started.lock().unwrap(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_background_server_passes_the_canonical_home_through_startup() -> Result<()> {
+        struct RecordingStartController {
+            homes: std::sync::Arc<std::sync::Mutex<Vec<PathBuf>>>,
+        }
+
+        impl DaemonStartController for RecordingStartController {
+            fn start_background_server(
+                &self,
+                coven_home: &Path,
+                _current_exe: &Path,
+                started_at: String,
+            ) -> Result<DaemonStatus> {
+                self.homes.lock().unwrap().push(coven_home.to_path_buf());
+                let status = DaemonStatus {
+                    pid: 54321,
+                    started_at,
+                    socket: daemon_socket_path(coven_home)
+                        .to_string_lossy()
+                        .into_owned(),
+                    process_creation_time: None,
+                };
+                write_status(coven_home, &status)?;
+                Ok(status)
+            }
+
+            fn wait_for_running_daemon(
+                &self,
+                coven_home: &Path,
+                status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                self.homes.lock().unwrap().push(coven_home.to_path_buf());
+                Ok(Some(status.clone()))
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        std::fs::create_dir(temp_dir.path().join("nested"))?;
+        let selected_home = temp_dir.path().join("nested").join("..");
+        let canonical_home = std::fs::canonicalize(temp_dir.path())?;
+        let homes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        ensure_background_server_with_controllers(
+            &selected_home,
+            Path::new("/usr/bin/coven"),
+            "2026-04-27T10:00:00Z".to_owned(),
+            &FakeStopController {
+                pid_alive: false,
+                exited_after_signal: false,
+                signal_error: None,
+                verified_daemon: false,
+                signaled: std::sync::Arc::default(),
+            },
+            &RecordingStartController {
+                homes: homes.clone(),
+            },
+        )?;
+
+        assert_eq!(
+            *homes.lock().unwrap(),
+            vec![canonical_home.clone(), canonical_home]
+        );
+        Ok(())
+    }
+
     #[test]
     fn ensure_background_server_reuses_verified_running_daemon() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let status = DaemonStatus {
             pid: 12345,
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
-                .to_string_lossy()
-                .into_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &status)?;
         let started = std::sync::Arc::new(std::sync::Mutex::new(0));
@@ -7257,12 +10450,14 @@ mod tests {
         use std::thread;
 
         let temp_dir = tempfile::tempdir()?;
+        let canonical_home = std::fs::canonicalize(temp_dir.path())?;
         let status = DaemonStatus {
-            pid: 12345,
+            pid: std::process::id(),
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
+            socket: daemon_socket_path(&canonical_home)
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
         let listener = bind_api_socket(temp_dir.path())?;
         let home = temp_dir.path().to_path_buf();
@@ -7313,21 +10508,24 @@ mod tests {
         use std::thread;
 
         let temp_dir = tempfile::tempdir()?;
+        let canonical_home = std::fs::canonicalize(temp_dir.path())?;
         let recovered = DaemonStatus {
-            pid: 12345,
+            pid: std::process::id(),
             started_at: "2026-04-27T10:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
+            socket: daemon_socket_path(&canonical_home)
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
         let stale = DaemonStatus {
             // Keep this within the range Linux `kill -0` treats as a plain
             // PID; u32::MAX can be interpreted as -1 by the shell utility.
             pid: 999_999,
             started_at: "2026-04-27T09:00:00Z".to_string(),
-            socket: daemon_socket_path(temp_dir.path())
+            socket: daemon_socket_path(&canonical_home)
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
         write_status(temp_dir.path(), &stale)?;
         let listener = bind_api_socket(temp_dir.path())?;
@@ -7370,6 +10568,56 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn lifecycle_preserves_status_when_pid_liveness_is_ambiguous() -> Result<()> {
+        struct AmbiguousPidController;
+
+        impl DaemonStopController for AmbiguousPidController {
+            fn stop_verified_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<VerifiedStopOutcome> {
+                panic!("status inspection must not stop a daemon")
+            }
+
+            fn recorded_process_state(
+                &self,
+                _status: &DaemonStatus,
+            ) -> Result<RecordedProcessState> {
+                anyhow::bail!("process identity could not be inspected")
+            }
+
+            fn status_matches_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<bool> {
+                Ok(false)
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_owned(),
+            socket: test_daemon_status_socket(temp_dir.path()),
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+
+        let error =
+            background_server_status_with_controller(temp_dir.path(), &AmbiguousPidController)
+                .expect_err("ambiguous PID liveness must fail closed");
+        assert!(error
+            .to_string()
+            .contains("could not determine whether Coven daemon pid 12345 is alive"));
+        assert_eq!(read_status(temp_dir.path())?, Some(status));
+        Ok(())
+    }
+
     struct FakeStopController {
         pid_alive: bool,
         exited_after_signal: bool,
@@ -7379,24 +10627,39 @@ mod tests {
     }
 
     impl DaemonStopController for FakeStopController {
-        fn signal_term(&self, _pid: u32) -> Result<()> {
+        fn stop_verified_daemon(
+            &self,
+            _coven_home: &Path,
+            _status: &DaemonStatus,
+            _deadline: LifecycleDeadline,
+        ) -> Result<VerifiedStopOutcome> {
+            if !self.verified_daemon {
+                return Ok(VerifiedStopOutcome::Unverified);
+            }
             *self.signaled.lock().unwrap() += 1;
             match &self.signal_error {
+                Some(_) if !self.pid_alive => Ok(VerifiedStopOutcome::Exited),
                 Some(error) => anyhow::bail!(error.clone()),
-                None => Ok(()),
+                None if self.exited_after_signal => Ok(VerifiedStopOutcome::Exited),
+                None => Ok(VerifiedStopOutcome::TimedOut),
             }
         }
 
-        fn pid_is_alive(&self, _pid: u32) -> bool {
-            self.pid_alive
+        fn recorded_process_state(&self, _status: &DaemonStatus) -> Result<RecordedProcessState> {
+            Ok(if self.pid_alive {
+                RecordedProcessState::Matching
+            } else {
+                RecordedProcessState::Gone
+            })
         }
 
-        fn wait_for_exit(&self, _pid: u32, _timeout: std::time::Duration) -> bool {
-            self.exited_after_signal
-        }
-
-        fn status_matches_running_daemon(&self, _status: &DaemonStatus) -> bool {
-            self.verified_daemon
+        fn status_matches_running_daemon(
+            &self,
+            _coven_home: &Path,
+            _status: &DaemonStatus,
+            _deadline: LifecycleDeadline,
+        ) -> Result<bool> {
+            Ok(self.verified_daemon)
         }
     }
 
@@ -7416,17 +10679,79 @@ mod tests {
             let status = DaemonStatus {
                 pid: 54321,
                 started_at,
-                socket: daemon_socket_path(coven_home)
-                    .to_string_lossy()
-                    .into_owned(),
+                socket: test_daemon_status_socket(coven_home),
+                process_creation_time: None,
             };
             write_status(coven_home, &status)?;
             Ok(status)
         }
 
-        fn wait_for_running_daemon(&self, _status: &DaemonStatus, _timeout: Duration) -> bool {
-            self.running_after_start
+        fn wait_for_running_daemon(
+            &self,
+            _coven_home: &Path,
+            status: &DaemonStatus,
+            _deadline: LifecycleDeadline,
+        ) -> Result<Option<DaemonStatus>> {
+            Ok(self.running_after_start.then(|| status.clone()))
         }
+    }
+
+    #[test]
+    fn managed_start_returns_the_authenticated_child_identity() -> Result<()> {
+        struct VerifiedIdentityStart {
+            health: DaemonStatus,
+        }
+
+        impl DaemonStartController for VerifiedIdentityStart {
+            fn start_background_server(
+                &self,
+                _coven_home: &Path,
+                _current_exe: &Path,
+                started_at: String,
+            ) -> Result<DaemonStatus> {
+                Ok(DaemonStatus {
+                    pid: self.health.pid,
+                    started_at,
+                    socket: self.health.socket.clone(),
+                    process_creation_time: None,
+                })
+            }
+
+            fn wait_for_running_daemon(
+                &self,
+                _coven_home: &Path,
+                _status: &DaemonStatus,
+                _deadline: LifecycleDeadline,
+            ) -> Result<Option<DaemonStatus>> {
+                Ok(Some(self.health.clone()))
+            }
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let health = DaemonStatus {
+            pid: 54321,
+            started_at: "2026-08-16T15:30:00Z".to_owned(),
+            socket: daemon_startup_status_socket(temp_dir.path())?,
+            process_creation_time: Some(WindowsProcessCreationTime::new(134_157_822_123_456_789)?),
+        };
+        let ensured = ensure_background_server_with_controllers(
+            temp_dir.path(),
+            Path::new("/usr/local/bin/coven"),
+            health.started_at.clone(),
+            &FakeStopController {
+                pid_alive: false,
+                exited_after_signal: true,
+                signal_error: None,
+                verified_daemon: false,
+                signaled: std::sync::Arc::default(),
+            },
+            &VerifiedIdentityStart {
+                health: health.clone(),
+            },
+        )?;
+
+        assert_eq!(ensured, health);
+        Ok(())
     }
 
     #[test]
@@ -7434,11 +10759,133 @@ mod tests {
         let spec = background_server_spec(
             Path::new("/usr/local/bin/coven"),
             Path::new("/tmp/coven-home"),
+            "2026-08-16T15:30:00.000000000Z",
         );
 
         assert_eq!(spec.program, PathBuf::from("/usr/local/bin/coven"));
-        assert_eq!(spec.args, vec!["daemon".to_string(), "serve".to_string()]);
+        assert_eq!(
+            spec.args,
+            vec![
+                "daemon".to_string(),
+                "serve".to_string(),
+                "--managed-started-at".to_string(),
+                "2026-08-16T15:30:00.000000000Z".to_string(),
+            ]
+        );
         assert_eq!(spec.coven_home, PathBuf::from("/tmp/coven-home"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_launcher_rejects_non_utf8_home_before_spawn_or_artifacts() -> Result<()> {
+        use std::{cell::Cell, ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let test_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .join("c");
+        std::fs::create_dir_all(&test_root)?;
+        let root = tempfile::tempdir_in(test_root)?;
+        let coven_home = root
+            .path()
+            .join(OsString::from_vec(b"non-utf8-\xff".to_vec()));
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::create_dir(&coven_home)?;
+            std::fs::set_permissions(&coven_home, std::fs::Permissions::from_mode(0o700))?;
+        }
+        let spawned = Cell::new(false);
+
+        let error = start_background_server_with_spawn(
+            &coven_home,
+            Path::new("/usr/local/bin/coven"),
+            "2026-08-16T15:30:00Z".to_owned(),
+            |_| {
+                spawned.set(true);
+                Ok(4242)
+            },
+        )
+        .expect_err("non-UTF-8 lifecycle state must be rejected before child launch");
+
+        assert!(
+            !spawned.get(),
+            "the daemon child launch must not be attempted"
+        );
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "error must explain the JSON path requirement: {error:#}"
+        );
+        assert!(!daemon_socket_path(&coven_home).exists());
+        assert!(!daemon_status_path(&coven_home).exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_serve_rejects_non_utf8_home_before_lifecycle_state() -> Result<()> {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let test_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root")
+            .join("c");
+        std::fs::create_dir_all(&test_root)?;
+        let root = tempfile::tempdir_in(test_root)?;
+        let coven_home = root
+            .path()
+            .join(OsString::from_vec(b"serve-non-utf8-\xff".to_vec()));
+
+        let error = serve_forever(&coven_home, "2026-08-16T15:30:00Z".to_owned(), None, &[])
+            .expect_err("direct serve must reject non-UTF-8 lifecycle state before startup");
+
+        assert!(
+            error.to_string().contains("valid UTF-8"),
+            "error must explain the JSON path requirement: {error:#}"
+        );
+        assert!(!daemon_socket_path(&coven_home).exists());
+        assert!(!daemon_status_path(&coven_home).exists());
+        assert!(!daemon_lifecycle_lock_path(&coven_home).exists());
+        assert!(!daemon_serve_lock_path(&coven_home).exists());
+        assert!(!coven_home.join("coven.sqlite3").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn managed_launcher_never_overwrites_status_already_published_by_child() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let started_at = "2026-08-16T15:30:00.000000000Z";
+        let socket = daemon_startup_status_socket(temp_dir.path())?;
+
+        let launched = start_background_server_with_spawn(
+            temp_dir.path(),
+            Path::new("/usr/local/bin/coven"),
+            started_at.to_owned(),
+            |_| {
+                std::fs::write(
+                    daemon_status_path(temp_dir.path()),
+                    serde_json::to_vec(&serde_json::json!({
+                        "pid": 4242,
+                        "startedAt": started_at,
+                        "socket": socket,
+                        "_publisher": "child",
+                    }))?,
+                )?;
+                Ok(4242)
+            },
+        )?;
+
+        assert_eq!(launched.pid, 4242);
+        assert_eq!(launched.started_at, started_at);
+        let serialized = std::fs::read_to_string(daemon_status_path(temp_dir.path()))?;
+        assert!(
+            serialized.contains(r#""_publisher":"child""#),
+            "the launcher republished daemon.json after the child: {serialized}"
+        );
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -7467,6 +10914,7 @@ mod tests {
             socket: daemon_socket_path(temp_dir.path())
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
         let listener = bind_api_socket(temp_dir.path())?;
         let home = temp_dir.path().to_path_buf();
@@ -7729,12 +11177,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn serves_health_over_windows_named_pipe() -> Result<()> {
-        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream};
-        use std::io::Write;
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+            os::windows::local_socket::ListenerOptionsExt,
+        };
         use std::thread;
 
         let temp_dir = tempfile::tempdir()?;
-        let pipe_name = windows_pipe_name(temp_dir.path());
+        let pipe_name = windows_pipe_name(temp_dir.path())?;
 
         let name = pipe_name
             .clone()
@@ -7742,13 +11192,19 @@ mod tests {
             .expect("pipe name");
         let listener = ListenerOptions::new()
             .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
             .create_sync()
             .expect("bind pipe");
 
+        let server_pid = std::process::id();
+        let server_creation_time = coven_client::windows_process_creation_time(server_pid)
+            .map_err(anyhow::Error::new)?
+            .context("test named-pipe server process was not live")?;
         let status = DaemonStatus {
-            pid: 12345,
+            pid: server_pid,
             started_at: "2026-04-27T10:00:00Z".to_string(),
             socket: pipe_name.clone(),
+            process_creation_time: Some(WindowsProcessCreationTime::new(server_creation_time)?),
         };
         let home = temp_dir.path().to_path_buf();
         let runtime = LiveSessionRuntime::default();
@@ -7768,36 +11224,352 @@ mod tests {
             Ok::<_, anyhow::Error>(())
         });
 
-        for _ in 0..2 {
-            let client_name = pipe_name
-                .clone()
-                .to_ns_name::<GenericNamespaced>()
-                .expect("client pipe name");
-            let mut client = Stream::connect(client_name).expect("connect");
-            client
-                .write_all(b"GET /api/v1/health HTTP/1.1\r\nHost: coven\r\n\r\n")
-                .expect("write request");
-            client.flush().expect("flush");
-            let (status_code, response) = read_windows_pipe_http_response(
-                client,
-                // Windows CI runners can take longer than one second to
-                // schedule the server thread while the Rust suite is busy.
-                Duration::from_secs(5),
-                MAX_SOCKET_BODY_BYTES,
-            )
-            .expect("read response");
-            assert_eq!(status_code, 200);
-            let response = String::from_utf8(response)?;
-            assert!(response.contains("\"apiVersion\""), "got: {response}");
-        }
+        let probed_status =
+            daemon_status_from_windows_pipe(&pipe_name)?.expect("probe running daemon status");
+        assert_eq!(probed_status.pid, server_pid);
+        assert_eq!(
+            probed_status
+                .process_creation_time
+                .map(WindowsProcessCreationTime::get),
+            Some(server_creation_time)
+        );
+
+        let (status_code, response) = coven_client::probe_windows_daemon_health(
+            &pipe_name,
+            // Windows CI runners can take longer than one second to schedule
+            // the server thread while the Rust suite is busy.
+            Duration::from_secs(5),
+        )
+        .map_err(anyhow::Error::new)?
+        .expect("connect to owner-safe daemon pipe");
+        assert_eq!(status_code, 200);
+        let response = String::from_utf8(response)?;
+        assert!(response.contains("\"apiVersion\""), "got: {response}");
+        let response: serde_json::Value = serde_json::from_str(&response)?;
+        assert_eq!(response["daemon"]["pid"], server_pid);
+        assert_eq!(
+            response["daemon"]["processCreationTime"],
+            server_creation_time.to_string()
+        );
         server.join().expect("server thread")?;
         Ok(())
     }
 
     #[cfg(windows)]
     #[test]
-    fn owner_only_pipe_security_descriptor_parses_sddl() -> Result<()> {
-        owner_only_pipe_security_descriptor()?;
+    fn shared_windows_probe_deadline_bounds_a_busy_pipe() -> Result<()> {
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream},
+            os::windows::local_socket::ListenerOptionsExt,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let pipe_name = windows_pipe_name(temp_dir.path())?;
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
+            .create_sync()
+            .expect("bind pipe");
+        let client_name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("client pipe name");
+        let _busy_client = Stream::connect(client_name).expect("occupy pipe instance");
+
+        let started = Instant::now();
+        let _ = coven_client::probe_windows_daemon_health(&pipe_name, Duration::from_millis(50));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a busy named pipe must not invoke an infinite WaitNamedPipeW"
+        );
+        drop(listener);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_retries_a_busy_pipe_until_an_owner_only_instance_is_available(
+    ) -> Result<()> {
+        use coven_client::DaemonEndpoint;
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream},
+            os::windows::local_socket::ListenerOptionsExt,
+            TryClone,
+        };
+        use std::sync::mpsc;
+
+        let temp_dir = tempfile::tempdir()?;
+        let pipe_name = windows_pipe_name(temp_dir.path())?;
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("busy pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
+            .create_sync()
+            .expect("bind busy pipe");
+        let client_name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("busy client pipe name");
+        let busy_client = Stream::connect(client_name).expect("occupy pipe instance");
+        let descriptor = owner_only_pipe_security_descriptor()?;
+        let replacement_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("replacement pipe name");
+        let (replacement_ready_tx, replacement_ready_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let replacement = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(busy_client);
+            drop(listener);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let replacement = loop {
+                match ListenerOptions::new()
+                    .name(replacement_name.clone())
+                    .security_descriptor(
+                        descriptor
+                            .try_clone()
+                            .expect("clone owner-only pipe descriptor"),
+                    )
+                    .create_sync()
+                {
+                    Ok(listener) => break listener,
+                    Err(error) if Instant::now() < deadline => {
+                        let _ = error;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("replace released busy pipe: {error}"),
+                }
+            };
+            replacement_ready_tx
+                .send(())
+                .expect("report replacement pipe");
+            release_rx.recv().expect("release replacement pipe");
+            drop(replacement);
+        });
+
+        let started = Instant::now();
+        let endpoint = DaemonEndpoint::discover(temp_dir.path()).map_err(anyhow::Error::new);
+        let discovery_elapsed = started.elapsed();
+        replacement_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("replacement pipe became available");
+        let owner_local = endpoint
+            .as_ref()
+            .is_ok_and(|endpoint| endpoint.is_owner_local());
+        release_tx.send(()).expect("release replacement listener");
+        replacement.join().expect("replacement pipe thread");
+        let _endpoint = endpoint?;
+        assert!(owner_local);
+        assert!(
+            discovery_elapsed >= Duration::from_millis(25),
+            "discovery did not exercise the busy-instance retry"
+        );
+        assert!(discovery_elapsed < Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_fails_a_persistently_busy_pipe_within_its_budget() -> Result<()> {
+        use coven_client::DaemonEndpoint;
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions, Stream},
+            os::windows::local_socket::ListenerOptionsExt,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let pipe_name = windows_pipe_name(temp_dir.path())?;
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("busy pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
+            .create_sync()
+            .expect("bind busy pipe");
+        let client_name = pipe_name
+            .to_ns_name::<GenericNamespaced>()
+            .expect("busy client pipe name");
+        let busy_client = Stream::connect(client_name).expect("occupy pipe instance");
+
+        let started = Instant::now();
+        let result = DaemonEndpoint::discover(temp_dir.path());
+
+        assert!(result.is_err(), "persistently busy pipe was discovered");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "busy discovery failed fast instead of sharing its retry deadline"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "busy discovery exceeded its two-second budget"
+        );
+        drop(busy_client);
+        drop(listener);
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_pipe_security_descriptor_has_explicit_token_user_owner() -> Result<()> {
+        use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt;
+        use windows_sys::Win32::Security::EqualSid;
+
+        let descriptor = owner_only_pipe_security_descriptor()?;
+        let (owner, defaulted) = descriptor.owner()?;
+        let current_user = current_windows_user_sid()?;
+
+        assert!(!owner.is_null());
+        assert!(!defaulted);
+        assert_ne!(
+            unsafe { EqualSid(owner.cast_mut(), current_user.as_ptr()) },
+            0
+        );
+        assert!(descriptor.dacl()?.is_some());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn client_accepts_object_manager_mapped_owner_only_pipe_and_status_acls() -> Result<()> {
+        use coven_client::DaemonEndpoint;
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+            os::windows::local_socket::ListenerOptionsExt,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        ensure_private_coven_home(temp_dir.path())?;
+        let pipe_name = windows_pipe_name(temp_dir.path())?;
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("daemon pipe name");
+        let _listener = ListenerOptions::new()
+            .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
+            .create_sync()
+            .expect("bind owner-only pipe");
+        let status = DaemonStatus {
+            pid: std::process::id(),
+            started_at: "2026-08-16T12:00:00Z".to_owned(),
+            socket: pipe_name,
+            process_creation_time: None,
+        };
+        write_status(temp_dir.path(), &status)?;
+
+        let serialized = coven_client::read_windows_daemon_status_for_lifecycle(temp_dir.path())
+            .map_err(anyhow::Error::new)?
+            .context("read hardened status")?;
+        assert_eq!(parse_daemon_status(&serialized)?, status);
+        DaemonEndpoint::discover(temp_dir.path()).map_err(anyhow::Error::new)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovers_same_profile_legacy_pipe_from_an_inherited_acl_status_file() -> Result<()> {
+        use coven_client::{DaemonClient, DaemonEndpoint};
+        use interprocess::{
+            local_socket::{prelude::*, GenericNamespaced, ListenerOptions},
+            os::windows::local_socket::ListenerOptionsExt,
+        };
+        use std::{
+            hash::{DefaultHasher, Hash, Hasher},
+            thread,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let mut hasher = DefaultHasher::new();
+        temp_dir.path().to_string_lossy().hash(&mut hasher);
+        let pipe_name = format!("coven-daemon-{:016x}.sock", hasher.finish());
+        let name = pipe_name
+            .clone()
+            .to_ns_name::<GenericNamespaced>()
+            .expect("legacy pipe name");
+        let listener = ListenerOptions::new()
+            .name(name)
+            .security_descriptor(owner_only_pipe_security_descriptor()?)
+            .create_sync()
+            .expect("bind protected legacy pipe");
+        let status = DaemonStatus {
+            pid: 12345,
+            started_at: "2026-04-27T10:00:00Z".to_string(),
+            socket: pipe_name,
+            process_creation_time: None,
+        };
+        write_inherited_windows_status(temp_dir.path(), serde_json::to_vec(&status)?)?;
+
+        let home = temp_dir.path().to_path_buf();
+        let server_status = status.clone();
+        let server = thread::spawn(move || {
+            // Legacy discovery authenticates status with health, opens a
+            // metadata-only connection to validate the pipe ACL, then the
+            // caller performs its own health negotiation.
+            for serves_health in [true, false, true] {
+                let conn = listener.incoming().next().expect("accept").expect("stream");
+                if serves_health {
+                    handle_http_stream(
+                        &conn,
+                        &conn,
+                        &home,
+                        Some(server_status.clone()),
+                        &LiveSessionRuntime::default(),
+                        None,
+                        HostGuard::Disabled,
+                    )?;
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let endpoint = DaemonEndpoint::discover(temp_dir.path()).map_err(anyhow::Error::new)?;
+        let health = DaemonClient::new(endpoint)
+            .health()
+            .map_err(anyhow::Error::new)?;
+        assert_eq!(health.api_version, "coven.daemon.v1");
+        server.join().expect("server thread")?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inherited_acl_status_rejects_cross_profile_and_arbitrary_pipe_redirection() -> Result<()> {
+        use coven_client::DaemonEndpoint;
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        let temp_dir = tempfile::tempdir()?;
+        let other_home = temp_dir.path().join("other-profile");
+        let mut hasher = DefaultHasher::new();
+        other_home.to_string_lossy().hash(&mut hasher);
+        let other_profile_pipe = format!("coven-daemon-{:016x}.sock", hasher.finish());
+
+        for redirected in [other_profile_pipe.as_str(), "other-daemon.sock"] {
+            let status = DaemonStatus {
+                pid: 12345,
+                started_at: "2026-04-27T10:00:00Z".to_string(),
+                socket: redirected.to_owned(),
+                process_creation_time: None,
+            };
+            std::fs::write(
+                daemon_status_path(temp_dir.path()),
+                serde_json::to_vec(&status)?,
+            )?;
+
+            assert!(
+                DaemonEndpoint::discover(temp_dir.path()).is_err(),
+                "inherited status redirected discovery to {redirected}"
+            );
+        }
         Ok(())
     }
 
@@ -7814,6 +11586,7 @@ mod tests {
                 pid: 42,
                 started_at: "2026-06-14T00:00:00Z".to_string(),
                 socket: socket_path.to_string_lossy().into_owned(),
+                process_creation_time: None,
             })?,
         )?;
         assert!(socket_path.exists());
@@ -7865,6 +11638,7 @@ mod tests {
                 pid: 100,
                 started_at: "2026-06-14T00:01:00Z".to_string(),
                 socket: socket_path.to_string_lossy().into_owned(),
+                process_creation_time: None,
             })?,
         )?;
 
@@ -8148,6 +11922,7 @@ mod tests {
             socket: daemon_socket_path(temp_dir.path())
                 .to_string_lossy()
                 .into_owned(),
+            process_creation_time: None,
         };
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
