@@ -126,8 +126,9 @@ fn set_owner_only_file_security(path: &Path) -> Result<(), ClientError> {
 
 fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), ClientError> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    use windows_sys::Win32::{
+        Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
+        Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
     };
 
     let temporary: Vec<u16> = temporary_path
@@ -140,17 +141,30 @@ fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), 
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
-    if unsafe {
-        MoveFileExW(
-            temporary.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(status_io_error(std::io::Error::last_os_error()));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if unsafe {
+            MoveFileExW(
+                temporary.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } != 0
+        {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(
+            error.raw_os_error(),
+            Some(code)
+                if code == ERROR_ACCESS_DENIED as i32
+                    || code == ERROR_SHARING_VIOLATION as i32
+        ) || std::time::Instant::now() >= deadline
+        {
+            return Err(status_io_error(error));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    Ok(())
 }
 
 fn status_io_error(source: std::io::Error) -> ClientError {

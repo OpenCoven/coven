@@ -735,7 +735,8 @@ fn a_mutation_is_not_sent_to_a_replacement_before_that_peer_is_negotiated() {
     original.join().expect("original daemon thread");
 
     let socket = home.path.join("coven.sock");
-    fs::remove_file(&socket).expect("remove original daemon endpoint");
+    fs::rename(&socket, home.path.join(".retired-original-socket"))
+        .expect("retire original daemon endpoint");
     let replacement = UnixListener::bind(&socket).expect("bind replacement daemon");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .expect("make replacement endpoint owner-only");
@@ -824,7 +825,8 @@ fn replacement_capabilities_are_enforced_before_mutation_bytes() {
     original.join().expect("original daemon thread");
 
     let socket = home.path.join("coven.sock");
-    fs::remove_file(&socket).expect("remove original daemon endpoint");
+    fs::rename(&socket, home.path.join(".retired-capability-socket"))
+        .expect("retire original daemon endpoint");
     let replacement = UnixListener::bind(&socket).expect("bind replacement daemon");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
         .expect("make replacement endpoint owner-only");

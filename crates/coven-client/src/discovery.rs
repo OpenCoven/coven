@@ -2042,29 +2042,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn status_file_reader_allows_an_atomic_status_replacement() {
-        use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr};
+        use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr, sync::mpsc, time::Duration};
         use windows_sys::Win32::{
             Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
-            Storage::FileSystem::{
-                CreateFileW, MoveFileExW, FILE_ATTRIBUTE_NORMAL, MOVEFILE_REPLACE_EXISTING,
-                MOVEFILE_WRITE_THROUGH, OPEN_EXISTING,
-            },
+            Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
         };
 
-        let test_prefix = format!(".coven-client-status-share-{}", std::process::id());
-        let status_path = std::env::current_dir()
-            .expect("test working directory")
-            .join(format!("{test_prefix}.json"));
-        let replacement_path = status_path.with_file_name(format!("{test_prefix}-next.json"));
-        let _ = std::fs::remove_file(&status_path);
-        let _ = std::fs::remove_file(&replacement_path);
+        let home =
+            std::env::temp_dir().join(format!(".coven-client-status-share-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir(&home).expect("create status replacement home");
+        let status_path = home.join("daemon.json");
         std::fs::write(&status_path, b"{\"pid\":1}").expect("write current status");
-        std::fs::write(&replacement_path, b"{\"pid\":2}").expect("write replacement status");
         let status_path_wide: Vec<u16> = OsStr::new(&status_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-        let replacement_path_wide: Vec<u16> = OsStr::new(&replacement_path)
             .encode_wide()
             .chain(std::iter::once(0))
             .collect();
@@ -2081,23 +2071,33 @@ mod tests {
             )
         };
         assert_ne!(reader, INVALID_HANDLE_VALUE, "open status reader");
-        let replaced = unsafe {
-            MoveFileExW(
-                replacement_path_wide.as_ptr(),
-                status_path_wide.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        let replacement_error = std::io::Error::last_os_error();
+        let home_path = home.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            result_tx
+                .send(crate::write_owner_only_windows_daemon_status(
+                    &home_path,
+                    b"{\"pid\":2}",
+                ))
+                .expect("report status replacement");
+        });
+        assert!(
+            result_rx.recv_timeout(Duration::from_millis(20)).is_err(),
+            "status replacement should wait for the active reader"
+        );
         unsafe {
             CloseHandle(reader);
         }
-        let _ = std::fs::remove_file(&replacement_path);
-        let _ = std::fs::remove_file(&status_path);
-        assert_ne!(
-            replaced, 0,
-            "atomic status replacement must not be blocked by a reader: {replacement_error}"
+        result_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("status replacement result")
+            .expect("replace status after reader closes");
+        writer.join().expect("status replacement thread");
+        assert_eq!(
+            std::fs::read_to_string(&status_path).expect("read replaced status"),
+            "{\"pid\":2}\n"
         );
+        std::fs::remove_dir_all(home).expect("remove status replacement home");
     }
 }
 
@@ -2589,11 +2589,9 @@ fn open_validated_windows_status_file(
 
 #[cfg(windows)]
 fn windows_status_file_share_mode() -> u32 {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
 
-    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+    FILE_SHARE_READ | FILE_SHARE_DELETE
 }
 
 #[cfg(windows)]
