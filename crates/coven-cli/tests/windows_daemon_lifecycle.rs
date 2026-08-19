@@ -222,11 +222,9 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 fn legacy_pipe_name(coven_home: &Path) -> String {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-    coven_home.to_string_lossy().hash(&mut hasher);
-    format!("coven-daemon-{:016x}.sock", hasher.finish())
+    coven_client::supported_windows_pipe_names(coven_home)
+        .expect("derive supported Windows daemon pipe names")[2]
+        .clone()
 }
 
 fn lowercase_hash_pipe_name(coven_home: &Path) -> String {

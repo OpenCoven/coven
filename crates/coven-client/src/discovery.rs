@@ -447,9 +447,11 @@ fn is_legacy_coven_daemon_pipe_name(pipe_name: &str) -> bool {
 
 #[cfg(any(windows, test))]
 fn legacy_windows_pipe_name(coven_home: &Path) -> String {
-    use std::hash::{DefaultHasher, Hash, Hasher};
+    use std::hash::{Hash, Hasher};
 
-    let mut hasher = DefaultHasher::new();
+    // Pin the historical `DefaultHasher` algorithm instead of relying on
+    // std's explicitly unspecified implementation across Rust upgrades.
+    let mut hasher = siphasher::sip::SipHasher13::new();
     coven_home.to_string_lossy().hash(&mut hasher);
     format!("coven-daemon-{:016x}.sock", hasher.finish())
 }
@@ -1184,16 +1186,7 @@ mod tests {
         windows_status_file_share_mode,
     };
     use crate::ClientError;
-    use std::{
-        hash::{DefaultHasher, Hash, Hasher},
-        path::{Path, PathBuf},
-    };
-
-    fn historical_legacy_windows_pipe_name(coven_home: &Path) -> String {
-        let mut hasher = DefaultHasher::new();
-        coven_home.to_string_lossy().hash(&mut hasher);
-        format!("coven-daemon-{:016x}.sock", hasher.finish())
-    }
+    use std::path::{Path, PathBuf};
 
     #[cfg(windows)]
     fn enable_windows_directory_case_sensitivity(directory: &Path) -> std::io::Result<()> {
@@ -1667,7 +1660,7 @@ mod tests {
     #[test]
     fn recorded_daemon_status_accepts_a_strict_legacy_pipe_for_its_profile() {
         let coven_home = Path::new(r"C:\CovenTest\Profile");
-        let legacy_pipe = historical_legacy_windows_pipe_name(coven_home);
+        let legacy_pipe = legacy_windows_pipe_name(coven_home);
         assert_eq!(
             legacy_pipe, "coven-daemon-fa932683394959d8.sock",
             "the historical DefaultHasher profile identity must remain compatible"
@@ -1684,8 +1677,7 @@ mod tests {
     #[test]
     fn recorded_daemon_status_rejects_a_legacy_pipe_for_another_profile() {
         let coven_home = Path::new(r"C:\CovenTest\Profile");
-        let other_profile_pipe =
-            historical_legacy_windows_pipe_name(Path::new(r"C:\CovenTest\Other"));
+        let other_profile_pipe = legacy_windows_pipe_name(Path::new(r"C:\CovenTest\Other"));
         let serialized = format!(r#"{{"socket":"{other_profile_pipe}"}}"#);
 
         assert!(recorded_pipe_name_from_status_for_home(coven_home, &serialized).is_err());

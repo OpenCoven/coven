@@ -94,11 +94,11 @@ pub fn shutdown_unix_daemon(
     if canonicalize_profile_binding(&endpoint, &mut canonical_expected, None).is_err() {
         return Ok(UnixDaemonShutdown::IdentityMismatch);
     }
-let body = serde_json::to_vec(&serde_json::json!({
-    "apiVersion": PROTOCOL_VERSION,
-    "daemon": &canonical_expected,
-}))
-.map_err(ClientError::InvalidJson)?
+    let body = serde_json::to_vec(&serde_json::json!({
+        "apiVersion": PROTOCOL_VERSION,
+        "daemon": &canonical_expected,
+    }))
+    .map_err(ClientError::InvalidJson)?;
     let pending = match request_retaining_connection(
         &endpoint,
         "POST",
@@ -150,12 +150,11 @@ let body = serde_json::to_vec(&serde_json::json!({
         &acknowledgement.api_version,
         &acknowledgement.capabilities,
     )?;
-    // The daemon only returns 202 when the request body's `daemon` (an exact
-    // copy of `expected`) matched its own recorded identity, and it echoes
-    // that same value back verbatim on success. Comparing the acknowledged
-    // identity directly against `expected` therefore validates the response
-    // body against the pre-send snapshot without touching the filesystem.
-    if acknowledgement.daemon != *expected {
+    // The daemon only returns 202 when the request body's canonical `daemon`
+    // identity matched its own record, and it echoes that value on success.
+    // Compare against the pre-send canonical snapshot without touching the
+    // filesystem after the daemon may have unlinked its socket.
+    if acknowledgement.daemon != canonical_expected {
         return Ok(UnixDaemonShutdown::IdentityMismatch);
     }
     if pending.wait_for_close()? {

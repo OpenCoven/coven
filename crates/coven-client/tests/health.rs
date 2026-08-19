@@ -1441,6 +1441,63 @@ fn lifecycle_shutdown_waits_for_eof_on_the_authenticated_connection() {
 }
 
 #[test]
+fn lifecycle_shutdown_sends_and_validates_the_canonical_socket_identity() {
+    use std::{
+        io::{Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+        time::Duration,
+    };
+
+    let home = TestHome::new();
+    let canonical = lifecycle_status(&home.path);
+    let socket = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&socket).expect("bind lifecycle socket");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .expect("make lifecycle socket private");
+
+    let current_dir = std::env::current_dir().expect("current directory");
+    let mut aliased = canonical.clone();
+    aliased.socket = relative_path(&current_dir, &socket)
+        .to_string_lossy()
+        .into_owned();
+    assert_ne!(aliased.socket, canonical.socket);
+
+    let canonical_for_server = canonical.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept shutdown");
+        let mut request = String::new();
+        stream.read_to_string(&mut request).expect("read shutdown");
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("shutdown request body");
+        let body: serde_json::Value =
+            serde_json::from_str(body).expect("valid shutdown request JSON");
+        assert_eq!(body["daemon"]["socket"], canonical_for_server.socket);
+
+        let acknowledged = serde_json::json!({
+            "ok": true,
+            "apiVersion": PROTOCOL_VERSION,
+            "capabilities": { "structuredErrors": true },
+            "daemon": canonical_for_server,
+        })
+        .to_string();
+        write!(
+            stream,
+            "HTTP/1.1 202 Accepted\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            acknowledged.len(),
+            acknowledged
+        )
+        .expect("acknowledge canonical shutdown");
+    });
+
+    let result = shutdown_unix_daemon(&home.path, &aliased, Duration::from_secs(1))
+        .expect("canonicalized shutdown");
+    server.join().expect("server thread");
+
+    assert_eq!(result, UnixDaemonShutdown::Exited);
+}
+
+#[test]
 fn lifecycle_shutdown_rejects_a_buffered_post_response_byte() {
     use std::{
         io::{Read, Write},
