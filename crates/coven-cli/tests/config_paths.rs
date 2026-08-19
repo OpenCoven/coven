@@ -141,15 +141,10 @@ fn paths_json_is_stable_and_creates_no_profile_state() {
     );
     #[cfg(windows)]
     {
-        let daemon_ipc = surfaces["state.daemon_ipc"]["path"]
-            .as_str()
-            .expect("Windows daemon IPC path");
-        assert!(
-            daemon_ipc.starts_with(r"\\.\pipe\coven-daemon-"),
-            "expected fully qualified Coven named pipe, got {daemon_ipc}"
-        );
-        assert!(daemon_ipc.ends_with(".sock"));
-        assert_eq!(surfaces["state.daemon_ipc"]["status"], "resolved");
+        // The v2 pipe identity depends on the profile directory's Windows file
+        // ID, which cannot be known without creating the directory.
+        assert!(surfaces["state.daemon_ipc"].get("path").is_none());
+        assert_eq!(surfaces["state.daemon_ipc"]["status"], "unresolved");
         assert_eq!(surfaces["state.daemon_ipc"]["source"], "environment");
     }
     assert_eq!(
