@@ -2108,20 +2108,22 @@ pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
     let status_path = daemon_status_path(coven_home);
     #[cfg(windows)]
     {
-        return write_windows_status(&status_path, &json);
+        write_windows_status(&status_path, &json)
     }
     #[cfg(not(windows))]
-    std::fs::write(&status_path, format!("{json}\n")).context("failed to write daemon status")?;
-    #[cfg(unix)]
-    std::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o600)).with_context(
-        || {
-            format!(
-                "failed to set daemon status permissions {}",
-                status_path.display()
-            )
-        },
-    )?;
-    Ok(())
+    {
+        std::fs::write(&status_path, format!("{json}\n"))
+            .context("failed to write daemon status")?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&status_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to set daemon status permissions {}",
+                    status_path.display()
+                )
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
