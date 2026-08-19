@@ -622,7 +622,7 @@ Add `jobs.changes` with outputs for every classifier category:
             empty_tree="$(git hash-object -t tree -w --stdin </dev/null)"
             range="${empty_tree}..${AFTER_SHA}"
           fi
-          git diff --name-only --diff-filter=ACMR "$range" > changed-files.txt
+          git diff --name-only --diff-filter=ACMRD "$range" > changed-files.txt
       - name: Classify changed paths
         id: classify
         run: python3 scripts/classify-ci-changes.py --github-output "$GITHUB_OUTPUT" < changed-files.txt

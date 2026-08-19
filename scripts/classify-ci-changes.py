@@ -37,7 +37,8 @@ def classify(paths: list[str]) -> dict[str, bool]:
         is_cargo_metadata = (
             path == 'Cargo.lock'
             or path == 'deny.toml'
-            or (path.endswith('Cargo.toml') and (path.count('/') <= 1))
+            or path == 'Cargo.toml'
+            or path.endswith('/Cargo.toml')
         )
         is_rust = is_cargo_metadata or path.startswith('crates/') or path.endswith('.rs')
         is_afs = is_cargo_metadata or path.startswith('crates/coven-afs/') or path == 'crates/coven-cli/src/afs_mount.rs' or path == 'scripts/afs-mount-smoke.sh'

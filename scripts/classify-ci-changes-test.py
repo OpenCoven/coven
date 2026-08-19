@@ -26,6 +26,13 @@ class ClassifyTest(unittest.TestCase):
         self.assertEqual(self.classify('Cargo.lock')['npm_packaging'], True)
         self.assertEqual(self.classify('Cargo.lock')['cargo_metadata'], True)
 
+    def test_crate_manifest_is_cargo_metadata(self):
+        result = self.classify('crates/coven-client/Cargo.toml')
+        self.assertTrue(result['rust'])
+        self.assertTrue(result['afs'])
+        self.assertTrue(result['npm_packaging'])
+        self.assertTrue(result['cargo_metadata'])
+
     def test_cli_daemon(self):
         result = self.classify('crates/coven-cli/src/daemon.rs')
         self.assertTrue(result['rust'])

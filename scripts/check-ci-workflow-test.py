@@ -14,6 +14,7 @@ RELEASE_TEXT = RELEASE_WORKFLOW.read_text(encoding='utf-8')
 class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_routes_pull_requests_through_gate(self) -> None:
         self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", CI_TEXT)
+        self.assertIn('git diff --name-only --diff-filter=ACMRD "$range"', CI_TEXT)
         self.assertIn("\n  changes:\n", CI_TEXT)
         self.assertIn("\n  pr-gate:\n", CI_TEXT)
         self.assertIn("name: PR gate", CI_TEXT)
