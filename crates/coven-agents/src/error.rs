@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::AgentId;
+use crate::{AgentId, RunItem};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -89,4 +89,56 @@ pub enum RunError {
     MaxTurnsExceeded { limit: usize },
     #[error("run exceeded the maximum of {limit} handoffs")]
     MaxHandoffsExceeded { limit: usize },
+}
+
+/// A failed run together with the transcript the run had produced when it
+/// failed.
+///
+/// A failing tool does not undo the work that preceded it: the user message,
+/// the assistant message, and the tool call that failed are all real transcript
+/// items. Returning a bare error would discard them, leaving callers unable to
+/// render the conversation, log it, or decide whether to retry. Every failure
+/// path therefore reports its partial transcript.
+///
+/// The runner never writes `new_items` to the session store on failure, so a
+/// failed run cannot silently become durable history. Persisting a partial
+/// transcript is a deliberate caller decision.
+#[derive(Debug)]
+pub struct RunFailure {
+    pub error: RunError,
+    /// Items produced during this run before it failed, in order. Always begins
+    /// with the user message that started the run.
+    pub new_items: Vec<RunItem>,
+    /// Model turns started before the failure. Zero when the run failed before
+    /// the first turn.
+    pub turns: usize,
+    /// Handoffs performed before the failure.
+    pub handoffs: usize,
+}
+
+impl RunFailure {
+    /// Discards the partial transcript and keeps only the error.
+    pub fn into_error(self) -> RunError {
+        self.error
+    }
+}
+
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, formatter)
+    }
+}
+
+impl std::error::Error for RunFailure {
+    /// Forwards to the underlying error's source so chain-printing callers see
+    /// the cause once rather than the wrapper's identical message twice.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
+}
+
+impl From<RunFailure> for RunError {
+    fn from(failure: RunFailure) -> Self {
+        failure.error
+    }
 }

@@ -13,7 +13,7 @@ mod session;
 mod tool;
 
 pub use agent::{Agent, AgentId, Handoff};
-pub use error::{BoxError, ConfigError, GuardrailStage, RunError};
+pub use error::{BoxError, ConfigError, GuardrailStage, RunError, RunFailure};
 pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
 pub use model::{
     HandoffCall, HandoffDefinition, Model, ModelAction, ModelRequest, ModelResponse, RunItem,
