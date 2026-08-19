@@ -1157,6 +1157,13 @@ fn finite_windows_security_wait_millis(remaining: std::time::Duration) -> Option
     (!remaining.is_zero()).then(|| remaining.as_millis().max(1).min((u32::MAX - 1) as u128) as u32)
 }
 
+#[cfg(any(windows, test))]
+const fn windows_pipe_client_flags() -> u32 {
+    // SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION prevents a named-pipe
+    // server from impersonating the client while its ACL is inspected.
+    0x0010_0000 | 0x0001_0000
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1167,9 +1174,9 @@ mod tests {
         read_bounded_windows_status, recorded_pipe_name_from_status,
         recorded_pipe_name_from_status_for_home, verify_legacy_case_folded_windows_home_identity,
         verify_legacy_windows_home_ancestors_are_case_insensitive, verify_legacy_windows_v1_home,
-        windows_status_validation_phase, PipeAccessRule, WindowsDirectoryIdentity,
-        WindowsStatusFileSecurity, WindowsTokenBuffer, MAX_DAEMON_STATUS_BYTES,
-        OWNER_ONLY_PIPE_ACCESS_MASK,
+        windows_pipe_client_flags, windows_status_validation_phase, PipeAccessRule,
+        WindowsDirectoryIdentity, WindowsStatusFileSecurity, WindowsTokenBuffer,
+        MAX_DAEMON_STATUS_BYTES, OWNER_ONLY_PIPE_ACCESS_MASK,
     };
     #[cfg(windows)]
     use super::{
@@ -1349,6 +1356,11 @@ mod tests {
             )),
             Some(u32::MAX - 1)
         );
+    }
+
+    #[test]
+    fn named_pipe_security_inspection_requests_identification_only_sqos() {
+        assert_eq!(windows_pipe_client_flags(), 0x0011_0000);
     }
 
     #[test]
@@ -2152,7 +2164,7 @@ fn validate_owner_only_windows_named_pipe_until(
             ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
             INVALID_HANDLE_VALUE,
         },
-        Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, READ_CONTROL},
+        Storage::FileSystem::{CreateFileW, OPEN_EXISTING, READ_CONTROL},
     };
 
     let mut object_path: Vec<u16> = object_path
@@ -2171,7 +2183,7 @@ fn validate_owner_only_windows_named_pipe_until(
                 0,
                 ptr::null(),
                 OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
+                windows_pipe_client_flags(),
                 ptr::null_mut(),
             )
         };

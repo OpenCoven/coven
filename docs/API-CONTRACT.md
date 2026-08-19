@@ -1548,6 +1548,11 @@ any of them.
 | `afterEventId`| No       | Compatibility cursor — resolves to a sequence position.|
 | `limit`       | No       | Maximum number of events to return (daemon-enforced, max 1000). |
 
+When `limit` is omitted, the daemon returns every remaining event that fits in
+one transport response; it does not apply an implicit 1000-event page. If the
+complete response would exceed the transport body limit, the request fails
+with `event_response_too_large` instead of silently returning a partial page.
+
 ### Response envelope
 
 ```json

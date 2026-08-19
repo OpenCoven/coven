@@ -266,8 +266,7 @@ fn lowercase_hash_pipe_name(coven_home: &Path) -> String {
 }
 
 fn write_inherited_legacy_status(coven_home: &Path, pid: u32, socket: &str) -> Result<()> {
-    std::fs::create_dir_all(coven_home)?;
-    coven_client::write_owner_only_windows_daemon_status(
+    write_inherited_legacy_status_bytes(
         coven_home,
         &serde_json::to_vec(&serde_json::json!({
             "pid": pid,
@@ -275,7 +274,23 @@ fn write_inherited_legacy_status(coven_home: &Path, pid: u32, socket: &str) -> R
             "socket": socket,
         }))?,
     )
-    .map_err(anyhow::Error::new)?;
+}
+
+fn write_inherited_legacy_status_bytes(coven_home: &Path, contents: &[u8]) -> Result<()> {
+    std::fs::create_dir_all(coven_home)?;
+    coven_client::write_owner_only_windows_daemon_status(coven_home, contents)
+        .map_err(anyhow::Error::new)?;
+    let status_path = coven_home.join("daemon.json");
+    for operation in ["/inheritance:e", "/reset"] {
+        let output = Command::new("icacls.exe")
+            .arg(&status_path)
+            .arg(operation)
+            .output()?;
+        assert_success(
+            &format!("apply inherited ACL to legacy daemon status with {operation}"),
+            &output,
+        );
+    }
     Ok(())
 }
 
@@ -509,12 +524,22 @@ fn inherited_legacy_status_rejects_cross_profile_and_arbitrary_records() -> Resu
     }
 
     let same_profile = legacy_pipe_name(&coven_home);
-    std::fs::write(
-        coven_home.join("daemon.json"),
+    write_inherited_legacy_status_bytes(
+        &coven_home,
         format!(
             r#"{{"pid":"ambiguous","startedAt":"2026-04-27T10:00:00Z","socket":"{same_profile}"}}"#
-        ),
+        )
+        .as_bytes(),
     )?;
+    let classification =
+        coven_client::read_windows_daemon_status_for_lifecycle(&coven_home).unwrap_err();
+    assert!(
+        classification
+            .to_string()
+            .contains("inherited daemon status identity could not be validated"),
+        "malformed legacy fixture was not classified through the inherited-ACL path: \
+         {classification}"
+    );
     let status = run_daemon_command(&coven_home, &["status", "--json"])?;
     assert!(!status.status.success());
     assert!(coven_home.join("daemon.json").exists());

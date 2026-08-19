@@ -4595,18 +4595,9 @@ fn list_session_events(coven_home: &Path, session_id: &str, query: &str) -> Resu
         );
     }
 
-    let requested_limit_raw = limit.unwrap_or(MAX_EVENTS_LIMIT);
-    let requested_limit = match usize::try_from(requested_limit_raw) {
-        Ok(n) if n >= 1 => n,
-        _ => {
-            return api_error(
-                400,
-                "invalid_request",
-                "limit must be a positive integer.",
-                Some(json!({ "limit": requested_limit_raw })),
-            );
-        }
-    };
+    let requested_limit = limit
+        .map(|limit| usize::try_from(limit).context("validated events limit was not representable"))
+        .transpose()?;
     let opts = store::EventsQueryOptions {
         after_seq,
         after_event_id,
@@ -4640,7 +4631,7 @@ struct BoundedEventsResponseStats {
 }
 
 fn bounded_events_response_from_source<FCandidates, FLoad>(
-    requested_limit: usize,
+    requested_limit: Option<usize>,
     initial_after_rowid: Option<i64>,
     mut candidates_after: FCandidates,
     mut load_event: FLoad,
@@ -4660,8 +4651,10 @@ where
     let mut has_more = false;
 
     'candidate_pages: loop {
-        let remaining_with_probe = requested_limit.saturating_sub(accepted).saturating_add(1);
-        let candidate_limit = remaining_with_probe.clamp(1, EVENT_CANDIDATE_BATCH_LIMIT);
+        let candidate_limit = requested_limit
+            .map(|limit| limit.saturating_sub(accepted).saturating_add(1))
+            .unwrap_or(EVENT_CANDIDATE_BATCH_LIMIT)
+            .clamp(1, EVENT_CANDIDATE_BATCH_LIMIT);
         let page = candidates_after(scan_after, candidate_limit)?;
         stats.candidate_batches = stats.candidate_batches.saturating_add(1);
         stats.peak_candidate_batch = stats.peak_candidate_batch.max(page.candidates.len());
@@ -4672,12 +4665,12 @@ where
 
         for candidate in page.candidates {
             stats.candidates_examined = stats.candidates_examined.saturating_add(1);
-            if accepted >= requested_limit {
+            if requested_limit.is_some_and(|limit| accepted >= limit) {
                 has_more = true;
                 break 'candidate_pages;
             }
             if candidate.allocation_bytes > MAX_EVENT_CANDIDATE_BYTES {
-                if accepted == 0 {
+                if accepted == 0 || requested_limit.is_none() {
                     return Ok((oversized_event_response(&candidate)?, stats));
                 }
                 has_more = true;
@@ -4695,7 +4688,7 @@ where
                 .encoded_lower_bound_bytes
                 .is_some_and(|lower_bound| lower_bound > event_json_budget)
             {
-                if accepted == 0 {
+                if accepted == 0 || requested_limit.is_none() {
                     return Ok((oversized_event_response(&candidate)?, stats));
                 }
                 has_more = true;
@@ -4712,14 +4705,14 @@ where
             stats.events_loaded = stats.events_loaded.saturating_add(1);
             stats.peak_loaded_event_bytes = stats.peak_loaded_event_bytes.max(loaded_bytes);
             if loaded_bytes > MAX_EVENT_CANDIDATE_BYTES {
-                if accepted == 0 {
+                if accepted == 0 || requested_limit.is_none() {
                     return Ok((oversized_event_response(&candidate)?, stats));
                 }
                 has_more = true;
                 break 'candidate_pages;
             }
             let Some(encoded_event) = serialize_event_with_limit(&event, event_json_budget)? else {
-                if accepted == 0 {
+                if accepted == 0 || requested_limit.is_none() {
                     return Ok((oversized_event_response(&candidate)?, stats));
                 }
                 has_more = true;
@@ -15860,6 +15853,30 @@ mod tests {
         Ok(())
     }
 
+    fn insert_numbered_test_events(
+        coven_home: &std::path::Path,
+        session_id: &str,
+        total: usize,
+    ) -> anyhow::Result<()> {
+        let mut conn = store::open_store(&store_path(coven_home))?;
+        let transaction = conn.transaction()?;
+        for index in 1..=total {
+            store::insert_event(
+                &transaction,
+                &store::EventRecord {
+                    seq: 0,
+                    id: format!("event-{index}"),
+                    session_id: session_id.to_string(),
+                    kind: "output".to_string(),
+                    payload_json: json!({ "data": index }).to_string(),
+                    created_at: "2026-05-19T00:00:00Z".to_string(),
+                },
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Regression coverage for the `/sessions/` route-prefix bug: an opaque
     /// session id that itself begins with `/sessions/` (e.g. a caller that
     /// doubles the collection prefix, or a raw v1 id chosen adversarially)
@@ -16793,6 +16810,12 @@ mod tests {
         }
         drop(conn);
 
+        let unbounded =
+            handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+        assert_eq!(unbounded.status, 413);
+        let unbounded_body: Value = serde_json::from_str(&unbounded.body)?;
+        assert_eq!(unbounded_body["error"]["code"], "event_response_too_large");
+
         let first = handle_request(
             "GET",
             "/events?sessionId=session-1&limit=2",
@@ -16948,7 +16971,7 @@ mod tests {
 
         let loaded = std::cell::RefCell::new(Vec::new());
         let (first, first_stats) = bounded_events_response_from_source(
-            3,
+            Some(3),
             None,
             |after, limit| store::list_event_candidates(&conn, "session-1", after, limit),
             |seq| {
@@ -16978,7 +17001,7 @@ mod tests {
         assert_eq!(*loaded.borrow(), [before_seq]);
 
         let (second, second_stats) = bounded_events_response_from_source(
-            3,
+            Some(3),
             Some(before_seq),
             |after, limit| store::list_event_candidates(&conn, "session-1", after, limit),
             |seq| {
@@ -17014,7 +17037,7 @@ mod tests {
         let loaded_events = Cell::new(0_usize);
 
         let (response, stats) = bounded_events_response_from_source(
-            TOTAL_EVENTS as usize,
+            Some(TOTAL_EVENTS as usize),
             None,
             |after_seq, limit| {
                 candidate_queries.set(candidate_queries.get() + 1);
@@ -17126,6 +17149,66 @@ mod tests {
         assert_eq!(limited.status, 200);
         assert_eq!(body["events"].as_array().unwrap().len(), 2);
         assert_eq!(body["hasMore"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_without_limit_returns_more_than_the_maximum_page() -> anyhow::Result<()> {
+        const TOTAL_EVENTS: usize = 1_005;
+
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        insert_numbered_test_events(temp_dir.path(), "session-1", TOTAL_EVENTS)?;
+
+        let response = handle_request("GET", "/events?sessionId=session-1", temp_dir.path(), None)?;
+
+        assert_eq!(response.status, 200);
+        let body: EventsResponse = serde_json::from_str(&response.body)?;
+        assert_eq!(body.events.len(), TOTAL_EVENTS);
+        assert_eq!(body.events.first().unwrap().id, "event-1");
+        assert_eq!(
+            body.events.last().unwrap().id,
+            format!("event-{TOTAL_EVENTS}")
+        );
+        assert!(!body.has_more);
+        Ok(())
+    }
+
+    #[test]
+    fn events_endpoint_explicit_maximum_limit_still_paginates() -> anyhow::Result<()> {
+        const TOTAL_EVENTS: usize = 1_005;
+
+        let temp_dir = tempfile::tempdir()?;
+        insert_test_session(temp_dir.path(), "session-1")?;
+        insert_numbered_test_events(temp_dir.path(), "session-1", TOTAL_EVENTS)?;
+
+        let first = handle_request(
+            "GET",
+            "/events?sessionId=session-1&limit=1000",
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(first.status, 200);
+        let first: EventsResponse = serde_json::from_str(&first.body)?;
+        assert_eq!(first.events.len(), 1_000);
+        assert!(first.has_more);
+        let cursor = first.next_cursor.expect("first page cursor").after_seq;
+
+        let second = handle_request(
+            "GET",
+            &format!("/events?sessionId=session-1&limit=1000&afterSeq={cursor}"),
+            temp_dir.path(),
+            None,
+        )?;
+        assert_eq!(second.status, 200);
+        let second: EventsResponse = serde_json::from_str(&second.body)?;
+        assert_eq!(second.events.len(), TOTAL_EVENTS - 1_000);
+        assert!(!second.has_more);
+        assert_eq!(second.events.first().unwrap().id, "event-1001");
+        assert_eq!(
+            second.events.last().unwrap().id,
+            format!("event-{TOTAL_EVENTS}")
+        );
         Ok(())
     }
 
