@@ -222,6 +222,7 @@ fn process_is_alive(pid: u32) -> bool {
 }
 
 fn legacy_pipe_name(coven_home: &Path) -> String {
+    std::fs::create_dir_all(coven_home).expect("create legacy fixture Coven home");
     coven_client::supported_windows_pipe_names(coven_home)
         .expect("derive supported Windows daemon pipe names")[2]
         .clone()
@@ -498,6 +499,22 @@ fn inherited_legacy_status_with_live_pid_is_preserved_by_lifecycle_commands() ->
         );
         assert!(coven_home.join("daemon.json").exists());
     }
+    Ok(())
+}
+
+#[test]
+fn legacy_pipe_fixture_creates_home_before_canonical_name_derivation() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let coven_home = temp.path().join("coven-home");
+    assert!(!coven_home.exists());
+
+    let legacy = legacy_pipe_name(&coven_home);
+
+    assert!(coven_home.is_dir());
+    assert_eq!(
+        legacy,
+        coven_client::supported_windows_pipe_names(&coven_home)?[2]
+    );
     Ok(())
 }
 
