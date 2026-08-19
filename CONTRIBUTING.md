@@ -135,6 +135,12 @@ python scripts/check-secrets.py
 python3 scripts/check-coven-privacy.py --staged
 ```
 
+If your change only touches one routed CI surface (for example docs, npm, or a
+single Rust crate), say that clearly in the PR and explain which local checks
+cover it. Reviewers and CI may then rely on the matching routed jobs instead of
+expecting every matrix leg; broad or cross-surface changes should still be
+validated with the full local check set above.
+
 5. Include smoke-test notes for runtime or API changes.
 6. Update docs when command behavior, API behavior, or trust boundaries change.
 
