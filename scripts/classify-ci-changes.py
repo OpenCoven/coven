@@ -41,22 +41,27 @@ def classify(paths: list[str]) -> dict[str, bool]:
         )
         is_rust = is_cargo_metadata or path.startswith('crates/') or path.endswith('.rs')
         is_afs = is_cargo_metadata or path.startswith('crates/coven-afs/') or path == 'crates/coven-cli/src/afs_mount.rs' or path == 'scripts/afs-mount-smoke.sh'
-        is_channels = path.startswith('channels/') or path.startswith('crates/coven-channels/')
-        is_openclaw = path.startswith('openclaw/') or path.startswith('crates/coven-openclaw/')
+        is_channels = path.startswith('packages/channels/') or path.startswith('crates/coven-channels/')
+        is_openclaw = path.startswith('packages/openclaw-coven/') or path.startswith('crates/coven-openclaw/')
         is_npm = is_cargo_metadata or path.startswith('npm/') or path.startswith('crates/coven-cli/') or path in {
             'scripts/publish-npm.mjs',
             'scripts/publish-npm-test.mjs',
             'scripts/release-npm-context.mjs',
             'scripts/release-npm-platform-matrix.mjs',
             'scripts/test-cli-prepublish.mjs',
-            'src/engine_install.rs',
         }
-        is_engine = path in {'crates/coven-cli/engine.lock', 'src/engine.rs', 'src/engine_install.rs', 'scripts/pin-engine.sh'}
+        is_engine = path in {
+            'crates/coven-cli/src/engine.rs',
+            'crates/coven-cli/src/engine_install.rs',
+            'crates/coven-cli/engine.lock',
+            'scripts/pin-engine.sh',
+        }
         is_workflow = path.startswith('.github/workflows/') or path in {
             'scripts/classify-ci-changes.py',
             'scripts/classify-ci-changes-test.py',
-            'scripts/workflow-check.py',
-            'scripts/workflow-check-test.py',
+            'scripts/check-workflows.sh',
+            'scripts/check-workflows-test.py',
+            'scripts/check-ci-workflow-test.py',
         }
         categories['rust'] |= is_rust
         categories['afs'] |= is_afs

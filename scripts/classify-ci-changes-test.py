@@ -37,19 +37,49 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(result['afs'])
 
     def test_channels_only(self):
-        self.assertTrue(self.classify('channels/src/index.ts')['channels'])
+        result = self.classify('packages/channels/src/index.ts')
+        self.assertTrue(result['channels'])
+        self.assertFalse(result['openclaw'])
+        self.assertFalse(result['npm_packaging'])
 
     def test_openclaw_only(self):
-        self.assertTrue(self.classify('openclaw/src/index.ts')['openclaw'])
+        result = self.classify('packages/openclaw-coven/src/client.ts')
+        self.assertTrue(result['openclaw'])
+        self.assertFalse(result['channels'])
+        self.assertFalse(result['engine'])
 
     def test_npm_wrapper_only(self):
         self.assertTrue(self.classify('crates/coven-cli/src/wrapper.rs')['npm_packaging'])
 
     def test_engine_install(self):
-        result = self.classify('src/engine_install.rs')
+        result = self.classify('crates/coven-cli/src/engine_install.rs')
         self.assertTrue(result['rust'])
         self.assertTrue(result['npm_packaging'])
         self.assertTrue(result['engine'])
+
+    def test_engine_related_paths(self):
+        for path in (
+            'crates/coven-cli/src/engine.rs',
+            'crates/coven-cli/engine.lock',
+            'scripts/pin-engine.sh',
+        ):
+            with self.subTest(path=path):
+                result = self.classify(path)
+                self.assertTrue(result['engine'])
+                self.assertFalse(result['workflow'])
+
+    def test_workflow_supporting_scripts_fan_out(self):
+        for path in (
+            'scripts/check-workflows.sh',
+            'scripts/check-workflows-test.py',
+            'scripts/check-ci-workflow-test.py',
+        ):
+            with self.subTest(path=path):
+                result = self.classify(path)
+                self.assertFalse(result['docs_only'])
+                for key, value in result.items():
+                    if key != 'docs_only':
+                        self.assertTrue(value, key)
 
     def test_workflow_fans_all(self):
         result = self.classify('.github/workflows/ci.yml')
@@ -62,7 +92,7 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(self.classify('foo/bar.txt')['rust'])
 
     def test_mixed_docs_channels(self):
-        result = self.classify('docs/a.md', 'channels/src/index.ts')
+        result = self.classify('docs/a.md', 'packages/channels/src/index.ts')
         self.assertFalse(result['docs_only'])
         self.assertTrue(result['channels'])
 
