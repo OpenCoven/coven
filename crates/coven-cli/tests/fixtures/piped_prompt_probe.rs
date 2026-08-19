@@ -44,7 +44,15 @@ fn required_arg(name: &str) -> String {
 }
 
 fn main() {
-    match required_arg("mode").as_str() {
+    let mode = required_arg("mode");
+    if !mode.starts_with("output-child") {
+        if let Ok(delay_ms) = env::var("COVEN_TEST_PIPED_STARTUP_DELAY_MS") {
+            thread::sleep(Duration::from_millis(
+                delay_ms.parse().expect("startup delay milliseconds"),
+            ));
+        }
+    }
+    match mode.as_str() {
         mode @ ("duplex" | "duplex-contained") => {
             let output_bytes = required_arg("first")
                 .parse::<usize>()

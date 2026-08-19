@@ -1050,10 +1050,10 @@ fn symlinked_ancestor_parent_components_connect_to_the_validated_socket() {
     }
 
     let sandbox = TestHome::new();
-    let target_parent = sandbox.path.join("target");
-    let symlink_target = target_parent.join("pivot");
-    let validated_home = target_parent.join("home");
-    let lexically_retargeted_home = sandbox.path.join("home");
+    let target_parent = sandbox.path.join("t");
+    let symlink_target = target_parent.join("p");
+    let validated_home = target_parent.join("h");
+    let lexically_retargeted_home = sandbox.path.join("h");
     fs::create_dir_all(&symlink_target).expect("create symlink target");
     fs::create_dir_all(&validated_home).expect("create validated Coven home");
     fs::create_dir_all(&lexically_retargeted_home).expect("create retargeted Coven home");
@@ -1064,7 +1064,7 @@ fn symlinked_ancestor_parent_components_connect_to_the_validated_socket() {
         fs::Permissions::from_mode(0o700),
     )
     .expect("make retargeted Coven home private");
-    let linked_ancestor = sandbox.path.join("linked-ancestor");
+    let linked_ancestor = sandbox.path.join("l");
     symlink(&symlink_target, &linked_ancestor).expect("create symlinked ancestor");
 
     let validated_socket = validated_home.join("coven.sock");
@@ -1091,7 +1091,7 @@ fn symlinked_ancestor_parent_components_connect_to_the_validated_socket() {
         Arc::clone(&stop_servers),
     );
 
-    let discovered_home = linked_ancestor.join("..").join("home");
+    let discovered_home = linked_ancestor.join("..").join("h");
     let endpoint = DaemonEndpoint::discover(&discovered_home)
         .expect("discover through a symlinked ancestor followed by parent traversal");
     let mut client = DaemonClient::new(endpoint);

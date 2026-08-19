@@ -1169,7 +1169,13 @@ struct Bundle {
 
 struct MigrationFamiliar {
     dir: Dir,
-    _lock: std::fs::File,
+    lock: std::fs::File,
+}
+
+impl Drop for MigrationFamiliar {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.lock);
+    }
 }
 
 struct TargetContext {
@@ -1656,12 +1662,19 @@ fn open_locked_migration_familiar(coven_home: &Path, familiar: &str) -> Result<M
         .map_err(|_| anyhow!("unable to open memory migration lock"))?;
     validate_private_file_handle(&lock)?;
     let lock = lock.into_std();
-    lock.try_lock_exclusive()
-        .map_err(|_| anyhow!("another memory migration is active for this familiar"))?;
+    lock.try_lock_exclusive().map_err(migration_lock_error)?;
     Ok(MigrationFamiliar {
         dir: familiar_dir,
-        _lock: lock,
+        lock,
     })
+}
+
+fn migration_lock_error(error: io::Error) -> anyhow::Error {
+    if crate::state_lock::is_lock_contended(&error) {
+        anyhow!("another memory migration is active for this familiar")
+    } else {
+        anyhow::Error::new(error).context("unable to acquire memory migration lock")
+    }
 }
 
 fn open_or_create_bundle(migration: &MigrationFamiliar, bundle_id: &str) -> Result<Bundle> {
@@ -6443,6 +6456,29 @@ mod tests {
         assert_eq!(fs::read(first.join("sentinel"))?, b"user directory");
         assert_eq!(fs::read(second)?, b"conflict");
         Ok(())
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn migration_lock_diagnostic_preserves_non_contention_os_error() {
+        let source = io::Error::new(io::ErrorKind::PermissionDenied, "fixture denied");
+
+        let error = migration_lock_error(source);
+
+        assert!(
+            error.chain().any(|cause| {
+                cause
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied)
+            }),
+            "{error:#}"
+        );
+        assert!(
+            !error
+                .to_string()
+                .contains("another memory migration is active"),
+            "{error:#}"
+        );
     }
 
     #[test]

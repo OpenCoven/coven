@@ -244,7 +244,19 @@ fn concurrent_takeover_of_expired_claim_yields_exactly_one_winner() -> anyhow::R
         ],
     )?;
     assert_success("claim acquire by ghost", &seeded);
-    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let claim_path = repo.claim_path("feature/demo")?;
+    let expired = fs::read_to_string(&claim_path)?
+        .lines()
+        .map(|line| {
+            if line.starts_with("expires_at=") {
+                "expires_at=0"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&claim_path, format!("{expired}\n"))?;
 
     let results = repo.race_acquire("feature/demo", &["cody", "sage", "nova", "kitty"], [])?;
 
@@ -730,39 +742,15 @@ impl TestRepo {
             .ok_or_else(|| anyhow::anyhow!("no {key} in {}:\n{contents}", path.display()))
     }
 
-    /// Launch one `claim acquire` per agent as concurrently as processes
-    /// allow, so the acquire path is exercised as a real race rather than a
-    /// sequence. Every child is spawned before any of them is waited on.
+    /// Release one prepared worker per agent through a shared start barrier,
+    /// then collect every outcome before evaluating the race.
     fn race_acquire<'a, const M: usize>(
         &self,
         branch: &str,
         agents: &[&'a str],
         env: [(&str, &str); M],
     ) -> anyhow::Result<Vec<(&'a str, Output)>> {
-        let children = agents
-            .iter()
-            .map(|agent| {
-                let mut command = Command::new(coven_bin());
-                command
-                    .args(["claim", "acquire", branch])
-                    .current_dir(&self.path)
-                    .env("COVEN_HOME", self.path.join(".coven-home"))
-                    .env("COVEN_AGENT_ID", agent)
-                    .env_remove("COVEN_ALLOW_PRIMARY_COMMIT")
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped());
-                for (key, value) in env {
-                    command.env(key, value);
-                }
-                command.spawn().map(|child| (*agent, child))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        children
-            .into_iter()
-            .map(|(agent, child)| child.wait_with_output().map(|output| (agent, output)))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
+        race_acquire_with_start_barrier(&self.path, branch, agents, env)
     }
 
     fn git_common_dir(&self) -> anyhow::Result<PathBuf> {
@@ -772,6 +760,54 @@ impl TestRepo {
 
 fn coven_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coven"))
+}
+
+fn race_acquire_with_start_barrier<'a, const M: usize>(
+    repo_path: &Path,
+    branch: &str,
+    agents: &[&'a str],
+    env: [(&str, &str); M],
+) -> anyhow::Result<Vec<(&'a str, Output)>> {
+    use std::sync::{mpsc, Arc, Barrier};
+
+    let start = Arc::new(Barrier::new(agents.len() + 1));
+    let (outcome_tx, outcome_rx) = mpsc::channel();
+    let mut outcomes = std::thread::scope(|scope| -> anyhow::Result<Vec<(usize, Output)>> {
+        for (index, agent) in agents.iter().enumerate() {
+            let start = Arc::clone(&start);
+            let outcome_tx = outcome_tx.clone();
+            scope.spawn(move || {
+                let mut command = Command::new(coven_bin());
+                command
+                    .args(["claim", "acquire", branch])
+                    .current_dir(repo_path)
+                    .env("COVEN_HOME", repo_path.join(".coven-home"))
+                    .env("COVEN_AGENT_ID", agent)
+                    .env_remove("COVEN_ALLOW_PRIMARY_COMMIT")
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped());
+                for (key, value) in env {
+                    command.env(key, value);
+                }
+                start.wait();
+                let _ = outcome_tx.send((index, command.output()));
+            });
+        }
+        drop(outcome_tx);
+        start.wait();
+
+        let mut outcomes = Vec::with_capacity(agents.len());
+        for _ in agents {
+            let (index, output) = outcome_rx.recv()?;
+            outcomes.push((index, output?));
+        }
+        Ok(outcomes)
+    })?;
+    outcomes.sort_by_key(|(index, _)| *index);
+    Ok(outcomes
+        .into_iter()
+        .map(|(index, output)| (agents[index], output))
+        .collect())
 }
 
 fn assert_success(label: &str, output: &Output) {
