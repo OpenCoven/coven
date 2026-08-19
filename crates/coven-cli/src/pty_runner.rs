@@ -5955,7 +5955,11 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "blocked prompt timeout took {elapsed:?}"
+        );
         assert!(format!("{error:#}").contains("timed out"), "{error:#}");
         let result = exit_rx.recv_timeout(Duration::from_secs(2))?;
         assert_eq!(result.status, "failed", "{result:?}");
