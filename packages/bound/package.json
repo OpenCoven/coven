@@ -1,0 +1,17 @@
+{
+  "name": "@opencoven/bound",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bound — signed spend authority for Coven familiars. A cap no agent can raise.",
+  "license": "MIT",
+  "engines": { "node": ">=22.18.0" },
+  "scripts": {
+    "dev": "node bin/bound.ts dev",
+    "status": "node bin/bound.ts status",
+    "demo": "node demo/agent.ts",
+    "attacks": "node demo/attacks.ts",
+    "test": "node --test \"test/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  }
+}
