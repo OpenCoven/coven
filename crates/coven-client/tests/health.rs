@@ -26,12 +26,16 @@ impl TestHome {
             .ancestors()
             .nth(2)
             .expect("workspace root");
-        let path = workspace.join("c").join(format!(
-            "{:x}{:x}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&path).expect("create test Coven home");
+        let test_root = workspace.join("c");
+        fs::create_dir_all(&test_root).expect("create test root");
+        let path = loop {
+            let candidate = test_root.join(format!("{:x}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("create test Coven home: {error}"),
+            }
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
