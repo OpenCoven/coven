@@ -9459,7 +9459,10 @@ mod tests {
             .expect("workspace root")
             .join("c");
         std::fs::create_dir_all(&test_root)?;
-        let temp_dir = tempfile::tempdir_in(&test_root)?;
+        let temp_dir = tempfile::Builder::new()
+            .prefix("")
+            .rand_bytes(2)
+            .tempdir_in(&test_root)?;
         let coven_home = temp_dir.path().to_path_buf();
         ensure_private_coven_home(&coven_home)?;
         let socket = daemon_socket_path(&coven_home);
