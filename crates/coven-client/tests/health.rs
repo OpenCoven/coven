@@ -2,6 +2,7 @@
 
 use std::{
     fs,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -13,6 +14,13 @@ use coven_client::{
 
 const HEALTH: &str = include_str!("../fixtures/health.json");
 const ERROR: &str = include_str!("../fixtures/error.json");
+const MIN_SOCKET_PATH_MARGIN: usize = 16;
+
+fn unix_socket_path_margin(path: &Path) -> usize {
+    let capacity = std::mem::size_of::<libc::sockaddr_un>()
+        - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    capacity.saturating_sub(path.as_os_str().as_bytes().len() + 1)
+}
 
 struct TestHome {
     path: PathBuf,
@@ -22,20 +30,20 @@ impl TestHome {
     fn new() -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root");
-        let test_root = workspace.join("c");
-        fs::create_dir_all(&test_root).expect("create test root");
+        let test_root = std::env::temp_dir();
         let path = loop {
-            let candidate = test_root.join(format!("{:x}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            let candidate = test_root.join(format!(
+                "c{:x}{:x}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
             match fs::create_dir(&candidate) {
                 Ok(()) => break candidate,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => panic!("create test Coven home: {error}"),
             }
         };
+        let path = fs::canonicalize(path).expect("canonicalize test Coven home");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -49,8 +57,44 @@ impl TestHome {
 impl Drop for TestHome {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
-        let _ = fs::remove_dir(self.path.parent().expect("test root"));
     }
+}
+
+#[test]
+fn dropping_test_home_keeps_the_shared_allocator_base() {
+    let home = TestHome::new();
+    let allocator_base = home.path.parent().expect("allocator base").to_path_buf();
+
+    drop(home);
+
+    assert!(
+        allocator_base.is_dir(),
+        "dropping one owned home must not remove the allocator base"
+    );
+}
+
+#[test]
+fn test_home_socket_path_is_checkout_independent_with_headroom() {
+    let workspace = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root"),
+    )
+    .expect("canonicalize workspace root");
+    let home = TestHome::new();
+    let socket = home.path.join("coven.sock");
+
+    assert!(
+        !home.path.starts_with(workspace),
+        "test home must not inherit checkout depth: {}",
+        home.path.display()
+    );
+    assert!(
+        unix_socket_path_margin(&socket) >= MIN_SOCKET_PATH_MARGIN,
+        "test socket needs at least {MIN_SOCKET_PATH_MARGIN} bytes of SUN_LEN headroom: {}",
+        socket.display()
+    );
 }
 
 #[cfg(unix)]

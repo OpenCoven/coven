@@ -5300,6 +5300,49 @@ mod tests {
 
     #[cfg(unix)]
     static DAEMON_TERMINATION_TEST_LOCK: Mutex<()> = Mutex::new(());
+    #[cfg(unix)]
+    const MIN_TEST_SOCKET_PATH_MARGIN: usize = 16;
+
+    #[cfg(unix)]
+    fn unix_socket_path_margin(path: &Path) -> usize {
+        let capacity = std::mem::size_of::<libc::sockaddr_un>()
+            - std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        capacity.saturating_sub(path.as_os_str().as_bytes().len() + 1)
+    }
+
+    #[cfg(unix)]
+    fn read_bounded_test_request(stream: &mut UnixStream, deadline: Instant) -> Result<String> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+        ))?;
+        let mut request = String::new();
+        stream.read_to_string(&mut request)?;
+        Ok(request)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_request_reader_waits_for_a_nonblocking_accepted_stream() -> Result<()> {
+        use std::net::Shutdown;
+
+        let (mut reader, mut writer) = UnixStream::pair()?;
+        reader.set_nonblocking(true)?;
+        let writer = std::thread::spawn(move || -> std::io::Result<()> {
+            std::thread::sleep(Duration::from_millis(25));
+            writer.write_all(b"GET /health HTTP/1.1\r\n\r\n")?;
+            writer.shutdown(Shutdown::Write)
+        });
+
+        let request =
+            read_bounded_test_request(&mut reader, Instant::now() + Duration::from_secs(1));
+        writer.join().expect("delayed request writer")?;
+
+        assert_eq!(request?, "GET /health HTTP/1.1\r\n\r\n");
+        Ok(())
+    }
 
     fn test_daemon_status_socket(coven_home: &Path) -> String {
         daemon_startup_status_socket(coven_home).expect("derive test daemon endpoint")
@@ -9429,7 +9472,7 @@ mod tests {
     #[test]
     fn authenticated_relative_status_is_rewritten_to_the_canonical_socket() -> Result<()> {
         use std::{
-            io::{Read, Write},
+            io::Write,
             os::unix::{fs::PermissionsExt, net::UnixListener},
             time::Instant,
         };
@@ -9453,19 +9496,34 @@ mod tests {
         }
 
         let current_dir = std::fs::canonicalize(std::env::current_dir()?)?;
-        let test_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root")
-            .join("c");
-        std::fs::create_dir_all(&test_root)?;
         let temp_dir = tempfile::Builder::new()
-            .prefix("")
-            .rand_bytes(2)
-            .tempdir_in(&test_root)?;
-        let coven_home = temp_dir.path().to_path_buf();
+            .prefix("c")
+            .rand_bytes(6)
+            .tempdir()?;
+        let coven_home = std::fs::canonicalize(temp_dir.path())?;
         ensure_private_coven_home(&coven_home)?;
         let socket = daemon_socket_path(&coven_home);
+        assert_eq!(
+            coven_home,
+            std::fs::canonicalize(&coven_home)?,
+            "relative-status fixture must measure and advertise its canonical home"
+        );
+        let workspace = std::fs::canonicalize(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("workspace root"),
+        )?;
+        assert!(
+            !coven_home.starts_with(&workspace),
+            "relative-status fixture must not inherit checkout depth: {}",
+            coven_home.display()
+        );
+        assert!(
+            unix_socket_path_margin(&socket) >= MIN_TEST_SOCKET_PATH_MARGIN,
+            "relative-status fixture needs at least {MIN_TEST_SOCKET_PATH_MARGIN} bytes of SUN_LEN headroom: {}",
+            socket.display()
+        );
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         let relative_socket = relative_path(&current_dir, &std::fs::canonicalize(&socket)?)
@@ -9485,8 +9543,7 @@ mod tests {
             loop {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = String::new();
-                        stream.read_to_string(&mut request)?;
+                        let request = read_bounded_test_request(&mut stream, deadline)?;
                         assert!(request.starts_with("GET /health HTTP/1.1\r\n"));
                         let body = serde_json::json!({
                             "ok": true,
@@ -9537,7 +9594,7 @@ mod tests {
     #[test]
     fn copied_profile_status_cannot_select_another_profiles_socket() -> Result<()> {
         use std::{
-            io::{Read, Write},
+            io::Write,
             os::unix::{fs::PermissionsExt, net::UnixListener},
             sync::{
                 atomic::{AtomicBool, Ordering},
@@ -9560,8 +9617,7 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             contacted.store(true, Ordering::Release);
-                            let mut request = String::new();
-                            stream.read_to_string(&mut request)?;
+                            let _request = read_bounded_test_request(&mut stream, deadline)?;
                             let body = serde_json::json!({
                                 "ok": true,
                                 "apiVersion": crate::api::COVEN_API_NAMED_VERSION,
