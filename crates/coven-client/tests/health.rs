@@ -1030,6 +1030,16 @@ fn symlinked_ancestor_parent_components_connect_to_the_validated_socket() {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream
+                            .set_nonblocking(false)
+                            .expect("configure blocking test stream");
+                        stream
+                            .set_read_timeout(Some(
+                                deadline
+                                    .saturating_duration_since(Instant::now())
+                                    .max(Duration::from_millis(1)),
+                            ))
+                            .expect("bound client request read");
                         let mut request = String::new();
                         stream
                             .read_to_string(&mut request)
