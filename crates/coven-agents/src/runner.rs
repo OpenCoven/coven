@@ -246,6 +246,13 @@ where
             }
             (None, _) => progress.items.clone(),
         };
+        let mut seen_call_ids: BTreeSet<String> = model_items
+            .iter()
+            .filter_map(|item| match item {
+                RunItem::ToolCall { call, .. } => Some(call.id.clone()),
+                _ => None,
+            })
+            .collect();
 
         for turn in 1..=options.max_turns {
             progress.turns = turn;
@@ -453,6 +460,26 @@ where
                 });
                 current = target;
                 continue;
+            }
+
+            // A tool result correlates to its call by id, so a reused id makes
+            // the transcript ambiguous. The whole response is screened before
+            // any tool runs: rejecting mid-batch would leave the side effects
+            // of the earlier calls behind with no way to correlate them.
+            for action in &response.actions {
+                let ModelAction::ToolCall(call) = action else {
+                    continue;
+                };
+                if !seen_call_ids.insert(call.id.clone()) {
+                    return Err(self.fail(
+                        &current.id,
+                        RunFailureKind::InvalidResponse,
+                        RunError::DuplicateToolCallId {
+                            agent: current.id.clone(),
+                            call_id: call.id.clone(),
+                        },
+                    ));
+                }
             }
 
             for action in response.actions {

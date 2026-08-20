@@ -87,6 +87,14 @@ Configuration errors are detected before a run. Runtime errors preserve the
 agent, tool, guardrail stage, operation, and source error where applicable.
 Unknown model-requested tools or handoffs fail closed.
 
+Tool call ids must be unique across a run, including ids already present in
+loaded session history. A `ToolResult` correlates to its call by id, so a reused
+id makes the transcript ambiguous and no consumer can pair a result with the
+call that produced it. The runner screens an entire response for duplicates
+before executing any of its tools, so a duplicate late in a batch cannot leave
+the side effects of earlier calls behind. Violations fail closed with
+`RunError::DuplicateToolCallId`.
+
 Input guardrails are blocking by default. This is safer for a local tool runtime
 because rejected input cannot race with model calls or tool side effects.
 

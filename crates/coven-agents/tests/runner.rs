@@ -110,6 +110,32 @@ impl Tool<()> for CountingDefinitionTool {
     }
 }
 
+/// Records how many times the runner actually executed a tool, so tests can
+/// prove a rejected response ran nothing.
+struct CountingCallTool {
+    calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Tool<()> for CountingCallTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "add",
+            "Counts executions",
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": true
+            }),
+        )
+    }
+
+    async fn execute(&self, _arguments: Value, _context: &()) -> Result<Value, BoxError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({ "ok": true }))
+    }
+}
+
 struct RejectInput;
 
 #[async_trait]
@@ -417,14 +443,17 @@ async fn rejected_output_is_not_appended_to_the_session() {
 
 #[tokio::test]
 async fn bounded_runner_stops_repeated_tool_turns() {
-    let repeated_call = || {
+    let repeated_call = |id: &str| {
         ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
-            "call",
+            id,
             "add",
             json!({ "left": 1, "right": 1 }),
         ))])
     };
-    let model = Arc::new(QueueModel::new([repeated_call(), repeated_call()]));
+    let model = Arc::new(QueueModel::new([
+        repeated_call("call-1"),
+        repeated_call("call-2"),
+    ]));
     let agent = Agent::new("loop", "Loop", "Keep calling.", model).with_tool(Arc::new(AddTool));
     let runner = Runner::new([agent]).unwrap();
     let options = RunOptions {
@@ -725,4 +754,138 @@ async fn tool_failure_after_a_handoff_returns_the_whole_run_transcript() {
         &items[2],
         RunItem::ToolCall { agent, call } if agent.as_str() == "worker" && call.name == "explode"
     ));
+}
+
+#[tokio::test]
+async fn rejects_duplicate_tool_call_ids_within_one_response() {
+    let model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 1, "right": 2 }),
+        )),
+        ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 3, "right": 4 }),
+        )),
+    ])]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent =
+        Agent::new("worker", "Worker", "Use tools.", model).with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let failure = runner
+        .run("worker", "Add twice.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
+    ));
+    assert_eq!(
+        failure.error.to_string(),
+        "agent `worker` reused tool call id `call-1`"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the whole response is screened before any tool runs"
+    );
+    assert!(
+        !failure
+            .new_items
+            .iter()
+            .any(|item| matches!(item, RunItem::ToolCall { .. })),
+        "an ambiguous call never enters the transcript, got {:?}",
+        failure.new_items
+    );
+    assert_paired_lifecycle(&observer.events());
+    assert!(observer.events().iter().any(|event| matches!(
+        event,
+        RunEvent::RunFailed {
+            kind: RunFailureKind::InvalidResponse,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn rejects_tool_call_ids_reused_across_turns() {
+    let repeated = || {
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 1, "right": 1 }),
+        ))])
+    };
+    let model = Arc::new(QueueModel::new([repeated(), repeated()]));
+    let agent = Agent::new("loop", "Loop", "Keep calling.", model).with_tool(Arc::new(AddTool));
+    let runner = Runner::new([agent]).unwrap();
+
+    let failure = runner
+        .run("loop", "Loop.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
+    ));
+    assert_eq!(failure.turns, 2);
+    assert_eq!(
+        failure.new_items.len(),
+        3,
+        "the first turn's call and result are kept, got {:?}",
+        failure.new_items
+    );
+}
+
+#[tokio::test]
+async fn rejects_tool_call_ids_already_present_in_session_history() {
+    let session = Arc::new(InMemorySession::default());
+    session
+        .append(
+            "conversation-1",
+            &[RunItem::ToolCall {
+                agent: "worker".into(),
+                call: ToolCall::new("call-1", "add", json!({ "left": 1, "right": 1 })),
+            }],
+        )
+        .await
+        .unwrap();
+    let model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({ "left": 2, "right": 2 }),
+        )),
+    ])]));
+    let agent = Agent::new("worker", "Worker", "Use tools.", model).with_tool(Arc::new(AddTool));
+    let runner = Runner::new([agent]).unwrap().with_session(session.clone());
+    let options = RunOptions {
+        session_id: Some("conversation-1".to_owned()),
+        ..RunOptions::default()
+    };
+
+    let failure = runner
+        .run("worker", "Add again.", &(), options)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
+    ));
+    assert_eq!(
+        session.items("conversation-1").await.unwrap().len(),
+        1,
+        "the rejected run adds nothing to durable history"
+    );
 }
