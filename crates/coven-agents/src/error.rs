@@ -74,6 +74,8 @@ pub enum RunError {
     },
     #[error("agent `{agent}` requested unknown tool `{tool}`")]
     UnknownTool { agent: AgentId, tool: String },
+    #[error("agent `{agent}` reused tool call id `{call_id}`")]
+    DuplicateToolCallId { agent: AgentId, call_id: String },
     #[error("tool `{tool}` for agent `{agent}` failed")]
     ToolFailed {
         agent: AgentId,
