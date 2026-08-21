@@ -5577,9 +5577,10 @@ mod tests {
                 &self,
                 _coven_home: &Path,
                 _status: &DaemonStatus,
-                _deadline: LifecycleDeadline,
+                deadline: LifecycleDeadline,
             ) -> Result<VerifiedStopOutcome> {
-                std::thread::sleep(Duration::from_millis(25));
+                let remaining = deadline.remaining("forcing the test stop deadline to expire")?;
+                std::thread::sleep(remaining.saturating_add(Duration::from_millis(10)));
                 Ok(VerifiedStopOutcome::Exited)
             }
 
@@ -5611,7 +5612,7 @@ mod tests {
         let error = stop_background_server_with_controller_until(
             temp_dir.path(),
             &SlowVerifiedStop,
-            LifecycleDeadline::after(Duration::from_millis(10))?,
+            LifecycleDeadline::after(Duration::from_millis(100))?,
         )
         .expect_err("cleanup must not start after the original stop budget");
 
