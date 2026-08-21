@@ -808,6 +808,58 @@ async fn duplicate_tool_call_ids_in_one_response_execute_no_tools() {
 }
 
 #[tokio::test]
+async fn tool_call_id_reused_across_turns_executes_only_once() {
+    let repeated = || {
+        ModelResponse::actions(vec![ModelAction::ToolCall(ToolCall::new(
+            "call-1",
+            "add",
+            json!({}),
+        ))])
+    };
+    let model = Arc::new(QueueModel::new([repeated(), repeated()]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let agent =
+        Agent::new("worker", "Worker", "Use tools.", model).with_tool(Arc::new(CountingCallTool {
+            calls: calls.clone(),
+        }));
+    let runner = Runner::new([agent]).unwrap();
+
+    let failure = runner
+        .run("worker", "Add twice.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
+    ));
+    assert_eq!(failure.turns, 2);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        failure.new_items.len(),
+        3,
+        "only the first turn's unambiguous call and result are retained, got {:?}",
+        failure.new_items
+    );
+    assert_eq!(
+        failure
+            .new_items
+            .iter()
+            .filter(|item| matches!(item, RunItem::ToolCall { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        failure
+            .new_items
+            .iter()
+            .filter(|item| matches!(item, RunItem::ToolResult { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn resumed_history_rejects_reused_tool_call_id() {
     let session = Arc::new(InMemorySession::default());
     session
