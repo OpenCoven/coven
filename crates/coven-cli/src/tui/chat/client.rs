@@ -162,7 +162,7 @@ pub(crate) fn validated_event_page_cursor(
     Ok(cursor)
 }
 
-/// Follow the daemon's `nextCursor` until the session listing is exhausted.
+/// Follow the daemon's `next_cursor` until the session listing is exhausted.
 ///
 /// The daemon pages `/sessions` and the previous caller asked for one page of
 /// 100 and dropped the continuation, so a ledger with more sessions than that

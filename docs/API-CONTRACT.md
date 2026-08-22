@@ -632,17 +632,19 @@ External `running` sessions are not daemon-control targets: `POST /api/v1/sessio
 ## Session list pagination (`v1`)
 
 `GET /api/v1/sessions` serves two response shapes and the query selects between
-them. With no query parameter at all it returns the inherited unpaginated
-`SessionRecord[]`. Any one of `limit`, `cursor`, or `includeArchived` switches
-it to the paginated envelope below. Sessions are ordered newest first by
-`created_at`, then by `id` descending as the tiebreak.
+them. The daemon inspects only `limit`, `cursor`, and `includeArchived`: any one
+of the three switches it to the paginated envelope below, and when none of them
+is present it returns the inherited unpaginated `SessionRecord[]` — so an empty
+query and a query carrying only unrelated parameters both yield the array.
+Sessions are ordered newest first by `created_at`, then by `id` descending as
+the tiebreak.
 
 ### Query parameters
 
 | Parameter        | Required | Description                                                        |
 |------------------|----------|--------------------------------------------------------------------|
 | `limit`          | No       | Sessions per page, 1–1000. Defaults to 100 when the envelope is selected by another parameter. |
-| `cursor`         | No       | Opaque continuation from a previous page's `nextCursor`.           |
+| `cursor`         | No       | Opaque continuation from a previous page's `next_cursor`.          |
 | `includeArchived`| No       | `true` or `false`. Defaults to `false`, which keeps the `archived_at IS NULL` filter. |
 
 An out-of-range `limit`, a non-boolean `includeArchived`, or a cursor the daemon
@@ -656,13 +658,19 @@ cannot decode is a `400 invalid_request`.
     { "id": "session-2", "created_at": "2026-05-09T06:43:00Z" },
     { "id": "session-1", "created_at": "2026-05-09T06:42:00Z" }
   ],
-  "nextCursor": "<opaque page cursor>"
+  "next_cursor": "<opaque page cursor>"
 }
 ```
 
 `sessions` carries full [session records](#session-record-shape-v1); the sample
-above elides their fields. `nextCursor` is `null` on the last page, so a client
-pages until it is absent rather than until a page comes back short.
+above elides their fields. `next_cursor` is `null` on the last page, so a client
+pages until it is `null` rather than until a page comes back short.
+
+Note the key is snake_case, matching the [session record
+shape](#session-record-shape-v1) rather than the camelCase `nextCursor` of the
+[event envelope](#event-record-shape-and-cursor-pagination-v1). A client that
+reads `nextCursor` here decodes nothing, cannot tell that from a genuine last
+page, and silently truncates at the first page.
 
 The cursor is URL-safe base64 without padding, so it is safe to place in a
 query string verbatim, and it is opaque: it encodes the last row's sort key,

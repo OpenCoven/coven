@@ -460,7 +460,7 @@ fn a_session_page_read_sends_the_daemon_cursor_and_archive_filter() {
             (
                 "/api/v1/sessions?limit=2&cursor=Y3Vyc29y&includeArchived=true".to_owned(),
                 200,
-                r#"{"sessions":[],"nextCursor":null}"#.to_owned(),
+                r#"{"sessions":[],"next_cursor":null}"#.to_owned(),
             ),
         ],
     );
@@ -477,7 +477,15 @@ fn a_session_page_read_sends_the_daemon_cursor_and_archive_filter() {
         .expect("the paginated envelope is reachable from the typed client");
 
     assert_eq!(page["sessions"], serde_json::json!([]));
-    assert_eq!(page["nextCursor"], serde_json::Value::Null);
+    // `get` rather than `[]`: indexing a missing key also yields `Null`, so an
+    // `assert_eq!(page["next_cursor"], Null)` would pass against a body that
+    // spelled the continuation key any other way — including the camelCase
+    // `nextCursor` of the event envelope, which this route does not emit.
+    assert_eq!(
+        page.get("next_cursor"),
+        Some(&serde_json::Value::Null),
+        "the daemon's snake_case continuation key must survive the typed read"
+    );
     server.join().expect("server thread");
 }
 
