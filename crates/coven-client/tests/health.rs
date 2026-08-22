@@ -180,6 +180,16 @@ fn health_with_capabilities(capabilities: serde_json::Value) -> String {
     health.to_string()
 }
 
+/// The listing with no query at all, which the inherited route answers with
+/// the unpaginated `SessionRecord[]`.
+fn unpaginated_sessions_read() -> ReadEndpoint {
+    ReadEndpoint::Sessions {
+        limit: None,
+        cursor: None,
+        include_archived: false,
+    }
+}
+
 #[test]
 fn lifecycle_client_rejects_non_utf8_home_before_creating_daemon_artifacts() {
     use std::{ffi::OsString, os::unix::ffi::OsStringExt, time::Duration};
@@ -371,7 +381,7 @@ fn missing_sessions_capability_blocks_sessions_but_not_events() {
 
     client.health().expect("health remains a valid v1 response");
     let error = client
-        .get_json::<serde_json::Value>(coven_client::ReadEndpoint::Sessions { limit: None })
+        .get_json::<serde_json::Value>(unpaginated_sessions_read())
         .expect_err("sessions must be blocked before request transmission");
     assert!(
         error.to_string().contains("capabilities.sessions"),
@@ -427,9 +437,74 @@ fn missing_events_capability_blocks_events_but_not_sessions() {
     );
 
     let sessions: serde_json::Value = client
-        .get_json(coven_client::ReadEndpoint::Sessions { limit: None })
+        .get_json(unpaginated_sessions_read())
         .expect("unrelated supported sessions remain usable");
     assert_eq!(sessions["sessions"], serde_json::json!([]));
+    server.join().expect("server thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_page_read_sends_the_daemon_cursor_and_archive_filter() {
+    let home = TestHome::new();
+    let health = health_with_capabilities(serde_json::json!({
+        "sessions": true,
+        "events": true,
+        "eventCursor": "sequence",
+        "structuredErrors": true
+    }));
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".to_owned(), 200, health),
+            (
+                "/api/v1/sessions?limit=2&cursor=Y3Vyc29y&includeArchived=true".to_owned(),
+                200,
+                r#"{"sessions":[],"nextCursor":null}"#.to_owned(),
+            ),
+        ],
+    );
+    let endpoint = DaemonEndpoint::discover(&home.path).expect("discover owner-local socket");
+    let mut client = DaemonClient::new(endpoint);
+
+    client.health().expect("health remains a valid v1 response");
+    let page: serde_json::Value = client
+        .get_json(ReadEndpoint::Sessions {
+            limit: Some(2),
+            cursor: Some("Y3Vyc29y".to_owned()),
+            include_archived: true,
+        })
+        .expect("the paginated envelope is reachable from the typed client");
+
+    assert_eq!(page["sessions"], serde_json::json!([]));
+    assert_eq!(page["nextCursor"], serde_json::Value::Null);
+    server.join().expect("server thread");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_page_cursor_outside_the_daemon_alphabet_is_never_sent() {
+    let home = TestHome::new();
+    let server = serve_responses(
+        &home.path,
+        vec![("/api/v1/health".to_owned(), 200, HEALTH.to_string())],
+    );
+    let endpoint = DaemonEndpoint::discover(&home.path).expect("discover owner-local socket");
+    let mut client = DaemonClient::new(endpoint);
+
+    client.health().expect("health remains a valid v1 response");
+    let error = client
+        .get_json::<serde_json::Value>(ReadEndpoint::Sessions {
+            limit: None,
+            cursor: Some("cursor&limit=999".to_owned()),
+            include_archived: false,
+        })
+        .expect_err("a forged cursor must be rejected before request transmission");
+
+    assert!(
+        matches!(error, ClientError::InvalidRouteParameter(_)),
+        "unexpected error: {error}"
+    );
     server.join().expect("server thread");
 }
 
@@ -755,7 +830,7 @@ fn a_disappeared_cached_socket_preserves_the_connect_error_contract() {
     fs::remove_file(home.path.join("coven.sock")).expect("remove original daemon endpoint");
 
     let error = client
-        .get_json::<serde_json::Value>(ReadEndpoint::Sessions { limit: None })
+        .get_json::<serde_json::Value>(unpaginated_sessions_read())
         .expect_err("a disappeared endpoint must fail before request bytes");
 
     assert!(matches!(

@@ -98,6 +98,14 @@ pub(crate) struct ChatEventQuery<'a> {
 pub(crate) const EVENT_PAGE_LIMIT: i64 = 512;
 pub(crate) const EVENT_PAGES_PER_POLL: usize = 8;
 
+/// Sessions requested per `/sessions` round trip. Stays inside the daemon's
+/// 1000-row page ceiling so a page is one bounded response, not a guess.
+pub(crate) const SESSION_PAGE_LIMIT: u16 = 200;
+/// Ceiling on the overlay listing. The overlay renders from memory, so the
+/// listing stops paging here rather than following an unbounded ledger; the
+/// previous single request stopped at 100 without saying so.
+pub(crate) const MAX_LISTED_SESSIONS: usize = 2_000;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ChatEventPage {
     pub(crate) events: Vec<store::EventRecord>,
@@ -152,6 +160,41 @@ pub(crate) fn validated_event_page_cursor(
         anyhow::bail!("daemon event page claimed a continuation without advancing its cursor");
     }
     Ok(cursor)
+}
+
+/// Follow the daemon's `nextCursor` until the session listing is exhausted.
+///
+/// The daemon pages `/sessions` and the previous caller asked for one page of
+/// 100 and dropped the continuation, so a ledger with more sessions than that
+/// simply lost the remainder with no error and no marker. Paging stops at
+/// [`MAX_LISTED_SESSIONS`] because the overlay renders the whole result from
+/// memory.
+pub(crate) fn collect_session_pages<F>(mut fetch: F) -> Result<Vec<store::SessionRecord>>
+where
+    F: FnMut(Option<String>) -> Result<SessionPageResponse>,
+{
+    let mut sessions: Vec<store::SessionRecord> = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = fetch(cursor.clone())?;
+        let page_len = page.sessions.len();
+        sessions.extend(page.sessions);
+        let Some(next_cursor) = page.next_cursor else {
+            return Ok(sessions);
+        };
+        // A repeated cursor replays the same page forever, and a page that
+        // advertises a continuation without returning a row cannot advance
+        // one either. Both are daemon faults, not empty results.
+        if page_len == 0 || Some(&next_cursor) == cursor.as_ref() {
+            anyhow::bail!(
+                "daemon session page claimed a continuation without advancing its cursor"
+            );
+        }
+        if sessions.len() >= MAX_LISTED_SESSIONS {
+            return Ok(sessions);
+        }
+        cursor = Some(next_cursor);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -484,9 +527,13 @@ impl ChatClient for DaemonChatClient {
     }
 
     fn list_sessions(&mut self) -> Result<Vec<store::SessionRecord>> {
-        let page: SessionPageResponse =
-            self.get_json(ReadEndpoint::Sessions { limit: Some(100) })?;
-        Ok(page.sessions)
+        collect_session_pages(|cursor| {
+            self.get_json(ReadEndpoint::Sessions {
+                limit: Some(SESSION_PAGE_LIMIT),
+                cursor,
+                include_archived: false,
+            })
+        })
     }
 
     fn list_events(&mut self, query: ChatEventQuery<'_>) -> Result<Vec<store::EventRecord>> {
@@ -624,6 +671,110 @@ fn session_title(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The plain unpaginated listing, used by transport-level tests that care
+    /// about connection reuse rather than about the session page shape.
+    #[cfg(unix)]
+    fn unpaginated_sessions_read() -> ReadEndpoint {
+        ReadEndpoint::Sessions {
+            limit: None,
+            cursor: None,
+            include_archived: false,
+        }
+    }
+
+    fn test_session(id: &str) -> store::SessionRecord {
+        store::SessionRecord {
+            id: id.to_owned(),
+            project_root: "/repo".to_owned(),
+            harness: "codex".to_owned(),
+            title: "Listed".to_owned(),
+            status: "completed".to_owned(),
+            exit_code: Some(0),
+            archived_at: None,
+            created_at: "2026-08-16T00:00:00Z".to_owned(),
+            updated_at: "2026-08-16T00:00:00Z".to_owned(),
+            conversation_id: None,
+            familiar_id: None,
+            execution_binding: None,
+            labels: Vec::new(),
+            visibility: "private".to_owned(),
+            external: false,
+            transcript_path: None,
+        }
+    }
+
+    #[test]
+    fn session_listing_follows_every_daemon_page_cursor() {
+        let mut requested = Vec::new();
+        let sessions = collect_session_pages(|cursor| {
+            requested.push(cursor.clone());
+            Ok(match cursor.as_deref() {
+                None => SessionPageResponse {
+                    sessions: vec![test_session("a"), test_session("b")],
+                    next_cursor: Some("page-2".to_owned()),
+                },
+                Some("page-2") => SessionPageResponse {
+                    sessions: vec![test_session("c")],
+                    next_cursor: None,
+                },
+                other => panic!("unexpected cursor {other:?}"),
+            })
+        })
+        .expect("continuation is followed to exhaustion");
+
+        assert_eq!(requested, vec![None, Some("page-2".to_owned())]);
+        assert_eq!(
+            sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+    }
+
+    #[test]
+    fn session_listing_stops_at_the_in_memory_ceiling() {
+        let mut pages = 0_usize;
+        let sessions = collect_session_pages(|_| {
+            pages += 1;
+            Ok(SessionPageResponse {
+                sessions: (0..usize::from(SESSION_PAGE_LIMIT))
+                    .map(|index| test_session(&format!("session-{pages}-{index}")))
+                    .collect(),
+                next_cursor: Some(format!("page-{pages}")),
+            })
+        })
+        .expect("an endless ledger is truncated rather than followed forever");
+
+        assert_eq!(sessions.len(), MAX_LISTED_SESSIONS);
+        assert_eq!(pages, MAX_LISTED_SESSIONS / usize::from(SESSION_PAGE_LIMIT));
+    }
+
+    #[test]
+    fn session_listing_rejects_a_continuation_that_cannot_advance() {
+        let repeated = collect_session_pages(|_| {
+            Ok(SessionPageResponse {
+                sessions: vec![test_session("a")],
+                next_cursor: Some("stuck".to_owned()),
+            })
+        });
+        let empty = collect_session_pages(|_| {
+            Ok(SessionPageResponse {
+                sessions: Vec::new(),
+                next_cursor: Some("page-2".to_owned()),
+            })
+        });
+
+        for error in [
+            repeated.expect_err("a repeated cursor must not replay forever"),
+            empty.expect_err("an empty page cannot carry a continuation"),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("claimed a continuation without advancing"),
+                "unexpected error: {error}"
+            );
+        }
+    }
 
     #[test]
     fn event_page_continuation_must_advance_before_another_request() {
@@ -802,7 +953,7 @@ mod tests {
             daemon_client: Some(cached),
             daemon_identity: Some(old_status),
         };
-        let response: Value = client.get_json(ReadEndpoint::Sessions { limit: None })?;
+        let response: Value = client.get_json(unpaginated_sessions_read())?;
 
         assert_eq!(response["source"], "stable");
         assert_eq!(
@@ -996,7 +1147,7 @@ mod tests {
             daemon_client: Some(cached),
             daemon_identity: Some(status),
         };
-        let response: Value = client.get_json(ReadEndpoint::Sessions { limit: None })?;
+        let response: Value = client.get_json(unpaginated_sessions_read())?;
 
         assert_eq!(response["source"], "replacement");
         assert_eq!(
@@ -1073,7 +1224,7 @@ mod tests {
             daemon_client: Some(cached),
             daemon_identity: Some(status),
         };
-        let response = client.get_json::<Value>(ReadEndpoint::Sessions { limit: None });
+        let response = client.get_json::<Value>(unpaginated_sessions_read());
         let (empty_checks, paths) = replacement_server.join().unwrap();
 
         assert_eq!(response?["source"], "replacement");
@@ -1137,7 +1288,7 @@ mod tests {
         };
 
         let error = client
-            .get_json::<Value>(ReadEndpoint::Sessions { limit: None })
+            .get_json::<Value>(unpaginated_sessions_read())
             .expect_err("unchanged incapable daemon must remain unavailable");
         let requests = server.join().unwrap();
 

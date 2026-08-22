@@ -80,6 +80,14 @@ collide with inherited nested route suffixes (`/handoffs`, `/log`, `/events`,
 or `/artifacts/`) are not exposed by that typed operation. These are inherited
 `v1` routing limitations, not a new id grammar.
 
+The typed session listing carries `limit`, the opaque page `cursor`, and
+`includeArchived`, mirroring the query the daemon already serves (see
+[Session list pagination (`v1`)](#session-list-pagination-v1)). It rejects a
+cursor outside the daemon's URL-safe base64 alphabet before sending, so a
+corrupted or hand-composed value cannot smuggle a separator into the request
+target. Setting none of the three requests the inherited unpaginated array;
+setting any of them requests the envelope.
+
 ## `GET /api/v1/health`
 
 `GET /api/v1/health` returns daemon reachability, the named contract version, coven version, and machine-readable capabilities:
@@ -567,7 +575,8 @@ In `v1`, session responses stay as raw JSON objects using the Rust daemon's snak
 
 Endpoints that return this shape:
 
-- `GET /api/v1/sessions` → `SessionRecord[]`
+- `GET /api/v1/sessions` → `SessionRecord[]` or the paginated envelope, see
+  [Session list pagination (`v1`)](#session-list-pagination-v1)
 - `POST /api/v1/sessions` → `SessionRecord`
 - `POST /api/v1/adopted-sessions` → `SessionRecord`
 - `GET /api/v1/sessions/:id` → `SessionRecord`
@@ -619,6 +628,49 @@ Classify the row kind before interpreting `status`. Synthetic `active` rows can 
 Archive is not a session status. It is stored separately in `archived_at`; archive and summon preserve the existing lifecycle status of every non-running session, including `created` and `idle`.
 
 External `running` sessions are not daemon-control targets: `POST /api/v1/sessions/:id/input` returns `409 session_not_live` because Coven has no owned live runtime, and `POST /api/v1/sessions/:id/kill` returns `422 external_session_not_killable` as documented below.
+
+## Session list pagination (`v1`)
+
+`GET /api/v1/sessions` serves two response shapes and the query selects between
+them. With no query parameter at all it returns the inherited unpaginated
+`SessionRecord[]`. Any one of `limit`, `cursor`, or `includeArchived` switches
+it to the paginated envelope below. Sessions are ordered newest first by
+`created_at`, then by `id` descending as the tiebreak.
+
+### Query parameters
+
+| Parameter        | Required | Description                                                        |
+|------------------|----------|--------------------------------------------------------------------|
+| `limit`          | No       | Sessions per page, 1–1000. Defaults to 100 when the envelope is selected by another parameter. |
+| `cursor`         | No       | Opaque continuation from a previous page's `nextCursor`.           |
+| `includeArchived`| No       | `true` or `false`. Defaults to `false`, which keeps the `archived_at IS NULL` filter. |
+
+An out-of-range `limit`, a non-boolean `includeArchived`, or a cursor the daemon
+cannot decode is a `400 invalid_request`.
+
+### Response envelope
+
+```json
+{
+  "sessions": [
+    { "id": "session-2", "created_at": "2026-05-09T06:43:00Z" },
+    { "id": "session-1", "created_at": "2026-05-09T06:42:00Z" }
+  ],
+  "nextCursor": "<opaque page cursor>"
+}
+```
+
+`sessions` carries full [session records](#session-record-shape-v1); the sample
+above elides their fields. `nextCursor` is `null` on the last page, so a client
+pages until it is absent rather than until a page comes back short.
+
+The cursor is URL-safe base64 without padding, so it is safe to place in a
+query string verbatim, and it is opaque: it encodes the last row's sort key,
+which keeps it stable while rows are inserted ahead of it. Clients must not compose one —
+only echo back what the daemon issued. A daemon old enough to predate this
+envelope answers a `limit` or `cursor` query with the plain array instead, so a
+client that decodes the envelope should treat that as a version mismatch rather
+than an empty page.
 
 ## `POST /api/v1/sessions/external`
 

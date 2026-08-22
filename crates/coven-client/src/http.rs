@@ -232,10 +232,27 @@ fn read_path(endpoint: &ReadEndpoint) -> Result<String, ClientError> {
             }
             Ok(format!("/api/v1/sessions/{session_id}"))
         }
-        ReadEndpoint::Sessions { limit } => Ok(limit.map_or_else(
-            || "/api/v1/sessions".to_owned(),
-            |limit| format!("/api/v1/sessions?limit={limit}"),
-        )),
+        ReadEndpoint::Sessions {
+            limit,
+            cursor,
+            include_archived,
+        } => {
+            let mut path = "/api/v1/sessions".to_owned();
+            let mut separator = '?';
+            if let Some(limit) = limit {
+                path.push_str(&format!("{separator}limit={limit}"));
+                separator = '&';
+            }
+            if let Some(cursor) = cursor {
+                validate_session_page_cursor(cursor)?;
+                path.push_str(&format!("{separator}cursor={cursor}"));
+                separator = '&';
+            }
+            if *include_archived {
+                path.push_str(&format!("{separator}includeArchived=true"));
+            }
+            Ok(path)
+        }
         ReadEndpoint::Events {
             session_id,
             after_seq,
@@ -280,6 +297,25 @@ fn validate_session_path_remainder(value: &str) -> Result<(), ClientError> {
     validate_session_request_target_data(value)?;
     if value.contains('?') {
         return Err(ClientError::InvalidRouteParameter("session id"));
+    }
+    Ok(())
+}
+
+/// Reject anything that is not the daemon's own session page cursor.
+///
+/// The daemon issues URL-safe base64 without padding, so a well-formed cursor
+/// is already representable verbatim in the inherited raw `v1` query. Checking
+/// the alphabet keeps a corrupted or hand-composed value from smuggling `&`,
+/// `#`, or whitespace into the request target.
+fn validate_session_page_cursor(value: &str) -> Result<(), ClientError> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(ClientError::InvalidRouteParameter(
+            "session page cursor is not the daemon's URL-safe base64 cursor",
+        ));
     }
     Ok(())
 }
@@ -337,6 +373,78 @@ mod tests {
                 })
                 .expect("contract-valid external session id"),
                 format!("/api/v1/sessions/{raw}/input")
+            );
+        }
+    }
+
+    #[test]
+    fn session_listing_selects_the_inherited_shape_it_is_asked_for() {
+        let cases = [
+            (None, None, false, "/api/v1/sessions"),
+            (Some(50), None, false, "/api/v1/sessions?limit=50"),
+            (
+                None,
+                Some("Y3Vyc29y"),
+                false,
+                "/api/v1/sessions?cursor=Y3Vyc29y",
+            ),
+            (None, None, true, "/api/v1/sessions?includeArchived=true"),
+            (
+                Some(50),
+                Some("Y3Vyc29y"),
+                true,
+                "/api/v1/sessions?limit=50&cursor=Y3Vyc29y&includeArchived=true",
+            ),
+            (
+                None,
+                Some("Y3Vyc29y"),
+                true,
+                "/api/v1/sessions?cursor=Y3Vyc29y&includeArchived=true",
+            ),
+            (
+                Some(50),
+                None,
+                true,
+                "/api/v1/sessions?limit=50&includeArchived=true",
+            ),
+        ];
+
+        for (limit, cursor, include_archived, expected) in cases {
+            assert_eq!(
+                read_path(&ReadEndpoint::Sessions {
+                    limit,
+                    cursor: cursor.map(str::to_owned),
+                    include_archived,
+                })
+                .expect("contract-valid session listing"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn session_listing_rejects_a_cursor_outside_the_daemon_alphabet() {
+        for cursor in [
+            "",
+            "cursor value",
+            "cursor&limit=999",
+            "cursor#fragment",
+            "cursor?other=route",
+            "Y3Vyc29y=",
+            "cursor/slash",
+            "cursor+plus",
+            "cursor\nnewline",
+        ] {
+            let error = read_path(&ReadEndpoint::Sessions {
+                limit: None,
+                cursor: Some(cursor.to_owned()),
+                include_archived: false,
+            })
+            .expect_err("unsafe session page cursor was accepted");
+
+            assert!(
+                matches!(error, ClientError::InvalidRouteParameter(_)),
+                "unexpected error for {cursor:?}: {error}"
             );
         }
     }
