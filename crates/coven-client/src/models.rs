@@ -31,8 +31,26 @@ pub enum ReadEndpoint {
     Session {
         session_id: String,
     },
+    /// Session listing.
+    ///
+    /// The inherited `v1` route serves two response shapes and the query
+    /// selects between them: the daemon inspects only `limit`, `cursor`, and
+    /// `includeArchived`, and any one of the three switches it to the
+    /// `{ sessions, next_cursor }` envelope, while a query carrying none of
+    /// them returns the unpaginated `SessionRecord[]`. Callers that decode the
+    /// envelope must therefore set at least one of the three, exactly as they
+    /// already had to for `limit` alone. Note the envelope key is snake_case,
+    /// unlike the event envelope's camelCase `nextCursor`.
     Sessions {
         limit: Option<u16>,
+        /// Opaque page cursor echoed back from a previous page's
+        /// `next_cursor`. It is never composed locally: a caller can only send
+        /// a cursor the daemon just issued, so an older daemon that never
+        /// issues one is never asked to honor one.
+        cursor: Option<String>,
+        /// Include archived sessions. `false` keeps the daemon's default
+        /// `archived_at IS NULL` filter and is not sent on the wire.
+        include_archived: bool,
     },
     Events {
         session_id: String,
