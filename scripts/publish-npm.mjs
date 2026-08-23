@@ -53,6 +53,64 @@ const nativePackageSets = {
   'post-intel': ['macos', 'macos-x64', 'linux-x64', 'windows']
 };
 
+// npm installs these into a consumer's dependency tree. `devDependencies` is
+// absent: npm does not install it for a consumer of a published package.
+// `bundleDependencies` is absent too — npm defines it as an array of names, not
+// a spec map, and bundled code ships inside the tarball under the tarball's own
+// integrity hash.
+const LOCKSTEP_DEPENDENCY_FIELDS = ['dependencies', 'optionalDependencies'];
+
+// A specifier npm resolves from somewhere other than the registry, so it
+// carries no integrity hash and needs git or a network fetch at install time.
+// A semver range never contains a slash, which is what separates a bare
+// `owner/repo` GitHub shorthand from a legitimate range.
+const NON_REGISTRY_SPECIFIER =
+  /^(?:git(?:\+[a-z]+)?:|ssh:|https?:|file:|link:|portal:|github:|gitlab:|bitbucket:|gist:)|\//i;
+
+/**
+ * Fail closed on any published dependency npm cannot install from the registry
+ * against an integrity hash.
+ *
+ * Every installed dependency of a published wrapper is a lockstep-versioned
+ * `@opencoven/cli-*` native, so each spec must equal the release version
+ * exactly. That is stronger and simpler than "looks like a version": it also
+ * rejects a `0.0.0` placeholder that escaped the rewrite in
+ * `writeWrapperPackage`, which is exact-shaped but names a version that was
+ * never published. Prerelease and build-metadata versions therefore pass or
+ * fail with the release itself rather than against a separate shape rule.
+ *
+ * Only this package's own manifest is in scope. A transitive git dependency
+ * pulled in by an otherwise well-formed dependency is invisible here; the
+ * defense against that is not declaring dependencies whose own closure is
+ * unaudited.
+ *
+ * `peerDependencies` are legitimately ranges, so they are held only to the
+ * weaker rule that they name something npm can integrity-check.
+ */
+export function assertInstallableDependencies(packageJson, version) {
+  for (const field of LOCKSTEP_DEPENDENCY_FIELDS) {
+    for (const [name, spec] of Object.entries(packageJson[field] ?? {})) {
+      if (spec !== version) {
+        throw new Error(
+          `Refusing to publish ${packageJson.name}: ${field}['${name}'] must be ` +
+            `pinned to the release version ${version}, got '${spec}'. Every ` +
+            `installed dependency of a published package is a lockstep-versioned ` +
+            `native package npm resolves from the registry with an integrity hash.`
+        );
+      }
+    }
+  }
+  for (const [name, spec] of Object.entries(packageJson.peerDependencies ?? {})) {
+    if (NON_REGISTRY_SPECIFIER.test(spec)) {
+      throw new Error(
+        `Refusing to publish ${packageJson.name}: peerDependencies['${name}'] ` +
+          `resolves outside the npm registry ('${spec}'), so npm cannot ` +
+          `integrity-check it and installing it needs credentials.`
+      );
+    }
+  }
+}
+
 if (isMainModule()) {
   main();
 }
@@ -172,6 +230,13 @@ function writePlatformPackage(targetName, target, binaryPath, version) {
     .replaceAll('__OS__', target.os)
     .replaceAll('__CPU__', target.cpu);
 
+  try {
+    // The template declares no dependencies today; the gate is what keeps that
+    // true for the native packages as well as the wrapper.
+    assertInstallableDependencies(JSON.parse(packageJson), version);
+  } catch (error) {
+    fail(error.message);
+  }
   writeFileSync(path.join(outDir, 'package.json'), `${packageJson.trim()}\n`);
   cpSync(path.join(repoRoot, 'npm', 'coven-platform-template', 'README.md'), path.join(outDir, 'README.md'));
   cpSync(binaryPath, path.join(binDir, target.binaryName));
@@ -207,6 +272,13 @@ function writeWrapperPackage(version, packageName = primaryWrapperPackageName, n
         packageJson.optionalDependencies[optionalName] = version;
       }
     }
+  }
+  try {
+    assertInstallableDependencies(packageJson, version);
+  } catch (error) {
+    // Report like every other publish failure: a bare actionable line, not an
+    // uncaught-throw stack dump in the release log.
+    fail(error.message);
   }
   writeFileSync(packagePath, `${JSON.stringify(packageJson, null, 2)}\n`);
   rewriteWrapperText(path.join(outDir, 'README.md'), packageName);
