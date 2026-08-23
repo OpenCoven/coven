@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/device-pairing/v1/transaction-authorization.schema.json",
+  "title": "OpenCoven TransactionAuthorization v1 diagnostic JSON representation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "operation",
+    "target",
+    "effect",
+    "actor",
+    "device",
+    "grantId",
+    "nonce",
+    "issuedAt",
+    "expiresAt",
+    "requestDigest",
+    "presentationDigest",
+    "signature"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "operation": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "target": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean", "null"]
+      }
+    },
+    "effect": { "type": "string", "minLength": 1, "maxLength": 1024 },
+    "actor": { "type": "string", "minLength": 8, "maxLength": 256 },
+    "device": { "type": "string", "minLength": 8, "maxLength": 256 },
+    "grantId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
+    "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22,86}$" },
+    "issuedAt": { "type": "integer", "minimum": 0 },
+    "expiresAt": { "type": "integer", "minimum": 0 },
+    "requestDigest": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "presentationDigest": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "signature": { "type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$" }
+  }
+}
