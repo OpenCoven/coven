@@ -119,9 +119,7 @@ async fn room_accepts_one_peer_per_role_with_the_same_credential() {
     state
         .unregister(&room, PeerRole::Client, client.peer_id)
         .await;
-    state
-        .unregister(&room, PeerRole::Host, host.peer_id)
-        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
     assert_eq!(state.room_count().await, 0);
 }
 
@@ -209,9 +207,7 @@ async fn binary_frames_forward_and_backpressure_fails_closed() {
     state
         .unregister(&room, PeerRole::Client, client.peer_id)
         .await;
-    state
-        .unregister(&room, PeerRole::Host, host.peer_id)
-        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
 }
 
 #[tokio::test]
@@ -235,7 +231,5 @@ async fn disconnect_notifies_the_remaining_peer() {
         .unregister(&room, PeerRole::Client, client.peer_id)
         .await;
     assert!(matches!(host.inbox.recv().await, Some(Message::Close(_))));
-    state
-        .unregister(&room, PeerRole::Host, host.peer_id)
-        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
 }
