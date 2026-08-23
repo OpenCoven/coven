@@ -5,6 +5,7 @@ import {
   chmodSync,
   copyFileSync,
   cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -18,7 +19,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { assertInstallableDependencies, defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { assertInstallableDependencies, defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, prepareDistRoot, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
 import { platformMatrix } from './release-npm-platform-matrix.mjs';
 
@@ -31,6 +32,82 @@ const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
+
+test('release staging removes stale generated npm output before regeneration', () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-'));
+  try {
+    const distRoot = path.join(fixture, 'npm', 'dist');
+    const stalePackage = path.join(distRoot, 'coven', 'package.json');
+    mkdirSync(path.dirname(stalePackage), { recursive: true });
+    writeFileSync(
+      stalePackage,
+      `${JSON.stringify({ name: '@opencoven/cli', version: '0.2.4' })}\n`
+    );
+
+    prepareDistRoot(distRoot);
+
+    assert.throws(() => readFileSync(stalePackage, 'utf8'), /ENOENT/);
+    assert.equal(existsSync(distRoot), true);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('wrapper dry-run cannot reuse a stale generated package version', () => {
+  const fixture = realpathSync(
+    mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-dry-run-'))
+  );
+  try {
+    mkdirSync(path.join(fixture, 'scripts'), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
+      path.join(fixture, 'scripts', 'publish-npm.mjs')
+    );
+    cpSync(
+      fileURLToPath(new URL('../npm/coven', import.meta.url)),
+      path.join(fixture, 'npm', 'coven'),
+      { recursive: true }
+    );
+
+    const stalePackage = path.join(fixture, 'npm', 'dist', 'coven', 'package.json');
+    mkdirSync(path.dirname(stalePackage), { recursive: true });
+    writeFileSync(
+      stalePackage,
+      `${JSON.stringify({ name: '@opencoven/cli', version: '0.2.4' })}\n`
+    );
+    writeFileSync(path.join(fixture, 'npm', 'dist', 'stale-platform.txt'), 'stale\n');
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
+      {
+        encoding: 'utf8',
+        cwd: fixture,
+        env: { ...process.env, COVEN_NPM_VERSION: '0.4.1' }
+      }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      JSON.parse(readFileSync(stalePackage, 'utf8')).version,
+      '0.4.1',
+      'generated package must be restamped from the release version'
+    );
+    assert.equal(
+      existsSync(path.join(fixture, 'npm', 'dist', 'stale-platform.txt')),
+      false,
+      'files outside the regenerated package set must be removed'
+    );
+    assert.equal(
+      JSON.parse(readFileSync(path.join(fixture, 'npm', 'coven', 'package.json'), 'utf8'))
+        .version,
+      '0.0.0',
+      'source manifest must remain a release-time placeholder'
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
 
 test('parseReleaseTag preserves stable releases', () => {
   assert.deepEqual(parseReleaseTag('v0.2.3'), {
@@ -364,7 +441,9 @@ test('publish path fails closed on a wrapper dependency npm cannot install', () 
   // The unit tests above would all still pass if the call site were deleted.
   // This drives the real script end to end so the gate is pinned to the publish
   // path itself, not merely to the exported function.
-  const fixture = mkdtempSync(path.join(tmpdir(), 'coven-publish-gate-'));
+  const fixture = realpathSync(
+    mkdtempSync(path.join(tmpdir(), 'coven-publish-gate-'))
+  );
   try {
     mkdirSync(path.join(fixture, 'scripts'), { recursive: true });
     copyFileSync(
@@ -590,7 +669,9 @@ test(
     // path, which is the default for everyone who has not installed the
     // companion: the wrapper sets nothing there, so anything it failed to clear
     // would reach the native binary unchallenged.
-    const fixture = mkdtempSync(path.join(tmpdir(), 'coven-wrapper-handoff-env-'));
+    const fixture = realpathSync(
+      mkdtempSync(path.join(tmpdir(), 'coven-wrapper-handoff-env-'))
+    );
     try {
       const wrapperDir = path.join(fixture, 'wrapper');
       const wrapperBinDir = path.join(wrapperDir, 'bin');

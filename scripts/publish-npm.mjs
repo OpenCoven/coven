@@ -145,8 +145,7 @@ function main() {
   validatePublishVersion(version, dryRun);
   validatePublishToken(process.env, dryRun);
 
-  rmSync(distRoot, { recursive: true, force: true });
-  mkdirSync(distRoot, { recursive: true });
+  prepareDistRoot();
 
   if (!wrapperOnly) {
     if (!skipBuild) {
@@ -186,6 +185,11 @@ function main() {
     ...(skipWrapper ? [] : wrapperPackageNames)
   ];
   console.log(`${dryRun ? 'Dry-run completed' : 'Publish completed'} for ${publishedNames.join(', ')} at version ${version}.`);
+}
+
+export function prepareDistRoot(root = distRoot) {
+  rmSync(root, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
 }
 
 function publishPackage(packageName, version, dryRun, cwd) {
