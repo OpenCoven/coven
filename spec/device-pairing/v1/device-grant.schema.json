@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/device-pairing/v1/device-grant.schema.json",
+  "title": "OpenCoven DeviceGrant v1 diagnostic JSON representation",
+  "description": "Diagnostic JSON form of a signed OpenCoven device grant. The canonical signed representation is deterministic CBOR wrapped in COSE_Sign1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "grantId",
+    "subject",
+    "issuer",
+    "audience",
+    "capabilities",
+    "restrictions",
+    "issuedAt",
+    "notBefore",
+    "expiresAt",
+    "revocationEpoch",
+    "confirmationKey",
+    "signature"
+  ],
+  "properties": {
+    "version": { "const": 1 },
+    "grantId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{22}$"
+    },
+    "subject": { "$ref": "#/$defs/keyReference" },
+    "issuer": { "$ref": "#/$defs/identityReference" },
+    "audience": { "$ref": "#/$defs/identityReference" },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "restrictions": { "$ref": "#/$defs/restrictions" },
+    "issuedAt": { "$ref": "#/$defs/timestamp" },
+    "notBefore": { "$ref": "#/$defs/timestamp" },
+    "expiresAt": { "$ref": "#/$defs/timestamp" },
+    "revocationEpoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "confirmationKey": { "$ref": "#/$defs/keyReference" },
+    "signature": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "identityReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "id"],
+      "properties": {
+        "type": {
+          "enum": ["owner", "installation", "device", "trust-domain"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        }
+      }
+    },
+    "keyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "publicKey"],
+      "properties": {
+        "algorithm": {
+          "enum": ["Ed25519", "P-256"]
+        },
+        "keyId": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        }
+      }
+    },
+    "capability": {
+      "enum": [
+        "sessions.metadata.read",
+        "conversations.read",
+        "messages.send",
+        "tools.request",
+        "tools.approve",
+        "secrets.read",
+        "memory.familiar.read",
+        "memory.familiar.write",
+        "identity.admin",
+        "devices.enroll",
+        "devices.revoke",
+        "identity.export",
+        "memory.export"
+      ]
+    },
+    "restrictions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "familiars": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "projects": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "sessions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 256 }
+        },
+        "requiredAssurance": {
+          "enum": ["possession", "recent_user_verification", "fresh_biometric", "step_up"]
+        },
+        "maxIdleSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "attestation": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["verified_official_app", "verified_hardware_key", "unattested_device"]
+          }
+        }
+      }
+    }
+  }
+}
