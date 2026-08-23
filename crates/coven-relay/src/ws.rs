@@ -15,6 +15,7 @@ use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{RawQuery, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::Instant;
 
@@ -84,7 +85,10 @@ impl RelayState {
 
         let peer_id = self.next_peer_id.fetch_add(1, Ordering::Relaxed);
         let (sender, inbox) = mpsc::channel(self.limits.channel_capacity);
-        *slot = Some(ConnectedPeer { id: peer_id, sender });
+        *slot = Some(ConnectedPeer {
+            id: peer_id,
+            sender,
+        });
         Ok(Registration {
             room_id: room_id.to_owned(),
             role,
@@ -93,11 +97,7 @@ impl RelayState {
         })
     }
 
-    async fn peer_sender(
-        &self,
-        room_id: &str,
-        role: PeerRole,
-    ) -> Option<mpsc::Sender<Message>> {
+    async fn peer_sender(&self, room_id: &str, role: PeerRole) -> Option<mpsc::Sender<Message>> {
         let registry = self.inner.lock().await;
         registry
             .rooms
@@ -230,9 +230,7 @@ impl RelayRequest {
         let mut room_id = None;
         let mut role = None;
         for pair in query.split('&') {
-            let (name, value) = pair
-                .split_once('=')
-                .ok_or(RequestError::InvalidQuery)?;
+            let (name, value) = pair.split_once('=').ok_or(RequestError::InvalidQuery)?;
             let target = match name {
                 "v" => &mut version,
                 "room" => &mut room_id,
@@ -271,11 +269,9 @@ enum RequestError {
 impl RequestError {
     fn response(self) -> Response {
         match self {
-            Self::InvalidQuery => (
-                StatusCode::BAD_REQUEST,
-                "invalid relay rendezvous request",
-            )
-                .into_response(),
+            Self::InvalidQuery => {
+                (StatusCode::BAD_REQUEST, "invalid relay rendezvous request").into_response()
+            }
             Self::ProtocolUnsupported => (
                 StatusCode::BAD_REQUEST,
                 "unsupported relay protocol version",
@@ -390,13 +386,11 @@ async fn forward_to_peer(
         .peer_sender(room_id, role)
         .await
         .ok_or_else(|| close_message(1013, "relay peer unavailable"))?;
-    peer.try_send(message).map_err(|error| {
-        if error.is_full() {
-            close_message(1013, "relay backpressure")
-        } else {
-            close_message(1001, "relay peer disconnected")
-        }
-    })
+    match peer.try_send(message) {
+        Ok(()) => Ok(()),
+        Err(TrySendError::Full(_)) => Err(close_message(1013, "relay backpressure")),
+        Err(TrySendError::Closed(_)) => Err(close_message(1001, "relay peer disconnected")),
+    }
 }
 
 fn bearer_credential(headers: &HeaderMap) -> Result<&str, RequestError> {
