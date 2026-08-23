@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/device-pairing/v1/pairing-offer.schema.json",
+  "title": "OpenCoven PairingOffer v1 diagnostic JSON representation",
+  "description": "Diagnostic JSON form of the canonical deterministic-CBOR PairingOffer. JSON is for tooling and validation; the wire encoding is deterministic CBOR.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "sessionId",
+    "caveEphemeralKey",
+    "rendezvous",
+    "requestedCapabilitiesHash",
+    "expiresAt"
+  ],
+  "properties": {
+    "version": {
+      "const": 1
+    },
+    "sessionId": {
+      "$ref": "#/$defs/base64url32"
+    },
+    "caveEphemeralKey": {
+      "$ref": "#/$defs/keyReference"
+    },
+    "rendezvous": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/rendezvousHint"
+      }
+    },
+    "localDiscoveryHint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    },
+    "requestedCapabilitiesHash": {
+      "$ref": "#/$defs/base64url32"
+    },
+    "expiresAt": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "$defs": {
+    "base64url32": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{43}$"
+    },
+    "keyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "publicKey"],
+      "properties": {
+        "algorithm": {
+          "enum": ["X25519", "Ed25519", "P-256"]
+        },
+        "publicKey": {
+          "type": "string",
+          "minLength": 43,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "keyId": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._:-]+$"
+        }
+      }
+    },
+    "rendezvousHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport", "endpoint"],
+      "properties": {
+        "transport": {
+          "enum": ["wss", "https", "local"]
+        },
+        "endpoint": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "default": 0
+        }
+      }
+    }
+  }
+}
