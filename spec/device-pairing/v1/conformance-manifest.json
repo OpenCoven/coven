@@ -1,0 +1,38 @@
+{
+  "protocol": "OpenCoven Device Pairing",
+  "version": 1,
+  "wire": {
+    "serialization": "deterministic-cbor",
+    "signatureEnvelope": "COSE_Sign1",
+    "hash": "SHA-256",
+    "kdf": "HKDF-SHA-256",
+    "keyAgreement": "X25519",
+    "portableSignature": "Ed25519",
+    "platformSignature": "P-256",
+    "aead": ["ChaCha20-Poly1305", "AES-256-GCM"]
+  },
+  "objects": [
+    "PairingOffer",
+    "EnrollmentRequest",
+    "DeviceGrant",
+    "DeviceChallenge",
+    "TransactionAuthorization",
+    "RevocationRecord",
+    "ResumptionContext"
+  ],
+  "requiredSuites": [
+    "canonical-encoding",
+    "positive-interoperability",
+    "malformed-input",
+    "replay-and-expiry",
+    "downgrade-resistance",
+    "capability-substitution",
+    "grant-proof-of-possession",
+    "revocation-and-resumption",
+    "transaction-substitution",
+    "malicious-relay",
+    "cross-coven-privacy"
+  ],
+  "releaseState": "experimental",
+  "productionReady": false
+}
