@@ -1,0 +1,7 @@
+{
+  "protocol": "OpenCoven Device Pairing",
+  "version": 1,
+  "wireEncoding": "deterministic-cbor",
+  "signatureEnvelope": "COSE_Sign1",
+  "status": "proposed"
+}
