@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "status": "placeholder-until-shared-library",
+  "notes": [
+    "These vectors define structural and validation cases only.",
+    "Canonical CBOR bytes, transcript hashes, signatures, and short-authentication strings must be generated and locked by the shared protocol implementation before interoperability release."
+  ],
+  "validationCases": [
+    {
+      "name": "pairing-offer-rejects-reusable-token-fields",
+      "objectType": "PairingOffer",
+      "expected": "reject",
+      "reason": "additional properties are forbidden"
+    },
+    {
+      "name": "pairing-offer-rejects-wrong-session-length",
+      "objectType": "PairingOffer",
+      "expected": "reject",
+      "reason": "session ID must encode exactly 32 bytes"
+    },
+    {
+      "name": "device-grant-rejects-unknown-capability",
+      "objectType": "DeviceGrant",
+      "expected": "reject",
+      "reason": "unknown capabilities fail closed"
+    },
+    {
+      "name": "device-grant-rejects-unbounded-additional-restrictions",
+      "objectType": "DeviceGrant",
+      "expected": "reject",
+      "reason": "unknown restrictions require explicit extension semantics"
+    },
+    {
+      "name": "transaction-authorization-rejects-missing-presentation-digest",
+      "objectType": "TransactionAuthorization",
+      "expected": "reject",
+      "reason": "displayed intent must be bound to the signature"
+    }
+  ]
+}
