@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/device-pairing/v1/revocation-record.schema.json",
+  "title": "OpenCoven RevocationRecord v1 diagnostic JSON representation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "subject", "epoch", "reason", "issuedAt", "issuer", "signature"],
+  "properties": {
+    "version": {"const": 1},
+    "subject": {"type": "string", "minLength": 8, "maxLength": 256},
+    "epoch": {"type": "integer", "minimum": 1},
+    "reason": {"enum": ["user_requested", "lost", "suspected_compromise", "key_rotation", "policy_change", "expired", "other"]},
+    "issuedAt": {"type": "integer", "minimum": 0},
+    "issuer": {"type": "string", "minLength": 8, "maxLength": 256},
+    "signature": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$"}
+  }
+}
