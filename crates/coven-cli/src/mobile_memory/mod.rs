@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod contract;
 pub mod gateway;
+pub mod grant;
 pub mod identity;
 pub mod pairing;
 pub mod registry;

@@ -9,7 +9,8 @@ use p256::ecdsa::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::registry::{DeviceRecord, DeviceRegistry};
+use super::grant::{AssuranceLevel, DeviceScope};
+use super::registry::{DeviceAuthorizationRecord, DeviceRecord, DeviceRegistry};
 use super::MOBILE_REQUEST_WINDOW_SECONDS;
 
 const MAX_REPLAY_ENTRIES: usize = 10_000;
@@ -64,6 +65,14 @@ fn validate_exact_path_and_query(value: &str) -> Result<(), MobileAuthError> {
     Ok(())
 }
 
+fn required_scope(path_and_query: &str) -> Option<DeviceScope> {
+    let path = path_and_query
+        .split_once('?')
+        .map_or(path_and_query, |(path, _)| path);
+    (path == "/api/v1/mobile/memory" || path.starts_with("/api/v1/mobile/memory/"))
+        .then_some(DeviceScope::MemoryRead)
+}
+
 fn decode_32(value: &str) -> Result<[u8; 32], MobileAuthError> {
     if value.len() != 43 {
         return Err(MobileAuthError::InvalidEncoding);
@@ -86,6 +95,9 @@ pub struct MobileRequestAuth {
 
 pub struct VerifiedMobileDevice {
     pub device_id: Uuid,
+    grant_id: Uuid,
+    revocation_epoch: u64,
+    required_scope: Option<DeviceScope>,
 }
 
 pub struct MobileAuthenticator {
@@ -114,7 +126,7 @@ impl MobileAuthenticator {
         self.registry
             .reload()
             .map_err(|_| MobileAuthError::DeviceUnknown)?;
-        let device = self.lookup_device(auth.device_id)?;
+        let authorization = self.lookup_device(auth.device_id)?;
         if now.timestamp().abs_diff(auth.timestamp) > MOBILE_REQUEST_WINDOW_SECONDS as u64 {
             return Err(MobileAuthError::RequestExpired);
         }
@@ -130,11 +142,19 @@ impl MobileAuthenticator {
             &auth.nonce,
             &auth.body_digest,
         )?;
-        verify_signature(&device, &canonical, &auth.signature)?;
+        verify_signature(&authorization.device, &canonical, &auth.signature)?;
+        let required_scope = required_scope(path_and_query);
+        authorization
+            .grant
+            .authorize(required_scope, AssuranceLevel::Possession, now)
+            .map_err(|_| MobileAuthError::DeviceRevoked)?;
         self.insert_nonce(auth.device_id, nonce, now.timestamp())?;
         self.record_rate(auth.device_id, now.timestamp())?;
         Ok(VerifiedMobileDevice {
             device_id: auth.device_id,
+            grant_id: authorization.grant.id,
+            revocation_epoch: authorization.grant.revocation_epoch,
+            required_scope,
         })
     }
 
@@ -145,18 +165,33 @@ impl MobileAuthenticator {
         self.registry
             .reload()
             .map_err(|_| MobileAuthError::DeviceUnknown)?;
-        self.lookup_device(verified.device_id).map(|_| ())
+        let authorization = self.lookup_device(verified.device_id)?;
+        if authorization.grant.id != verified.grant_id
+            || authorization.grant.revocation_epoch != verified.revocation_epoch
+        {
+            return Err(MobileAuthError::DeviceRevoked);
+        }
+        authorization
+            .grant
+            .authorize(
+                verified.required_scope,
+                AssuranceLevel::Possession,
+                Utc::now(),
+            )
+            .map_err(|_| MobileAuthError::DeviceRevoked)
     }
 
-    fn lookup_device(&self, id: Uuid) -> Result<DeviceRecord, MobileAuthError> {
+    fn lookup_device(&self, id: Uuid) -> Result<DeviceAuthorizationRecord, MobileAuthError> {
         match self
             .registry
-            .device(id)
+            .authorization_record(id)
             .map_err(|_| MobileAuthError::DeviceUnknown)?
         {
             None => Err(MobileAuthError::DeviceUnknown),
-            Some(device) if device.revoked_at.is_some() => Err(MobileAuthError::DeviceRevoked),
-            Some(device) => Ok(device),
+            Some(record) if record.device.revoked_at.is_some() => {
+                Err(MobileAuthError::DeviceRevoked)
+            }
+            Some(record) => Ok(record),
         }
     }
 
@@ -242,7 +277,7 @@ mod tests {
             public_key_x963: vector["publicKeyX963"].as_str().unwrap().to_owned(),
             paired_at: Utc::now(),
             revoked_at: None,
-            scopes: vec![super::super::registry::DeviceScope::MemoryRead],
+            scopes: vec![DeviceScope::MemoryRead],
         };
         let canonical = canonical_request(
             vector["method"].as_str().unwrap(),
@@ -284,6 +319,19 @@ mod tests {
     }
 
     #[test]
+    fn protected_memory_routes_require_memory_read_scope() {
+        assert_eq!(
+            required_scope("/api/v1/mobile/memory"),
+            Some(DeviceScope::MemoryRead)
+        );
+        assert_eq!(
+            required_scope("/api/v1/mobile/memory/overview"),
+            Some(DeviceScope::MemoryRead)
+        );
+        assert_eq!(required_scope("/api/v1/mobile/device"), None);
+    }
+
+    #[test]
     fn accepted_nonce_cannot_be_replayed_even_concurrently() {
         let (_temp, authenticator) = authenticator();
         let authenticator = Arc::new(authenticator);
@@ -313,10 +361,51 @@ mod tests {
             .registry
             .register(test_device(device_id))
             .unwrap();
-        let verified = VerifiedMobileDevice { device_id };
+        let authorization = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        let verified = VerifiedMobileDevice {
+            device_id,
+            grant_id: authorization.grant.id,
+            revocation_epoch: authorization.grant.revocation_epoch,
+            required_scope: Some(DeviceScope::MemoryRead),
+        };
         authenticator
             .registry
             .revoke(device_id, Utc::now() + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            authenticator.ensure_still_active(&verified),
+            Err(MobileAuthError::DeviceRevoked)
+        );
+    }
+
+    #[test]
+    fn changed_grant_loses_a_race_before_response() {
+        let (_temp, authenticator) = authenticator();
+        let device_id = Uuid::from_u128(2);
+        authenticator
+            .registry
+            .register(test_device(device_id))
+            .unwrap();
+        let authorization = authenticator
+            .registry
+            .authorization_record(device_id)
+            .unwrap()
+            .unwrap();
+        let verified = VerifiedMobileDevice {
+            device_id,
+            grant_id: authorization.grant.id,
+            revocation_epoch: authorization.grant.revocation_epoch,
+            required_scope: Some(DeviceScope::MemoryRead),
+        };
+        let mut changed = authorization.grant;
+        changed.revocation_epoch += 1;
+        authenticator
+            .registry
+            .replace_grant(device_id, changed)
             .unwrap();
         assert_eq!(
             authenticator.ensure_still_active(&verified),
@@ -358,7 +447,7 @@ mod tests {
                 .encode(signing_key.public_key().to_encoded_point(false).as_bytes()),
             paired_at: Utc::now(),
             revoked_at: None,
-            scopes: vec![super::super::registry::DeviceScope::MemoryRead],
+            scopes: vec![DeviceScope::MemoryRead],
         }
     }
 }
