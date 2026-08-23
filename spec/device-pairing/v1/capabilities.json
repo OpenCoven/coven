@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "capabilities": [
+    {"id": "sessions.metadata.read", "risk": "low", "description": "Read session identity and status metadata without conversation content."},
+    {"id": "conversations.read", "risk": "sensitive", "description": "Read conversation content permitted by grant restrictions."},
+    {"id": "messages.send", "risk": "moderate", "description": "Send messages into permitted sessions."},
+    {"id": "tools.request", "risk": "moderate", "description": "Request a tool invocation without authorizing execution."},
+    {"id": "tools.approve", "risk": "high", "description": "Authorize exact transaction-bound tool executions."},
+    {"id": "secrets.read", "risk": "critical", "description": "Read permitted secret material; normally requires fresh step-up."},
+    {"id": "memory.familiar.read", "risk": "sensitive", "description": "Read permitted familiar memory."},
+    {"id": "memory.familiar.write", "risk": "high", "description": "Propose or commit permitted familiar-memory mutations."},
+    {"id": "identity.admin", "risk": "critical", "description": "Administer identity and delegation policy."},
+    {"id": "devices.enroll", "risk": "critical", "description": "Enroll another delegated device."},
+    {"id": "devices.revoke", "risk": "critical", "description": "Revoke delegated device authority."},
+    {"id": "identity.export", "risk": "critical", "description": "Export identity material subject to explicit recovery/root policy."},
+    {"id": "memory.export", "risk": "critical", "description": "Export familiar memory subject to explicit policy."}
+  ],
+  "assuranceLevels": [
+    {"id": "possession", "rank": 1},
+    {"id": "recent_user_verification", "rank": 2},
+    {"id": "fresh_biometric", "rank": 3},
+    {"id": "step_up", "rank": 4}
+  ]
+}
