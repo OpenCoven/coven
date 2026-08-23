@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/device-pairing/v1/enrollment-request.schema.json",
+  "title": "OpenCoven EnrollmentRequest v1 diagnostic JSON representation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "transcriptHash", "deviceKey", "pairwiseDeviceId", "capabilities", "nonce", "expiresAt", "signature"],
+  "properties": {
+    "version": {"const": 1},
+    "transcriptHash": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+    "deviceKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "publicKey"],
+      "properties": {
+        "algorithm": {"enum": ["Ed25519", "P-256"]},
+        "keyId": {"type": "string", "minLength": 8, "maxLength": 128},
+        "publicKey": {"type": "string", "minLength": 43, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$"}
+      }
+    },
+    "pairwiseDeviceId": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 128}
+    },
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{22,86}$"},
+    "expiresAt": {"type": "integer", "minimum": 0},
+    "signature": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$"}
+  }
+}
