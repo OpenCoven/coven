@@ -370,7 +370,8 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .context("mobile device registry omitted a numeric version")?;
-    let version = u16::try_from(version).context("mobile device registry version is out of range")?;
+    let version =
+        u16::try_from(version).context("mobile device registry version is out of range")?;
 
     let loaded = match version {
         LEGACY_DEVICE_REGISTRY_VERSION => {
