@@ -782,7 +782,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "copilot".to_string(),
             label: "Copilot CLI".to_string(),
-            executable: "copilot".to_string(),
+            executable: crate::setup::copilot::EXECUTABLE.to_string(),
             // Copilot rejects positional prompts outright: non-interactive
             // one-shots are `--prompt <text>` and interactive-with-prompt is
             // `--interactive <text>`. Both ride the `=` form via
@@ -794,7 +794,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // non-interactive launches under a PTY — mirror codex's
             // `--color never` hygiene. Interactive launches keep color.
             non_interactive_prompt_prefix_args: vec!["--no-color".to_string()],
-            install_hint: "Install GitHub Copilot CLI with `npm install -g @github/copilot` or `brew install --cask copilot-cli`; if it is already installed, make sure `copilot` is on PATH and run `copilot login` to authenticate, then retry `coven doctor`.".to_string(),
+            install_hint: crate::setup::copilot::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             // Copilot has no system-prompt flag; identity is injected as a
