@@ -297,6 +297,8 @@ fn claude_provider_handles_missing_declined_and_non_tty_without_launching() -> R
         rendered,
         format!("Claude Code: not_installed\n{}\n", claude::INSTALL_GUIDANCE)
     );
+    assert!(rendered.contains("claude auth login"));
+    assert!(!rendered.contains("claude doctor"));
 
     let (outcome, launches, _) = run_claude(
         FixedTerminal(true),
