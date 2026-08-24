@@ -87,7 +87,7 @@ async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
     throw new Error(
-      'Usage: package-github-release.mjs <verify-source-run|verify-npm-provenance|package|sync-release> [--option value ...]'
+      'Usage: package-github-release.mjs <verify-source-run|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
     );
   }
 
@@ -119,6 +119,13 @@ async function main() {
         headSha: requiredOption(options, 'head-sha'),
         sourceRunId: requiredOption(options, 'source-run-id'),
         sourceRunAttempt: requiredOption(options, 'source-run-attempt')
+      });
+      return;
+    }
+    case 'verify-npm-signatures': {
+      verifyNpmRegistrySignatures({
+        npmVersion: requiredOption(options, 'npm-version'),
+        auditDir: requiredOption(options, 'audit-dir')
       });
       return;
     }
@@ -234,6 +241,16 @@ export function verifyAnnotatedTag(tagRef, tagObject, { releaseTag, expectedHead
       `Refusing GitHub release: ${releaseTag} must be an annotated tag, not ${JSON.stringify(tagRef?.object?.type)}.`
     );
   }
+  if (!isSha(tagRef?.object?.sha)) {
+    throw new Error(
+      `Refusing GitHub release: ${releaseTag} must resolve to a GitHub tag object SHA, got ${JSON.stringify(tagRef?.object?.sha)}.`
+    );
+  }
+  if (tagObject?.tag !== releaseTag) {
+    throw new Error(
+      `Refusing GitHub release: GitHub tag API payload must name tag ${releaseTag}, got ${JSON.stringify(tagObject?.tag)}.`
+    );
+  }
   if (tagObject?.verification?.verified !== true) {
     throw new Error(
       `Refusing GitHub release: ${releaseTag} must have a GitHub-verified signature (reason=${tagObject?.verification?.reason ?? 'unknown'}).`
@@ -261,14 +278,26 @@ export function verifyReleaseSource({
   sourceRun,
   tagRef,
   tagObject,
+  localTagObjectSha,
+  localHeadSha,
   commitContainedInMain,
   sourceDateEpoch
 }) {
   const sourceContext = verifySourceRun(sourceRun, { releaseTag });
-  verifyAnnotatedTag(tagRef, tagObject, {
+  const tagContext = verifyAnnotatedTag(tagRef, tagObject, {
     releaseTag,
     expectedHeadSha: sourceContext.headSha
   });
+  if (String(localTagObjectSha ?? '').trim() !== tagContext.tagObjectSha) {
+    throw new Error(
+      `Refusing GitHub release: local tag ${releaseTag} must resolve to the exact GitHub-verified tag object ${tagContext.tagObjectSha}, got ${localTagObjectSha}.`
+    );
+  }
+  if (String(localHeadSha ?? '').trim() !== sourceContext.headSha) {
+    throw new Error(
+      `Refusing GitHub release: local tag ${releaseTag} must resolve to the exact source run commit ${sourceContext.headSha}, got ${localHeadSha}.`
+    );
+  }
   if (commitContainedInMain !== true) {
     throw new Error(
       `Refusing GitHub release: tagged commit ${sourceContext.headSha} is not contained in origin/main.`
@@ -296,12 +325,14 @@ export async function resolveReleaseSource({ repository, releaseTag, sourceRunId
     });
   }
   const tagObject = await ghApi(`/repos/${repository}/git/tags/${tagRef.object.sha}`);
-  const gitState = git.verifyLocalTagState(releaseTag, sourceRun.head_sha);
+  const gitState = git.verifyLocalTagState(releaseTag);
   return verifyReleaseSource({
     releaseTag,
     sourceRun,
     tagRef,
     tagObject,
+    localTagObjectSha: gitState.localTagObjectSha,
+    localHeadSha: gitState.localHeadSha,
     commitContainedInMain: gitState.commitContainedInMain,
     sourceDateEpoch: gitState.sourceDateEpoch
   });
@@ -564,6 +595,48 @@ export async function verifyAllPackageProvenance({
       attestationDocument: attestations
     });
   }
+}
+
+export function verifyNpmRegistrySignatures({
+  npmVersion,
+  auditDir,
+  commandRunner = runCommand
+}) {
+  const normalizedVersion = String(npmVersion ?? '').trim();
+  if (!normalizedVersion) {
+    throw new Error('Refusing GitHub release: npm version is required to verify npm registry signatures.');
+  }
+  const normalizedAuditDirInput = String(auditDir ?? '').trim();
+  if (!normalizedAuditDirInput) {
+    throw new Error('Refusing GitHub release: audit directory is required to verify npm registry signatures.');
+  }
+  const normalizedAuditDir = path.resolve(normalizedAuditDirInput);
+  rmSync(normalizedAuditDir, { recursive: true, force: true });
+  mkdirSync(normalizedAuditDir, { recursive: true });
+  writeFileSync(
+    path.join(normalizedAuditDir, 'package.json'),
+    `${JSON.stringify({
+      name: 'opencoven-release-npm-signatures-audit',
+      private: true,
+      version: '0.0.0',
+      dependencies: Object.fromEntries(
+        RELEASE_PACKAGES.map((packageName) => [packageName, normalizedVersion])
+      )
+    }, null, 2)}\n`
+  );
+  commandRunner(
+    'npm',
+    ['install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false'],
+    { cwd: normalizedAuditDir }
+  );
+  commandRunner('npm', ['audit', 'signatures', '--package-lock-only'], {
+    cwd: normalizedAuditDir
+  });
+  return {
+    auditDir: normalizedAuditDir,
+    packageNames: [...RELEASE_PACKAGES],
+    npmVersion: normalizedVersion
+  };
 }
 
 export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sourceDateEpoch }) {
@@ -858,18 +931,14 @@ export async function syncGitHubRelease({
 
   const uploaded = [];
   const skipped = [];
+  const missingAssetNames = [];
   for (const assetName of expectedAssetNames) {
-    const expectedBytes = expectedBytesByName.get(assetName);
     const existingAsset = existingAssetsByName.get(assetName);
     if (!existingAsset) {
-      await releaseClient.uploadAsset({
-        releaseTag,
-        assetName,
-        filePath: path.join(normalizedOutputDir, assetName)
-      });
-      uploaded.push(assetName);
+      missingAssetNames.push(assetName);
       continue;
     }
+    const expectedBytes = expectedBytesByName.get(assetName);
     const observedBytes = await releaseClient.downloadAsset(existingAsset);
     const observedHash = sha256Hex(observedBytes);
     const expectedHash = sha256Hex(expectedBytes);
@@ -881,6 +950,14 @@ export async function syncGitHubRelease({
     }
     skipped.push(assetName);
   }
+  for (const assetName of missingAssetNames) {
+    await releaseClient.uploadAsset({
+      releaseTag,
+      assetName,
+      filePath: path.join(normalizedOutputDir, assetName)
+    });
+    uploaded.push(assetName);
+  }
 
   return {
     createdRelease,
@@ -891,7 +968,7 @@ export async function syncGitHubRelease({
 
 function createGitClient() {
   return {
-    verifyLocalTagState(releaseTag, expectedHeadSha) {
+    verifyLocalTagState(releaseTag) {
       runCommand('git', [
         'fetch',
         '--force',
@@ -908,22 +985,19 @@ function createGitClient() {
         );
       }
       const localHeadSha = runCommand('git', ['rev-parse', `${releaseTag}^{commit}`]).trim();
-      if (localHeadSha !== expectedHeadSha) {
-        throw new Error(
-          `Refusing GitHub release: local tag ${releaseTag} must resolve to ${expectedHeadSha}, got ${localHeadSha}.`
-        );
-      }
-      const ancestor = spawnCapture('git', ['merge-base', '--is-ancestor', expectedHeadSha, 'origin/main']);
+      const ancestor = spawnCapture('git', ['merge-base', '--is-ancestor', localHeadSha, 'origin/main']);
       if (ancestor.error) {
         throw new Error(ancestor.error.message);
       }
       if (ancestor.status !== 0 && ancestor.status !== 1) {
         throw new Error(
-          `git merge-base --is-ancestor ${expectedHeadSha} origin/main exited with ${ancestor.status}.`
+          `git merge-base --is-ancestor ${localHeadSha} origin/main exited with ${ancestor.status}.`
         );
       }
-      const sourceDateEpoch = runCommand('git', ['log', '-1', '--format=%ct', expectedHeadSha]).trim();
+      const sourceDateEpoch = runCommand('git', ['log', '-1', '--format=%ct', localHeadSha]).trim();
       return {
+        localTagObjectSha: tagObjectSha,
+        localHeadSha,
         commitContainedInMain: ancestor.status === 0,
         sourceDateEpoch: toNonNegativeInteger(sourceDateEpoch, 'SOURCE_DATE_EPOCH')
       };
@@ -1020,12 +1094,19 @@ function decodeDssePayload(dsseEnvelope) {
 }
 
 function integrityDigestHex(integrity) {
-  if (typeof integrity !== 'string' || !integrity.startsWith('sha512-')) {
+  const match = /^sha512-([A-Za-z0-9+/]+={0,2})$/.exec(String(integrity ?? ''));
+  if (!match || match[1].length % 4 !== 0) {
     throw new Error(
-      `Refusing GitHub release: npm dist.integrity must be a sha512 SRI string, got ${JSON.stringify(integrity)}.`
+      `Refusing GitHub release: npm dist.integrity must be a canonical sha512 SRI string with a 64-byte digest, got ${JSON.stringify(integrity)}.`
     );
   }
-  return Buffer.from(integrity.slice('sha512-'.length), 'base64').toString('hex');
+  const decoded = Buffer.from(match[1], 'base64');
+  if (decoded.length !== 64 || decoded.toString('base64') !== match[1]) {
+    throw new Error(
+      `Refusing GitHub release: npm dist.integrity must be a canonical sha512 SRI string with a 64-byte digest, got ${JSON.stringify(integrity)}.`
+    );
+  }
+  return decoded.toString('hex');
 }
 
 function crc32ForBuffer(buffer) {

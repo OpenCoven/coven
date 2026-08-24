@@ -13,6 +13,7 @@ import {
   packageGitHubRelease,
   syncGitHubRelease,
   verifyAnnotatedTag,
+  verifyNpmRegistrySignatures,
   verifyPackageProvenance,
   verifyReleaseSource,
   verifySourceRun
@@ -420,6 +421,14 @@ test('release-github workflow supports automatic and recovery triggers with pinn
     workflowText,
     /node scripts\/package-github-release\.mjs verify-npm-provenance/
   );
+  assert.match(
+    workflowText,
+    /node scripts\/package-github-release\.mjs verify-npm-signatures/
+  );
+  assert.match(
+    workflowText,
+    /--audit-dir github-release-npm-audit/
+  );
   assert.match(workflowText, /node scripts\/package-github-release\.mjs package/);
   assert.match(workflowText, /node scripts\/package-github-release\.mjs sync-release/);
   assert.match(workflowText, new RegExp(`actions/checkout@${CHECKOUT_ACTION_SHA}`));
@@ -543,6 +552,14 @@ test('verifyAnnotatedTag rejects lightweight, unsigned, or retargeted tags', () 
   );
   assert.throws(
     () =>
+      verifyAnnotatedTag(baseTagRef(), { ...baseTagObject(), tag: 'v0.4.2' }, {
+        releaseTag: RELEASE_TAG,
+        expectedHeadSha: HEAD_SHA
+      }),
+    /must name tag v0\.4\.1/
+  );
+  assert.throws(
+    () =>
       verifyAnnotatedTag(baseTagRef(), { ...baseTagObject(), object: { type: 'tree', sha: HEAD_SHA } }, {
         releaseTag: RELEASE_TAG,
         expectedHeadSha: HEAD_SHA
@@ -566,6 +583,8 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
       sourceRun: baseValidSourceRun(),
       tagRef: baseTagRef(),
       tagObject: baseTagObject(),
+      localTagObjectSha: baseTagRef().object.sha,
+      localHeadSha: HEAD_SHA,
       commitContainedInMain: true,
       sourceDateEpoch: SOURCE_DATE_EPOCH
     }),
@@ -585,6 +604,36 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
         sourceRun: baseValidSourceRun(),
         tagRef: baseTagRef(),
         tagObject: baseTagObject(),
+        localTagObjectSha: '2'.repeat(40),
+        localHeadSha: HEAD_SHA,
+        commitContainedInMain: true,
+        sourceDateEpoch: SOURCE_DATE_EPOCH
+      }),
+    /exact GitHub-verified tag object/
+  );
+  assert.throws(
+    () =>
+      verifyReleaseSource({
+        releaseTag: RELEASE_TAG,
+        sourceRun: baseValidSourceRun(),
+        tagRef: baseTagRef(),
+        tagObject: baseTagObject(),
+        localTagObjectSha: baseTagRef().object.sha,
+        localHeadSha: 'f'.repeat(40),
+        commitContainedInMain: true,
+        sourceDateEpoch: SOURCE_DATE_EPOCH
+      }),
+    /exact source run commit/
+  );
+  assert.throws(
+    () =>
+      verifyReleaseSource({
+        releaseTag: RELEASE_TAG,
+        sourceRun: baseValidSourceRun(),
+        tagRef: baseTagRef(),
+        tagObject: baseTagObject(),
+        localTagObjectSha: baseTagRef().object.sha,
+        localHeadSha: HEAD_SHA,
         commitContainedInMain: false,
         sourceDateEpoch: SOURCE_DATE_EPOCH
       }),
@@ -597,11 +646,76 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
         sourceRun: baseValidSourceRun(),
         tagRef: baseTagRef(),
         tagObject: baseTagObject(),
+        localTagObjectSha: baseTagRef().object.sha,
+        localHeadSha: HEAD_SHA,
         commitContainedInMain: true,
         sourceDateEpoch: 'bad'
       }),
     /SOURCE_DATE_EPOCH/
   );
+});
+
+test('verifyNpmRegistrySignatures writes an isolated exact-version audit context and invokes npm audit signatures', () => {
+  withScratchDir('npm-signatures-audit', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    const result = verifyNpmRegistrySignatures({
+      npmVersion: NPM_VERSION,
+      auditDir,
+      commandRunner(command, args, options = {}) {
+        calls.push({ command, args, cwd: options.cwd });
+      }
+    });
+
+    assert.equal(result.auditDir, path.resolve(auditDir));
+    assert.deepEqual(result.packageNames, RELEASE_PACKAGES);
+    assert.equal(result.npmVersion, NPM_VERSION);
+    assert.deepEqual(
+      JSON.parse(readFileSync(path.join(auditDir, 'package.json'), 'utf8')),
+      {
+        name: 'opencoven-release-npm-signatures-audit',
+        private: true,
+        version: '0.0.0',
+        dependencies: Object.fromEntries(
+          RELEASE_PACKAGES.map((packageName) => [packageName, NPM_VERSION])
+        )
+      }
+    );
+    assert.deepEqual(calls, [
+      {
+        command: 'npm',
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false'],
+        cwd: path.resolve(auditDir)
+      },
+      {
+        command: 'npm',
+        args: ['audit', 'signatures', '--package-lock-only'],
+        cwd: path.resolve(auditDir)
+      }
+    ]);
+  });
+});
+
+test('verifyNpmRegistrySignatures fails closed before auditing when package-lock generation fails', () => {
+  withScratchDir('npm-signatures-audit-fail', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    assert.throws(
+      () =>
+        verifyNpmRegistrySignatures({
+          npmVersion: NPM_VERSION,
+          auditDir,
+          commandRunner(command, args) {
+            calls.push([command, ...args].join(' '));
+            throw new Error('npm install failed');
+          }
+        }),
+      /npm install failed/
+    );
+    assert.deepEqual(calls, [
+      'npm install --package-lock-only --ignore-scripts --audit=false --fund=false'
+    ]);
+  });
 });
 
 test('verifyPackageProvenance accepts the real npm attestation shape for every release package', async () => {
@@ -790,6 +904,54 @@ test('verifyPackageProvenance rejects malformed or mismatched attestation payloa
           attestationDocument: attestationDocument ?? base
         }),
       error,
+      name
+    );
+  }
+});
+
+test('verifyPackageProvenance rejects malformed sha512 SRI digests before comparing attestations', async () => {
+  const packageName = '@opencoven/cli';
+  const tarballBytes = Buffer.from('npm package tarball fixture');
+  const goodDigest = createHash('sha512').update(tarballBytes).digest('hex');
+  const attestationDocument = buildAttestations({ packageName, subjectDigest: goodDigest });
+  const canonicalIntegrity = integrityFor(tarballBytes);
+  const cases = [
+    {
+      name: 'empty digest',
+      integrity: 'sha512-'
+    },
+    {
+      name: 'malformed base64',
+      integrity: 'sha512-***'
+    },
+    {
+      name: 'noncanonical base64 without required padding',
+      integrity: canonicalIntegrity.replace(/=+$/, '')
+    },
+    {
+      name: 'wrong-length digest that decodes to 63 bytes',
+      integrity: `sha512-${Buffer.alloc(63).toString('base64')}`
+    },
+    {
+      name: 'wrong-length digest that decodes to 65 bytes',
+      integrity: `sha512-${Buffer.alloc(65).toString('base64')}`
+    }
+  ];
+
+  for (const { name, integrity } of cases) {
+    await assert.rejects(
+      () =>
+        verifyPackageProvenance({
+          packageName,
+          npmVersion: NPM_VERSION,
+          releaseTag: RELEASE_TAG,
+          headSha: HEAD_SHA,
+          sourceRunId: SOURCE_RUN_ID,
+          sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+          packageMetadata: makePackageMetadata(packageName, integrity),
+          attestationDocument
+        }),
+      /canonical sha512 SRI string/,
       name
     );
   }
@@ -1084,5 +1246,42 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
         }),
       /duplicate release assets/
     );
+  });
+});
+
+test('syncGitHubRelease preflights later mismatches before uploading earlier missing assets', async () => {
+  await withScratchDir('sync-preflight-mismatch', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const windowsAssetName = 'coven-v0.4.1-windows-x64.zip';
+    const client = fakeReleaseClient({
+      existingRelease: {
+        tagName: RELEASE_TAG,
+        assets: [{ id: 1, name: windowsAssetName }]
+      },
+      assetBytesByName: {
+        [windowsAssetName]: Buffer.from('wrong windows bytes\n')
+      }
+    });
+
+    await assert.rejects(
+      () =>
+        syncGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          outputDir,
+          releaseClient: client
+        }),
+      /asset .*windows.* mismatch/i
+    );
+    assert.deepEqual(client.state.downloads, [windowsAssetName]);
+    assert.equal(client.state.uploads.length, 0);
   });
 });
