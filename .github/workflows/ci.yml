@@ -69,6 +69,9 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.x'
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
       - run: python scripts/check-coven-privacy-test.py
       - run: python scripts/check-secrets-test.py
       - run: python3 scripts/check-api-contract-docs-test.py
@@ -90,6 +93,7 @@ jobs:
       - run: python3 scripts/classify-ci-changes-test.py
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
+      - run: node --test scripts/package-github-release-test.mjs
       - run: scripts/check-workflows.sh
 
   rust-lint-linux:
