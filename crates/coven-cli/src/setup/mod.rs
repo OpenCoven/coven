@@ -1,5 +1,6 @@
 pub mod claude;
 pub mod codex;
+pub mod copilot;
 mod process;
 
 use std::ffi::{OsStr, OsString};

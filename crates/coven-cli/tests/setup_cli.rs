@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 #[path = "../src/setup/mod.rs"]
 mod setup;
 
-use setup::{claude, codex};
+use setup::{claude, codex, copilot};
 use setup::{
     render_human, run_setup, Clock, CommandSpec, Confirmer, ConsentDecision, ConsentRequest,
     ExecutableDiscovery, LaunchRequest, Outcome, ProcessExit, ProcessLauncher, ProviderDescriptor,
@@ -310,6 +310,101 @@ fn claude_provider_handles_missing_declined_and_non_tty_without_launching() -> R
     assert_eq!(launches, 0);
 
     let (outcome, launches, _) = run_claude(
+        FixedTerminal(false),
+        Some("1.2.3"),
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NonTty);
+    assert_eq!(launches, 0);
+    Ok(())
+}
+
+#[test]
+fn copilot_provider_launches_exact_login_command() -> Result<()> {
+    let provider = copilot::descriptor();
+    let providers = [provider];
+    let discovery = FakeDiscovery::all_present(&providers, "1.2.3");
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([LaunchBehavior::exit(0)]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::Copilot), &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    assert_eq!(confirmer.requests.len(), 1);
+    assert_eq!(confirmer.requests[0].command, "copilot login");
+    assert_eq!(launcher.launches.len(), 1);
+    assert_eq!(
+        launcher.launches[0].executable,
+        PathBuf::from("/fixture/copilot")
+    );
+    assert_eq!(launcher.launches[0].args, vec![OsString::from("login")]);
+    Ok(())
+}
+
+#[test]
+fn copilot_provider_preserves_failure_and_cancellation_outcomes() -> Result<()> {
+    assert_eq!(
+        run_copilot(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::exit(7),
+        )?
+        .0,
+        Outcome::ProviderFailed
+    );
+    assert_eq!(
+        run_copilot(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::signalled(),
+        )?
+        .0,
+        Outcome::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn copilot_provider_handles_missing_declined_and_non_tty_without_launching() -> Result<()> {
+    let (outcome, launches, rendered) = run_copilot(
+        FixedTerminal(true),
+        None,
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NotInstalled);
+    assert_eq!(launches, 0);
+    assert_eq!(
+        rendered,
+        format!(
+            "GitHub Copilot CLI: not_installed\n{}\n",
+            copilot::INSTALL_GUIDANCE
+        )
+    );
+    assert!(rendered.contains("copilot login"));
+
+    let (outcome, launches, _) = run_copilot(
+        FixedTerminal(true),
+        Some("1.2.3"),
+        ConsentDecision::Declined,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::Declined);
+    assert_eq!(launches, 0);
+
+    let (outcome, launches, _) = run_copilot(
         FixedTerminal(false),
         Some("1.2.3"),
         ConsentDecision::Accepted,
@@ -758,6 +853,97 @@ fn inherited_terminal_and_report_helper() -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn copilot_fixture_inherits_terminal_streams_and_records_exact_login() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_tempdir()?;
+    let fake_copilot = temp.path().join("copilot");
+    let args_path = temp.path().join("args.txt");
+    let stdout_path = temp.path().join("terminal.stdout");
+    let stderr_path = temp.path().join("terminal.stderr");
+    fs::write(
+        &fake_copilot,
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' \"$@\" > \"$COVEN_SETUP_ARGS_PATH\"\n",
+            "IFS= read -r line\n",
+            "printf 'copilot-stdout:%s\\n' \"$line\"\n",
+            "printf 'copilot-stderr:%s\\n' \"$line\" >&2\n",
+        ),
+    )?;
+    let mut permissions = fs::metadata(&fake_copilot)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_copilot, permissions)?;
+
+    let mut child = Command::new(std::env::current_exe()?)
+        .args([
+            "--exact",
+            "copilot_inherited_terminal_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("COVEN_SETUP_COPILOT_HELPER", "1")
+        .env("COVEN_SETUP_COPILOT_PATH", &fake_copilot)
+        .env("COVEN_SETUP_ARGS_PATH", &args_path)
+        .stdin(Stdio::piped())
+        .stdout(fs::File::create(&stdout_path)?)
+        .stderr(fs::File::create(&stderr_path)?)
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .context("helper stdin")?
+        .write_all(b"terminal-input\n")?;
+    drop(child.stdin.take());
+    let status = child.wait()?;
+    assert!(status.success(), "helper failed with {status}");
+
+    assert_eq!(fs::read_to_string(args_path)?, "login\n");
+    assert!(
+        fs::read_to_string(stdout_path)?.contains("copilot-stdout:terminal-input"),
+        "Copilot stdout should remain attached to the inherited terminal"
+    );
+    assert!(
+        fs::read_to_string(stderr_path)?.contains("copilot-stderr:terminal-input"),
+        "Copilot stderr should remain attached to the inherited terminal"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn copilot_inherited_terminal_helper() -> Result<()> {
+    if std::env::var_os("COVEN_SETUP_COPILOT_HELPER").is_none() {
+        return Ok(());
+    }
+    let executable =
+        PathBuf::from(std::env::var_os("COVEN_SETUP_COPILOT_PATH").context("Copilot path")?);
+    let provider = copilot::descriptor();
+    let providers = [provider];
+    let discovery = FixedDiscovery(Some(ResolvedExecutable {
+        path: executable,
+        version: Some("1.2.3".to_owned()),
+    }));
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = SystemClock::new();
+    let mut launcher = SystemProcessLauncher;
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::Copilot), &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    Ok(())
+}
+
 #[test]
 fn report_publication_is_fail_if_exists_atomic_and_redaction_closed() -> Result<()> {
     let temp = test_tempdir()?;
@@ -1000,6 +1186,38 @@ fn run_claude(
         launcher: &mut launcher,
     };
     let summary = run_setup(&options(Selector::Claude), &providers, &mut runtime)?;
+    let mut rendered = Vec::new();
+    render_human(&summary, &mut rendered)?;
+    Ok((
+        summary.results[0].outcome,
+        launcher.launches.len(),
+        String::from_utf8(rendered)?,
+    ))
+}
+
+fn run_copilot(
+    terminal: FixedTerminal,
+    version: Option<&str>,
+    consent: ConsentDecision,
+    behavior: LaunchBehavior,
+) -> Result<(Outcome, usize, String)> {
+    let provider = copilot::descriptor();
+    let providers = [provider];
+    let discovery = FixedDiscovery(version.map(|version| ResolvedExecutable {
+        path: PathBuf::from("fake-copilot"),
+        version: Some(version.to_owned()),
+    }));
+    let mut confirmer = FakeConfirmer::new([consent]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([behavior]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+    let summary = run_setup(&options(Selector::Copilot), &providers, &mut runtime)?;
     let mut rendered = Vec::new();
     render_human(&summary, &mut rendered)?;
     Ok((

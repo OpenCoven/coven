@@ -1522,7 +1522,11 @@ fn run_setup_command(
     verify_only: bool,
     report_json: Option<PathBuf>,
 ) -> Result<()> {
-    let providers = [setup::codex::descriptor(), setup::claude::descriptor()];
+    let providers = [
+        setup::codex::descriptor(),
+        setup::claude::descriptor(),
+        setup::copilot::descriptor(),
+    ];
     let mode = if verify_only {
         setup::SetupMode::VerifyOnly
     } else if verify {
