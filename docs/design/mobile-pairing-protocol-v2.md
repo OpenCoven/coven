@@ -6,7 +6,7 @@
 
 ## Purpose
 
-Pairing v2 hardens the existing QR enrollment flow without replacing its proven transport and confirmation model. The QR introduces a short-lived Coven installation. TLS 1.3 protects the direct connection and the QR-pinned host certificate fingerprint authenticates the endpoint. A transcript-derived six-word phrase confirms that the phone and host observed the same offer and enrollment request before a device grant is persisted.
+Pairing v2 hardens the existing QR enrollment flow without replacing its proven transport and confirmation model. The QR introduces a short-lived Coven installation. TLS 1.3 protects the direct connection and the QR-pinned host public-key fingerprint authenticates the endpoint. A transcript-derived six-word phrase confirms that the phone and host observed the same offer and enrollment request before a device grant is persisted.
 
 The QR is not a bearer login credential. A captured offer is useful only during its short invitation window, succeeds at most once, and still requires confirmation on both endpoints.
 
@@ -32,14 +32,18 @@ The terminal renders a `coven-memory://pair` URL with these query members:
 | `minimumVersion` | Oldest pairing protocol accepted by the host; `1` |
 | `maximumVersion` | Newest pairing protocol accepted by the host; `2` |
 | `pairingId` | Canonical lowercase UUID |
-| `endpoint` | Canonical HTTPS mobile-gateway endpoint; no user info, query, or fragment |
-| `fingerprint` | Unpadded base64url encoding of the 32-byte TLS certificate fingerprint |
+| `endpoint` | Canonical HTTPS mobile-gateway endpoint; root path only, with no user info, query, or fragment |
+| `fingerprint` | Unpadded base64url encoding of SHA-256 over the host's canonical uncompressed 65-byte P-256 X9.63 public key |
 | `nonce` | Unpadded base64url encoding of the 32-byte single-use pairing nonce |
 | `expires` | Signed Unix timestamp in seconds |
 | `scope` | Requested authority; currently exactly `memory_read` |
 | `offerDigest` | Unpadded base64url SHA-256 digest of the canonical offer below |
 
-The endpoint is a routing hint authenticated by the pinned TLS certificate. It is intentionally not included in the offer digest: changing an address without possessing the pinned host private key cannot impersonate the host, while allowing the same installation identity to remain reachable through an equivalent route.
+The endpoint is a routing hint authenticated by requiring the TLS certificate
+to use the public key whose fingerprint appears in the QR. It is intentionally
+not included in the offer digest: changing an address without possessing the
+corresponding host private key cannot impersonate the host, while allowing the
+same installation identity to remain reachable through an equivalent route.
 
 ## Canonical offer digest
 
@@ -118,7 +122,7 @@ The first 66 bits of the transcript digest select six words from the existing fi
 1. Modifying any offer security field changes `offerDigest` and the six-word phrase.
 2. Modifying the device key, selected/range versions, name, or app version changes the phrase.
 3. Pairing v1 vectors remain unchanged for older compatible clients.
-4. A relay or network observer cannot substitute a host without the QR-pinned TLS private key.
+4. A relay or network observer cannot substitute a host without the private key corresponding to the QR-pinned P-256 public key.
 5. Successful pairing creates a key-bound scoped grant, not a reusable bearer credential.
 6. Biometric authorization is outside this transcript: the mobile operating system may gate use of the enrolled private key, while only signatures and assurance evidence reach Coven.
 
