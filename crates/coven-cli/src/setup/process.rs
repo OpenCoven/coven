@@ -76,34 +76,19 @@ impl ProcessLauncher for SystemProcessLauncher {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        if let Some(current_dir) = request.current_dir.as_deref() {
-            command.current_dir(current_dir);
-        }
-        for (name, value) in &request.env_overrides {
-            match value {
-                Some(value) => {
-                    command.env(name, value);
-                }
-                None => {
-                    command.env_remove(name);
-                }
-            }
-        }
+        apply_launch_context(&mut command, request);
         Ok(Box::new(spawn_managed(&mut command)?))
     }
 }
 
-pub fn probe_version(
-    executable: &std::path::Path,
-    args: &[OsString],
-    timeout: Duration,
-) -> io::Result<Option<String>> {
-    let mut command = Command::new(executable);
+pub fn probe_version(request: &LaunchRequest, timeout: Duration) -> io::Result<Option<String>> {
+    let mut command = Command::new(&request.executable);
     command
-        .args(args)
+        .args(&request.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    apply_launch_context(&mut command, request);
     let mut process = spawn_managed(&mut command)?;
     let stdout = process
         .child
@@ -143,29 +128,110 @@ pub fn probe_version(
             return Err(io::Error::other("version probe output reader stopped"));
         }
     };
+    process.terminate_tree()?;
+    let _ = process.wait()?;
     if exit != ProcessExit::Exited(0) {
         return Ok(None);
     }
-    Ok(extract_version(&String::from_utf8_lossy(&output)))
+    Ok(extract_version(
+        &String::from_utf8_lossy(&output),
+        request
+            .executable
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str),
+    ))
 }
 
-fn extract_version(output: &str) -> Option<String> {
-    output
+fn apply_launch_context(command: &mut Command, request: &LaunchRequest) {
+    if let Some(current_dir) = request.current_dir.as_deref() {
+        command.current_dir(current_dir);
+    }
+    for (name, value) in &request.env_overrides {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
+}
+
+fn extract_version(output: &str, expected_program: Option<&str>) -> Option<String> {
+    let tokens = output
         .split_whitespace()
-        .map(|token| {
-            token.trim_matches(|character: char| {
+        .map(|raw| {
+            let normalized = raw.trim_matches(|character: char| {
                 !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '+' | '-')
-            })
+            });
+            (raw, normalized)
         })
-        .find(|token| {
-            !token.is_empty()
-                && token.len() <= 128
-                && token.bytes().any(|byte| byte.is_ascii_digit())
-                && token.bytes().all(|byte| {
-                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'+' | b'-')
-                })
+        .collect::<Vec<_>>();
+    let candidates = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, normalized))| valid_version(normalized))
+        .collect::<Vec<_>>();
+    let labeled = candidates
+        .iter()
+        .copied()
+        .filter(|(index, _)| {
+            index
+                .checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .is_some_and(|(_, normalized)| normalized.eq_ignore_ascii_case("version"))
         })
-        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if let [(_, (_, normalized))] = labeled.as_slice() {
+        return Some((*normalized).to_owned());
+    }
+    let [(_, (_, normalized))] = candidates.as_slice() else {
+        return None;
+    };
+    if tokens.len() == 1 {
+        return Some((*normalized).to_owned());
+    }
+    let expected_program = expected_program?.to_ascii_lowercase();
+    if tokens.iter().any(|(_, marker)| {
+        let marker = marker.to_ascii_lowercase();
+        marker == expected_program
+            || marker
+                .strip_prefix(&expected_program)
+                .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('_'))
+    }) {
+        Some((*normalized).to_owned())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn valid_version(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let value = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))
+        .unwrap_or(value);
+    let suffix_start = value
+        .bytes()
+        .position(|byte| matches!(byte, b'-' | b'+'))
+        .unwrap_or(value.len());
+    let (core, suffix) = value.split_at(suffix_start);
+    let mut component_count = 0;
+    for component in core.split('.') {
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        component_count += 1;
+    }
+    component_count >= 2
+        && (suffix.is_empty()
+            || (suffix.len() > 1
+                && suffix.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')
+                })))
 }
 
 pub(crate) enum BoundedProcessResult {
@@ -181,6 +247,8 @@ pub(crate) fn wait_bounded(
     let deadline = clock.now().saturating_add(timeout);
     loop {
         if let Some(exit) = process.try_wait()? {
+            process.terminate_tree()?;
+            let _ = process.wait()?;
             return Ok(BoundedProcessResult::Exited(exit));
         }
         let now = clock.now();
@@ -230,7 +298,7 @@ fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
         };
         if !windows_job::resume_suspended_child(&child) {
             let _ = job.terminate();
-            let _ = child.wait();
+            let _ = child.kill();
             return Err(io::Error::other("could not resume managed Windows process"));
         }
         (child, job)
@@ -243,6 +311,13 @@ fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
         #[cfg(windows)]
         job,
     })
+}
+
+impl Drop for SystemRunningProcess {
+    fn drop(&mut self) {
+        let _ = terminate_system_tree(self);
+        let _ = self.child.try_wait();
+    }
 }
 
 impl RunningProcess for SystemRunningProcess {

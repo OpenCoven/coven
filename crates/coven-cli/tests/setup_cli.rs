@@ -1016,6 +1016,7 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
     let temp = test_tempdir()?;
     let fake_codex = temp.path().join("codex");
     let observation_path = temp.path().join("verification-state.txt");
+    let version_observation_path = temp.path().join("version-state.txt");
     let args_path = temp.path().join("verification-args.txt");
     let report_path = temp.path().join("verification-report.json");
     let stdout_path = temp.path().join("verification.stdout");
@@ -1024,6 +1025,11 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
         &fake_codex,
         concat!(
             "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then\n",
+            "  printf '%s\\n%s\\n' \"$PWD\" \"$COVEN_HOME\" > \"$COVEN_SETUP_VERSION_STATE_PATH\"\n",
+            "  printf 'Authenticated alice123 account 123.456.789 sk-proj-123 version 1.2.3\\n'\n",
+            "  exit 0\n",
+            "fi\n",
             "printf '%s\\n%s\\n' \"$PWD\" \"$COVEN_HOME\" > \"$COVEN_SETUP_STATE_PATH\"\n",
             "printf '%s\\n' \"$@\" > \"$COVEN_SETUP_ARGS_PATH\"\n",
             "printf 'provider-stdout:oauth token private-path=%s\\n' \"$COVEN_SETUP_STATE_PATH\"\n",
@@ -1044,6 +1050,7 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
         .env("COVEN_SETUP_VERIFY_HELPER", "1")
         .env("COVEN_SETUP_VERIFY_EXECUTABLE", &fake_codex)
         .env("COVEN_SETUP_STATE_PATH", &observation_path)
+        .env("COVEN_SETUP_VERSION_STATE_PATH", &version_observation_path)
         .env("COVEN_SETUP_ARGS_PATH", &args_path)
         .env("COVEN_SETUP_REPORT_PATH", &report_path)
         .stdin(Stdio::null())
@@ -1074,6 +1081,11 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
         "ephemeral verification state should be removed: {current_dir:?}"
     );
     assert_eq!(
+        fs::read_to_string(version_observation_path)?,
+        observation,
+        "version probing must use the same ephemeral cwd and COVEN_HOME"
+    );
+    assert_eq!(
         fs::read_to_string(args_path)?,
         concat!(
             "exec\n",
@@ -1090,6 +1102,10 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
     assert!(stdout.contains("provider-stdout:oauth token private-path="));
     assert!(stderr.contains("provider-stderr:account model bearer="));
     let report = fs::read_to_string(report_path)?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&report)?["cli_version"],
+        "1.2.3"
+    );
     for forbidden in [
         "provider-stdout",
         "provider-stderr",
@@ -1106,6 +1122,111 @@ fn verify_ephemeral_state_reaches_provider_then_is_removed() -> Result<()> {
             "verification report leaked {forbidden:?}: {report}"
         );
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn version_probe_reaps_detached_provider_descendants() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_tempdir()?;
+    let fake_codex = temp.path().join("codex");
+    let pid_path = temp.path().join("version-descendant.pid");
+    let report_path = temp.path().join("report.json");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/usr/bin/env python3\n",
+            "import os, sys, time\n",
+            "if sys.argv[1:] == ['--version']:\n",
+            "    child = os.fork()\n",
+            "    if child == 0:\n",
+            "        os.close(1)\n",
+            "        os.close(2)\n",
+            "        time.sleep(30)\n",
+            "        os._exit(0)\n",
+            "    path = os.path.join(os.path.dirname(__file__), 'version-descendant.pid')\n",
+            "    with open(path, 'w') as output:\n",
+            "        output.write(str(child))\n",
+            "    print('1.2.3', flush=True)\n",
+            "    os._exit(0)\n",
+        ),
+    )?;
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))?;
+    let providers = [codex::descriptor()];
+    let discovery = FixedDiscovery(Some(ResolvedExecutable {
+        path: fake_codex,
+        version: None,
+    }));
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = SystemClock::new();
+    let mut launcher = SystemProcessLauncher;
+    let mut setup_options = options(Selector::Codex);
+    setup_options.mode = SetupMode::VerifyOnly;
+    setup_options.report_json = Some(report_path);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&setup_options, &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    let pid = fs::read_to_string(pid_path)?
+        .parse::<u32>()
+        .context("version descendant pid")?;
+    wait_for_process_exit(pid)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn version_probe_rejects_contextual_account_identifier() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_tempdir()?;
+    let fake_codex = temp.path().join("codex");
+    let report_path = temp.path().join("report.json");
+    fs::write(
+        &fake_codex,
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then\n",
+            "  printf 'Authenticated account 123.456.789\\n'\n",
+            "fi\n",
+        ),
+    )?;
+    fs::set_permissions(&fake_codex, fs::Permissions::from_mode(0o755))?;
+    let providers = [codex::descriptor()];
+    let discovery = FixedDiscovery(Some(ResolvedExecutable {
+        path: fake_codex,
+        version: None,
+    }));
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = SystemClock::new();
+    let mut launcher = SystemProcessLauncher;
+    let mut setup_options = options(Selector::Codex);
+    setup_options.mode = SetupMode::VerifyOnly;
+    setup_options.report_json = Some(report_path.clone());
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let error = run_setup(&setup_options, &providers, &mut runtime)
+        .expect_err("contextual account identifier must not become a CLI version");
+
+    assert!(matches!(error, SetupError::Rejected));
+    assert!(!report_path.exists());
     Ok(())
 }
 
@@ -1162,7 +1283,7 @@ fn verify_ephemeral_state_helper() -> Result<()> {
     let providers = [codex::descriptor()];
     let discovery = FixedDiscovery(Some(ResolvedExecutable {
         path: executable,
-        version: Some("1.2.3".to_owned()),
+        version: None,
     }));
     let terminal = FixedTerminal(true);
     let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
@@ -1182,6 +1303,95 @@ fn verify_ephemeral_state_helper() -> Result<()> {
     let summary = run_setup(&setup_options, &providers, &mut runtime)?;
 
     assert!(summary.completed());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn declining_setup_does_not_execute_provider_version_command() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_tempdir()?;
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin)?;
+    let marker = temp.path().join("version-ran");
+    let executable = bin.join("fake-codex");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf ran > '{}'\nprintf 'fake-codex 1.2.3\\n'\n",
+            marker.display()
+        ),
+    )?;
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+
+    let provider = descriptor(ProviderId::Codex);
+    let providers = [provider];
+    let discovery = SystemExecutableDiscovery::from_path(Some(std::env::join_paths([bin])?), None);
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Declined]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::Codex), &providers, &mut runtime)?;
+
+    assert_eq!(summary.results[0].outcome, Outcome::Declined);
+    assert!(
+        !marker.exists(),
+        "provider code ran before explicit setup consent"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn completed_verification_reaps_detached_provider_descendants() -> Result<()> {
+    let temp = test_tempdir()?;
+    let pid_file = temp.path().join("descendant.pid");
+    let provider = ProviderDescriptor::new(
+        ProviderId::Codex,
+        "sh",
+        "Install the shell from its official source.",
+    )
+    .with_verification(CommandSpec::new([
+        "-c",
+        "sleep 30 >/dev/null 2>&1 & printf '%s' \"$!\" > \"$1\"",
+        "setup-completed",
+        pid_file.to_str().context("test path must be valid UTF-8")?,
+    ]));
+    let providers = [provider];
+    let discovery = FixedDiscovery(Some(ResolvedExecutable {
+        path: PathBuf::from("/bin/sh"),
+        version: None,
+    }));
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = SystemClock::new();
+    let mut launcher = SystemProcessLauncher;
+    let mut setup_options = options(Selector::Codex);
+    setup_options.mode = SetupMode::VerifyOnly;
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&setup_options, &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    let pid = fs::read_to_string(pid_file)?
+        .parse::<u32>()
+        .context("descendant pid")?;
+    wait_for_process_exit(pid)?;
     Ok(())
 }
 
@@ -1338,9 +1548,8 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
         .to_string_lossy()
         .eq_ignore_ascii_case(&executable.to_string_lossy()));
     #[cfg(not(windows))]
-    assert_eq!(resolved.path, executable);
-    #[cfg(unix)]
-    assert_eq!(resolved.version.as_deref(), Some("1.2.3"));
+    assert_eq!(resolved.path, fs::canonicalize(&executable)?);
+    assert_eq!(resolved.version, None);
 
     #[cfg(unix)]
     {
@@ -1348,6 +1557,32 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
         fs::set_permissions(&resolved.path, fs::Permissions::from_mode(0o644))?;
         assert!(discovery.discover(&provider)?.is_none());
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn executable_discovery_normalizes_explicit_relative_paths() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = test_tempdir()?;
+    let executable = temp.path().join("relative-cli");
+    fs::write(&executable, b"#!/bin/sh\nprintf 'relative-cli 1.2.3\\n'\n")?;
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+    let relative = executable.strip_prefix(std::env::current_dir()?)?;
+    let provider = ProviderDescriptor::new(
+        ProviderId::Codex,
+        relative.to_string_lossy(),
+        "Official install guidance.",
+    );
+    let discovery = SystemExecutableDiscovery::from_path(None, None);
+
+    let resolved = discovery
+        .discover(&provider)?
+        .context("relative executable should be discovered")?;
+
+    assert!(resolved.path.is_absolute(), "{:?}", resolved.path);
+    assert_eq!(resolved.path, fs::canonicalize(executable)?);
     Ok(())
 }
 
