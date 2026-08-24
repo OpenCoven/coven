@@ -240,9 +240,10 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     );
   }
   for (const expected of [
-    'Install and authenticate at least one harness in this same shell',
-    'npm install -g @openai/codex && codex login',
-    'npm install -g @anthropic-ai/claude-code && claude doctor',
+    'Set up at least one harness in this same shell',
+    'Codex: coven setup codex',
+    'Claude Code: coven setup claude',
+    'GitHub Copilot CLI: coven setup copilot',
     'Doctor found problems; review the failing checks above.'
   ]) {
     if (!doctorOutput.stdout.includes(expected)) {

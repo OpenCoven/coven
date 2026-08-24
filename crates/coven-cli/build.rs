@@ -33,14 +33,21 @@ fn main() {
     // declaring it here lets a CI re-run with a different tag re-stamp the
     // binary without `cargo clean`.
     println!("cargo:rerun-if-env-changed=COVEN_BUILD_VERSION");
+    println!("cargo:rerun-if-env-changed=COVEN_BUILD_COMMIT");
     println!("cargo:rerun-if-env-changed=GITHUB_REF_NAME");
+    println!("cargo:rerun-if-env-changed=GITHUB_SHA");
 
     let describe = explicit_build_version()
         .or_else(describe_from_git)
         .or_else(github_ref_name_if_tag)
         .unwrap_or_else(|| format!("{} (unknown source)", env!("CARGO_PKG_VERSION")));
+    let commit = explicit_build_commit()
+        .or_else(commit_from_git)
+        .or_else(github_sha)
+        .unwrap_or_else(|| "unknown".to_owned());
 
     println!("cargo:rustc-env=COVEN_VERSION_DESC={}", describe);
+    println!("cargo:rustc-env=COVEN_BUILD_COMMIT={}", commit);
 }
 
 fn explicit_build_version() -> Option<String> {
@@ -48,6 +55,10 @@ fn explicit_build_version() -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn explicit_build_commit() -> Option<String> {
+    commit_environment_value("COVEN_BUILD_COMMIT")
 }
 
 fn describe_from_git() -> Option<String> {
@@ -65,6 +76,33 @@ fn describe_from_git() -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+fn commit_from_git() -> Option<String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    valid_commit(stdout.trim()).then(|| stdout.trim().to_owned())
+}
+
+fn github_sha() -> Option<String> {
+    commit_environment_value("GITHUB_SHA")
+}
+
+fn commit_environment_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| valid_commit(value))
+}
+
+fn valid_commit(value: &str) -> bool {
+    (7..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn github_ref_name_if_tag() -> Option<String> {

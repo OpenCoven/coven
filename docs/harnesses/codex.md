@@ -18,7 +18,8 @@ harness.
 | Harness id | `codex` |
 | Install | `npm install -g @openai/codex` |
 | Auth | `codex login` (one-time, OpenAI side) |
-| Doctor check | `coven doctor` reports the resolved Codex path and version. |
+| Guided setup | `coven setup codex` |
+| Doctor check | `coven doctor` reports local availability; it does not verify auth. |
 
 ## Setup
 
@@ -29,17 +30,26 @@ harness.
     ```
     Other install methods (Homebrew cask, package managers) are listed at the [Codex repo](https://github.com/openai/codex).
   </Step>
-  <Step title="Log in to OpenAI">
+  <Step title="Run guided provider login">
     ```bash
-    codex login
+    coven setup codex
     ```
-    Provider credentials stay with Codex. Coven never reads them.
+    After explicit consent, Coven hands the terminal to `codex login`.
+    Provider credentials stay with Codex; Coven never reads them.
+  </Step>
+  <Step title="Optionally verify provider access">
+    ```bash
+    coven setup codex --verify-only
+    ```
+    Verification requires separate consent, network access, and may incur
+    provider usage or cost. It runs in ephemeral state.
   </Step>
   <Step title="Confirm with Coven">
     ```bash
     coven doctor
     ```
-    The output should include a line like `codex: ok (/usr/local/bin/codex)`.
+    Doctor confirms only that Codex is locally available. It remains offline
+    and does not verify provider authentication.
   </Step>
   <Step title="Launch">
     ```bash
@@ -61,6 +71,9 @@ coven run codex "audit this repo" --cwd packages/cli --title "CLI audit"
 ## Provider auth boundary
 
 Codex owns its own OAuth flow and token cache. If you see `Invalidated OAuth token`, run `codex login` again. Coven will keep the existing session record so you can re-launch with the same title.
+
+For the complete TTY, consent, timeout, verification, and redacted report
+contract, see [`coven setup`](/reference/cli-setup).
 
 For the local rescue path:
 
@@ -117,4 +130,5 @@ available; otherwise Coven's timeout/error cleanup uses `taskkill /T /F`.
 
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
+- [`coven setup`](/reference/cli-setup)
 - [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

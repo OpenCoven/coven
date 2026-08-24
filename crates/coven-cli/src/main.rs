@@ -63,6 +63,7 @@ mod repos_config;
 mod reset;
 mod session_launch;
 mod settings;
+pub mod setup;
 mod state_lock;
 mod store;
 mod stream_json;
@@ -160,6 +161,34 @@ impl Cli {
                 ));
             }
         }
+        if let Some(Command::Setup {
+            verify,
+            verify_only,
+            report_json,
+            ..
+        }) = &self.command
+        {
+            if *verify && *verify_only {
+                let mut command = Cli::command();
+                let setup = command
+                    .find_subcommand_mut("setup")
+                    .expect("derived CLI must contain the setup command");
+                return Err(setup.error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "'--verify' cannot be used with '--verify-only'",
+                ));
+            }
+            if report_json.is_some() && !verify && !verify_only {
+                let mut command = Cli::command();
+                let setup = command
+                    .find_subcommand_mut("setup")
+                    .expect("derived CLI must contain the setup command");
+                return Err(setup.error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    "'--report-json' requires '--verify' or '--verify-only'",
+                ));
+            }
+        }
         Ok(self)
     }
 }
@@ -199,6 +228,29 @@ enum Command {
     Doctor {
         #[arg(long, help = "Print checks as JSON (machine-readable)")]
         json: bool,
+    },
+    #[command(about = "Run provider-owned login with explicit consent and direct terminal access")]
+    Setup {
+        #[arg(value_enum, default_value_t = setup::Selector::All)]
+        provider: setup::Selector,
+        #[arg(
+            long,
+            conflicts_with = "verify_only",
+            help = "After login, request separate consent for a bounded provider verification turn"
+        )]
+        verify: bool,
+        #[arg(
+            long,
+            conflicts_with = "verify",
+            help = "Skip login and request consent only for a bounded provider verification turn"
+        )]
+        verify_only: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Atomically write a redacted verification report; the path must not exist"
+        )]
+        report_json: Option<PathBuf>,
     },
     #[command(about = "Report resolved configuration and state paths")]
     Config {
@@ -1119,6 +1171,18 @@ fn main() -> Result<()> {
     // This diagnostic must not create COVEN_HOME through the shared state lock
     // or read settings contents during startup. It is deliberately the one
     // command that runs before normal state initialization.
+    if matches!(&cli.command, Some(Command::Setup { .. })) {
+        match run_cli(cli) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.downcast_ref::<SetupIncomplete>().is_some() => {
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("Error: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if matches!(
         &cli.command,
         Some(Command::Config {
@@ -1170,6 +1234,9 @@ fn main() -> Result<()> {
             eprintln!("{}", cancelled.0);
             std::process::exit(1);
         }
+        if error.downcast_ref::<SetupIncomplete>().is_some() {
+            std::process::exit(1);
+        }
         if let Some(reset_error) = error.downcast_ref::<reset::ResetError>() {
             eprintln!("Error: {reset_error}");
             std::process::exit(reset_error.exit_code());
@@ -1194,6 +1261,17 @@ impl std::fmt::Display for Cancelled {
 
 impl std::error::Error for Cancelled {}
 
+#[derive(Debug)]
+struct SetupIncomplete;
+
+impl std::fmt::Display for SetupIncomplete {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("setup did not complete")
+    }
+}
+
+impl std::error::Error for SetupIncomplete {}
+
 fn run_cli(cli: Cli) -> Result<()> {
     if cli.command.is_none() && !cli.prompt.is_empty() {
         return run_bare_prompt(&cli.prompt);
@@ -1202,6 +1280,12 @@ fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
         None | Some(Command::Chat) | Some(Command::Tui) => run_shared_interactive_shell(),
         Some(Command::Doctor { json }) => run_doctor(json),
+        Some(Command::Setup {
+            provider,
+            verify,
+            verify_only,
+            report_json,
+        }) => run_setup_command(provider, verify, verify_only, report_json),
         Some(Command::Config {
             command: ConfigCommand::Paths { json },
         }) => {
@@ -1430,6 +1514,56 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Acp { args }) => run_engine_passthrough(Some("acp"), &args),
         Some(Command::Code { args }) => run_engine_passthrough(None, &args),
     }
+}
+
+fn run_setup_command(
+    provider: setup::Selector,
+    verify: bool,
+    verify_only: bool,
+    report_json: Option<PathBuf>,
+) -> Result<()> {
+    let providers = [
+        setup::codex::descriptor(),
+        setup::claude::descriptor(),
+        setup::copilot::descriptor(),
+    ];
+    let mode = if verify_only {
+        setup::SetupMode::VerifyOnly
+    } else if verify {
+        setup::SetupMode::LoginAndVerify
+    } else {
+        setup::SetupMode::Login
+    };
+    let options = setup::SetupOptions {
+        selector: provider,
+        mode,
+        timeout: Duration::from_secs(300),
+        report_json,
+        candidate_commit: setup_candidate_commit(),
+    };
+    let discovery = setup::SystemExecutableDiscovery::from_environment();
+    let terminal = setup::SystemTerminalState;
+    let mut confirmer = setup::SystemConfirmer;
+    let clock = setup::SystemClock::new();
+    let mut launcher = setup::SystemProcessLauncher;
+    let mut runtime = setup::SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+    let summary = setup::run_setup(&options, &providers, &mut runtime)?;
+    setup::render_human(&summary, &mut io::stdout().lock())?;
+    if summary.completed() {
+        Ok(())
+    } else {
+        Err(anyhow::Error::new(SetupIncomplete))
+    }
+}
+
+fn setup_candidate_commit() -> String {
+    env!("COVEN_BUILD_COMMIT").to_owned()
 }
 
 fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
@@ -2287,9 +2421,10 @@ fn doctor_next_steps(default_harness: Option<&str>) -> Vec<String> {
             "coven sessions".to_string(),
         ],
         None => vec![
-            "Install and authenticate at least one harness in this same shell.".to_string(),
-            "Codex: npm install -g @openai/codex && codex login".to_string(),
-            "Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor".to_string(),
+            "Set up at least one harness in this same shell.".to_string(),
+            "Codex: coven setup codex".to_string(),
+            "Claude Code: coven setup claude".to_string(),
+            "GitHub Copilot CLI: coven setup copilot".to_string(),
             "If PATH changed, open a new terminal and run `coven doctor` again.".to_string(),
             "Then run: coven daemon start".to_string(),
             "Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
@@ -3558,9 +3693,9 @@ fn credentials_lines(
 /// adapter's own install/authentication hint.
 fn auth_setup_hint_for_harness(harness_id: &str) -> String {
     match harness_id {
-        "codex" => "codex login".to_string(),
-        "claude" => "claude doctor".to_string(),
-        "copilot" => "copilot login".to_string(),
+        "codex" => "coven setup codex".to_string(),
+        "claude" => "coven setup claude".to_string(),
+        "copilot" => "coven setup copilot".to_string(),
         other => format!("coven adapter doctor {other}"),
     }
 }
@@ -7643,9 +7778,12 @@ mod tests {
         // doctor renders this hint inside backticks. Adapter harnesses used to
         // land on the prose fallback "see harness docs", which reads as a
         // command that does not exist.
-        assert_eq!(auth_setup_hint_for_harness("codex"), "codex login");
-        assert_eq!(auth_setup_hint_for_harness("claude"), "claude doctor");
-        assert_eq!(auth_setup_hint_for_harness("copilot"), "copilot login");
+        assert_eq!(auth_setup_hint_for_harness("codex"), "coven setup codex");
+        assert_eq!(auth_setup_hint_for_harness("claude"), "coven setup claude");
+        assert_eq!(
+            auth_setup_hint_for_harness("copilot"),
+            "coven setup copilot"
+        );
         for id in ["grok", "hermes", "opencode", "some-local-adapter"] {
             let hint = auth_setup_hint_for_harness(id);
             assert_eq!(hint, format!("coven adapter doctor {id}"));
@@ -7654,6 +7792,25 @@ mod tests {
                 "hint must be runnable, got: {hint}"
             );
         }
+    }
+
+    #[test]
+    fn missing_harness_next_steps_use_guided_setup() {
+        let steps = doctor_next_steps(None);
+        for command in [
+            "Codex: coven setup codex",
+            "Claude Code: coven setup claude",
+            "GitHub Copilot CLI: coven setup copilot",
+        ] {
+            assert!(
+                steps.iter().any(|step| step == command),
+                "missing {command}"
+            );
+        }
+        let rendered = steps.join("\n");
+        assert!(!rendered.contains("codex login"));
+        assert!(!rendered.contains("claude auth login"));
+        assert!(!rendered.contains("copilot login"));
     }
 
     #[test]
@@ -8166,7 +8323,10 @@ mod tests {
             codex_line.contains("authentication not verified"),
             "got: {codex_line}"
         );
-        assert!(codex_line.contains("codex login"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("coven setup codex"),
+            "got: {codex_line}"
+        );
         assert!(
             codex_line.contains("explicitly authorized test turn"),
             "got: {codex_line}"
@@ -8177,7 +8337,10 @@ mod tests {
             claude_line.contains("authentication not verified"),
             "got: {claude_line}"
         );
-        assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("coven setup claude"),
+            "got: {claude_line}"
+        );
         assert!(
             claude_line.contains("explicitly authorized test turn"),
             "got: {claude_line}"
