@@ -1186,16 +1186,22 @@ mod tests {
             let probe = TcpListener::bind(SocketAddr::new(ip, 0)).ok()?;
             probe.set_nonblocking(true).ok()?;
             let address = probe.local_addr().ok()?;
-            let _client = TcpStream::connect_timeout(&address, Duration::from_millis(200)).ok()?;
             let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+            if remaining.is_zero() {
+                return None;
+            }
+            let _client = TcpStream::connect_timeout(&address, remaining).ok()?;
             loop {
+                let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
+                if remaining.is_zero() {
+                    return None;
+                }
                 match probe.accept() {
                     Ok(_) => return Some(ip),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        if std::time::Instant::now() >= deadline {
-                            return None;
-                        }
-                        std::thread::sleep(Duration::from_millis(5));
+                        std::thread::sleep(remaining.min(Duration::from_millis(5)));
                     }
                     Err(_) => return None,
                 }
