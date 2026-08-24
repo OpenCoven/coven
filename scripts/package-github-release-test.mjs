@@ -655,7 +655,7 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
   );
 });
 
-test('verifyNpmRegistrySignatures writes an isolated exact-version audit context and invokes npm audit signatures', () => {
+test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-version audit context and invokes real npm audit signatures', () => {
   withScratchDir('npm-signatures-audit', (scratchDir) => {
     const auditDir = path.join(scratchDir, 'audit');
     const calls = [];
@@ -676,7 +676,7 @@ test('verifyNpmRegistrySignatures writes an isolated exact-version audit context
         name: 'opencoven-release-npm-signatures-audit',
         private: true,
         version: '0.0.0',
-        dependencies: Object.fromEntries(
+        optionalDependencies: Object.fromEntries(
           RELEASE_PACKAGES.map((packageName) => [packageName, NPM_VERSION])
         )
       }
@@ -684,12 +684,12 @@ test('verifyNpmRegistrySignatures writes an isolated exact-version audit context
     assert.deepEqual(calls, [
       {
         command: 'npm',
-        args: ['install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false'],
+        args: ['install', '--ignore-scripts', '--audit=false', '--fund=false'],
         cwd: path.resolve(auditDir)
       },
       {
         command: 'npm',
-        args: ['audit', 'signatures', '--package-lock-only'],
+        args: ['audit', 'signatures'],
         cwd: path.resolve(auditDir)
       }
     ]);
@@ -713,7 +713,7 @@ test('verifyNpmRegistrySignatures fails closed before auditing when package-lock
       /npm install failed/
     );
     assert.deepEqual(calls, [
-      'npm install --package-lock-only --ignore-scripts --audit=false --fund=false'
+      'npm install --ignore-scripts --audit=false --fund=false'
     ]);
   });
 });

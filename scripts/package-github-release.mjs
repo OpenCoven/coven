@@ -619,17 +619,17 @@ export function verifyNpmRegistrySignatures({
       name: 'opencoven-release-npm-signatures-audit',
       private: true,
       version: '0.0.0',
-      dependencies: Object.fromEntries(
+      optionalDependencies: Object.fromEntries(
         RELEASE_PACKAGES.map((packageName) => [packageName, normalizedVersion])
       )
     }, null, 2)}\n`
   );
   commandRunner(
     'npm',
-    ['install', '--package-lock-only', '--ignore-scripts', '--audit=false', '--fund=false'],
+    ['install', '--ignore-scripts', '--audit=false', '--fund=false'],
     { cwd: normalizedAuditDir }
   );
-  commandRunner('npm', ['audit', 'signatures', '--package-lock-only'], {
+  commandRunner('npm', ['audit', 'signatures'], {
     cwd: normalizedAuditDir
   });
   return {
