@@ -2421,9 +2421,10 @@ fn doctor_next_steps(default_harness: Option<&str>) -> Vec<String> {
             "coven sessions".to_string(),
         ],
         None => vec![
-            "Install and authenticate at least one harness in this same shell.".to_string(),
-            "Codex: npm install -g @openai/codex && codex login".to_string(),
-            "Claude Code: npm install -g @anthropic-ai/claude-code && claude doctor".to_string(),
+            "Set up at least one harness in this same shell.".to_string(),
+            "Codex: coven setup codex".to_string(),
+            "Claude Code: coven setup claude".to_string(),
+            "GitHub Copilot CLI: coven setup copilot".to_string(),
             "If PATH changed, open a new terminal and run `coven doctor` again.".to_string(),
             "Then run: coven daemon start".to_string(),
             "Install docs: https://github.com/OpenCoven/coven/blob/main/docs/install/index.md"
@@ -3692,9 +3693,9 @@ fn credentials_lines(
 /// adapter's own install/authentication hint.
 fn auth_setup_hint_for_harness(harness_id: &str) -> String {
     match harness_id {
-        "codex" => "codex login".to_string(),
-        "claude" => "claude doctor".to_string(),
-        "copilot" => "copilot login".to_string(),
+        "codex" => "coven setup codex".to_string(),
+        "claude" => "coven setup claude".to_string(),
+        "copilot" => "coven setup copilot".to_string(),
         other => format!("coven adapter doctor {other}"),
     }
 }
@@ -7777,9 +7778,12 @@ mod tests {
         // doctor renders this hint inside backticks. Adapter harnesses used to
         // land on the prose fallback "see harness docs", which reads as a
         // command that does not exist.
-        assert_eq!(auth_setup_hint_for_harness("codex"), "codex login");
-        assert_eq!(auth_setup_hint_for_harness("claude"), "claude doctor");
-        assert_eq!(auth_setup_hint_for_harness("copilot"), "copilot login");
+        assert_eq!(auth_setup_hint_for_harness("codex"), "coven setup codex");
+        assert_eq!(auth_setup_hint_for_harness("claude"), "coven setup claude");
+        assert_eq!(
+            auth_setup_hint_for_harness("copilot"),
+            "coven setup copilot"
+        );
         for id in ["grok", "hermes", "opencode", "some-local-adapter"] {
             let hint = auth_setup_hint_for_harness(id);
             assert_eq!(hint, format!("coven adapter doctor {id}"));
@@ -7788,6 +7792,25 @@ mod tests {
                 "hint must be runnable, got: {hint}"
             );
         }
+    }
+
+    #[test]
+    fn missing_harness_next_steps_use_guided_setup() {
+        let steps = doctor_next_steps(None);
+        for command in [
+            "Codex: coven setup codex",
+            "Claude Code: coven setup claude",
+            "GitHub Copilot CLI: coven setup copilot",
+        ] {
+            assert!(
+                steps.iter().any(|step| step == command),
+                "missing {command}"
+            );
+        }
+        let rendered = steps.join("\n");
+        assert!(!rendered.contains("codex login"));
+        assert!(!rendered.contains("claude auth login"));
+        assert!(!rendered.contains("copilot login"));
     }
 
     #[test]
@@ -8300,7 +8323,10 @@ mod tests {
             codex_line.contains("authentication not verified"),
             "got: {codex_line}"
         );
-        assert!(codex_line.contains("codex login"), "got: {codex_line}");
+        assert!(
+            codex_line.contains("coven setup codex"),
+            "got: {codex_line}"
+        );
         assert!(
             codex_line.contains("explicitly authorized test turn"),
             "got: {codex_line}"
@@ -8311,7 +8337,10 @@ mod tests {
             claude_line.contains("authentication not verified"),
             "got: {claude_line}"
         );
-        assert!(claude_line.contains("claude doctor"), "got: {claude_line}");
+        assert!(
+            claude_line.contains("coven setup claude"),
+            "got: {claude_line}"
+        );
         assert!(
             claude_line.contains("explicitly authorized test turn"),
             "got: {claude_line}"

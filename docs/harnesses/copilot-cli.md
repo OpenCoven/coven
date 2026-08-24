@@ -17,7 +17,8 @@ rituals work the same as for any other harness.
 | Harness id | `copilot` |
 | Install | `npm install -g @github/copilot` or `brew install --cask copilot-cli` |
 | Auth | `copilot login` (one-time, GitHub side) |
-| Doctor check | `coven doctor` reports Copilot CLI availability and the install hint when missing. |
+| Guided setup | `coven setup copilot` |
+| Doctor check | `coven doctor` reports local availability; it does not verify auth. |
 
 ## Setup
 
@@ -30,17 +31,27 @@ rituals work the same as for any other harness.
     ```
     Other install methods are listed in the [Copilot CLI docs](https://docs.github.com/en/copilot/concepts/agents/about-copilot-cli).
   </Step>
-  <Step title="Log in to GitHub">
+  <Step title="Run guided provider login">
     ```bash
-    copilot login
+    coven setup copilot
     ```
-    GitHub credentials stay with Copilot. Coven never reads them.
+    After explicit consent, Coven hands the terminal to `copilot login`.
+    GitHub credentials stay with Copilot; Coven never reads them.
+  </Step>
+  <Step title="Optionally verify provider access">
+    ```bash
+    coven setup copilot --verify-only
+    ```
+    Verification requires separate consent, network access, and may incur
+    provider usage or cost. It runs in ephemeral state.
   </Step>
   <Step title="Confirm with Coven">
     ```bash
     coven doctor
     ```
-    The Harnesses section should include `[OK] Copilot CLI` with the resolved `copilot` executable.
+    The Harnesses section should include `[OK] Copilot CLI` with the resolved
+    `copilot` executable. Doctor remains offline and does not verify provider
+    authentication.
   </Step>
   <Step title="Launch">
     ```bash
@@ -118,9 +129,13 @@ Copilot owns its GitHub auth flow and token cache (under `~/.copilot/`).
 Coven never reads, proxies, or stores those credentials — see the
 [provider auth boundary](/harnesses/provider-auth).
 
+For the complete TTY, consent, timeout, verification, and redacted report
+contract, see [`coven setup`](/reference/cli-setup).
+
 ## Related
 
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
+- [`coven setup`](/reference/cli-setup)
 - [Harness adapter guide](/HARNESS-ADAPTERS)
 - [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

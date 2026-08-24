@@ -39,7 +39,7 @@ found):
     { "id": "harnesses", "status": "pass", "message": "2 of 4 configured harness executables available" },
     { "id": "engine", "status": "pass", "message": "<engine> (managed install), version 0.6.1 (pin 0.6.1)" },
     { "id": "credentials:engine", "status": "warn", "message": "authentication configured; provider turn not verified", "hint": "run an explicitly authorized test turn to verify provider access" },
-    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn" }
+    { "id": "credentials:codex", "status": "warn", "message": "executable available; authentication not verified", "hint": "authenticate or inspect local setup with: coven setup codex; verify provider access with an explicitly authorized test turn" }
   ],
   "nextSteps": ["coven run codex \"explain this repo in 5 bullets\"", "coven sessions"]
 }
@@ -76,7 +76,7 @@ availability, where any missing adapter is a `fail`.
 | `Harnesses` | Supported harness executables that are visible on this shell's `PATH`. |
 | `Engine` | Whether the Coven engine is installed and meets the minimum supported version. |
 | `Familiars` | Configured familiar identities from `familiars.toml`, if present. |
-| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it never launches a provider harness, starts a provider turn, contacts a provider, or reads harness credentials. |
+| `Credentials` | Advisory local engine auth configuration and explicit `authentication not verified` rows for external harnesses. Doctor calls only the engine's contractually offline `auth status --json`; it launches no provider CLI process, performs no provider network request, does not inspect provider tokens or credential stores, and does not verify authentication. |
 | `Next steps` | The safest next command based on the detected state. |
 
 ## Expected first-run loop
@@ -84,6 +84,7 @@ availability, where any missing adapter is a `fail`.
 ```sh
 coven --version
 coven doctor
+coven setup codex
 coven daemon start
 coven daemon status
 cd /path/to/project
@@ -98,18 +99,19 @@ coven run claude "explain this repo in 5 bullets"
 
 ## Missing harness output
 
-When no supported harness is visible, `doctor` prints a per-harness install
-hint. For Codex, Claude Code, and GitHub Copilot CLI those hints boil down to:
+When no supported harness is visible, Doctor points each built-in harness to
+the guided setup path:
 
 ```sh
-npm install -g @openai/codex
-codex login
-npm install -g @anthropic-ai/claude-code
-claude doctor
-npm install -g @github/copilot
-copilot login
+coven setup codex
+coven setup claude
+coven setup copilot
 coven doctor
 ```
+
+Setup prints official install guidance when the selected executable is missing.
+When present, those commands hand the terminal to `codex login`,
+`claude auth login`, or `copilot login` only after explicit consent.
 
 If you installed a harness in another shell, open a new terminal and run
 `coven doctor` again. Coven can only launch CLIs that are visible from the
@@ -164,9 +166,14 @@ Each missing harness prints an advisory `[--]` line with an install hint. When
 none is available, Doctor adds a blocking `[!!] No supported harness is
 available` line and exits 1; one working harness keeps the aggregate usable.
 Executable discovery does not prove provider authentication. A harness's own
-login/status command can configure or inspect local authentication, while only
-an explicitly authorized test turn verifies provider access.
+`coven setup` can configure local authentication, while only its separately
+consented `--verify` or `--verify-only` turn verifies provider access.
 
 `coven adapter doctor` is stricter about its own subject: it exits `1` if any
 listed adapter is unavailable. `coven wt --doctor` exits `1` when managed hooks
 are missing or a worktree sits outside the protocol layout.
+
+## Related
+
+- [`coven setup`](/reference/cli-setup)
+- [Provider auth boundary](/harnesses/provider-auth)

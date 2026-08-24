@@ -141,7 +141,7 @@ test('model selection only offers CLI-login harness choices', () => {
   assert.match(text, /Codex CLI/i);
   assert.match(text, /Claude Code/i);
   assert.match(text, /codex login/);
-  assert.match(text, /claude doctor/);
+  assert.match(text, /claude auth login/);
   assert.match(text, /\/harnesses\/codex/);
   assert.match(text, /\/harnesses\/claude-code/);
   assert.doesNotMatch(text, /Per-provider setup/i);
@@ -166,7 +166,7 @@ test('ci runs npm onboarding smoke on every published platform', () => {
   assert.doesNotMatch(workflow, /os:\s+macos-latest/);
   assert.match(workflow, /windows-latest/);
   assert.match(workflow, /node scripts\/test-cli-prepublish\.mjs --target=\$\{\{ matrix\.npm-target \}\} --skip-build --skip-secrets-scan/);
-  assert.match(workflow, /COVEN_NPM_DRY_RUN_VERSION:\s+999\.0\.0\s*(?:\n|$)/);
+  assert.match(workflow, /COVEN_NPM_DRY_RUN_VERSION:\s+9{3}\.0\.0\s*(?:\n|$)/);
 });
 
 test('npm onboarding smoke exercises daemon lifecycle with isolated state', () => {
@@ -197,9 +197,74 @@ test('npm onboarding smoke verifies first-run missing-harness guidance determini
   assert.match(script, /PATH:\s*firstRunSmokePath\(wrapperBin,\s*tempDir\)/);
   assert.match(script, /node-shim-bin/);
   assert.doesNotMatch(script, /path\.dirname\(process\.execPath\)/);
-  assert.match(script, /Install and authenticate at least one harness in this same shell/);
-  assert.match(script, /npm install -g @openai\/codex && codex login/);
-  assert.match(script, /npm install -g @anthropic-ai\/claude-code && claude doctor/);
+  assert.match(script, /Set up at least one harness in this same shell/);
+  assert.match(script, /Codex: coven setup codex/);
+  assert.match(script, /Claude Code: coven setup claude/);
+  assert.match(script, /GitHub Copilot CLI: coven setup copilot/);
+  assert.doesNotMatch(script, /claude doctor/);
+});
+
+test('canonical setup docs cover the complete three-provider workflow', () => {
+  const setupReference = readRepoFile('docs/reference/cli-setup.md');
+  for (const command of [
+    'coven setup codex',
+    'coven setup claude',
+    'coven setup copilot',
+    'coven setup all'
+  ]) {
+    assert.match(setupReference, new RegExp(command.replaceAll(' ', '\\s+')));
+  }
+
+  for (const token of [
+    '--verify',
+    '--verify-only',
+    '--report-json <path>',
+    'codex login',
+    'claude auth login',
+    'copilot login',
+    'candidate_commit',
+    'exit_class'
+  ]) {
+    assert.ok(setupReference.includes(token), `setup reference must include ${JSON.stringify(token)}`);
+  }
+  assert.doesNotMatch(setupReference, /\b(?:Hermes|Grok|OpenCode)\b/);
+
+  const setupDocs = [
+    readRepoFile('README.md'),
+    readRepoFile('docs/start/onboarding.md'),
+    readRepoFile('docs/harnesses/provider-auth.md'),
+    readRepoFile('docs/harnesses/codex.md'),
+    readRepoFile('docs/harnesses/claude-code.md'),
+    readRepoFile('docs/harnesses/copilot-cli.md'),
+    setupReference
+  ].join('\n');
+  assert.match(setupDocs, /explicit consent/i);
+  assert.match(setupDocs, /stdin/i);
+  assert.match(setupDocs, /stdout/i);
+  assert.match(setupDocs, /stderr/i);
+  assert.match(setupDocs, /non-TTY/i);
+  assert.match(setupDocs, /fail-if-exists/i);
+  assert.match(setupDocs, /atomic/i);
+  assert.match(setupDocs, /redacted/i);
+  assert.match(setupDocs, /no machine JSON/i);
+  assert.match(setupDocs, /do not redirect stdout or stderr/i);
+  assert.match(setupDocs, /fake harness/i);
+  assert.match(setupDocs, /no real provider credentials/i);
+  assert.match(setupDocs, /operator-run ceremony/i);
+  assert.doesNotMatch(setupDocs, /claude doctor/);
+});
+
+test('Doctor docs preserve the offline no-auth-verification boundary', () => {
+  const doctorDocs = [
+    readRepoFile('docs/start/doctor.md'),
+    readRepoFile('docs/reference/cli-doctor.md')
+  ].join('\n');
+  assert.match(doctorDocs, /offline/i);
+  assert.match(doctorDocs, /no provider (?:CLI )?process/i);
+  assert.match(doctorDocs, /no provider network request/i);
+  assert.match(doctorDocs, /does not inspect.*(?:token|credential)/is);
+  assert.match(doctorDocs, /does not verify authentication/i);
+  assert.match(doctorDocs, /coven setup/);
 });
 
 test('npm onboarding smoke runs onboarding guardrails before packaging', () => {
