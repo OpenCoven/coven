@@ -1546,7 +1546,7 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
     assert!(resolved
         .path
         .to_string_lossy()
-        .eq_ignore_ascii_case(&executable.to_string_lossy()));
+        .eq_ignore_ascii_case(&fs::canonicalize(&executable)?.to_string_lossy()));
     #[cfg(not(windows))]
     assert_eq!(resolved.path, fs::canonicalize(&executable)?);
     assert_eq!(resolved.version, None);
