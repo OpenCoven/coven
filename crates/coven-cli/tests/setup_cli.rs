@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 #[path = "../src/setup/mod.rs"]
 mod setup;
 
-use setup::codex;
+use setup::{claude, codex};
 use setup::{
     render_human, run_setup, Clock, CommandSpec, Confirmer, ConsentDecision, ConsentRequest,
     ExecutableDiscovery, LaunchRequest, Outcome, ProcessExit, ProcessLauncher, ProviderDescriptor,
@@ -209,6 +209,105 @@ fn codex_provider_handles_missing_declined_and_non_tty_without_launching() -> Re
     assert_eq!(launches, 0);
 
     let (outcome, launches, _) = run_codex(
+        FixedTerminal(false),
+        Some("1.2.3"),
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NonTty);
+    assert_eq!(launches, 0);
+    Ok(())
+}
+
+#[test]
+fn claude_provider_launches_exact_auth_login_command_and_never_doctor() -> Result<()> {
+    let provider = claude::descriptor();
+    let providers = [provider];
+    let discovery = FakeDiscovery::all_present(&providers, "1.2.3");
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([LaunchBehavior::exit(0)]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::Claude), &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    assert_eq!(confirmer.requests.len(), 1);
+    assert_eq!(confirmer.requests[0].command, "claude auth login");
+    assert!(!confirmer.requests[0].command.contains("doctor"));
+    assert_eq!(launcher.launches.len(), 1);
+    assert_eq!(
+        launcher.launches[0].executable,
+        PathBuf::from("/fixture/claude")
+    );
+    assert_eq!(
+        launcher.launches[0].args,
+        vec![OsString::from("auth"), OsString::from("login")]
+    );
+    assert!(!launcher.launches[0]
+        .args
+        .iter()
+        .any(|argument| argument == "doctor"));
+    Ok(())
+}
+
+#[test]
+fn claude_provider_preserves_failure_and_cancellation_outcomes() -> Result<()> {
+    assert_eq!(
+        run_claude(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::exit(7),
+        )?
+        .0,
+        Outcome::ProviderFailed
+    );
+    assert_eq!(
+        run_claude(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::signalled(),
+        )?
+        .0,
+        Outcome::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_provider_handles_missing_declined_and_non_tty_without_launching() -> Result<()> {
+    let (outcome, launches, rendered) = run_claude(
+        FixedTerminal(true),
+        None,
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NotInstalled);
+    assert_eq!(launches, 0);
+    assert_eq!(
+        rendered,
+        format!("Claude Code: not_installed\n{}\n", claude::INSTALL_GUIDANCE)
+    );
+
+    let (outcome, launches, _) = run_claude(
+        FixedTerminal(true),
+        Some("1.2.3"),
+        ConsentDecision::Declined,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::Declined);
+    assert_eq!(launches, 0);
+
+    let (outcome, launches, _) = run_claude(
         FixedTerminal(false),
         Some("1.2.3"),
         ConsentDecision::Accepted,
@@ -867,6 +966,38 @@ fn run_codex(
         launcher: &mut launcher,
     };
     let summary = run_setup(&options(Selector::Codex), &providers, &mut runtime)?;
+    let mut rendered = Vec::new();
+    render_human(&summary, &mut rendered)?;
+    Ok((
+        summary.results[0].outcome,
+        launcher.launches.len(),
+        String::from_utf8(rendered)?,
+    ))
+}
+
+fn run_claude(
+    terminal: FixedTerminal,
+    version: Option<&str>,
+    consent: ConsentDecision,
+    behavior: LaunchBehavior,
+) -> Result<(Outcome, usize, String)> {
+    let provider = claude::descriptor();
+    let providers = [provider];
+    let discovery = FixedDiscovery(version.map(|version| ResolvedExecutable {
+        path: PathBuf::from("fake-claude"),
+        version: Some(version.to_owned()),
+    }));
+    let mut confirmer = FakeConfirmer::new([consent]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([behavior]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+    let summary = run_setup(&options(Selector::Claude), &providers, &mut runtime)?;
     let mut rendered = Vec::new();
     render_human(&summary, &mut rendered)?;
     Ok((
