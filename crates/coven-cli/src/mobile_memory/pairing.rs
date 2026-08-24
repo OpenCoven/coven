@@ -16,6 +16,11 @@ use super::registry::{DeviceRecord, DeviceRegistry, DeviceScope};
 use super::MOBILE_PROTOCOL_VERSION;
 
 const PAIRING_WORDS: &str = include_str!("pairing_words.txt");
+pub const PAIRING_PROTOCOL_MINIMUM_VERSION: u16 = 1;
+pub const PAIRING_PROTOCOL_VERSION: u16 = 2;
+const PAIRING_SCOPE_MEMORY_READ: &str = "memory_read";
+const PAIRING_TRANSCRIPT_V2_DOMAIN: &[u8] = b"COVEN-PAIR/2";
+const PAIRING_OFFER_V2_DOMAIN: &[u8] = b"COVEN-PAIR-OFFER/2";
 
 #[derive(Debug, Clone)]
 pub struct PendingPairing {
@@ -35,6 +40,7 @@ pub struct PendingDevice {
     pub display_name: String,
     pub public_key_x963: String,
     pub app_version: String,
+    pub scopes: Vec<DeviceScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,13 +211,16 @@ impl PairingManager {
         let public_key = URL_SAFE_NO_PAD
             .decode(&request.device_public_key)
             .map_err(|_| PairingError::InvalidRequest)?;
-        let transcript = PairingTranscript {
-            protocol_version: request.protocol_version,
-            host_fingerprint,
-            pairing_id,
-            device_public_key: public_key,
-            nonce,
-        };
+        let transcript = PairingTranscript::for_request(
+            &request,
+            PairingOfferV2 {
+                host_fingerprint,
+                pairing_id,
+                nonce,
+                expires_at: pairing.expires_at,
+            },
+            public_key,
+        );
         let transcript_hash = transcript.hash();
         let phrase = derive_pairing_phrase(&transcript);
         pairing.transcript_hash = Some(transcript_hash);
@@ -219,6 +228,7 @@ impl PairingManager {
             display_name: request.device_name,
             public_key_x963: request.device_public_key,
             app_version: request.app_version,
+            scopes: vec![DeviceScope::MemoryRead],
         });
         Ok(EnrolledPairing {
             id: pairing_id,
@@ -335,7 +345,7 @@ impl PairingManager {
             public_key_x963: device.public_key_x963,
             paired_at: now,
             revoked_at: None,
-            scopes: vec![DeviceScope::MemoryRead],
+            scopes: device.scopes,
         };
         self.registry
             .register(record.clone())
@@ -344,7 +354,14 @@ impl PairingManager {
             id: record.id,
             display_name: record.display_name,
             paired_at: record.paired_at,
-            scopes: vec![MobileDeviceScope::MemoryRead],
+            scopes: record
+                .scopes
+                .iter()
+                .filter_map(|scope| match scope {
+                    DeviceScope::MemoryRead => Some(MobileDeviceScope::MemoryRead),
+                    _ => None,
+                })
+                .collect(),
         };
         pairing.device = None;
         pairing.completed = Some(completed.clone());
@@ -355,41 +372,157 @@ impl PairingManager {
     }
 }
 
-struct PairingTranscript {
-    protocol_version: u16,
-    host_fingerprint: [u8; 32],
-    pairing_id: Uuid,
-    device_public_key: Vec<u8>,
-    nonce: [u8; 32],
+#[derive(Debug, Clone)]
+enum PairingTranscript {
+    V1 {
+        protocol_version: u16,
+        host_fingerprint: [u8; 32],
+        pairing_id: Uuid,
+        device_public_key: Vec<u8>,
+        nonce: [u8; 32],
+    },
+    V2 {
+        offer_digest: [u8; 32],
+        protocol_version: u16,
+        supported_minimum: u16,
+        supported_maximum: u16,
+        device_public_key: Vec<u8>,
+        device_name: String,
+        app_version: String,
+    },
 }
 
 impl PairingTranscript {
+    fn for_request(
+        request: &MobilePairingRequest,
+        offer: PairingOfferV2,
+        device_public_key: Vec<u8>,
+    ) -> Self {
+        if request.protocol_version == MOBILE_PROTOCOL_VERSION {
+            Self::V1 {
+                protocol_version: request.protocol_version,
+                host_fingerprint: offer.host_fingerprint,
+                pairing_id: offer.pairing_id,
+                device_public_key,
+                nonce: offer.nonce,
+            }
+        } else {
+            Self::V2 {
+                offer_digest: offer.hash(),
+                protocol_version: request.protocol_version,
+                supported_minimum: request.supported_protocol.minimum,
+                supported_maximum: request.supported_protocol.maximum,
+                device_public_key,
+                device_name: request.device_name.clone(),
+                app_version: request.app_version.clone(),
+            }
+        }
+    }
+
     fn hash(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
-        for field in [
-            self.protocol_version.to_be_bytes().as_slice(),
-            self.host_fingerprint.as_slice(),
-            self.pairing_id.as_bytes(),
-            self.device_public_key.as_slice(),
-            self.nonce.as_slice(),
-        ] {
-            digest.update((field.len() as u32).to_be_bytes());
-            digest.update(field);
+        match self {
+            Self::V1 {
+                protocol_version,
+                host_fingerprint,
+                pairing_id,
+                device_public_key,
+                nonce,
+            } => {
+                let protocol_version = protocol_version.to_be_bytes();
+                for field in [
+                    protocol_version.as_slice(),
+                    host_fingerprint.as_slice(),
+                    pairing_id.as_bytes(),
+                    device_public_key.as_slice(),
+                    nonce.as_slice(),
+                ] {
+                    update_length_prefixed(&mut digest, field);
+                }
+            }
+            Self::V2 {
+                offer_digest,
+                protocol_version,
+                supported_minimum,
+                supported_maximum,
+                device_public_key,
+                device_name,
+                app_version,
+            } => {
+                let protocol_version = protocol_version.to_be_bytes();
+                let supported_minimum = supported_minimum.to_be_bytes();
+                let supported_maximum = supported_maximum.to_be_bytes();
+                for field in [
+                    PAIRING_TRANSCRIPT_V2_DOMAIN,
+                    offer_digest.as_slice(),
+                    protocol_version.as_slice(),
+                    supported_minimum.as_slice(),
+                    supported_maximum.as_slice(),
+                    device_public_key.as_slice(),
+                    device_name.as_bytes(),
+                    app_version.as_bytes(),
+                ] {
+                    update_length_prefixed(&mut digest, field);
+                }
+            }
         }
         digest.finalize().into()
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PairingOfferV2 {
+    host_fingerprint: [u8; 32],
+    pairing_id: Uuid,
+    nonce: [u8; 32],
+    expires_at: DateTime<Utc>,
+}
+
+impl PairingOfferV2 {
+    fn hash(&self) -> [u8; 32] {
+        let minimum_version = PAIRING_PROTOCOL_MINIMUM_VERSION.to_be_bytes();
+        let maximum_version = PAIRING_PROTOCOL_VERSION.to_be_bytes();
+        let expires_at = self.expires_at.timestamp().to_be_bytes();
+        let mut digest = Sha256::new();
+        for field in [
+            PAIRING_OFFER_V2_DOMAIN,
+            minimum_version.as_slice(),
+            maximum_version.as_slice(),
+            self.host_fingerprint.as_slice(),
+            self.pairing_id.as_bytes(),
+            self.nonce.as_slice(),
+            expires_at.as_slice(),
+            PAIRING_SCOPE_MEMORY_READ.as_bytes(),
+        ] {
+            update_length_prefixed(&mut digest, field);
+        }
+        digest.finalize().into()
+    }
+}
+
+fn update_length_prefixed(digest: &mut Sha256, field: &[u8]) {
+    digest.update((field.len() as u32).to_be_bytes());
+    digest.update(field);
+}
+
 fn validate_pairing_request(request: &MobilePairingRequest) -> Result<(), PairingError> {
-    if request.protocol_version != MOBILE_PROTOCOL_VERSION
-        || request.supported_protocol.minimum > MOBILE_PROTOCOL_VERSION
-        || request.supported_protocol.maximum < MOBILE_PROTOCOL_VERSION
+    let selected_version_supported = request.supported_protocol.minimum <= request.protocol_version
+        && request.supported_protocol.maximum >= request.protocol_version;
+    let supported_version = matches!(
+        request.protocol_version,
+        MOBILE_PROTOCOL_VERSION | PAIRING_PROTOCOL_VERSION
+    );
+    if !supported_version
+        || !selected_version_supported
+        || request.supported_protocol.minimum > request.supported_protocol.maximum
         || request.device_name.is_empty()
         || request.device_name.trim() != request.device_name
         || request.device_name.chars().count() > 80
         || request.device_name.chars().any(char::is_control)
         || request.app_version.is_empty()
         || request.app_version.len() > 64
+        || !request.app_version.is_ascii()
+        || request.app_version.chars().any(char::is_control)
     {
         return Err(PairingError::InvalidRequest);
     }
@@ -431,14 +564,45 @@ pub fn build_pairing_url(
     endpoint: &str,
     host_fingerprint: [u8; 32],
 ) -> Result<String, PairingError> {
+    let endpoint =
+        validate_pairing_endpoint(endpoint)?;
+    let offer = PairingOfferV2 {
+        host_fingerprint,
+        pairing_id: invitation.id,
+        nonce: invitation.nonce,
+        expires_at: invitation.expires_at,
+    };
     let mut url = Url::parse("coven-memory://pair").map_err(|_| PairingError::InvalidRequest)?;
     url.query_pairs_mut()
-        .append_pair("version", &MOBILE_PROTOCOL_VERSION.to_string())
-        .append_pair("endpoint", endpoint)
+        .append_pair("version", &PAIRING_PROTOCOL_VERSION.to_string())
+        .append_pair(
+            "minimumVersion",
+            &PAIRING_PROTOCOL_MINIMUM_VERSION.to_string(),
+        )
+        .append_pair("maximumVersion", &PAIRING_PROTOCOL_VERSION.to_string())
+        .append_pair("pairingId", &invitation.id.to_string())
+        .append_pair("endpoint", endpoint.as_str())
         .append_pair("fingerprint", &URL_SAFE_NO_PAD.encode(host_fingerprint))
         .append_pair("nonce", &URL_SAFE_NO_PAD.encode(invitation.nonce))
-        .append_pair("expires", &invitation.expires_at.timestamp().to_string());
+        .append_pair("expires", &invitation.expires_at.timestamp().to_string())
+        .append_pair("scope", PAIRING_SCOPE_MEMORY_READ)
+        .append_pair("offerDigest", &URL_SAFE_NO_PAD.encode(offer.hash()));
     Ok(url.into())
+}
+
+fn validate_pairing_endpoint(endpoint: &str) -> Result<Url, PairingError> {
+    let mut endpoint = Url::parse(endpoint).map_err(|_| PairingError::InvalidRequest)?;
+    if endpoint.scheme() != "https"
+        || endpoint.host_str().is_none()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(PairingError::InvalidRequest);
+    }
+    endpoint.set_fragment(None);
+    Ok(endpoint)
 }
 
 pub fn render_pairing_invitation(
@@ -518,6 +682,12 @@ mod tests {
             }
         }
 
+        fn use_v2(&mut self) {
+            self.request.protocol_version = PAIRING_PROTOCOL_VERSION;
+            self.request.supported_protocol.minimum = PAIRING_PROTOCOL_MINIMUM_VERSION;
+            self.request.supported_protocol.maximum = PAIRING_PROTOCOL_VERSION;
+        }
+
         fn enroll(&self) -> EnrolledPairing {
             self.enroll_with_nonce(self.pairing_nonce).unwrap()
         }
@@ -561,13 +731,42 @@ mod tests {
     }
 
     fn synthetic_transcript() -> PairingTranscript {
-        PairingTranscript {
+        PairingTranscript::V1 {
             protocol_version: 1,
             host_fingerprint: [3; 32],
             pairing_id: Uuid::from_u128(1),
             device_public_key: vec![4; 65],
             nonce: [7; 32],
         }
+    }
+
+    fn synthetic_v2_transcript() -> PairingTranscript {
+        PairingTranscript::V2 {
+            offer_digest: [2; 32],
+            protocol_version: 2,
+            supported_minimum: 1,
+            supported_maximum: 2,
+            device_public_key: vec![4; 65],
+            device_name: "Synthetic phone".to_owned(),
+            app_version: "1.0.0".to_owned(),
+        }
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        assert_eq!(value.len() % 2, 0);
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = char::from(pair[0]).to_digit(16).unwrap();
+                let low = char::from(pair[1]).to_digit(16).unwrap();
+                ((high << 4) | low) as u8
+            })
+            .collect()
+    }
+
+    fn encode_hex(value: &[u8]) -> String {
+        value.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     #[test]
@@ -590,6 +789,19 @@ mod tests {
     }
 
     #[test]
+    fn pairing_v2_requires_host_and_device_confirmation() {
+        let mut harness = PairingHarness::new();
+        harness.use_v2();
+        let pending = harness.enroll();
+        assert_eq!(
+            harness.confirm_device(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_host(&pending.phrase), false);
+        assert_eq!(device.scopes, [MobileDeviceScope::MemoryRead]);
+    }
+
+    #[test]
     fn pairing_nonce_is_consumed_on_first_enrollment_attempt() {
         let harness = PairingHarness::new();
         assert_eq!(
@@ -600,6 +812,18 @@ mod tests {
             harness.enroll_with_nonce([7; 32]).unwrap_err(),
             PairingError::PairingConsumed
         );
+    }
+
+    #[test]
+    fn unsupported_pairing_protocol_is_rejected() {
+        let mut harness = PairingHarness::new();
+        harness.request.protocol_version = 3;
+        harness.request.supported_protocol.maximum = 3;
+        assert_eq!(
+            harness.enroll().unwrap_err(),
+            PairingError::InvalidRequest
+        );
+        assert!(harness.devices().is_empty());
     }
 
     #[test]
@@ -743,7 +967,13 @@ mod tests {
             )
             .unwrap();
         let enrolled = manager
-            .enroll(pairing_id, pairing_nonce, request, [3; 32], expired_now)
+            .enroll(
+                pairing_id,
+                pairing_nonce,
+                request,
+                [3; 32],
+                expired_now,
+            )
             .unwrap();
         assert_eq!(
             manager
@@ -836,11 +1066,108 @@ mod tests {
     }
 
     #[test]
-    fn phrase_is_deterministic_for_the_complete_transcript() {
+    fn phrase_is_deterministic_for_the_v1_transcript() {
         let transcript = synthetic_transcript();
         assert_eq!(
             derive_pairing_phrase(&transcript),
             ["athlete", "spatial", "stay", "border", "change", "report"].map(str::to_owned)
+        );
+    }
+
+    #[test]
+    fn pairing_v2_binds_offer_and_client_metadata() {
+        let baseline = synthetic_v2_transcript();
+        let baseline_hash = baseline.hash();
+
+        let mut changed = synthetic_v2_transcript();
+        if let PairingTranscript::V2 { offer_digest, .. } = &mut changed {
+            *offer_digest = [3; 32];
+        }
+        assert_ne!(baseline_hash, changed.hash());
+
+        let mut changed = synthetic_v2_transcript();
+        if let PairingTranscript::V2 { device_name, .. } = &mut changed {
+            device_name.push_str(" other");
+        }
+        assert_ne!(baseline_hash, changed.hash());
+
+        let mut changed = synthetic_v2_transcript();
+        if let PairingTranscript::V2 { app_version, .. } = &mut changed {
+            app_version.push_str("-other");
+        }
+        assert_ne!(baseline_hash, changed.hash());
+    }
+
+    #[test]
+    fn pairing_offer_binds_security_relevant_fields() {
+        let expires_at = DateTime::from_timestamp(1_785_326_700, 0).unwrap();
+        let baseline = PairingOfferV2 {
+            host_fingerprint: [3; 32],
+            pairing_id: Uuid::from_u128(1),
+            nonce: [7; 32],
+            expires_at,
+        };
+        let baseline_hash = baseline.hash();
+
+        let mut changed = baseline;
+        changed.host_fingerprint = [4; 32];
+        assert_ne!(baseline_hash, changed.hash());
+        let mut changed = baseline;
+        changed.pairing_id = Uuid::from_u128(2);
+        assert_ne!(baseline_hash, changed.hash());
+        let mut changed = baseline;
+        changed.nonce = [8; 32];
+        assert_ne!(baseline_hash, changed.hash());
+        let mut changed = baseline;
+        changed.expires_at += Duration::seconds(1);
+        assert_ne!(baseline_hash, changed.hash());
+    }
+
+    #[test]
+    fn portable_pairing_v2_vector_matches_the_contract() {
+        let vector: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/mobile-pairing-v2/transcript-vector.json"
+        ))
+        .unwrap();
+        let host_fingerprint: [u8; 32] = decode_hex(
+            vector["hostFingerprintHex"].as_str().unwrap(),
+        )
+        .try_into()
+        .unwrap();
+        let nonce: [u8; 32] = decode_hex(vector["pairingNonceHex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
+        let offer = PairingOfferV2 {
+            host_fingerprint,
+            pairing_id: Uuid::parse_str(vector["pairingId"].as_str().unwrap()).unwrap(),
+            nonce,
+            expires_at: DateTime::from_timestamp(vector["expiresAtUnix"].as_i64().unwrap(), 0)
+                .unwrap(),
+        };
+        assert_eq!(
+            encode_hex(&offer.hash()),
+            vector["offerDigestHex"].as_str().unwrap()
+        );
+        assert_eq!(vector["requestedScopes"], serde_json::json!(["memory_read"]));
+
+        let transcript = PairingTranscript::V2 {
+            offer_digest: offer.hash(),
+            protocol_version: vector["pairingProtocolVersion"].as_u64().unwrap() as u16,
+            supported_minimum: vector["minimumPairingProtocolVersion"]
+                .as_u64()
+                .unwrap() as u16,
+            supported_maximum: vector["maximumPairingProtocolVersion"]
+                .as_u64()
+                .unwrap() as u16,
+            device_public_key: decode_hex(
+                vector["devicePublicKeyX963Hex"].as_str().unwrap(),
+            ),
+            device_name: vector["deviceName"].as_str().unwrap().to_owned(),
+            app_version: vector["appVersion"].as_str().unwrap().to_owned(),
+        };
+        assert_eq!(
+            encode_hex(&transcript.hash()),
+            vector["transcriptDigestHex"].as_str().unwrap()
         );
     }
 
@@ -852,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_pairing_output_prints_the_url_once() {
+    fn terminal_pairing_output_prints_a_v2_offer_once() {
         let expires_at = DateTime::from_timestamp(1_785_326_700, 0).unwrap();
         let invitation = PairingInvitation {
             id: Uuid::from_u128(1),
@@ -860,9 +1187,49 @@ mod tests {
             expires_at,
         };
         let url = build_pairing_url(&invitation, "https://192.0.2.1:7443", [3; 32]).unwrap();
+        let parsed = Url::parse(&url).unwrap();
+        let query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(query["version"], PAIRING_PROTOCOL_VERSION.to_string());
+        assert_eq!(
+            query["minimumVersion"],
+            PAIRING_PROTOCOL_MINIMUM_VERSION.to_string()
+        );
+        assert_eq!(query["pairingId"], invitation.id.to_string());
+        assert_eq!(query["scope"], PAIRING_SCOPE_MEMORY_READ);
+        let expected_offer = PairingOfferV2 {
+            host_fingerprint: [3; 32],
+            pairing_id: invitation.id,
+            nonce: invitation.nonce,
+            expires_at,
+        };
+        assert_eq!(
+            query["offerDigest"],
+            URL_SAFE_NO_PAD.encode(expected_offer.hash())
+        );
+
         let output = render_pairing_invitation(&url, expires_at).unwrap();
         assert_eq!(output.matches(&url).count(), 1);
         assert!(output.contains("Waiting for device"));
         assert!(output.contains("Ctrl-C"));
+    }
+
+    #[test]
+    fn pairing_url_rejects_ambiguous_or_unencrypted_endpoints() {
+        let invitation = PairingInvitation {
+            id: Uuid::from_u128(1),
+            nonce: [7; 32],
+            expires_at: DateTime::from_timestamp(1_785_326_700, 0).unwrap(),
+        };
+        for endpoint in [
+            "http://192.0.2.1:7443",
+            "https://user@192.0.2.1:7443",
+            "https://192.0.2.1:7443?other=value",
+            "https://192.0.2.1:7443#fragment",
+        ] {
+            assert_eq!(
+                build_pairing_url(&invitation, endpoint, [3; 32]).unwrap_err(),
+                PairingError::InvalidRequest
+            );
+        }
     }
 }

@@ -1,0 +1,16 @@
+{
+  "fixtureNotice": "SYNTHETIC TEST KEY — NOT A CREDENTIAL",
+  "pairingProtocolVersion": 2,
+  "minimumPairingProtocolVersion": 1,
+  "maximumPairingProtocolVersion": 2,
+  "pairingId": "00000000-0000-0000-0000-000000000001",
+  "hostFingerprintHex": "0303030303030303030303030303030303030303030303030303030303030303",
+  "pairingNonceHex": "0707070707070707070707070707070707070707070707070707070707070707",
+  "expiresAtUnix": 1785326700,
+  "requestedScopes": ["memory_read"],
+  "offerDigestHex": "c71ef974862afd9911afda3af32a128205d861ccf1c124b9abb8c2ae01c97367",
+  "devicePublicKeyX963Hex": "046ff03b949241ce1dadd43519e6960e0a85b41a69a05c328103aa2bce1594ca163c4f753a55bf01dc53f6c0b0c7eee78b40c6ff7d25a96e2282b989cef71c144a",
+  "deviceName": "Synthetic phone",
+  "appVersion": "1.0.0",
+  "transcriptDigestHex": "3011bc63626b5df43504b769356e0558b971b4448970164ffc803946c552ae57"
+}
