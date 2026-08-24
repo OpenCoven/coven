@@ -3,12 +3,13 @@ use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 #[path = "../src/setup/mod.rs"]
 mod setup;
@@ -49,6 +50,83 @@ fn options(selector: Selector) -> SetupOptions {
         report_json: None,
         candidate_commit: "0123456789abcdef0123456789abcdef01234567".to_owned(),
     }
+}
+
+fn compile_setup_provider_probe(root: &Path) -> Result<PathBuf> {
+    let executable = root.join(if cfg!(windows) {
+        "setup-provider-probe.exe"
+    } else {
+        "setup-provider-probe"
+    });
+    let source =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/setup_provider_probe.rs");
+    let rustc = std::env::var_os("RUSTC")
+        .unwrap_or_else(|| OsString::from(if cfg!(windows) { "rustc.exe" } else { "rustc" }));
+    let output = Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("-o")
+        .arg(&executable)
+        .arg(source)
+        .output()
+        .context("compile setup provider probe")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "setup provider probe failed to compile:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(executable)
+}
+
+fn parse_provider(value: &str) -> Result<ProviderId> {
+    match value {
+        "codex" => Ok(ProviderId::Codex),
+        "claude" => Ok(ProviderId::Claude),
+        "copilot" => Ok(ProviderId::Copilot),
+        other => anyhow::bail!("unsupported matrix provider {other}"),
+    }
+}
+
+fn provider_selector(provider: ProviderId) -> Selector {
+    match provider {
+        ProviderId::Codex => Selector::Codex,
+        ProviderId::Claude => Selector::Claude,
+        ProviderId::Copilot => Selector::Copilot,
+    }
+}
+
+fn provider_label(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Codex => "Codex",
+        ProviderId::Claude => "Claude Code",
+        ProviderId::Copilot => "GitHub Copilot CLI",
+    }
+}
+
+fn expected_verification_args(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Codex => "exec\n--skip-git-repo-check\n--color\nnever\n--\nReply with OK.",
+        ProviderId::Claude => "--print\n--\nReply with OK.",
+        ProviderId::Copilot => "--no-color\n--prompt=Reply with OK.",
+    }
+}
+
+fn process_is_running_cross_platform(pid: u32) -> bool {
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    system.process(pid).is_some()
+}
+
+fn wait_for_process_stop(pid: u32, label: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_running_cross_platform(pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    anyhow::ensure!(
+        !process_is_running_cross_platform(pid),
+        "{label} pid {pid} remained alive"
+    );
+    Ok(())
 }
 
 #[test]
@@ -473,6 +551,197 @@ fn all_discovers_and_confirms_each_provider_once_before_launch() -> Result<()> {
         assert_eq!(request.command, format!("fake-{} login", provider.as_str()));
         assert_eq!(launch.args, vec![OsString::from("login")]);
     }
+    Ok(())
+}
+
+#[test]
+fn every_provider_preserves_the_complete_failure_and_tty_matrix() -> Result<()> {
+    for provider in [ProviderId::Codex, ProviderId::Claude, ProviderId::Copilot] {
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::exit(0),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::Completed
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                false,
+                ConsentDecision::Accepted,
+                LaunchBehavior::exit(0),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::NotInstalled
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Declined,
+                LaunchBehavior::exit(0),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::Declined
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Cancelled,
+                LaunchBehavior::exit(0),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::Cancelled
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::exit(17),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::ProviderFailed
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::signalled(),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::Cancelled
+        );
+        let terminated = Rc::new(Cell::new(false));
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                true,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::never(Rc::clone(&terminated)),
+                Duration::from_millis(25),
+            )?
+            .0,
+            Outcome::TimedOut
+        );
+        assert!(
+            terminated.get(),
+            "{} timed-out process tree was not terminated",
+            provider.as_str()
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::Login,
+                false,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::exit(0),
+                Duration::from_secs(2),
+            )?,
+            (Outcome::NonTty, 0)
+        );
+        assert_eq!(
+            run_provider_matrix_case(
+                provider,
+                SetupMode::VerifyOnly,
+                true,
+                true,
+                ConsentDecision::Accepted,
+                LaunchBehavior::exit(17),
+                Duration::from_secs(2),
+            )?
+            .0,
+            Outcome::VerificationFailed
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn all_preserves_order_and_mixed_outcomes_without_result_loss() -> Result<()> {
+    let providers = [
+        codex::descriptor(),
+        claude::descriptor(),
+        copilot::descriptor(),
+    ];
+    let discovery = FakeDiscovery {
+        entries: vec![
+            (
+                ProviderId::Codex,
+                Some(ResolvedExecutable {
+                    path: PathBuf::from("/fixture/codex"),
+                    version: None,
+                }),
+            ),
+            (ProviderId::Claude, None),
+            (
+                ProviderId::Copilot,
+                Some(ResolvedExecutable {
+                    path: PathBuf::from("/fixture/copilot"),
+                    version: None,
+                }),
+            ),
+        ],
+        calls: RefCell::new(Vec::new()),
+    };
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted, ConsentDecision::Declined]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([LaunchBehavior::exit(0)]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::All), &providers, &mut runtime)?;
+
+    assert_eq!(
+        summary
+            .results
+            .iter()
+            .map(|result| (result.provider, result.outcome))
+            .collect::<Vec<_>>(),
+        vec![
+            (ProviderId::Codex, Outcome::Completed),
+            (ProviderId::Claude, Outcome::NotInstalled),
+            (ProviderId::Copilot, Outcome::Declined),
+        ]
+    );
+    assert_eq!(
+        discovery.calls.borrow().as_slice(),
+        &[ProviderId::Codex, ProviderId::Claude, ProviderId::Copilot]
+    );
+    assert_eq!(confirmer.requests.len(), 2);
+    assert_eq!(launcher.launches.len(), 1);
     Ok(())
 }
 
@@ -1005,6 +1274,221 @@ fn copilot_inherited_terminal_helper() -> Result<()> {
     let summary = run_setup(&options(Selector::Copilot), &providers, &mut runtime)?;
 
     assert!(summary.completed());
+    Ok(())
+}
+
+#[test]
+fn every_provider_inherits_hostile_streams_without_report_leakage() -> Result<()> {
+    if std::env::var_os("COVEN_SETUP_MATRIX_HELPER").is_some() {
+        return Ok(());
+    }
+    let temp = test_tempdir()?;
+    let executable = compile_setup_provider_probe(temp.path())?;
+
+    for provider in [ProviderId::Codex, ProviderId::Claude, ProviderId::Copilot] {
+        let args_path = temp.path().join(format!("{}-args.txt", provider.as_str()));
+        let report_path = temp
+            .path()
+            .join(format!("{}-report.json", provider.as_str()));
+        let private_path = temp.path().join(format!("{}-private", provider.as_str()));
+        let input = format!("terminal-input-{}", provider.as_str());
+        let mut child = Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "provider_matrix_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("COVEN_SETUP_MATRIX_HELPER", "1")
+            .env("COVEN_SETUP_MATRIX_PROVIDER", provider.as_str())
+            .env("COVEN_SETUP_MATRIX_ACTION", "verify")
+            .env("COVEN_SETUP_MATRIX_EXECUTABLE", &executable)
+            .env("COVEN_SETUP_MATRIX_REPORT", &report_path)
+            .env("COVEN_SETUP_PROBE_MODE", "streams")
+            .env("COVEN_SETUP_PROBE_ARGS", &args_path)
+            .env("COVEN_SETUP_PROBE_PRIVATE", &private_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .as_mut()
+            .context("matrix helper stdin")?
+            .write_all(format!("{input}\n").as_bytes())?;
+        drop(child.stdin.take());
+        let output = child.wait_with_output()?;
+
+        assert!(
+            output.status.success(),
+            "{} stream helper failed\nstdout:\n{}\nstderr:\n{}",
+            provider.as_str(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stdout.contains(&format!("provider-stdout:{input}")));
+        assert!(stderr.contains("provider-stderr:\u{1b}[31m"));
+        assert!(stdout.contains(&format!("{}: completed", provider_label(provider))));
+        assert_eq!(
+            fs::read_to_string(&args_path)?,
+            expected_verification_args(provider)
+        );
+
+        let report_text = fs::read_to_string(&report_path)?;
+        let report: serde_json::Value = serde_json::from_str(&report_text)?;
+        assert_eq!(report["harness"], provider.as_str());
+        assert_eq!(report["cli_version"], "1.2.3");
+        assert_eq!(report["completed"], true);
+        for forbidden in [
+            "provider-stdout",
+            "provider-stderr",
+            "oauth",
+            "account",
+            "token",
+            "model",
+            "bearer",
+            "authorization",
+            "cookie",
+            "\u{1b}",
+            &input,
+            &private_path.to_string_lossy(),
+        ] {
+            assert!(
+                !report_text.contains(forbidden),
+                "{} report leaked {forbidden:?}: {report_text}",
+                provider.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn every_provider_login_and_verify_timeout_reaps_descendants() -> Result<()> {
+    if std::env::var_os("COVEN_SETUP_MATRIX_HELPER").is_some() {
+        return Ok(());
+    }
+    let temp = test_tempdir()?;
+    let executable = compile_setup_provider_probe(temp.path())?;
+    let warmup = Command::new(&executable).arg("--version").output()?;
+    anyhow::ensure!(
+        warmup.status.success(),
+        "setup provider probe warmup failed:\n{}",
+        String::from_utf8_lossy(&warmup.stderr)
+    );
+
+    for provider in [ProviderId::Codex, ProviderId::Claude, ProviderId::Copilot] {
+        for action in ["login", "verify"] {
+            let state_path = temp
+                .path()
+                .join(format!("{}-{action}-state.txt", provider.as_str()));
+            let output = Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    "provider_matrix_helper",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("COVEN_SETUP_MATRIX_HELPER", "1")
+                .env("COVEN_SETUP_MATRIX_PROVIDER", provider.as_str())
+                .env("COVEN_SETUP_MATRIX_ACTION", action)
+                .env("COVEN_SETUP_MATRIX_EXECUTABLE", &executable)
+                .env("COVEN_SETUP_PROBE_MODE", "timeout")
+                .env("COVEN_SETUP_PROBE_STATE", &state_path)
+                .stdin(Stdio::null())
+                .output()?;
+            assert!(
+                output.status.success(),
+                "{} {action} timeout helper failed\nstdout:\n{}\nstderr:\n{}",
+                provider.as_str(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains(&format!("{}: timed_out", provider_label(provider))));
+            let state = fs::read_to_string(&state_path).with_context(|| {
+                format!(
+                    "read {} {action} timeout state\nstdout:\n{}\nstderr:\n{}",
+                    provider.as_str(),
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            })?;
+            let mut lines = state.lines();
+            let current_dir = PathBuf::from(lines.next().context("probe current directory")?);
+            let coven_home = PathBuf::from(lines.next().unwrap_or_default());
+            let parent_pid = lines.next().context("probe parent pid")?.parse::<u32>()?;
+            let child_pid = lines
+                .next()
+                .context("probe descendant pid")?
+                .parse::<u32>()?;
+            wait_for_process_stop(parent_pid, "timed-out provider parent")?;
+            wait_for_process_stop(child_pid, "timed-out provider descendant")?;
+            if action == "verify" {
+                assert!(
+                    !current_dir.exists(),
+                    "verification cwd survived timeout: {current_dir:?}"
+                );
+                assert!(
+                    !coven_home.exists(),
+                    "verification COVEN_HOME survived timeout: {coven_home:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_matrix_helper() -> Result<()> {
+    if std::env::var_os("COVEN_SETUP_MATRIX_HELPER").is_none() {
+        return Ok(());
+    }
+    let provider =
+        parse_provider(&std::env::var("COVEN_SETUP_MATRIX_PROVIDER").context("matrix provider")?)?;
+    let action = std::env::var("COVEN_SETUP_MATRIX_ACTION").context("matrix action")?;
+    let executable = PathBuf::from(
+        std::env::var_os("COVEN_SETUP_MATRIX_EXECUTABLE").context("matrix executable")?,
+    );
+    let descriptor = match provider {
+        ProviderId::Codex => codex::descriptor(),
+        ProviderId::Claude => claude::descriptor(),
+        ProviderId::Copilot => copilot::descriptor(),
+    };
+    let providers = [descriptor];
+    let discovery = FixedDiscovery(Some(ResolvedExecutable {
+        path: executable,
+        version: None,
+    }));
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = SystemClock::new();
+    let mut launcher = SystemProcessLauncher;
+    let mut setup_options = options(provider_selector(provider));
+    setup_options.mode = match action.as_str() {
+        "login" => SetupMode::Login,
+        "verify" => SetupMode::VerifyOnly,
+        other => anyhow::bail!("unsupported matrix action {other}"),
+    };
+    setup_options.timeout = if std::env::var("COVEN_SETUP_PROBE_MODE").as_deref() == Ok("timeout") {
+        Duration::from_secs(1)
+    } else {
+        Duration::from_secs(2)
+    };
+    setup_options.report_json = std::env::var_os("COVEN_SETUP_MATRIX_REPORT").map(PathBuf::from);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&setup_options, &providers, &mut runtime)?;
+
+    render_human(&summary, &mut io::stdout().lock())?;
     Ok(())
 }
 
@@ -1622,6 +2106,49 @@ fn human_summary_never_echoes_paths_launch_errors_or_terminal_bytes() -> Result<
         "{debug}"
     );
     Ok(())
+}
+
+fn run_provider_matrix_case(
+    provider: ProviderId,
+    mode: SetupMode,
+    interactive: bool,
+    present: bool,
+    consent: ConsentDecision,
+    behavior: LaunchBehavior,
+    timeout: Duration,
+) -> Result<(Outcome, usize)> {
+    let descriptor = match provider {
+        ProviderId::Codex => codex::descriptor(),
+        ProviderId::Claude => claude::descriptor(),
+        ProviderId::Copilot => copilot::descriptor(),
+    };
+    let providers = [descriptor];
+    let discovery = FixedDiscovery(present.then(|| ResolvedExecutable {
+        path: PathBuf::from(format!("fake-{}", provider.as_str())),
+        version: None,
+    }));
+    let terminal = FixedTerminal(interactive);
+    let mut confirmer = FakeConfirmer::new([consent]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([behavior]);
+    let mut setup_options = options(match provider {
+        ProviderId::Codex => Selector::Codex,
+        ProviderId::Claude => Selector::Claude,
+        ProviderId::Copilot => Selector::Copilot,
+    });
+    setup_options.mode = mode;
+    setup_options.timeout = timeout;
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&setup_options, &providers, &mut runtime)?;
+
+    Ok((summary.results[0].outcome, launcher.launches.len()))
 }
 
 fn run_single(
