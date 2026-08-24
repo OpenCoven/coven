@@ -103,6 +103,32 @@ fn setup_cli_refuses_non_tty_without_waiting_or_launching() -> Result<()> {
 }
 
 #[test]
+fn unregistered_provider_is_rejected_before_runtime_actions() -> Result<()> {
+    let providers = [codex::descriptor()];
+    let discovery = FakeDiscovery::all_present(&providers, "1.2.3");
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let error = run_setup(&options(Selector::Claude), &providers, &mut runtime)
+        .expect_err("an unregistered provider must fail explicitly");
+
+    assert!(matches!(error, SetupError::UnsupportedProvider));
+    assert!(discovery.calls.borrow().is_empty());
+    assert!(confirmer.requests.is_empty());
+    assert!(launcher.launches.is_empty());
+    Ok(())
+}
+
+#[test]
 fn codex_provider_launches_exact_login_command() -> Result<()> {
     let provider = codex::descriptor();
     let providers = [provider];
