@@ -130,10 +130,18 @@ fn doctor_auth_boundary_is_offline_hermetic_and_failure_bounded() -> Result<()> 
         assert_eq!(harness_status(&configured_json, harness), "pass");
         assert_eq!(credential_status(&configured_json, harness), "warn");
     }
-    assert_eq!(
-        credential_hint(&configured_json, "codex"),
-        "authenticate or inspect local setup with: codex login; verify provider access with an explicitly authorized test turn"
-    );
+    for (harness, setup_command) in [
+        ("codex", "coven setup codex"),
+        ("claude", "coven setup claude"),
+        ("copilot", "coven setup copilot"),
+    ] {
+        assert_eq!(
+            credential_hint(&configured_json, harness),
+            format!(
+                "authenticate or inspect local setup with: {setup_command}; verify provider access with an explicitly authorized test turn"
+            )
+        );
+    }
     assert_only_local_engine_probes(&configured.invocations);
 
     let unconfigured = fixture.run("unconfigured", "unconfigured", false)?;

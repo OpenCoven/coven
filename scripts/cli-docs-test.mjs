@@ -113,6 +113,7 @@ test('canonical CLI docs are discoverable and local guide contracts remain concr
   assert.match(topLevelCli, /## Usage/);
   assert.match(topLevelCli, /## Related/);
   assert.match(topLevelCli, /coven chat/);
+  assert.match(topLevelCli, /coven setup \[<codex\\\|claude\\\|copilot\\\|all>\]/);
 
   for (const { path, required } of coreGuideDocs) {
     const text = readRepoFile(path);
@@ -122,4 +123,40 @@ test('canonical CLI docs are discoverable and local guide contracts remain concr
       assert.match(text, new RegExp(escaped(phrase), 'i'), `${path} must mention ${phrase}`);
     }
   }
+});
+
+test('setup reference documents verification consent, terminal ownership, and reports', () => {
+  const setupReference = readRepoFile('docs/reference/cli-setup.md');
+
+  for (const token of [
+    'coven setup [<codex|claude|copilot|all>]',
+    '--verify',
+    '--verify-only',
+    '--report-json <path>',
+    'codex login',
+    'claude auth login',
+    'copilot login',
+    'harness',
+    'cli_version',
+    'platform',
+    'candidate_commit',
+    'duration',
+    'exit_class',
+    'completed'
+  ]) {
+    assert.ok(setupReference.includes(token), `setup reference must include ${JSON.stringify(token)}`);
+  }
+
+  assert.match(setupReference, /explicit consent/i);
+  assert.match(setupReference, /inherits stdin,\s+stdout, and\s+stderr/i);
+  assert.match(setupReference, /non-TTY/i);
+  assert.match(setupReference, /no machine JSON.*stdout/is);
+  assert.match(setupReference, /fail-if-exists/i);
+  assert.match(setupReference, /atomic/i);
+  assert.match(setupReference, /redacted/i);
+  assert.match(setupReference, /report mode is success-only/i);
+  assert.match(setupReference, /do not redirect stdout or stderr/i);
+  assert.match(setupReference, /fake harness/i);
+  assert.match(setupReference, /CI\s+receives no real provider credentials/i);
+  assert.match(setupReference, /operator-run ceremony/i);
 });
