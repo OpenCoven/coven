@@ -49,6 +49,7 @@ an explicit ANSI-color policy.
 | Goal | Start with |
 | --- | --- |
 | Check whether the local runtime is usable | `coven doctor` |
+| Complete provider login or optional verification | `coven setup <codex\|claude\|copilot\|all>` |
 | Control the local daemon | `coven daemon status` |
 | Launch an explicit harness task | `coven run <harness> "<prompt>"` |
 | Browse or manage history | `coven sessions` |
@@ -62,6 +63,7 @@ authority layer, and harness credentials remain owned by the selected harness.
 ## Related
 
 - [CLI reference](/reference/cli)
+- [`coven setup`](/reference/cli-setup)
 - [Core access guide](/guides/core-access)
 - [Coven TUI](/start/coven-tui)
 - [Engine contract](/ENGINE-CONTRACT)

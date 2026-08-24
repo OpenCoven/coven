@@ -21,7 +21,8 @@ Coven supervises harness PTYs. It never reads, proxies, persists, or mints provi
 
 ```mermaid
 flowchart LR
-  User[Developer] -->|once| HarnessLogin["harness login (codex login / claude doctor)"]
+  User[Developer] -->|once| CovenSetup["coven setup codex / claude / copilot"]
+  CovenSetup --> HarnessLogin["provider login (codex login / claude auth login / copilot login)"]
   HarnessLogin --> HarnessStore[("Provider credential store\n~/.codex, keychain, etc.")]
 
   User -->|every run| CovenRun["coven run codex prompt"]
@@ -42,7 +43,11 @@ The arrow that matters is the missing one: the daemon has no dotted line into th
 
 ### CLI
 
-`coven run codex|claude <prompt>` launches the harness with an empty argument vector apart from the validated prompt and adapter prefix args. It does not inject `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or any token-bearing env var. If the harness needs a credential, it reads it the same way it would when launched directly from your shell.
+`coven run codex|claude|copilot <prompt>` launches the harness with the
+validated prompt and adapter prefix args. It does not inject
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or any token-bearing env var. If the
+harness needs a credential, it reads it the same way it would when launched
+directly from your shell.
 
 ### Coven Code engine
 
@@ -85,7 +90,7 @@ Clients (CastCodes, comux, the OpenClaw plugin) connect to the local socket. The
 | Harness | Login command | Where credentials live | Notes |
 |---|---|---|---|
 | `codex` | `codex login` | `~/.codex/auth.json` (or platform keychain, depending on Codex version) | Use `codex logout` to revoke. Coven does not need to be restarted. |
-| `claude` | `claude doctor` then follow prompts | `~/.config/anthropic/` and/or system keychain | `claude doctor` is also a general health check; Coven only relies on the binary being present. |
+| `claude` | `claude auth login` | `~/.config/anthropic/` and/or system keychain | Coven only relies on the binary being present unless you explicitly request setup verification. |
 | `copilot` | `copilot login` | `~/.copilot/` (GitHub device-flow token managed by the CLI) | Use `copilot logout` to revoke. GitHub-side Copilot access is governed by your GitHub plan. |
 | `grok` (experimental recipe) | `grok login` or `grok login --device-code` | `~/.grok/` and/or provider-managed local auth | `XAI_API_KEY` is also supported for headless use; Coven inherits it but never reads or stores it. |
 
@@ -104,7 +109,10 @@ The daemon's responsibility is to **stay out of the credential path**. Concretel
 
 Because Coven refuses to own credentials, **the user** is responsible for:
 
-- Running each harness's own `login` / `doctor` flow at least once before expecting `coven run` to succeed.
+- Running each harness's own login flow at least once before expecting
+  `coven run` to succeed. `coven setup codex`, `coven setup claude`, and
+  `coven setup copilot` hand the terminal to the exact commands in the table
+  after explicit consent.
 - Rotating provider tokens through the harness CLI when needed.
 - Treating any harness output that prints a credential (because you asked it to) as ledger-recorded. Rotate or revoke the credential immediately. An eligible non-running session without adoption evidence may be removed with [`coven sacrifice`](/SESSION-LIFECYCLE#sacrifice); adopted/reserved sessions are retained and O3 provides no sacrifice release, so do not rely on deletion as the containment plan.
 
@@ -114,6 +122,7 @@ Because Coven refuses to own credentials, **the user** is responsible for:
 - [Authentication and local access](/AUTH)
 - [Safety model](/SAFETY-MODEL)
 - [Install harness CLIs](/harnesses/installing)
+- [`coven setup`](/reference/cli-setup)
 - [Harness adapters](/HARNESS-ADAPTERS)
 - [Codex harness](/harnesses/codex)
 - [Claude Code harness](/harnesses/claude-code)

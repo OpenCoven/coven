@@ -88,6 +88,9 @@ Shipped:
 - Local daemon lifecycle: `coven daemon start/status/restart/stop`.
 - Project-root and cwd boundary guard.
 - Built-in Codex, Claude Code, and GitHub Copilot CLI harness adapters.
+- Provider-owned `coven setup` login for those three harnesses, with optional
+  explicitly consented ephemeral verification and redacted certification
+  reports.
 - Trusted opt-in recipes for Hermes 1.0.3 and OpenCode 0.1.1; experimental opt-in recipe for Grok Build 1.0.0.
 - PTY-backed `coven run codex|claude|copilot <prompt>` sessions.
 - SQLite-backed session metadata and event log.

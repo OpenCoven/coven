@@ -112,7 +112,9 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 
 ### Installing harness CLIs
 
-Run `coven doctor` first — it prints specific install hints for any missing harness.
+Run `coven doctor` first — it reports local readiness and points missing
+harnesses to `coven setup`. Doctor stays offline and does not verify provider
+authentication.
 
 **Codex (OpenAI):**
 
@@ -126,7 +128,7 @@ codex login
 
 ```bash
 npm install -g @anthropic-ai/claude-code
-claude doctor
+claude auth login
 ```
 
 **GitHub Copilot CLI (GitHub):**
@@ -134,11 +136,17 @@ claude doctor
 ```bash
 npm install -g @github/copilot
 # or: brew install --cask copilot-cli
+copilot login
 ```
 
-Per-harness setup detail lives in [`docs/harnesses/`](docs/harnesses/index.md).
+The recommended guided path is `coven setup codex`, `coven setup claude`, or
+`coven setup copilot`; `coven setup all` processes all three in order. Add
+`--verify` for a separately consented provider turn, or use `--verify-only`
+after an existing login. See the
+[`coven setup` reference](docs/reference/cli-setup.md).
 
-After installing and authenticating, run `coven doctor` again to confirm the harness is detected. If `doctor` still reports missing, ensure the harness binary is on your `PATH`.
+After setup, run `coven doctor` again to confirm the harness is detected. If
+Doctor still reports it missing, ensure the harness binary is on your `PATH`.
 
 ---
 
@@ -221,21 +229,24 @@ a recorded session.
 ```bash
 cd /path/to/your/project
 
-# 1. Verify setup
+# 1. Complete provider-owned login
+coven setup codex
+
+# 2. Check local readiness
 coven doctor
 
-# 2. Start the daemon
+# 3. Start the daemon
 coven daemon start
 
-# 3. Launch a session
+# 4. Launch a session
 coven run codex "fix the failing tests"
 # or with Claude Code:
 coven run claude "polish this UI"
 
-# 4. Browse and manage sessions
+# 5. Browse and manage sessions
 coven sessions
 
-# 5. Stop the daemon when done
+# 6. Stop the daemon when done
 coven daemon stop
 ```
 
@@ -261,6 +272,7 @@ verbs:
 | --- | --- | --- |
 | `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [Interactive UI](https://docs.opencoven.ai/docs/cli/interactive) |
 | `coven doctor` | Detect supported harness CLIs and print install hints | [Doctor](https://docs.opencoven.ai/docs/cli/doctor) |
+| `coven setup <codex\|claude\|copilot\|all>` | Run provider-owned login and optional explicitly consented verification | [Setup](docs/reference/cli-setup.md) |
 | `coven daemon start/status/restart/stop` | Manage the local daemon | [Daemon commands](https://docs.opencoven.ai/docs/cli/daemon) |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [Run](https://docs.opencoven.ai/docs/cli/run) |
 | `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
@@ -564,7 +576,10 @@ No. Coven wraps them. You still use the harness CLI for its AI capabilities — 
 
 **Q: Does Coven require an internet connection or an account?**
 
-No. Coven itself is fully local. Your harness CLIs (Codex, Claude Code) require their own provider authentication, but Coven stores no credentials and makes no outbound network calls.
+Core Coven operation and `coven doctor` are local. Your harness CLIs require
+their own provider authentication and network access. Coven stores no provider
+credentials; only an explicitly consented `coven setup --verify` or a harness
+session launches a provider turn.
 
 **Q: Is Windows supported?**
 

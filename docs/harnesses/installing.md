@@ -30,7 +30,7 @@ The daemon revalidates the harness id on every launch request. Clients cannot wi
 | Harness id | Executable | Install command | Provider login | Detail page |
 |---|---|---|---|---|
 | `codex` | `codex` | `npm install -g @openai/codex` | `codex login` | [Codex harness](/harnesses/codex) |
-| `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude doctor` | [Claude Code harness](/harnesses/claude-code) |
+| `claude` | `claude` | `npm install -g @anthropic-ai/claude-code` | `claude auth login` | [Claude Code harness](/harnesses/claude-code) |
 | `copilot` | `copilot` | `npm install -g @github/copilot` | `copilot login` | [Copilot CLI harness](/harnesses/copilot-cli) |
 
 Other CLIs (Aider, Gemini CLI, Cline, custom commands) are **not** bundled in
@@ -67,15 +67,19 @@ bundled. Install and set up Hermes Agent first, then run
   </Step>
 
   <Step title="Finish provider auth in the harness CLI">
-    Coven never touches provider credentials. Run each CLI's own login flow once.
+    Coven never touches provider credentials. Use guided setup to run each
+    provider-owned login flow after explicit consent.
 
     ```bash
-    codex login
-    claude doctor
-    copilot login
+    coven setup codex
+    coven setup claude
+    coven setup copilot
     ```
 
-    See [Provider auth boundary](/harnesses/provider-auth) for the rationale.
+    These invoke `codex login`, `claude auth login`, and `copilot login`
+    respectively. See [Provider auth boundary](/harnesses/provider-auth) for
+    the rationale and [`coven setup`](/reference/cli-setup) for optional
+    verification.
   </Step>
 
   <Step title="Verify Coven sees the harness">
@@ -135,7 +139,7 @@ coven doctor
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `coven doctor` reports a harness as `missing` even after install | New shell `PATH` not picked up by the daemon | `coven daemon restart`, then `coven doctor`. |
-| Doctor finds the binary but `coven run` fails immediately | Provider auth incomplete | Re-run `codex login` / `claude doctor` / `copilot login`. See [provider auth](/harnesses/provider-auth). |
+| Doctor finds the binary but `coven run` fails immediately | Provider auth incomplete | Re-run `coven setup codex`, `coven setup claude`, or `coven setup copilot`. See [provider auth](/harnesses/provider-auth). |
 | Doctor shows a stale version | Older binary earlier on `PATH` | `which -a codex` (or `claude`, `copilot`) and remove the duplicate. |
 | Doctor reports `unsupported harness` | Typo in harness id | Use one of the ids in the table above. |
 
@@ -146,6 +150,7 @@ coven doctor
 - [Codex harness](/harnesses/codex)
 - [Claude Code harness](/harnesses/claude-code)
 - [Copilot CLI harness](/harnesses/copilot-cli)
+- [`coven setup`](/reference/cli-setup)
 - [Grok Build adapter](/harnesses/grok-build)
 - [Harness adapters](/HARNESS-ADAPTERS)
 - [Future harness notes](/FUTURE-HARNESSES)

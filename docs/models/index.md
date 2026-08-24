@@ -16,7 +16,7 @@ limited to the bundled harness CLI login paths.
     Install `@openai/codex`, run `codex login`, then launch with harness id `codex`.
   </Card>
   <Card title="Claude Code" href="/harnesses/claude-code" icon="brain">
-    Install `@anthropic-ai/claude-code`, run `claude doctor`, then launch with harness id `claude`.
+    Install `@anthropic-ai/claude-code`, run `claude auth login`, then launch with harness id `claude`.
   </Card>
   <Card title="Copilot CLI" href="/harnesses/copilot-cli" icon="github">
     Install `@github/copilot`, run `copilot login`, then launch with harness id `copilot`.
@@ -30,13 +30,16 @@ npm install -g @openai/codex
 codex login
 
 npm install -g @anthropic-ai/claude-code
-claude doctor
+claude auth login
 
 npm install -g @github/copilot
 copilot login
 
 coven doctor
 ```
+
+For a guided provider-owned login, use `coven setup codex`,
+`coven setup claude`, or `coven setup copilot`.
 
 ## What this means for clients
 
