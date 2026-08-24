@@ -2726,7 +2726,8 @@ mod tests {
         assert!(claude
             .install_hint
             .contains("npm install -g @anthropic-ai/claude-code"));
-        assert!(claude.install_hint.contains("claude doctor"));
+        assert!(claude.install_hint.contains("claude auth login"));
+        assert!(!claude.install_hint.contains("claude doctor"));
         assert!(claude.install_hint.contains("claude"));
         assert!(claude.install_hint.contains("PATH"));
 
