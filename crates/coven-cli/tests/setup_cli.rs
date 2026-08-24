@@ -643,6 +643,12 @@ fn executable_discovery_is_injectable_and_rejects_non_executables() -> Result<()
     let resolved = discovery
         .discover(&provider)?
         .context("executable should be discovered")?;
+    #[cfg(windows)]
+    assert!(resolved
+        .path
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&executable.to_string_lossy()));
+    #[cfg(not(windows))]
     assert_eq!(resolved.path, executable);
 
     #[cfg(unix)]

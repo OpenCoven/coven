@@ -1559,11 +1559,7 @@ fn run_setup_command(
 }
 
 fn setup_candidate_commit() -> String {
-    env!("COVEN_VERSION_DESC")
-        .split(|character: char| !character.is_ascii_hexdigit())
-        .find(|segment| (7..=64).contains(&segment.len()))
-        .unwrap_or("unknown")
-        .to_owned()
+    env!("COVEN_BUILD_COMMIT").to_owned()
 }
 
 fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
