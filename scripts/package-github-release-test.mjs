@@ -9,6 +9,7 @@ import { gunzipSync } from 'node:zlib';
 import {
   PACKAGE_DEFINITIONS,
   assertChecksumManifest,
+  captureCommandOutputToFile,
   canonicalReleaseAssetNames,
   packageGitHubRelease,
   syncGitHubRelease,
@@ -56,7 +57,12 @@ function releasePackageVersionMap(version = NPM_VERSION) {
 
 function writeSignatureAuditLockfile(
   auditDir,
-  { resolvedPackages = RELEASE_PACKAGES, versionOverrides = {} } = {}
+  {
+    resolvedPackages = RELEASE_PACKAGES,
+    rootDependencies = releasePackageVersionMap(),
+    versionOverrides = {},
+    lockfileVersion = 3
+  } = {}
 ) {
   const packageEntries = Object.fromEntries(
     resolvedPackages.map((packageName) => [
@@ -68,22 +74,46 @@ function writeSignatureAuditLockfile(
       }
     ])
   );
+  const rootDependencyEntries = Object.fromEntries(
+    Object.entries(rootDependencies).map(([packageName, version]) => [
+      packageName,
+      {
+        version,
+        resolved: `https://registry.npmjs.org/${encodeURIComponent(packageName)}/-/${packageName.split('/').at(-1)}-${version}.tgz`,
+        integrity: `sha512-${Buffer.from(packageName).toString('base64')}`
+      }
+    ])
+  );
   writeFileSync(
     path.join(auditDir, 'package-lock.json'),
-    `${JSON.stringify({
-      name: 'opencoven-release-npm-signatures-audit',
-      version: '0.0.0',
-      lockfileVersion: 3,
-      requires: true,
-      packages: {
-        '': {
-          name: 'opencoven-release-npm-signatures-audit',
-          version: '0.0.0',
-          dependencies: releasePackageVersionMap()
-        },
-        ...packageEntries
-      }
-    }, null, 2)}\n`
+    `${
+      JSON.stringify(
+        lockfileVersion === 1
+          ? {
+              name: 'opencoven-release-npm-signatures-audit',
+              version: '0.0.0',
+              lockfileVersion,
+              requires: true,
+              dependencies: rootDependencyEntries
+            }
+          : {
+              name: 'opencoven-release-npm-signatures-audit',
+              version: '0.0.0',
+              lockfileVersion,
+              requires: true,
+              packages: {
+                '': {
+                  name: 'opencoven-release-npm-signatures-audit',
+                  version: '0.0.0',
+                  dependencies: rootDependencies
+                },
+                ...packageEntries
+              }
+            },
+        null,
+        2
+      )
+    }\n`
   );
 }
 
@@ -403,9 +433,13 @@ function fakeReleaseClient({ existingRelease = null, assetBytesByName = {} } = {
       state.release = { tagName: releaseTag, assets: [] };
       return state.release;
     },
-    async downloadAsset(asset) {
+    async downloadAsset(asset, filePath) {
       state.downloads.push(asset.name);
-      return assetBytesByName[asset.name];
+      const bytes = assetBytesByName[asset.name];
+      if (!bytes) {
+        throw new Error(`missing fake asset bytes for ${asset.name}`);
+      }
+      writeFileSync(filePath, bytes);
     },
     async uploadAsset({ releaseTag, assetName, filePath }) {
       state.uploads.push({ releaseTag, assetName, bytes: readFileSync(filePath) });
@@ -733,6 +767,48 @@ test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-versio
       {
         command: 'npm',
         args: ['audit', 'signatures'],
+        cwd: path.resolve(auditDir)
+      }
+    ]);
+  });
+});
+
+test('verifyNpmRegistrySignatures rejects extra root dependencies after the full install rewrites package-lock.json', () => {
+  withScratchDir('npm-signatures-audit-extra-root-postinstall', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    assert.throws(
+      () =>
+        verifyNpmRegistrySignatures({
+          npmVersion: NPM_VERSION,
+          auditDir,
+          commandRunner(command, args, options = {}) {
+            calls.push({ command, args, cwd: options.cwd });
+            if (args[0] === 'install' && args.includes('--package-lock-only')) {
+              writeSignatureAuditLockfile(auditDir);
+              return;
+            }
+            if (args[0] === 'install') {
+              writeSignatureAuditLockfile(auditDir, {
+                rootDependencies: {
+                  ...releasePackageVersionMap(),
+                  'left-pad': '1.3.0'
+                }
+              });
+            }
+          }
+        }),
+      /left-pad/
+    );
+    assert.deepEqual(calls, [
+      {
+        command: 'npm',
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+        cwd: path.resolve(auditDir)
+      },
+      {
+        command: 'npm',
+        args: ['install', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
         cwd: path.resolve(auditDir)
       }
     ]);
@@ -1245,6 +1321,21 @@ test('assertChecksumManifest rejects self entries, duplicates, path-qualified na
   );
 });
 
+test('captureCommandOutputToFile writes stdout larger than spawnSync maxBuffer directly to disk', () => {
+  withScratchDir('capture-command-output', (scratchDir) => {
+    const outputPath = path.join(scratchDir, 'large-stdout.bin');
+    const byteCount = (1024 * 1024) + 4096;
+    captureCommandOutputToFile(
+      process.execPath,
+      ['-e', `process.stdout.write(Buffer.alloc(${byteCount}, 0x61));`],
+      { filePath: outputPath }
+    );
+    const outputBytes = readFileSync(outputPath);
+    assert.equal(outputBytes.length, byteCount);
+    assert.equal(outputBytes.subarray(0, 4).toString('utf8'), 'aaaa');
+  });
+});
+
 test('syncGitHubRelease creates a missing release and uploads every canonical asset with tag notes', async () => {
   await withScratchDir('sync-create', async (scratchDir) => {
     const artifactsDir = path.join(scratchDir, 'artifacts');
@@ -1269,6 +1360,50 @@ test('syncGitHubRelease creates a missing release and uploads every canonical as
     ]);
     assert.deepEqual(result.uploaded.sort(), EXPECTED_ASSET_NAMES);
     assert.deepEqual(result.skipped, []);
+  });
+});
+
+test('syncGitHubRelease skips a fully matching rerun, including >1 MiB assets, without uploading', async () => {
+  await withScratchDir('sync-large-match', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+
+    const windowsDefinition = PACKAGE_DEFINITIONS.windows;
+    const windowsBinaryPath = path.join(artifactsDir, windowsDefinition.artifactName, 'coven.exe');
+    writeFileSync(
+      windowsBinaryPath,
+      Buffer.concat([readFileSync(windowsBinaryPath), Buffer.alloc(1_250_000, 0x61)])
+    );
+
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const windowsArchiveName = windowsDefinition.assetName(NPM_VERSION);
+    assert.ok(readFileSync(path.join(outputDir, windowsArchiveName)).length > 1024 * 1024);
+
+    const matchingClient = fakeReleaseClient({
+      existingRelease: {
+        tagName: RELEASE_TAG,
+        assets: EXPECTED_ASSET_NAMES.map((name, index) => ({ id: index + 1, name }))
+      },
+      assetBytesByName: Object.fromEntries(
+        EXPECTED_ASSET_NAMES.map((assetName) => [assetName, readFileSync(path.join(outputDir, assetName))])
+      )
+    });
+    const matchingResult = await syncGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      outputDir,
+      releaseClient: matchingClient
+    });
+
+    assert.deepEqual(matchingResult.skipped, EXPECTED_ASSET_NAMES);
+    assert.deepEqual(matchingResult.uploaded, []);
+    assert.equal(matchingClient.state.uploads.length, 0);
   });
 });
 

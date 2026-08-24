@@ -2,7 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -629,7 +629,7 @@ export function verifyNpmRegistrySignatures({
     ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
     { cwd: normalizedAuditDir }
   );
-  const packageLockEntries = assertReleasePackagesResolvedInLockfile({
+  assertReleasePackagesResolvedInLockfile({
     auditDir: normalizedAuditDir,
     npmVersion: normalizedVersion
   });
@@ -638,6 +638,10 @@ export function verifyNpmRegistrySignatures({
     ['install', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
     { cwd: normalizedAuditDir }
   );
+  const packageLockEntries = assertReleasePackagesResolvedInLockfile({
+    auditDir: normalizedAuditDir,
+    npmVersion: normalizedVersion
+  });
   commandRunner('npm', ['audit', 'signatures'], {
     cwd: normalizedAuditDir
   });
@@ -646,6 +650,79 @@ export function verifyNpmRegistrySignatures({
     packageNames: [...RELEASE_PACKAGES],
     npmVersion: normalizedVersion,
     packageLockEntries
+  };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function packageLockRootDependencies(packageLock) {
+  const rootPackageDependencies = packageLock?.packages?.['']?.dependencies;
+  if (isPlainObject(rootPackageDependencies)) {
+    return {
+      dependencies: rootPackageDependencies,
+      source: 'packages[""].dependencies'
+    };
+  }
+  if (!isPlainObject(packageLock?.packages) && isPlainObject(packageLock?.dependencies)) {
+    return {
+      dependencies: Object.fromEntries(
+        Object.entries(packageLock.dependencies).map(([packageName, entry]) => [
+          packageName,
+          typeof entry === 'string' ? entry : entry?.version
+        ])
+      ),
+      source: 'dependencies'
+    };
+  }
+  throw new Error(
+    'Refusing GitHub release: package-lock.json must record the exact five @opencoven dependencies in packages[""].dependencies (lockfile v2+) or dependencies (lockfile v1).'
+  );
+}
+
+function assertExactReleaseRootDependencies({ rootDependencies, source, npmVersion }) {
+  const expectedNames = [...RELEASE_PACKAGES].sort();
+  const actualNames = Object.keys(rootDependencies).sort();
+  const missingNames = expectedNames.filter((packageName) => !actualNames.includes(packageName));
+  const extraNames = actualNames.filter((packageName) => !expectedNames.includes(packageName));
+  if (missingNames.length > 0 || extraNames.length > 0) {
+    const details = [
+      missingNames.length > 0 ? `missing root dependencies: ${missingNames.join(', ')}` : null,
+      extraNames.length > 0 ? `unexpected root dependencies: ${extraNames.join(', ')}` : null
+    ].filter(Boolean);
+    throw new Error(
+      `Refusing GitHub release: package-lock.json must declare exactly the five release packages in ${source}; ${details.join('; ')}.`
+    );
+  }
+  for (const packageName of expectedNames) {
+    const declaredVersion = rootDependencies[packageName];
+    if (declaredVersion !== npmVersion) {
+      throw new Error(
+        `Refusing GitHub release: package-lock.json must declare ${packageName}@${npmVersion} in ${source}, got ${JSON.stringify(declaredVersion)}.`
+      );
+    }
+  }
+}
+
+function resolvedPackageLockEntry(packageLock, packageName) {
+  const packagePath = `node_modules/${packageName}`;
+  const packageEntry = packageLock?.packages?.[packagePath];
+  if (isPlainObject(packageEntry)) {
+    return {
+      entry: packageEntry,
+      source: packagePath
+    };
+  }
+  if (!isPlainObject(packageLock?.packages) && isPlainObject(packageLock?.dependencies?.[packageName])) {
+    return {
+      entry: packageLock.dependencies[packageName],
+      source: `dependencies.${packageName}`
+    };
+  }
+  return {
+    entry: null,
+    source: isPlainObject(packageLock?.packages) ? packagePath : `dependencies.${packageName}`
   };
 }
 
@@ -659,27 +736,19 @@ function assertReleasePackagesResolvedInLockfile({ auditDir, npmVersion }) {
       `Refusing GitHub release: failed to read ${packageLockPath}: ${error?.message ?? String(error)}`
     );
   }
-  const rootEntry = packageLock?.packages?.[''];
-  const rootDependencies = rootEntry?.dependencies;
-  if (!rootDependencies || typeof rootDependencies !== 'object' || Array.isArray(rootDependencies)) {
-    throw new Error(
-      `Refusing GitHub release: package-lock.json must record the exact five @opencoven dependencies in packages[""].dependencies.`
-    );
-  }
+  const { dependencies: rootDependencies, source: rootDependencySource } = packageLockRootDependencies(packageLock);
+  assertExactReleaseRootDependencies({
+    rootDependencies,
+    source: rootDependencySource,
+    npmVersion
+  });
 
   const entries = {};
   for (const packageName of RELEASE_PACKAGES) {
-    const declaredVersion = rootDependencies[packageName];
-    if (declaredVersion !== npmVersion) {
+    const { entry: packageEntry, source: packageEntrySource } = resolvedPackageLockEntry(packageLock, packageName);
+    if (!packageEntry) {
       throw new Error(
-        `Refusing GitHub release: package-lock.json must declare ${packageName}@${npmVersion} in packages[""].dependencies, got ${JSON.stringify(declaredVersion)}.`
-      );
-    }
-    const packagePath = `node_modules/${packageName}`;
-    const packageEntry = packageLock?.packages?.[packagePath];
-    if (!packageEntry || typeof packageEntry !== 'object' || Array.isArray(packageEntry)) {
-      throw new Error(
-        `Refusing GitHub release: package-lock.json is missing resolved entry ${packagePath} for ${packageName}@${npmVersion}.`
+        `Refusing GitHub release: package-lock.json is missing resolved entry ${packageEntrySource} for ${packageName}@${npmVersion}.`
       );
     }
     if (packageEntry.version !== npmVersion) {
@@ -953,8 +1022,8 @@ export async function syncGitHubRelease({
       `Refusing GitHub release: ${normalizedOutputDir} must contain the exact canonical assets ${expectedAssetNames.join(', ')}.`
     );
   }
-  const expectedBytesByName = new Map(
-    expectedAssetNames.map((assetName) => [assetName, readFileSync(path.join(normalizedOutputDir, assetName))])
+  const expectedHashesByName = new Map(
+    expectedAssetNames.map((assetName) => [assetName, sha256Hex(readFileSync(path.join(normalizedOutputDir, assetName)))])
   );
 
   let release = await releaseClient.getReleaseByTag(releaseTag);
@@ -981,7 +1050,7 @@ export async function syncGitHubRelease({
   }
   const existingAssetsByName = new Map(existingAssets.map((asset) => [asset.name, asset]));
   const extraAssets = [...existingAssetsByName.keys()]
-    .filter((assetName) => !expectedBytesByName.has(assetName))
+    .filter((assetName) => !expectedHashesByName.has(assetName))
     .sort();
   if (extraAssets.length > 0) {
     throw new Error(
@@ -993,31 +1062,44 @@ export async function syncGitHubRelease({
   const uploaded = [];
   const skipped = [];
   const missingAssetNames = [];
-  for (const assetName of expectedAssetNames) {
-    const existingAsset = existingAssetsByName.get(assetName);
-    if (!existingAsset) {
-      missingAssetNames.push(assetName);
-      continue;
+  const downloadDir = path.join(normalizedOutputDir, '.release-sync-downloads');
+  rmSync(downloadDir, { recursive: true, force: true });
+  mkdirSync(downloadDir, { recursive: true });
+  try {
+    for (const assetName of expectedAssetNames) {
+      const existingAsset = existingAssetsByName.get(assetName);
+      if (!existingAsset) {
+        missingAssetNames.push(assetName);
+        continue;
+      }
+      const defaultDownloadPath = path.join(downloadDir, assetName);
+      const downloadResult = await releaseClient.downloadAsset(existingAsset, defaultDownloadPath);
+      let observedAssetPath = defaultDownloadPath;
+      if (Buffer.isBuffer(downloadResult)) {
+        writeFileSync(defaultDownloadPath, downloadResult);
+      } else if (typeof downloadResult === 'string' && downloadResult.trim() !== '') {
+        observedAssetPath = path.resolve(downloadResult);
+      }
+      const observedHash = sha256Hex(readFileSync(observedAssetPath));
+      const expectedHash = expectedHashesByName.get(assetName);
+      if (observedHash !== expectedHash) {
+        throw new Error(
+          `Refusing GitHub release: asset ${assetName} mismatch: observed hash ${observedHash}, expected hash ${expectedHash}. ` +
+            'Record the observed hash, expected hash, and reason, delete only the mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
+        );
+      }
+      skipped.push(assetName);
     }
-    const expectedBytes = expectedBytesByName.get(assetName);
-    const observedBytes = await releaseClient.downloadAsset(existingAsset);
-    const observedHash = sha256Hex(observedBytes);
-    const expectedHash = sha256Hex(expectedBytes);
-    if (observedHash !== expectedHash) {
-      throw new Error(
-        `Refusing GitHub release: asset ${assetName} mismatch: observed hash ${observedHash}, expected hash ${expectedHash}. ` +
-          'Record the observed hash, expected hash, and reason, delete only the mismatched GitHub asset through an audited operator action, then rerun this GitHub-only workflow. Never move/reuse the tag and never republish npm.'
-      );
+    for (const assetName of missingAssetNames) {
+      await releaseClient.uploadAsset({
+        releaseTag,
+        assetName,
+        filePath: path.join(normalizedOutputDir, assetName)
+      });
+      uploaded.push(assetName);
     }
-    skipped.push(assetName);
-  }
-  for (const assetName of missingAssetNames) {
-    await releaseClient.uploadAsset({
-      releaseTag,
-      assetName,
-      filePath: path.join(normalizedOutputDir, assetName)
-    });
-    uploaded.push(assetName);
+  } finally {
+    rmSync(downloadDir, { recursive: true, force: true });
   }
 
   return {
@@ -1098,23 +1180,17 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
       }
       return release;
     },
-    async downloadAsset(asset) {
+    async downloadAsset(asset, filePath) {
       const assetUrl = asset?.url;
       if (!assetUrl) {
         throw new Error(`GitHub release asset ${asset?.name ?? '(unknown)'} has no API URL.`);
       }
       const endpoint = new URL(assetUrl).pathname;
-      const result = spawnCapture('gh', ['api', '-H', 'Accept: application/octet-stream', endpoint], {
-        encoding: null
-      });
-      if (result.error) {
-        throw new Error(result.error.message);
-      }
-      if (result.status !== 0) {
-        const stderr = bufferToTrimmedString(result.stderr);
-        throw new Error(stderr || `gh api ${endpoint} exited with ${result.status}.`);
-      }
-      return Buffer.from(result.stdout);
+      return captureCommandOutputToFile(
+        'gh',
+        ['api', '-H', 'Accept: application/octet-stream', endpoint],
+        { filePath }
+      );
     },
     async uploadAsset({ releaseTag, filePath }) {
       runCommand('gh', ['release', 'upload', releaseTag, filePath, '--repo', repository]);
@@ -1214,6 +1290,50 @@ function toNonNegativeInteger(value, label) {
 
 function isSha(value) {
   return typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value);
+}
+
+export function captureCommandOutputToFile(
+  command,
+  args,
+  { filePath, cwd = repoRoot, env = process.env } = {}
+) {
+  const normalizedFilePathInput = String(filePath ?? '').trim();
+  if (!normalizedFilePathInput) {
+    throw new Error('Refusing GitHub release: capture output file path is required.');
+  }
+  const normalizedFilePath = path.resolve(normalizedFilePathInput);
+  mkdirSync(path.dirname(normalizedFilePath), { recursive: true });
+
+  let outputHandle;
+  let captureError;
+  try {
+    outputHandle = openSync(normalizedFilePath, 'w');
+    const result = spawnSync(command, args, {
+      cwd,
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', outputHandle, 'pipe']
+    });
+    if (result.error) {
+      throw new Error(result.error.message);
+    }
+    if (result.status !== 0) {
+      const printable = [command, ...args].join(' ');
+      const stderr = bufferToTrimmedString(result.stderr);
+      throw new Error(stderr || `${printable} exited with ${result.status}.`);
+    }
+    return normalizedFilePath;
+  } catch (error) {
+    captureError = error;
+    throw error;
+  } finally {
+    if (outputHandle !== undefined) {
+      closeSync(outputHandle);
+    }
+    if (captureError) {
+      rmSync(normalizedFilePath, { force: true });
+    }
+  }
 }
 
 function runCommand(command, args, { encoding = 'utf8', cwd = repoRoot, env = process.env } = {}) {

@@ -116,7 +116,7 @@ npm view @opencoven/cli-windows version dist-tags
 
 All five should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
-After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Only then does it download the four retained build artifacts, package deterministic archives, and reconcile the matching GitHub Release.
+After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Its signature-audit preflight also rebuilds a throwaway consumer `package-lock.json` and rejects any final lock whose root dependency set is not exactly those five canonical packages at the tag version. Only then does it download the four retained build artifacts, package deterministic archives, and reconcile the matching GitHub Release.
 
 The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using the signed tag annotation notes, with exactly these assets:
 
@@ -139,7 +139,7 @@ The recovery path is deliberately narrow:
 
 - A missing GitHub Release may be created.
 - A missing canonical asset may be uploaded.
-- A canonical asset that already exists is downloaded and hash-checked first; it is skipped only on an exact byte match.
+- A canonical asset that already exists is streamed to a local file and hash-checked first; it is skipped only on an exact byte match.
 - Any mismatched canonical asset or any extra/renamed asset fails closed. The workflow never overwrites GitHub assets automatically, never moves or reuses the tag, and never republishes npm.
 
 When a mismatch blocks recovery, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag and source run ID. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
