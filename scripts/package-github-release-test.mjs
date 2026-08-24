@@ -1443,6 +1443,10 @@ test('packageGitHubRelease rejects missing or extra source artifact files', () =
 test('assertChecksumManifest rejects self entries, duplicates, path-qualified names, missing assets, and non-lexical order', () => {
   assert.throws(() => assertChecksumManifest('', EXPECTED_ARCHIVES), /exactly four non-empty entries/);
   assert.throws(
+    () => assertChecksumManifest('', EXPECTED_ARCHIVES.slice(0, 2)),
+    /exactly 2 non-empty entries/
+  );
+  assert.throws(
     () =>
       assertChecksumManifest(
         [

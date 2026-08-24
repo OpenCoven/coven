@@ -1097,7 +1097,8 @@ export function assertChecksumManifest(text, expectedNames) {
   const trimmed = String(text).replace(/\s+$/, '');
   const lines = trimmed.length === 0 ? [] : trimmed.split(/\r?\n/);
   if (lines.length !== expected.length || lines.some((line) => line.trim().length === 0)) {
-    throw new Error('SHA256SUMS must contain exactly four non-empty entries.');
+    const expectedCount = expected.length === 4 ? 'four' : String(expected.length);
+    throw new Error(`SHA256SUMS must contain exactly ${expectedCount} non-empty entries.`);
   }
   const names = [];
   for (const line of lines) {

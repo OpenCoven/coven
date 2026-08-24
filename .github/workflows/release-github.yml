@@ -57,7 +57,7 @@ jobs:
       - name: Verify release source run and signed tag
         id: source
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch || inputs.release_tag }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
           SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.source_run_attempt }}
@@ -121,7 +121,7 @@ jobs:
           path: github-release-source/coven-windows
       - name: Reconfirm source run attempt after artifact download
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
           SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
@@ -145,7 +145,7 @@ jobs:
             --source-date-epoch "$SOURCE_DATE_EPOCH"
       - name: Synchronize canonical GitHub release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
           HEAD_SHA: ${{ steps.source.outputs.head_sha }}

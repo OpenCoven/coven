@@ -72,6 +72,16 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("actions: read", RELEASE_GITHUB_TEXT)
         self.assertIn("contents: write", RELEASE_GITHUB_TEXT)
         self.assertNotIn("id-token: write", RELEASE_GITHUB_TEXT)
+        self.assertEqual(
+            RELEASE_GITHUB_TEXT.count(
+                "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
+            ),
+            3,
+        )
+        self.assertNotIn(
+            "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+            RELEASE_GITHUB_TEXT,
+        )
         self.assertIn("cancel-in-progress: false", RELEASE_GITHUB_TEXT)
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", RELEASE_GITHUB_TEXT)
         self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", RELEASE_GITHUB_TEXT)
