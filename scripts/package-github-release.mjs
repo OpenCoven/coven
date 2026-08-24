@@ -758,7 +758,7 @@ function assertReleasePackagesResolvedInLockfile({ auditDir, npmVersion }) {
     }
     if (typeof packageEntry.resolved !== 'string' || packageEntry.resolved.trim() === '') {
       throw new Error(
-        `Refusing GitHub release: package-lock.json entry ${packagePath} for ${packageName}@${npmVersion} is missing a resolved tarball URL.`
+        `Refusing GitHub release: package-lock.json entry ${packageEntrySource} for ${packageName}@${npmVersion} is missing a resolved tarball URL.`
       );
     }
     entries[packageName] = {

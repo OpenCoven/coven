@@ -61,6 +61,7 @@ function writeSignatureAuditLockfile(
     resolvedPackages = RELEASE_PACKAGES,
     rootDependencies = releasePackageVersionMap(),
     versionOverrides = {},
+    packageEntryOverrides = {},
     lockfileVersion = 3
   } = {}
 ) {
@@ -70,7 +71,8 @@ function writeSignatureAuditLockfile(
       {
         version: versionOverrides[packageName] ?? NPM_VERSION,
         resolved: `https://registry.npmjs.org/${encodeURIComponent(packageName)}/-/${packageName.split('/').at(-1)}-${versionOverrides[packageName] ?? NPM_VERSION}.tgz`,
-        integrity: `sha512-${Buffer.from(packageName).toString('base64')}`
+        integrity: `sha512-${Buffer.from(packageName).toString('base64')}`,
+        ...packageEntryOverrides[packageName]
       }
     ])
   );
@@ -890,6 +892,41 @@ test('verifyNpmRegistrySignatures rejects wrong-version package-lock entries bef
           }
         }),
       new RegExp(`${wrongPackage}.*0\\.4\\.1`)
+    );
+    assert.deepEqual(calls, [
+      {
+        command: 'npm',
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+        cwd: path.resolve(auditDir)
+      }
+    ]);
+  });
+});
+
+test('verifyNpmRegistrySignatures rejects package-lock entries missing resolved tarball URLs before auditing', () => {
+  withScratchDir('npm-signatures-audit-missing-resolved', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    const wrongPackage = '@opencoven/cli-macos';
+    assert.throws(
+      () =>
+        verifyNpmRegistrySignatures({
+          npmVersion: NPM_VERSION,
+          auditDir,
+          commandRunner(command, args, options = {}) {
+            calls.push({ command, args, cwd: options.cwd });
+            if (args[0] === 'install') {
+              writeSignatureAuditLockfile(auditDir, {
+                packageEntryOverrides: {
+                  [wrongPackage]: {
+                    resolved: undefined
+                  }
+                }
+              });
+            }
+          }
+        }),
+      new RegExp(`package-lock\\.json entry node_modules/${wrongPackage}.*missing a resolved tarball URL`)
     );
     assert.deepEqual(calls, [
       {
