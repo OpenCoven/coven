@@ -87,7 +87,7 @@ async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
     throw new Error(
-      'Usage: package-github-release.mjs <verify-source-run|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
+      'Usage: package-github-release.mjs <verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
     );
   }
 
@@ -112,6 +112,15 @@ async function main() {
           ''
         ].join('\n')
       );
+      return;
+    }
+    case 'verify-source-run-attempt': {
+      await verifyLatestSourceRunAttempt({
+        repository: requiredOption(options, 'repository'),
+        releaseTag: requiredOption(options, 'release-tag'),
+        sourceRunId: requiredOption(options, 'source-run-id'),
+        sourceRunAttempt: requiredOption(options, 'source-run-attempt')
+      });
       return;
     }
     case 'verify-npm-provenance': {
@@ -361,6 +370,42 @@ export function assertRemoteTagMatchesVerifiedContext({
   return remoteTagContext;
 }
 
+function assertLatestSourceRunAttempt(latestSourceRun, {
+  releaseTag,
+  expectedSourceRunId,
+  expectedSourceRunAttempt
+}) {
+  const normalizedSourceRunId = toPositiveIntegerString(expectedSourceRunId, 'source run id');
+  const normalizedSourceRunAttempt = toPositiveIntegerString(expectedSourceRunAttempt, 'source run attempt');
+  const latestRunAttempt = toPositiveInteger(latestSourceRun?.run_attempt, 'latest source run attempt');
+  if (latestRunAttempt !== toPositiveInteger(normalizedSourceRunAttempt, 'source run attempt')) {
+    throw new Error(
+      `Refusing GitHub release: source run ${normalizedSourceRunId} latest run attempt ${latestRunAttempt} does not match selected attempt ${normalizedSourceRunAttempt}; actions/download-artifact is run-id only, so old-attempt artifacts are ambiguous or unavailable after a rerun.`
+    );
+  }
+  return verifySourceRun(latestSourceRun, {
+    releaseTag,
+    expectedSourceRunId: normalizedSourceRunId,
+    expectedSourceRunAttempt: normalizedSourceRunAttempt
+  });
+}
+
+export async function verifyLatestSourceRunAttempt({
+  repository,
+  releaseTag,
+  sourceRunId,
+  sourceRunAttempt,
+  ghApi = ghApiJson
+}) {
+  const normalizedSourceRunId = toPositiveIntegerString(sourceRunId, 'source run id');
+  const latestSourceRun = await ghApi(`/repos/${repository}/actions/runs/${normalizedSourceRunId}`);
+  return assertLatestSourceRunAttempt(latestSourceRun, {
+    releaseTag,
+    expectedSourceRunId: normalizedSourceRunId,
+    expectedSourceRunAttempt: sourceRunAttempt
+  });
+}
+
 export async function resolveReleaseSource({
   repository,
   releaseTag,
@@ -380,12 +425,11 @@ export async function resolveReleaseSource({
     expectedSourceRunId: normalizedSourceRunId,
     expectedSourceRunAttempt: normalizedSourceRunAttempt
   });
-  const latestRunAttempt = toPositiveInteger(latestSourceRun?.run_attempt, 'latest source run attempt');
-  if (latestRunAttempt !== sourceContext.sourceRunAttempt) {
-    throw new Error(
-      `Refusing GitHub release: source run ${normalizedSourceRunId} latest run attempt ${latestRunAttempt} does not match selected attempt ${sourceContext.sourceRunAttempt}; actions/download-artifact is run-id only, so old-attempt artifacts are ambiguous or unavailable after a rerun.`
-    );
-  }
+  assertLatestSourceRunAttempt(latestSourceRun, {
+    releaseTag,
+    expectedSourceRunId: normalizedSourceRunId,
+    expectedSourceRunAttempt: sourceContext.sourceRunAttempt
+  });
   const tagRef = await ghApi(`/repos/${repository}/git/ref/tags/${encodeURIComponent(releaseTag)}`);
   if (tagRef?.object?.type !== 'tag') {
     return verifyReleaseSource({
@@ -1082,6 +1126,31 @@ export function assertChecksumManifest(text, expectedNames) {
   }
 }
 
+function assertExistingReleaseMetadata(release, releaseTag) {
+  const actualTagName = String(release?.tag_name ?? release?.tagName ?? '').trim();
+  if (actualTagName !== releaseTag) {
+    throw new Error(
+      `Refusing GitHub release: existing release tag must be ${releaseTag}, got ${JSON.stringify(actualTagName || null)}.`
+    );
+  }
+  const expectedTitle = `Coven ${releaseTag}`;
+  if (release?.name !== expectedTitle) {
+    throw new Error(
+      `Refusing GitHub release: existing release title must be ${JSON.stringify(expectedTitle)}, got ${JSON.stringify(release?.name)}.`
+    );
+  }
+  if (release?.draft !== false) {
+    throw new Error(
+      'Refusing GitHub release: existing release must not be a draft; draft=false is required for recovery.'
+    );
+  }
+  if (release?.prerelease !== false) {
+    throw new Error(
+      'Refusing GitHub release: existing release must not be a prerelease; prerelease=false is required for recovery.'
+    );
+  }
+}
+
 export async function syncGitHubRelease({
   releaseTag,
   outputDir,
@@ -1116,6 +1185,8 @@ export async function syncGitHubRelease({
       verifyTag: true
     });
     createdRelease = true;
+  } else {
+    assertExistingReleaseMetadata(release, releaseTag);
   }
 
   const existingAssets = Array.isArray(release?.assets) ? release.assets : [];
@@ -1170,6 +1241,13 @@ export async function syncGitHubRelease({
         );
       }
       skipped.push(assetName);
+    }
+    if (missingAssetNames.length > 0) {
+      await releaseClient.revalidateTag({
+        releaseTag,
+        expectedTagObjectSha,
+        expectedHeadSha
+      });
     }
     for (const assetName of missingAssetNames) {
       await releaseClient.uploadAsset({

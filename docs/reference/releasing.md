@@ -116,7 +116,7 @@ npm view @opencoven/cli-windows version dist-tags
 
 All five should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
-After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Its signature-audit preflight also rebuilds a throwaway consumer `package-lock.json` and rejects any final lock whose root dependency set is not exactly those five canonical packages at the tag version. Only then does it download the four retained build artifacts, package deterministic archives, and reconcile the matching GitHub Release.
+After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Its signature-audit preflight also rebuilds a throwaway consumer `package-lock.json` and rejects any final lock whose root dependency set is not exactly those five canonical packages at the tag version. After the four artifact downloads complete, it rechecks that the latest run attempt still equals the selected `source_run_attempt`; if a rerun started during download, the workflow fails closed before packaging or any GitHub Release mutation. Existing Releases are only accepted for recovery when the tag, title `Coven vX.Y.Z`, `draft=false`, and `prerelease=false` already match the canonical public release. Only then does it package deterministic archives and reconcile the matching GitHub Release.
 
 The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using the signed tag annotation notes, with exactly these assets:
 
@@ -134,6 +134,17 @@ If the automatic GitHub-only workflow fails after the npm publication succeeded,
 
 - `release_tag`: the immutable signed tag (`vX.Y.Z`)
 - `source_run_id`: the successful **Release npm packages** run ID for that tag
+- `source_run_attempt`: the exact successful **Release npm packages** run attempt for that run ID
+
+To collect the recovery inputs safely:
+
+1. Open the successful **Release npm packages** run for `vX.Y.Z` in the GitHub Actions UI, or list recent runs and copy the run ID shown there.
+2. Query that run's immutable metadata and copy **both** the run ID and run attempt:
+   ```sh
+   gh api /repos/OpenCoven/coven/actions/runs/<source_run_id> \
+     --jq '{release_tag: .head_branch, source_run_id: .id, source_run_attempt: .run_attempt, conclusion: .conclusion}'
+   ```
+3. Confirm the output still shows `release_tag: "vX.Y.Z"` and `conclusion: "success"`, then pass all three values into the recovery dispatch.
 
 The recovery path is deliberately narrow:
 
@@ -141,8 +152,9 @@ The recovery path is deliberately narrow:
 - A missing canonical asset may be uploaded.
 - A canonical asset that already exists is streamed to a local file and hash-checked first; it is skipped only on an exact byte match.
 - Any mismatched canonical asset or any extra/renamed asset fails closed. The workflow never overwrites GitHub assets automatically, never moves or reuses the tag, and never republishes npm.
+- The workflow rechecks the latest run attempt once before download and once again after all downloads. If either check sees a newer attempt than the supplied `source_run_attempt`, recovery fails closed before packaging or mutation because `actions/download-artifact` is keyed only by run ID. In that case, use the newer successful run's ID/attempt pair instead of reusing the old attempt.
 
-When a mismatch blocks recovery, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag and source run ID. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
+When a mismatch blocks recovery, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag plus the same source run ID/attempt pair. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
 
 ### Recover a partial npm publication
 

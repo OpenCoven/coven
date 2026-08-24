@@ -119,6 +119,19 @@ jobs:
           run-id: ${{ steps.source.outputs.source_run_id }}
           name: coven-windows
           path: github-release-source/coven-windows
+      - name: Reconfirm source run attempt after artifact download
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          SOURCE_RUN_ID: ${{ steps.source.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source_run_attempt }}
+        run: |
+          set -euo pipefail
+          node scripts/package-github-release.mjs verify-source-run-attempt \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT"
       - name: Package deterministic GitHub release assets
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}

@@ -188,6 +188,22 @@ function baseTagObject() {
   };
 }
 
+function baseExistingRelease({
+  tagName = RELEASE_TAG,
+  title = `Coven ${RELEASE_TAG}`,
+  draft = false,
+  prerelease = false,
+  assets = []
+} = {}) {
+  return {
+    tag_name: tagName,
+    name: title,
+    draft,
+    prerelease,
+    assets
+  };
+}
+
 function trustedPublisherMetadata(overrides = {}) {
   const base = {
     name: 'GitHub Actions',
@@ -441,7 +457,7 @@ function fakeReleaseClient({ existingRelease = null, assetBytesByName = {}, reva
     },
     async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
       state.created.push({ releaseTag, title, notesFromTag, verifyTag });
-      state.release = { tagName: releaseTag, assets: [] };
+      state.release = baseExistingRelease({ tagName: releaseTag, title, assets: [] });
       return state.release;
     },
     async downloadAsset(asset, filePath) {
@@ -514,6 +530,10 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   assert.match(
     workflowText,
     /--audit-dir github-release-npm-audit/
+  );
+  assert.match(
+    workflowText,
+    /actions\/download-artifact@[\s\S]*actions\/download-artifact@[\s\S]*actions\/download-artifact@[\s\S]*actions\/download-artifact@[\s\S]*node scripts\/package-github-release\.mjs verify-source-run-attempt[\s\S]*--source-run-id "\$SOURCE_RUN_ID"[\s\S]*--source-run-attempt "\$SOURCE_RUN_ATTEMPT"[\s\S]*node scripts\/package-github-release\.mjs package/
   );
   assert.match(workflowText, /node scripts\/package-github-release\.mjs package/);
   assert.match(
@@ -829,6 +849,34 @@ test('resolveReleaseSource rejects rerun ambiguity before any artifact download 
     `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`,
     `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}/attempts/${selectedAttempt}`
   ]);
+});
+
+test('verifyLatestSourceRunAttempt rejects a rerun that starts after artifact downloads and before packaging', async () => {
+  const { verifyLatestSourceRunAttempt } = await import('./package-github-release.mjs');
+  assert.equal(typeof verifyLatestSourceRunAttempt, 'function');
+
+  const requestedRepository = 'OpenCoven/coven';
+  const selectedAttempt = 1;
+  const latestAttempt = 2;
+  const calls = [];
+  await assert.rejects(
+    () =>
+      verifyLatestSourceRunAttempt({
+        repository: requestedRepository,
+        releaseTag: RELEASE_TAG,
+        sourceRunId: SOURCE_RUN_ID,
+        sourceRunAttempt: String(selectedAttempt),
+        ghApi: async (endpoint) => {
+          calls.push(endpoint);
+          if (endpoint === `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`) {
+            return { ...baseValidSourceRun(), run_attempt: latestAttempt };
+          }
+          throw new Error(`unexpected endpoint ${endpoint}`);
+        }
+      }),
+    /latest run attempt 2 does not match selected attempt 1[\s\S]*run-id only/i
+  );
+  assert.deepEqual(calls, [`/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`]);
 });
 
 test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-version audit context and invokes real npm audit signatures', () => {
@@ -1502,6 +1550,11 @@ test('syncGitHubRelease revalidates the verified remote tag before creating a mi
         releaseTag: RELEASE_TAG,
         expectedTagObjectSha: baseTagRef().object.sha,
         expectedHeadSha: HEAD_SHA
+      },
+      {
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha: baseTagRef().object.sha,
+        expectedHeadSha: HEAD_SHA
       }
     ]);
     assert.deepEqual(client.state.created, [
@@ -1589,10 +1642,9 @@ test('syncGitHubRelease skips a fully matching rerun, including >1 MiB assets, w
     assert.ok(readFileSync(path.join(outputDir, windowsArchiveName)).length > 1024 * 1024);
 
     const matchingClient = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: EXPECTED_ASSET_NAMES.map((name, index) => ({ id: index + 1, name }))
-      },
+      }),
       assetBytesByName: Object.fromEntries(
         EXPECTED_ASSET_NAMES.map((assetName) => [assetName, readFileSync(path.join(outputDir, assetName))])
       )
@@ -1623,25 +1675,25 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
 
     const checksumBytes = readFileSync(path.join(outputDir, 'SHA256SUMS'));
     const matchingClient = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: [{ id: 1, name: 'SHA256SUMS' }]
-      },
+      }),
       assetBytesByName: { SHA256SUMS: checksumBytes }
     });
     const matchingResult = await syncGitHubRelease({
       releaseTag: RELEASE_TAG,
       outputDir,
+      expectedTagObjectSha: baseTagRef().object.sha,
+      expectedHeadSha: HEAD_SHA,
       releaseClient: matchingClient
     });
     assert.deepEqual(matchingResult.skipped, ['SHA256SUMS']);
     assert.equal(matchingClient.state.uploads.length, EXPECTED_ASSET_NAMES.length - 1);
 
     const mismatchedClient = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: [{ id: 1, name: 'SHA256SUMS' }]
-      },
+      }),
       assetBytesByName: { SHA256SUMS: Buffer.from('wrong checksums\n') }
     });
     await assert.rejects(
@@ -1656,10 +1708,9 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
     assert.equal(mismatchedClient.state.uploads.length, 0);
 
     const extraClient = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: [{ id: 1, name: 'unexpected.txt' }]
-      }
+      })
     });
     await assert.rejects(
       () =>
@@ -1670,15 +1721,13 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
         }),
       /unexpected release assets/
     );
-
     const duplicateClient = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: [
           { id: 1, name: 'SHA256SUMS' },
           { id: 2, name: 'SHA256SUMS' }
         ]
-      },
+      }),
       assetBytesByName: { SHA256SUMS: checksumBytes }
     });
     await assert.rejects(
@@ -1693,6 +1742,178 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
   });
 });
 
+test('syncGitHubRelease revalidates the verified remote tag before uploading missing assets to an existing release', async () => {
+  await withScratchDir('sync-existing-release-revalidate', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const client = fakeReleaseClient({
+      existingRelease: baseExistingRelease({
+        assets: [{ id: 1, name: 'SHA256SUMS' }]
+      }),
+      assetBytesByName: {
+        SHA256SUMS: readFileSync(path.join(outputDir, 'SHA256SUMS'))
+      }
+    });
+    const result = await syncGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      outputDir,
+      expectedTagObjectSha: baseTagRef().object.sha,
+      expectedHeadSha: HEAD_SHA,
+      releaseClient: client
+    });
+
+    assert.deepEqual(client.state.revalidated, [
+      {
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha: baseTagRef().object.sha,
+        expectedHeadSha: HEAD_SHA
+      }
+    ]);
+    assert.deepEqual(result.skipped, ['SHA256SUMS']);
+    assert.equal(result.uploaded.length, EXPECTED_ASSET_NAMES.length - 1);
+  });
+});
+
+test('syncGitHubRelease refuses to upload missing assets to an existing release when the verified remote tag was deleted or replaced', async () => {
+  await withScratchDir('sync-existing-release-race', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const cases = [
+      {
+        name: 'deleted',
+        error: /no longer resolves to refs\/tags\/v0\.4\.1/i,
+        revalidateTagState() {
+          throw new Error(
+            `Refusing GitHub release: ${RELEASE_TAG} no longer resolves to refs/tags/${RELEASE_TAG}.`
+          );
+        }
+      },
+      {
+        name: 'replaced',
+        error: /tag object SHA/i,
+        revalidateTagState() {
+          throw new Error(
+            `Refusing GitHub release: ${RELEASE_TAG} tag object SHA changed from ${baseTagRef().object.sha} to ${'2'.repeat(40)}.`
+          );
+        }
+      }
+    ];
+
+    for (const { name, error, revalidateTagState } of cases) {
+      const client = fakeReleaseClient({
+        existingRelease: baseExistingRelease({
+          assets: [{ id: 1, name: 'SHA256SUMS' }]
+        }),
+        assetBytesByName: {
+          SHA256SUMS: readFileSync(path.join(outputDir, 'SHA256SUMS'))
+        },
+        revalidateTagState
+      });
+      await assert.rejects(
+        () =>
+          syncGitHubRelease({
+            releaseTag: RELEASE_TAG,
+            outputDir,
+            expectedTagObjectSha: baseTagRef().object.sha,
+            expectedHeadSha: HEAD_SHA,
+            releaseClient: client
+          }),
+        error,
+        name
+      );
+      assert.equal(client.state.uploads.length, 0, `${name} must not upload release assets`);
+    }
+  });
+});
+
+test('syncGitHubRelease rejects existing release metadata mismatches before accepting or uploading assets', async () => {
+  await withScratchDir('sync-existing-release-metadata', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const matchingAssetBytesByName = Object.fromEntries(
+      EXPECTED_ASSET_NAMES.map((assetName) => [assetName, readFileSync(path.join(outputDir, assetName))])
+    );
+    const allAssets = EXPECTED_ASSET_NAMES.map((assetName, index) => ({ id: index + 1, name: assetName }));
+    const cases = [
+      {
+        name: 'wrong tag',
+        release: baseExistingRelease({
+          tagName: 'v0.4.2',
+          assets: allAssets
+        }),
+        error: /existing release tag/i
+      },
+      {
+        name: 'wrong title',
+        release: baseExistingRelease({
+          title: 'Wrong title',
+          assets: allAssets
+        }),
+        error: /title .*Coven v0\.4\.1/i
+      },
+      {
+        name: 'draft release',
+        release: baseExistingRelease({
+          draft: true,
+          assets: allAssets
+        }),
+        error: /must not be a draft/i
+      },
+      {
+        name: 'prerelease',
+        release: baseExistingRelease({
+          prerelease: true,
+          assets: allAssets
+        }),
+        error: /must not be a prerelease/i
+      }
+    ];
+
+    for (const { name, release, error } of cases) {
+      const client = fakeReleaseClient({
+        existingRelease: release,
+        assetBytesByName: matchingAssetBytesByName
+      });
+      await assert.rejects(
+        () =>
+          syncGitHubRelease({
+            releaseTag: RELEASE_TAG,
+            outputDir,
+            releaseClient: client
+          }),
+        error,
+        name
+      );
+      assert.equal(client.state.downloads.length, 0, `${name} must fail before accepting assets`);
+      assert.equal(client.state.uploads.length, 0, `${name} must fail before uploading assets`);
+    }
+  });
+});
+
 test('syncGitHubRelease preflights later mismatches before uploading earlier missing assets', async () => {
   await withScratchDir('sync-preflight-mismatch', async (scratchDir) => {
     const artifactsDir = path.join(scratchDir, 'artifacts');
@@ -1704,13 +1925,11 @@ test('syncGitHubRelease preflights later mismatches before uploading earlier mis
       outputDir,
       sourceDateEpoch: SOURCE_DATE_EPOCH
     });
-
     const windowsAssetName = 'coven-v0.4.1-windows-x64.zip';
     const client = fakeReleaseClient({
-      existingRelease: {
-        tagName: RELEASE_TAG,
+      existingRelease: baseExistingRelease({
         assets: [{ id: 1, name: windowsAssetName }]
-      },
+      }),
       assetBytesByName: {
         [windowsAssetName]: Buffer.from('wrong windows bytes\n')
       }
