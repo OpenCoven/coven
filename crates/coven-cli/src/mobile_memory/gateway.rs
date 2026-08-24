@@ -1184,10 +1184,22 @@ mod tests {
                 return None;
             }
             let probe = TcpListener::bind(SocketAddr::new(ip, 0)).ok()?;
+            probe.set_nonblocking(true).ok()?;
             let address = probe.local_addr().ok()?;
-            TcpStream::connect_timeout(&address, Duration::from_millis(200))
-                .ok()
-                .map(|_| ip)
+            let _client = TcpStream::connect_timeout(&address, Duration::from_millis(200)).ok()?;
+            let deadline = std::time::Instant::now() + Duration::from_millis(200);
+            loop {
+                match probe.accept() {
+                    Ok(_) => return Some(ip),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            return None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return None,
+                }
+            }
         })?;
         let reserved = TcpListener::bind(SocketAddr::new(ip, 0)).ok()?;
         let port = reserved.local_addr().ok()?.port();
