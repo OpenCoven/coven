@@ -66,6 +66,10 @@ RESERVED_EXAMPLE_URL = re.compile(
     r"(?:example\.(?:com|net|org)|[A-Za-z0-9-]+\.(?:example|invalid|localhost|test))"
     r"(?::[0-9]{1,5})?(?:/[^\s\"'<>]*)?"
 )
+# The TypeScript and JavaScript accessors below only vary in how the
+# environment variable *name* is spelled, so none of them can carry a literal
+# secret value. Bare `env.NAME` is deliberately excluded: `env` is an ordinary
+# identifier that any object can bind.
 ENV_SECRET_READ = re.compile(
     r'''(?ix)\b(?:api[_-]?key|secret|token|password|private[_-]?key)\b\s*[:=]\s*
     (?:
@@ -76,7 +80,14 @@ ENV_SECRET_READ = re.compile(
         \)
         |std::env::var\(\s*["'][A-Z0-9_]+["']\s*\)
         |env::var\(\s*["'][A-Z0-9_]+["']\s*\)
-        |process\.env\.[A-Z0-9_]+(?:\.trim\(\)|\?\.trim\(\)|!)?
+        |(?:process\.env|Bun\.env|import\.meta\.env)
+            (?:
+                (?:\.|\?\.)[A-Z0-9_]+
+                |(?:\?\.)?\[\s*["'][A-Z0-9_]+["']\s*\]
+            )
+            (?:\.trim\(\)|\?\.trim\(\)|!)?
+        |Deno\.env\.get\(\s*["'][A-Z0-9_]+["']\s*\)
+            (?:\.trim\(\)|\?\.trim\(\)|!)?
     )'''
 )
 ENV_SECRET_REFERENCE = re.compile(

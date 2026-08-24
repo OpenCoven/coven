@@ -990,6 +990,70 @@ class SecretGuardExceptionScopeTests(unittest.TestCase):
 
                 self.assertEqual(hits, [])
 
+    def test_typescript_environment_reads_are_safe(self) -> None:
+        cases = [
+            'const token = process.env["REALLY_LONG_SECRET_NAME"];',
+            "const token = process.env['REALLY_LONG_SECRET_NAME'];",
+            "const token = process.env?.REALLY_LONG_SECRET_NAME;",
+            'const token = process.env?.["REALLY_LONG_SECRET_NAME"];',
+            'const token = process.env["REALLY_LONG_SECRET_NAME"]!;',
+            'const token = process.env["REALLY_LONG_SECRET_NAME"].trim();',
+            'const token = process.env["REALLY_LONG_SECRET_NAME"]?.trim();',
+            'const token = process.env["GITHUB_ACCESS_TOKEN"] ?? "";',
+            'const token = process.env["GITHUB_ACCESS_TOKEN"] || "";',
+            'const apiKey = process.env["OPENAI_API_KEY"] as string;',
+            'const secret = Deno.env.get("REALLY_LONG_SECRET_NAME");',
+            'const secret = Deno.env.get("REALLY_LONG_SECRET_NAME")?.trim();',
+            'const secret = Deno.env.get("REALLY_LONG_SECRET_NAME") ?? "";',
+            "const token = Bun.env.REALLY_LONG_SECRET_NAME;",
+            'const token = Bun.env["REALLY_LONG_SECRET_NAME"];',
+            "const apiKey = import.meta.env.VITE_REALLY_LONG_KEY;",
+            'const apiKey = import.meta.env["VITE_REALLY_LONG_KEY"];',
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(
+                    text, "packages/channels/src/config.ts"
+                )
+
+                self.assertEqual(hits, [])
+
+    def test_typescript_environment_reads_reject_literal_payloads(self) -> None:
+        cases = [
+            'const token = process.env["TOKEN"] + "hunter2hunter2hunter2";',
+            'const token = process.env["TOKEN"] ?? "hunter2hunter2hunter2";',
+            'const token = process.env["TOKEN"] || "hunter2hunter2hunter2";',
+            'const token = process.env?.TOKEN ?? "hunter2hunter2hunter2";',
+            'const token = Deno.env.get("TOKEN") ?? "hunter2hunter2hunter2";',
+            'const token = Bun.env.TOKEN ?? "hunter2hunter2hunter2";',
+            (
+                "const apiKey = import.meta.env.VITE_KEY ?? "
+                '"hunter2hunter2hunter2";'
+            ),
+        ]
+
+        for text in cases:
+            with self.subTest(text=text):
+                hits = check_secrets.scan_text(
+                    text, "packages/channels/src/config.ts"
+                )
+
+                self.assertEqual(
+                    hits,
+                    [("packages/channels/src/config.ts", 1, "generic_assignment")],
+                )
+
+    def test_bare_env_object_read_is_not_treated_as_runtime_binding(self) -> None:
+        text = "const token = env.REALLY_LONG_SECRET_NAME;"
+
+        hits = check_secrets.scan_text(text, "packages/channels/src/config.ts")
+
+        self.assertEqual(
+            hits,
+            [("packages/channels/src/config.ts", 1, "generic_assignment")],
+        )
+
     def test_environment_reference_with_appended_value_is_not_safe(self) -> None:
         text = "api_key=${API_KEY}hunter2hunter2hunter2"
 
