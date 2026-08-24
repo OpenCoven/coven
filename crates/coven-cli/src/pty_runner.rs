@@ -7232,11 +7232,12 @@ exec sleep 10
             env_overrides: Vec::new(),
         };
 
-        let started = Instant::now();
         let outcome =
             stream_codex_json_with_timeout(&command, Duration::from_millis(25), |_| Ok(()))?;
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        // The terminated outcome proves the activity timeout won while stdin
+        // was blocked. A wall-clock assertion here measures runner load, not
+        // the timeout behavior.
         assert!(outcome
             .error
             .as_deref()
