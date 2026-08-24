@@ -564,8 +564,7 @@ pub fn build_pairing_url(
     endpoint: &str,
     host_fingerprint: [u8; 32],
 ) -> Result<String, PairingError> {
-    let endpoint =
-        validate_pairing_endpoint(endpoint)?;
+    let endpoint = validate_pairing_endpoint(endpoint)?;
     let offer = PairingOfferV2 {
         host_fingerprint,
         pairing_id: invitation.id,
@@ -819,10 +818,7 @@ mod tests {
         let mut harness = PairingHarness::new();
         harness.request.protocol_version = 3;
         harness.request.supported_protocol.maximum = 3;
-        assert_eq!(
-            harness.enroll().unwrap_err(),
-            PairingError::InvalidRequest
-        );
+        assert_eq!(harness.enroll().unwrap_err(), PairingError::InvalidRequest);
         assert!(harness.devices().is_empty());
     }
 
@@ -967,13 +963,7 @@ mod tests {
             )
             .unwrap();
         let enrolled = manager
-            .enroll(
-                pairing_id,
-                pairing_nonce,
-                request,
-                [3; 32],
-                expired_now,
-            )
+            .enroll(pairing_id, pairing_nonce, request, [3; 32], expired_now)
             .unwrap();
         assert_eq!(
             manager
@@ -1129,11 +1119,9 @@ mod tests {
             "../../tests/fixtures/mobile-pairing-v2/transcript-vector.json"
         ))
         .unwrap();
-        let host_fingerprint: [u8; 32] = decode_hex(
-            vector["hostFingerprintHex"].as_str().unwrap(),
-        )
-        .try_into()
-        .unwrap();
+        let host_fingerprint: [u8; 32] = decode_hex(vector["hostFingerprintHex"].as_str().unwrap())
+            .try_into()
+            .unwrap();
         let nonce: [u8; 32] = decode_hex(vector["pairingNonceHex"].as_str().unwrap())
             .try_into()
             .unwrap();
@@ -1148,20 +1136,17 @@ mod tests {
             encode_hex(&offer.hash()),
             vector["offerDigestHex"].as_str().unwrap()
         );
-        assert_eq!(vector["requestedScopes"], serde_json::json!(["memory_read"]));
+        assert_eq!(
+            vector["requestedScopes"],
+            serde_json::json!(["memory_read"])
+        );
 
         let transcript = PairingTranscript::V2 {
             offer_digest: offer.hash(),
             protocol_version: vector["pairingProtocolVersion"].as_u64().unwrap() as u16,
-            supported_minimum: vector["minimumPairingProtocolVersion"]
-                .as_u64()
-                .unwrap() as u16,
-            supported_maximum: vector["maximumPairingProtocolVersion"]
-                .as_u64()
-                .unwrap() as u16,
-            device_public_key: decode_hex(
-                vector["devicePublicKeyX963Hex"].as_str().unwrap(),
-            ),
+            supported_minimum: vector["minimumPairingProtocolVersion"].as_u64().unwrap() as u16,
+            supported_maximum: vector["maximumPairingProtocolVersion"].as_u64().unwrap() as u16,
+            device_public_key: decode_hex(vector["devicePublicKeyX963Hex"].as_str().unwrap()),
             device_name: vector["deviceName"].as_str().unwrap().to_owned(),
             app_version: vector["appVersion"].as_str().unwrap().to_owned(),
         };
