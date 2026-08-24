@@ -595,6 +595,7 @@ fn validate_pairing_endpoint(endpoint: &str) -> Result<Url, PairingError> {
         || endpoint.host_str().is_none()
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
+        || endpoint.path() != "/"
         || endpoint.query().is_some()
         || endpoint.fragment().is_some()
     {
@@ -1208,6 +1209,7 @@ mod tests {
         for endpoint in [
             "http://192.0.2.1:7443",
             "https://user@192.0.2.1:7443",
+            "https://192.0.2.1:7443/path",
             "https://192.0.2.1:7443?other=value",
             "https://192.0.2.1:7443#fragment",
         ] {
