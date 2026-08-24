@@ -1,9 +1,9 @@
 ---
 summary: "Release flow for @opencoven/cli and platform packages."
-description: "Operator runbook for releasing Coven to npm: one-time OIDC setup, signed-tag release, automated publish with provenance, and how to recover from a refused or failed release."
+description: "Operator runbook for releasing Coven to npm and GitHub Releases: OIDC setup, signed-tag publication, deterministic assets, provenance checks, and recovery."
 read_when:
   - Cutting a release
-title: "Releasing Coven to npm"
+title: "Releasing Coven to npm and GitHub Releases"
 ---
 
 Coven publishes the `@opencoven/cli` wrapper and its four native platform packages (`@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`) automatically from the **Release npm packages** GitHub Actions workflow.
@@ -116,7 +116,9 @@ npm view @opencoven/cli-windows version dist-tags
 
 All five should now show the tag's version as `latest`. The package pages on npmjs.com should display a **"Provenance"** badge with a link back to the GitHub Actions run.
 
-Create or update the matching GitHub Release from the successful workflow artifacts. Package the downloaded binaries with the same public asset names as prior releases:
+After the npm workflow succeeds, **Publish GitHub Release** (`.github/workflows/release-github.yml`) runs automatically from the default-branch workflow code. It refuses to touch GitHub Releases until it re-verifies the successful source npm workflow run through the GitHub API, confirms the signed annotated tag still resolves to that exact commit on `origin/main`, and proves all five npm packages have trusted-publisher / SLSA provenance tied to `https://github.com/OpenCoven/coven`, `.github/workflows/release-npm.yml`, `refs/tags/vX.Y.Z`, the tagged commit, and the source workflow run attempt. Only then does it download the four retained build artifacts, package deterministic archives, and reconcile the matching GitHub Release.
+
+The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using the signed tag annotation notes, with exactly these assets:
 
 - `coven-vX.Y.Z-macos-aarch64.tar.gz`
 - `coven-vX.Y.Z-macos-x64.tar.gz`
@@ -124,7 +126,23 @@ Create or update the matching GitHub Release from the successful workflow artifa
 - `coven-vX.Y.Z-windows-x64.zip`
 - `SHA256SUMS`
 
-The release body should include the npm install command, published package list, action run URL, tagged commit, and compare link. This GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
+`SHA256SUMS` contains exactly four lexically ordered entries naming only those four archive filenames. The GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
+
+### Recover GitHub Release assets without touching npm
+
+If the automatic GitHub-only workflow fails after the npm publication succeeded, rerun **Publish GitHub Release** with **Run workflow** / `workflow_dispatch` from the default branch and provide:
+
+- `release_tag`: the immutable signed tag (`vX.Y.Z`)
+- `source_run_id`: the successful **Release npm packages** run ID for that tag
+
+The recovery path is deliberately narrow:
+
+- A missing GitHub Release may be created.
+- A missing canonical asset may be uploaded.
+- A canonical asset that already exists is downloaded and hash-checked first; it is skipped only on an exact byte match.
+- Any mismatched canonical asset or any extra/renamed asset fails closed. The workflow never overwrites GitHub assets automatically, never moves or reuses the tag, and never republishes npm.
+
+When a mismatch blocks recovery, record **the observed hash, the expected hash, and the reason** in the release log or incident notes. Then delete **only** the mismatched GitHub asset through an audited operator action (for example the GitHub UI or `gh release delete-asset ...`), and rerun the GitHub-only workflow with the same immutable tag and source run ID. Do not delete matching assets, do not retag, and do not rerun the npm publish workflow for the same version.
 
 ### Recover a partial npm publication
 
