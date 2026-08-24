@@ -50,6 +50,43 @@ const EXPECTED_ARCHIVES = [
 ].sort();
 const EXPECTED_ASSET_NAMES = [...EXPECTED_ARCHIVES, 'SHA256SUMS'].sort();
 
+function releasePackageVersionMap(version = NPM_VERSION) {
+  return Object.fromEntries(RELEASE_PACKAGES.map((packageName) => [packageName, version]));
+}
+
+function writeSignatureAuditLockfile(
+  auditDir,
+  { resolvedPackages = RELEASE_PACKAGES, versionOverrides = {} } = {}
+) {
+  const packageEntries = Object.fromEntries(
+    resolvedPackages.map((packageName) => [
+      `node_modules/${packageName}`,
+      {
+        version: versionOverrides[packageName] ?? NPM_VERSION,
+        resolved: `https://registry.npmjs.org/${encodeURIComponent(packageName)}/-/${packageName.split('/').at(-1)}-${versionOverrides[packageName] ?? NPM_VERSION}.tgz`,
+        integrity: `sha512-${Buffer.from(packageName).toString('base64')}`
+      }
+    ])
+  );
+  writeFileSync(
+    path.join(auditDir, 'package-lock.json'),
+    `${JSON.stringify({
+      name: 'opencoven-release-npm-signatures-audit',
+      version: '0.0.0',
+      lockfileVersion: 3,
+      requires: true,
+      packages: {
+        '': {
+          name: 'opencoven-release-npm-signatures-audit',
+          version: '0.0.0',
+          dependencies: releasePackageVersionMap()
+        },
+        ...packageEntries
+      }
+    }, null, 2)}\n`
+  );
+}
+
 function withScratchDir(name, fn) {
   const dir = path.join(scratchRoot, `${name}-${randomUUID()}`);
   mkdirSync(dir, { recursive: true });
@@ -664,6 +701,9 @@ test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-versio
       auditDir,
       commandRunner(command, args, options = {}) {
         calls.push({ command, args, cwd: options.cwd });
+        if (args[0] === 'install') {
+          writeSignatureAuditLockfile(auditDir);
+        }
       }
     });
 
@@ -676,15 +716,18 @@ test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-versio
         name: 'opencoven-release-npm-signatures-audit',
         private: true,
         version: '0.0.0',
-        optionalDependencies: Object.fromEntries(
-          RELEASE_PACKAGES.map((packageName) => [packageName, NPM_VERSION])
-        )
+        dependencies: releasePackageVersionMap()
       }
     );
     assert.deepEqual(calls, [
       {
         command: 'npm',
-        args: ['install', '--ignore-scripts', '--audit=false', '--fund=false'],
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+        cwd: path.resolve(auditDir)
+      },
+      {
+        command: 'npm',
+        args: ['install', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
         cwd: path.resolve(auditDir)
       },
       {
@@ -713,7 +756,71 @@ test('verifyNpmRegistrySignatures fails closed before auditing when package-lock
       /npm install failed/
     );
     assert.deepEqual(calls, [
-      'npm install --ignore-scripts --audit=false --fund=false'
+      'npm install --package-lock-only --ignore-scripts --force --no-audit --no-fund'
+    ]);
+  });
+});
+
+test('verifyNpmRegistrySignatures fails closed when a native package is absent from package-lock.json', () => {
+  withScratchDir('npm-signatures-audit-missing-native', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    const missingPackage = '@opencoven/cli-windows';
+    assert.throws(
+      () =>
+        verifyNpmRegistrySignatures({
+          npmVersion: NPM_VERSION,
+          auditDir,
+          commandRunner(command, args, options = {}) {
+            calls.push({ command, args, cwd: options.cwd });
+            if (args[0] === 'install') {
+              writeSignatureAuditLockfile(auditDir, {
+                resolvedPackages: RELEASE_PACKAGES.filter((packageName) => packageName !== missingPackage)
+              });
+            }
+          }
+        }),
+      new RegExp(`package-lock\\.json.*${missingPackage}`)
+    );
+    assert.deepEqual(calls, [
+      {
+        command: 'npm',
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+        cwd: path.resolve(auditDir)
+      }
+    ]);
+  });
+});
+
+test('verifyNpmRegistrySignatures rejects wrong-version package-lock entries before auditing', () => {
+  withScratchDir('npm-signatures-audit-wrong-version', (scratchDir) => {
+    const auditDir = path.join(scratchDir, 'audit');
+    const calls = [];
+    const wrongPackage = '@opencoven/cli-macos';
+    assert.throws(
+      () =>
+        verifyNpmRegistrySignatures({
+          npmVersion: NPM_VERSION,
+          auditDir,
+          commandRunner(command, args, options = {}) {
+            calls.push({ command, args, cwd: options.cwd });
+            if (args[0] === 'install') {
+              writeSignatureAuditLockfile(auditDir, {
+                versionOverrides: {
+                  [wrongPackage]: '9.9.9'
+                }
+              });
+            }
+          }
+        }),
+      new RegExp(`${wrongPackage}.*0\\.4\\.1`)
+    );
+    assert.deepEqual(calls, [
+      {
+        command: 'npm',
+        args: ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+        cwd: path.resolve(auditDir)
+      }
     ]);
   });
 });

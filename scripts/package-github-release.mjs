@@ -619,14 +619,23 @@ export function verifyNpmRegistrySignatures({
       name: 'opencoven-release-npm-signatures-audit',
       private: true,
       version: '0.0.0',
-      optionalDependencies: Object.fromEntries(
+      dependencies: Object.fromEntries(
         RELEASE_PACKAGES.map((packageName) => [packageName, normalizedVersion])
       )
     }, null, 2)}\n`
   );
   commandRunner(
     'npm',
-    ['install', '--ignore-scripts', '--audit=false', '--fund=false'],
+    ['install', '--package-lock-only', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
+    { cwd: normalizedAuditDir }
+  );
+  const packageLockEntries = assertReleasePackagesResolvedInLockfile({
+    auditDir: normalizedAuditDir,
+    npmVersion: normalizedVersion
+  });
+  commandRunner(
+    'npm',
+    ['install', '--ignore-scripts', '--force', '--no-audit', '--no-fund'],
     { cwd: normalizedAuditDir }
   );
   commandRunner('npm', ['audit', 'signatures'], {
@@ -635,8 +644,60 @@ export function verifyNpmRegistrySignatures({
   return {
     auditDir: normalizedAuditDir,
     packageNames: [...RELEASE_PACKAGES],
-    npmVersion: normalizedVersion
+    npmVersion: normalizedVersion,
+    packageLockEntries
   };
+}
+
+function assertReleasePackagesResolvedInLockfile({ auditDir, npmVersion }) {
+  const packageLockPath = path.join(auditDir, 'package-lock.json');
+  let packageLock;
+  try {
+    packageLock = JSON.parse(readFileSync(packageLockPath, 'utf8'));
+  } catch (error) {
+    throw new Error(
+      `Refusing GitHub release: failed to read ${packageLockPath}: ${error?.message ?? String(error)}`
+    );
+  }
+  const rootEntry = packageLock?.packages?.[''];
+  const rootDependencies = rootEntry?.dependencies;
+  if (!rootDependencies || typeof rootDependencies !== 'object' || Array.isArray(rootDependencies)) {
+    throw new Error(
+      `Refusing GitHub release: package-lock.json must record the exact five @opencoven dependencies in packages[""].dependencies.`
+    );
+  }
+
+  const entries = {};
+  for (const packageName of RELEASE_PACKAGES) {
+    const declaredVersion = rootDependencies[packageName];
+    if (declaredVersion !== npmVersion) {
+      throw new Error(
+        `Refusing GitHub release: package-lock.json must declare ${packageName}@${npmVersion} in packages[""].dependencies, got ${JSON.stringify(declaredVersion)}.`
+      );
+    }
+    const packagePath = `node_modules/${packageName}`;
+    const packageEntry = packageLock?.packages?.[packagePath];
+    if (!packageEntry || typeof packageEntry !== 'object' || Array.isArray(packageEntry)) {
+      throw new Error(
+        `Refusing GitHub release: package-lock.json is missing resolved entry ${packagePath} for ${packageName}@${npmVersion}.`
+      );
+    }
+    if (packageEntry.version !== npmVersion) {
+      throw new Error(
+        `Refusing GitHub release: package-lock.json resolved ${packageName}@${packageEntry.version ?? '<missing>'}; expected ${npmVersion}.`
+      );
+    }
+    if (typeof packageEntry.resolved !== 'string' || packageEntry.resolved.trim() === '') {
+      throw new Error(
+        `Refusing GitHub release: package-lock.json entry ${packagePath} for ${packageName}@${npmVersion} is missing a resolved tarball URL.`
+      );
+    }
+    entries[packageName] = {
+      version: packageEntry.version,
+      resolved: packageEntry.resolved
+    };
+  }
+  return entries;
 }
 
 export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sourceDateEpoch }) {
