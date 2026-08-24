@@ -819,7 +819,12 @@ mod tests {
         let mut harness = PairingHarness::new();
         harness.request.protocol_version = 3;
         harness.request.supported_protocol.maximum = 3;
-        assert_eq!(harness.enroll().unwrap_err(), PairingError::InvalidRequest);
+        assert_eq!(
+            harness
+                .enroll_with_nonce(harness.pairing_nonce)
+                .unwrap_err(),
+            PairingError::InvalidRequest
+        );
         assert!(harness.devices().is_empty());
     }
 
