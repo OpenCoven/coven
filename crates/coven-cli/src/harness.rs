@@ -674,12 +674,12 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "claude".to_string(),
             label: "Claude Code".to_string(),
-            executable: "claude".to_string(),
+            executable: crate::setup::claude::EXECUTABLE.to_string(),
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
             non_interactive_prompt_prefix_args: vec!["--print".to_string()],
-            install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
+            install_hint: crate::setup::claude::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             system_prompt_flag: Some("--system-prompt".to_string()),
@@ -2726,7 +2726,8 @@ mod tests {
         assert!(claude
             .install_hint
             .contains("npm install -g @anthropic-ai/claude-code"));
-        assert!(claude.install_hint.contains("claude doctor"));
+        assert!(claude.install_hint.contains("claude auth login"));
+        assert!(!claude.install_hint.contains("claude doctor"));
         assert!(claude.install_hint.contains("claude"));
         assert!(claude.install_hint.contains("PATH"));
 
