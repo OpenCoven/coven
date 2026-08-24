@@ -16,6 +16,10 @@ on:
         description: Source Release npm packages workflow run ID
         required: true
         type: string
+      source_run_attempt:
+        description: Exact source Release npm packages workflow run attempt
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -56,12 +60,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.workflow_run.head_branch || inputs.release_tag }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id || inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt || inputs.source_run_attempt }}
         run: |
           set -euo pipefail
           node scripts/package-github-release.mjs verify-source-run \
             --repository "$GITHUB_REPOSITORY" \
             --release-tag "$RELEASE_TAG" \
-            --source-run-id "$SOURCE_RUN_ID" >> "$GITHUB_OUTPUT"
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
       - name: Verify npm provenance for every published package
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -128,9 +134,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
         run: |
           set -euo pipefail
           node scripts/package-github-release.mjs sync-release \
             --repository "$GITHUB_REPOSITORY" \
             --release-tag "$RELEASE_TAG" \
-            --output-dir github-release-assets
+            --output-dir github-release-assets \
+            --expected-tag-object-sha "$TAG_OBJECT_SHA" \
+            --expected-head-sha "$HEAD_SHA"

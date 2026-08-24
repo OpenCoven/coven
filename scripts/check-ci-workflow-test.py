@@ -68,12 +68,17 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("workflow_run:", RELEASE_GITHUB_TEXT)
         self.assertIn("Release npm packages", RELEASE_GITHUB_TEXT)
         self.assertIn("workflow_dispatch:", RELEASE_GITHUB_TEXT)
+        self.assertIn("source_run_attempt:", RELEASE_GITHUB_TEXT)
         self.assertIn("actions: read", RELEASE_GITHUB_TEXT)
         self.assertIn("contents: write", RELEASE_GITHUB_TEXT)
         self.assertNotIn("id-token: write", RELEASE_GITHUB_TEXT)
         self.assertIn("cancel-in-progress: false", RELEASE_GITHUB_TEXT)
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", RELEASE_GITHUB_TEXT)
         self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", RELEASE_GITHUB_TEXT)
+        self.assertIn("github.event.workflow_run.run_attempt || inputs.source_run_attempt", RELEASE_GITHUB_TEXT)
+        self.assertIn('--source-run-attempt "$SOURCE_RUN_ATTEMPT"', RELEASE_GITHUB_TEXT)
+        self.assertIn('--expected-tag-object-sha "$TAG_OBJECT_SHA"', RELEASE_GITHUB_TEXT)
+        self.assertIn('--expected-head-sha "$HEAD_SHA"', RELEASE_GITHUB_TEXT)
         self.assertNotIn("npm publish", RELEASE_GITHUB_TEXT)
 
     def test_release_includes_performance_baseline_dependency(self) -> None:

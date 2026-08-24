@@ -12,6 +12,7 @@ import {
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
   packageGitHubRelease,
+  resolveReleaseSource,
   syncGitHubRelease,
   verifyAnnotatedTag,
   verifyNpmRegistrySignatures,
@@ -418,10 +419,11 @@ function expectedZipTimestamp(epochSeconds) {
   };
 }
 
-function fakeReleaseClient({ existingRelease = null, assetBytesByName = {} } = {}) {
+function fakeReleaseClient({ existingRelease = null, assetBytesByName = {}, revalidateTagState = null } = {}) {
   const state = {
     release: existingRelease,
     created: [],
+    revalidated: [],
     downloads: [],
     uploads: []
   };
@@ -430,8 +432,15 @@ function fakeReleaseClient({ existingRelease = null, assetBytesByName = {} } = {
     async getReleaseByTag() {
       return state.release;
     },
-    async createRelease({ releaseTag, title, notesFromTag }) {
-      state.created.push({ releaseTag, title, notesFromTag });
+    async revalidateTag({ releaseTag, expectedTagObjectSha, expectedHeadSha }) {
+      state.revalidated.push({ releaseTag, expectedTagObjectSha, expectedHeadSha });
+      if (typeof revalidateTagState === 'function') {
+        return revalidateTagState({ releaseTag, expectedTagObjectSha, expectedHeadSha });
+      }
+      return revalidateTagState;
+    },
+    async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
+      state.created.push({ releaseTag, title, notesFromTag, verifyTag });
       state.release = { tagName: releaseTag, assets: [] };
       return state.release;
     },
@@ -480,7 +489,7 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   );
   assert.match(
     workflowText,
-    /workflow_dispatch:[\s\S]*release_tag:[\s\S]*required: true[\s\S]*source_run_id:[\s\S]*required: true/
+    /workflow_dispatch:[\s\S]*release_tag:[\s\S]*required: true[\s\S]*source_run_id:[\s\S]*required: true[\s\S]*source_run_attempt:[\s\S]*required: true/
   );
   assert.match(
     workflowText,
@@ -488,7 +497,11 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   );
   assert.match(
     workflowText,
-    /node scripts\/package-github-release\.mjs verify-source-run/
+    /SOURCE_RUN_ATTEMPT: \$\{\{ github\.event\.workflow_run\.run_attempt \|\| inputs\.source_run_attempt \}\}/
+  );
+  assert.match(
+    workflowText,
+    /node scripts\/package-github-release\.mjs verify-source-run[\s\S]*--source-run-attempt "\$SOURCE_RUN_ATTEMPT"/
   );
   assert.match(
     workflowText,
@@ -503,7 +516,10 @@ test('release-github workflow supports automatic and recovery triggers with pinn
     /--audit-dir github-release-npm-audit/
   );
   assert.match(workflowText, /node scripts\/package-github-release\.mjs package/);
-  assert.match(workflowText, /node scripts\/package-github-release\.mjs sync-release/);
+  assert.match(
+    workflowText,
+    /node scripts\/package-github-release\.mjs sync-release[\s\S]*--expected-tag-object-sha "\$TAG_OBJECT_SHA"[\s\S]*--expected-head-sha "\$HEAD_SHA"/
+  );
   assert.match(workflowText, new RegExp(`actions/checkout@${CHECKOUT_ACTION_SHA}`));
   assert.match(workflowText, new RegExp(`actions/setup-node@${SETUP_NODE_ACTION_SHA}`));
   assert.equal(
@@ -666,6 +682,7 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
       npmVersion: NPM_VERSION,
       sourceRunId: SOURCE_RUN_ID,
       sourceRunAttempt: SOURCE_RUN_ATTEMPT,
+      tagObjectSha: baseTagRef().object.sha,
       headSha: HEAD_SHA,
       sourceDateEpoch: SOURCE_DATE_EPOCH
     }
@@ -726,6 +743,92 @@ test('verifyReleaseSource requires the tagged commit to stay on origin/main and 
       }),
     /SOURCE_DATE_EPOCH/
   );
+});
+
+test('resolveReleaseSource uses the selected run attempt metadata and preserves the verified tag identity', async () => {
+  const selectedAttempt = 3;
+  const requestedRepository = 'OpenCoven/coven';
+  const calls = [];
+  const expectedResult = {
+    releaseTag: RELEASE_TAG,
+    npmVersion: NPM_VERSION,
+    sourceRunId: SOURCE_RUN_ID,
+    sourceRunAttempt: selectedAttempt,
+    tagObjectSha: baseTagRef().object.sha,
+    headSha: HEAD_SHA,
+    sourceDateEpoch: SOURCE_DATE_EPOCH
+  };
+  const result = await resolveReleaseSource({
+    repository: requestedRepository,
+    releaseTag: RELEASE_TAG,
+    sourceRunId: SOURCE_RUN_ID,
+    sourceRunAttempt: String(selectedAttempt),
+    ghApi: async (endpoint) => {
+      calls.push(endpoint);
+      if (endpoint === `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`) {
+        return { ...baseValidSourceRun(), run_attempt: selectedAttempt };
+      }
+      if (endpoint === `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}/attempts/${selectedAttempt}`) {
+        return { ...baseValidSourceRun(), run_attempt: selectedAttempt };
+      }
+      if (endpoint === `/repos/${requestedRepository}/git/ref/tags/${encodeURIComponent(RELEASE_TAG)}`) {
+        return baseTagRef();
+      }
+      if (endpoint === `/repos/${requestedRepository}/git/tags/${baseTagRef().object.sha}`) {
+        return baseTagObject();
+      }
+      throw new Error(`unexpected endpoint ${endpoint}`);
+    },
+    git: {
+      verifyLocalTagState(releaseTag) {
+        assert.equal(releaseTag, RELEASE_TAG);
+        return {
+          localTagObjectSha: baseTagRef().object.sha,
+          localHeadSha: HEAD_SHA,
+          commitContainedInMain: true,
+          sourceDateEpoch: SOURCE_DATE_EPOCH
+        };
+      }
+    }
+  });
+  assert.deepEqual(result, expectedResult);
+  assert.deepEqual(calls, [
+    `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`,
+    `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}/attempts/${selectedAttempt}`,
+    `/repos/${requestedRepository}/git/ref/tags/${encodeURIComponent(RELEASE_TAG)}`,
+    `/repos/${requestedRepository}/git/tags/${baseTagRef().object.sha}`
+  ]);
+});
+
+test('resolveReleaseSource rejects rerun ambiguity before any artifact download can rely on run-id only', async () => {
+  const requestedRepository = 'OpenCoven/coven';
+  const selectedAttempt = 1;
+  const latestAttempt = 2;
+  const calls = [];
+  await assert.rejects(
+    () =>
+      resolveReleaseSource({
+        repository: requestedRepository,
+        releaseTag: RELEASE_TAG,
+        sourceRunId: SOURCE_RUN_ID,
+        sourceRunAttempt: String(selectedAttempt),
+        ghApi: async (endpoint) => {
+          calls.push(endpoint);
+          if (endpoint === `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`) {
+            return { ...baseValidSourceRun(), run_attempt: latestAttempt };
+          }
+          if (endpoint === `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}/attempts/${selectedAttempt}`) {
+            return { ...baseValidSourceRun(), run_attempt: selectedAttempt };
+          }
+          throw new Error(`unexpected endpoint ${endpoint}`);
+        }
+      }),
+    /latest run attempt 2 does not match selected attempt 1[\s\S]*run-id only/i
+  );
+  assert.deepEqual(calls, [
+    `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}`,
+    `/repos/${requestedRepository}/actions/runs/${SOURCE_RUN_ID}/attempts/${selectedAttempt}`
+  ]);
 });
 
 test('verifyNpmRegistrySignatures writes an isolated cross-platform exact-version audit context and invokes real npm audit signatures', () => {
@@ -1373,7 +1476,7 @@ test('captureCommandOutputToFile writes stdout larger than spawnSync maxBuffer d
   });
 });
 
-test('syncGitHubRelease creates a missing release and uploads every canonical asset with tag notes', async () => {
+test('syncGitHubRelease revalidates the verified remote tag before creating a missing release', async () => {
   await withScratchDir('sync-create', async (scratchDir) => {
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
@@ -1389,14 +1492,76 @@ test('syncGitHubRelease creates a missing release and uploads every canonical as
     const result = await syncGitHubRelease({
       releaseTag: RELEASE_TAG,
       outputDir,
+      expectedTagObjectSha: baseTagRef().object.sha,
+      expectedHeadSha: HEAD_SHA,
       releaseClient: client
     });
 
+    assert.deepEqual(client.state.revalidated, [
+      {
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha: baseTagRef().object.sha,
+        expectedHeadSha: HEAD_SHA
+      }
+    ]);
     assert.deepEqual(client.state.created, [
-      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.1', notesFromTag: true }
+      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.1', notesFromTag: true, verifyTag: true }
     ]);
     assert.deepEqual(result.uploaded.sort(), EXPECTED_ASSET_NAMES);
     assert.deepEqual(result.skipped, []);
+  });
+});
+
+test('syncGitHubRelease refuses release creation when the verified remote tag was deleted or replaced', async () => {
+  await withScratchDir('sync-create-race', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const cases = [
+      {
+        name: 'deleted',
+        error: /no longer resolves to refs\/tags\/v0\.4\.1/i,
+        revalidateTagState() {
+          throw new Error(
+            `Refusing GitHub release: ${RELEASE_TAG} no longer resolves to refs/tags/${RELEASE_TAG}.`
+          );
+        }
+      },
+      {
+        name: 'replaced',
+        error: /tag object SHA/i,
+        revalidateTagState() {
+          throw new Error(
+            `Refusing GitHub release: ${RELEASE_TAG} tag object SHA changed from ${baseTagRef().object.sha} to ${'2'.repeat(40)}.`
+          );
+        }
+      }
+    ];
+
+    for (const { name, error, revalidateTagState } of cases) {
+      const client = fakeReleaseClient({ revalidateTagState });
+      await assert.rejects(
+        () =>
+          syncGitHubRelease({
+            releaseTag: RELEASE_TAG,
+            outputDir,
+            expectedTagObjectSha: baseTagRef().object.sha,
+            expectedHeadSha: HEAD_SHA,
+            releaseClient: client
+          }),
+        error,
+        name
+      );
+      assert.deepEqual(client.state.created, [], `${name} must not create the release`);
+      assert.deepEqual(client.state.uploads, [], `${name} must not upload release assets`);
+    }
   });
 });
 

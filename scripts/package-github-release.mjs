@@ -97,13 +97,15 @@ async function main() {
       const result = await resolveReleaseSource({
         repository: requiredOption(options, 'repository'),
         releaseTag: requiredOption(options, 'release-tag'),
-        sourceRunId: requiredOption(options, 'source-run-id')
+        sourceRunId: requiredOption(options, 'source-run-id'),
+        sourceRunAttempt: requiredOption(options, 'source-run-attempt')
       });
       process.stdout.write(
         [
           `release_tag=${result.releaseTag}`,
           `npm_version=${result.npmVersion}`,
           `head_sha=${result.headSha}`,
+          `tag_object_sha=${result.tagObjectSha}`,
           `source_run_id=${result.sourceRunId}`,
           `source_run_attempt=${result.sourceRunAttempt}`,
           `source_date_epoch=${result.sourceDateEpoch}`,
@@ -142,6 +144,8 @@ async function main() {
       await syncGitHubRelease({
         releaseTag: requiredOption(options, 'release-tag'),
         outputDir: requiredOption(options, 'output-dir'),
+        expectedTagObjectSha: requiredOption(options, 'expected-tag-object-sha'),
+        expectedHeadSha: requiredOption(options, 'expected-head-sha'),
         releaseClient: createGhReleaseClient({
           repository: requiredOption(options, 'repository')
         })
@@ -187,10 +191,27 @@ export function canonicalReleaseAssetNames(releaseTag) {
   ];
 }
 
-export function verifySourceRun(sourceRun, { releaseTag }) {
+export function verifySourceRun(sourceRun, {
+  releaseTag,
+  expectedSourceRunId,
+  expectedSourceRunAttempt
+}) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   const sourceRunId = toPositiveIntegerString(sourceRun?.id, 'source run id');
   const sourceRunAttempt = toPositiveInteger(sourceRun?.run_attempt, 'source run attempt');
+  if (expectedSourceRunId && sourceRunId !== toPositiveIntegerString(expectedSourceRunId, 'source run id')) {
+    throw new Error(
+      `Refusing GitHub release: source run payload ${sourceRunId} does not match requested run ${expectedSourceRunId}.`
+    );
+  }
+  if (
+    expectedSourceRunAttempt &&
+    sourceRunAttempt !== toPositiveInteger(expectedSourceRunAttempt, 'source run attempt')
+  ) {
+    throw new Error(
+      `Refusing GitHub release: source run attempt payload ${sourceRunAttempt} does not match requested attempt ${expectedSourceRunAttempt}.`
+    );
+  }
   if (sourceRun?.name !== WORKFLOW_NAME) {
     throw new Error(
       `Refusing GitHub release: source run ${sourceRunId} must be ${WORKFLOW_NAME}, got ${JSON.stringify(sourceRun?.name)}.`
@@ -306,13 +327,65 @@ export function verifyReleaseSource({
   const normalizedSourceDateEpoch = toNonNegativeInteger(sourceDateEpoch, 'SOURCE_DATE_EPOCH');
   return {
     ...sourceContext,
+    tagObjectSha: tagContext.tagObjectSha,
     sourceDateEpoch: normalizedSourceDateEpoch
   };
 }
 
-export async function resolveReleaseSource({ repository, releaseTag, sourceRunId, ghApi = ghApiJson, git = createGitClient() }) {
+export function assertRemoteTagMatchesVerifiedContext({
+  releaseTag,
+  expectedTagObjectSha,
+  expectedHeadSha,
+  tagRef,
+  tagObject
+}) {
+  if (!isSha(expectedTagObjectSha)) {
+    throw new Error(
+      `Refusing GitHub release: expected verified tag object SHA for ${releaseTag}, got ${JSON.stringify(expectedTagObjectSha)}.`
+    );
+  }
+  if (!isSha(expectedHeadSha)) {
+    throw new Error(
+      `Refusing GitHub release: expected verified source commit SHA for ${releaseTag}, got ${JSON.stringify(expectedHeadSha)}.`
+    );
+  }
+  const remoteTagContext = verifyAnnotatedTag(tagRef, tagObject, {
+    releaseTag,
+    expectedHeadSha
+  });
+  if (remoteTagContext.tagObjectSha !== expectedTagObjectSha) {
+    throw new Error(
+      `Refusing GitHub release: ${releaseTag} tag object SHA changed from ${expectedTagObjectSha} to ${remoteTagContext.tagObjectSha}.`
+    );
+  }
+  return remoteTagContext;
+}
+
+export async function resolveReleaseSource({
+  repository,
+  releaseTag,
+  sourceRunId,
+  sourceRunAttempt,
+  ghApi = ghApiJson,
+  git = createGitClient()
+}) {
   const normalizedSourceRunId = toPositiveIntegerString(sourceRunId, 'source run id');
-  const sourceRun = await ghApi(`/repos/${repository}/actions/runs/${normalizedSourceRunId}`);
+  const normalizedSourceRunAttempt = toPositiveIntegerString(sourceRunAttempt, 'source run attempt');
+  const latestSourceRun = await ghApi(`/repos/${repository}/actions/runs/${normalizedSourceRunId}`);
+  const sourceRun = await ghApi(
+    `/repos/${repository}/actions/runs/${normalizedSourceRunId}/attempts/${normalizedSourceRunAttempt}`
+  );
+  const sourceContext = verifySourceRun(sourceRun, {
+    releaseTag,
+    expectedSourceRunId: normalizedSourceRunId,
+    expectedSourceRunAttempt: normalizedSourceRunAttempt
+  });
+  const latestRunAttempt = toPositiveInteger(latestSourceRun?.run_attempt, 'latest source run attempt');
+  if (latestRunAttempt !== sourceContext.sourceRunAttempt) {
+    throw new Error(
+      `Refusing GitHub release: source run ${normalizedSourceRunId} latest run attempt ${latestRunAttempt} does not match selected attempt ${sourceContext.sourceRunAttempt}; actions/download-artifact is run-id only, so old-attempt artifacts are ambiguous or unavailable after a rerun.`
+    );
+  }
   const tagRef = await ghApi(`/repos/${repository}/git/ref/tags/${encodeURIComponent(releaseTag)}`);
   if (tagRef?.object?.type !== 'tag') {
     return verifyReleaseSource({
@@ -1012,6 +1085,8 @@ export function assertChecksumManifest(text, expectedNames) {
 export async function syncGitHubRelease({
   releaseTag,
   outputDir,
+  expectedTagObjectSha,
+  expectedHeadSha,
   releaseClient = createGhReleaseClient()
 }) {
   const expectedAssetNames = canonicalReleaseAssetNames(releaseTag).sort();
@@ -1029,10 +1104,16 @@ export async function syncGitHubRelease({
   let release = await releaseClient.getReleaseByTag(releaseTag);
   let createdRelease = false;
   if (!release) {
+    await releaseClient.revalidateTag({
+      releaseTag,
+      expectedTagObjectSha,
+      expectedHeadSha
+    });
     release = await releaseClient.createRelease({
       releaseTag,
       title: `Coven ${releaseTag}`,
-      notesFromTag: true
+      notesFromTag: true,
+      verifyTag: true
     });
     createdRelease = true;
   }
@@ -1168,10 +1249,13 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
       }
       return JSON.parse(result.stdout);
     },
-    async createRelease({ releaseTag, title, notesFromTag }) {
+    async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
       const args = ['release', 'create', releaseTag, '--repo', repository, '--title', title];
       if (notesFromTag) {
         args.push('--notes-from-tag');
+      }
+      if (verifyTag) {
+        args.push('--verify-tag');
       }
       runCommand('gh', args);
       const release = await this.getReleaseByTag(releaseTag);
@@ -1179,6 +1263,64 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
         throw new Error(`GitHub release ${releaseTag} was created but could not be reloaded.`);
       }
       return release;
+    },
+    async revalidateTag({ releaseTag, expectedTagObjectSha, expectedHeadSha }) {
+      const refEndpoint = `/repos/${repository}/git/ref/tags/${encodeURIComponent(releaseTag)}`;
+      const refResult = spawnCapture('gh', ['api', refEndpoint], { encoding: 'utf8' });
+      if (refResult.error) {
+        throw new Error(refResult.error.message);
+      }
+      if (refResult.status !== 0) {
+        const stderr = String(refResult.stderr ?? '').trim();
+        if (/404/.test(stderr)) {
+          throw new Error(
+            `Refusing GitHub release: ${releaseTag} no longer resolves to refs/tags/${releaseTag}.`
+          );
+        }
+        throw new Error(stderr || `gh api ${refEndpoint} exited with ${refResult.status}.`);
+      }
+      const tagRef = JSON.parse(refResult.stdout);
+      if (tagRef?.object?.type !== 'tag' || !isSha(tagRef?.object?.sha)) {
+        assertRemoteTagMatchesVerifiedContext({
+          releaseTag,
+          expectedTagObjectSha,
+          expectedHeadSha,
+          tagRef,
+          tagObject: {
+            tag: releaseTag,
+            object: {
+              type: tagRef?.object?.type,
+              sha: tagRef?.object?.sha
+            },
+            verification: {
+              verified: false,
+              reason: 'remote-ref-mismatch'
+            }
+          }
+        });
+      }
+      const tagObjectEndpoint = `/repos/${repository}/git/tags/${tagRef?.object?.sha ?? ''}`;
+      const tagObjectResult = spawnCapture('gh', ['api', tagObjectEndpoint], { encoding: 'utf8' });
+      if (tagObjectResult.error) {
+        throw new Error(tagObjectResult.error.message);
+      }
+      if (tagObjectResult.status !== 0) {
+        const stderr = String(tagObjectResult.stderr ?? '').trim();
+        if (/404/.test(stderr)) {
+          throw new Error(
+            `Refusing GitHub release: annotated tag object ${tagRef?.object?.sha ?? '(missing)'} for ${releaseTag} no longer exists.`
+          );
+        }
+        throw new Error(stderr || `gh api ${tagObjectEndpoint} exited with ${tagObjectResult.status}.`);
+      }
+      const tagObject = JSON.parse(tagObjectResult.stdout);
+      assertRemoteTagMatchesVerifiedContext({
+        releaseTag,
+        expectedTagObjectSha,
+        expectedHeadSha,
+        tagRef,
+        tagObject
+      });
     },
     async downloadAsset(asset, filePath) {
       const assetUrl = asset?.url;
