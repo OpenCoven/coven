@@ -1522,7 +1522,7 @@ fn run_setup_command(
     verify_only: bool,
     report_json: Option<PathBuf>,
 ) -> Result<()> {
-    const PROVIDERS: &[setup::ProviderDescriptor] = &[];
+    let providers = [setup::codex::descriptor()];
     let mode = if verify_only {
         setup::SetupMode::VerifyOnly
     } else if verify {
@@ -1549,7 +1549,7 @@ fn run_setup_command(
         clock: &clock,
         launcher: &mut launcher,
     };
-    let summary = setup::run_setup(&options, PROVIDERS, &mut runtime)?;
+    let summary = setup::run_setup(&options, &providers, &mut runtime)?;
     setup::render_human(&summary, &mut io::stdout().lock())?;
     if summary.completed() {
         Ok(())

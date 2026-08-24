@@ -1,3 +1,4 @@
+pub mod codex;
 mod process;
 
 use std::ffi::{OsStr, OsString};
@@ -319,6 +320,7 @@ pub enum SetupError {
     RequiresVerification,
     Rejected,
     PublicationFailed,
+    UnsupportedProvider,
 }
 
 impl fmt::Display for SetupError {
@@ -328,6 +330,9 @@ impl fmt::Display for SetupError {
             Self::RequiresVerification => "setup reports are available only for verification modes",
             Self::Rejected => "setup report failed privacy validation",
             Self::PublicationFailed => "setup report could not be published",
+            Self::UnsupportedProvider => {
+                "the selected setup provider is not available in this build"
+            }
         })
     }
 }
@@ -349,6 +354,12 @@ pub fn run_setup(
     }
 
     let provider_ids = options.selector.providers();
+    if provider_ids
+        .iter()
+        .any(|provider_id| !providers.iter().any(|provider| provider.id == *provider_id))
+    {
+        return Err(SetupError::UnsupportedProvider);
+    }
     let mut results = Vec::with_capacity(provider_ids.len());
     if !runtime.terminal.is_interactive() {
         results.extend(provider_ids.iter().copied().map(|provider| ProviderResult {
@@ -360,19 +371,10 @@ pub fn run_setup(
         }));
     } else {
         for provider_id in provider_ids {
-            let Some(provider) = providers
+            let provider = providers
                 .iter()
                 .find(|provider| provider.id == *provider_id)
-            else {
-                results.push(ProviderResult {
-                    provider: *provider_id,
-                    outcome: Outcome::ProviderFailed,
-                    duration: Duration::ZERO,
-                    version: None,
-                    install_guidance: None,
-                });
-                continue;
-            };
+                .expect("provider registration was validated before setup");
             results.push(run_provider(options, provider, runtime));
         }
     }
