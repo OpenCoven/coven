@@ -1242,7 +1242,7 @@ export async function syncGitHubRelease({
       }
       skipped.push(assetName);
     }
-    if (missingAssetNames.length > 0) {
+    if (!createdRelease || missingAssetNames.length > 0) {
       await releaseClient.revalidateTag({
         releaseTag,
         expectedTagObjectSha,

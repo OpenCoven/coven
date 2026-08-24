@@ -1652,12 +1652,65 @@ test('syncGitHubRelease skips a fully matching rerun, including >1 MiB assets, w
     const matchingResult = await syncGitHubRelease({
       releaseTag: RELEASE_TAG,
       outputDir,
+      expectedTagObjectSha: baseTagRef().object.sha,
+      expectedHeadSha: HEAD_SHA,
       releaseClient: matchingClient
     });
 
+    assert.deepEqual(matchingClient.state.revalidated, [
+      {
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha: baseTagRef().object.sha,
+        expectedHeadSha: HEAD_SHA
+      }
+    ]);
     assert.deepEqual(matchingResult.skipped, EXPECTED_ASSET_NAMES);
     assert.deepEqual(matchingResult.uploaded, []);
     assert.equal(matchingClient.state.uploads.length, 0);
+  });
+});
+
+test('syncGitHubRelease refuses a fully matching rerun when the verified remote tag moved', async () => {
+  await withScratchDir('sync-full-match-tag-race', async (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+
+    const client = fakeReleaseClient({
+      existingRelease: baseExistingRelease({
+        assets: EXPECTED_ASSET_NAMES.map((name, index) => ({ id: index + 1, name }))
+      }),
+      assetBytesByName: Object.fromEntries(
+        EXPECTED_ASSET_NAMES.map((assetName) => [
+          assetName,
+          readFileSync(path.join(outputDir, assetName))
+        ])
+      ),
+      revalidateTagState() {
+        throw new Error(
+          `Refusing GitHub release: ${RELEASE_TAG} tag object SHA changed from ${baseTagRef().object.sha} to ${'2'.repeat(40)}.`
+        );
+      }
+    });
+
+    await assert.rejects(
+      () =>
+        syncGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          outputDir,
+          expectedTagObjectSha: baseTagRef().object.sha,
+          expectedHeadSha: HEAD_SHA,
+          releaseClient: client
+        }),
+      /tag object SHA/i
+    );
+    assert.equal(client.state.uploads.length, 0);
   });
 });
 
