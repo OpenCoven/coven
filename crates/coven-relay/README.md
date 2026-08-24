@@ -21,7 +21,7 @@ The first peer creates an in-memory room. Exactly one `host` and one `client` ma
 - text frames are rejected;
 - ping/pong remains transport-local;
 - no offline buffering or message persistence occurs;
-- bounded channels apply backpressure instead of allowing unbounded memory growth;
+- bounded channels and a relay-wide byte budget apply backpressure instead of allowing unbounded memory growth;
 - a peer disconnect closes the remaining peer;
 - idle connections expire;
 - the room is destroyed after both peers disconnect.
@@ -37,6 +37,8 @@ The current server bounds:
 - WebSocket message size: 4 MiB;
 - WebSocket frame size: 64 KiB;
 - queued live frames per peer: 32;
+- queued and in-flight application data across the relay: 16 MiB;
+- outbound send lifetime: 10 seconds;
 - idle lifetime: 120 seconds.
 
 These defaults are deliberately conservative and may become explicit deployment configuration after production measurements. The relay never logs room credentials or application frames.

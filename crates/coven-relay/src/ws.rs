@@ -16,20 +16,23 @@ use axum::extract::{RawQuery, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 const RELAY_PROTOCOL_VERSION: &str = "1";
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 64 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_ROOMS: usize = 1_024;
 const DEFAULT_CHANNEL_CAPACITY: usize = 32;
+const DEFAULT_MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RelayState {
     inner: Arc<Mutex<RelayRegistry>>,
     next_peer_id: Arc<AtomicU64>,
+    queued_bytes: Arc<Semaphore>,
     limits: RelayLimits,
 }
 
@@ -38,6 +41,7 @@ impl Default for RelayState {
         Self::with_limits(RelayLimits {
             max_rooms: DEFAULT_MAX_ROOMS,
             channel_capacity: DEFAULT_CHANNEL_CAPACITY,
+            max_queued_bytes: DEFAULT_MAX_QUEUED_BYTES,
         })
     }
 }
@@ -46,9 +50,11 @@ impl RelayState {
     fn with_limits(limits: RelayLimits) -> Self {
         assert!(limits.max_rooms > 0);
         assert!(limits.channel_capacity > 0);
+        assert!(limits.max_queued_bytes > 0);
         Self {
             inner: Arc::new(Mutex::new(RelayRegistry::default())),
             next_peer_id: Arc::new(AtomicU64::new(1)),
+            queued_bytes: Arc::new(Semaphore::new(limits.max_queued_bytes)),
             limits,
         }
     }
@@ -97,7 +103,11 @@ impl RelayState {
         })
     }
 
-    async fn peer_sender(&self, room_id: &str, role: PeerRole) -> Option<mpsc::Sender<Message>> {
+    async fn peer_sender(
+        &self,
+        room_id: &str,
+        role: PeerRole,
+    ) -> Option<mpsc::Sender<QueuedMessage>> {
         let registry = self.inner.lock().await;
         registry
             .rooms
@@ -129,7 +139,10 @@ impl RelayState {
             peer_to_notify
         };
         if let Some(peer) = peer_to_notify {
-            let _ = peer.try_send(close_message(1001, "relay peer disconnected"));
+            let _ = peer.try_send(QueuedMessage::control(close_message(
+                1001,
+                "relay peer disconnected",
+            )));
         }
     }
 
@@ -143,6 +156,7 @@ impl RelayState {
 struct RelayLimits {
     max_rooms: usize,
     channel_capacity: usize,
+    max_queued_bytes: usize,
 }
 
 #[derive(Default)]
@@ -174,14 +188,28 @@ impl RelayRoom {
 
 struct ConnectedPeer {
     id: u64,
-    sender: mpsc::Sender<Message>,
+    sender: mpsc::Sender<QueuedMessage>,
+}
+
+struct QueuedMessage {
+    message: Message,
+    _byte_budget: Option<OwnedSemaphorePermit>,
+}
+
+impl QueuedMessage {
+    fn control(message: Message) -> Self {
+        Self {
+            message,
+            _byte_budget: None,
+        }
+    }
 }
 
 struct Registration {
     room_id: String,
     role: PeerRole,
     peer_id: u64,
-    inbox: mpsc::Receiver<Message>,
+    inbox: mpsc::Receiver<QueuedMessage>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,7 +338,7 @@ async fn serve(mut socket: WebSocket, state: RelayState, request: RelayRequest) 
         Ok(registration) => registration,
         Err(error) => {
             let (code, reason) = error.close();
-            let _ = socket.send(close_message(code, reason)).await;
+            let _ = send_with_timeout(&mut socket, close_message(code, reason)).await;
             return;
         }
     };
@@ -329,7 +357,7 @@ async fn relay_loop(
     state: &RelayState,
     room_id: &str,
     role: PeerRole,
-    inbox: &mut mpsc::Receiver<Message>,
+    inbox: &mut mpsc::Receiver<QueuedMessage>,
 ) {
     let idle = tokio::time::sleep(IDLE_TIMEOUT);
     tokio::pin!(idle);
@@ -343,18 +371,22 @@ async fn relay_loop(
                         if let Err(close) = forward_to_peer(
                             state, room_id, role, Message::Binary(payload),
                         ).await {
-                            let _ = socket.send(close).await;
+                            let _ = send_with_timeout(socket, close).await;
                             break;
                         }
                     }
                     Message::Text(_) => {
-                        let _ = socket.send(close_message(1003, "binary frames required")).await;
+                        let _ = send_with_timeout(
+                            socket,
+                            close_message(1003, "binary frames required"),
+                        )
+                        .await;
                         break;
                     }
                     Message::Ping(_) | Message::Pong(_) => {}
                     Message::Close(frame) => {
                         if let Some(peer) = state.peer_sender(room_id, role).await {
-                            let _ = peer.try_send(Message::Close(frame));
+                            let _ = peer.try_send(QueuedMessage::control(Message::Close(frame)));
                         }
                         break;
                     }
@@ -363,16 +395,23 @@ async fn relay_loop(
             outgoing = inbox.recv() => {
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                 let Some(outgoing) = outgoing else { break; };
-                let is_close = matches!(outgoing, Message::Close(_));
-                if socket.send(outgoing).await.is_err() || is_close {
+                let is_close = matches!(outgoing.message, Message::Close(_));
+                if send_with_timeout(socket, outgoing.message).await.is_err() || is_close {
                     break;
                 }
             }
             () = &mut idle => {
-                let _ = socket.send(close_message(1001, "relay idle timeout")).await;
+                let _ = send_with_timeout(socket, close_message(1001, "relay idle timeout")).await;
                 break;
             }
         }
+    }
+}
+
+async fn send_with_timeout(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
+    match tokio::time::timeout(SEND_TIMEOUT, socket.send(message)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) | Err(_) => Err(()),
     }
 }
 
@@ -386,7 +425,25 @@ async fn forward_to_peer(
         .peer_sender(room_id, role)
         .await
         .ok_or_else(|| close_message(1013, "relay peer unavailable"))?;
-    match peer.try_send(message) {
+    let message_bytes = match &message {
+        Message::Binary(payload) => payload.len(),
+        _ => 0,
+    };
+    let byte_budget = if message_bytes == 0 {
+        None
+    } else {
+        Some(
+            state
+                .queued_bytes
+                .clone()
+                .try_acquire_many_owned(message_bytes as u32)
+                .map_err(|_| close_message(1013, "relay byte budget exhausted"))?,
+        )
+    };
+    match peer.try_send(QueuedMessage {
+        message,
+        _byte_budget: byte_budget,
+    }) {
         Ok(()) => Ok(()),
         Err(TrySendError::Full(_)) => Err(close_message(1013, "relay backpressure")),
         Err(TrySendError::Closed(_)) => Err(close_message(1001, "relay peer disconnected")),
