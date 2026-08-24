@@ -272,7 +272,7 @@ verbs:
 | --- | --- | --- |
 | `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [Interactive UI](https://docs.opencoven.ai/docs/cli/interactive) |
 | `coven doctor` | Detect supported harness CLIs and print install hints | [Doctor](https://docs.opencoven.ai/docs/cli/doctor) |
-| `coven setup <codex\|claude\|copilot\|all>` | Run provider-owned login and optional explicitly consented verification | [Setup](docs/reference/cli-setup.md) |
+| `coven setup [<codex\|claude\|copilot\|all>]` | Run provider-owned login and optional explicitly consented verification | [Setup](docs/reference/cli-setup.md) |
 | `coven daemon start/status/restart/stop` | Manage the local daemon | [Daemon commands](https://docs.opencoven.ai/docs/cli/daemon) |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [Run](https://docs.opencoven.ai/docs/cli/run) |
 | `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |

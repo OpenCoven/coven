@@ -113,7 +113,7 @@ test('canonical CLI docs are discoverable and local guide contracts remain concr
   assert.match(topLevelCli, /## Usage/);
   assert.match(topLevelCli, /## Related/);
   assert.match(topLevelCli, /coven chat/);
-  assert.match(topLevelCli, /coven setup <codex\\\|claude\\\|copilot\\\|all>/);
+  assert.match(topLevelCli, /coven setup \[<codex\\\|claude\\\|copilot\\\|all>\]/);
 
   for (const { path, required } of coreGuideDocs) {
     const text = readRepoFile(path);
@@ -129,7 +129,7 @@ test('setup reference documents verification consent, terminal ownership, and re
   const setupReference = readRepoFile('docs/reference/cli-setup.md');
 
   for (const token of [
-    'coven setup <codex|claude|copilot|all>',
+    'coven setup [<codex|claude|copilot|all>]',
     '--verify',
     '--verify-only',
     '--report-json <path>',

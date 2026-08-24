@@ -14,7 +14,7 @@ provider-owned command, asks for explicit consent, and then hands the terminal
 to that CLI.
 
 ```sh
-coven setup <codex|claude|copilot|all>
+coven setup [<codex|claude|copilot|all>]
 ```
 
 The default selector is `all`, so bare `coven setup` is equivalent to

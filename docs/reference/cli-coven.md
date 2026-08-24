@@ -49,7 +49,7 @@ an explicit ANSI-color policy.
 | Goal | Start with |
 | --- | --- |
 | Check whether the local runtime is usable | `coven doctor` |
-| Complete provider login or optional verification | `coven setup <codex\|claude\|copilot\|all>` |
+| Complete provider login or optional verification | `coven setup [<codex\|claude\|copilot\|all>]` |
 | Control the local daemon | `coven daemon status` |
 | Launch an explicit harness task | `coven run <harness> "<prompt>"` |
 | Browse or manage history | `coven sessions` |
