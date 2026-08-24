@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 #[path = "../src/setup/mod.rs"]
 mod setup;
 
+use setup::codex;
 use setup::{
     render_human, run_setup, Clock, CommandSpec, Confirmer, ConsentDecision, ConsentRequest,
     ExecutableDiscovery, LaunchRequest, Outcome, ProcessExit, ProcessLauncher, ProviderDescriptor,
@@ -98,6 +99,97 @@ fn setup_cli_refuses_non_tty_without_waiting_or_launching() -> Result<()> {
         !String::from_utf8_lossy(&output.stderr).contains("Error:"),
         "non-TTY refusal should be a closed setup result, not an internal error"
     );
+    Ok(())
+}
+
+#[test]
+fn codex_provider_launches_exact_login_command() -> Result<()> {
+    let provider = codex::descriptor();
+    let providers = [provider];
+    let discovery = FakeDiscovery::all_present(&providers, "1.2.3");
+    let terminal = FixedTerminal(true);
+    let mut confirmer = FakeConfirmer::new([ConsentDecision::Accepted]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([LaunchBehavior::exit(0)]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+
+    let summary = run_setup(&options(Selector::Codex), &providers, &mut runtime)?;
+
+    assert!(summary.completed());
+    assert_eq!(confirmer.requests.len(), 1);
+    assert_eq!(confirmer.requests[0].command, "codex login");
+    assert_eq!(launcher.launches.len(), 1);
+    assert_eq!(
+        launcher.launches[0].executable,
+        PathBuf::from("/fixture/codex")
+    );
+    assert_eq!(launcher.launches[0].args, vec![OsString::from("login")]);
+    Ok(())
+}
+
+#[test]
+fn codex_provider_preserves_failure_and_cancellation_outcomes() -> Result<()> {
+    assert_eq!(
+        run_codex(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::exit(7),
+        )?
+        .0,
+        Outcome::ProviderFailed
+    );
+    assert_eq!(
+        run_codex(
+            FixedTerminal(true),
+            Some("1.2.3"),
+            ConsentDecision::Accepted,
+            LaunchBehavior::signalled(),
+        )?
+        .0,
+        Outcome::Cancelled
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_provider_handles_missing_declined_and_non_tty_without_launching() -> Result<()> {
+    let (outcome, launches, rendered) = run_codex(
+        FixedTerminal(true),
+        None,
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NotInstalled);
+    assert_eq!(launches, 0);
+    assert_eq!(
+        rendered,
+        format!("Codex: not_installed\n{}\n", codex::INSTALL_GUIDANCE)
+    );
+
+    let (outcome, launches, _) = run_codex(
+        FixedTerminal(true),
+        Some("1.2.3"),
+        ConsentDecision::Declined,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::Declined);
+    assert_eq!(launches, 0);
+
+    let (outcome, launches, _) = run_codex(
+        FixedTerminal(false),
+        Some("1.2.3"),
+        ConsentDecision::Accepted,
+        LaunchBehavior::exit(0),
+    )?;
+    assert_eq!(outcome, Outcome::NonTty);
+    assert_eq!(launches, 0);
     Ok(())
 }
 
@@ -724,6 +816,38 @@ fn run_single(
         launcher: &mut launcher,
     };
     Ok(run_setup(&setup_options, &providers, &mut runtime)?.results[0].outcome)
+}
+
+fn run_codex(
+    terminal: FixedTerminal,
+    version: Option<&str>,
+    consent: ConsentDecision,
+    behavior: LaunchBehavior,
+) -> Result<(Outcome, usize, String)> {
+    let provider = codex::descriptor();
+    let providers = [provider];
+    let discovery = FixedDiscovery(version.map(|version| ResolvedExecutable {
+        path: PathBuf::from("fake-codex"),
+        version: Some(version.to_owned()),
+    }));
+    let mut confirmer = FakeConfirmer::new([consent]);
+    let clock = FakeClock::default();
+    let mut launcher = FakeLauncher::new([behavior]);
+    let mut runtime = SetupRuntime {
+        discovery: &discovery,
+        confirmer: &mut confirmer,
+        terminal: &terminal,
+        clock: &clock,
+        launcher: &mut launcher,
+    };
+    let summary = run_setup(&options(Selector::Codex), &providers, &mut runtime)?;
+    let mut rendered = Vec::new();
+    render_human(&summary, &mut rendered)?;
+    Ok((
+        summary.results[0].outcome,
+        launcher.launches.len(),
+        String::from_utf8(rendered)?,
+    ))
 }
 
 struct FixedTerminal(bool);

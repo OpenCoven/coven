@@ -620,7 +620,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "codex".to_string(),
             label: "Codex".to_string(),
-            executable: "codex".to_string(),
+            executable: crate::setup::codex::EXECUTABLE.to_string(),
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
@@ -630,7 +630,7 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
                 "--color".to_string(),
                 "never".to_string(),
             ],
-            install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.".to_string(),
+            install_hint: crate::setup::codex::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             // Codex has no --system-prompt flag; identity is injected as a

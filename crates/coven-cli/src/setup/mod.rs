@@ -1,3 +1,4 @@
+pub mod codex;
 mod process;
 
 use std::ffi::{OsStr, OsString};
