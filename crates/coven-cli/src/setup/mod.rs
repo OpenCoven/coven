@@ -2,6 +2,7 @@ pub mod claude;
 pub mod codex;
 pub mod copilot;
 mod process;
+mod verify;
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -96,6 +97,7 @@ pub struct ProviderDescriptor {
     pub official_install_guidance: String,
     login: Option<CommandSpec>,
     verification: Option<CommandSpec>,
+    version: CommandSpec,
 }
 
 impl ProviderDescriptor {
@@ -110,6 +112,7 @@ impl ProviderDescriptor {
             official_install_guidance: official_install_guidance.into(),
             login: None,
             verification: None,
+            version: CommandSpec::new(["--version"]),
         }
     }
 
@@ -154,12 +157,14 @@ impl ExecutableDiscovery for SystemExecutableDiscovery {
     fn discover(&self, provider: &ProviderDescriptor) -> io::Result<Option<ResolvedExecutable>> {
         let executable = Path::new(&provider.executable);
         if executable.components().count() > 1 {
-            return Ok(
-                executable_is_runnable(executable).then(|| ResolvedExecutable {
-                    path: executable.to_path_buf(),
-                    version: None,
-                }),
-            );
+            return executable_is_runnable(executable)
+                .then(|| {
+                    fs::canonicalize(executable).map(|path| ResolvedExecutable {
+                        path,
+                        version: None,
+                    })
+                })
+                .transpose();
         }
         let Some(path) = self.path.as_deref() else {
             return Ok(None);
@@ -168,10 +173,12 @@ impl ExecutableDiscovery for SystemExecutableDiscovery {
             for name in executable_names(&provider.executable, self.pathext.as_deref()) {
                 let candidate = directory.join(name);
                 if executable_is_runnable(&candidate) {
-                    return Ok(Some(ResolvedExecutable {
-                        path: candidate,
-                        version: None,
-                    }));
+                    return fs::canonicalize(candidate).map(|path| {
+                        Some(ResolvedExecutable {
+                            path,
+                            version: None,
+                        })
+                    });
                 }
             }
         }
@@ -322,6 +329,7 @@ pub enum SetupError {
     RequiresVerification,
     Rejected,
     PublicationFailed,
+    ReportRequiresSingleProvider,
     UnsupportedProvider,
 }
 
@@ -332,6 +340,9 @@ impl fmt::Display for SetupError {
             Self::RequiresVerification => "setup reports are available only for verification modes",
             Self::Rejected => "setup report failed privacy validation",
             Self::PublicationFailed => "setup report could not be published",
+            Self::ReportRequiresSingleProvider => {
+                "setup reports require selecting exactly one provider"
+            }
             Self::UnsupportedProvider => {
                 "the selected setup provider is not available in this build"
             }
@@ -356,6 +367,9 @@ pub fn run_setup(
     }
 
     let provider_ids = options.selector.providers();
+    if options.report_json.is_some() && provider_ids.len() != 1 {
+        return Err(SetupError::ReportRequiresSingleProvider);
+    }
     if provider_ids
         .iter()
         .any(|provider_id| !providers.iter().any(|provider| provider.id == *provider_id))
@@ -435,11 +449,12 @@ fn run_provider(
         }
     };
 
-    let outcome = match options.mode {
+    let action_result = match options.mode {
         SetupMode::Login => run_action(
             provider,
             executable.path.as_path(),
             provider.login.as_ref(),
+            None,
             SetupAction::Login,
             options.timeout,
             runtime,
@@ -448,6 +463,10 @@ fn run_provider(
             provider,
             executable.path.as_path(),
             provider.verification.as_ref(),
+            options.report_json.as_ref().map(|_| VersionResolution {
+                command: &provider.version,
+                cached: executable.version.as_deref(),
+            }),
             SetupAction::Verification,
             options.timeout,
             runtime,
@@ -457,15 +476,20 @@ fn run_provider(
                 provider,
                 executable.path.as_path(),
                 provider.login.as_ref(),
+                None,
                 SetupAction::Login,
                 options.timeout,
                 runtime,
             );
-            if login == Outcome::Completed {
+            if login.outcome == Outcome::Completed {
                 run_action(
                     provider,
                     executable.path.as_path(),
                     provider.verification.as_ref(),
+                    options.report_json.as_ref().map(|_| VersionResolution {
+                        command: &provider.version,
+                        cached: executable.version.as_deref(),
+                    }),
                     SetupAction::Verification,
                     options.timeout,
                     runtime,
@@ -477,24 +501,35 @@ fn run_provider(
     };
     result(
         provider.id,
-        outcome,
+        action_result.outcome,
         provider_started,
-        executable.version,
+        action_result.version,
         None,
         runtime.clock,
     )
+}
+
+struct ActionResult {
+    outcome: Outcome,
+    version: Option<String>,
+}
+
+struct VersionResolution<'a> {
+    command: &'a CommandSpec,
+    cached: Option<&'a str>,
 }
 
 fn run_action(
     provider: &ProviderDescriptor,
     executable: &Path,
     command: Option<&CommandSpec>,
+    version_resolution: Option<VersionResolution<'_>>,
     action: SetupAction,
     timeout: Duration,
     runtime: &mut SetupRuntime<'_>,
-) -> Outcome {
+) -> ActionResult {
     let Some(command) = command else {
-        return failure_outcome(action);
+        return action_result(failure_outcome(action));
     };
     let consent = ConsentRequest {
         provider: provider.id,
@@ -513,24 +548,77 @@ fn run_action(
     };
     match runtime.confirmer.confirm(&consent) {
         Ok(ConsentDecision::Accepted) => {}
-        Ok(ConsentDecision::Declined) => return Outcome::Declined,
-        Ok(ConsentDecision::Cancelled) => return Outcome::Cancelled,
-        Err(_) => return Outcome::Cancelled,
+        Ok(ConsentDecision::Declined) => return action_result(Outcome::Declined),
+        Ok(ConsentDecision::Cancelled) => return action_result(Outcome::Cancelled),
+        Err(_) => return action_result(Outcome::Cancelled),
     }
+    let ephemeral_state = if action == SetupAction::Verification {
+        match verify::EphemeralState::create() {
+            Ok(state) => Some(state),
+            Err(_) => return action_result(failure_outcome(action)),
+        }
+    } else {
+        None
+    };
     let request = LaunchRequest {
         executable: executable.to_path_buf(),
         args: command.args.clone(),
+        current_dir: ephemeral_state
+            .as_ref()
+            .map(|state| state.current_dir().to_path_buf()),
+        env_overrides: ephemeral_state
+            .as_ref()
+            .map(verify::EphemeralState::env_overrides)
+            .unwrap_or_default(),
     };
     let mut process = match runtime.launcher.launch(&request) {
         Ok(process) => process,
-        Err(_) => return failure_outcome(action),
+        Err(_) => return action_result(failure_outcome(action)),
     };
-    match wait_bounded(process.as_mut(), runtime.clock, timeout) {
+    let mut outcome = match wait_bounded(process.as_mut(), runtime.clock, timeout) {
         Ok(BoundedProcessResult::TimedOut) => Outcome::TimedOut,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(0))) => Outcome::Completed,
         Ok(BoundedProcessResult::Exited(ProcessExit::Exited(_))) => failure_outcome(action),
         Ok(BoundedProcessResult::Exited(ProcessExit::Signalled)) => Outcome::Cancelled,
         Err(_) => failure_outcome(action),
+    };
+    drop(process);
+    let mut version = None;
+    if outcome == Outcome::Completed {
+        if let Some(version_resolution) = version_resolution {
+            version = version_resolution.cached.map(str::to_owned).or_else(|| {
+                let request = LaunchRequest {
+                    executable: executable.to_path_buf(),
+                    args: version_resolution.command.args.clone(),
+                    current_dir: ephemeral_state
+                        .as_ref()
+                        .map(|state| state.current_dir().to_path_buf()),
+                    env_overrides: ephemeral_state
+                        .as_ref()
+                        .map(verify::EphemeralState::env_overrides)
+                        .unwrap_or_default(),
+                };
+                process::probe_version(&request, timeout.min(Duration::from_secs(2)))
+                    .ok()
+                    .flatten()
+            });
+            if version.is_none() {
+                outcome = failure_outcome(action);
+            }
+        }
+    }
+    if let Some(state) = ephemeral_state {
+        if state.cleanup().is_err() {
+            return action_result(failure_outcome(action));
+        }
+    }
+    ActionResult { outcome, version }
+}
+
+fn action_result(outcome: Outcome) -> ActionResult {
+    ActionResult {
+        outcome,
+        version: None,
     }
 }
 
@@ -591,13 +679,12 @@ fn executable_names(executable: &str, pathext: Option<&OsStr>) -> Vec<OsString> 
         let extensions = pathext
             .and_then(OsStr::to_str)
             .unwrap_or(".COM;.EXE;.BAT;.CMD");
-        let mut names = vec![OsString::from(executable)];
-        names.extend(
-            extensions
-                .split(';')
-                .filter(|extension| !extension.is_empty())
-                .map(|extension| OsString::from(format!("{executable}{extension}"))),
-        );
+        let mut names = extensions
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .map(|extension| OsString::from(format!("{executable}{extension}")))
+            .collect::<Vec<_>>();
+        names.push(OsString::from(executable));
         names
     }
 
@@ -625,20 +712,13 @@ fn executable_is_runnable(path: &Path) -> bool {
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SetupReport {
-    schema_version: u32,
-    results: Vec<ReportResult>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct ReportResult {
     harness: ProviderId,
-    version: String,
+    cli_version: String,
     platform: String,
     candidate_commit: String,
-    duration_ms: u64,
+    duration: u64,
     exit_class: Outcome,
-    completion: bool,
+    completed: bool,
 }
 
 fn publish_report(
@@ -646,24 +726,19 @@ fn publish_report(
     summary: &SetupSummary,
     candidate_commit: &str,
 ) -> Result<(), SetupError> {
+    let result = summary
+        .results
+        .first()
+        .filter(|_| summary.results.len() == 1)
+        .ok_or(SetupError::ReportRequiresSingleProvider)?;
     let report = SetupReport {
-        schema_version: 1,
-        results: summary
-            .results
-            .iter()
-            .map(|result| ReportResult {
-                harness: result.provider,
-                version: result
-                    .version
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_owned()),
-                platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-                candidate_commit: candidate_commit.to_owned(),
-                duration_ms: result.duration.as_millis().try_into().unwrap_or(u64::MAX),
-                exit_class: result.outcome,
-                completion: result.outcome == Outcome::Completed,
-            })
-            .collect(),
+        harness: result.provider,
+        cli_version: result.version.clone().ok_or(SetupError::Rejected)?,
+        platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+        candidate_commit: candidate_commit.to_owned(),
+        duration: result.duration.as_millis().try_into().unwrap_or(u64::MAX),
+        exit_class: result.outcome,
+        completed: result.outcome == Outcome::Completed,
     };
     validate_report(&report)?;
     let bytes = serde_json::to_vec_pretty(&report).map_err(|_| SetupError::Rejected)?;
@@ -710,17 +785,13 @@ fn publish_report(
 }
 
 fn validate_report(report: &SetupReport) -> Result<(), SetupError> {
-    if report.schema_version != 1 || report.results.is_empty() {
+    if !process::valid_version(&report.cli_version)
+        || !safe_report_value(&report.cli_version)
+        || !safe_report_value(&report.platform)
+        || !valid_commit(&report.candidate_commit)
+        || report.completed != (report.exit_class == Outcome::Completed)
+    {
         return Err(SetupError::Rejected);
-    }
-    for result in &report.results {
-        if !safe_report_value(&result.version)
-            || !safe_report_value(&result.platform)
-            || !valid_commit(&result.candidate_commit)
-            || result.completion != (result.exit_class == Outcome::Completed)
-        {
-            return Err(SetupError::Rejected);
-        }
     }
     Ok(())
 }
@@ -762,16 +833,63 @@ fn atomic_publish_noclobber(staged: &Path, destination: &Path) -> Result<(), Set
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn atomic_publish_noclobber(staged: &Path, destination: &Path) -> Result<(), SetupError> {
-    if destination.exists() {
-        return Err(SetupError::Exists);
-    }
-    fs::rename(staged, destination).map_err(|error| {
-        if error.kind() == io::ErrorKind::AlreadyExists {
-            SetupError::Exists
-        } else {
-            SetupError::PublicationFailed
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS};
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+
+    fn wide_path(path: &Path) -> Result<Vec<u16>, SetupError> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(SetupError::Rejected);
         }
-    })
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let staged = wide_path(staged)?;
+    let destination = wide_path(destination)?;
+    if unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } != 0
+    {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error().map(|code| code as u32) {
+        Some(ERROR_ALREADY_EXISTS | ERROR_FILE_EXISTS) => Err(SetupError::Exists),
+        _ => Err(SetupError::PublicationFailed),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn atomic_publish_noclobber(_staged: &Path, _destination: &Path) -> Result<(), SetupError> {
+    Err(SetupError::PublicationFailed)
+}
+
+#[cfg(all(test, windows))]
+mod windows_atomic_publish_tests {
+    use super::{atomic_publish_noclobber, SetupError};
+    use std::fs;
+
+    #[test]
+    fn atomic_publish_never_replaces_an_existing_destination() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let staged = temp.path().join("staged.json");
+        let destination = temp.path().join("report.json");
+        fs::write(&staged, b"new").expect("staged report");
+        fs::write(&destination, b"existing").expect("existing report");
+
+        let error = atomic_publish_noclobber(&staged, &destination)
+            .expect_err("existing destination must be preserved");
+
+        assert!(matches!(error, SetupError::Exists));
+        assert_eq!(fs::read(&destination).expect("destination"), b"existing");
+        assert_eq!(fs::read(&staged).expect("staged"), b"new");
+    }
 }

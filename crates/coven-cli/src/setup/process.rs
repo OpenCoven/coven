@@ -1,7 +1,9 @@
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read};
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -10,6 +12,8 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 pub struct LaunchRequest {
     pub executable: PathBuf,
     pub args: Vec<OsString>,
+    pub current_dir: Option<PathBuf>,
+    pub env_overrides: Vec<(OsString, Option<OsString>)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,37 +76,162 @@ impl ProcessLauncher for SystemProcessLauncher {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-
-        let child = command.spawn()?;
-
-        #[cfg(windows)]
-        let (child, job) = {
-            let mut child = child;
-            let job = match windows_job::assign_kill_on_close_job(&child) {
-                Ok(job) => job,
-                Err(error) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error);
-                }
-            };
-            (child, job)
-        };
-
-        Ok(Box::new(SystemRunningProcess {
-            #[cfg(unix)]
-            process_group: child.id() as libc::pid_t,
-            child,
-            #[cfg(windows)]
-            job,
-        }))
+        apply_launch_context(&mut command, request);
+        Ok(Box::new(spawn_managed(&mut command)?))
     }
+}
+
+pub fn probe_version(request: &LaunchRequest, timeout: Duration) -> io::Result<Option<String>> {
+    let mut command = Command::new(&request.executable);
+    command
+        .args(&request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    apply_launch_context(&mut command, request);
+    let mut process = spawn_managed(&mut command)?;
+    let stdout = process
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("version probe stdout was not piped"))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = stdout.take(4097).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let exit = loop {
+        if let Some(exit) = process.try_wait()? {
+            break exit;
+        }
+        if Instant::now() >= deadline {
+            process.terminate_tree()?;
+            let _ = process.wait()?;
+            return Ok(None);
+        }
+        thread::sleep(POLL_INTERVAL);
+    };
+    let output = match receiver.recv_timeout(Duration::from_millis(100)) {
+        Ok(output) => output?,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            process.terminate_tree()?;
+            receiver
+                .recv_timeout(Duration::from_millis(150))
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "version probe output timed out")
+                })??
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(io::Error::other("version probe output reader stopped"));
+        }
+    };
+    process.terminate_tree()?;
+    let _ = process.wait()?;
+    if exit != ProcessExit::Exited(0) {
+        return Ok(None);
+    }
+    Ok(extract_version(
+        &String::from_utf8_lossy(&output),
+        request
+            .executable
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str),
+    ))
+}
+
+fn apply_launch_context(command: &mut Command, request: &LaunchRequest) {
+    if let Some(current_dir) = request.current_dir.as_deref() {
+        command.current_dir(current_dir);
+    }
+    for (name, value) in &request.env_overrides {
+        match value {
+            Some(value) => {
+                command.env(name, value);
+            }
+            None => {
+                command.env_remove(name);
+            }
+        }
+    }
+}
+
+fn extract_version(output: &str, expected_program: Option<&str>) -> Option<String> {
+    let tokens = output
+        .split_whitespace()
+        .map(|raw| {
+            let normalized = raw.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '+' | '-')
+            });
+            (raw, normalized)
+        })
+        .collect::<Vec<_>>();
+    let candidates = tokens
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, normalized))| valid_version(normalized))
+        .collect::<Vec<_>>();
+    let labeled = candidates
+        .iter()
+        .copied()
+        .filter(|(index, _)| {
+            index
+                .checked_sub(1)
+                .and_then(|previous| tokens.get(previous))
+                .is_some_and(|(_, normalized)| normalized.eq_ignore_ascii_case("version"))
+        })
+        .collect::<Vec<_>>();
+    if let [(_, (_, normalized))] = labeled.as_slice() {
+        return Some((*normalized).to_owned());
+    }
+    let [(_, (_, normalized))] = candidates.as_slice() else {
+        return None;
+    };
+    if tokens.len() == 1 {
+        return Some((*normalized).to_owned());
+    }
+    let expected_program = expected_program?.to_ascii_lowercase();
+    if tokens.iter().any(|(_, marker)| {
+        let marker = marker.to_ascii_lowercase();
+        marker == expected_program
+            || marker
+                .strip_prefix(&expected_program)
+                .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('_'))
+    }) {
+        Some((*normalized).to_owned())
+    } else {
+        None
+    }
+}
+
+pub(crate) fn valid_version(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let value = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))
+        .unwrap_or(value);
+    let suffix_start = value
+        .bytes()
+        .position(|byte| matches!(byte, b'-' | b'+'))
+        .unwrap_or(value.len());
+    let (core, suffix) = value.split_at(suffix_start);
+    let mut component_count = 0;
+    for component in core.split('.') {
+        if component.is_empty() || !component.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        component_count += 1;
+    }
+    component_count >= 2
+        && (suffix.is_empty()
+            || (suffix.len() > 1
+                && suffix.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'+' | b'-')
+                })))
 }
 
 pub(crate) enum BoundedProcessResult {
@@ -118,6 +247,8 @@ pub(crate) fn wait_bounded(
     let deadline = clock.now().saturating_add(timeout);
     loop {
         if let Some(exit) = process.try_wait()? {
+            process.terminate_tree()?;
+            let _ = process.wait()?;
             return Ok(BoundedProcessResult::Exited(exit));
         }
         let now = clock.now();
@@ -136,6 +267,57 @@ struct SystemRunningProcess {
     process_group: libc::pid_t,
     #[cfg(windows)]
     job: windows_job::Job,
+}
+
+fn spawn_managed(command: &mut Command) -> io::Result<SystemRunningProcess> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+        command.creation_flags(CREATE_SUSPENDED);
+    }
+
+    let child = command.spawn()?;
+
+    #[cfg(windows)]
+    let (child, job) = {
+        let mut child = child;
+        let job = match windows_job::assign_kill_on_close_job(&child) {
+            Ok(job) => job,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        if !windows_job::resume_suspended_child(&child) {
+            let _ = job.terminate();
+            let _ = child.kill();
+            return Err(io::Error::other("could not resume managed Windows process"));
+        }
+        (child, job)
+    };
+
+    Ok(SystemRunningProcess {
+        #[cfg(unix)]
+        process_group: child.id() as libc::pid_t,
+        child,
+        #[cfg(windows)]
+        job,
+    })
+}
+
+impl Drop for SystemRunningProcess {
+    fn drop(&mut self) {
+        let _ = terminate_system_tree(self);
+        let _ = self.child.try_wait();
+    }
 }
 
 impl RunningProcess for SystemRunningProcess {
@@ -217,11 +399,19 @@ mod windows_job {
     use std::process::Child;
     use std::ptr;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::{
+        Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        },
+        JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+        Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
     };
 
     pub(super) struct Job(HANDLE);
@@ -269,5 +459,44 @@ mod windows_job {
             return Err(io::Error::last_os_error());
         }
         Ok(job)
+    }
+
+    pub(super) fn resume_suspended_child(child: &Child) -> bool {
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+
+        let mut entry = THREADENTRY32 {
+            dwSize: size_of::<THREADENTRY32>() as u32,
+            ..Default::default()
+        };
+        let mut thread_ids = Vec::new();
+        let mut has_entry = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+        let mut enumeration_complete = false;
+        while has_entry {
+            if entry.th32OwnerProcessID == child.id() {
+                thread_ids.push(entry.th32ThreadID);
+            }
+            has_entry = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+            if !has_entry {
+                enumeration_complete = unsafe { GetLastError() } == ERROR_NO_MORE_FILES;
+            }
+        }
+        unsafe { CloseHandle(snapshot) };
+
+        if !enumeration_complete {
+            return false;
+        }
+        let [thread_id] = thread_ids.as_slice() else {
+            return false;
+        };
+        let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, *thread_id) };
+        if thread.is_null() {
+            return false;
+        }
+        let previous_suspend_count = unsafe { ResumeThread(thread) };
+        unsafe { CloseHandle(thread) };
+        previous_suspend_count == 1
     }
 }

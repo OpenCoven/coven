@@ -624,12 +624,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
-            non_interactive_prompt_prefix_args: vec![
-                "exec".to_string(),
-                "--skip-git-repo-check".to_string(),
-                "--color".to_string(),
-                "never".to_string(),
-            ],
+            non_interactive_prompt_prefix_args: crate::setup::codex::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
             install_hint: crate::setup::codex::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
@@ -678,7 +676,10 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
-            non_interactive_prompt_prefix_args: vec!["--print".to_string()],
+            non_interactive_prompt_prefix_args: crate::setup::claude::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
             install_hint: crate::setup::claude::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
@@ -787,13 +788,16 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
             // one-shots are `--prompt <text>` and interactive-with-prompt is
             // `--interactive <text>`. Both ride the `=` form via
             // `prompt_args`. Verified against the installed copilot CLI.
-            prompt_flag: Some("--prompt".to_string()),
+            prompt_flag: Some(crate::setup::copilot::PROMPT_FLAG.to_string()),
             interactive_prompt_flag: Some("--interactive".to_string()),
             interactive_prompt_prefix_args: Vec::new(),
             // Copilot colorizes whenever it sees a TTY, and Coven runs
             // non-interactive launches under a PTY — mirror codex's
             // `--color never` hygiene. Interactive launches keep color.
-            non_interactive_prompt_prefix_args: vec!["--no-color".to_string()],
+            non_interactive_prompt_prefix_args: crate::setup::copilot::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
             install_hint: crate::setup::copilot::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
