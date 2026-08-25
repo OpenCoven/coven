@@ -427,11 +427,8 @@ impl MaintenanceGate {
 
     fn validate_participant(&self, participant: &WriterParticipant, now: u64) -> Result<()> {
         let path = self.writers_dir().join(writer_file_name(&participant.id));
-        let metadata = fs::symlink_metadata(&path).map_err(|_| GateError::ParticipantInvalid)?;
-        if !metadata.file_type().is_file() {
-            return Err(GateError::ParticipantInvalid.into());
-        }
-        let mut file = fs::File::open(&path).map_err(|_| GateError::ParticipantInvalid)?;
+        let (mut file, metadata) =
+            open_participant_file(&path).map_err(|_| GateError::ParticipantInvalid)?;
         let mut data = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
         file.read_to_end(&mut data)
             .map_err(|_| GateError::ParticipantInvalid)?;
@@ -448,19 +445,9 @@ impl MaintenanceGate {
 
     fn release_writer(&self, path: &Path, generation: &str) {
         let _ = self.with_lock(|| {
-            let Ok(metadata) = fs::symlink_metadata(path) else {
+            let Ok(data) = fs::read(path) else {
                 return Ok(());
             };
-            if !metadata.file_type().is_file() {
-                return Ok(());
-            }
-            let Ok(mut file) = fs::File::open(path) else {
-                return Ok(());
-            };
-            let mut data = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
-            if file.read_to_end(&mut data).is_err() {
-                return Ok(());
-            }
             let Ok(intent) = serde_json::from_slice::<WriterIntent>(&data) else {
                 return Ok(());
             };
@@ -499,6 +486,45 @@ impl MaintenanceGate {
             .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn open_participant_file(path: &Path) -> std::io::Result<(fs::File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "participant entry is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(windows)]
+fn open_participant_file(path: &Path) -> std::io::Result<(fs::File, fs::Metadata)> {
+    use std::os::windows::fs::{FileTypeExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let file_type = metadata.file_type();
+    if !metadata.is_file() || file_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "participant entry is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
 }
 
 #[cfg(not(windows))]
@@ -987,9 +1013,17 @@ mod tests {
     fn owner_rejects_symlinked_participant_writer_without_touching_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
-        let writer = gate.acquire_writer("session-self", "session")?;
-        let participant = writer.participant().clone();
+        let mut writer = Some(gate.acquire_writer("session-self", "session")?);
+        let participant = writer
+            .as_ref()
+            .expect("writer present")
+            .participant()
+            .clone();
         let writer_path = gate.writers_dir().join(writer_file_name(&participant.id));
+        let backup_path = gate
+            .writers_dir()
+            .join(format!("{}.backup", writer_file_name(&participant.id)));
+        fs::rename(&writer_path, &backup_path)?;
         let external_path = temp.path().join("external-writer.json");
         let external_writer = WriterIntent {
             id: participant.id.clone(),
@@ -998,8 +1032,6 @@ mod tests {
             expires_at: unix_now() + WRITER_TTL.as_secs(),
         };
         fs::write(&external_path, serde_json::to_vec(&external_writer)?)?;
-        std::mem::forget(writer);
-        fs::remove_file(&writer_path)?;
         symlink(&external_path, &writer_path)?;
 
         let before = fs::read(&external_path)?;
@@ -1011,6 +1043,9 @@ mod tests {
             .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
         assert_eq!(fs::read(&external_path)?, before);
         assert!(gate.read_owner()?.is_none());
+        fs::remove_file(&writer_path)?;
+        fs::rename(&backup_path, &writer_path)?;
+        drop(writer.take());
         Ok(())
     }
 
