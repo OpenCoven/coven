@@ -9,7 +9,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -336,10 +336,10 @@ impl MaintenanceGate {
         self.with_lock(|| {
             let now = unix_now();
             let owner = self.read_owner()?;
-            let writers = self.read_writers(now)?;
-            let writers = owner.as_ref().map_or(writers.clone(), |owner| {
-                blocking_writers(owner, writers.clone())
-            });
+            let mut writers = self.read_writers(now)?;
+            if let Some(owner) = owner.as_ref() {
+                writers = blocking_writers(owner, writers);
+            }
             Ok(GateStatus { owner, writers })
         })
     }
@@ -427,7 +427,14 @@ impl MaintenanceGate {
 
     fn validate_participant(&self, participant: &WriterParticipant, now: u64) -> Result<()> {
         let path = self.writers_dir().join(writer_file_name(&participant.id));
-        let data = fs::read(&path).map_err(|_| GateError::ParticipantInvalid)?;
+        let metadata = fs::symlink_metadata(&path).map_err(|_| GateError::ParticipantInvalid)?;
+        if !metadata.file_type().is_file() {
+            return Err(GateError::ParticipantInvalid.into());
+        }
+        let mut file = fs::File::open(&path).map_err(|_| GateError::ParticipantInvalid)?;
+        let mut data = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+        file.read_to_end(&mut data)
+            .map_err(|_| GateError::ParticipantInvalid)?;
         let writer: WriterIntent =
             serde_json::from_slice(&data).map_err(|_| GateError::ParticipantInvalid)?;
         if writer.id != participant.id
@@ -441,9 +448,19 @@ impl MaintenanceGate {
 
     fn release_writer(&self, path: &Path, generation: &str) {
         let _ = self.with_lock(|| {
-            let Ok(data) = fs::read(path) else {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
                 return Ok(());
             };
+            if !metadata.file_type().is_file() {
+                return Ok(());
+            }
+            let Ok(mut file) = fs::File::open(path) else {
+                return Ok(());
+            };
+            let mut data = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+            if file.read_to_end(&mut data).is_err() {
+                return Ok(());
+            }
             let Ok(intent) = serde_json::from_slice::<WriterIntent>(&data) else {
                 return Ok(());
             };
@@ -962,6 +979,60 @@ mod tests {
             .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
         assert!(gate.read_owner()?.is_none());
         drop(replacement_writer);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_rejects_symlinked_participant_writer_without_touching_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer = gate.acquire_writer("session-self", "session")?;
+        let participant = writer.participant().clone();
+        let writer_path = gate.writers_dir().join(writer_file_name(&participant.id));
+        let external_path = temp.path().join("external-writer.json");
+        let external_writer = WriterIntent {
+            id: participant.id.clone(),
+            kind: "session".into(),
+            generation: participant.generation.clone(),
+            expires_at: unix_now() + WRITER_TTL.as_secs(),
+        };
+        fs::write(&external_path, serde_json::to_vec(&external_writer)?)?;
+        std::mem::forget(writer);
+        fs::remove_file(&writer_path)?;
+        symlink(&external_path, &writer_path)?;
+
+        let before = fs::read(&external_path)?;
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("symlinked participant writer must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert_eq!(fs::read(&external_path)?, before);
+        assert!(gate.read_owner()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_rejects_non_regular_participant_writer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let participant = WriterParticipant {
+            id: "session-self".into(),
+            generation: "gen-1".into(),
+        };
+        let writer_path = gate.writers_dir().join(writer_file_name(&participant.id));
+        fs::create_dir(&writer_path)?;
+
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("directory participant writer must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert!(gate.read_owner()?.is_none());
         Ok(())
     }
 

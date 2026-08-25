@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::env::VarError;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Read;
@@ -1574,6 +1575,18 @@ fn maintenance_participant_from_value(
         .transpose()
 }
 
+fn maintenance_participant_from_env_value(
+    value: std::result::Result<String, VarError>,
+) -> Result<Option<maintenance_gate::WriterParticipant>> {
+    match value {
+        Ok(value) => maintenance_participant_from_value(Some(&value)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("COVEN_MAINTENANCE_PARTICIPANT must be valid UTF-8")
+        }
+    }
+}
+
 fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let gate = maintenance_gate::MaintenanceGate::discover(&cwd)?;
@@ -1587,11 +1600,9 @@ fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
             wait_ms,
             json,
         } => {
-            let participant = maintenance_participant_from_value(
-                std::env::var(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV)
-                    .ok()
-                    .as_deref(),
-            )?;
+            let participant = maintenance_participant_from_env_value(std::env::var(
+                maintenance_gate::MAINTENANCE_PARTICIPANT_ENV,
+            ))?;
             let mut lease = gate.acquire_owner(owner, participant)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
             let mut status = lease.refresh_phase()?;
@@ -5214,6 +5225,8 @@ mod tests {
         MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn tui_launcher_and_session_browser_are_owned_by_tui_modules() {
@@ -5343,6 +5356,26 @@ mod tests {
                 .expect("participant should parse");
         assert_eq!(participant.id, "writer-1");
         assert_eq!(participant.generation, "gen-1");
+    }
+
+    #[test]
+    fn maintenance_participant_env_helper_is_fail_closed() {
+        assert_eq!(
+            maintenance_participant_from_env_value(Err(VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert!(maintenance_participant_from_env_value(Ok("not-json".into())).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn maintenance_participant_env_helper_rejects_non_utf8() {
+        let invalid = OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f]);
+        let error = maintenance_participant_from_env_value(Err(VarError::NotUnicode(invalid)))
+            .expect_err("non-UTF-8 participant env must be rejected");
+        assert!(error
+            .to_string()
+            .contains("COVEN_MAINTENANCE_PARTICIPANT must be valid UTF-8"));
     }
 
     #[test]
