@@ -43,6 +43,7 @@ mod harness;
 /// Public at the crate root so every adapter entrypoint shares one contract
 /// vocabulary instead of re-declaring embedded runner details.
 pub mod harness_contract;
+mod help;
 mod hub;
 mod maintenance_gate;
 mod memory_dashboard;
@@ -94,15 +95,13 @@ const COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID: &str = "COVEN_CODE_ANTHROPIC_OAUTH_C
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
+#[command(bin_name = "coven")]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
     long_about = "Coven runs Codex, Claude Code, GitHub Copilot CLI, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."
 )]
-#[command(after_help = "Common first steps:
-  coven doctor                    check your local setup and harnesses
-  coven run codex \"<task>\"        run a task in a recorded session
-  coven sessions                  browse recorded sessions
-  coven status                    see daemon, sessions, familiars, and hub at a glance")]
+#[command(help_template = help::TOP_LEVEL_HELP_TEMPLATE)]
+#[command(after_help = help::TOP_LEVEL_AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -278,7 +277,7 @@ enum Command {
     },
     #[command(about = "Manage the local Coven daemon")]
     #[command(
-        long_about = "Manage the local Coven daemon that hosts live sessions and the local socket API. `daemon start` launches the hidden `coven daemon serve` entrypoint in the background; serve is the internal foreground server process and is not meant to be run by hand."
+        long_about = "Manage the local Coven daemon that hosts live sessions and the local socket API. `daemon start` launches the background daemon process when it is not already running; the long-running foreground server process stays internal and is not meant to be run by hand."
     )]
     #[command(after_help = "Examples:
   coven daemon start     start the daemon if it is not already running
@@ -1167,6 +1166,12 @@ fn main() -> Result<()> {
         }
     }
 
+    let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    if let Some(result) = help::maybe_run_from_raw_args(&raw_args) {
+        result?;
+        return Ok(());
+    }
+
     let cli = Cli::parse().validate().unwrap_or_else(|error| error.exit());
     // This diagnostic must not create COVEN_HOME through the shared state lock
     // or read settings contents during startup. It is deliberately the one
@@ -1295,13 +1300,8 @@ fn run_cli(cli: Cli) -> Result<()> {
             config_paths::print_json()
         }
         Some(Command::Completions { shell }) => {
-            use clap::CommandFactory;
-            clap_complete::generate(
-                shell,
-                &mut Cli::command(),
-                "coven",
-                &mut io::stdout().lock(),
-            );
+            let mut command = help::completion_command();
+            clap_complete::generate(shell, &mut command, "coven", &mut io::stdout().lock());
             Ok(())
         }
         Some(Command::Adapter { command }) => run_adapter_command(command),

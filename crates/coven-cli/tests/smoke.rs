@@ -1191,6 +1191,55 @@ fn completions_generate_for_supported_shells() -> anyhow::Result<()> {
 }
 
 #[test]
+fn completions_expose_progressive_help_flags_and_hide_internal_targets() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    fs::create_dir_all(&coven_home)?;
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let coven = coven_bin();
+
+    let bash = run_coven(&coven, &coven_home, &path, &["completions", "bash"])?;
+    assert_success("completions bash progressive help", &bash);
+    let stdout = String::from_utf8(bash.stdout)?;
+
+    let root_opts = bash_completion_opts(&stdout, "coven").context("missing root completion")?;
+    assert!(root_opts.contains(&"-h"));
+    assert!(root_opts.contains(&"--help"));
+    assert!(root_opts.contains(&"run"));
+    assert!(root_opts.contains(&"help"));
+    assert!(!root_opts.contains(&"process-supervisor"));
+
+    let daemon_opts = bash_completion_opts(&stdout, "coven__subcmd__daemon")
+        .context("missing daemon completion")?;
+    assert!(daemon_opts.contains(&"-h"));
+    assert!(daemon_opts.contains(&"--help"));
+
+    let help_opts =
+        bash_completion_opts(&stdout, "coven__subcmd__help").context("missing help completion")?;
+    assert!(help_opts.contains(&"-h"));
+    assert!(help_opts.contains(&"--help"));
+    assert!(help_opts.contains(&"--all"));
+    assert!(help_opts.contains(&"--json"));
+    assert!(help_opts.contains(&"--color"));
+    assert!(help_opts.contains(&"daemon"));
+    assert!(help_opts.contains(&"run"));
+    assert!(help_opts.contains(&"help"));
+    assert!(!help_opts.contains(&"process-supervisor"));
+
+    let daemon_help_opts = bash_completion_opts(&stdout, "coven__subcmd__daemon__subcmd__help")
+        .context("missing daemon help completion")?;
+    assert!(daemon_help_opts.contains(&"-h"));
+    assert!(daemon_help_opts.contains(&"--help"));
+    assert!(daemon_help_opts.contains(&"start"));
+    assert!(daemon_help_opts.contains(&"status"));
+    assert!(!daemon_help_opts.contains(&"serve"));
+
+    assert!(!stdout.contains("process-supervisor"));
+    assert!(!stdout.contains("daemon__subcmd__serve"));
+    Ok(())
+}
+
+#[test]
 fn color_flag_parses_and_rejects_unknown_values() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -1967,6 +2016,21 @@ fn assert_stdout_not_contains(label: &str, output: &Output, needle: &str) {
         "{label} stdout unexpectedly contained {needle:?}\nstdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn bash_completion_opts<'a>(script: &'a str, case_label: &str) -> Option<Vec<&'a str>> {
+    let marker = format!("{case_label})");
+    let section = script.split_once(&marker)?.1;
+    let opts_line = section
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("opts=\""))?;
+    let opts = opts_line
+        .strip_prefix("opts=\"")?
+        .strip_suffix('"')?
+        .split_whitespace()
+        .collect();
+    Some(opts)
 }
 
 fn prepend_path(fake_bin: &Path) -> OsString {
