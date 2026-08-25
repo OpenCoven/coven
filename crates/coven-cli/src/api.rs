@@ -10888,7 +10888,7 @@ mod tests {
             .status()?;
         assert!(init.success());
         let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
-        let owner = gate.acquire_owner("cave-delete")?;
+        let owner = gate.acquire_owner("cave-delete", None)?;
         let runtime = RecordingRuntime::default();
         let body = json!({
             "projectRoot": project_root,
@@ -10938,7 +10938,7 @@ mod tests {
             .status()?;
         assert!(init.success());
         let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
-        let owner = gate.acquire_owner("cave-delete")?;
+        let owner = gate.acquire_owner("cave-delete", None)?;
 
         let (response, runtime) =
             run_bound_launch(&temp_dir, &project_root, "sage", root_binding("sage"))?;
@@ -11701,7 +11701,7 @@ mod tests {
 
         runtime.release_writer()?;
         assert!(maintenance.status()?.writers.is_empty());
-        let owner = maintenance.acquire_owner("after-retained-writer")?;
+        let owner = maintenance.acquire_owner("after-retained-writer", None)?;
         owner.assert_held()?;
         owner.release()?;
         Ok(())
@@ -11762,7 +11762,7 @@ mod tests {
         assert_eq!(store::list_sessions(&conn)?.len(), 1);
         assert_eq!(adoption_row_count(temp.path())?, 1);
         assert!(maintenance.status()?.writers.is_empty());
-        let owner = maintenance.acquire_owner("after-transaction-replay")?;
+        let owner = maintenance.acquire_owner("after-transaction-replay", None)?;
         owner.assert_held()?;
         owner.release()?;
         Ok(())
@@ -11827,7 +11827,7 @@ mod tests {
         assert_eq!(store::list_sessions(&conn)?.len(), 1);
         assert_eq!(adoption_row_count(temp.path())?, 1);
         assert!(maintenance.status()?.writers.is_empty());
-        let owner = maintenance.acquire_owner("after-transaction-conflict")?;
+        let owner = maintenance.acquire_owner("after-transaction-conflict", None)?;
         owner.assert_held()?;
         owner.release()?;
         Ok(())
@@ -11956,7 +11956,7 @@ mod tests {
         assert_eq!(first.status, 201, "{}", first.body);
 
         let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
-        let owner = maintenance.acquire_owner("test-maintenance")?;
+        let owner = maintenance.acquire_owner("test-maintenance", None)?;
         let replay = post_adopted_launch(temp.path(), &body, &runtime)?;
         assert_eq!(replay.status, 200, "{}", replay.body);
         owner.release()?;
@@ -12799,7 +12799,7 @@ mod tests {
             .status()?;
         assert!(git.success());
         let maintenance = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
-        let owner = maintenance.acquire_owner("precedence-owner")?;
+        let owner = maintenance.acquire_owner("precedence-owner", None)?;
         let child = child_binding("sage", "missing-parent", "graph-1", "node-1", "attempt-1");
         let mut invalid_child =
             adopted_launch_body(&project_root, "sage", child, "invalid child key");
@@ -14550,7 +14550,7 @@ mod tests {
             .status()?;
         assert!(init.success());
         let gate = crate::maintenance_gate::MaintenanceGate::discover(&project_root)?;
-        let owner = gate.acquire_owner("cave-delete")?;
+        let owner = gate.acquire_owner("cave-delete", None)?;
 
         // An invalid binding (missing familiarId at the top level) must be
         // reported before the maintenance gate is ever consulted.

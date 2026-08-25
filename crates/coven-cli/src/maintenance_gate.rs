@@ -9,7 +9,7 @@
 
 use std::{
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -29,6 +29,7 @@ const LOCK_WAIT: Duration = Duration::from_secs(5);
 const WRITER_TTL: Duration = Duration::from_secs(90);
 const OWNER_TTL: Duration = Duration::from_secs(120);
 const RENEW_EVERY: Duration = Duration::from_secs(20);
+pub const MAINTENANCE_PARTICIPANT_ENV: &str = "COVEN_MAINTENANCE_PARTICIPANT";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Owner {
@@ -36,6 +37,8 @@ pub struct Owner {
     pub generation: String,
     pub expires_at: u64,
     pub phase: OwnerPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<WriterParticipant>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -54,6 +57,27 @@ pub struct WriterIntent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriterParticipant {
+    pub id: String,
+    pub generation: String,
+}
+
+impl WriterParticipant {
+    pub fn encode(&self) -> Result<String> {
+        serde_json::to_string(self).context("failed to serialize maintenance participant")
+    }
+
+    pub fn decode(value: &str) -> Result<Self> {
+        let participant: Self =
+            serde_json::from_str(value).context("failed to parse maintenance participant")?;
+        if participant.id.trim().is_empty() || participant.generation.trim().is_empty() {
+            anyhow::bail!("maintenance participant must include non-blank id and generation");
+        }
+        Ok(participant)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GateStatus {
     pub owner: Option<Owner>,
     pub writers: Vec<WriterIntent>,
@@ -67,6 +91,7 @@ pub enum GateError {
     OwnerChanged,
     LeaseExpired,
     Contended,
+    ParticipantInvalid,
 }
 
 impl std::fmt::Display for GateError {
@@ -95,6 +120,10 @@ impl std::fmt::Display for GateError {
             Self::OwnerChanged => write!(f, "maintenance ownership changed; acquire a new fence"),
             Self::LeaseExpired => write!(f, "maintenance lease expired; acquire a new fence"),
             Self::Contended => write!(f, "maintenance state is contended; retry"),
+            Self::ParticipantInvalid => write!(
+                f,
+                "maintenance participant is stale, missing, or mismatched"
+            ),
         }
     }
 }
@@ -203,7 +232,7 @@ impl MaintenanceGate {
     }
 
     #[cfg(test)]
-    fn at(common_dir: PathBuf) -> Self {
+    pub(crate) fn at_for_test(common_dir: PathBuf) -> Self {
         Self { common_dir }
     }
 
@@ -266,13 +295,18 @@ impl MaintenanceGate {
     /// Acquire an owner fence. New writers are refused from the instant this
     /// record is published. Existing writers remain visible while Cave drains
     /// them; the phase becomes `held` only after they have all left.
-    pub fn acquire_owner(&self, owner_id: impl Into<String>) -> Result<OwnerLease> {
+    pub fn acquire_owner(
+        &self,
+        owner_id: impl Into<String>,
+        participant: Option<WriterParticipant>,
+    ) -> Result<OwnerLease> {
         self.ensure_layout()?;
         let owner = Owner {
             owner_id: owner_id.into(),
             generation: Uuid::new_v4().to_string(),
             expires_at: unix_now() + OWNER_TTL.as_secs(),
             phase: OwnerPhase::Draining,
+            participant,
         };
         self.with_lock(|| {
             if let Some(existing) = self.read_owner()? {
@@ -281,6 +315,9 @@ impl MaintenanceGate {
                 }
                 fs::remove_file(self.owner_path())
                     .with_context(|| "failed to remove expired maintenance owner")?;
+            }
+            if let Some(participant) = &owner.participant {
+                self.validate_participant(participant, unix_now())?;
             }
             self.write_new(&self.owner_path(), &owner)
                 .with_context(|| "failed to publish maintenance owner")?;
@@ -299,20 +336,25 @@ impl MaintenanceGate {
         self.with_lock(|| {
             let now = unix_now();
             let owner = self.read_owner()?;
-            let writers = self.read_writers(now)?;
+            let mut writers = self.read_writers(now)?;
+            if let Some(owner) = owner.as_ref() {
+                writers = blocking_writers(owner, writers);
+            }
             Ok(GateStatus { owner, writers })
         })
     }
 
     pub fn heartbeat_owner(&self, owner_id: &str, generation: &str) -> Result<GateStatus> {
+        let owner = self.with_lock(|| {
+            let owner = self.read_owner()?.ok_or(GateError::OwnerChanged)?;
+            if owner.owner_id != owner_id || owner.generation != generation {
+                return Err(GateError::OwnerChanged.into());
+            }
+            Ok(owner)
+        })?;
         let mut lease = OwnerLease {
             gate: self.clone(),
-            owner: Owner {
-                owner_id: owner_id.to_string(),
-                generation: generation.to_string(),
-                expires_at: 0,
-                phase: OwnerPhase::Draining,
-            },
+            owner,
         };
         lease.refresh_phase()
     }
@@ -325,6 +367,7 @@ impl MaintenanceGate {
                 generation: generation.to_string(),
                 expires_at: 0,
                 phase: OwnerPhase::Draining,
+                participant: None,
             },
         }
         .release()
@@ -382,6 +425,24 @@ impl MaintenanceGate {
         })
     }
 
+    fn validate_participant(&self, participant: &WriterParticipant, now: u64) -> Result<()> {
+        let path = self.writers_dir().join(writer_file_name(&participant.id));
+        let (mut file, metadata) =
+            open_participant_file(&path).map_err(|_| GateError::ParticipantInvalid)?;
+        let mut data = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+        file.read_to_end(&mut data)
+            .map_err(|_| GateError::ParticipantInvalid)?;
+        let writer: WriterIntent =
+            serde_json::from_slice(&data).map_err(|_| GateError::ParticipantInvalid)?;
+        if writer.id != participant.id
+            || writer.generation != participant.generation
+            || writer.expires_at <= now
+        {
+            return Err(GateError::ParticipantInvalid.into());
+        }
+        Ok(())
+    }
+
     fn release_writer(&self, path: &Path, generation: &str) {
         let _ = self.with_lock(|| {
             let Ok(data) = fs::read(path) else {
@@ -425,6 +486,45 @@ impl MaintenanceGate {
             .with_context(|| format!("failed to replace {}", path.display()))?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn open_participant_file(path: &Path) -> std::io::Result<(fs::File, fs::Metadata)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "participant entry is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+#[cfg(windows)]
+fn open_participant_file(path: &Path) -> std::io::Result<(fs::File, fs::Metadata)> {
+    use std::os::windows::fs::{FileTypeExt, OpenOptionsExt};
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    let file_type = metadata.file_type();
+    if !metadata.is_file() || file_type.is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "participant entry is not a regular file",
+        ));
+    }
+    Ok((file, metadata))
 }
 
 #[cfg(not(windows))]
@@ -471,7 +571,7 @@ fn replace_file(staged: &Path, path: &Path) -> std::io::Result<()> {
 pub struct WriterLease {
     gate: MaintenanceGate,
     path: PathBuf,
-    generation: String,
+    participant: WriterParticipant,
     stopper: Arc<(Mutex<bool>, Condvar)>,
     renewer: Option<thread::JoinHandle<()>>,
 }
@@ -482,7 +582,11 @@ impl WriterLease {
         let thread_stopper = Arc::clone(&stopper);
         let thread_gate = gate.clone();
         let thread_path = path.clone();
-        let generation = intent.generation.clone();
+        let participant = WriterParticipant {
+            id: intent.id.clone(),
+            generation: intent.generation.clone(),
+        };
+        let thread_participant = participant.clone();
         let renewer = thread::spawn(move || {
             loop {
                 let (stopped, wake) = &*thread_stopper;
@@ -494,7 +598,10 @@ impl WriterLease {
                     return;
                 }
                 drop(guard);
-                if thread_gate.renew_writer(&thread_path, &generation).is_err() {
+                if thread_gate
+                    .renew_writer(&thread_path, &thread_participant.generation)
+                    .is_err()
+                {
                     // Keep trying: a transient rename failure must not make a
                     // still-running session invisible to a maintenance owner.
                 }
@@ -503,10 +610,18 @@ impl WriterLease {
         Self {
             gate,
             path,
-            generation: intent.generation,
+            participant,
             stopper,
             renewer: Some(renewer),
         }
+    }
+
+    pub fn participant(&self) -> &WriterParticipant {
+        &self.participant
+    }
+
+    pub fn participant_capability(&self) -> Result<String> {
+        self.participant().encode()
     }
 }
 
@@ -520,10 +635,12 @@ impl Drop for WriterLease {
         if let Some(renewer) = self.renewer.take() {
             let _ = renewer.join();
         }
-        self.gate.release_writer(&self.path, &self.generation);
+        self.gate
+            .release_writer(&self.path, &self.participant.generation);
     }
 }
 
+#[derive(Debug)]
 pub struct OwnerLease {
     gate: MaintenanceGate,
     owner: Owner,
@@ -547,9 +664,10 @@ impl OwnerLease {
                 return Err(GateError::LeaseExpired.into());
             }
             let writers = self.gate.read_writers(unix_now())?;
+            let blocking_writers = blocking_writers(&current, writers);
             let mut next = current;
             next.expires_at = unix_now() + OWNER_TTL.as_secs();
-            next.phase = if writers.is_empty() {
+            next.phase = if blocking_writers.is_empty() {
                 OwnerPhase::Held
             } else {
                 OwnerPhase::Draining
@@ -558,7 +676,7 @@ impl OwnerLease {
             self.owner = next.clone();
             Ok(GateStatus {
                 owner: Some(next),
-                writers,
+                writers: blocking_writers,
             })
         })
     }
@@ -654,6 +772,17 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn blocking_writers(owner: &Owner, writers: Vec<WriterIntent>) -> Vec<WriterIntent> {
+    writers
+        .into_iter()
+        .filter(|writer| {
+            owner.participant.as_ref().is_none_or(|participant| {
+                writer.id != participant.id || writer.generation != participant.generation
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,7 +846,7 @@ mod tests {
     #[test]
     fn live_gate_lock_blocks_a_second_acquirer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let _first = GateLock::acquire(gate.lock_path())?;
 
@@ -730,7 +859,7 @@ mod tests {
     #[test]
     fn dropping_gate_lock_allows_the_next_acquirer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let first = GateLock::acquire(gate.lock_path())?;
         drop(first);
@@ -743,7 +872,7 @@ mod tests {
     #[test]
     fn stale_mtime_does_not_allow_live_gate_lock_takeover() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let _first = GateLock::acquire(gate.lock_path())?;
         let lock_file = fs::OpenOptions::new().write(true).open(gate.lock_path())?;
@@ -761,7 +890,7 @@ mod tests {
     #[test]
     fn symlinked_gate_lock_is_refused_without_touching_the_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let outside = tempfile::NamedTempFile::new()?;
         fs::write(outside.path(), b"outside-lock-target")?;
@@ -778,7 +907,7 @@ mod tests {
     #[test]
     fn multiply_linked_gate_lock_is_refused() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         fs::write(gate.lock_path(), b"lock")?;
         let alias = temp.path().join("lock-alias");
@@ -794,8 +923,8 @@ mod tests {
     #[test]
     fn owner_rejects_a_writer_until_release() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
-        let owner = gate.acquire_owner("cave")?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let owner = gate.acquire_owner("cave", None)?;
         assert_eq!(owner.owner().phase, OwnerPhase::Held);
         let error = gate.acquire_writer("session-1", "session").unwrap_err();
         assert!(error
@@ -809,9 +938,9 @@ mod tests {
     #[test]
     fn owner_drains_existing_writer_then_becomes_held() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer = gate.acquire_writer("session-1", "session")?;
-        let mut owner = gate.acquire_owner("cave")?;
+        let mut owner = gate.acquire_owner("cave", None)?;
         assert_eq!(owner.owner().phase, OwnerPhase::Draining);
         drop(writer);
         assert!(owner.refresh_phase()?.writers.is_empty());
@@ -821,9 +950,165 @@ mod tests {
     }
 
     #[test]
+    fn owner_excludes_only_its_exact_participant_writer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer_self = gate.acquire_writer("session-self", "session")?;
+        let writer_other = gate.acquire_writer("session-other", "session")?;
+        let participant = writer_self.participant().clone();
+        let mut owner = gate.acquire_owner("cave", Some(participant))?;
+
+        let status = owner.refresh_phase()?;
+        assert_eq!(status.writers.len(), 1);
+        assert_eq!(status.writers[0].id, "session-other");
+        assert_eq!(owner.owner().phase, OwnerPhase::Draining);
+
+        drop(writer_other);
+        assert!(owner.refresh_phase()?.writers.is_empty());
+        owner.assert_held()?;
+        owner.release()?;
+        Ok(())
+    }
+
+    #[test]
+    fn owner_rejects_a_stale_or_forged_participant_generation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer = gate.acquire_writer("session-self", "session")?;
+        let mut participant = writer.participant().clone();
+        participant.generation.push_str("-forged");
+
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("forged participant must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert!(gate.read_owner()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_does_not_exclude_a_replacement_writer_with_the_same_id() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let first_writer = gate.acquire_writer("session-self", "session")?;
+        let participant = first_writer.participant().clone();
+        drop(first_writer);
+
+        let replacement_writer = gate.acquire_writer("session-self", "session")?;
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("stale participant must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert!(gate.read_owner()?.is_none());
+        drop(replacement_writer);
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owner_rejects_symlinked_participant_writer_without_touching_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let mut writer = Some(gate.acquire_writer("session-self", "session")?);
+        let participant = writer
+            .as_ref()
+            .expect("writer present")
+            .participant()
+            .clone();
+        let writer_path = gate.writers_dir().join(writer_file_name(&participant.id));
+        let backup_path = gate
+            .writers_dir()
+            .join(format!("{}.backup", writer_file_name(&participant.id)));
+        fs::rename(&writer_path, &backup_path)?;
+        let external_path = temp.path().join("external-writer.json");
+        let external_writer = WriterIntent {
+            id: participant.id.clone(),
+            kind: "session".into(),
+            generation: participant.generation.clone(),
+            expires_at: unix_now() + WRITER_TTL.as_secs(),
+        };
+        fs::write(&external_path, serde_json::to_vec(&external_writer)?)?;
+        symlink(&external_path, &writer_path)?;
+
+        let before = fs::read(&external_path)?;
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("symlinked participant writer must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert_eq!(fs::read(&external_path)?, before);
+        assert!(gate.read_owner()?.is_none());
+        fs::remove_file(&writer_path)?;
+        fs::rename(&backup_path, &writer_path)?;
+        drop(writer.take());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_rejects_non_regular_participant_writer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        gate.ensure_layout()?;
+        let participant = WriterParticipant {
+            id: "session-self".into(),
+            generation: "gen-1".into(),
+        };
+        let writer_path = gate.writers_dir().join(writer_file_name(&participant.id));
+        fs::create_dir(&writer_path)?;
+
+        let error = gate
+            .acquire_owner("cave", Some(participant))
+            .expect_err("directory participant writer must be rejected");
+        assert!(error
+            .downcast_ref::<GateError>()
+            .is_some_and(|e| matches!(e, GateError::ParticipantInvalid)));
+        assert!(gate.read_owner()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn owner_without_participant_remains_backward_compatible() -> Result<()> {
+        let owner: Owner = serde_json::from_str(
+            r#"{"owner_id":"cave","generation":"g1","expires_at":123,"phase":"held"}"#,
+        )?;
+        assert_eq!(owner.participant, None);
+        Ok(())
+    }
+
+    #[test]
+    fn writer_participant_encode_decode_round_trips_and_rejects_blank_fields() -> Result<()> {
+        let participant = WriterParticipant {
+            id: "session-self".into(),
+            generation: "gen-1".into(),
+        };
+        let encoded = participant.encode()?;
+        assert_eq!(&WriterParticipant::decode(&encoded)?, &participant);
+        assert!(WriterParticipant::decode(r#"{"id":" ","generation":"gen"}"#).is_err());
+        assert!(WriterParticipant::decode(r#"{"id":"session","generation":" "}"#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn writer_lease_participant_capability_uses_public_env_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer = gate.acquire_writer("session-self", "session")?;
+        let capability = writer.participant_capability()?;
+        let decoded = WriterParticipant::decode(&capability)?;
+        assert_eq!(decoded, *writer.participant());
+        assert_eq!(MAINTENANCE_PARTICIPANT_ENV, "COVEN_MAINTENANCE_PARTICIPANT");
+        Ok(())
+    }
+
+    #[test]
     fn malformed_owner_fails_closed() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         fs::write(gate.owner_path(), b"not-json")?;
         let error = gate.acquire_writer("session-1", "session").unwrap_err();

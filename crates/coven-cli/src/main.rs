@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::env::VarError;
 use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::io::Read;
@@ -1566,6 +1567,26 @@ fn setup_candidate_commit() -> String {
     env!("COVEN_BUILD_COMMIT").to_owned()
 }
 
+fn maintenance_participant_from_value(
+    value: Option<&str>,
+) -> Result<Option<maintenance_gate::WriterParticipant>> {
+    value
+        .map(maintenance_gate::WriterParticipant::decode)
+        .transpose()
+}
+
+fn maintenance_participant_from_env_value(
+    value: std::result::Result<String, VarError>,
+) -> Result<Option<maintenance_gate::WriterParticipant>> {
+    match value {
+        Ok(value) => maintenance_participant_from_value(Some(&value)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => {
+            anyhow::bail!("COVEN_MAINTENANCE_PARTICIPANT must be valid UTF-8")
+        }
+    }
+}
+
 fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let gate = maintenance_gate::MaintenanceGate::discover(&cwd)?;
@@ -1579,7 +1600,10 @@ fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
             wait_ms,
             json,
         } => {
-            let mut lease = gate.acquire_owner(owner)?;
+            let participant = maintenance_participant_from_env_value(std::env::var(
+                maintenance_gate::MAINTENANCE_PARTICIPANT_ENV,
+            ))?;
+            let mut lease = gate.acquire_owner(owner, participant)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
             let mut status = lease.refresh_phase()?;
             while !status.writers.is_empty() && std::time::Instant::now() < deadline {
@@ -1657,6 +1681,19 @@ fn acquire_session_writer(
             .map(Some),
         None => Ok(None),
     }
+}
+
+fn apply_maintenance_participant(
+    command: &mut pty_runner::HarnessCommand,
+    writer: Option<&maintenance_gate::WriterLease>,
+) -> Result<()> {
+    if let Some(writer) = writer {
+        command.set_environment_override(
+            maintenance_gate::MAINTENANCE_PARTICIPANT_ENV,
+            Some(writer.participant_capability()?),
+        );
+    }
+    Ok(())
 }
 
 fn run_bare_prompt(prompt: &[String]) -> Result<()> {
@@ -3274,7 +3311,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         request.harness_id.as_str(),
         session_launch::HarnessCheck::Available,
     )?;
-    let _maintenance_writer = acquire_session_writer(&request.repo.root, "patch-session")?;
+    let maintenance_writer = acquire_session_writer(&request.repo.root, "patch-session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
@@ -3322,12 +3359,13 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
     // row was sacrificed or is otherwise non-`created`, the helper bails
     // before `run_harness_attached` ever runs.
     let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
-    let command = pty_runner::build_harness_command(
+    let mut command = pty_runner::build_harness_command(
         &selected_harness.id,
         &brief,
         &request.repo.root,
         launch_mode,
     )?;
+    apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
     let result = activate_direct_launch_with_runner(&conn, &record.id, || {
         run_harness_attached(&command, launch_mode, false)
     })?;
@@ -4120,7 +4158,7 @@ fn run_session(
             )),
             session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
         })?;
-    let _maintenance_writer = acquire_session_writer(&project_root, "session")?;
+    let maintenance_writer = acquire_session_writer(&project_root, "session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
@@ -4407,7 +4445,8 @@ fn run_session(
             familiar_for_args,
             launch_options,
         );
-        let exit_code = command.and_then(|command| {
+        let exit_code = command.and_then(|mut command| {
+            apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
             pty_runner::stream_harness(
                 &command,
                 stream_json_input,
@@ -4528,7 +4567,7 @@ fn run_session(
             launch_options,
         )
     };
-    let command = match command {
+    let mut command = match command {
         Ok(command) => command,
         Err(error) => {
             store::update_session_status(
@@ -4552,6 +4591,7 @@ fn run_session(
             return Err(error);
         }
     };
+    apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
     if stream_json && selected_harness.id == "codex" {
         let output_session_id = record.id.clone();
         let outcome = pty_runner::stream_codex_json(&command, move |text| {
@@ -5185,6 +5225,8 @@ mod tests {
         MagicalTuiMove, MagicalTuiRequest, MAGICAL_TUI_MAX_INNER_WIDTH,
     };
     use crossterm::event::KeyEventKind;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn tui_launcher_and_session_browser_are_owned_by_tui_modules() {
@@ -5298,6 +5340,71 @@ mod tests {
                 command: ConfigCommand::Paths { json: true }
             })
         ));
+    }
+
+    #[test]
+    fn maintenance_participant_env_is_optional_and_strict() {
+        assert_eq!(maintenance_participant_from_value(None).unwrap(), None);
+        assert!(maintenance_participant_from_value(Some("not-json")).is_err());
+
+        let blank = maintenance_participant_from_value(Some(r#"{"id":"","generation":"g"}"#));
+        assert!(blank.is_err());
+
+        let participant =
+            maintenance_participant_from_value(Some(r#"{"id":"writer-1","generation":"gen-1"}"#))
+                .unwrap()
+                .expect("participant should parse");
+        assert_eq!(participant.id, "writer-1");
+        assert_eq!(participant.generation, "gen-1");
+    }
+
+    #[test]
+    fn maintenance_participant_env_helper_is_fail_closed() {
+        assert_eq!(
+            maintenance_participant_from_env_value(Err(VarError::NotPresent)).unwrap(),
+            None
+        );
+        assert!(maintenance_participant_from_env_value(Ok("not-json".into())).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn maintenance_participant_env_helper_rejects_non_utf8() {
+        let invalid = OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f]);
+        let error = maintenance_participant_from_env_value(Err(VarError::NotUnicode(invalid)))
+            .expect_err("non-UTF-8 participant env must be rejected");
+        assert!(error
+            .to_string()
+            .contains("COVEN_MAINTENANCE_PARTICIPANT must be valid UTF-8"));
+    }
+
+    #[test]
+    fn maintenance_participant_is_added_only_when_a_writer_exists() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = maintenance_gate::MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer = gate.acquire_writer("session-self", "session")?;
+        let mut command =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp.path().to_path_buf());
+
+        apply_maintenance_participant(&mut command, Some(&writer))?;
+
+        let capability = command
+            .environment_override_for_test(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV)
+            .expect("writer should add maintenance participant override");
+        assert_eq!(
+            maintenance_gate::WriterParticipant::decode(capability)?,
+            *writer.participant()
+        );
+
+        let mut command_without_writer =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp.path().to_path_buf());
+        apply_maintenance_participant(&mut command_without_writer, None)?;
+        assert_eq!(
+            command_without_writer
+                .environment_override_for_test(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV),
+            None
+        );
+        Ok(())
     }
 
     #[test]

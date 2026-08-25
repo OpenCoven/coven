@@ -942,6 +942,19 @@ impl SessionRuntime for LiveSessionRuntime {
 }
 
 impl LiveSessionRuntime {
+    fn apply_writer_participant(
+        command: &mut pty_runner::HarnessCommand,
+        writer: Option<&crate::maintenance_gate::WriterLease>,
+    ) -> Result<()> {
+        if let Some(writer) = writer {
+            command.set_environment_override(
+                crate::maintenance_gate::MAINTENANCE_PARTICIPANT_ENV,
+                Some(writer.participant_capability()?),
+            );
+        }
+        Ok(())
+    }
+
     fn launch_session_inner(
         &self,
         launch: &SessionLaunch,
@@ -966,7 +979,7 @@ impl LiveSessionRuntime {
             launch_policy: launch.launch_policy.as_ref(),
             ..Default::default()
         };
-        let command = if launch.harness == "codex"
+        let mut command = if launch.harness == "codex"
             && launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
         {
             pty_runner::build_piped_harness_command_with_conversation(
@@ -989,6 +1002,7 @@ impl LiveSessionRuntime {
                 launch_options,
             )?
         };
+        Self::apply_writer_participant(&mut command, writer.as_ref())?;
         self.launch_prepared_session(launch, writer, command, ownership_established)
     }
 
@@ -7222,6 +7236,46 @@ mod tests {
     fn adopted_piped_registration_publishes_running_before_blocked_prompt_and_is_killable(
     ) -> Result<()> {
         assert_adopted_publication_precedes_blocked_delivery(false)
+    }
+
+    #[test]
+    fn daemon_harness_receives_maintenance_participant_without_debug_disclosure() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let gate =
+            crate::maintenance_gate::MaintenanceGate::at_for_test(temp_dir.path().to_path_buf());
+        let writer = gate.acquire_writer("daemon-session", "session")?;
+        let expected_capability = writer.participant_capability()?;
+        let mut command =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp_dir.path().to_path_buf());
+
+        LiveSessionRuntime::apply_writer_participant(&mut command, Some(&writer))?;
+
+        assert_eq!(
+            command.environment_override_for_test(
+                crate::maintenance_gate::MAINTENANCE_PARTICIPANT_ENV
+            ),
+            Some(expected_capability.as_str())
+        );
+        assert!(!format!("{command:?}").contains(expected_capability.as_str()));
+        assert!(!format!("{:?}", command.cwd()).contains(expected_capability.as_str()));
+        Ok(())
+    }
+
+    #[test]
+    fn daemon_harness_skips_maintenance_participant_without_writer() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let mut command =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp_dir.path().to_path_buf());
+
+        LiveSessionRuntime::apply_writer_participant(&mut command, None)?;
+
+        assert_eq!(
+            command.environment_override_for_test(
+                crate::maintenance_gate::MAINTENANCE_PARTICIPANT_ENV
+            ),
+            None
+        );
+        Ok(())
     }
 
     #[cfg(any(unix, windows))]

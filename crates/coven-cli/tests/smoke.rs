@@ -1278,6 +1278,184 @@ fn color_flag_parses_and_rejects_unknown_values() -> anyhow::Result<()> {
 }
 
 #[test]
+fn session_harness_can_acquire_maintenance_against_its_own_writer() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("coven-home");
+    let project = temp_dir.path().join("project");
+    let fake_bin = temp_dir.path().join("bin");
+    let coven = coven_bin();
+    fs::create_dir_all(&coven_home)?;
+    fs::create_dir_all(&project)?;
+    fs::create_dir_all(&fake_bin)?;
+    init_git_repo(&project)?;
+    write_maintenance_participant_fake_codex(&fake_bin)?;
+    let path = prepend_path(&fake_bin);
+
+    let self_only_acquisition = temp_dir.path().join("self-only-acquisition.json");
+    let self_only_held = temp_dir.path().join("self-only-held.json");
+    let self_only_ready = temp_dir.path().join("self-only-ready");
+    let self_only_generation = temp_dir.path().join("self-only-generation");
+    fs::write(&self_only_generation, b"self-only\n")?;
+    let self_only = run_coven_in(
+        &coven,
+        &coven_home,
+        &path,
+        &project,
+        &[
+            ("COVEN_TEST_COVEN_BIN", coven.to_string_lossy().as_ref()),
+            (
+                "COVEN_TEST_ACQUISITION_FILE",
+                self_only_acquisition.to_string_lossy().as_ref(),
+            ),
+            (
+                "COVEN_TEST_HELD_FILE",
+                self_only_held.to_string_lossy().as_ref(),
+            ),
+            (
+                "COVEN_TEST_PARTICIPANT_READY",
+                self_only_ready.to_string_lossy().as_ref(),
+            ),
+            (
+                "COVEN_TEST_PARTICIPANT_GENERATION",
+                self_only_generation.to_string_lossy().as_ref(),
+            ),
+        ],
+        &["run", "codex", "participant"],
+    )?;
+    assert_success("self-only participant run", &self_only);
+    let self_only_json =
+        parse_prefixed_json_line("self-only participant run", &self_only, "participant-held:")?;
+    assert_eq!(
+        self_only_json["owner"]["phase"].as_str(),
+        Some("held"),
+        "self-only acquire should reach held: {self_only_json}"
+    );
+    assert!(
+        self_only_json["writers"]
+            .as_array()
+            .is_some_and(|writers| writers.is_empty()),
+        "self-only acquire should exclude its own writer: {self_only_json}"
+    );
+
+    let blocker_ready = temp_dir.path().join("blocker-ready");
+    let release_blocker = temp_dir.path().join("release-blocker");
+    let participant_ready = temp_dir.path().join("participant-ready");
+    let participant_generation = temp_dir.path().join("participant-generation");
+    let acquisition_json = temp_dir.path().join("participant-acquisition.json");
+    let held_json = temp_dir.path().join("participant-held.json");
+
+    let mut blocker = ChildGuard::spawn(
+        Command::new(&coven)
+            .args(["run", "codex", "blocker"])
+            .env("COVEN_HOME", &coven_home)
+            .env("PATH", &path)
+            .env("COVEN_TEST_COVEN_BIN", &coven)
+            .env("COVEN_TEST_BLOCKER_READY", &blocker_ready)
+            .env("COVEN_TEST_RELEASE_BLOCKER", &release_blocker)
+            .current_dir(&project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null()),
+    )?;
+    wait_until("blocker ready", || Ok(blocker_ready.exists()))?;
+
+    let participant_coven = coven.clone();
+    let participant_home = coven_home.clone();
+    let participant_path = path.clone();
+    let participant_project = project.clone();
+    let participant_acquisition = acquisition_json.clone();
+    let participant_held = held_json.clone();
+    let participant_ready_file = participant_ready.clone();
+    let participant_generation_file = participant_generation.clone();
+    let participant_thread = thread::spawn(move || {
+        run_coven_in(
+            &participant_coven,
+            &participant_home,
+            &participant_path,
+            &participant_project,
+            &[
+                (
+                    "COVEN_TEST_COVEN_BIN",
+                    participant_coven.to_string_lossy().as_ref(),
+                ),
+                (
+                    "COVEN_TEST_ACQUISITION_FILE",
+                    participant_acquisition.to_string_lossy().as_ref(),
+                ),
+                (
+                    "COVEN_TEST_HELD_FILE",
+                    participant_held.to_string_lossy().as_ref(),
+                ),
+                (
+                    "COVEN_TEST_PARTICIPANT_READY",
+                    participant_ready_file.to_string_lossy().as_ref(),
+                ),
+                (
+                    "COVEN_TEST_PARTICIPANT_GENERATION",
+                    participant_generation_file.to_string_lossy().as_ref(),
+                ),
+            ],
+            &["run", "codex", "participant"],
+        )
+    });
+
+    wait_until("participant acquisition json", || {
+        Ok(acquisition_json.exists())
+    })?;
+    wait_until("participant ready", || Ok(participant_ready.exists()))?;
+    let acquired: Value = serde_json::from_str(&fs::read_to_string(&acquisition_json)?)?;
+    assert_eq!(
+        acquired["owner"]["phase"].as_str(),
+        Some("draining"),
+        "blocked acquire should stay draining until blocker exits: {acquired}"
+    );
+    let writers = acquired["writers"]
+        .as_array()
+        .context("participant acquisition writers array")?;
+    assert_eq!(
+        writers.len(),
+        1,
+        "expected exactly one unrelated blocker writer: {acquired}"
+    );
+    let writer = &writers[0];
+    let writer_id = writer["id"].as_str().context("writer id")?;
+    assert_ne!(
+        writer_id, "in-session-owner",
+        "writer should be blocker, not owner: {acquired}"
+    );
+    assert!(
+        writer_id.starts_with("session-"),
+        "writer should be a session writer id: {acquired}"
+    );
+    assert_ne!(
+        writer_id, "participant",
+        "writer should not be participant script label: {acquired}"
+    );
+
+    fs::write(&release_blocker, b"release\n")?;
+    wait_for_child_exit_any_platform(&mut blocker, "blocker run")?;
+
+    let generation = acquired["owner"]["generation"]
+        .as_str()
+        .context("participant owner generation")?;
+    fs::write(&participant_generation, format!("{generation}\n"))?;
+
+    let participant_output = participant_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("participant thread panicked"))??;
+    assert_success("participant run with blocker", &participant_output);
+    let held: Value = serde_json::from_str(&fs::read_to_string(&held_json)?)?;
+    assert_eq!(held["owner"]["phase"].as_str(), Some("held"));
+    assert!(
+        held["writers"]
+            .as_array()
+            .is_some_and(|writers| writers.is_empty()),
+        "held maintenance status should have no writers: {held}"
+    );
+    Ok(())
+}
+
+#[test]
 fn piped_run_output_has_no_eof_control_artifact() -> anyhow::Result<()> {
     let temp_dir = tempfile::tempdir()?;
     let coven_home = temp_dir.path().join("coven-home");
@@ -2039,6 +2217,107 @@ fn prepend_path(fake_bin: &Path) -> OsString {
         paths.extend(std::env::split_paths(&existing));
     }
     std::env::join_paths(paths).expect("test PATH should be joinable")
+}
+
+fn parse_prefixed_json_line(label: &str, output: &Output, prefix: &str) -> anyhow::Result<Value> {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{label} stdout did not contain {prefix:?}\nstdout:\n{stdout}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+    serde_json::from_str(line.trim()).map_err(|error| {
+        anyhow::anyhow!(
+            "{label} had invalid JSON after {prefix:?}: {error}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+fn wait_for_child_exit_any_platform(child: &mut ChildGuard, label: &str) -> anyhow::Result<()> {
+    wait_until(&format!("{label} exit"), || Ok(!child.is_running()?))
+}
+
+fn write_maintenance_participant_fake_codex(fake_bin: &Path) -> anyhow::Result<()> {
+    let codex = fake_bin.join("codex");
+    fs::write(
+        &codex,
+        r#"#!/bin/sh
+set -eu
+mode=""
+for arg in "$@"; do
+  case "$arg" in
+    blocker|participant)
+      mode="$arg"
+      break
+      ;;
+  esac
+done
+case "$mode" in
+  blocker)
+    : "${COVEN_TEST_BLOCKER_READY:?}"
+    : "${COVEN_TEST_RELEASE_BLOCKER:?}"
+    : > "$COVEN_TEST_BLOCKER_READY"
+    i=0
+    while [ ! -f "$COVEN_TEST_RELEASE_BLOCKER" ] && [ "$i" -lt 200 ]; do
+      i=$((i + 1))
+      sleep 0.05
+    done
+    [ -f "$COVEN_TEST_RELEASE_BLOCKER" ]
+    ;;
+  participant)
+    : "${COVEN_MAINTENANCE_PARTICIPANT:?}"
+    : "${COVEN_TEST_COVEN_BIN:?}"
+    : "${COVEN_TEST_ACQUISITION_FILE:?}"
+    : "${COVEN_TEST_HELD_FILE:?}"
+    : "${COVEN_TEST_PARTICIPANT_READY:?}"
+    : "${COVEN_TEST_PARTICIPANT_GENERATION:?}"
+    acquisition="$($COVEN_TEST_COVEN_BIN maintenance acquire in-session-owner --wait-ms 100 --json)"
+    printf '%s\n' "$acquisition" > "$COVEN_TEST_ACQUISITION_FILE"
+    owner_generation=$(printf '%s\n' "$acquisition" | python3 -c 'import json,sys; print(json.load(sys.stdin)["owner"]["generation"])')
+    : > "$COVEN_TEST_PARTICIPANT_READY"
+    i=0
+    while [ ! -f "$COVEN_TEST_PARTICIPANT_GENERATION" ] && [ "$i" -lt 200 ]; do
+      i=$((i + 1))
+      sleep 0.05
+    done
+    [ -f "$COVEN_TEST_PARTICIPANT_GENERATION" ]
+    target_generation=$(tr -d '\r\n' < "$COVEN_TEST_PARTICIPANT_GENERATION")
+    if [ "$target_generation" = "self-only" ]; then
+      target_generation="$owner_generation"
+    fi
+    [ "$target_generation" = "$owner_generation" ]
+    i=0
+    while [ "$i" -lt 200 ]; do
+      held="$($COVEN_TEST_COVEN_BIN maintenance heartbeat in-session-owner "$target_generation" --json)"
+      printf '%s\n' "$held" > "$COVEN_TEST_HELD_FILE"
+      phase=$(printf '%s\n' "$held" | python3 -c 'import json,sys; print(json.load(sys.stdin)["owner"]["phase"])')
+      if [ "$phase" = "held" ]; then
+        $COVEN_TEST_COVEN_BIN maintenance release in-session-owner "$target_generation" >/dev/null
+        printf 'participant-held:%s\n' "$held"
+        exit 0
+      fi
+      i=$((i + 1))
+      sleep 0.05
+    done
+    echo "participant timed out waiting for held" >&2
+    exit 1
+    ;;
+  *)
+    echo "unexpected fake codex mode: $mode" >&2
+    exit 64
+    ;;
+esac
+"#,
+    )?;
+    let mut permissions = fs::metadata(&codex)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&codex, permissions)?;
+    Ok(())
 }
 
 fn write_fake_codex(fake_bin: &Path) -> anyhow::Result<()> {
