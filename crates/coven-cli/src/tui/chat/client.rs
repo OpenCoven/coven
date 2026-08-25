@@ -812,6 +812,12 @@ mod tests {
     fn read_request_path(stream: &mut std::os::unix::net::UnixStream) -> String {
         use std::io::Read;
 
+        // BSD `accept(2)` inherits O_NONBLOCK from the listener; Linux does
+        // not. Tests that poll a non-blocking listener would otherwise get
+        // EWOULDBLOCK here on macOS instead of the request.
+        stream
+            .set_nonblocking(false)
+            .expect("restore blocking mode on accepted stream");
         let mut request = String::new();
         stream
             .read_to_string(&mut request)
@@ -828,6 +834,11 @@ mod tests {
     fn write_response(stream: &mut std::os::unix::net::UnixStream, status: u16, body: &str) {
         use std::io::Write;
 
+        // See `read_request_path`: an accepted stream inherits the listener's
+        // non-blocking mode on BSD/macOS, which would short-write the response.
+        stream
+            .set_nonblocking(false)
+            .expect("restore blocking mode on accepted stream");
         write!(
             stream,
             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\n\r\n{body}",
@@ -867,6 +878,11 @@ mod tests {
     fn read_request_path_if_present(stream: &mut std::os::unix::net::UnixStream) -> Option<String> {
         use std::io::Read;
 
+        // See `read_request_path`: an accepted stream inherits the listener's
+        // non-blocking mode on BSD/macOS.
+        stream
+            .set_nonblocking(false)
+            .expect("restore blocking mode on accepted stream");
         let mut request = String::new();
         stream
             .read_to_string(&mut request)

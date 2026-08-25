@@ -195,6 +195,27 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn state_lock_descriptors_are_close_on_exec() -> Result<()> {
+        // Lock descriptors must not survive into an exec'd child, or a spawned
+        // helper would hold the flock for its entire lifetime. Note this only
+        // takes effect at `exec`: a forked-but-not-yet-exec'd child still
+        // inherits the descriptor, which is why in-process lock tests retry.
+        use std::os::fd::AsRawFd;
+
+        let home = tempfile::tempdir()?;
+        let lock = acquire_shared(home.path())?;
+        let flags = unsafe { libc::fcntl(lock.file.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1, "F_GETFD failed on the shared lock descriptor");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "shared state lock descriptor is not close-on-exec"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn anchored_exclusive_lock_stays_with_opened_home_after_path_replacement() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path().join("coven-home");

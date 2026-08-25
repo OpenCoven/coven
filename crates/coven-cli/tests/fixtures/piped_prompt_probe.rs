@@ -43,6 +43,29 @@ fn required_arg(name: &str) -> String {
         .unwrap_or_else(|| panic!("missing {name}"))
 }
 
+fn optional_arg(name: &str) -> Option<String> {
+    env::args().nth(match name {
+        "mode" => 1,
+        "first" => 2,
+        "second" => 3,
+        _ => unreachable!(),
+    })
+}
+
+/// Blocks until `path` exists. A fixed sleep standing in for "the descendant
+/// produced output" always loses the race under CPU contention, so the root
+/// waits for the descendant to prove it wrote to both inherited pipes.
+fn wait_for_marker(path: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if fs::metadata(path).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("descendant readiness marker {path} never appeared");
+}
+
 fn main() {
     let mode = required_arg("mode");
     if !mode.starts_with("output-child") {
@@ -142,15 +165,25 @@ fn main() {
         }
         "root-exit-short-output-descendant" => {
             let pid_file = required_arg("first");
-            let child = Command::new(env::current_exe().expect("current executable"))
-                .arg("output-child-short")
+            let ready_marker = optional_arg("second");
+            let mut command = Command::new(env::current_exe().expect("current executable"));
+            command.arg("output-child-short");
+            if let Some(marker) = ready_marker.as_ref() {
+                command.arg(marker);
+            }
+            let child = command
                 .stdin(Stdio::null())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .spawn()
                 .expect("spawn short inherited-output descendant");
             fs::write(pid_file, child.id().to_string()).expect("write descendant pid");
-            thread::sleep(Duration::from_millis(50));
+            // Exit only once the descendant has proven both inherited pipes
+            // carry real output.
+            match ready_marker.as_deref() {
+                Some(marker) => wait_for_marker(marker),
+                None => thread::sleep(Duration::from_millis(50)),
+            }
         }
         "root-exit-closed-descendant" => {
             let pid_file = required_arg("first");
@@ -173,12 +206,22 @@ fn main() {
             thread::sleep(Duration::from_millis(5));
         },
         "output-child-short" => {
+            let ready_marker = optional_arg("first");
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let mut announced = false;
             while std::time::Instant::now() < deadline {
                 io::stdout().write_all(b"stdout-tick\n").expect("stdout tick");
                 io::stdout().flush().expect("flush stdout tick");
                 io::stderr().write_all(b"stderr-tick\n").expect("stderr tick");
                 io::stderr().flush().expect("flush stderr tick");
+                if !announced {
+                    // Both inherited pipes now hold real bytes; release the
+                    // root so it can exit.
+                    if let Some(marker) = ready_marker.as_ref() {
+                        fs::write(marker, b"ready").expect("write readiness marker");
+                    }
+                    announced = true;
+                }
                 thread::sleep(Duration::from_millis(5));
             }
         }
