@@ -52,19 +52,24 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'node --test scripts/package-github-release-test.mjs',
             'node --test scripts/release-stress-test.mjs',
             "needs.changes.outputs.docs_only != 'true'",
-            'npm-onboarding-linux',
+            'npm-onboarding-pr',
             "github.event_name == 'push'",
             'performance-baseline',
             'name: CLI performance baseline',
             "if: ${{ github.event_name == 'push' }}",
         ]:
             self.assertIn(needle, CI_TEXT)
-        self.assertIn("\n  npm-onboarding-linux:\n", CI_TEXT)
+        self.assertIn("\n  npm-onboarding-pr:\n", CI_TEXT)
         self.assertIn("\n  npm-onboarding-main:\n", CI_TEXT)
         self.assertIn(
             "if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}",
             CI_TEXT,
         )
+        pull_request_job = CI_TEXT.split("\n  npm-onboarding-pr:\n", 1)[1].split(
+            "\n  npm-onboarding-main:\n", 1
+        )[0]
+        self.assertIn("npm-target: linux-x64", pull_request_job)
+        self.assertIn("npm-target: windows", pull_request_job)
 
 
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
