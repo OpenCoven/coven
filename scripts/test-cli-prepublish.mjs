@@ -118,6 +118,7 @@ step('onboarding, PR readiness, and publish guardrails', () => {
     '--test',
     'scripts/onboarding-docs-test.mjs',
     'scripts/cli-docs-test.mjs',
+    'scripts/export-cli-help-contract-test.mjs',
     'scripts/pr-readiness-test.mjs',
     'scripts/publish-npm-test.mjs'
   ]);

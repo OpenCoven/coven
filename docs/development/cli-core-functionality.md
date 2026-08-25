@@ -28,7 +28,7 @@ Do not call the CLI healthy merely because `--help` renders. A healthy core path
 
 | User outcome | CLI entry point | Primary Rust owner | Contract to preserve |
 | --- | --- | --- | --- |
-| Discover commands and route free-text input | `coven`, `coven chat`, `coven tui`, `coven help` | `crates/coven-cli/src/main.rs`, `tui/`, `engine.rs` | Bare Coven opens the interactive route; free-text work remains confirmable and recorded. |
+| Discover commands and route free-text input | `coven`, `coven chat`, `coven tui`, `coven help` | `crates/coven-cli/src/main.rs`, `help.rs`, `tui/`, `engine.rs` | Bare Coven opens the interactive route; default top-level help stays concise (`doctor`, `run`, `sessions`, `attach`, `daemon`, `status`, `help`); `coven help --all` exposes the full public command map without leaking internal entrypoints. |
 | Check local readiness | `coven doctor [--json]` | `main.rs`, `harness.rs`, `paths.rs`, `daemon.rs` | Human output gives repair hints; JSON stays a single machine-readable document. |
 | Control the daemon | `coven daemon start/status/restart/stop` | `daemon.rs`, `api.rs`, `paths.rs` | One same-user local daemon owns the socket and state directory. |
 | Launch work | `coven run <harness> <prompt>` | `session_launch.rs`, `harness.rs`, `pty_runner.rs`, `store.rs` | Validate project root and cwd in Rust, construct argv safely, then record session/events. |
@@ -39,13 +39,21 @@ Do not call the CLI healthy merely because `--help` renders. A healthy core path
 
 `main.rs` is the authoritative parser and dispatch map. When a command changes, start there and follow its delegated module before changing documentation.
 
+Progressive help is part of that parser contract:
+
+- `coven --help` and `coven help` stay focused on the core workflow while still documenting the bare interactive `coven` route above the command list.
+- `coven help --all` is the public inventory: every public top-level command appears once, grouped by user task, plus the machine-readable `--json` view.
+- `coven help <command>` should stay equivalent in useful content to `coven <command> --help`.
+- Hidden/internal entrypoints such as `process-supervisor` and `coven daemon serve` stay absent from the public help surfaces and JSON catalog.
+
 ## Access paths developers should exercise
 
 Run these from a clean, representative project directory. They are ordered from read-only inspection to daemon activation; the final launch is intentionally opt-in.
 
 ```sh
-# Parser and command inventory: no daemon or harness execution.
+# Concise discovery plus the grouped public inventory: no daemon or harness execution.
 coven --help
+coven help --all
 
 # Readiness envelope: succeeds only when a usable local path exists.
 coven doctor --json | jq -e '.ok'
