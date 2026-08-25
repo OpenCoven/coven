@@ -280,9 +280,7 @@ export function createNodeShim(nodeShimDir, { nodePath = process.execPath, platf
 export function createGitShim(shimDir, { baseEnv = process.env, platform = process.platform } = {}) {
   const gitPath = resolveExecutableOnPath('git', { baseEnv, platform });
   if (platform === 'win32') {
-    const shim = path.join(shimDir, 'git.cmd');
-    writeFileSync(shim, windowsCommandShim(gitPath));
-    return shim;
+    return gitPath;
   }
   const shim = path.join(shimDir, 'git');
   writeFileSync(shim, unixCommandShim(gitPath));
@@ -456,12 +454,13 @@ function sanitizeBaseEnv(baseEnv = process.env, platform = process.platform) {
 export function buildJourneyEnv({
   baseEnv = process.env,
   fixtureBinDir,
+  gitBinDir,
   layout,
   platform = process.platform,
   wrapperBin
 }) {
   const env = sanitizeBaseEnv(baseEnv, platform);
-  const pathValue = [path.dirname(wrapperBin), layout.nodeShimDir, fixtureBinDir]
+  const pathValue = [path.dirname(wrapperBin), layout.nodeShimDir, fixtureBinDir, gitBinDir]
     .filter(Boolean)
     .join(path.delimiter);
   env.COVEN_FAKE_FIXTURE_LOG = layout.fixtureLogPath;
@@ -863,10 +862,12 @@ export function runPackagedUserJourney({
   try {
     ensureJourneyLayout(layout);
     createNodeShim(layout.nodeShimDir, { platform });
-    createGitShim(layout.nodeShimDir, { baseEnv, platform });
+    const gitCommand = createGitShim(layout.nodeShimDir, { baseEnv, platform });
+    const gitBinDir = platform === 'win32' ? path.dirname(gitCommand) : undefined;
 
     activeEnv = buildJourneyEnv({
       baseEnv,
+      gitBinDir,
       layout,
       platform,
       wrapperBin: resolvedWrapperBin
@@ -911,6 +912,7 @@ export function runPackagedUserJourney({
     activeEnv = buildJourneyEnv({
       baseEnv,
       fixtureBinDir: layout.fixtureBinDir,
+      gitBinDir,
       layout,
       platform,
       wrapperBin: resolvedWrapperBin

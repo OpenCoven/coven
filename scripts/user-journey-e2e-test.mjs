@@ -351,9 +351,13 @@ test(
       }
 
       createNodeShim(layout.nodeShimDir, { platform: process.platform });
-      createGitShim(layout.nodeShimDir, { baseEnv, platform: process.platform });
+      const gitCommand = createGitShim(layout.nodeShimDir, {
+        baseEnv,
+        platform: process.platform
+      });
       const env = buildJourneyEnv({
         baseEnv,
+        gitBinDir: process.platform === 'win32' ? path.dirname(gitCommand) : undefined,
         layout,
         platform: process.platform,
         wrapperBin
