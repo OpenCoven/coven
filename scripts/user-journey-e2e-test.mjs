@@ -225,6 +225,7 @@ test('Windows commands use an explicitly quoted cmd.exe invocation', () => {
   assert.equal(spawnOptionsForCommand({}, 'darwin').shell, false);
   assert.equal(spawnOptionsForCommand({}, 'win32').shell, false);
   assert.equal(spawnOptionsForCommand({}, 'win32').windowsHide, true);
+  assert.equal(spawnOptionsForCommand({}, 'win32').windowsVerbatimArguments, true);
 
   const calls = [];
   const runner = createCommandRunner({
@@ -245,13 +246,14 @@ test('Windows commands use an explicitly quoted cmd.exe invocation', () => {
   assert.deepEqual(calls[0].args.slice(0, 4), ['/d', '/v:off', '/s', '/c']);
   assert.equal(
     calls[0].args[4],
-    '"%COVEN_JOURNEY_COMMAND_0%" "%COVEN_JOURNEY_COMMAND_1%" "%COVEN_JOURNEY_COMMAND_2%"'
+    '""%COVEN_JOURNEY_COMMAND_0%" "%COVEN_JOURNEY_COMMAND_1%" "%COVEN_JOURNEY_COMMAND_2%""'
   );
   assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_0, 'C:\\wrapper path\\coven.cmd');
   assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_1, 'daemon');
   assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_2, 'start');
   assert.equal(calls[0].options.shell, false);
   assert.equal(calls[0].options.windowsHide, true);
+  assert.equal(calls[0].options.windowsVerbatimArguments, true);
   assert.equal(calls[0].options.stdio, 'inherit');
 });
 

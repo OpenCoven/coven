@@ -94,6 +94,7 @@ export function spawnOptionsForCommand(options = {}, platform = process.platform
   return {
     shell: false,
     windowsHide: platform === 'win32',
+    windowsVerbatimArguments: platform === 'win32',
     ...options.spawnOptions
   };
 }
@@ -117,7 +118,7 @@ export function windowsCommandInvocation(command, commandArgs, baseEnv = {}) {
   });
   return {
     command: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
-    commandArgs: ['/d', '/v:off', '/s', '/c', references.join(' ')],
+    commandArgs: ['/d', '/v:off', '/s', '/c', `"${references.join(' ')}"`],
     env
   };
 }
