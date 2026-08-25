@@ -6021,8 +6021,25 @@ mod tests {
         );
         // Releasing the lock lets the next daemon take it — it never wedges shut.
         drop(first);
-        let _second =
-            acquire_serve_lock(home.path()).expect("lock should be reacquirable once released");
+        // The suite forks constantly (fixtures shell out to `git`, probes, and
+        // sh). FD_CLOEXEC only takes effect at `exec`, so between `fork` and
+        // `exec` a sibling test's child inherits this descriptor and holds the
+        // flock. That is an in-process artifact — a real daemon never shares an
+        // address space with the releasing process — so retry against a
+        // deadline rather than asserting on the first attempt.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let second = loop {
+            match acquire_serve_lock(home.path()) {
+                Ok(lock) => break lock,
+                Err(error) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(error).context("lock should be reacquirable once released");
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+            }
+        };
+        drop(second);
         Ok(())
     }
 

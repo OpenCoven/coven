@@ -5853,11 +5853,14 @@ mod tests {
         let pid_file = temp_dir
             .path()
             .join("observed-inherited-output-descendant.pid");
+        let ready_marker = temp_dir
+            .path()
+            .join("observed-inherited-output-descendant.ready");
         let mut command = piped_prompt_probe_command(
             temp_dir.path(),
             "root-exit-short-output-descendant",
             &pid_file.to_string_lossy(),
-            None,
+            Some(&ready_marker),
             Vec::new(),
         )?;
         command.env_overrides.push((
@@ -5891,6 +5894,22 @@ mod tests {
                 )));
             }
         };
+        // The one-second budget below measures post-exit cleanup only. Start it
+        // after the descendant has proven both inherited pipes carry output, so
+        // fixture startup under load cannot consume the budget.
+        let readiness_deadline = Instant::now() + Duration::from_secs(30);
+        while !ready_marker.exists() {
+            if Instant::now() >= readiness_deadline {
+                let late = result_rx.recv_timeout(Duration::from_secs(5));
+                runner
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                anyhow::bail!(
+                    "inherited-output descendant never signalled readiness; result: {late:?}"
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
         let result = match result_rx.recv_timeout(Duration::from_secs(1)) {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => {
