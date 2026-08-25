@@ -13,6 +13,18 @@ use thiserror::Error;
 
 use crate::{AgentId, BoxError, RunFailure, RunOptions, RunResult, Runner};
 
+pub(crate) const MAX_LOOP_ID_BYTES: usize = 127;
+
+pub(crate) fn validate_loop_id(loop_id: &str) -> Result<(), &'static str> {
+    if loop_id.is_empty() {
+        return Err("must not be empty");
+    }
+    if loop_id.len() > MAX_LOOP_ID_BYTES {
+        return Err("must not exceed 127 bytes");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopCheckpointStatus {
@@ -147,6 +159,21 @@ pub enum LoopReconciliation {
     Blocked { reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopRecoveryFence {
+    evidence: String,
+}
+
+impl LoopRecoveryFence {
+    /// Records proof that the previous executor can no longer act, such as a
+    /// revoked lease or terminated process identity.
+    pub fn new(evidence: impl Into<String>) -> Self {
+        Self {
+            evidence: evidence.into(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait LoopReconciler<C>: Send + Sync
 where
@@ -221,7 +248,7 @@ pub enum LoopError {
         loop_id: String,
         iteration: usize,
         #[source]
-        source: RunFailure,
+        source: Box<RunFailure>,
     },
     #[error("loop `{loop_id}` exit evaluation failed at iteration {iteration}")]
     EvaluationFailed {
@@ -245,6 +272,14 @@ pub enum LoopError {
     },
     #[error("loop process instance id must not be empty")]
     InvalidProcessInstanceId,
+    #[error("loop id {reason}")]
+    InvalidLoopId { reason: &'static str },
+    #[error("loop `{loop_id}` has no checkpoint to reconcile")]
+    CheckpointNotFound { loop_id: String },
+    #[error("loop `{loop_id}` has no reconciler configured")]
+    ReconcilerUnavailable { loop_id: String },
+    #[error("loop `{loop_id}` recovery fence evidence must not be empty")]
+    InvalidRecoveryFence { loop_id: String },
 }
 
 pub struct GoalLoopRunner<C>
@@ -284,6 +319,113 @@ where
         self
     }
 
+    /// Reconciles durable work only after the caller has fenced the previous
+    /// executor. Ordinary [`Self::run`] calls never reclaim running work.
+    pub async fn reconcile(
+        &self,
+        loop_id: impl Into<String>,
+        starting_agent: impl Into<AgentId>,
+        fence: LoopRecoveryFence,
+        context: &C,
+    ) -> Result<LoopCheckpoint, LoopError> {
+        let loop_id = loop_id.into();
+        let starting_agent = starting_agent.into();
+        validate_loop_id(&loop_id).map_err(|reason| LoopError::InvalidLoopId { reason })?;
+        if self.process_instance_id.trim().is_empty() {
+            return Err(LoopError::InvalidProcessInstanceId);
+        }
+        if fence.evidence.trim().is_empty() {
+            return Err(LoopError::InvalidRecoveryFence { loop_id });
+        }
+        let checkpoint =
+            self.load(&loop_id)
+                .await?
+                .ok_or_else(|| LoopError::CheckpointNotFound {
+                    loop_id: loop_id.clone(),
+                })?;
+        if checkpoint.starting_agent != starting_agent {
+            return Err(LoopError::StartingAgentMismatch {
+                loop_id,
+                expected: starting_agent,
+                actual: checkpoint.starting_agent,
+            });
+        }
+        if checkpoint.status == LoopCheckpointStatus::Running
+            && checkpoint
+                .active_attempt
+                .as_ref()
+                .is_some_and(|attempt| attempt.process_instance_id == self.process_instance_id)
+        {
+            return Err(LoopError::ActiveInFlight { loop_id });
+        }
+        if !matches!(
+            checkpoint.status,
+            LoopCheckpointStatus::Pending | LoopCheckpointStatus::Running
+        ) {
+            return Err(LoopError::InvalidReconciliation {
+                loop_id,
+                status: checkpoint.status,
+            });
+        }
+        let reconciler =
+            self.reconciler
+                .as_ref()
+                .ok_or_else(|| LoopError::ReconcilerUnavailable {
+                    loop_id: loop_id.clone(),
+                })?;
+        let reconciliation = match reconciler.reconcile(&checkpoint, context).await {
+            Ok(reconciliation) => reconciliation,
+            Err(source) => {
+                let mut blocked = checkpoint.clone();
+                blocked.status = LoopCheckpointStatus::Blocked;
+                blocked.active_attempt = None;
+                blocked.blocked_reason = Some("offline reconciliation failed".to_owned());
+                self.compare_and_set(Some(&checkpoint), &blocked, "reconciliation failure")
+                    .await?;
+                return Err(LoopError::ReconciliationFailed { loop_id, source });
+            }
+        };
+        let mut next = checkpoint.clone();
+        match reconciliation {
+            LoopReconciliation::Unchanged => return Ok(checkpoint),
+            LoopReconciliation::Complete => {
+                if checkpoint.status == LoopCheckpointStatus::Running {
+                    next.completed_iterations += 1;
+                }
+                next.status = LoopCheckpointStatus::Completed;
+                next.next_input = None;
+            }
+            LoopReconciliation::Resume { input } => {
+                next.status = LoopCheckpointStatus::Pending;
+                next.next_input = Some(input);
+            }
+            LoopReconciliation::Continue { input } => {
+                if checkpoint.status != LoopCheckpointStatus::Running {
+                    return Err(LoopError::InvalidReconciliation {
+                        loop_id,
+                        status: checkpoint.status,
+                    });
+                }
+                next.completed_iterations += 1;
+                next.status = LoopCheckpointStatus::Pending;
+                next.next_input = Some(input);
+            }
+            LoopReconciliation::Blocked { reason } => {
+                next.status = LoopCheckpointStatus::Blocked;
+                next.blocked_reason = Some(reason.clone());
+                next.active_attempt = None;
+                self.compare_and_set(Some(&checkpoint), &next, "blocked reconciliation")
+                    .await?;
+                return Err(LoopError::ReconciliationBlocked { loop_id, reason });
+            }
+        }
+        next.active_attempt = None;
+        next.blocked_reason = None;
+        self.compare_and_set(Some(&checkpoint), &next, "offline reconciliation")
+            .await?;
+        Ok(next)
+    }
+
     pub async fn run(
         &self,
         loop_id: impl Into<String>,
@@ -295,16 +437,13 @@ where
         let loop_id = loop_id.into();
         let starting_agent = starting_agent.into();
         let initial_input = initial_input.into();
+        validate_loop_id(&loop_id).map_err(|reason| LoopError::InvalidLoopId { reason })?;
         if self.process_instance_id.trim().is_empty() {
             return Err(LoopError::InvalidProcessInstanceId);
         }
-        let mut resumed = false;
         let mut checkpoint = loop {
             match self.load(&loop_id).await? {
-                Some(checkpoint) => {
-                    resumed = true;
-                    break checkpoint;
-                }
+                Some(checkpoint) => break checkpoint,
                 None => {
                     let checkpoint = LoopCheckpoint {
                         loop_id: loop_id.clone(),
@@ -340,87 +479,6 @@ where
                 .is_some_and(|attempt| attempt.process_instance_id == self.process_instance_id)
         {
             return Err(LoopError::ActiveInFlight { loop_id });
-        }
-
-        if resumed
-            && matches!(
-                checkpoint.status,
-                LoopCheckpointStatus::Pending | LoopCheckpointStatus::Running
-            )
-        {
-            if let Some(reconciler) = &self.reconciler {
-                let reconciliation = match reconciler.reconcile(&checkpoint, context).await {
-                    Ok(reconciliation) => reconciliation,
-                    Err(source) => {
-                        let mut blocked = checkpoint.clone();
-                        blocked.status = LoopCheckpointStatus::Blocked;
-                        blocked.active_attempt = None;
-                        blocked.blocked_reason = Some("offline reconciliation failed".to_owned());
-                        self.compare_and_set(Some(&checkpoint), &blocked, "reconciliation failure")
-                            .await?;
-                        return Err(LoopError::ReconciliationFailed { loop_id, source });
-                    }
-                };
-                match reconciliation {
-                    LoopReconciliation::Unchanged => {}
-                    LoopReconciliation::Complete => {
-                        let mut completed = checkpoint.clone();
-                        if checkpoint.status == LoopCheckpointStatus::Running {
-                            completed.completed_iterations += 1;
-                        }
-                        completed.status = LoopCheckpointStatus::Completed;
-                        completed.next_input = None;
-                        completed.active_attempt = None;
-                        completed.blocked_reason = None;
-                        self.compare_and_set(
-                            Some(&checkpoint),
-                            &completed,
-                            "offline reconciliation",
-                        )
-                        .await?;
-                        return Ok(LoopRunResult {
-                            result: None,
-                            iterations: completed.completed_iterations,
-                        });
-                    }
-                    LoopReconciliation::Resume { input } => {
-                        let mut pending = checkpoint.clone();
-                        pending.status = LoopCheckpointStatus::Pending;
-                        pending.next_input = Some(input);
-                        pending.active_attempt = None;
-                        pending.blocked_reason = None;
-                        self.compare_and_set(Some(&checkpoint), &pending, "offline reconciliation")
-                            .await?;
-                        checkpoint = pending;
-                    }
-                    LoopReconciliation::Continue { input } => {
-                        if checkpoint.status != LoopCheckpointStatus::Running {
-                            return Err(LoopError::InvalidReconciliation {
-                                loop_id,
-                                status: checkpoint.status,
-                            });
-                        }
-                        let mut pending = checkpoint.clone();
-                        pending.completed_iterations += 1;
-                        pending.status = LoopCheckpointStatus::Pending;
-                        pending.next_input = Some(input);
-                        pending.active_attempt = None;
-                        pending.blocked_reason = None;
-                        self.compare_and_set(Some(&checkpoint), &pending, "offline reconciliation")
-                            .await?;
-                        checkpoint = pending;
-                    }
-                    LoopReconciliation::Blocked { reason } => {
-                        let mut blocked = checkpoint.clone();
-                        blocked.status = LoopCheckpointStatus::Blocked;
-                        blocked.active_attempt = None;
-                        blocked.blocked_reason = Some(reason.clone());
-                        self.compare_and_set(Some(&checkpoint), &blocked, "blocked reconciliation")
-                            .await?;
-                        return Err(LoopError::ReconciliationBlocked { loop_id, reason });
-                    }
-                }
-            }
         }
 
         match checkpoint.status {
@@ -499,7 +557,7 @@ where
                     return Err(LoopError::RunFailed {
                         loop_id,
                         iteration,
-                        source,
+                        source: Box::new(source),
                     });
                 }
             };

@@ -54,9 +54,11 @@ A process or machine that restarts from `pending` can safely continue from the
 saved input. `LoopJournal::list` lets the daemon discover work without relying
 on volatile scheduler state.
 A restart from `running` is ambiguous because the model or tools may already
-have caused external side effects. Without a reconciler, the runner refuses
-automatic replay rather than guessing. A `LoopReconciler` may inspect the
-authoritative external system and return one of five explicit decisions:
+have caused external side effects. Ordinary `run` calls always refuse automatic
+replay rather than guessing. After the application proves the previous executor
+can no longer act, it may call the separate `reconcile` API with a
+`LoopRecoveryFence`. A `LoopReconciler` then inspects the authoritative external
+system and returns one of five explicit decisions:
 
 - leave the checkpoint unchanged;
 - mark the goal complete;
@@ -66,11 +68,11 @@ authoritative external system and return one of five explicit decisions:
 
 A running checkpoint records both an attempt id and a process-lifetime instance
 id. A runner must use an id that changes on every daemon boot. It refuses to
-reconcile a running attempt owned by its own process instance, preventing a
-second local caller from turning live work back into pending work. After reboot,
-the new process id can reconcile the orphaned attempt. A blocked decision and
-its reason are persisted atomically; execution does not retry it until an
-operator or policy adapter explicitly transitions the checkpoint.
+reconcile a running attempt owned by its own process instance, and a different
+process cannot reclaim the work through `run`; recovery requires the explicit
+fence-bearing API. A blocked decision and its reason are persisted atomically;
+execution does not retry it until an operator or policy adapter explicitly
+transitions the checkpoint.
 
 A malformed `pending` checkpoint without saved input also fails closed rather
 than silently running with empty input.
@@ -99,8 +101,9 @@ Focused tests cover convergence, resume from a pending checkpoint, refusal to
 replay an in-flight iteration, malformed pending state, iteration exhaustion,
 starting-agent identity mismatch, a compare-and-set race in which only one
 iteration claim may succeed, file-journal reconstruction and discovery,
-reboot-style resume, offline reconciliation of an in-flight iteration, live
-attempt fencing, and persistent blocked recovery state.
+crash-leftover staging cleanup, reboot-style resume, explicit fenced
+reconciliation of an in-flight iteration, cross-process replay refusal, live
+attempt fencing, invalid journal ids, and persistent blocked recovery state.
 
 ## Deferred adapters
 

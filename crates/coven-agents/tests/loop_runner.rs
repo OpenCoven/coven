@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use coven_agents::{
     Agent, AgentId, BoxError, FileLoopJournal, GoalLoopRunner, InMemoryLoopJournal, LoopAttempt,
     LoopCheckpoint, LoopCheckpointStatus, LoopControl, LoopError, LoopEvaluator, LoopJournal,
-    LoopOptions, LoopReconciler, LoopReconciliation, Model, ModelRequest, ModelResponse,
-    RunOptions, RunResult, Runner,
+    LoopOptions, LoopReconciler, LoopReconciliation, LoopRecoveryFence, Model, ModelRequest,
+    ModelResponse, RunOptions, RunResult, Runner,
 };
 
 struct QueueModel {
@@ -123,6 +123,39 @@ async fn loops_until_the_evaluator_declares_success() {
     );
 }
 
+#[tokio::test]
+async fn rejects_empty_loop_ids_before_journal_access() {
+    let model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let journal = Arc::new(InMemoryLoopJournal::default());
+    let loop_runner = goal_loop(model.clone(), journal.clone());
+
+    let error = loop_runner
+        .run("", "worker", "unused", &(), LoopOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LoopError::InvalidLoopId { .. }));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(journal.list().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn rejects_loop_ids_that_cannot_fit_in_a_journal_path_component() {
+    let model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let journal = Arc::new(InMemoryLoopJournal::default());
+    let loop_runner = goal_loop(model.clone(), journal.clone());
+    let loop_id = "x".repeat(128);
+
+    let error = loop_runner
+        .run(loop_id, "worker", "unused", &(), LoopOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LoopError::InvalidLoopId { .. }));
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert!(journal.list().await.unwrap().is_empty());
+}
+
 struct StaticReconciler {
     action: LoopReconciliation,
     calls: AtomicUsize,
@@ -165,6 +198,44 @@ async fn file_journal_survives_reconstruction_and_lists_recoverable_work() {
         Some(checkpoint.clone())
     );
     assert_eq!(reopened.list().await.unwrap(), vec![checkpoint]);
+}
+
+#[tokio::test]
+async fn file_journal_removes_crash_leftover_staging_files_before_writing() {
+    let root = tempfile::tempdir().unwrap();
+    let journal = FileLoopJournal::new(root.path()).unwrap();
+    let first = LoopCheckpoint {
+        loop_id: "staging-loop".to_owned(),
+        starting_agent: AgentId::from("worker"),
+        completed_iterations: 0,
+        status: LoopCheckpointStatus::Pending,
+        next_input: Some("first".to_owned()),
+        active_attempt: None,
+        blocked_reason: None,
+    };
+    assert!(journal
+        .compare_and_set("staging-loop", None, &first)
+        .await
+        .unwrap());
+    let loop_directory = std::fs::read_dir(root.path())
+        .unwrap()
+        .find_map(|entry| {
+            let entry = entry.unwrap();
+            entry.file_type().unwrap().is_dir().then(|| entry.path())
+        })
+        .unwrap();
+    let stale = loop_directory.join(".checkpoint-123-0.tmp");
+    std::fs::write(&stale, b"partial checkpoint").unwrap();
+
+    let mut second = first.clone();
+    second.next_input = Some("second".to_owned());
+    assert!(journal
+        .compare_and_set("staging-loop", Some(&first), &second)
+        .await
+        .unwrap());
+
+    assert!(!stale.exists());
+    assert_eq!(journal.load("staging-loop").await.unwrap(), Some(second));
 }
 
 #[tokio::test]
@@ -241,19 +312,18 @@ async fn offline_reconciliation_can_complete_without_replaying_the_agent() {
     });
     let runner = goal_loop(model.clone(), journal.clone()).with_reconciler(reconciler.clone());
 
-    let result = runner
-        .run(
+    let checkpoint = runner
+        .reconcile(
             "offline-complete",
             "worker",
-            "Do not replay.",
+            LoopRecoveryFence::new("previous process lease revoked"),
             &(),
-            LoopOptions::default(),
         )
         .await
         .unwrap();
 
-    assert_eq!(result.result, None);
-    assert_eq!(result.iterations, 3);
+    assert_eq!(checkpoint.status, LoopCheckpointStatus::Completed);
+    assert_eq!(checkpoint.completed_iterations, 3);
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert_eq!(reconciler.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
@@ -298,6 +368,15 @@ async fn offline_reconciliation_can_confirm_an_iteration_and_continue() {
     });
     let runner = goal_loop(model.clone(), journal.clone()).with_reconciler(reconciler);
 
+    runner
+        .reconcile(
+            "offline-continue",
+            "worker",
+            LoopRecoveryFence::new("previous process lease revoked"),
+            &(),
+        )
+        .await
+        .unwrap();
     let result = runner
         .run(
             "offline-continue",
@@ -346,12 +425,11 @@ async fn live_iteration_owner_cannot_reconcile_its_own_claim() {
     let runner = goal_loop(model.clone(), journal.clone()).with_reconciler(reconciler.clone());
 
     let error = runner
-        .run(
+        .reconcile(
             "live-loop",
             "worker",
-            "Do not replay.",
+            LoopRecoveryFence::new("incorrectly asserted stale"),
             &(),
-            LoopOptions::default(),
         )
         .await
         .unwrap_err();
@@ -371,6 +449,56 @@ async fn live_iteration_owner_cannot_reconcile_its_own_claim() {
             .status,
         LoopCheckpointStatus::Running
     );
+}
+
+#[tokio::test]
+async fn ordinary_run_never_reconciles_another_process_live_claim() {
+    let model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let journal = Arc::new(InMemoryLoopJournal::default());
+    journal
+        .compare_and_set(
+            "other-live-loop",
+            None,
+            &LoopCheckpoint {
+                loop_id: "other-live-loop".to_owned(),
+                starting_agent: AgentId::from("worker"),
+                completed_iterations: 1,
+                status: LoopCheckpointStatus::Running,
+                next_input: None,
+                active_attempt: Some(LoopAttempt {
+                    id: "other-process:2:0".to_owned(),
+                    process_instance_id: "other-process".to_owned(),
+                }),
+                blocked_reason: None,
+            },
+        )
+        .await
+        .unwrap();
+    let reconciler = Arc::new(StaticReconciler {
+        action: LoopReconciliation::Resume {
+            input: "Unsafe duplicate.".to_owned(),
+        },
+        calls: AtomicUsize::new(0),
+    });
+    let runner = goal_loop(model.clone(), journal).with_reconciler(reconciler.clone());
+
+    let error = runner
+        .run(
+            "other-live-loop",
+            "worker",
+            "Do not replay.",
+            &(),
+            LoopOptions::default(),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        LoopError::AmbiguousInFlight { ref loop_id } if loop_id == "other-live-loop"
+    ));
+    assert_eq!(reconciler.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -405,12 +533,11 @@ async fn blocked_reconciliation_is_persisted_for_operator_recovery() {
     let runner = goal_loop(model.clone(), journal.clone()).with_reconciler(reconciler);
 
     let error = runner
-        .run(
+        .reconcile(
             "blocked-loop",
             "worker",
-            "Do not replay.",
+            LoopRecoveryFence::new("previous process lease revoked"),
             &(),
-            LoopOptions::default(),
         )
         .await
         .unwrap_err();

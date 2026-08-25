@@ -21,7 +21,7 @@ pub use loop_journal::FileLoopJournal;
 pub use loop_runner::{
     GoalLoopRunner, InMemoryLoopJournal, LoopAttempt, LoopCheckpoint, LoopCheckpointStatus,
     LoopControl, LoopError, LoopEvaluator, LoopJournal, LoopOptions, LoopReconciler,
-    LoopReconciliation, LoopRunResult,
+    LoopReconciliation, LoopRecoveryFence, LoopRunResult,
 };
 pub use model::{
     HandoffCall, HandoffDefinition, Model, ModelAction, ModelRequest, ModelResponse, RunItem,

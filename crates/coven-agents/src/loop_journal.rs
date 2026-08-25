@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::{BoxError, LoopCheckpoint, LoopJournal};
+use crate::{loop_runner::validate_loop_id, BoxError, LoopCheckpoint, LoopJournal};
 
 const JOURNAL_SCHEMA_VERSION: u32 = 1;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -123,11 +123,38 @@ impl FileLoopJournal {
         }
         Ok(())
     }
+
+    fn remove_stale_staging_files(directory: &Path) -> Result<(), io::Error> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                continue;
+            };
+            if name.starts_with(".checkpoint-")
+                && name.ends_with(".tmp")
+                && entry.file_type()?.is_file()
+            {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_key(loop_id: &str) -> Result<(), BoxError> {
+        validate_loop_id(loop_id).map_err(|reason| {
+            Box::new(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("loop id {reason}"),
+            )) as BoxError
+        })
+    }
 }
 
 #[async_trait]
 impl LoopJournal for FileLoopJournal {
     async fn load(&self, loop_id: &str) -> Result<Option<LoopCheckpoint>, BoxError> {
+        Self::validate_key(loop_id)?;
         let directory = self.loop_directory(loop_id);
         if !directory.exists() {
             return Ok(None);
@@ -163,6 +190,7 @@ impl LoopJournal for FileLoopJournal {
         expected: Option<&LoopCheckpoint>,
         next: &LoopCheckpoint,
     ) -> Result<bool, BoxError> {
+        Self::validate_key(loop_id)?;
         if next.loop_id != loop_id {
             return Err(Box::new(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -173,6 +201,7 @@ impl LoopJournal for FileLoopJournal {
         create_directory_durable(&directory)?;
         let lock = Self::open_lock(&directory)?;
         FileExt::lock_exclusive(&lock)?;
+        Self::remove_stale_staging_files(&directory)?;
         let latest = Self::latest_checkpoint(&directory)?;
         if latest.as_ref().map(|(_, checkpoint)| checkpoint) != expected {
             FileExt::unlock(&lock)?;

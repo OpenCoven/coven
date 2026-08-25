@@ -54,9 +54,12 @@ See the design document under `docs/superpowers/specs/`.
 behind per-loop file locks. A restarted daemon can call `LoopJournal::list` to
 discover pending and in-flight work, reconstruct its runners, and resume only
 safe checkpoints. Applications that need to compare remote state after downtime
-attach a `LoopReconciler`; it can complete an already-satisfied goal, supply a
-safe resume input, confirm an in-flight iteration, or block for operator input.
-Each runner receives a process-lifetime instance id. Running checkpoints retain
-that id and an attempt id, so another caller in the same live process cannot
-revoke the claim under the guise of recovery. Blocked decisions are checkpointed
-with their reason and require an explicit journal transition before execution.
+attach a `LoopReconciler`, prove the previous executor can no longer act, and
+call `GoalLoopRunner::reconcile` with a `LoopRecoveryFence`. Reconciliation can
+complete an already-satisfied goal, supply a safe resume input, confirm an
+in-flight iteration, or block for operator input. Ordinary `run` calls never
+reclaim running work. Each runner receives a process-lifetime instance id;
+running checkpoints retain that id and an attempt id so the live owner also
+cannot revoke its own claim under the guise of recovery. Blocked decisions are
+checkpointed with their reason and require an explicit journal transition
+before execution.
