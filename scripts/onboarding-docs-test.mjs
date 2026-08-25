@@ -160,25 +160,31 @@ test('model selection only offers CLI-login harness choices', () => {
 
 test('ci runs npm onboarding smoke on every published platform', () => {
   const workflow = readRepoFile('.github/workflows/ci.yml');
+  const dryRunVersionPattern = new RegExp(
+    String.raw`COVEN_NPM_DRY_RUN_VERSION:\s+${'9'.repeat(3)}\.0\.0\s*(?:\n|$)`
+  );
   assert.match(workflow, /name:\s+npm onboarding smoke/i);
   assert.match(workflow, /ubuntu-latest/);
   assert.match(workflow, /macos-26/);
   assert.doesNotMatch(workflow, /os:\s+macos-latest/);
   assert.match(workflow, /windows-latest/);
   assert.match(workflow, /node scripts\/test-cli-prepublish\.mjs --target=\$\{\{ matrix\.npm-target \}\} --skip-build --skip-secrets-scan/);
-  assert.match(workflow, /COVEN_NPM_DRY_RUN_VERSION:\s+9{3}\.0\.0\s*(?:\n|$)/);
+  assert.match(workflow, dryRunVersionPattern);
 });
 
 test('npm onboarding smoke exercises daemon lifecycle with isolated state', () => {
-  const script = readRepoFile('scripts/test-cli-prepublish.mjs');
-  assert.match(script, /COVEN_HOME:\s*path\.join\(tempDir,\s*'coven-home'\)/);
-  assert.match(script, /\['daemon',\s*'start'\]/);
-  assert.match(script, /\['daemon',\s*'status'\]/);
-  assert.match(script, /\['daemon',\s*'stop'\]/);
-  assert.match(script, /\['sessions',\s*'--plain'\]/);
-  assert.match(script, /Coven daemon: running/);
-  assert.match(script, /\['daemon',\s*'status',\s*'--json'\]/);
-  assert.match(script, /statusJson\.ok !== true/);
+  const prepublish = readRepoFile('scripts/test-cli-prepublish.mjs');
+  const journey = readRepoFile('scripts/user-journey-e2e.mjs');
+  assert.match(prepublish, /runPackagedUserJourney\(/);
+  assert.match(prepublish, /keepScratchDir:\s*keepTempdir/);
+  assert.match(prepublish, /packaged user journey scratch preserved at/);
+  assert.match(journey, /\['daemon',\s*'start'\]/);
+  assert.match(journey, /\['daemon',\s*'status'\]/);
+  assert.match(journey, /\['daemon',\s*'stop'\]/);
+  assert.match(journey, /\['daemon',\s*'status',\s*'--json'\]/);
+  assert.match(journey, /\['sessions',\s*'--json'\]/);
+  assert.match(journey, /Coven daemon: running/);
+  assert.match(journey, /assertDaemonStatusJson\(daemonStatusJson,\s*'running',\s*true\)/);
 });
 
 test('npm onboarding smoke launches Windows cmd shims through a shell', () => {
@@ -187,16 +193,16 @@ test('npm onboarding smoke launches Windows cmd shims through a shell', () => {
   assert.match(script, /shell:\s*platform === 'win32'/);
   assert.match(script, /spawnOptionsForCommand\(options/);
   assert.match(script, /spawnSync\(command,\s*args,\s*\{\s*\.\.\.spawnOptionsForCommand\(\)/);
-  assert.match(script, /spawnSync\('npm',\s*\['view'[\s\S]*?\.\.\.spawnOptionsForCommand\(\)/);
+  assert.match(script, /spawnSyncImpl\('npm',\s*\['view'[\s\S]*?\.\.\.spawnOptionsForCommand\(\)/);
   assert.match(script, /spawnSync\('npm',\s*\['pack'[\s\S]*?\.\.\.spawnOptionsForCommand\(\)/);
 });
 
-test('npm onboarding smoke verifies first-run missing-harness guidance deterministically', () => {
-  const script = readRepoFile('scripts/test-cli-prepublish.mjs');
-  assert.match(script, /function firstRunSmokePath\(/);
-  assert.match(script, /PATH:\s*firstRunSmokePath\(wrapperBin,\s*tempDir\)/);
-  assert.match(script, /node-shim-bin/);
-  assert.doesNotMatch(script, /path\.dirname\(process\.execPath\)/);
+test('packaged journey isolates shims and verifies current setup guidance', () => {
+  const script = readRepoFile('scripts/user-journey-e2e.mjs');
+  assert.match(script, /function createNodeShim\(/);
+  assert.match(script, /nodeShimDir/);
+  assert.match(script, /fixtureBinDir/);
+  assert.match(script, /PATH = pathValue/);
   assert.match(script, /Set up at least one harness in this same shell/);
   assert.match(script, /Codex: coven setup codex/);
   assert.match(script, /Claude Code: coven setup claude/);
@@ -271,6 +277,7 @@ test('npm onboarding smoke runs onboarding guardrails before packaging', () => {
   const script = readRepoFile('scripts/test-cli-prepublish.mjs');
   assert.match(script, /scripts\/onboarding-docs-test\.mjs/);
   assert.match(script, /scripts\/publish-npm-test\.mjs/);
+  assert.match(script, /scripts\/test-cli-prepublish-test\.mjs/);
 });
 
 test('npm onboarding smoke avoids deprecated optional dependency install flag', () => {
@@ -284,6 +291,8 @@ test('npm onboarding smoke bounds subprocess hangs', () => {
   assert.match(script, /DEFAULT_COMMAND_TIMEOUT_MS/);
   assert.match(script, /timeout:\s*options\.timeoutMs \?\? DEFAULT_COMMAND_TIMEOUT_MS/);
   assert.match(script, /ETIMEDOUT/);
+  assert.match(script, /npm view timed out after/);
+  assert.match(script, /Set COVEN_NPM_DRY_RUN_VERSION to an unpublished higher semver and rerun/);
 });
 
 test('npm onboarding smoke gives full cargo gates the CI timeout budget', () => {
@@ -298,9 +307,9 @@ test('npm onboarding smoke gives full cargo gates the CI timeout budget', () => 
 });
 
 test('npm onboarding smoke does not pipe-capture Windows daemon start', () => {
-  const script = readRepoFile('scripts/test-cli-prepublish.mjs');
+  const script = readRepoFile('scripts/user-journey-e2e.mjs');
   assert.match(script, /function runDaemonStart\(/);
-  assert.match(script, /process\.platform === 'win32'/);
+  assert.match(script, /platform === 'win32'/);
   assert.match(script, /run\(wrapperBin, \['daemon', 'start'\]/);
-  assert.match(script, /runCapture\(wrapperBin, \['daemon', 'status'\]/);
+  assert.match(script, /runCapture\(wrapperBin, \['daemon', 'start'\]/);
 });

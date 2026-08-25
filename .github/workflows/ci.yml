@@ -318,15 +318,22 @@ jobs:
       - run: pnpm test
         working-directory: packages/openclaw-coven
 
-  npm-onboarding-linux:
-    name: npm onboarding smoke (linux-x64)
+  npm-onboarding-pr:
+    name: npm onboarding smoke (${{ matrix.npm-target }})
     needs: changes
     if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
-    env:
-      NPM_TARGET: linux-x64
-      RUST_TARGET: x86_64-unknown-linux-gnu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            npm-target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            npm-target: windows
+            rust-target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v7
@@ -334,7 +341,7 @@ jobs:
           node-version: 24
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.RUST_TARGET }}
+          targets: ${{ matrix.rust-target }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -345,9 +352,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
-      - run: cargo build --release --package coven-cli --target ${{ env.RUST_TARGET }}
-      - run: node scripts/test-cli-prepublish.mjs --target="$NPM_TARGET" --skip-build --skip-secrets-scan
+      - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
+      - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
         env:
           COVEN_NPM_DRY_RUN_VERSION: 999.0.0
 
@@ -460,7 +468,7 @@ jobs:
       - performance-baseline
       - channels
       - openclaw-bridge
-      - npm-onboarding-linux
+      - npm-onboarding-pr
       - npm-onboarding-main
       - engine-contract
       - cargo-deny

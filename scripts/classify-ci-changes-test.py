@@ -63,6 +63,30 @@ class ClassifyTest(unittest.TestCase):
         self.assertTrue(result['npm_packaging'])
         self.assertFalse(result['rust'])
 
+    def test_help_surface_routes_to_npm_packaging(self):
+        for path in (
+            'docs/reference/cli-daemon.md',
+            'docs/guides/core-access.md',
+            'docs/development/cli-core-functionality.md',
+            'scripts/cli-docs-test.mjs',
+        ):
+            with self.subTest(path=path):
+                result = self.classify(path)
+                self.assertTrue(result['npm_packaging'])
+                self.assertFalse(result['workflow'])
+
+    def test_packaged_user_journey_paths_route_to_npm_packaging(self):
+        for path in (
+            'scripts/test-cli-prepublish-test.mjs',
+            'scripts/user-journey-e2e.mjs',
+            'scripts/user-journey-e2e-test.mjs',
+            'scripts/fixtures/fake-codex.mjs',
+        ):
+            with self.subTest(path=path):
+                result = self.classify(path)
+                self.assertTrue(result['npm_packaging'])
+                self.assertFalse(result['workflow'])
+
     def test_engine_install(self):
         result = self.classify('crates/coven-cli/src/engine_install.rs')
         self.assertTrue(result['rust'])

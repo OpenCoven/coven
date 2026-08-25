@@ -100,6 +100,9 @@ test('parallel-work guide uses issue-keyed claim tokens', () => {
 test('prepublish smoke runs the CLI docs discovery guard', () => {
   const prepublish = readRepoFile('scripts/test-cli-prepublish.mjs');
   assert.match(prepublish, /scripts\/cli-docs-test\.mjs/);
+  assert.match(prepublish, /scripts\/test-cli-prepublish-test\.mjs/);
+  assert.match(prepublish, /scripts\/user-journey-e2e-test\.mjs/);
+  assert.match(prepublish, /runPackagedUserJourney/);
 });
 
 test('canonical CLI docs are discoverable and local guide contracts remain concrete', () => {
