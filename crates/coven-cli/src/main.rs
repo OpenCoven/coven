@@ -95,6 +95,7 @@ const COVEN_CODE_ANTHROPIC_OAUTH_CLIENT_ID: &str = "COVEN_CODE_ANTHROPIC_OAUTH_C
 
 #[derive(Parser, Debug)]
 #[command(name = "coven")]
+#[command(bin_name = "coven")]
 #[command(about = "Run project-scoped coding agents without memorizing harness commands")]
 #[command(
     long_about = "Coven runs Codex, Claude Code, GitHub Copilot CLI, and future harnesses inside a local, project-scoped session ledger. Run `coven` with no arguments to open the interactive Coven UI (requires the coven-code front-end), or pass a free-text task to plan and run it directly."

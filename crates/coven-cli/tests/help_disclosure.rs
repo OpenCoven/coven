@@ -204,6 +204,8 @@ fn top_level_help_is_concise_and_help_subcommand_matches() -> anyhow::Result<()>
     );
     let stdout = String::from_utf8(top_level.stdout)?;
     assert!(stdout.contains("Run `coven` with no arguments to open the interactive Coven UI"));
+    assert!(stdout.contains("Usage: coven "));
+    assert!(!stdout.contains("coven.exe"));
     assert_eq!(listed_commands(&stdout), CURATED_COMMANDS);
     assert!(!stdout.contains("\n  chat  "));
     assert!(!stdout.contains("\n  config  "));
@@ -381,6 +383,10 @@ fn full_help_json_has_stable_schema_routes_and_no_ansi() -> anyhow::Result<()> {
     );
 
     let help = command_from_json(&json, "help").expect("help command");
+    assert_eq!(
+        help["summary"],
+        "Show concise help, every public command, or help for one command"
+    );
     assert_eq!(
         help["docsUrl"],
         "https://docs.opencoven.ai/docs/cli/interactive"

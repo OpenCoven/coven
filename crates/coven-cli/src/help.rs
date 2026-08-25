@@ -287,6 +287,9 @@ fn is_public_completion_subcommand(command: &Command) -> bool {
     !command.is_hide_set() && command.get_name() != "help"
 }
 
+// Clap requires a static command name unless its optional `string` feature is
+// enabled. Completion generation is a short-lived CLI process, and this leaks
+// only the bounded command tree once before exit.
 fn leak_command_name(name: &str) -> &'static str {
     Box::leak(name.to_owned().into_boxed_str())
 }
@@ -572,8 +575,8 @@ fn public_help_groups() -> Result<Vec<PublicHelpGroup>> {
         let mut commands = Vec::with_capacity(group.commands.len());
         for command in group.commands {
             let summary = match (summaries.remove(command.name), command.summary_override) {
-                (Some(summary), _) => summary,
-                (None, Some(summary)) => summary.to_owned(),
+                (Some(_), Some(summary)) | (None, Some(summary)) => summary.to_owned(),
+                (Some(summary), None) => summary,
                 (None, None) => {
                     return Err(anyhow!(
                         "public help metadata references unknown command `{}`",
