@@ -232,7 +232,7 @@ impl MaintenanceGate {
     }
 
     #[cfg(test)]
-    fn at(common_dir: PathBuf) -> Self {
+    pub(crate) fn at_for_test(common_dir: PathBuf) -> Self {
         Self { common_dir }
     }
 
@@ -803,7 +803,7 @@ mod tests {
     #[test]
     fn live_gate_lock_blocks_a_second_acquirer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let _first = GateLock::acquire(gate.lock_path())?;
 
@@ -816,7 +816,7 @@ mod tests {
     #[test]
     fn dropping_gate_lock_allows_the_next_acquirer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let first = GateLock::acquire(gate.lock_path())?;
         drop(first);
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn stale_mtime_does_not_allow_live_gate_lock_takeover() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let _first = GateLock::acquire(gate.lock_path())?;
         let lock_file = fs::OpenOptions::new().write(true).open(gate.lock_path())?;
@@ -847,7 +847,7 @@ mod tests {
     #[test]
     fn symlinked_gate_lock_is_refused_without_touching_the_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         let outside = tempfile::NamedTempFile::new()?;
         fs::write(outside.path(), b"outside-lock-target")?;
@@ -864,7 +864,7 @@ mod tests {
     #[test]
     fn multiply_linked_gate_lock_is_refused() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         fs::write(gate.lock_path(), b"lock")?;
         let alias = temp.path().join("lock-alias");
@@ -880,7 +880,7 @@ mod tests {
     #[test]
     fn owner_rejects_a_writer_until_release() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let owner = gate.acquire_owner("cave", None)?;
         assert_eq!(owner.owner().phase, OwnerPhase::Held);
         let error = gate.acquire_writer("session-1", "session").unwrap_err();
@@ -895,7 +895,7 @@ mod tests {
     #[test]
     fn owner_drains_existing_writer_then_becomes_held() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer = gate.acquire_writer("session-1", "session")?;
         let mut owner = gate.acquire_owner("cave", None)?;
         assert_eq!(owner.owner().phase, OwnerPhase::Draining);
@@ -909,7 +909,7 @@ mod tests {
     #[test]
     fn owner_excludes_only_its_exact_participant_writer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer_self = gate.acquire_writer("session-self", "session")?;
         let writer_other = gate.acquire_writer("session-other", "session")?;
         let participant = writer_self.participant();
@@ -930,7 +930,7 @@ mod tests {
     #[test]
     fn owner_rejects_a_stale_or_forged_participant_generation() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer = gate.acquire_writer("session-self", "session")?;
         let mut participant = writer.participant();
         participant.generation.push_str("-forged");
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn owner_does_not_exclude_a_replacement_writer_with_the_same_id() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let first_writer = gate.acquire_writer("session-self", "session")?;
         let participant = first_writer.participant();
         drop(first_writer);
@@ -990,7 +990,7 @@ mod tests {
     #[test]
     fn writer_lease_participant_capability_uses_public_env_name() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer = gate.acquire_writer("session-self", "session")?;
         let capability = writer.participant_capability()?;
         let decoded = WriterParticipant::decode(&capability)?;
@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn malformed_owner_fails_closed() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let gate = MaintenanceGate::at(temp.path().to_path_buf());
+        let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         gate.ensure_layout()?;
         fs::write(gate.owner_path(), b"not-json")?;
         let error = gate.acquire_writer("session-1", "session").unwrap_err();

@@ -1672,6 +1672,19 @@ fn acquire_session_writer(
     }
 }
 
+fn apply_maintenance_participant(
+    command: &mut pty_runner::HarnessCommand,
+    writer: Option<&maintenance_gate::WriterLease>,
+) -> Result<()> {
+    if let Some(writer) = writer {
+        command.set_environment_override(
+            maintenance_gate::MAINTENANCE_PARTICIPANT_ENV,
+            Some(writer.participant_capability()?),
+        );
+    }
+    Ok(())
+}
+
 fn run_bare_prompt(prompt: &[String]) -> Result<()> {
     // The bare-prompt catch-all swallows anything clap doesn't recognize, so
     // it has to do its own front-door validation: reject stray flags, catch
@@ -3287,7 +3300,7 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         request.harness_id.as_str(),
         session_launch::HarnessCheck::Available,
     )?;
-    let _maintenance_writer = acquire_session_writer(&request.repo.root, "patch-session")?;
+    let maintenance_writer = acquire_session_writer(&request.repo.root, "patch-session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_home.join(STORE_FILE_NAME);
     let conn = store::open_store(&store_path)?;
@@ -3335,12 +3348,13 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
     // row was sacrificed or is otherwise non-`created`, the helper bails
     // before `run_harness_attached` ever runs.
     let launch_mode = harness_launch_mode_for_stdio(&selected_harness.id);
-    let command = pty_runner::build_harness_command(
+    let mut command = pty_runner::build_harness_command(
         &selected_harness.id,
         &brief,
         &request.repo.root,
         launch_mode,
     )?;
+    apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
     let result = activate_direct_launch_with_runner(&conn, &record.id, || {
         run_harness_attached(&command, launch_mode, false)
     })?;
@@ -4133,7 +4147,7 @@ fn run_session(
             )),
             session_launch::LaunchPathError::Cwd(error) => error.context("failed to resolve cwd"),
         })?;
-    let _maintenance_writer = acquire_session_writer(&project_root, "session")?;
+    let maintenance_writer = acquire_session_writer(&project_root, "session")?;
     let coven_home = coven_home_dir()?;
     let store_path = coven_store_path()?;
     let conn = store::open_store(&store_path)?;
@@ -4420,7 +4434,8 @@ fn run_session(
             familiar_for_args,
             launch_options,
         );
-        let exit_code = command.and_then(|command| {
+        let exit_code = command.and_then(|mut command| {
+            apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
             pty_runner::stream_harness(
                 &command,
                 stream_json_input,
@@ -4541,7 +4556,7 @@ fn run_session(
             launch_options,
         )
     };
-    let command = match command {
+    let mut command = match command {
         Ok(command) => command,
         Err(error) => {
             store::update_session_status(
@@ -4565,6 +4580,7 @@ fn run_session(
             return Err(error);
         }
     };
+    apply_maintenance_participant(&mut command, maintenance_writer.as_ref())?;
     if stream_json && selected_harness.id == "codex" {
         let output_session_id = record.id.clone();
         let outcome = pty_runner::stream_codex_json(&command, move |text| {
@@ -5327,6 +5343,35 @@ mod tests {
                 .expect("participant should parse");
         assert_eq!(participant.id, "writer-1");
         assert_eq!(participant.generation, "gen-1");
+    }
+
+    #[test]
+    fn maintenance_participant_is_added_only_when_a_writer_exists() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let gate = maintenance_gate::MaintenanceGate::at_for_test(temp.path().to_path_buf());
+        let writer = gate.acquire_writer("session-self", "session")?;
+        let mut command =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp.path().to_path_buf());
+
+        apply_maintenance_participant(&mut command, Some(&writer))?;
+
+        let capability = command
+            .environment_override_for_test(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV)
+            .expect("writer should add maintenance participant override");
+        assert_eq!(
+            maintenance_gate::WriterParticipant::decode(capability)?,
+            writer.participant()
+        );
+
+        let mut command_without_writer =
+            pty_runner::HarnessCommand::fixture("echo", Vec::new(), temp.path().to_path_buf());
+        apply_maintenance_participant(&mut command_without_writer, None)?;
+        assert_eq!(
+            command_without_writer
+                .environment_override_for_test(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV),
+            None
+        );
+        Ok(())
     }
 
     #[test]
