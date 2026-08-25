@@ -1350,6 +1350,26 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
+    /git\/ref\/tags\/\$TAG_NAME/,
+    'verify-tag must resolve the exact remote tag ref before trusting the local tag object'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$api_tag_object_sha" != "\$TAG_OBJECT_SHA" \]; then/,
+    'verify-tag must require the local annotated tag object SHA to match the GitHub-verified tag object SHA'
+  );
+  assert.match(
+    workflow,
+    /jq -r '\.tag \/\/ ""'/,
+    'verify-tag must require the GitHub tag object payload to echo the requested tag name'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$tag_name" != "\$TAG_NAME" \]; then/,
+    'verify-tag must reject GitHub tag payloads that name a different tag'
+  );
+  assert.match(
+    workflow,
     /lightweight tag/,
     'verify-tag must explicitly reject lightweight (unsigned) tags'
   );
@@ -1412,6 +1432,16 @@ test('release workflow verifies the signed release tag before building or publis
     workflow,
     /tag_object_type.*commit/s,
     'verify-tag must reject annotated tags that do not target commits'
+  );
+  assert.match(
+    workflow,
+    /LOCAL_TAGGED_COMMIT_SHA=\$\(git rev-parse "\$TAG_NAME\^\{commit\}"\)/,
+    'verify-tag must resolve the local tagged commit after the tag-object identity check'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$LOCAL_TAGGED_COMMIT_SHA" != "\$TAGGED_COMMIT_SHA" \]; then/,
+    'verify-tag must reject local tag aliases that resolve to a different commit than the verified tag object'
   );
 });
 
