@@ -221,28 +221,20 @@ fn sync_directory(directory: &Path) -> Result<(), io::Error> {
 
 #[cfg(not(unix))]
 fn sync_directory(directory: &Path) -> Result<(), io::Error> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-
-        OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(directory)?
-            .sync_all()
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = directory;
-        Ok(())
-    }
+    let _ = directory;
+    Ok(())
 }
 
 fn create_directory_durable(directory: &Path) -> Result<(), io::Error> {
     if directory.exists() {
-        return Ok(());
+        return if directory.is_dir() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "loop journal path exists and is not a directory",
+            ))
+        };
     }
 
     let mut missing = Vec::new();

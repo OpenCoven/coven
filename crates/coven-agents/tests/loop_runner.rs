@@ -86,6 +86,17 @@ fn goal_loop(model: Arc<QueueModel>, journal: Arc<dyn LoopJournal>) -> GoalLoopR
     )
 }
 
+#[test]
+fn file_journal_rejects_a_root_that_is_not_a_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("journal-file");
+    std::fs::write(&file, b"not a directory").unwrap();
+
+    let error = FileLoopJournal::new(&file).unwrap_err();
+
+    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+}
+
 #[tokio::test]
 async fn loops_until_the_evaluator_declares_success() {
     let model = Arc::new(QueueModel::new([
@@ -107,7 +118,7 @@ async fn loops_until_the_evaluator_declares_success() {
         .unwrap();
 
     assert_eq!(result.iterations, 2);
-    assert_eq!(result.result.unwrap().final_output, "done");
+    assert_eq!(result.result.final_output, "done");
     assert_eq!(model.calls.load(Ordering::SeqCst), 2);
     assert_eq!(
         journal.checkpoint("loop-1").await.unwrap(),
@@ -275,7 +286,7 @@ async fn resumes_pending_work_after_file_journal_reopens() {
         .unwrap();
 
     assert_eq!(result.iterations, 4);
-    assert_eq!(result.result.unwrap().final_output, "done");
+    assert_eq!(result.result.final_output, "done");
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         reopened.load("reboot-loop").await.unwrap().unwrap().status,
@@ -389,7 +400,7 @@ async fn offline_reconciliation_can_confirm_an_iteration_and_continue() {
         .unwrap();
 
     assert_eq!(result.iterations, 3);
-    assert_eq!(result.result.unwrap().final_output, "done");
+    assert_eq!(result.result.final_output, "done");
     assert_eq!(model.calls.load(Ordering::SeqCst), 1);
 }
 

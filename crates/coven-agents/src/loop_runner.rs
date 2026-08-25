@@ -203,9 +203,7 @@ impl Default for LoopOptions {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoopRunResult {
-    /// `None` means reconciliation proved the external goal was already met,
-    /// so no agent iteration ran in this process.
-    pub result: Option<RunResult>,
+    pub result: RunResult,
     pub iterations: usize,
 }
 
@@ -454,10 +452,15 @@ where
                         active_attempt: None,
                         blocked_reason: None,
                     };
-                    if self
-                        .compare_and_set(None, &checkpoint, "initialization")
-                        .await?
-                    {
+                    let initialized = self
+                        .journal
+                        .compare_and_set(&loop_id, None, &checkpoint)
+                        .await
+                        .map_err(|source| LoopError::JournalFailed {
+                            operation: "initialization",
+                            source,
+                        })?;
+                    if initialized {
                         break checkpoint;
                     }
                 }
@@ -587,7 +590,7 @@ where
                     self.compare_and_set(Some(&checkpoint), &completed, "completion")
                         .await?;
                     return Ok(LoopRunResult {
-                        result: Some(result),
+                        result,
                         iterations: iteration,
                     });
                 }
@@ -631,7 +634,7 @@ where
         expected: Option<&LoopCheckpoint>,
         next: &LoopCheckpoint,
         operation: &'static str,
-    ) -> Result<bool, LoopError> {
+    ) -> Result<(), LoopError> {
         let changed = self
             .journal
             .compare_and_set(&next.loop_id, expected, next)
@@ -643,6 +646,6 @@ where
                 operation,
             });
         }
-        Ok(true)
+        Ok(())
     }
 }
