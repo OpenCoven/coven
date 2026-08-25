@@ -63,6 +63,19 @@ function assertHermeticGitOptions(options, layout, wrapperBin, maliciousHome) {
   assert.notEqual(options.env.USERPROFILE, maliciousHome);
 }
 
+function scriptedJourneyBaseEnv(scratch, maliciousHome) {
+  const systemBin = path.join(scratch, 'system-bin');
+  mkdirSync(systemBin, { recursive: true });
+  writeFileSync(path.join(systemBin, 'git'), 'fixture');
+  return {
+    ...process.env,
+    HOME: maliciousHome,
+    USERPROFILE: maliciousHome,
+    GIT_CONFIG_GLOBAL: path.join(maliciousHome, '.gitconfig'),
+    PATH: [systemBin, process.env.PATH ?? process.env.Path ?? ''].join(path.delimiter)
+  };
+}
+
 function gitInitArgs(layout) {
   return [
     '-c',
@@ -665,12 +678,7 @@ test('runPackagedUserJourney sequences installed-wrapper commands and full lifec
     ]);
 
     const result = runPackagedUserJourney({
-      baseEnv: {
-        ...process.env,
-        HOME: maliciousHome,
-        USERPROFILE: maliciousHome,
-        GIT_CONFIG_GLOBAL: path.join(maliciousHome, '.gitconfig')
-      },
+      baseEnv: scriptedJourneyBaseEnv(scratch, maliciousHome),
       keepScratchDir: false,
       platform: 'darwin',
       runner: script.runner,
@@ -833,12 +841,7 @@ test('runPackagedUserJourney attempts bounded daemon stop after start failure', 
     assert.throws(
       () =>
         runPackagedUserJourney({
-          baseEnv: {
-            ...process.env,
-            HOME: maliciousHome,
-            USERPROFILE: maliciousHome,
-            GIT_CONFIG_GLOBAL: path.join(maliciousHome, '.gitconfig')
-          },
+          baseEnv: scriptedJourneyBaseEnv(scratch, maliciousHome),
           platform: 'darwin',
           runner: script.runner,
           scratchRoot: journeyRoot,
@@ -1012,12 +1015,7 @@ test('runPackagedUserJourney stops the daemon and removes scratch after mid-jour
     assert.throws(
       () =>
         runPackagedUserJourney({
-          baseEnv: {
-            ...process.env,
-            HOME: maliciousHome,
-            USERPROFILE: maliciousHome,
-            GIT_CONFIG_GLOBAL: path.join(maliciousHome, '.gitconfig')
-          },
+          baseEnv: scriptedJourneyBaseEnv(scratch, maliciousHome),
           platform: 'darwin',
           runner: script.runner,
           scratchRoot: journeyRoot,
