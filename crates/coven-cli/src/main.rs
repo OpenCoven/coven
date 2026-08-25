@@ -1566,6 +1566,14 @@ fn setup_candidate_commit() -> String {
     env!("COVEN_BUILD_COMMIT").to_owned()
 }
 
+fn maintenance_participant_from_value(
+    value: Option<&str>,
+) -> Result<Option<maintenance_gate::WriterParticipant>> {
+    value
+        .map(maintenance_gate::WriterParticipant::decode)
+        .transpose()
+}
+
 fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
     let cwd = std::env::current_dir().context("failed to read current directory")?;
     let gate = maintenance_gate::MaintenanceGate::discover(&cwd)?;
@@ -1579,7 +1587,12 @@ fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
             wait_ms,
             json,
         } => {
-            let mut lease = gate.acquire_owner(owner, None)?;
+            let participant = maintenance_participant_from_value(
+                std::env::var(maintenance_gate::MAINTENANCE_PARTICIPANT_ENV)
+                    .ok()
+                    .as_deref(),
+            )?;
+            let mut lease = gate.acquire_owner(owner, participant)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
             let mut status = lease.refresh_phase()?;
             while !status.writers.is_empty() && std::time::Instant::now() < deadline {
@@ -5298,6 +5311,22 @@ mod tests {
                 command: ConfigCommand::Paths { json: true }
             })
         ));
+    }
+
+    #[test]
+    fn maintenance_participant_env_is_optional_and_strict() {
+        assert_eq!(maintenance_participant_from_value(None).unwrap(), None);
+        assert!(maintenance_participant_from_value(Some("not-json")).is_err());
+
+        let blank = maintenance_participant_from_value(Some(r#"{"id":"","generation":"g"}"#));
+        assert!(blank.is_err());
+
+        let participant =
+            maintenance_participant_from_value(Some(r#"{"id":"writer-1","generation":"gen-1"}"#))
+                .unwrap()
+                .expect("participant should parse");
+        assert_eq!(participant.id, "writer-1");
+        assert_eq!(participant.generation, "gen-1");
     }
 
     #[test]
