@@ -1579,7 +1579,7 @@ fn run_maintenance_command(command: MaintenanceCommand) -> Result<()> {
             wait_ms,
             json,
         } => {
-            let mut lease = gate.acquire_owner(owner)?;
+            let mut lease = gate.acquire_owner(owner, None)?;
             let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms);
             let mut status = lease.refresh_phase()?;
             while !status.writers.is_empty() && std::time::Instant::now() < deadline {
