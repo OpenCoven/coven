@@ -4,6 +4,8 @@ import { once } from 'node:events';
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,14 +19,95 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
+import { assertInstallableDependencies, defaultTargetName, isMainModule, targetHelperBinaryName, isOidcContext, nativeTargetNamesForPackageSet, packageVersionPublished, prepareDistRoot, publishArgs, publishEnv, releaseVersion, targetPackageName, validatePublishToken, validatePublishVersion, wrapperPackageDirName, wrapperPackageNameList, wrapperTextForPackage } from './publish-npm.mjs';
 import { parseReleaseTag } from './release-npm-context.mjs';
 import { platformMatrix } from './release-npm-platform-matrix.mjs';
+
+const WRAPPER_PACKAGE_PATH = new URL(
+  ['..', 'npm', 'coven', 'package.json'].join('/'),
+  import.meta.url
+);
 
 const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'fake-oidc-token',
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
+
+test('release staging removes stale generated npm output before regeneration', () => {
+  const fixture = mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-'));
+  try {
+    const distRoot = path.join(fixture, 'npm', 'dist');
+    const stalePackage = path.join(distRoot, 'coven', 'package.json');
+    mkdirSync(path.dirname(stalePackage), { recursive: true });
+    writeFileSync(
+      stalePackage,
+      `${JSON.stringify({ name: '@opencoven/cli', version: '0.2.4' })}\n`
+    );
+
+    prepareDistRoot(distRoot);
+
+    assert.throws(() => readFileSync(stalePackage, 'utf8'), /ENOENT/);
+    assert.equal(existsSync(distRoot), true);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
+
+test('wrapper dry-run cannot reuse a stale generated package version', () => {
+  const fixture = realpathSync(
+    mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-dry-run-'))
+  );
+  try {
+    mkdirSync(path.join(fixture, 'scripts'), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
+      path.join(fixture, 'scripts', 'publish-npm.mjs')
+    );
+    cpSync(
+      fileURLToPath(new URL('../npm/coven', import.meta.url)),
+      path.join(fixture, 'npm', 'coven'),
+      { recursive: true }
+    );
+
+    const stalePackage = path.join(fixture, 'npm', 'dist', 'coven', 'package.json');
+    mkdirSync(path.dirname(stalePackage), { recursive: true });
+    writeFileSync(
+      stalePackage,
+      `${JSON.stringify({ name: '@opencoven/cli', version: '0.2.4' })}\n`
+    );
+    writeFileSync(path.join(fixture, 'npm', 'dist', 'stale-platform.txt'), 'stale\n');
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
+      {
+        encoding: 'utf8',
+        cwd: fixture,
+        env: { ...process.env, COVEN_NPM_VERSION: '0.4.1' }
+      }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(
+      JSON.parse(readFileSync(stalePackage, 'utf8')).version,
+      '0.4.1',
+      'generated package must be restamped from the release version'
+    );
+    assert.equal(
+      existsSync(path.join(fixture, 'npm', 'dist', 'stale-platform.txt')),
+      false,
+      'files outside the regenerated package set must be removed'
+    );
+    assert.equal(
+      JSON.parse(readFileSync(path.join(fixture, 'npm', 'coven', 'package.json'), 'utf8'))
+        .version,
+      '0.0.0',
+      'source manifest must remain a release-time placeholder'
+    );
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
+});
 
 test('parseReleaseTag preserves stable releases', () => {
   assert.deepEqual(parseReleaseTag('v0.2.3'), {
@@ -246,18 +329,157 @@ test('defaultTargetName maps win32 x64 to windows', () => {
 });
 
 test('wrapper declares linux x64 native package as an optional dependency', () => {
-  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  const packageJson = JSON.parse(readFileSync(WRAPPER_PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-linux-x64'], '0.0.0');
 });
 
-test('wrapper keeps the dashboard companion on its independent version', () => {
-  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
-  assert.equal(
-    packageJson.optionalDependencies['@opencoven/coven-memory-dashboard'],
-    '^0.1.0'
+test('wrapper does not depend on the dashboard companion', () => {
+  // The dashboard is a Next.js application whose own dependency closure is far
+  // larger than the wrapper's, and only `coven memory open` needs it. Depending
+  // on it here put that whole closure into every global CLI install. The
+  // command resolves the companion at run time instead, and the native binary
+  // prints the single actionable install instruction when it is absent.
+  const packageJson = JSON.parse(readFileSync(WRAPPER_PACKAGE_PATH, 'utf8'));
+  for (const field of ['dependencies', 'optionalDependencies', 'peerDependencies']) {
+    assert.equal(
+      packageJson[field]?.['@opencoven/coven-memory-dashboard'],
+      undefined,
+      `dashboard companion must not be declared in ${field}`
+    );
+  }
+});
+
+test('wrapper template is self-consistent at the placeholder version', () => {
+  const packageJson = JSON.parse(readFileSync(WRAPPER_PACKAGE_PATH, 'utf8'));
+  assert.doesNotThrow(() => assertInstallableDependencies(packageJson, '0.0.0'));
+});
+
+test('publish refuses a wrapper dependency npm cannot integrity-check', () => {
+  // These specifiers skip npm's integrity check and need git or a network
+  // fetch, plus credentials, at install time. Only this manifest is in scope:
+  // the specifier that shipped the bug was transitive, reachable because the
+  // wrapper declared the dashboard at all, and is caught below by the pin rule.
+  for (const spec of [
+    'git+https://github.com/OpenCoven/coven-design-system.git#6032f9f4',
+    'ssh://git@github.com/OpenCoven/coven-design-system.git',
+    'github:OpenCoven/coven-design-system',
+    'OpenCoven/coven-design-system',
+    'https://example.invalid/pkg.tgz',
+    'file:../pkg'
+  ]) {
+    assert.throws(
+      () => assertInstallableDependencies({ dependencies: { pkg: spec } }, '0.4.1'),
+      /must be pinned to the release version/,
+      `expected '${spec}' to be refused`
+    );
+  }
+});
+
+test('publish refuses a wrapper dependency left off the release version', () => {
+  // Every installed wrapper dependency is a lockstep-versioned native, so a
+  // surviving range means the placeholder rewrite missed it — which is exactly
+  // how `^0.1.0` shipped. A bare `0.0.0` is the same miss wearing an
+  // exact-looking shape, and resolves to a version that was never published.
+  for (const spec of ['^0.4.1', '~0.4.1', '0.x', 'latest', '*', '0.0.0', '0.4.0']) {
+    assert.throws(
+      () => assertInstallableDependencies({ optionalDependencies: { pkg: spec } }, '0.4.1'),
+      /must be pinned to the release version/,
+      `expected '${spec}' to be refused`
+    );
+  }
+});
+
+test('publish accepts any exact release version, prereleases included', () => {
+  // The rule is equality with the release version, not a version shape, so a
+  // prerelease or build-metadata release passes or fails with the release
+  // itself rather than against a second, divergent shape rule.
+  for (const version of ['0.4.1', '1.0.0-rc.1', '1.0.0+build.5', '999.0.0']) {
+    assert.doesNotThrow(
+      () => assertInstallableDependencies({ optionalDependencies: { pkg: version } }, version),
+      `expected '${version}' to be accepted`
+    );
+  }
+});
+
+test('publish checks every dependency field npm installs from', () => {
+  for (const field of ['dependencies', 'optionalDependencies']) {
+    assert.throws(
+      () =>
+        assertInstallableDependencies(
+          { [field]: { pkg: 'git+https://x.invalid/p.git' } },
+          '0.4.1'
+        ),
+      /must be pinned to the release version/,
+      `expected ${field} to be checked`
+    );
+  }
+  // devDependencies are not installed for a consumer of a published package.
+  assert.doesNotThrow(() =>
+    assertInstallableDependencies(
+      { devDependencies: { pkg: 'git+https://x.invalid/p.git' } },
+      '0.4.1'
+    )
   );
+});
+
+test('publish holds peer dependencies to registry resolution but not to a pin', () => {
+  // Peer ranges are idiomatic and legitimate; a non-registry peer specifier is
+  // not, because npm installs peers and cannot integrity-check those.
+  assert.doesNotThrow(() =>
+    assertInstallableDependencies({ peerDependencies: { pkg: '^3.0.0' } }, '0.4.1')
+  );
+  for (const spec of ['git+https://x.invalid/p.git', 'github:owner/repo', 'file:../p']) {
+    assert.throws(
+      () => assertInstallableDependencies({ peerDependencies: { pkg: spec } }, '0.4.1'),
+      /resolves outside the npm registry/,
+      `expected peer '${spec}' to be refused`
+    );
+  }
+});
+
+test('publish path fails closed on a wrapper dependency npm cannot install', () => {
+  // The unit tests above would all still pass if the call site were deleted.
+  // This drives the real script end to end so the gate is pinned to the publish
+  // path itself, not merely to the exported function.
+  const fixture = realpathSync(
+    mkdtempSync(path.join(tmpdir(), 'coven-publish-gate-'))
+  );
+  try {
+    mkdirSync(path.join(fixture, 'scripts'), { recursive: true });
+    copyFileSync(
+      fileURLToPath(new URL('publish-npm.mjs', import.meta.url)),
+      path.join(fixture, 'scripts', 'publish-npm.mjs')
+    );
+    cpSync(
+      fileURLToPath(new URL('../npm/coven', import.meta.url)),
+      path.join(fixture, 'npm', 'coven'),
+      { recursive: true }
+    );
+    const poisoned = path.join(fixture, 'npm', 'coven', 'package.json');
+    const packageJson = JSON.parse(readFileSync(poisoned, 'utf8'));
+    packageJson.dependencies = {
+      '@opencoven/coven-design-system':
+        'git+https://github.com/OpenCoven/coven-design-system.git#6032f9f4'
+    };
+    writeFileSync(poisoned, `${JSON.stringify(packageJson, null, 2)}\n`);
+
+    // --wrapper-only --dry-run reaches writeWrapperPackage and must abort there,
+    // before npm is invoked at all.
+    const result = spawnSync(
+      process.execPath,
+      [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
+      { encoding: 'utf8', cwd: fixture, env: { ...process.env, COVEN_NPM_VERSION: '0.4.1' } }
+    );
+    assert.notEqual(result.status, 0, 'publish must fail closed on a git dependency');
+    assert.match(
+      result.stderr,
+      /Refusing to publish @opencoven\/cli: dependencies\['@opencoven\/coven-design-system'\]/
+    );
+    // fail() reports a bare actionable line, not an uncaught-throw stack dump.
+    assert.doesNotMatch(result.stderr, /at assertInstallableDependencies/);
+  } finally {
+    rmSync(fixture, { recursive: true, force: true });
+  }
 });
 
 test('wrapper declares the installed dashboard entrypoint handoff', () => {
@@ -433,6 +655,121 @@ test(
   }
 );
 
+test(
+  'wrapper clears an inherited dashboard handoff instead of forwarding it',
+  {
+    skip:
+      process.platform === 'win32' ||
+      !SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`]
+  },
+  () => {
+    // The native CLI launches whatever entrypoint the handoff names, so an
+    // inherited value is arbitrary code chosen by whoever set it. The wrapper
+    // is the only legitimate source. This matters most on the dashboard-absent
+    // path, which is the default for everyone who has not installed the
+    // companion: the wrapper sets nothing there, so anything it failed to clear
+    // would reach the native binary unchallenged.
+    const fixture = realpathSync(
+      mkdtempSync(path.join(tmpdir(), 'coven-wrapper-handoff-env-'))
+    );
+    try {
+      const wrapperDir = path.join(fixture, 'wrapper');
+      const wrapperBinDir = path.join(wrapperDir, 'bin');
+      const wrapperPath = path.join(wrapperBinDir, 'coven.js');
+      mkdirSync(wrapperBinDir, { recursive: true });
+      writeFileSync(
+        path.join(wrapperDir, 'package.json'),
+        JSON.stringify({ name: '@opencoven/cli-test', type: 'module' })
+      );
+      copyFileSync(
+        fileURLToPath(new URL('../npm/coven/bin/coven.js', import.meta.url)),
+        wrapperPath
+      );
+
+      const [packageName, binaryName] =
+        SIGNAL_TEST_PACKAGES[`${process.platform}-${process.arch}`];
+      const nativeDir = path.join(wrapperDir, 'node_modules', ...packageName.split('/'));
+      const nativeBinDir = path.join(nativeDir, 'bin');
+      const nativePath = path.join(nativeBinDir, binaryName);
+      mkdirSync(nativeBinDir, { recursive: true });
+      writeFileSync(
+        path.join(nativeDir, 'package.json'),
+        JSON.stringify({ name: packageName, version: '0.0.0' })
+      );
+      writeFileSync(
+        nativePath,
+        [
+          '#!/bin/sh',
+          'printf "%s\\n%s\\n%s\\n" "$COVEN_MEMORY_DASHBOARD_ENTRY" "$COVEN_MEMORY_DASHBOARD_NODE" "$COVEN_MEMORY_DASHBOARD_BIN"',
+          ''
+        ].join('\n')
+      );
+      chmodSync(nativePath, 0o755);
+
+      const inherited = {
+        ...process.env,
+        COVEN_MEMORY_DASHBOARD_ENTRY: '/tmp/attacker-entry.mjs',
+        COVEN_MEMORY_DASHBOARD_NODE: '/tmp/attacker-node',
+        COVEN_MEMORY_DASHBOARD_BIN: '/tmp/attacker-bin'
+      };
+
+      // No dashboard is installed in this fixture, so the wrapper's resolve
+      // fails and it sets no handoff of its own.
+      const absent = spawnSync(process.execPath, [wrapperPath, 'memory', 'open'], {
+        encoding: 'utf8',
+        env: inherited
+      });
+      assert.equal(absent.status, 0, `wrapper exited ${absent.status}: ${absent.stderr}`);
+      assert.equal(
+        absent.stdout,
+        '\n\n\n',
+        'every inherited dashboard handoff variable must be cleared'
+      );
+
+      // A non-dashboard invocation must not carry them either.
+      const unrelated = spawnSync(process.execPath, [wrapperPath, 'doctor'], {
+        encoding: 'utf8',
+        env: inherited
+      });
+      assert.equal(unrelated.status, 0, `wrapper exited ${unrelated.status}`);
+      assert.equal(unrelated.stdout, '\n\n\n');
+
+      // With the companion installed the wrapper supplies its own entry and
+      // Node, and still drops the inherited binary override.
+      const dashboardDir = path.join(
+        wrapperDir,
+        'node_modules',
+        '@opencoven',
+        'coven-memory-dashboard'
+      );
+      const dashboardBinDir = path.join(dashboardDir, 'bin');
+      const dashboardEntry = path.join(dashboardBinDir, 'coven-memory-dashboard.mjs');
+      mkdirSync(dashboardBinDir, { recursive: true });
+      writeFileSync(
+        path.join(dashboardDir, 'package.json'),
+        JSON.stringify({
+          name: '@opencoven/coven-memory-dashboard',
+          version: '0.0.0',
+          type: 'module'
+        })
+      );
+      writeFileSync(dashboardEntry, '');
+
+      const present = spawnSync(process.execPath, [wrapperPath, 'memory', 'open'], {
+        encoding: 'utf8',
+        env: inherited
+      });
+      assert.equal(present.status, 0, `wrapper exited ${present.status}: ${present.stderr}`);
+      const [entry, node, bin] = present.stdout.split('\n');
+      assert.equal(entry, dashboardEntry, 'wrapper must resolve the entry itself');
+      assert.equal(node, process.execPath, 'wrapper must supply its own Node');
+      assert.equal(bin, '', 'inherited binary override must be cleared');
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  }
+);
+
 test('release publishes only the canonical @opencoven/cli wrapper package', () => {
   assert.deepEqual(wrapperPackageNameList(), ['@opencoven/cli']);
   assert.equal(wrapperPackageDirName('@opencoven/cli'), 'coven');
@@ -445,8 +782,7 @@ test('wrapperTextForPackage rewrites @opencoven/cli only when given a different 
 });
 
 test('wrapper declares windows native package as an optional dependency', () => {
-  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  const packageJson = JSON.parse(readFileSync(WRAPPER_PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-windows'], '0.0.0');
 });
 
@@ -461,8 +797,7 @@ test('wrapper binary maps Intel macOS to the Intel native package', () => {
   const binPath = new URL(['..', 'npm', 'coven', 'bin', 'coven.js'].join('/'), import.meta.url);
   const bin = readFileSync(binPath, 'utf8');
   assert.match(bin, /'darwin-x64': '@opencoven\/cli-macos-x64'/);
-  const packagePath = new URL(['..', 'npm', 'coven', 'package.json'].join('/'), import.meta.url);
-  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  const packageJson = JSON.parse(readFileSync(WRAPPER_PACKAGE_PATH, 'utf8'));
   assert.equal(packageJson.optionalDependencies['@opencoven/cli-macos-x64'], '0.0.0');
 });
 
@@ -1015,6 +1350,26 @@ test('release workflow verifies the signed release tag before building or publis
   );
   assert.match(
     workflow,
+    /git\/ref\/tags\/\$TAG_NAME/,
+    'verify-tag must resolve the exact remote tag ref before trusting the local tag object'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$api_tag_object_sha" != "\$TAG_OBJECT_SHA" \]; then/,
+    'verify-tag must require the local annotated tag object SHA to match the GitHub-verified tag object SHA'
+  );
+  assert.match(
+    workflow,
+    /jq -r '\.tag \/\/ ""'/,
+    'verify-tag must require the GitHub tag object payload to echo the requested tag name'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$tag_name" != "\$TAG_NAME" \]; then/,
+    'verify-tag must reject GitHub tag payloads that name a different tag'
+  );
+  assert.match(
+    workflow,
     /lightweight tag/,
     'verify-tag must explicitly reject lightweight (unsigned) tags'
   );
@@ -1077,6 +1432,16 @@ test('release workflow verifies the signed release tag before building or publis
     workflow,
     /tag_object_type.*commit/s,
     'verify-tag must reject annotated tags that do not target commits'
+  );
+  assert.match(
+    workflow,
+    /LOCAL_TAGGED_COMMIT_SHA=\$\(git rev-parse "\$TAG_NAME\^\{commit\}"\)/,
+    'verify-tag must resolve the local tagged commit after the tag-object identity check'
+  );
+  assert.match(
+    workflow,
+    /if \[ "\$LOCAL_TAGGED_COMMIT_SHA" != "\$TAGGED_COMMIT_SHA" \]; then/,
+    'verify-tag must reject local tag aliases that resolve to a different commit than the verified tag object'
   );
 });
 

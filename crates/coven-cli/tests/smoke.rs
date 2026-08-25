@@ -1110,8 +1110,16 @@ fn doctor_missing_harness_prints_cross_platform_setup_loop() -> anyhow::Result<(
     assert_stdout_contains(
         "doctor without harnesses",
         &output,
-        "Install and authenticate at least one harness in this same shell.",
+        "Set up at least one harness in this same shell.",
     );
+    for command in [
+        "Codex: coven setup codex",
+        "Claude Code: coven setup claude",
+        "GitHub Copilot CLI: coven setup copilot",
+    ] {
+        assert_stdout_contains("doctor without harnesses", &output, command);
+    }
+    assert_stdout_not_contains("doctor without harnesses", &output, "claude doctor");
     assert_stdout_contains(
         "doctor without harnesses",
         &output,

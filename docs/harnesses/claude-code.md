@@ -14,8 +14,9 @@ Claude Code is Anthropic's coding-agent CLI. Coven wraps it in a project-rooted 
 |---|---|
 | Harness id | `claude` |
 | Install | `npm install -g @anthropic-ai/claude-code` |
-| Auth | `claude doctor` (one-time, Anthropic side) |
-| Doctor check | `coven doctor` reports the resolved Claude path and version. |
+| Auth | `claude auth login` (one-time, Anthropic side) |
+| Guided setup | `coven setup claude` |
+| Doctor check | `coven doctor` reports local availability; it does not verify auth. |
 
 ## Setup
 
@@ -25,17 +26,26 @@ Claude Code is Anthropic's coding-agent CLI. Coven wraps it in a project-rooted 
     npm install -g @anthropic-ai/claude-code
     ```
   </Step>
-  <Step title="Run Claude's own doctor">
+  <Step title="Run guided provider login">
     ```bash
-    claude doctor
+    coven setup claude
     ```
-    Provider credentials stay with Claude Code. Coven never reads them.
+    After explicit consent, Coven hands the terminal to `claude auth login`.
+    Provider credentials stay with Claude Code; Coven never reads them.
+  </Step>
+  <Step title="Optionally verify provider access">
+    ```bash
+    coven setup claude --verify-only
+    ```
+    Verification requires separate consent, network access, and may incur
+    provider usage or cost. It runs in ephemeral state.
   </Step>
   <Step title="Confirm with Coven">
     ```bash
     coven doctor
     ```
-    The output should include `claude: ok (/usr/local/bin/claude)`.
+    Doctor confirms only that Claude Code is locally available. It remains
+    offline and does not verify provider authentication.
   </Step>
   <Step title="Launch">
     ```bash
@@ -58,12 +68,15 @@ coven run claude "refactor for clarity" --cwd packages/web --title "Web refactor
 
 Claude Code owns its own OAuth flow and token cache. Coven never reads Anthropic keys or session cookies.
 
+For the complete TTY, consent, timeout, verification, and redacted report
+contract, see [`coven setup`](/reference/cli-setup).
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `coven doctor` reports `claude` missing | Claude Code not on `PATH` | `npm install -g @anthropic-ai/claude-code`, then re-run doctor. |
-| Claude prompts for login | Auth not finished | `claude doctor`. |
+| Claude prompts for login | Auth not finished | `claude auth login` or `coven setup claude`. |
 | Session shows long pre-flight pause | Claude resolving config | First run only; subsequent launches are fast. |
 
 ## How Coven supervises Claude Code
@@ -95,4 +108,5 @@ Claude Code's tool calls run inside the Claude process — Coven does not arbitr
 
 - [Installing harness CLIs](/harnesses/installing)
 - [Provider auth boundary](/harnesses/provider-auth)
+- [`coven setup`](/reference/cli-setup)
 - [Troubleshooting](https://docs.opencoven.ai/docs/harnesses/troubleshooting)

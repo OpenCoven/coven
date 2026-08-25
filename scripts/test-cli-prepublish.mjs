@@ -45,6 +45,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
 const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+const CARGO_GATE_TIMEOUT_MS = 20 * 60_000;
 
 const PLATFORM_TARGETS = {
   macos: { packageName: '@opencoven/cli-macos', binaryName: 'coven' },
@@ -125,10 +126,14 @@ step('onboarding, PR readiness, and publish guardrails', () => {
 if (withCargoGates) {
   step('cargo fmt --check', () => run('cargo', ['fmt', '--check']));
   step('cargo clippy', () =>
-    run('cargo', ['clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'])
+    run('cargo', ['clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'], {
+      timeoutMs: CARGO_GATE_TIMEOUT_MS
+    })
   );
   step('cargo test --workspace --locked', () =>
-    run('cargo', ['test', '--workspace', '--locked'])
+    run('cargo', ['test', '--workspace', '--locked'], {
+      timeoutMs: CARGO_GATE_TIMEOUT_MS
+    })
   );
 }
 
@@ -240,9 +245,10 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     );
   }
   for (const expected of [
-    'Install and authenticate at least one harness in this same shell',
-    'npm install -g @openai/codex && codex login',
-    'npm install -g @anthropic-ai/claude-code && claude doctor',
+    'Set up at least one harness in this same shell',
+    'Codex: coven setup codex',
+    'Claude Code: coven setup claude',
+    'GitHub Copilot CLI: coven setup copilot',
     'Doctor found problems; review the failing checks above.'
   ]) {
     if (!doctorOutput.stdout.includes(expected)) {

@@ -620,17 +620,15 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "codex".to_string(),
             label: "Codex".to_string(),
-            executable: "codex".to_string(),
+            executable: crate::setup::codex::EXECUTABLE.to_string(),
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
-            non_interactive_prompt_prefix_args: vec![
-                "exec".to_string(),
-                "--skip-git-repo-check".to_string(),
-                "--color".to_string(),
-                "never".to_string(),
-            ],
-            install_hint: "Install Codex with `npm install -g @openai/codex` or `brew install --cask codex`; if it is already installed, make sure `codex` is on PATH and run `codex login` or `codex` once to authenticate, then retry `coven doctor`.".to_string(),
+            non_interactive_prompt_prefix_args: crate::setup::codex::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            install_hint: crate::setup::codex::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             // Codex has no --system-prompt flag; identity is injected as a
@@ -674,12 +672,15 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "claude".to_string(),
             label: "Claude Code".to_string(),
-            executable: "claude".to_string(),
+            executable: crate::setup::claude::EXECUTABLE.to_string(),
             prompt_flag: None,
             interactive_prompt_flag: None,
             interactive_prompt_prefix_args: Vec::new(),
-            non_interactive_prompt_prefix_args: vec!["--print".to_string()],
-            install_hint: "Install Claude Code with `npm install -g @anthropic-ai/claude-code`; if it is already installed, make sure `claude` is on PATH and run `claude doctor` to finish local auth/setup, then retry `coven doctor`.".to_string(),
+            non_interactive_prompt_prefix_args: crate::setup::claude::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            install_hint: crate::setup::claude::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             system_prompt_flag: Some("--system-prompt".to_string()),
@@ -782,19 +783,22 @@ pub fn built_in_harness_specs() -> Vec<HarnessCommandSpec> {
         HarnessCommandSpec {
             id: "copilot".to_string(),
             label: "Copilot CLI".to_string(),
-            executable: "copilot".to_string(),
+            executable: crate::setup::copilot::EXECUTABLE.to_string(),
             // Copilot rejects positional prompts outright: non-interactive
             // one-shots are `--prompt <text>` and interactive-with-prompt is
             // `--interactive <text>`. Both ride the `=` form via
             // `prompt_args`. Verified against the installed copilot CLI.
-            prompt_flag: Some("--prompt".to_string()),
+            prompt_flag: Some(crate::setup::copilot::PROMPT_FLAG.to_string()),
             interactive_prompt_flag: Some("--interactive".to_string()),
             interactive_prompt_prefix_args: Vec::new(),
             // Copilot colorizes whenever it sees a TTY, and Coven runs
             // non-interactive launches under a PTY — mirror codex's
             // `--color never` hygiene. Interactive launches keep color.
-            non_interactive_prompt_prefix_args: vec!["--no-color".to_string()],
-            install_hint: "Install GitHub Copilot CLI with `npm install -g @github/copilot` or `brew install --cask copilot-cli`; if it is already installed, make sure `copilot` is on PATH and run `copilot login` to authenticate, then retry `coven doctor`.".to_string(),
+            non_interactive_prompt_prefix_args: crate::setup::copilot::NON_INTERACTIVE_PREFIX_ARGS
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
+            install_hint: crate::setup::copilot::INSTALL_GUIDANCE.to_string(),
             source: "bundled".to_string(),
             manifest_path: None,
             // Copilot has no system-prompt flag; identity is injected as a
@@ -2726,7 +2730,8 @@ mod tests {
         assert!(claude
             .install_hint
             .contains("npm install -g @anthropic-ai/claude-code"));
-        assert!(claude.install_hint.contains("claude doctor"));
+        assert!(claude.install_hint.contains("claude auth login"));
+        assert!(!claude.install_hint.contains("claude doctor"));
         assert!(claude.install_hint.contains("claude"));
         assert!(claude.install_hint.contains("PATH"));
 

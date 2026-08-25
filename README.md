@@ -112,7 +112,9 @@ The Rust daemon is the authority boundary. All clients — including the CLI its
 
 ### Installing harness CLIs
 
-Run `coven doctor` first — it prints specific install hints for any missing harness.
+Run `coven doctor` first — it reports local readiness and points missing
+harnesses to `coven setup`. Doctor stays offline and does not verify provider
+authentication.
 
 **Codex (OpenAI):**
 
@@ -126,7 +128,7 @@ codex login
 
 ```bash
 npm install -g @anthropic-ai/claude-code
-claude doctor
+claude auth login
 ```
 
 **GitHub Copilot CLI (GitHub):**
@@ -134,11 +136,17 @@ claude doctor
 ```bash
 npm install -g @github/copilot
 # or: brew install --cask copilot-cli
+copilot login
 ```
 
-Per-harness setup detail lives in [`docs/harnesses/`](docs/harnesses/index.md).
+The recommended guided path is `coven setup codex`, `coven setup claude`, or
+`coven setup copilot`; `coven setup all` processes all three in order. Add
+`--verify` for a separately consented provider turn, or use `--verify-only`
+after an existing login. See the
+[`coven setup` reference](docs/reference/cli-setup.md).
 
-After installing and authenticating, run `coven doctor` again to confirm the harness is detected. If `doctor` still reports missing, ensure the harness binary is on your `PATH`.
+After setup, run `coven doctor` again to confirm the harness is detected. If
+Doctor still reports it missing, ensure the harness binary is on your `PATH`.
 
 ---
 
@@ -153,16 +161,25 @@ Install globally:
 ```bash
 npm install -g @opencoven/cli
 coven doctor
+```
+
+The memory dashboard is an opt-in companion on its own release train, so a CLI
+install stays thin and never pulls the dashboard's application dependencies:
+
+```bash
+npm install -g @opencoven/coven-memory-dashboard
 coven memory open
 ```
 
 `coven memory open` starts or reuses the installed local Coven daemon before
-launching the packaged dashboard. It does not require a checkout or running
-development server from the `coven-memory` repository.
+launching that companion. It does not require a checkout or running development
+server from the `coven-memory` repository. Without the companion installed it
+prints the install command above and exits; every other Coven command is
+unaffected.
 
-The core npm wrapper supports Node.js 18 or newer. The optional memory
-dashboard requires Node.js 24 or newer; on an older runtime, only
-`coven memory open` is blocked and prints an upgrade instruction.
+The core npm wrapper supports Node.js 18 or newer. The memory dashboard
+requires Node.js 24 or newer; on an older runtime, only `coven memory open` is
+blocked and prints an upgrade instruction.
 
 **Available npm packages:**
 
@@ -173,7 +190,7 @@ dashboard requires Node.js 24 or newer; on an older runtime, only
 | `@opencoven/cli-macos-x64` | macOS Intel x64                                |
 | `@opencoven/cli-linux-x64` | glibc-based Linux x64 (Alpine unsupported)    |
 | `@opencoven/cli-windows`   | Windows x64                                    |
-| `@opencoven/coven-memory-dashboard` | Optional loopback memory dashboard companion |
+| `@opencoven/coven-memory-dashboard` | Opt-in loopback memory dashboard companion (installed separately) |
 
 ### Build from source (recommended for contributors)
 
@@ -212,21 +229,24 @@ a recorded session.
 ```bash
 cd /path/to/your/project
 
-# 1. Verify setup
+# 1. Complete provider-owned login
+coven setup codex
+
+# 2. Check local readiness
 coven doctor
 
-# 2. Start the daemon
+# 3. Start the daemon
 coven daemon start
 
-# 3. Launch a session
+# 4. Launch a session
 coven run codex "fix the failing tests"
 # or with Claude Code:
 coven run claude "polish this UI"
 
-# 4. Browse and manage sessions
+# 5. Browse and manage sessions
 coven sessions
 
-# 5. Stop the daemon when done
+# 6. Stop the daemon when done
 coven daemon stop
 ```
 
@@ -252,6 +272,7 @@ verbs:
 | --- | --- | --- |
 | `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [Interactive UI](https://docs.opencoven.ai/docs/cli/interactive) |
 | `coven doctor` | Detect supported harness CLIs and print install hints | [Doctor](https://docs.opencoven.ai/docs/cli/doctor) |
+| `coven setup [<codex\|claude\|copilot\|all>]` | Run provider-owned login and optional explicitly consented verification | [Setup](docs/reference/cli-setup.md) |
 | `coven daemon start/status/restart/stop` | Manage the local daemon | [Daemon commands](https://docs.opencoven.ai/docs/cli/daemon) |
 | `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [Run](https://docs.opencoven.ai/docs/cli/run) |
 | `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
@@ -327,9 +348,11 @@ paths directly.
 installed `@opencoven/coven-memory-dashboard` executable. The npm wrapper
 supplies only the installed Node executable and dashboard entrypoint; memory
 data and daemon transport proofs are never passed through the environment.
-Direct native binary installs can place `coven-memory-dashboard` on `PATH` or
-install the package globally. The dashboard requires Node.js 24 or newer; the
-rest of the npm-wrapped CLI remains available on Node.js 18 or newer.
+The companion is not a dependency of the wrapper; install it globally with
+`npm install -g @opencoven/coven-memory-dashboard`, which also puts
+`coven-memory-dashboard` on `PATH` for direct native binary installs. The
+dashboard requires Node.js 24 or newer; the rest of the npm-wrapped CLI remains
+available on Node.js 18 or newer.
 
 Treat the local IPC API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
 
@@ -553,7 +576,10 @@ No. Coven wraps them. You still use the harness CLI for its AI capabilities — 
 
 **Q: Does Coven require an internet connection or an account?**
 
-No. Coven itself is fully local. Your harness CLIs (Codex, Claude Code) require their own provider authentication, but Coven stores no credentials and makes no outbound network calls.
+Core Coven operation and `coven doctor` are local. Your harness CLIs require
+their own provider authentication and network access. Coven stores no provider
+credentials; only an explicitly consented `coven setup --verify` or a harness
+session launches a provider turn.
 
 **Q: Is Windows supported?**
 

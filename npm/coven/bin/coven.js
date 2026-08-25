@@ -18,6 +18,13 @@ const platformKey = `${process.platform}-${process.arch}`;
 const packageName = PLATFORM_PACKAGES[platformKey];
 const MEMORY_DASHBOARD_MIN_NODE_MAJOR = 24;
 const WINDOWS_HIDE_NATIVE_WINDOW_ENV = 'COVEN_WINDOWS_HIDE_NATIVE_WINDOW';
+// Wrapper-to-native handoff for `coven memory open`. The wrapper is the only
+// legitimate source of these, so an inherited value is always stale or hostile.
+const MEMORY_DASHBOARD_HANDOFF_ENV = [
+  'COVEN_MEMORY_DASHBOARD_ENTRY',
+  'COVEN_MEMORY_DASHBOARD_NODE',
+  'COVEN_MEMORY_DASHBOARD_BIN'
+];
 const PRINT_NATIVE_BINARY_PATH_ARG = '--print-native-binary-path';
 
 function resolveBinary() {
@@ -106,6 +113,17 @@ for (const name of Object.keys(childEnv)) {
     delete childEnv[name];
   }
 }
+// Same reasoning for the dashboard handoff, and the same case-insensitive
+// sweep. The native CLI launches whatever entrypoint these name, so an
+// inherited value is arbitrary code selected by whoever set it. Clearing them
+// first means the wrapper's own resolution below is the only thing that can
+// populate them; when that resolution fails the native binary sees no handoff
+// and emits its installation error instead of running a stale build.
+for (const name of Object.keys(childEnv)) {
+  if (MEMORY_DASHBOARD_HANDOFF_ENV.includes(name.toUpperCase())) {
+    delete childEnv[name];
+  }
+}
 const opensMemoryDashboard = isMemoryOpenInvocation(args);
 const requestsHelp = args.some((arg) => arg === '--help' || arg === '-h');
 if (
@@ -114,7 +132,7 @@ if (
   !supportsMemoryDashboard(process.versions.node)
 ) {
   console.error(
-    `coven memory open requires Node.js ${MEMORY_DASHBOARD_MIN_NODE_MAJOR} or newer; current Node.js is ${process.versions.node}. Upgrade Node.js and reinstall @opencoven/cli. Other Coven CLI commands continue to support Node.js 18 or newer.`
+    `coven memory open requires Node.js ${MEMORY_DASHBOARD_MIN_NODE_MAJOR} or newer; current Node.js is ${process.versions.node}. Upgrade Node.js, then install the dashboard companion with: npm install -g @opencoven/coven-memory-dashboard. Other Coven CLI commands continue to support Node.js 18 or newer.`
   );
   process.exit(1);
 }
@@ -125,7 +143,9 @@ if (opensMemoryDashboard) {
     );
     childEnv['COVEN_MEMORY_DASHBOARD_NODE'] = process.execPath;
   } catch {
-    // The native binary emits the single actionable installation error.
+    // The default for anyone who has not installed the companion. The
+    // handoff variables stay cleared, so the native binary emits the single
+    // actionable installation error.
   }
 }
 
