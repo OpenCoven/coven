@@ -5360,7 +5360,7 @@ mod tests {
             .expect("writer should add maintenance participant override");
         assert_eq!(
             maintenance_gate::WriterParticipant::decode(capability)?,
-            writer.participant()
+            *writer.participant()
         );
 
         let mut command_without_writer =

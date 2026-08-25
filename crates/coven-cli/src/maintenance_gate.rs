@@ -573,12 +573,12 @@ impl WriterLease {
         }
     }
 
-    pub fn participant(&self) -> WriterParticipant {
-        self.participant.clone()
+    pub fn participant(&self) -> &WriterParticipant {
+        &self.participant
     }
 
     pub fn participant_capability(&self) -> Result<String> {
-        self.participant.encode()
+        self.participant().encode()
     }
 }
 
@@ -912,7 +912,7 @@ mod tests {
         let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer_self = gate.acquire_writer("session-self", "session")?;
         let writer_other = gate.acquire_writer("session-other", "session")?;
-        let participant = writer_self.participant();
+        let participant = writer_self.participant().clone();
         let mut owner = gate.acquire_owner("cave", Some(participant))?;
 
         let status = owner.refresh_phase()?;
@@ -932,7 +932,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let writer = gate.acquire_writer("session-self", "session")?;
-        let mut participant = writer.participant();
+        let mut participant = writer.participant().clone();
         participant.generation.push_str("-forged");
 
         let error = gate
@@ -950,7 +950,7 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let gate = MaintenanceGate::at_for_test(temp.path().to_path_buf());
         let first_writer = gate.acquire_writer("session-self", "session")?;
-        let participant = first_writer.participant();
+        let participant = first_writer.participant().clone();
         drop(first_writer);
 
         let replacement_writer = gate.acquire_writer("session-self", "session")?;
@@ -981,7 +981,7 @@ mod tests {
             generation: "gen-1".into(),
         };
         let encoded = participant.encode()?;
-        assert_eq!(WriterParticipant::decode(&encoded)?, participant);
+        assert_eq!(&WriterParticipant::decode(&encoded)?, &participant);
         assert!(WriterParticipant::decode(r#"{"id":" ","generation":"gen"}"#).is_err());
         assert!(WriterParticipant::decode(r#"{"id":"session","generation":" "}"#).is_err());
         Ok(())
@@ -994,7 +994,7 @@ mod tests {
         let writer = gate.acquire_writer("session-self", "session")?;
         let capability = writer.participant_capability()?;
         let decoded = WriterParticipant::decode(&capability)?;
-        assert_eq!(decoded, writer.participant());
+        assert_eq!(decoded, *writer.participant());
         assert_eq!(MAINTENANCE_PARTICIPANT_ENV, "COVEN_MAINTENANCE_PARTICIPANT");
         Ok(())
     }

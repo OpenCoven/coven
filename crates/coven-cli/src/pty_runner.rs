@@ -280,7 +280,9 @@ impl HarnessCommand {
         self.env_overrides
             .iter()
             .rev()
-            .find_map(|(candidate, value)| (candidate == name).then(|| value.as_deref()).flatten())
+            .find_map(|(candidate, value)| {
+                (candidate == name).then_some(value.as_deref()).flatten()
+            })
     }
 
     fn to_command_builder(&self) -> CommandBuilder {
