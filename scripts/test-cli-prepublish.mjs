@@ -9,8 +9,8 @@
 //      --skip-build is passed) and lets `npm publish --dry-run` validate the
 //      platform + wrapper tarballs.
 //   4. `npm pack`s the native and wrapper packages, installs them into a fresh
-//      temp project, and invokes the wrapper bin to confirm the native binary
-//      is resolved, executable, and can start the daemon with isolated state.
+//      temp project, then runs the full hermetic installed-wrapper user
+//      journey through scripts/user-journey-e2e.mjs.
 //
 // Flags:
 //   --target=<name>       Override the npm target (macos, macos-x64, linux-x64, windows).
@@ -28,23 +28,28 @@
 //                         local iteration; CI still runs both.
 //   --keep-tempdir        Leave the temp install dir on disk for inspection.
 //   COVEN_NPM_DRY_RUN_VERSION=vX.Y.Z
-//                         Override the synthesized dry-run version when the
+//                         Override the synthesized dry-run version to skip
+//                         npm view during hermetic verification, or when the
 //                         public npm registry cannot be reached.
 //
 // Exit code is non-zero on the first failing step.
 
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { defaultTargetName } from './publish-npm.mjs';
+import {
+  createScratchDir,
+  isMainModule,
+  runPackagedUserJourney
+} from './user-journey-e2e.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const distRoot = path.join(repoRoot, 'npm', 'dist');
-const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
+export const DEFAULT_COMMAND_TIMEOUT_MS = 120_000;
 const CARGO_GATE_TIMEOUT_MS = 20 * 60_000;
 
 const PLATFORM_TARGETS = {
@@ -120,7 +125,9 @@ step('onboarding, PR readiness, and publish guardrails', () => {
     'scripts/cli-docs-test.mjs',
     'scripts/export-cli-help-contract-test.mjs',
     'scripts/pr-readiness-test.mjs',
-    'scripts/publish-npm-test.mjs'
+    'scripts/publish-npm-test.mjs',
+    'scripts/test-cli-prepublish-test.mjs',
+    'scripts/user-journey-e2e-test.mjs'
   ]);
 });
 
@@ -180,7 +187,7 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
   const platformTgz = npmPack(platformDir);
   const wrapperTgz = npmPack(wrapperDir);
 
-  tempDir = mkdtempSync(path.join(tmpdir(), 'coven-prepublish-'));
+  tempDir = createScratchDir(path.join(repoRoot, 'target', 'script-scratch'), 'coven-prepublish');
   writeFileSync(
     path.join(tempDir, 'package.json'),
     `${JSON.stringify({ name: 'coven-prepublish-test', private: true, version: '0.0.0' }, null, 2)}\n`
@@ -206,66 +213,6 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     fail(`wrapper bin not present at ${wrapperBin} after install`);
   }
 
-  const isolatedUserHome = path.join(tempDir, 'user-home');
-  mkdirSync(isolatedUserHome, { recursive: true });
-  const smokeEnv = {
-    ...process.env,
-    COVEN_HOME: path.join(tempDir, 'coven-home'),
-    HOME: isolatedUserHome,
-    PATH: firstRunSmokePath(wrapperBin, tempDir),
-    USERPROFILE: isolatedUserHome
-  };
-  if (process.platform === 'win32') {
-    const homeRoot = path.parse(isolatedUserHome).root;
-    smokeEnv.HOMEDRIVE = homeRoot.replace(/[\\/]$/, '');
-    smokeEnv.HOMEPATH = isolatedUserHome.slice(homeRoot.length - 1);
-  }
-  mkdirSync(smokeEnv.COVEN_HOME, { recursive: true });
-
-  const versionOutput = runCapture(wrapperBin, ['--version'], { env: smokeEnv });
-  if (!versionOutput.stdout.trim()) {
-    fail('`coven --version` produced no output');
-  }
-  console.log(`coven --version => ${versionOutput.stdout.trim()}`);
-
-  // A bare runner has no harness installed, so doctor correctly reports a
-  // blocking problem and exits 1. The smoke asserts the first-run report,
-  // not a provisioned environment.
-  const doctorOutput = runCapture(wrapperBin, ['doctor'], {
-    env: smokeEnv,
-    allowedExitCodes: [1]
-  });
-  if (doctorOutput.status !== 1) {
-    fail(
-      `\`coven doctor\` on a bare runner should exit 1 (no harness available); got ${doctorOutput.status}\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`
-    );
-  }
-  if (!doctorOutput.stdout.includes('Coven doctor')) {
-    fail(
-      `\`coven doctor\` did not print the expected banner.\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`
-    );
-  }
-  for (const expected of [
-    'Set up at least one harness in this same shell',
-    'Codex: coven setup codex',
-    'Claude Code: coven setup claude',
-    'GitHub Copilot CLI: coven setup copilot',
-    'Doctor found problems; review the failing checks above.'
-  ]) {
-    if (!doctorOutput.stdout.includes(expected)) {
-      fail(`\`coven doctor\` missing first-run setup guidance "${expected}".\nstdout:\n${doctorOutput.stdout}\nstderr:\n${doctorOutput.stderr}`);
-    }
-  }
-  console.log('coven doctor first-run setup guidance present (exit 1 on bare runner)');
-
-  const helpOutput = runCapture(wrapperBin, ['--help'], { env: smokeEnv });
-  if (helpOutput.status !== 0) {
-    fail(`\`coven --help\` exited with ${helpOutput.status}\nstderr:\n${helpOutput.stderr}`);
-  }
-  if (!helpOutput.stdout.toLowerCase().includes('usage')) {
-    fail(`\`coven --help\` missing usage section.\nstdout:\n${helpOutput.stdout}`);
-  }
-
   if (dashboardTarball) {
     const dashboardEntry = path.join(
       tempDir,
@@ -278,55 +225,20 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     if (!existsSync(dashboardEntry)) {
       fail(`dashboard entry not present after install: ${dashboardEntry}`);
     }
-    const memoryHelp = runCapture(wrapperBin, ['memory', 'open', '--help'], {
-      env: smokeEnv
-    });
-    if (!memoryHelp.stdout.includes('private local memory dashboard')) {
-      fail(
-        `\`coven memory open --help\` did not describe the private local dashboard.\nstdout:\n${memoryHelp.stdout}\nstderr:\n${memoryHelp.stderr}`
-      );
-    }
   }
 
-  let daemonStarted = false;
-  try {
-    const startOutput = runDaemonStart(wrapperBin, smokeEnv);
-    daemonStarted = true;
-    if (startOutput && !startOutput.stdout.includes('Coven daemon: running')) {
-      fail(`\`coven daemon start\` did not report a running daemon.\nstdout:\n${startOutput.stdout}\nstderr:\n${startOutput.stderr}`);
-    }
-
-    const statusOutput = runCapture(wrapperBin, ['daemon', 'status'], { env: smokeEnv });
-    if (!statusOutput.stdout.includes('Coven daemon: running')) {
-      fail(`\`coven daemon status\` did not report a running daemon.\nstdout:\n${statusOutput.stdout}\nstderr:\n${statusOutput.stderr}`);
-    }
-
-    // Health check goes through the machine surface: `--json` carries the
-    // `ok` flag that the human prose line intentionally no longer prints.
-    const statusJsonOutput = runCapture(wrapperBin, ['daemon', 'status', '--json'], { env: smokeEnv });
-    let statusJson;
-    try {
-      statusJson = JSON.parse(statusJsonOutput.stdout);
-    } catch {
-      fail(`\`coven daemon status --json\` did not print valid JSON.\nstdout:\n${statusJsonOutput.stdout}\nstderr:\n${statusJsonOutput.stderr}`);
-    }
-    if (statusJson.status !== 'running' || statusJson.ok !== true) {
-      fail(`\`coven daemon status --json\` did not report a healthy running daemon.\nstdout:\n${statusJsonOutput.stdout}\nstderr:\n${statusJsonOutput.stderr}`);
-    }
-
-    const sessionsOutput = runCapture(wrapperBin, ['sessions', '--plain'], { env: smokeEnv });
-    if (!sessionsOutput.stdout.includes('No active Coven sessions yet.')) {
-      fail(`\`coven sessions --plain\` did not report an empty fresh store.\nstdout:\n${sessionsOutput.stdout}\nstderr:\n${sessionsOutput.stderr}`);
-    }
-    console.log('coven daemon lifecycle verified');
-  } finally {
-    if (daemonStarted) {
-      runCapture(wrapperBin, ['daemon', 'stop'], { env: smokeEnv });
-    }
+  const result = runPackagedUserJourney({
+    dashboardExpected: Boolean(dashboardTarball),
+    keepScratchDir: keepTempdir,
+    wrapperBin
+  });
+  console.log(`packaged user journey ok (session ${result.sessionId})`);
+  if (keepTempdir) {
+    console.log(`packaged user journey scratch preserved at ${result.scratchRoot}`);
   }
 });
 
-(async () => {
+export async function main() {
   try {
     for (const run of steps) {
       await run();
@@ -343,10 +255,17 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
       console.log(`\nTemp project left at ${tempDir} (--keep-tempdir).`);
     }
   }
-})();
+}
 
-function synthesizeDryRunVersion(packageName) {
-  const override = process.env.COVEN_NPM_DRY_RUN_VERSION?.trim();
+export function synthesizeDryRunVersion(
+  packageName,
+  {
+    env = process.env,
+    spawnSyncImpl = spawnSync,
+    timeoutMs = DEFAULT_COMMAND_TIMEOUT_MS
+  } = {}
+) {
+  const override = env.COVEN_NPM_DRY_RUN_VERSION?.trim();
   if (override) {
     const normalized = override.replace(/^v/, '');
     if (!/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(normalized)) {
@@ -355,11 +274,24 @@ function synthesizeDryRunVersion(packageName) {
     return normalized;
   }
 
-  const view = spawnSync('npm', ['view', packageName, 'version', '--silent'], {
+  const view = spawnSyncImpl('npm', ['view', packageName, 'version', '--silent'], {
     ...spawnOptionsForCommand(),
     stdio: ['ignore', 'pipe', 'pipe'],
-    encoding: 'utf8'
+    encoding: 'utf8',
+    timeout: timeoutMs
   });
+  if (view.error?.code === 'ETIMEDOUT') {
+    fail(
+      `npm view timed out after ${timeoutMs}ms while reading current ${packageName} version. ` +
+        'Set COVEN_NPM_DRY_RUN_VERSION to an unpublished higher semver and rerun.'
+    );
+  }
+  if (view.error) {
+    fail(
+      `npm view failed while reading current ${packageName} version: ${view.error.message}. ` +
+        'Set COVEN_NPM_DRY_RUN_VERSION to an unpublished higher semver and rerun.'
+    );
+  }
   if (view.status !== 0) {
     const stderr = view.stderr.trim();
     fail(
@@ -382,6 +314,10 @@ function synthesizeDryRunVersion(packageName) {
   const baseMinor = Number(match[2]);
   const basePatch = Number(match[3]);
   return `${baseMajor}.${baseMinor}.${basePatch + 1}`;
+}
+
+if (isMainModule(import.meta.url)) {
+  void main();
 }
 
 function ensureCommand(command, args) {
@@ -470,37 +406,11 @@ function runCapture(command, commandArgs, options = {}) {
   return result;
 }
 
-function runDaemonStart(wrapperBin, smokeEnv) {
-  if (process.platform === 'win32') {
-    // Capturing stdout from npm's Windows .cmd shim can keep the pipe open
-    // while the background daemon is alive. Run start attached to this process,
-    // then verify health via a separate captured status command below.
-    run(wrapperBin, ['daemon', 'start'], { env: smokeEnv });
-    return undefined;
-  }
-  return runCapture(wrapperBin, ['daemon', 'start'], { env: smokeEnv });
-}
-
 function spawnOptionsForCommand(options = {}, platform = process.platform) {
   return {
     shell: platform === 'win32',
     ...options.spawnOptions
   };
-}
-
-function firstRunSmokePath(wrapperBin, tempProjectDir) {
-  const nodeShimDir = path.join(tempProjectDir, 'node-shim-bin');
-  mkdirSync(nodeShimDir, { recursive: true });
-
-  if (process.platform === 'win32') {
-    writeFileSync(path.join(nodeShimDir, 'node.cmd'), `@"${process.execPath}" %*\r\n`);
-  } else {
-    const nodeShim = path.join(nodeShimDir, 'node');
-    writeFileSync(nodeShim, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`);
-    chmodSync(nodeShim, 0o755);
-  }
-
-  return [path.dirname(wrapperBin), nodeShimDir].join(path.delimiter);
 }
 
 function fail(message) {

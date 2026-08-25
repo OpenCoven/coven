@@ -1755,6 +1755,7 @@ test('prepublish smoke has explicit dry-run version override and registry failur
 
   assert.match(script, /COVEN_NPM_DRY_RUN_VERSION/);
   assert.match(script, /Could not read current \$\{packageName\} version/);
+  assert.match(script, /npm view timed out after/);
 });
 
 test('prepublish smoke rejects a missing dashboard tarball before running gates', () => {

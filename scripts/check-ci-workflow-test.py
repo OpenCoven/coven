@@ -61,6 +61,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
             self.assertIn(needle, CI_TEXT)
         self.assertIn("\n  npm-onboarding-linux:\n", CI_TEXT)
         self.assertIn("\n  npm-onboarding-main:\n", CI_TEXT)
+        self.assertIn(
+            "if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}",
+            CI_TEXT,
+        )
 
 
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:

@@ -44,13 +44,27 @@ def classify(paths: list[str]) -> dict[str, bool]:
         is_afs = is_cargo_metadata or path.startswith('crates/coven-afs/') or path == 'crates/coven-cli/src/afs_mount.rs' or path == 'scripts/afs-mount-smoke.sh'
         is_channels = path.startswith('packages/channels/') or path.startswith('crates/coven-channels/')
         is_openclaw = path.startswith('packages/openclaw-coven/') or path.startswith('crates/coven-openclaw/')
+        is_help_surface = (
+            path.startswith('docs/reference/cli')
+            or path in {
+                'docs/development/cli-core-functionality.md',
+                'docs/guides/core-access.md',
+                'docs/guides/session-operations.md',
+                'docs/guides/automation-json.md',
+                'scripts/cli-docs-test.mjs',
+            }
+        )
         is_npm = is_cargo_metadata or path.startswith('npm/') or path.startswith('crates/coven-cli/') or path in {
             'scripts/publish-npm.mjs',
             'scripts/publish-npm-test.mjs',
             'scripts/release-npm-context.mjs',
             'scripts/release-npm-platform-matrix.mjs',
             'scripts/test-cli-prepublish.mjs',
-        }
+            'scripts/test-cli-prepublish-test.mjs',
+            'scripts/user-journey-e2e.mjs',
+            'scripts/user-journey-e2e-test.mjs',
+            'scripts/fixtures/fake-codex.mjs',
+        } or is_help_surface
         is_engine = path in {
             'crates/coven-cli/src/engine.rs',
             'crates/coven-cli/src/engine_install.rs',
