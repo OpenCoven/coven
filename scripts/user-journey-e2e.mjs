@@ -13,6 +13,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -97,16 +98,28 @@ export function spawnOptionsForCommand(options = {}, platform = process.platform
   };
 }
 
-export function windowsCommandLine(command, commandArgs) {
-  return [command, ...commandArgs]
-    .map((value) => {
-      const argument = String(value);
-      if (/[\0\r\n"]/.test(argument)) {
-        fail(`unsupported character in Windows command argument: ${JSON.stringify(argument)}`);
-      }
-      return `"${argument.replaceAll('%', '%%')}"`;
-    })
-    .join(' ');
+export function windowsCommandInvocation(command, commandArgs, baseEnv = {}) {
+  const prefix = 'COVEN_JOURNEY_COMMAND_';
+  const env = Object.fromEntries(
+    Object.entries(baseEnv).filter(([name]) => !name.toUpperCase().startsWith(prefix))
+  );
+  const values = [command, ...commandArgs].map((value) => {
+    const argument = String(value);
+    if (/[\0\r\n"]/.test(argument)) {
+      fail(`unsupported character in Windows command argument: ${JSON.stringify(argument)}`);
+    }
+    return argument;
+  });
+  const references = values.map((value, index) => {
+    const name = `${prefix}${index}`;
+    env[name] = value;
+    return `"%${name}%"`;
+  });
+  return {
+    command: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
+    commandArgs: ['/d', '/v:off', '/s', '/c', references.join(' ')],
+    env
+  };
 }
 
 export function createCommandRunner({
@@ -117,12 +130,9 @@ export function createCommandRunner({
 } = {}) {
   function spawnInvocation(command, commandArgs, env) {
     if (platform !== 'win32') {
-      return { command, commandArgs };
+      return { command, commandArgs, env };
     }
-    return {
-      command: env.ComSpec ?? env.COMSPEC ?? 'cmd.exe',
-      commandArgs: ['/d', '/s', '/c', windowsCommandLine(command, commandArgs)]
-    };
+    return windowsCommandInvocation(command, commandArgs, env);
   }
 
   function run(command, commandArgs, options = {}) {
@@ -133,7 +143,7 @@ export function createCommandRunner({
     const result = spawnSyncImpl(invocation.command, invocation.commandArgs, {
       ...spawnOptionsForCommand(options, platform),
       cwd: options.cwd ?? commandRepoRoot,
-      env,
+      env: invocation.env,
       stdio: 'inherit',
       timeout: options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
     });
@@ -149,8 +159,12 @@ export function createCommandRunner({
     const result = spawnSyncImpl(invocation.command, invocation.commandArgs, {
       ...spawnOptionsForCommand(options, platform),
       cwd: options.cwd ?? commandRepoRoot,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
+      env: invocation.env,
+      stdio: [
+        options.spawnOptions?.input === undefined ? 'ignore' : 'pipe',
+        'pipe',
+        'pipe'
+      ],
       encoding: 'utf8',
       timeout: options.timeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS
     });
@@ -284,7 +298,7 @@ function unixCommandShim(targetPath) {
 }
 
 function windowsCommandShim(targetPath) {
-  return `@"${targetPath}" %*\r\n`;
+  return `@"${targetPath.replaceAll('%', '%%')}" %*\r\n`;
 }
 
 export function createFakeCodexFixture(
@@ -292,15 +306,77 @@ export function createFakeCodexFixture(
   {
     fixtureScript = path.join(__dirname, 'fixtures', 'fake-codex.mjs'),
     nodePath = process.execPath,
-    platform = process.platform
+    platform = process.platform,
+    baseEnv = process.env,
+    architecture = process.arch,
+    windowsNativeFixture
   } = {}
 ) {
   mkdirSync(binDir, { recursive: true });
   if (platform === 'win32') {
+    const target =
+      architecture === 'arm64'
+        ? {
+            cpu: 'arm64',
+            packageName: '@openai/codex-win32-arm64',
+            triple: 'aarch64-pc-windows-msvc'
+          }
+        : {
+            cpu: 'x64',
+            packageName: '@openai/codex-win32-x64',
+            triple: 'x86_64-pc-windows-msvc'
+          };
+    const packageRoot = path.join(binDir, 'node_modules', '@openai', 'codex');
+    const packageBin = path.join(packageRoot, 'bin');
+    const targetRoot = path.join(
+      packageRoot,
+      'node_modules',
+      '@openai',
+      target.packageName.slice('@openai/'.length)
+    );
+    const nativeBin = path.join(targetRoot, 'vendor', target.triple, 'bin');
+    mkdirSync(packageBin, { recursive: true });
+    mkdirSync(nativeBin, { recursive: true });
+    const nativeCodex = path.join(nativeBin, 'codex.exe');
+    if (windowsNativeFixture) {
+      copyFileSync(windowsNativeFixture, nativeCodex);
+    } else {
+      const rustc = resolveExecutableOnPath('rustc', { baseEnv, platform });
+      const source = path.join(__dirname, 'fixtures', 'fake-harness-windows.rs');
+      const printable = `${rustc} --edition=2021 ${source} -o ${nativeCodex}`;
+      const compile = spawnSync(rustc, ['--edition=2021', source, '-o', nativeCodex], {
+        cwd: repoRoot,
+        env: baseEnv,
+        shell: false,
+        stdio: 'inherit',
+        timeout: DEFAULT_COMMAND_TIMEOUT_MS
+      });
+      handleSpawnResult(printable, compile, {}, { capture: false });
+    }
+    writeFileSync(path.join(packageBin, 'codex.js'), '// validated fixture entry\n');
+    writeFileSync(
+      path.join(packageRoot, 'package.json'),
+      `${JSON.stringify({
+        name: '@openai/codex',
+        bin: { codex: 'bin/codex.js' },
+        optionalDependencies: { [target.packageName]: '0.0.0' }
+      })}\n`
+    );
+    writeFileSync(
+      path.join(targetRoot, 'package.json'),
+      `${JSON.stringify({
+        name: '@openai/codex',
+        os: ['win32'],
+        cpu: [target.cpu]
+      })}\n`
+    );
     const codexCommand = path.join(binDir, 'codex.cmd');
-    const engineCommand = path.join(binDir, 'coven-code.cmd');
-    writeFileSync(codexCommand, windowsShim(nodePath, fixtureScript, 'codex'));
-    writeFileSync(engineCommand, windowsShim(nodePath, fixtureScript, 'coven-code'));
+    const engineCommand = path.join(binDir, 'coven-code.exe');
+    writeFileSync(
+      codexCommand,
+      '@"%~dp0\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n'
+    );
+    copyFileSync(nativeCodex, engineCommand);
     return {
       binDir,
       codexCommand,
@@ -328,7 +404,7 @@ function unixShim(nodePath, fixtureScript, kind) {
 }
 
 function windowsShim(nodePath, fixtureScript, kind) {
-  return `@echo off\r\n"${nodePath}" "${fixtureScript}" --fixture-kind ${kind} %*\r\n`;
+  return `@echo off\r\n"${nodePath.replaceAll('%', '%%')}" "${fixtureScript.replaceAll('%', '%%')}" --fixture-kind ${kind} %*\r\n`;
 }
 
 function resolveExecutableOnPath(command, { baseEnv = process.env, platform = process.platform } = {}) {
@@ -667,12 +743,21 @@ export function assertSessionInspection({
   if (terminalIndex <= completionIndex) {
     fail(`session events did not preserve output-before-terminal ordering for ${marker}.\npayloads:\n${payloads.join('\n')}`);
   }
-  if (fixtureLogPath && existsSync(fixtureLogPath)) {
+  if (fixtureLogPath) {
+    if (!existsSync(fixtureLogPath)) {
+      fail(`fixture log was not created at ${fixtureLogPath}.`);
+    }
     const fixtureEvents = readFileSync(fixtureLogPath, 'utf8')
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line));
-    if (!fixtureEvents.some((entry) => entry.kind === 'codex' && entry.argv.includes(marker))) {
+    if (
+      !fixtureEvents.some(
+        (entry) =>
+          entry.kind === 'codex' &&
+          (entry.prompt === marker || entry.argv.includes(marker))
+      )
+    ) {
       fail(`fixture log did not record the Codex marker invocation for ${marker}.`);
     }
   }
@@ -821,7 +906,7 @@ export function runPackagedUserJourney({
       assertDashboardHelp(textFromResult(memoryHelp, 'stdout'));
     }
 
-    createFakeCodexFixture(layout.fixtureBinDir, { platform });
+    createFakeCodexFixture(layout.fixtureBinDir, { baseEnv, platform });
     activeEnv = buildJourneyEnv({
       baseEnv,
       fixtureBinDir: layout.fixtureBinDir,

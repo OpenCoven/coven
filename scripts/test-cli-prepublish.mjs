@@ -247,7 +247,7 @@ export async function main() {
     console.log('Next: bump version + tag (vX.Y.Z) to trigger .github/workflows/release-npm.yml.');
   } catch (error) {
     console.error(`\n${error.message}`);
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     if (tempDir && !keepTempdir) {
       rmSync(tempDir, { recursive: true, force: true });

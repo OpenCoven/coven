@@ -17,7 +17,7 @@ import {
   repoRoot,
   runPackagedUserJourney,
   spawnOptionsForCommand,
-  windowsCommandLine
+  windowsCommandInvocation
 } from './user-journey-e2e.mjs';
 
 function withScratch(label, fn) {
@@ -164,28 +164,54 @@ test('createFakeCodexFixture writes executable Unix shims that log deterministic
     assert.equal(entries[0].argv.at(-1), 'fixture marker');
   }));
 
+test('fake Codex fixture reads a dash prompt from stdin', { skip: process.platform === 'win32' }, () =>
+  withScratch('fixture-stdin', (scratch) => {
+    const fixture = createFakeCodexFixture(path.join(scratch, 'bin'));
+    const logPath = path.join(scratch, 'fixture-log.jsonl');
+    const runner = createCommandRunner({ platform: process.platform });
+    const result = runner.runCapture(fixture.codexCommand, ['exec', '-'], {
+      cwd: scratch,
+      env: { ...process.env, COVEN_FAKE_FIXTURE_LOG: logPath },
+      spawnOptions: { input: 'stdin marker\n' }
+    });
+
+    assert.match(result.stdout, /fake codex complete: stdin marker/);
+    const entry = JSON.parse(readFileSync(logPath, 'utf8').trim());
+    assert.equal(entry.prompt, 'stdin marker');
+  }));
+
 test('createFakeCodexFixture writes Windows cmd shims without requiring a release package', () =>
   withScratch('fixture-win', (scratch) => {
-    const fixture = createFakeCodexFixture(path.join(scratch, 'bin'), { platform: 'win32' });
+    const nativeFixture = path.join(scratch, 'fixture.exe');
+    writeFileSync(nativeFixture, 'fixture');
+    const fixture = createFakeCodexFixture(path.join(scratch, 'bin'), {
+      platform: 'win32',
+      windowsNativeFixture: nativeFixture
+    });
     assert.deepEqual(
       fixture.files.map((file) => path.basename(file)).sort(),
-      ['codex.cmd', 'coven-code.cmd']
+      ['codex.cmd', 'coven-code.exe']
     );
-    for (const file of fixture.files) {
-      const text = readFileSync(file, 'utf8');
-      assert.match(text, /fake-codex\.mjs/);
-      assert.match(text, /--fixture-kind/);
-    }
+    assert.match(
+      readFileSync(fixture.codexCommand, 'utf8'),
+      /node_modules\\@openai\\codex\\bin\\codex\.js/
+    );
+    assert.equal(readFileSync(fixture.engineCommand, 'utf8'), 'fixture');
+  }));
+
+test('createNodeShim escapes percent characters in Windows batch files', () =>
+  withScratch('node-shim-win', (scratch) => {
+    const shim = createNodeShim(scratch, {
+      nodePath: 'C:\\100% ready\\node.exe',
+      platform: 'win32'
+    });
+    assert.equal(readFileSync(shim, 'utf8'), '@"C:\\100%% ready\\node.exe" %*\r\n');
   }));
 
 test('Windows commands use an explicitly quoted cmd.exe invocation', () => {
   assert.equal(spawnOptionsForCommand({}, 'darwin').shell, false);
   assert.equal(spawnOptionsForCommand({}, 'win32').shell, false);
   assert.equal(spawnOptionsForCommand({}, 'win32').windowsHide, true);
-  assert.equal(
-    windowsCommandLine('C:\\wrapper path\\coven.cmd', ['run', 'marker & 100%']),
-    '"C:\\wrapper path\\coven.cmd" "run" "marker & 100%%"'
-  );
 
   const calls = [];
   const runner = createCommandRunner({
@@ -203,14 +229,29 @@ test('Windows commands use an explicitly quoted cmd.exe invocation', () => {
   assert.equal(result, undefined);
   assert.equal(calls.length, 1);
   assert.equal(calls[0].command, 'C:\\Windows\\cmd.exe');
-  assert.deepEqual(calls[0].args.slice(0, 3), ['/d', '/s', '/c']);
+  assert.deepEqual(calls[0].args.slice(0, 4), ['/d', '/v:off', '/s', '/c']);
   assert.equal(
-    calls[0].args[3],
-    '"C:\\wrapper path\\coven.cmd" "daemon" "start"'
+    calls[0].args[4],
+    '"%COVEN_JOURNEY_COMMAND_0%" "%COVEN_JOURNEY_COMMAND_1%" "%COVEN_JOURNEY_COMMAND_2%"'
   );
+  assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_0, 'C:\\wrapper path\\coven.cmd');
+  assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_1, 'daemon');
+  assert.equal(calls[0].options.env.COVEN_JOURNEY_COMMAND_2, 'start');
   assert.equal(calls[0].options.shell, false);
   assert.equal(calls[0].options.windowsHide, true);
   assert.equal(calls[0].options.stdio, 'inherit');
+});
+
+test('windowsCommandInvocation preserves percent characters outside shell text', () => {
+  const invocation = windowsCommandInvocation(
+    'C:\\100% ready\\coven.cmd',
+    ['run', 'marker & %TEMP%'],
+    { ComSpec: 'C:\\Windows\\cmd.exe' }
+  );
+  assert.equal(invocation.command, 'C:\\Windows\\cmd.exe');
+  assert.equal(invocation.env.COVEN_JOURNEY_COMMAND_0, 'C:\\100% ready\\coven.cmd');
+  assert.equal(invocation.env.COVEN_JOURNEY_COMMAND_2, 'marker & %TEMP%');
+  assert.doesNotMatch(invocation.commandArgs.at(-1), /100%|TEMP/);
 });
 
 test('buildJourneyEnv strips inherited npm configuration', () =>
@@ -507,6 +548,17 @@ test('runPackagedUserJourney sequences installed-wrapper commands and full lifec
         method: 'runCapture',
         command: wrapperBin,
         args: ['run', 'codex', 'E2E journey marker'],
+        assertOptions(options) {
+          writeFileSync(
+            options.env.COVEN_FAKE_FIXTURE_LOG,
+            `${JSON.stringify({
+              kind: 'codex',
+              argv: ['exec', '-'],
+              cwd: options.cwd,
+              prompt: 'E2E journey marker'
+            })}\n`
+          );
+        },
         result: makeResult({ stdout: 'fake codex complete: E2E journey marker\n' })
       },
       {
@@ -643,6 +695,21 @@ test('assertSessionInspection rejects missing terminal events after the completi
     /did not record a completed terminal payload/
   );
 });
+
+test('assertSessionInspection requires the supplied fixture log', () =>
+  withScratch('fixture-log-required', (scratch) => {
+    assert.throws(
+      () =>
+        assertSessionInspection({
+          ...makeSessionInspectionArgs([
+            { seq: 1, payload_json: '{"text":"fake codex complete: E2E journey marker"}' },
+            { seq: 2, kind: 'exit', payload_json: '{"status":"completed","exitCode":0}' }
+          ]),
+          fixtureLogPath: path.join(scratch, 'missing.jsonl')
+        }),
+      /fixture log was not created/
+    );
+  }));
 
 test('assertSessionInspection rejects terminal events that arrive before completion output', () => {
   assert.throws(

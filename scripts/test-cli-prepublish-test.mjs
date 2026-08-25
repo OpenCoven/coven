@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -64,4 +65,10 @@ test('synthesizeDryRunVersion bumps the published patch version for dry-run pack
   });
 
   assert.equal(version, '1.2.4');
+});
+
+test('prepublish failures preserve finally cleanup', () => {
+  const script = readFileSync(new URL('./test-cli-prepublish.mjs', import.meta.url), 'utf8');
+  assert.match(script, /process\.exitCode = 1/);
+  assert.doesNotMatch(script, /process\.exit\(1\)/);
 });

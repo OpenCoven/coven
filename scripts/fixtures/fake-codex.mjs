@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 const fixtureFlagIndex = args.indexOf('--fixture-kind');
@@ -15,11 +15,15 @@ const passthroughArgs = [
   ...args.slice(fixtureFlagIndex + 2),
 ];
 
-logInvocation(fixtureKind, passthroughArgs);
+const stdinPrompt =
+  fixtureKind === 'codex' && passthroughArgs.at(-1) === '-'
+    ? readFileSync(0, 'utf8').trim()
+    : undefined;
+logInvocation(fixtureKind, passthroughArgs, stdinPrompt);
 
 switch (fixtureKind) {
   case 'codex':
-    runCodexFixture(passthroughArgs);
+    runCodexFixture(passthroughArgs, stdinPrompt);
     break;
   case 'coven-code':
     runCovenCodeFixture(passthroughArgs);
@@ -29,7 +33,7 @@ switch (fixtureKind) {
     process.exit(2);
 }
 
-function runCodexFixture(argv) {
+function runCodexFixture(argv, stdinPrompt) {
   if (argv[0] === '--version') {
     process.stdout.write('codex 0.0.0-fake\n');
     return;
@@ -39,7 +43,7 @@ function runCodexFixture(argv) {
     return;
   }
 
-  const prompt = promptText(argv);
+  const prompt = promptText(argv, stdinPrompt);
   process.stdout.write('fake codex harness=codex\n');
   process.stdout.write(`fake codex complete: ${prompt}\n`);
 }
@@ -62,21 +66,24 @@ function runCovenCodeFixture(argv) {
   process.stdout.write('fake coven-code ready\n');
 }
 
-function promptText(argv) {
+function promptText(argv, stdinPrompt) {
+  if (stdinPrompt !== undefined) {
+    return stdinPrompt || '<empty prompt>';
+  }
   const separatorIndex = argv.indexOf('--');
   const promptArgs =
     separatorIndex === -1 ? argv.filter((arg) => !arg.startsWith('-')) : argv.slice(separatorIndex + 1);
   return promptArgs.join(' ').trim() || '<empty prompt>';
 }
 
-function logInvocation(kind, argv) {
+function logInvocation(kind, argv, prompt) {
   const logPath = process.env.COVEN_FAKE_FIXTURE_LOG;
   if (!logPath) {
     return;
   }
   appendFileSync(
     logPath,
-    `${JSON.stringify({ kind, argv, cwd: process.cwd() })}\n`,
+    `${JSON.stringify({ kind, argv, cwd: process.cwd(), prompt })}\n`,
     'utf8'
   );
 }
