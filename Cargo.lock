@@ -1569,17 +1569,17 @@ checksum = "dd2e7510819d6fbf51a5545c8f922716ecfb14df168a3242f7d33e0239efe6a1"
 
 [[package]]
 name = "fastembed"
-version = "5.17.4"
+version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4539f4a2c4472269adc227587b935c0a973e6b5fc4a03e14bbe62608e06c2298"
+checksum = "3b2b9435b3f3218e0d2aba98405d5afeb4a0aa974729d4eb4577118762f31564"
 dependencies = [
- "anyhow",
  "hf-hub",
  "ndarray",
  "ort",
  "safetensors",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "tokenizers",
 ]
 
