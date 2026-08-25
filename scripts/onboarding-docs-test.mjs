@@ -286,6 +286,17 @@ test('npm onboarding smoke bounds subprocess hangs', () => {
   assert.match(script, /ETIMEDOUT/);
 });
 
+test('npm onboarding smoke gives full cargo gates the CI timeout budget', () => {
+  const script = readRepoFile('scripts/test-cli-prepublish.mjs');
+  assert.match(script, /CARGO_GATE_TIMEOUT_MS\s*=\s*20\s*\*\s*60_000/);
+  assert.match(script, /run\('cargo', \['clippy', '--workspace', '--all-targets'/);
+  assert.match(script, /run\('cargo', \['test', '--workspace', '--locked'\]/);
+  assert.equal(
+    (script.match(/timeoutMs: CARGO_GATE_TIMEOUT_MS/g) ?? []).length,
+    2
+  );
+});
+
 test('npm onboarding smoke does not pipe-capture Windows daemon start', () => {
   const script = readRepoFile('scripts/test-cli-prepublish.mjs');
   assert.match(script, /function runDaemonStart\(/);

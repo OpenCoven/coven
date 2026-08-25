@@ -86,6 +86,7 @@ async fn room_accepts_one_peer_per_role_with_the_same_credential() {
     let state = RelayState::with_limits(RelayLimits {
         max_rooms: 2,
         channel_capacity: 2,
+        max_queued_bytes: 1024,
     });
     let room = canonical('H');
     let credential = canonical('I');
@@ -128,6 +129,7 @@ async fn room_capacity_is_bounded_and_released_after_disconnect() {
     let state = RelayState::with_limits(RelayLimits {
         max_rooms: 1,
         channel_capacity: 1,
+        max_queued_bytes: 1024,
     });
     let first_room = canonical('K');
     let second_room = canonical('L');
@@ -162,6 +164,7 @@ async fn binary_frames_forward_and_backpressure_fails_closed() {
     let state = RelayState::with_limits(RelayLimits {
         max_rooms: 1,
         channel_capacity: 1,
+        max_queued_bytes: 1024,
     });
     let room = canonical('N');
     let credential = canonical('O');
@@ -182,10 +185,10 @@ async fn binary_frames_forward_and_backpressure_fails_closed() {
     )
     .await
     .unwrap();
-    assert_eq!(
+    assert!(matches!(
         client.inbox.recv().await,
-        Some(Message::binary(b"ciphertext".to_vec()))
-    );
+        Some(message) if message.message == Message::binary(b"ciphertext".to_vec())
+    ));
 
     forward_to_peer(
         &state,
@@ -211,10 +214,109 @@ async fn binary_frames_forward_and_backpressure_fails_closed() {
 }
 
 #[tokio::test]
+async fn relay_enforces_and_releases_the_global_queued_byte_budget() {
+    let state = RelayState::with_limits(RelayLimits {
+        max_rooms: 1,
+        channel_capacity: 4,
+        max_queued_bytes: 5,
+    });
+    let room = canonical('R');
+    let credential = canonical('S');
+    let host = state
+        .register(&room, &credential, PeerRole::Host)
+        .await
+        .unwrap();
+    let mut client = state
+        .register(&room, &credential, PeerRole::Client)
+        .await
+        .unwrap();
+
+    forward_to_peer(
+        &state,
+        &room,
+        PeerRole::Host,
+        Message::binary(&b"12345"[..]),
+    )
+    .await
+    .unwrap();
+    assert!(
+        forward_to_peer(&state, &room, PeerRole::Host, Message::binary(&b"6"[..]))
+            .await
+            .is_err()
+    );
+
+    drop(client.inbox.recv().await.unwrap());
+    forward_to_peer(&state, &room, PeerRole::Host, Message::binary(&b"6"[..]))
+        .await
+        .unwrap();
+
+    state
+        .unregister(&room, PeerRole::Client, client.peer_id)
+        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
+}
+
+#[test]
+#[cfg(target_pointer_width = "64")]
+#[should_panic(expected = "max_queued_bytes must fit in u32")]
+fn relay_rejects_a_byte_budget_larger_than_per_message_permits_can_represent() {
+    RelayState::with_limits(RelayLimits {
+        max_rooms: 1,
+        channel_capacity: 1,
+        max_queued_bytes: u32::MAX as usize + 1,
+    });
+}
+
+#[tokio::test]
+async fn relay_holds_the_byte_budget_until_the_socket_send_finishes() {
+    let state = RelayState::with_limits(RelayLimits {
+        max_rooms: 1,
+        channel_capacity: 1,
+        max_queued_bytes: 5,
+    });
+    let room = canonical('T');
+    let credential = canonical('U');
+    let host = state
+        .register(&room, &credential, PeerRole::Host)
+        .await
+        .unwrap();
+    let mut client = state
+        .register(&room, &credential, PeerRole::Client)
+        .await
+        .unwrap();
+
+    forward_to_peer(
+        &state,
+        &room,
+        PeerRole::Host,
+        Message::binary(&b"12345"[..]),
+    )
+    .await
+    .unwrap();
+    let outgoing = client.inbox.recv().await.unwrap();
+    let queued_bytes = state.queued_bytes.clone();
+    let (result, is_close) = deliver_queued_message(outgoing, |message| async move {
+        assert_eq!(message, Message::binary(&b"12345"[..]));
+        assert_eq!(queued_bytes.available_permits(), 0);
+        Ok(())
+    })
+    .await;
+    assert!(result.is_ok());
+    assert!(!is_close);
+    assert_eq!(state.queued_bytes.available_permits(), 5);
+
+    state
+        .unregister(&room, PeerRole::Client, client.peer_id)
+        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
+}
+
+#[tokio::test]
 async fn disconnect_notifies_the_remaining_peer() {
     let state = RelayState::with_limits(RelayLimits {
         max_rooms: 1,
         channel_capacity: 2,
+        max_queued_bytes: 1024,
     });
     let room = canonical('P');
     let credential = canonical('Q');
@@ -230,6 +332,12 @@ async fn disconnect_notifies_the_remaining_peer() {
     state
         .unregister(&room, PeerRole::Client, client.peer_id)
         .await;
-    assert!(matches!(host.inbox.recv().await, Some(Message::Close(_))));
+    assert!(matches!(
+        host.inbox.recv().await,
+        Some(QueuedMessage {
+            message: Message::Close(_),
+            ..
+        })
+    ));
     state.unregister(&room, PeerRole::Host, host.peer_id).await;
 }

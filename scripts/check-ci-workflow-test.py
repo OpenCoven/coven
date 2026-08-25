@@ -6,9 +6,13 @@ import unittest
 
 CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'ci.yml'
 RELEASE_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'release-npm.yml'
+RELEASE_GITHUB_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'release-github.yml'
+RELEASE_STRESS_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'release-stress.yml'
 CACHE_SHA = "55cc8345863c7cc4c66a329aec7e433d2d1c52a9"
+SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"
 CI_TEXT = CI_WORKFLOW.read_text(encoding='utf-8')
 RELEASE_TEXT = RELEASE_WORKFLOW.read_text(encoding='utf-8')
+RELEASE_GITHUB_TEXT = RELEASE_GITHUB_WORKFLOW.read_text(encoding='utf-8')
 
 
 class CheckCiWorkflowTests(unittest.TestCase):
@@ -45,6 +49,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'python3 scripts/check-workflows-test.py',
             'python3 scripts/check-ci-workflow-test.py',
             'scripts/check-workflows.sh',
+            'node --test scripts/package-github-release-test.mjs',
+            'node --test scripts/release-stress-test.mjs',
             "needs.changes.outputs.docs_only != 'true'",
             'npm-onboarding-linux',
             "github.event_name == 'push'",
@@ -56,9 +62,61 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n  npm-onboarding-linux:\n", CI_TEXT)
         self.assertIn("\n  npm-onboarding-main:\n", CI_TEXT)
 
+
+    def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
+        self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
+
+    def test_release_github_workflow_has_expected_trigger_and_permissions(self) -> None:
+        self.assertIn("workflow_run:", RELEASE_GITHUB_TEXT)
+        self.assertIn("Release npm packages", RELEASE_GITHUB_TEXT)
+        self.assertIn("workflow_dispatch:", RELEASE_GITHUB_TEXT)
+        self.assertIn("source_run_attempt:", RELEASE_GITHUB_TEXT)
+        self.assertIn("actions: read", RELEASE_GITHUB_TEXT)
+        self.assertIn("contents: write", RELEASE_GITHUB_TEXT)
+        self.assertNotIn("id-token: write", RELEASE_GITHUB_TEXT)
+        self.assertEqual(
+            RELEASE_GITHUB_TEXT.count(
+                "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
+            ),
+            3,
+        )
+        self.assertNotIn(
+            "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",
+            RELEASE_GITHUB_TEXT,
+        )
+        self.assertIn("cancel-in-progress: false", RELEASE_GITHUB_TEXT)
+        self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", RELEASE_GITHUB_TEXT)
+        self.assertIn("actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c", RELEASE_GITHUB_TEXT)
+        self.assertIn("github.event.workflow_run.run_attempt || inputs.source_run_attempt", RELEASE_GITHUB_TEXT)
+        self.assertIn('--source-run-attempt "$SOURCE_RUN_ATTEMPT"', RELEASE_GITHUB_TEXT)
+        self.assertIn("verify-source-run-attempt", RELEASE_GITHUB_TEXT)
+        self.assertIn('--expected-tag-object-sha "$TAG_OBJECT_SHA"', RELEASE_GITHUB_TEXT)
+        self.assertIn('--expected-head-sha "$HEAD_SHA"', RELEASE_GITHUB_TEXT)
+        self.assertNotIn("npm publish", RELEASE_GITHUB_TEXT)
+
     def test_release_includes_performance_baseline_dependency(self) -> None:
         self.assertIn('performance-baseline', RELEASE_TEXT)
         self.assertIn('needs: [build-platform, npm-dry-run, performance-baseline, verify-tag]', RELEASE_TEXT)
+
+    def test_release_stress_workflow_is_bounded_and_uploads_failure_evidence(self) -> None:
+        stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
+        self.assertIn(
+            "name: Release stress\n\non:\n  workflow_dispatch:\n\npermissions:",
+            stress_text,
+        )
+        self.assertNotIn("schedule:", stress_text)
+        self.assertEqual(stress_text.count("timeout-minutes: 45"), 2)
+        self.assertEqual(stress_text.count("timeout-minutes: 42"), 2)
+        self.assertIn("--suite unix --iterations 10 --command-timeout-ms 180000", stress_text)
+        self.assertIn("--suite windows --iterations 10 --command-timeout-ms 180000", stress_text)
+        self.assertEqual(stress_text.count("if: ${{ always() }}"), 2)
+        self.assertEqual(stress_text.count("actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"), 2)
+
+    def test_release_npm_workflow_uses_same_tag_specific_concurrency_without_cancellation(self) -> None:
+        self.assertIn(
+            "concurrency:\n  group: release-npm-${{ github.ref }}\n  cancel-in-progress: false",
+            RELEASE_TEXT,
+        )
 
 
 if __name__ == '__main__':
