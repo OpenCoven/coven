@@ -29,6 +29,14 @@ mutations without admitting another one. Owners are fenced by a random
 generation and an expiry deadline. Heartbeat and release reject a different or
 expired generation; malformed owner or writer records also fail closed.
 
+When a maintenance client runs inside a Coven-managed harness, Coven
+automatically supplies a generation-bound participant capability for that
+session. The owner excludes only the exact supervisor-owned writer generation;
+all other existing writers must drain before the fence can be released. This
+capability is internal to the maintenance protocol, not a user-facing
+credential, and it must never be copied into logs or persisted in session
+metadata.
+
 Direct `coven run`, `coven patch`, daemon `POST /sessions`, and claim
 `acquire`, `release`, `heartbeat`, and `canary` register renewable writer
 intents before their mutation/launch path. A daemon session retains the intent
