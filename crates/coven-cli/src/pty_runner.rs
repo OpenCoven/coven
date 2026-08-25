@@ -266,6 +266,23 @@ impl HarnessCommand {
         self.stdin_prompt = Some(prompt);
     }
 
+    pub(crate) fn set_environment_override(
+        &mut self,
+        name: impl Into<String>,
+        value: Option<impl Into<String>>,
+    ) {
+        self.env_overrides
+            .push((name.into(), value.map(Into::into)));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn environment_override_for_test(&self, name: &str) -> Option<&str> {
+        self.env_overrides
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (candidate == name).then(|| value.as_deref()).flatten())
+    }
+
     fn to_command_builder(&self) -> CommandBuilder {
         let mut builder = CommandBuilder::new(&self.program);
         builder.args(&self.args);
@@ -5845,6 +5862,22 @@ mod tests {
             "natural root exit left inherited-output descendant {descendant_pid} running"
         );
         Ok(())
+    }
+
+    #[test]
+    fn harness_command_can_set_a_private_runtime_environment_value() {
+        let mut command = HarnessCommand::fixture("echo", Vec::new(), PathBuf::from("/tmp"));
+
+        command.set_environment_override("COVEN_TEST_CAPABILITY", Some("opaque-value"));
+
+        assert!(command.env_overrides.contains(&(
+            "COVEN_TEST_CAPABILITY".to_owned(),
+            Some("opaque-value".to_owned())
+        )));
+        assert_eq!(
+            command.environment_override_for_test("COVEN_TEST_CAPABILITY"),
+            Some("opaque-value")
+        );
     }
 
     #[test]
