@@ -6,6 +6,8 @@
 mod agent;
 mod error;
 mod guardrail;
+mod loop_journal;
+mod loop_runner;
 mod model;
 mod observer;
 mod runner;
@@ -15,6 +17,12 @@ mod tool;
 pub use agent::{Agent, AgentId, Handoff};
 pub use error::{BoxError, ConfigError, GuardrailStage, RunError, RunFailure};
 pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
+pub use loop_journal::FileLoopJournal;
+pub use loop_runner::{
+    GoalLoopRunner, InMemoryLoopJournal, LoopAttempt, LoopCheckpoint, LoopCheckpointStatus,
+    LoopControl, LoopError, LoopEvaluator, LoopJournal, LoopOptions, LoopReconciler,
+    LoopReconciliation, LoopRecoveryFence, LoopRunResult,
+};
 pub use model::{
     HandoffCall, HandoffDefinition, Model, ModelAction, ModelRequest, ModelResponse, RunItem,
     ToolCall,

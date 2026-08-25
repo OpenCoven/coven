@@ -228,6 +228,21 @@ Step execution mapping:
 The executor writes run events to the session/event ledger so both Cave and
 Coven Code can display the same run state.
 
+For `pattern: loop-until-done`, the runtime composes the step executor through
+`coven_agents::GoalLoopRunner`. The workflow adapter translates
+`exit_criteria` into a `LoopEvaluator` and persists checkpoints through a
+daemon-owned `LoopJournal`. The daemon lists the journal during startup so
+pending work survives both process restarts and machine reboots. An in-flight
+`running` checkpoint is ambiguous and ordinary execution must fail closed. After
+the daemon proves the previous executor can no longer act, it calls the separate
+fence-bearing reconciliation API so a `LoopReconciler` can compare authoritative
+external state and explicitly complete, resume, or advance the checkpoint; the
+runtime never blindly replays external side effects. Running checkpoints carry a
+process-lifetime owner and attempt id; the daemon generates a new owner id on
+every boot, and a live owner cannot reconcile its own running claim.
+Reconciliation failures and unresolved ambiguity are persisted as blocked run
+state with an operator-facing reason rather than success-shaped recovery.
+
 ---
 
 ## Coven Code integration
