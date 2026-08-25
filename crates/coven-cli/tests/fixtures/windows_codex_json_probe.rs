@@ -14,7 +14,7 @@ fn main() {
     std::fs::write("stdin.txt", prompt).expect("failed to record Codex stdin");
 
     if std::env::var_os("COVEN_TEST_CODEX_PROBE_SILENT").is_some() {
-        std::thread::sleep(Duration::from_secs(60));
+        std::thread::sleep(Duration::from_secs(30));
         return;
     }
 
