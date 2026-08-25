@@ -7,6 +7,7 @@
 //! interpret them and is not an authentication or authorization authority.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,6 +52,10 @@ impl RelayState {
         assert!(limits.max_rooms > 0);
         assert!(limits.channel_capacity > 0);
         assert!(limits.max_queued_bytes > 0);
+        assert!(
+            u32::try_from(limits.max_queued_bytes).is_ok(),
+            "max_queued_bytes must fit in u32"
+        );
         Self {
             inner: Arc::new(Mutex::new(RelayRegistry::default())),
             next_peer_id: Arc::new(AtomicU64::new(1)),
@@ -395,8 +400,11 @@ async fn relay_loop(
             outgoing = inbox.recv() => {
                 idle.as_mut().reset(Instant::now() + IDLE_TIMEOUT);
                 let Some(outgoing) = outgoing else { break; };
-                let is_close = matches!(outgoing.message, Message::Close(_));
-                if send_with_timeout(socket, outgoing.message).await.is_err() || is_close {
+                let (send_result, is_close) = deliver_queued_message(
+                    outgoing,
+                    |message| send_with_timeout(socket, message),
+                ).await;
+                if send_result.is_err() || is_close {
                     break;
                 }
             }
@@ -406,6 +414,21 @@ async fn relay_loop(
             }
         }
     }
+}
+
+async fn deliver_queued_message<F, Fut>(outgoing: QueuedMessage, send: F) -> (Result<(), ()>, bool)
+where
+    F: FnOnce(Message) -> Fut,
+    Fut: Future<Output = Result<(), ()>>,
+{
+    let QueuedMessage {
+        message,
+        _byte_budget: byte_budget,
+    } = outgoing;
+    let is_close = matches!(message, Message::Close(_));
+    let result = send(message).await;
+    drop(byte_budget);
+    (result, is_close)
 }
 
 async fn send_with_timeout(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
@@ -432,11 +455,13 @@ async fn forward_to_peer(
     let byte_budget = if message_bytes == 0 {
         None
     } else {
+        let permit_count = u32::try_from(message_bytes)
+            .map_err(|_| close_message(1009, "relay message too large"))?;
         Some(
             state
                 .queued_bytes
                 .clone()
-                .try_acquire_many_owned(message_bytes as u32)
+                .try_acquire_many_owned(permit_count)
                 .map_err(|_| close_message(1013, "relay byte budget exhausted"))?,
         )
     };

@@ -256,6 +256,61 @@ async fn relay_enforces_and_releases_the_global_queued_byte_budget() {
     state.unregister(&room, PeerRole::Host, host.peer_id).await;
 }
 
+#[test]
+#[cfg(target_pointer_width = "64")]
+#[should_panic(expected = "max_queued_bytes must fit in u32")]
+fn relay_rejects_a_byte_budget_larger_than_per_message_permits_can_represent() {
+    RelayState::with_limits(RelayLimits {
+        max_rooms: 1,
+        channel_capacity: 1,
+        max_queued_bytes: u32::MAX as usize + 1,
+    });
+}
+
+#[tokio::test]
+async fn relay_holds_the_byte_budget_until_the_socket_send_finishes() {
+    let state = RelayState::with_limits(RelayLimits {
+        max_rooms: 1,
+        channel_capacity: 1,
+        max_queued_bytes: 5,
+    });
+    let room = canonical('T');
+    let credential = canonical('U');
+    let host = state
+        .register(&room, &credential, PeerRole::Host)
+        .await
+        .unwrap();
+    let mut client = state
+        .register(&room, &credential, PeerRole::Client)
+        .await
+        .unwrap();
+
+    forward_to_peer(
+        &state,
+        &room,
+        PeerRole::Host,
+        Message::binary(&b"12345"[..]),
+    )
+    .await
+    .unwrap();
+    let outgoing = client.inbox.recv().await.unwrap();
+    let queued_bytes = state.queued_bytes.clone();
+    let (result, is_close) = deliver_queued_message(outgoing, |message| async move {
+        assert_eq!(message, Message::binary(&b"12345"[..]));
+        assert_eq!(queued_bytes.available_permits(), 0);
+        Ok(())
+    })
+    .await;
+    assert!(result.is_ok());
+    assert!(!is_close);
+    assert_eq!(state.queued_bytes.available_permits(), 5);
+
+    state
+        .unregister(&room, PeerRole::Client, client.peer_id)
+        .await;
+    state.unregister(&room, PeerRole::Host, host.peer_id).await;
+}
+
 #[tokio::test]
 async fn disconnect_notifies_the_remaining_peer() {
     let state = RelayState::with_limits(RelayLimits {
