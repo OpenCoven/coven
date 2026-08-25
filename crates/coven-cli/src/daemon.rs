@@ -6029,11 +6029,11 @@ mod tests {
         // deadline rather than asserting on the first attempt.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let second = loop {
-            match acquire_serve_lock(home.path()) {
-                Ok(lock) => break lock,
-                Err(error) => {
+            match try_acquire_serve_lock(home.path())? {
+                Some(lock) => break lock,
+                None => {
                     if std::time::Instant::now() >= deadline {
-                        return Err(error).context("lock should be reacquirable once released");
+                        anyhow::bail!("lock should be reacquirable once released");
                     }
                     std::thread::sleep(std::time::Duration::from_millis(25));
                 }

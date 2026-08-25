@@ -5899,6 +5899,23 @@ mod tests {
         // fixture startup under load cannot consume the budget.
         let readiness_deadline = Instant::now() + Duration::from_secs(30);
         while !ready_marker.exists() {
+            match result_rx.try_recv() {
+                Ok(early) => {
+                    runner
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                    anyhow::bail!(
+                        "observed runner finished before descendant readiness; result: {early:?}"
+                    );
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    runner
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("observed runner panicked"))?;
+                    anyhow::bail!("observed runner disconnected before descendant readiness");
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
             if Instant::now() >= readiness_deadline {
                 let late = result_rx.recv_timeout(Duration::from_secs(5));
                 runner
