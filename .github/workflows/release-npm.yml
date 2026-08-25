@@ -77,7 +77,28 @@ jobs:
             echo "::error::Refusing to release: $TAG_NAME is a lightweight tag, not an annotated signed tag. Re-tag with \`git tag -s vX.Y.Z -m ...\`."
             exit 1
           fi
-          payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA")
+          tag_ref_payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG_NAME")
+          ref_name=$(jq -r '.ref // ""' <<<"$tag_ref_payload")
+          if [ "$ref_name" != "refs/tags/$TAG_NAME" ]; then
+            echo "::error::Refusing to release: GitHub tag ref payload named $ref_name instead of refs/tags/$TAG_NAME."
+            exit 1
+          fi
+          ref_object_type=$(jq -r '.object.type // ""' <<<"$tag_ref_payload")
+          api_tag_object_sha=$(jq -r '.object.sha // ""' <<<"$tag_ref_payload")
+          if [ "$ref_object_type" != "tag" ] || [ -z "$api_tag_object_sha" ]; then
+            echo "::error::Refusing to release: GitHub tag ref for $TAG_NAME must resolve to an annotated tag object."
+            exit 1
+          fi
+          if [ "$api_tag_object_sha" != "$TAG_OBJECT_SHA" ]; then
+            echo "::error::Refusing to release: local tag object $TAG_OBJECT_SHA does not match the GitHub-verified tag object $api_tag_object_sha for $TAG_NAME."
+            exit 1
+          fi
+          payload=$(gh api "/repos/$GITHUB_REPOSITORY/git/tags/$api_tag_object_sha")
+          tag_name=$(jq -r '.tag // ""' <<<"$payload")
+          if [ "$tag_name" != "$TAG_NAME" ]; then
+            echo "::error::Refusing to release: GitHub tag payload named $tag_name instead of $TAG_NAME."
+            exit 1
+          fi
           verified=$(jq -r '.verification.verified' <<<"$payload")
           reason=$(jq -r '.verification.reason' <<<"$payload")
           if [ "$verified" != "true" ]; then
@@ -89,6 +110,11 @@ jobs:
           echo "tag=$TAG_NAME verified=$verified reason=$reason target=$TAGGED_COMMIT_SHA"
           if [ "$tag_object_type" != "commit" ] || [ -z "$TAGGED_COMMIT_SHA" ]; then
             echo "::error::Refusing release: annotated tag $TAG_NAME targets ${tag_object_type:-unknown}, not a commit."
+            exit 1
+          fi
+          LOCAL_TAGGED_COMMIT_SHA=$(git rev-parse "$TAG_NAME^{commit}")
+          if [ "$LOCAL_TAGGED_COMMIT_SHA" != "$TAGGED_COMMIT_SHA" ]; then
+            echo "::error::Refusing to release: local tag $TAG_NAME resolves to $LOCAL_TAGGED_COMMIT_SHA, not the GitHub-verified commit $TAGGED_COMMIT_SHA."
             exit 1
           fi
           allowed_signers_raw="${NPM_RELEASE_ALLOWED_SIGNERS:-}"
