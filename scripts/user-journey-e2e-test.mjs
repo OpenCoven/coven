@@ -545,6 +545,12 @@ test('runPackagedUserJourney sequences installed-wrapper commands and full lifec
         })
       },
       {
+        method: 'runCapture',
+        command: wrapperBin,
+        args: ['setup', 'codex'],
+        result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
+      },
+      {
         method: 'runDaemonStart',
         command: wrapperBin,
         result: makeResult({ stdout: 'Coven daemon: running\n' })
@@ -826,6 +832,12 @@ test('runPackagedUserJourney attempts bounded daemon stop after start failure', 
         })
       },
       {
+        method: 'runCapture',
+        command: wrapperBin,
+        args: ['setup', 'codex'],
+        result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
+      },
+      {
         method: 'runDaemonStart',
         command: wrapperBin,
         error: new Error('daemon start timed out after 60000ms')
@@ -949,6 +961,12 @@ test('runPackagedUserJourney stops the daemon and removes scratch after mid-jour
             ]
           })
         })
+      },
+      {
+        method: 'runCapture',
+        command: wrapperBin,
+        args: ['setup', 'codex'],
+        result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
       },
       {
         method: 'runDaemonStart',

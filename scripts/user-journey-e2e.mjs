@@ -627,6 +627,18 @@ export function assertDoctorPass(output) {
   }
 }
 
+export function assertSetupNonTty(output, status) {
+  // The packed smoke runs headless, so `coven setup` must fail closed rather
+  // than attempt a provider login it cannot supervise. This is the only place
+  // the packaged artifact proves its setup command is wired at all.
+  if (status !== 1) {
+    fail(`\`coven setup codex\` on a headless runner should exit 1, got ${status}`);
+  }
+  if (!output.includes('Codex: non_tty')) {
+    fail(`\`coven setup codex\` did not report the non-TTY outcome.\nstdout:\n${output}`);
+  }
+}
+
 export function assertDoctorJsonPass(output) {
   const body = parseJsonOutput('`coven doctor --json`', output);
   if (body.ok !== true || body.blocking !== false) {
@@ -929,6 +941,13 @@ export function runPackagedUserJourney({
       env: activeEnv
     });
     assertDoctorJsonPass(doctorJson);
+
+    const setup = runner.runCapture(resolvedWrapperBin, ['setup', 'codex'], {
+      allowedExitCodes: [1],
+      cwd: layout.projectRoot,
+      env: activeEnv
+    });
+    assertSetupNonTty(textFromResult(setup, 'stdout'), setup.status);
 
     const daemonStart = runner.runDaemonStart(resolvedWrapperBin, activeEnv, {
       cwd: layout.projectRoot
