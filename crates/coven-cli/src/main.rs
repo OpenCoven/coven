@@ -32,6 +32,7 @@ mod engine_install;
 mod eval_loop;
 mod event_writer;
 mod execution_binding;
+mod install_conflict;
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod request_adoption;
@@ -2611,6 +2612,31 @@ impl DoctorJsonPathRedactor {
 fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     let paths = DoctorJsonPathRedactor::new(report);
+
+    // Shadowed installs answer every command silently, so an upgrade appears to
+    // do nothing and the operator concludes Coven is broken. Warn rather than
+    // fail: several installs is legitimate on a developer machine, it just has
+    // to be visible. Paths stay concrete here because the whole point is to
+    // tell the operator which file to remove.
+    let installations = install_conflict::current_installations("coven");
+    if let Some(report_line) = install_conflict::conflict_report(&installations) {
+        checks.push(DoctorCheck::warn(
+            "install:conflicts",
+            format!("{} coven executables on PATH: {report_line}", installations.len()),
+            Some(
+                "the first entry wins; remove the others or reorder PATH, then re-check with `coven --version`"
+                    .to_string(),
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::pass(
+            "install:conflicts",
+            match installations.len() {
+                0 => "coven is not on PATH (running from an explicit path)".to_string(),
+                _ => "one coven on PATH".to_string(),
+            },
+        ));
+    }
 
     checks.push(match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
