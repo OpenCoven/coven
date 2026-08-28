@@ -168,31 +168,44 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// Build a candidate exactly the way `installations_on_path` does, so the
+    /// host's separator is used on both sides. An earlier version of these
+    /// tests hardcoded joined paths as string literals; that passes on the
+    /// platform the literals were written for and fails on the other, which is
+    /// precisely the bug this module exists to catch in production code.
+    fn at(directory: &str, file: &str) -> PathBuf {
+        Path::new(directory).join(file)
+    }
+
     /// Case-sensitive probe, matching Unix filesystem semantics.
-    fn probe_from(paths: &[&str]) -> impl Fn(&Path) -> bool {
-        let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    fn probe(paths: Vec<PathBuf>) -> impl Fn(&Path) -> bool {
+        let set: HashSet<PathBuf> = paths.into_iter().collect();
         move |candidate: &Path| set.contains(candidate)
     }
 
-    /// Case-insensitive probe, matching Windows filesystem semantics. This
-    /// matters: PATHEXT is conventionally uppercase (".EXE") while files on
-    /// disk are conventionally lowercase ("coven.exe"), and Windows resolves
-    /// them to each other. A case-sensitive fake would make these tests pass
-    /// only for spellings that never occur in practice.
-    fn windows_probe_from(paths: &[&str]) -> impl Fn(&Path) -> bool {
-        let set: HashSet<String> = paths.iter().map(|path| path.to_ascii_lowercase()).collect();
+    /// Case-insensitive probe, matching Windows filesystem semantics. PATHEXT
+    /// is conventionally uppercase (".EXE") while files on disk are lowercase
+    /// ("coven.exe"), and Windows resolves them to each other.
+    fn windows_probe(paths: Vec<PathBuf>) -> impl Fn(&Path) -> bool {
+        let set: HashSet<String> = paths
+            .into_iter()
+            .map(|path| path.display().to_string().to_ascii_lowercase())
+            .collect();
         move |candidate: &Path| set.contains(&candidate.display().to_string().to_ascii_lowercase())
+    }
+
+    fn rendered(found: &[Installation]) -> Vec<PathBuf> {
+        found.iter().map(|install| install.path.clone()).collect()
     }
 
     #[test]
     fn a_single_unix_install_is_not_a_conflict() {
-        let probe = probe_from(&["/usr/local/bin/coven"]);
         let found = installations_on_path(
             "coven",
             Some("/usr/local/bin:/usr/bin"),
             None,
             Platform::Unix,
-            &probe,
+            &probe(vec![at("/usr/local/bin", "coven")]),
         );
         assert_eq!(found.len(), 1);
         assert_eq!(conflict_report(&found), None);
@@ -200,98 +213,79 @@ mod tests {
 
     #[test]
     fn nothing_installed_is_not_a_conflict() {
-        let probe = probe_from(&[]);
-        let found =
-            installations_on_path("coven", Some("/usr/bin:/bin"), None, Platform::Unix, &probe);
+        let found = installations_on_path(
+            "coven",
+            Some("/usr/bin:/bin"),
+            None,
+            Platform::Unix,
+            &probe(Vec::new()),
+        );
         assert!(found.is_empty());
         assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
     fn unix_reports_every_install_in_path_order() {
-        // The real shape this exists for: a cargo build, a user-local copy,
-        // and an npm/nvm global all answering to `coven`. Paths use a neutral
-        // fixture root because the privacy guard rejects absolute home paths
-        // in source, and rightly so.
-        let probe = probe_from(&[
-            "/fixture/cargo/bin/coven",
-            "/fixture/local/bin/coven",
-            "/fixture/nvm/bin/coven",
-        ]);
+        // The real shape this exists for: a cargo build, a user-local copy, and
+        // an npm/nvm global all answering to `coven`.
+        let cargo = at("/fixture/cargo/bin", "coven");
+        let local = at("/fixture/local/bin", "coven");
+        let nvm = at("/fixture/nvm/bin", "coven");
         let found = installations_on_path(
             "coven",
             Some("/fixture/local/bin:/fixture/nvm/bin:/fixture/cargo/bin"),
             None,
             Platform::Unix,
-            &probe,
+            &probe(vec![cargo.clone(), local.clone(), nvm.clone()]),
         );
-        let rendered: Vec<String> = found
-            .iter()
-            .map(|install| install.path.display().to_string())
-            .collect();
         assert_eq!(
-            rendered,
-            vec![
-                "/fixture/local/bin/coven",
-                "/fixture/nvm/bin/coven",
-                "/fixture/cargo/bin/coven",
-            ],
+            rendered(&found),
+            vec![local.clone(), nvm, cargo.clone()],
             "installs must be reported in PATH order so the first is the one that runs"
         );
         let report = conflict_report(&found).expect("three installs is a conflict");
-        assert!(report.contains("/fixture/local/bin/coven (active)"));
-        assert!(report.contains("/fixture/cargo/bin/coven (shadowed)"));
+        assert!(report.contains(&format!("{} (active)", local.display())));
+        assert!(report.contains(&format!("{} (shadowed)", cargo.display())));
     }
 
     #[test]
     fn a_repeated_path_entry_is_not_a_second_install() {
-        let probe = probe_from(&["/usr/local/bin/coven"]);
         let found = installations_on_path(
             "coven",
             Some("/usr/local/bin:/usr/bin:/usr/local/bin"),
             None,
             Platform::Unix,
-            &probe,
+            &probe(vec![at("/usr/local/bin", "coven")]),
         );
         assert_eq!(found.len(), 1, "a duplicated PATH entry is not a conflict");
         assert_eq!(conflict_report(&found), None);
     }
 
     #[test]
-    fn unix_ignores_a_non_executable_file() {
-        // probe_from only reports the paths given, standing in for the
-        // executable-bit check the real probe performs.
-        let probe = probe_from(&["/usr/bin/coven"]);
+    fn unix_ignores_a_candidate_the_probe_rejects() {
+        // The probe stands in for the executable-bit check the real one does.
         let found = installations_on_path(
             "coven",
             Some("/opt/broken/bin:/usr/bin"),
             None,
             Platform::Unix,
-            &probe,
+            &probe(vec![at("/usr/bin", "coven")]),
         );
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].path, PathBuf::from("/usr/bin/coven"));
+        assert_eq!(rendered(&found), vec![at("/usr/bin", "coven")]);
     }
 
-    // Windows paths here use forward slashes so `Path::join` produces the same
-    // string on whatever host runs the test; Windows accepts '/' as a separator,
-    // and the rules under test are the separator and PATHEXT handling, not the
-    // spelling of the join.
     #[test]
     fn windows_splits_path_on_semicolons_and_applies_pathext() {
-        let probe = windows_probe_from(&["C:/tools/coven.exe", "C:/npm/coven.cmd"]);
+        let tools = at("C:/tools", "coven.exe");
+        let npm = at("C:/npm", "coven.cmd");
         let found = installations_on_path(
             "coven",
             Some("C:/tools;C:/npm"),
             Some(".COM;.EXE;.BAT;.CMD"),
             Platform::Windows,
-            &probe,
+            &windows_probe(vec![tools.clone(), npm.clone()]),
         );
-        let rendered: Vec<String> = found
-            .iter()
-            .map(|install| install.path.display().to_string())
-            .collect();
-        assert_eq!(rendered, vec!["C:/tools/coven.exe", "C:/npm/coven.cmd"]);
+        assert_eq!(rendered(&found), vec![tools, npm]);
         assert!(conflict_report(&found).is_some());
     }
 
@@ -299,75 +293,77 @@ mod tests {
     fn windows_prefers_exe_over_cmd_in_the_same_directory() {
         // Both spellings in one directory is still two installs, and PATHEXT
         // order decides which one Windows actually runs.
-        let probe = windows_probe_from(&["C:/npm/coven.cmd", "C:/npm/coven.exe"]);
+        let exe = at("C:/npm", "coven.exe");
+        let cmd = at("C:/npm", "coven.cmd");
         let found = installations_on_path(
             "coven",
             Some("C:/npm"),
             Some(".COM;.EXE;.BAT;.CMD"),
             Platform::Windows,
-            &probe,
+            &windows_probe(vec![cmd.clone(), exe.clone()]),
         );
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[0].path, PathBuf::from("C:/npm/coven.exe"));
+        assert_eq!(rendered(&found), vec![exe.clone(), cmd.clone()]);
         let report = conflict_report(&found).expect("two spellings is a conflict");
-        assert!(report.contains("C:/npm/coven.exe (active)"));
-        assert!(report.contains("C:/npm/coven.cmd (shadowed)"));
+        assert!(report.contains(&format!("{} (active)", exe.display())));
+        assert!(report.contains(&format!("{} (shadowed)", cmd.display())));
     }
 
     #[test]
     fn windows_honors_a_reordered_pathext() {
-        let probe = windows_probe_from(&["C:/npm/coven.cmd", "C:/npm/coven.exe"]);
+        let exe = at("C:/npm", "coven.exe");
+        let cmd = at("C:/npm", "coven.cmd");
         let found = installations_on_path(
             "coven",
             Some("C:/npm"),
             Some(".CMD;.EXE"),
             Platform::Windows,
-            &probe,
+            &windows_probe(vec![cmd.clone(), exe]),
         );
         assert_eq!(
-            found[0].path,
-            PathBuf::from("C:/npm/coven.cmd"),
+            found[0].path, cmd,
             "PATHEXT order decides which spelling wins, not a hardcoded preference"
         );
     }
 
     #[test]
     fn windows_falls_back_to_the_default_pathext() {
-        let probe = windows_probe_from(&["C:/tools/coven.exe"]);
+        let exe = at("C:/tools", "coven.exe");
         for pathext in [None, Some(""), Some("   ")] {
             let found = installations_on_path(
                 "coven",
                 Some("C:/tools"),
                 pathext,
                 Platform::Windows,
-                &probe,
+                &windows_probe(vec![exe.clone()]),
             );
-            assert_eq!(found.len(), 1, "pathext {pathext:?} should fall back");
-            assert_eq!(found[0].path, PathBuf::from("C:/tools/coven.exe"));
+            assert_eq!(
+                rendered(&found),
+                vec![exe.clone()],
+                "pathext {pathext:?} should fall back to the Windows default"
+            );
         }
     }
 
     #[test]
     fn pathext_entries_without_a_leading_dot_still_match() {
-        let probe = windows_probe_from(&["C:/tools/coven.exe"]);
+        let exe = at("C:/tools", "coven.exe");
         let found = installations_on_path(
             "coven",
             Some("C:/tools"),
             Some("COM;EXE"),
             Platform::Windows,
-            &probe,
+            &windows_probe(vec![exe.clone()]),
         );
-        assert_eq!(found.len(), 1);
-        assert_eq!(found[0].path, PathBuf::from("C:/tools/coven.exe"));
+        assert_eq!(rendered(&found), vec![exe]);
     }
 
     #[test]
     fn an_absent_or_empty_path_reports_nothing() {
-        let probe = probe_from(&["/usr/bin/coven"]);
-        assert!(installations_on_path("coven", None, None, Platform::Unix, &probe).is_empty());
-        assert!(installations_on_path("coven", Some(""), None, Platform::Unix, &probe).is_empty());
+        let p = probe(vec![at("/usr/bin", "coven")]);
+        assert!(installations_on_path("coven", None, None, Platform::Unix, &p).is_empty());
+        assert!(installations_on_path("coven", Some(""), None, Platform::Unix, &p).is_empty());
         assert!(
-            installations_on_path("coven", Some("::"), None, Platform::Unix, &probe).is_empty(),
+            installations_on_path("coven", Some("::"), None, Platform::Unix, &p).is_empty(),
             "empty PATH segments must not be probed as the current directory"
         );
     }
