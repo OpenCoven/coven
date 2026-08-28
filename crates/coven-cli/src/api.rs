@@ -577,7 +577,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
-            let (status, response) = control_plane::route_action(payload, &conn);
+            let (status, response) = control_plane::route_action(payload, &conn, runtime);
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),
@@ -10733,6 +10733,83 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""deleted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_action_runs_a_routine_through_the_ledger() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Daily notes",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "familiarId": "charm",
+                "prompt": "Write the daily reflection."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&run_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(
+            response.body.contains(r#""status":"succeeded""#),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains(r#""sessionId":"session-"#),
+            "{}",
+            response.body
+        );
+
+        let runs_body = json!({
+            "action": "coven.automations.runs",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&runs_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""runs":[{""#), "{}", response.body);
+        assert!(
+            response.body.contains(r#""status":"succeeded""#),
+            "{}",
+            response.body
+        );
         Ok(())
     }
 

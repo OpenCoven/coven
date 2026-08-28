@@ -113,6 +113,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.delete",
                     "coven.automations.tick",
                     "coven.automations.runs",
+                    "coven.automations.run",
                 ],
             },
             Capability {
@@ -127,7 +128,11 @@ pub fn capabilities() -> CapabilityCatalog {
     }
 }
 
-pub fn route_action(payload: Value, conn: &rusqlite::Connection) -> (u16, ControlActionResponse) {
+pub fn route_action(
+    payload: Value,
+    conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> (u16, ControlActionResponse) {
     if !payload.is_object() {
         return (
             400,
@@ -260,6 +265,20 @@ pub fn route_action(payload: Value, conn: &rusqlite::Connection) -> (u16, Contro
             };
             (200, event)
         }
+        "coven.automations.run" => {
+            let id = required_id_field(&payload, action);
+            let now = chrono::Utc::now();
+            let event = match id {
+                Ok(id) => automation_event(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_run_payload(conn, runtime, &id, now),
+                ),
+                Err(error) => return (400, rejected_action(action, error)),
+            };
+            (200, event)
+        }
         _ => (
             400,
             rejected_action(action, format!("unknown action `{action}`")),
@@ -324,6 +343,29 @@ fn automation_tick_payload(
             "failed": report.failed,
         }),
         Err(error) => json!({ "error": format!("{error:#}") }),
+    }
+}
+
+fn automation_run_payload(
+    conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    match crate::automations::runner::load_definition_for_run(conn, id) {
+        Ok(Some(definition)) => {
+            match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
+                Ok(outcome) => json!({
+                    "runId": outcome.run_id,
+                    "status": outcome.status,
+                    "sessionId": outcome.session_id,
+                    "error": outcome.error,
+                }),
+                Err(error) => json!({ "error": error }),
+            }
+        }
+        Ok(None) => json!({ "error": format!("no routine with id `{id}`") }),
+        Err(error) => json!({ "error": error }),
     }
 }
 
