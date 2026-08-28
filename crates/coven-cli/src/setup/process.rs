@@ -165,6 +165,13 @@ fn extract_version(output: &str, expected_program: Option<&str>) -> Option<Strin
             let normalized = raw.trim_matches(|character: char| {
                 !character.is_ascii_alphanumeric() && !matches!(character, '.' | '_' | '+' | '-')
             });
+            // '.' has to survive the trim above because versions are full of
+            // them, which leaves a sentence-ending period attached: GitHub
+            // Copilot CLI prints "GitHub Copilot CLI 1.0.81." and the trailing
+            // dot made valid_version see an empty final component, so no
+            // version was extracted at all. A version never legitimately ends
+            // in '.', so strip it here rather than loosening validation.
+            let normalized = normalized.trim_end_matches('.');
             (raw, normalized)
         })
         .collect::<Vec<_>>();
@@ -498,5 +505,40 @@ mod windows_job {
         let previous_suspend_count = unsafe { ResumeThread(thread) };
         unsafe { CloseHandle(thread) };
         previous_suspend_count == 1
+    }
+}
+
+#[cfg(test)]
+mod version_extraction_tests {
+    use super::*;
+
+    #[test]
+    fn copilot_version_output_with_a_trailing_period_is_extracted() {
+        // GitHub Copilot CLI ends its version line with a sentence period:
+        //   GitHub Copilot CLI 1.0.81.
+        // A trailing '.' is punctuation, never part of a version, but the token
+        // normalizer keeps '.' because versions contain them. That left
+        // "1.0.81." which valid_version rejects (an empty final component), so
+        // no version was extracted and `coven setup copilot --report-json`
+        // failed privacy validation with no report written.
+        assert_eq!(
+            extract_version(
+                "GitHub Copilot CLI 1.0.81.\nRun 'copilot update' to check for updates.",
+                Some("copilot")
+            ),
+            Some("1.0.81".to_string())
+        );
+    }
+
+    #[test]
+    fn versions_without_trailing_punctuation_still_extract() {
+        assert_eq!(
+            extract_version("OpenAI Codex v0.145.0", Some("codex")),
+            Some("v0.145.0".to_string())
+        );
+        assert_eq!(
+            extract_version("2.1.220 (Claude Code)", Some("claude")),
+            Some("2.1.220".to_string())
+        );
     }
 }
