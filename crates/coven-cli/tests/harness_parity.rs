@@ -274,20 +274,43 @@ fn every_harness_forwards_each_add_dir_grant() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_harness_accepts_a_continuity_request_without_error() -> anyhow::Result<()> {
-    // `--continue` with no prior session must fail cleanly rather than panic or
-    // hang. Parity is that all three refuse the same way.
+fn every_harness_refuses_an_unsatisfiable_continue_instead_of_starting_over() -> anyhow::Result<()>
+{
+    // Each harness declares its own resume mechanism (Codex re-invokes through
+    // `exec ... resume`, others use their own flags), so asserting one exact
+    // token would only test Codex. The parity claim that holds for all three is
+    // that a resumed turn must not be invoked identically to a fresh one --
+    // that is precisely the regression where `--continue` is silently dropped
+    // and the harness starts a brand new conversation instead.
     for harness in HARNESSES {
         let fixture = Fixture::new(0, false)?;
-        let output = fixture.run(&["run", harness, "--continue", "prompt"])?;
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+
+        fixture.run(&["run", harness, "first-turn"])?;
+        let fresh = fixture.recorded()?;
+        assert!(
+            !fresh.is_empty(),
+            "{harness} never invoked the harness on a fresh turn"
+        );
+
+        // Truncate the record so the second run's argv is isolated.
+        fs::write(&fixture.record, "")?;
+        let output = fixture.run(&["run", harness, "--continue", "second-turn"])?;
+        let resumed = fixture.recorded()?;
+
+        // The first turn already completed, so there is no active session to
+        // resume. The dangerous failure here is not an error -- it is silently
+        // starting a BRAND NEW conversation while the operator believes they
+        // continued the old one. All three harnesses must refuse rather than
+        // launch, and must say so rather than exiting 0.
+        assert!(
+            resumed.is_empty(),
+            "{harness} launched a fresh conversation for --continue with no resumable \
+             session, so continuity was silently downgraded: {resumed:?}"
         );
         assert!(
-            !combined.contains("panicked"),
-            "{harness} panicked on --continue with no prior session: {combined}"
+            !output.status.success(),
+            "{harness} reported success for an unsatisfiable --continue: stdout {}",
+            String::from_utf8_lossy(&output.stdout)
         );
     }
     Ok(())
