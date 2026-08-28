@@ -133,6 +133,7 @@ pub fn installations_on_path(
 
 /// Human-readable summary for `coven doctor`. `None` when there is nothing to
 /// report -- zero or one install is the healthy case.
+#[allow(dead_code)] // prose is built inline in main.rs; kept for the conflict contract tests
 pub fn conflict_report(installations: &[Installation]) -> Option<String> {
     if installations.len() < 2 {
         return None;

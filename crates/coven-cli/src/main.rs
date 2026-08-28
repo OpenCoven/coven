@@ -2358,8 +2358,7 @@ fn print_doctor_prose(report: &DoctorReport) {
             ));
         }
         print_doctor_line(
-            "  The first entry wins. Remove the others or reorder PATH, then re-check with `coven --version`."
-                .to_string(),
+            "  The first entry wins. Remove the others or reorder PATH, then re-check with `coven --version`.",
         );
     }
     print_doctor_line(format!("Store: {}", report.home.display()));
