@@ -6640,7 +6640,10 @@ mod tests {
         drop(watcher);
 
         dropped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The poll interval this drop must interrupt is 60s, so five seconds
+        // still fails loudly if the interrupt regresses while tolerating a
+        // slow thread wake-up.
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

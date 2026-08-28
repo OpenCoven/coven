@@ -103,6 +103,22 @@ justifying comment.
   policy and adapter contracts are stable. Don't add speculative harness adapters.
 - **Never weaken the secret scan.** If `check-secrets.py` flags something, fix
   the content — don't allowlist your way past it.
+- **Wall-clock assertions in tests must clear scheduler jitter.** A bound like
+  `assert!(started.elapsed() < …)` runs on shared CI runners, so a threshold
+  close to the nominal duration will flake. Before adding or "fixing" one, work
+  out which kind it is — they are not interchangeable, and a blanket bump
+  deletes real coverage:
+  - **A documented contract** (e.g. the two-second `daemon stop` budget in
+    `daemon.rs`): keep it strict. This is the assertion's whole point.
+  - **A discriminating threshold** separating a fast path from an injected slow
+    path: put the bound near the *midpoint*, not just above the fast path.
+  - **A hang guard** that only turns a wedge into a readable failure: set it far
+    above anything load can produce, and say so in a comment.
+  - **A promptness claim already proven deterministically** in the same test
+    (a call count, an ordering, an error string): delete it rather than tune it.
+
+  Report the observed duration in the failure message, or the next flake tells
+  you nothing.
 - Prefer the fast loop (`cargo check`, debug builds) over `--release` unless you
   specifically need optimized output.
 
