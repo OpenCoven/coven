@@ -38,10 +38,9 @@ fn max_iso(
 
 /// Computes the health snapshot for one routine. Reads-only.
 pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result<RoutineHealth> {
-    let definition: RoutineDefinition =
-        super::runner::load_definition_for_run(conn, id)
-            .map_err(anyhow::Error::msg)?
-            .ok_or_else(|| anyhow::anyhow!("no routine with id `{id}`"))?;
+    let definition: RoutineDefinition = super::runner::load_definition_for_run(conn, id)
+        .map_err(anyhow::Error::msg)?
+        .ok_or_else(|| anyhow::anyhow!("no routine with id `{id}`"))?;
 
     let next_due_at = next_due(&definition.rrule, definition.timezone, now)
         .map_err(|error| anyhow::anyhow!("{error}"))?

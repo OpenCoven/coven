@@ -11,23 +11,36 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-/// One automations pass: open the store, run the full tick, log failures to
-/// the daemon recovery log. Returns the tick report summary for tests.
-pub fn process_automations_tick(coven_home: &Path) -> Result<super::occurrences::TickReport> {
+/// One automations pass: open the store, run the full tick (plan, recover,
+/// claim), then dispatch every claimed occurrence through the shared
+/// session-launch runtime. Failures land in the daemon recovery log via the
+/// caller.
+pub fn process_automations_tick(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+) -> Result<super::occurrences::TickReport> {
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
-    let report = super::occurrences::tick(&conn, chrono::Utc::now())?;
+    let now = chrono::Utc::now();
+    let report = super::occurrences::tick(&conn, now)?;
+    if !report.claimed.is_empty() {
+        let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
+            .map_err(anyhow::Error::msg)?;
+    }
     Ok(report)
 }
 
 /// Starts the automations scheduler thread on the daemon's 60s cadence.
-pub fn start_automations_scheduler(coven_home: &Path) -> Result<()> {
+pub fn start_automations_scheduler(
+    coven_home: &Path,
+    runtime: std::sync::Arc<dyn crate::api::SessionRuntime + Send + Sync>,
+) -> Result<()> {
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-automations-scheduler".into())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(60));
-            if let Err(error) = process_automations_tick(&home) {
+            if let Err(error) = process_automations_tick(&home, runtime.as_ref()) {
                 crate::daemon::append_daemon_recovery_log(
                     &home,
                     &format!("automations tick failed: {error:#}"),
@@ -80,7 +93,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let report = process_automations_tick(home).unwrap();
+        let report = process_automations_tick(home, &crate::api::NoopSessionRuntime).unwrap();
         assert_eq!(report.planned.len(), 1);
         assert_eq!(report.claimed.len(), 1);
 
@@ -92,6 +105,11 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state, "claimed");
+        // The tick claims and then dispatches through the (noop) runtime, so
+        // the occurrence settles as succeeded and the ledger records the run.
+        assert_eq!(state, "succeeded");
+        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "succeeded");
     }
 }
