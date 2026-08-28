@@ -123,6 +123,11 @@ pub struct RunResult {
     /// back to the harness on a later resume.
     pub harness_session_id: Option<String>,
     pub error: Option<String>,
+    /// Per-turn token usage, relayed for consumers that persist it (Cave's
+    /// `parseStreamJsonUsage` reads the snake_case contract). Omitted from
+    /// the wire when the harness reported none — absent, not zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
 }
 
 /// Emit one event as a JSONL frame followed by a single `\n`. Flushes the
@@ -185,6 +190,7 @@ mod tests {
             session_id: "s1".into(),
             harness_session_id: None,
             error: None,
+            usage: None,
         });
         let mut buf = Vec::new();
         emit_event(&mut buf, &event).unwrap();
@@ -197,6 +203,35 @@ mod tests {
         assert_eq!(v["session_id"], "s1");
         assert!(v.get("harness_session_id").is_some());
         assert!(v.get("error").is_some(), "null error field is preserved");
+        assert!(
+            v.get("usage").is_none(),
+            "absent usage is omitted, never serialized as null"
+        );
+    }
+
+    #[test]
+    fn result_usage_relays_when_present() {
+        let event = Event::Result(RunResult {
+            subtype: "success".into(),
+            duration_ms: 12,
+            is_error: false,
+            num_turns: 1,
+            session_id: "s1".into(),
+            harness_session_id: None,
+            error: None,
+            usage: Some(serde_json::json!({
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_read_input_tokens": 2,
+            })),
+        });
+        let mut buf = Vec::new();
+        emit_event(&mut buf, &event).unwrap();
+        let line = String::from_utf8(buf).unwrap();
+        let v: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(v["usage"]["input_tokens"], 10);
+        assert_eq!(v["usage"]["output_tokens"], 4);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 2);
     }
 
     #[test]
@@ -394,6 +429,7 @@ mod tests {
                 session_id: "s1".into(),
                 harness_session_id: None,
                 error: None,
+                usage: None,
             }),
         )
         .unwrap();
