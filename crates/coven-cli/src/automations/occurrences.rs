@@ -25,6 +25,7 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
         lease_owner TEXT,
         lease_expires_at TEXT,
         attempt INTEGER NOT NULL DEFAULT 0,
+        failure_reason TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, scheduled_for)
@@ -38,6 +39,7 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
 ";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // planning-only report; the production tick reports the superset TickReport
 pub struct PlanTickReport {
     pub planned: Vec<String>,
     pub already_fenced: usize,
@@ -51,6 +53,167 @@ pub struct PlannedOccurrence {
     pub automation_id: String,
     pub scheduled_for: String,
     pub state: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TickReport {
+    pub planned: Vec<String>,
+    pub already_fenced: usize,
+    pub paused_skipped: usize,
+    pub recovered: usize,
+    pub claimed: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
+
+/// Claims the earliest due PLANNED occurrence for a routine with a bounded
+/// lease. Returns the claimed occurrence id, or `None` when nothing is due.
+/// The compare-and-set WHERE clause makes claims race-safe across callers.
+///
+/// The runner (coven#816 part 4) is the production caller; until then tests
+/// and the daemon tick exercise the path directly.
+#[allow(dead_code)]
+pub fn claim_due_occurrence(
+    conn: &Connection,
+    automation_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
+        return Err("lease minutes must be 1..=1440".to_string());
+    }
+    let expires = now + chrono::Duration::minutes(lease_minutes);
+    let now_iso = iso(now);
+    let expires_iso = iso(expires);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'claimed',
+                 lease_owner = ?3,
+                 lease_expires_at = ?4,
+                 attempt = attempt + 1,
+                 updated_at = ?2
+             WHERE automation_id = ?1
+               AND state = 'planned'
+               AND scheduled_for <= ?2
+               AND id = (
+                   SELECT id FROM automation_occurrences
+                   WHERE automation_id = ?1
+                     AND state = 'planned'
+                     AND scheduled_for <= ?2
+                   ORDER BY scheduled_for ASC
+                   LIMIT 1
+               )",
+            params![automation_id, now_iso, owner, expires_iso],
+        )
+        .map_err(|error| format!("failed to claim occurrence: {error}"))?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    let id: String = conn
+        .query_row(
+            "SELECT id FROM automation_occurrences WHERE automation_id = ?1 AND state = 'claimed' AND lease_owner = ?2 ORDER BY scheduled_for ASC LIMIT 1",
+            params![automation_id, owner],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read claim: {error}"))?;
+    Ok(Some(id))
+}
+
+/// Marks occurrences whose lease has expired as failed with a stale reason.
+/// A stale lease must never render as live work (coven#816).
+pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<usize, String> {
+    let now_iso = iso(now);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = 'lease expired',
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?1
+             WHERE state IN ('claimed', 'running')
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at < ?1",
+            params![now_iso],
+        )
+        .map_err(|error| format!("failed to recover expired leases: {error}"))?;
+    Ok(changed)
+}
+
+/// Finalizes an occurrence into a terminal state. Releasing a PLANNED
+/// occurrence is refused — only claimed work can settle.
+#[allow(dead_code)]
+pub fn settle_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+    terminal_state: &str,
+    failure_reason: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    if !OCCURRENCE_TERMINAL_STATES.contains(&terminal_state) {
+        return Err(format!(
+            "terminal state must be one of {OCCURRENCE_TERMINAL_STATES:?}"
+        ));
+    }
+    let now_iso = iso(now);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = ?2,
+                 failure_reason = ?3,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?4
+             WHERE id = ?1 AND state IN ('claimed', 'running')",
+            params![occurrence_id, terminal_state, failure_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to settle occurrence: {error}"))?;
+    Ok(changed > 0)
+}
+
+/// One full tick: plan due slots, recover expired leases, then claim the
+/// earliest due occurrence of every ACTIVE routine that has one.
+pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
+    let mut report = TickReport::default();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+
+    let definitions = active_definitions(conn)?;
+    for definition in &definitions {
+        if !seen.insert(definition.id.clone()) {
+            continue;
+        }
+        let created_at = definition_created_at(conn, &definition.id).unwrap_or(now);
+        match plan_latest_due_occurrence(conn, definition, created_at, now) {
+            Ok(PlanOutcome::Planned(occurrence)) => report.planned.push(occurrence.id),
+            Ok(PlanOutcome::AlreadyFenced) => report.already_fenced += 1,
+            Ok(PlanOutcome::NotDue) => {}
+            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
+        }
+    }
+
+    report.recovered = recover_expired_leases(conn, now).unwrap_or(0);
+
+    for definition in &definitions {
+        match claim_due_occurrence(conn, &definition.id, "daemon", 60, now) {
+            Ok(Some(id)) => report.claimed.push(id),
+            Ok(None) => {}
+            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
+        }
+    }
+
+    let paused: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM automation_definitions WHERE status = 'PAUSED'",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to count paused routines")?;
+    report.paused_skipped = paused as usize;
+
+    Ok(report)
 }
 
 fn iso(instant: DateTime<Utc>) -> String {
@@ -177,7 +340,10 @@ pub fn plan_latest_due_occurrence(
 }
 
 /// One planning tick across every stored routine. Idempotent: a repeated
-/// tick fences nothing twice.
+/// tick fences nothing twice. Production ticks go through `tick`, which
+/// adds lease recovery and claiming; this stays public for planning-only
+/// callers and tests.
+#[allow(dead_code)]
 pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickReport> {
     let mut report = PlanTickReport::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -331,6 +497,86 @@ mod tests {
             "future slots must not be fenced: {report:?}"
         );
         assert_eq!(report.already_fenced, 0);
+    }
+
+    #[test]
+    fn claims_the_earliest_due_occurrence_with_a_lease() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        let old_created = (real_now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            rusqlite::params![old_created],
+        )
+        .unwrap();
+        tick_planning(&conn, real_now()).unwrap();
+
+        let claimed = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
+        assert!(claimed.is_some());
+
+        // A second claimant finds nothing left to claim.
+        let second = claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now()).unwrap();
+        assert!(second.is_none());
+    }
+
+    #[test]
+    fn recovers_expired_leases_to_failed() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        let old_created = (real_now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            rusqlite::params![old_created],
+        )
+        .unwrap();
+        tick_planning(&conn, real_now()).unwrap();
+        claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
+
+        // Expire the lease by hand, then tick: recovery marks it failed.
+        conn.execute(
+            "UPDATE automation_occurrences SET lease_expires_at = '2020-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
+        let report = tick(&conn, real_now()).unwrap();
+        assert_eq!(report.recovered, 1);
+
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE automation_id = 'daily'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn settles_claimed_work_but_never_planned() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        let old_created = (real_now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            rusqlite::params![old_created],
+        )
+        .unwrap();
+        tick_planning(&conn, real_now()).unwrap();
+
+        let planned: String = conn
+            .query_row(
+                "SELECT id FROM automation_occurrences WHERE automation_id = 'daily'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!settle_occurrence(&conn, &planned, "succeeded", None, real_now()).unwrap());
+
+        claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
+        assert!(settle_occurrence(&conn, &planned, "succeeded", None, real_now()).unwrap());
     }
 
     #[test]

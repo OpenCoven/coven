@@ -9,6 +9,7 @@
 pub mod definition;
 pub mod occurrences;
 pub mod rrule;
+pub mod runs;
 pub mod schedule;
 pub mod store;
 

@@ -112,6 +112,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.update",
                     "coven.automations.delete",
                     "coven.automations.tick",
+                    "coven.automations.runs",
                 ],
             },
             Capability {
@@ -245,6 +246,20 @@ pub fn route_action(payload: Value, conn: &rusqlite::Connection) -> (u16, Contro
             );
             (200, event)
         }
+        "coven.automations.runs" => {
+            let id = required_id_field(&payload, action);
+            let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(20);
+            let event = match id {
+                Ok(id) => automation_event(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_runs_payload(conn, &id, limit),
+                ),
+                Err(error) => return (400, rejected_action(action, error)),
+            };
+            (200, event)
+        }
         _ => (
             400,
             rejected_action(action, format!("unknown action `{action}`")),
@@ -299,13 +314,43 @@ fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
-    match crate::automations::occurrences::tick_planning(conn, now) {
+    match crate::automations::occurrences::tick(conn, now) {
         Ok(report) => json!({
             "planned": report.planned,
             "alreadyFenced": report.already_fenced,
             "pausedSkipped": report.paused_skipped,
+            "recovered": report.recovered,
+            "claimed": report.claimed,
             "failed": report.failed,
         }),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
+}
+
+fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) -> Value {
+    match crate::automations::runs::list_runs(conn, id, limit) {
+        Ok(records) => {
+            let runs: Vec<Value> = records
+                .iter()
+                .map(|record| {
+                    json!({
+                        "id": record.id,
+                        "automationId": record.automation_id,
+                        "occurrenceId": record.occurrence_id,
+                        "sessionId": record.session_id,
+                        "familiarId": record.familiar_id,
+                        "runtime": record.runtime,
+                        "status": record.status,
+                        "exitCode": record.exit_code,
+                        "logJson": record.log_json,
+                        "outputCommit": record.output_commit,
+                        "startedAt": record.started_at,
+                        "finishedAt": record.finished_at,
+                    })
+                })
+                .collect();
+            json!({ "runs": runs })
+        }
         Err(error) => json!({ "error": format!("{error:#}") }),
     }
 }
