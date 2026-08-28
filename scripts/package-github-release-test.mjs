@@ -2013,16 +2013,21 @@ test('release creation never combines --notes-from-tag with --repo', () => {
   //   using `--notes-from-tag` with `--repo` is not supported
   // The unit tests above stub createRelease, so nothing exercised the real
   // argv and the incompatibility shipped. This guards the argv itself.
+  // Match the argv construction rather than raw text: quote style is
+  // incidental, and a bare search for the flag name would also hit the
+  // explanatory comment above createRelease.
+  const pushes = (flag) =>
+    new RegExp(String.raw`args\.push\(\s*['"]` + flag + String.raw`['"]`).test(releaseScriptText);
   assert.ok(
-    releaseScriptText.includes("'--repo'"),
+    /['"]--repo['"]/.test(releaseScriptText),
     'the release client must keep --repo; it cannot assume its cwd is the target repository'
   );
   assert.ok(
-    !releaseScriptText.includes("'--notes-from-tag'"),
+    !pushes('--notes-from-tag'),
     'gh refuses --notes-from-tag alongside --repo; resolve the tag annotation and pass --notes-file instead'
   );
   assert.ok(
-    releaseScriptText.includes("'--notes-file'"),
+    pushes('--notes-file'),
     'release notes must still come from the signed tag annotation, via --notes-file'
   );
 });

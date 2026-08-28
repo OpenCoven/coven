@@ -1354,21 +1354,24 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
     },
     async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
       const args = ['release', 'create', releaseTag, '--repo', repository, '--title', title];
-      let notesPath;
-      if (notesFromTag) {
-        const notes = await this.readTagAnnotation(releaseTag);
-        notesPath = path.join(mkdtempSync(path.join(tmpdir(), 'coven-release-notes-')), 'notes.md');
-        writeFileSync(notesPath, notes.endsWith('\n') ? notes : `${notes}\n`);
-        args.push('--notes-file', notesPath);
-      }
-      if (verifyTag) {
-        args.push('--verify-tag');
-      }
+      // The cleanup guard opens before the directory exists and closes after
+      // gh returns, so a throw from writeFileSync leaves nothing behind either.
+      let notesDir;
       try {
+        if (notesFromTag) {
+          const notes = await this.readTagAnnotation(releaseTag);
+          notesDir = mkdtempSync(path.join(tmpdir(), 'coven-release-notes-'));
+          const notesPath = path.join(notesDir, 'notes.md');
+          writeFileSync(notesPath, notes.endsWith('\n') ? notes : `${notes}\n`);
+          args.push('--notes-file', notesPath);
+        }
+        if (verifyTag) {
+          args.push('--verify-tag');
+        }
         runCommand('gh', args);
       } finally {
-        if (notesPath) {
-          rmSync(path.dirname(notesPath), { recursive: true, force: true });
+        if (notesDir) {
+          rmSync(notesDir, { recursive: true, force: true });
         }
       }
       const release = await this.getReleaseByTag(releaseTag);
