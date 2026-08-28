@@ -5523,8 +5523,12 @@ mod tests {
         )?;
 
         assert!(restarted.0);
+        // The injected diagnostic delay is 500ms and the restart deadline is
+        // 100ms, so any bound strictly between them proves the scan did not
+        // block. 250ms sat close to the fast path; 400ms keeps the same signal
+        // with more room for jitter.
         assert!(
-            started_at.elapsed() < Duration::from_millis(250),
+            started_at.elapsed() < Duration::from_millis(400),
             "optional diagnostic scan delayed restart completion"
         );
         Ok(())

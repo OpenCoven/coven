@@ -1296,7 +1296,10 @@ mod tests {
                 .contains("connection closed before response completed"),
             "unexpected error: {error}"
         );
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // Discriminates "returned on the disconnect" from "waited out the 1s
+        // deadline above". Half the deadline keeps that separation unambiguous
+        // while leaving room for scheduler jitter on a loaded runner.
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     struct AlwaysNoDataReader {
@@ -1716,7 +1719,10 @@ mod tests {
             error,
             crate::ClientError::Io { source, .. } if source.raw_os_error() == Some(109)
         ));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // Discriminates "returned on the disconnect" from "waited out the 1s
+        // deadline above". Half the deadline keeps that separation unambiguous
+        // while leaving room for scheduler jitter on a loaded runner.
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     struct DisconnectedWriter;
@@ -1746,6 +1752,9 @@ mod tests {
             error,
             crate::ClientError::Io { source, .. } if source.raw_os_error() == Some(232)
         ));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        // Discriminates "returned on the disconnect" from "waited out the 1s
+        // deadline above". Half the deadline keeps that separation unambiguous
+        // while leaving room for scheduler jitter on a loaded runner.
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 }

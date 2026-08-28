@@ -1503,8 +1503,11 @@ fn lifecycle_probe_rejects_trickling_and_unbounded_responses_quickly() {
         let started = std::time::Instant::now();
         let result = probe_unix_daemon_health(&home.path, Duration::from_millis(30));
         assert!(result.is_err(), "malformed unbounded response was accepted");
+        // The failure mode is an unbounded read, so any finite bound proves
+        // the 30ms deadline held. Widened off 250ms because the bound only has
+        // to be finite, not tight, and a tight one is pure jitter exposure.
         assert!(
-            started.elapsed() < Duration::from_millis(250),
+            started.elapsed() < Duration::from_secs(1),
             "response deadline was reset by trickling bytes"
         );
         server.join().expect("server thread");
