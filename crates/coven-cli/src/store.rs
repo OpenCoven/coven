@@ -971,6 +971,12 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     migrate_historical_request_adoptions(conn)?;
     ensure_node_registry_dispatch_columns(conn)?;
     ensure_session_external_columns(conn)?;
+    conn.execute_batch(crate::automations::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .context("failed to initialize automation_definitions schema")?;
+    conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .context("failed to initialize automation_occurrences schema")?;
+    conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
+        .context("failed to initialize automation_runs schema")?;
 
     backfill_events_fts_if_needed(conn)?;
 

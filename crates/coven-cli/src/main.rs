@@ -37,6 +37,7 @@ mod execution_binding;
 mod request_adoption;
 #[allow(dead_code)]
 mod adoption_gate;
+mod automations;
 mod executor_node;
 mod familiar_identity;
 mod handoff;

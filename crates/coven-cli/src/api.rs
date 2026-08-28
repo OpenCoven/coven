@@ -565,7 +565,19 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
-            let (status, response) = control_plane::route_action(payload);
+            let conn = match store::open_store(&store_path(coven_home)) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    return json_response(
+                        500,
+                        &control_plane::rejected_action(
+                            "(unknown)",
+                            format!("store unavailable: {error:#}"),
+                        ),
+                    );
+                }
+            };
+            let (status, response) = control_plane::route_action(payload, &conn, runtime);
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),
@@ -10616,6 +10628,221 @@ mod tests {
         assert!(response.body.contains(r#""kind":"capabilities.refreshed""#));
         assert!(response.body.contains(r#""origin":"external-client""#));
         assert!(response.body.contains(r#""intentId":"intent-1""#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_manage_routine_definitions_end_to_end() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let create_body = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Daily notes",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "familiarId": "charm",
+                "prompt": "Write the daily reflection."
+            }
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""routine":"#));
+        assert!(response.body.contains(r#""id":"daily-notes""#));
+
+        let list_body = json!({ "action": "coven.automations.list" }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&list_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""routines":[{"#));
+
+        let get_body = json!({
+            "action": "coven.automations.get",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&get_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""name":"Daily notes""#));
+
+        let update_body = json!({
+            "action": "coven.automations.update",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Daily notes (renamed)",
+                "status": "ACTIVE",
+                "rrule": "FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=8,17",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 60,
+                "runtime": "coven-code",
+                "prompt": "Write the weekly reflection."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&update_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""name":"Daily notes (renamed)""#));
+        assert!(response.body.contains(r#""status":"ACTIVE""#));
+
+        let delete_body = json!({
+            "action": "coven.automations.delete",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&delete_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""deleted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_action_runs_a_routine_through_the_ledger() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Daily notes",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "familiarId": "charm",
+                "prompt": "Write the daily reflection."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&run_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(
+            response.body.contains(r#""status":"succeeded""#),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains(r#""sessionId":"session-"#),
+            "{}",
+            response.body
+        );
+
+        let runs_body = json!({
+            "action": "coven.automations.runs",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&runs_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""runs":[{""#), "{}", response.body);
+        assert!(
+            response.body.contains(r#""status":"succeeded""#),
+            "{}",
+            response.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_reject_invalid_routine_definitions() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let body = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "bad schedule!",
+                "name": "Bad",
+                "status": "PAUSED",
+                "rrule": "FREQ=HOURLY",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Never runs."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains("coven.automations.create"));
         Ok(())
     }
 
