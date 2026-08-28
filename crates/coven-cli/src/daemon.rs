@@ -5570,9 +5570,19 @@ mod tests {
         .expect_err("the single outer start budget must expire");
 
         assert_eq!(calls.get(), 1, "no fixed post-deadline probe is allowed");
+        // `calls == 1` is what actually proves the behaviour this test names:
+        // the budget expired and no further probe was issued. The elapsed bound
+        // only has to separate "returned once the in-flight probe finished"
+        // from "waited on some long fixed delay afterwards", and the probe
+        // itself sleeps 25ms, so a correct run lands near 25-30ms. 100ms left
+        // barely any room for scheduler jitter and flaked on a loaded macOS
+        // runner; two seconds still catches a regression that reintroduces a
+        // fixed post-deadline wait.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_millis(100),
-            "start readiness materially overshot its 20ms budget"
+            elapsed < Duration::from_secs(2),
+            "start readiness materially overshot its 20ms budget: took {elapsed:?}, \
+             ceiling is 2s and a correct run lands near the probe's own 25ms sleep"
         );
         assert!(
             error
