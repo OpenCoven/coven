@@ -12,6 +12,16 @@
 //! forwarded*, not about what a struct declares. No network, no provider
 //! accounts, no installed CLIs.
 
+//! Unix-only: the fake harnesses are `#!/bin/sh` scripts made executable via
+//! the Unix permission bits, and Windows resolves harness executables through
+//! `.cmd` shims instead. What these tests exercise -- the flag translation in
+//! `built_in_harness_specs` -- is platform-independent, so Unix coverage does
+//! prove the contract itself. Windows-specific *executable resolution* is
+//! covered separately by `windows_daemon_lifecycle.rs` and by the Windows leg
+//! of the npm onboarding smoke. Extending these fakes to `.cmd` so parity runs
+//! on all three platforms is tracked as follow-up work.
+#![cfg(unix)]
+
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
