@@ -104,6 +104,19 @@ function gitCommitArgs(layout) {
   ];
 }
 
+// `coven setup` is the one journey step expected to exit nonzero, so the
+// scripted runner has to pin its options too: without `allowedExitCodes: [1]`
+// the real journey aborts on the fail-closed path it is meant to assert.
+function assertSetupStepOptions(options, layout) {
+  assert.deepEqual(options.allowedExitCodes, [1]);
+  assert.equal(options.cwd, layout.projectRoot);
+  assert.equal(options.env.COVEN_HOME, layout.covenHome);
+  assert.ok(
+    options.env.PATH.split(path.delimiter).includes(layout.fixtureBinDir),
+    'setup must run with the fake harness on PATH'
+  );
+}
+
 function createScriptedRunner(script) {
   const queue = [...script];
   const calls = [];
@@ -548,6 +561,9 @@ test('runPackagedUserJourney sequences installed-wrapper commands and full lifec
         method: 'runCapture',
         command: wrapperBin,
         args: ['setup', 'codex'],
+        assertOptions(options) {
+          assertSetupStepOptions(options, layout);
+        },
         result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
       },
       {
@@ -835,6 +851,9 @@ test('runPackagedUserJourney attempts bounded daemon stop after start failure', 
         method: 'runCapture',
         command: wrapperBin,
         args: ['setup', 'codex'],
+        assertOptions(options) {
+          assertSetupStepOptions(options, layout);
+        },
         result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
       },
       {
@@ -966,6 +985,9 @@ test('runPackagedUserJourney stops the daemon and removes scratch after mid-jour
         method: 'runCapture',
         command: wrapperBin,
         args: ['setup', 'codex'],
+        assertOptions(options) {
+          assertSetupStepOptions(options, layout);
+        },
         result: makeResult({ status: 1, stdout: 'Codex: non_tty\n' })
       },
       {
