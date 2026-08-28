@@ -110,6 +110,10 @@ fn doctor_json_is_stable_redacted_and_stdout_pure() -> anyhow::Result<()> {
     assert_eq!(
         check_ids,
         vec![
+            // First on purpose: if a shadowed install is answering, every
+            // check below it describes a different binary than the operator
+            // thinks they are running.
+            "install:conflicts",
             "daemon",
             "repo:alias_a",
             "repo:alias_b",
