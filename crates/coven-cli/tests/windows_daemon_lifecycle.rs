@@ -131,7 +131,15 @@ fn captured_output_with_timeout(
     command: &mut Command,
     coven_home: &Path,
 ) -> Result<Output> {
-    const LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+    // A hang guard, not a promptness contract. Nothing here asserts how fast
+    // the launcher starts -- the two-second budget this suite enforces is on
+    // `daemon stop`, not on start. This bound exists only so a wedged
+    // node.exe -> npm wrapper -> coven.exe chain fails with a diagnosable
+    // message instead of hanging until the CI job is killed, so it must sit
+    // far above anything ordinary runner load can produce. Fifteen seconds
+    // did not: it flaked on windows-latest against Rust code identical to a
+    // passing run.
+    const LAUNCHER_EXIT_TIMEOUT: Duration = Duration::from_secs(120);
     const CAPTURE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
     const LAUNCHER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -181,7 +189,10 @@ fn captured_output_with_timeout(
                 terminate_recorded_daemon(coven_home);
                 launcher.terminate();
                 let _ = result_rx.recv_timeout(CAPTURE_CLOSE_TIMEOUT);
-                anyhow::bail!("{label} launcher did not exit within fifteen seconds")
+                anyhow::bail!(
+                    "{label} launcher did not exit within {}s; this is a hang guard, so treat it as a wedged launcher rather than a slow runner",
+                    LAUNCHER_EXIT_TIMEOUT.as_secs()
+                )
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
@@ -682,7 +693,10 @@ fn abrupt_daemon_stop_kills_live_piped_descendants() -> Result<()> {
         .env("PATH", &path)
         .output()?;
     assert_success("abrupt Windows daemon stop with descendant", &stop);
-    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Windows daemon stop exceeded its documented two-second contract"
+    );
     wait_until("Windows daemon descendant termination", || {
         Ok(!process_is_alive(descendant_pid))
     })?;
