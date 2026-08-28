@@ -33,6 +33,11 @@ const OIDC_ENV = {
   ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.githubusercontent.com/'
 };
 
+/// A version npm can never accept a publish for, so a dry run in a test can
+/// never collide with a real release. Any real version number here passes only
+/// until that version ships.
+const UNPUBLISHABLE_VERSION = '999.0.0';
+
 test('release staging removes stale generated npm output before regeneration', () => {
   const fixture = mkdtempSync(path.join(tmpdir(), 'coven-stale-dist-'));
   try {
@@ -77,20 +82,26 @@ test('wrapper dry-run cannot reuse a stale generated package version', () => {
     );
     writeFileSync(path.join(fixture, 'npm', 'dist', 'stale-platform.txt'), 'stale\n');
 
+    // This reaches a real `npm publish --dry-run`, and npm refuses to publish
+    // over an existing version. A real release number is therefore a time bomb:
+    // it passes until that version ships, then fails forever. v0.4.1 was
+    // hardcoded here and broke every onboarding smoke on main the moment
+    // v0.4.1 was published. Use the same unpublishable sentinel that
+    // test-cli-prepublish.mjs uses for its dry runs.
     const result = spawnSync(
       process.execPath,
       [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
       {
         encoding: 'utf8',
         cwd: fixture,
-        env: { ...process.env, COVEN_NPM_VERSION: '0.4.1' }
+        env: { ...process.env, COVEN_NPM_VERSION: UNPUBLISHABLE_VERSION }
       }
     );
 
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       JSON.parse(readFileSync(stalePackage, 'utf8')).version,
-      '0.4.1',
+      UNPUBLISHABLE_VERSION,
       'generated package must be restamped from the release version'
     );
     assert.equal(
@@ -468,7 +479,7 @@ test('publish path fails closed on a wrapper dependency npm cannot install', () 
     const result = spawnSync(
       process.execPath,
       [path.join(fixture, 'scripts', 'publish-npm.mjs'), '--wrapper-only', '--dry-run'],
-      { encoding: 'utf8', cwd: fixture, env: { ...process.env, COVEN_NPM_VERSION: '0.4.1' } }
+      { encoding: 'utf8', cwd: fixture, env: { ...process.env, COVEN_NPM_VERSION: UNPUBLISHABLE_VERSION } }
     );
     assert.notEqual(result.status, 0, 'publish must fail closed on a git dependency');
     assert.match(
