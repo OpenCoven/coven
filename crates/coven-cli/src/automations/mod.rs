@@ -7,7 +7,9 @@
 //! seams.
 
 pub mod definition;
+pub mod occurrences;
 pub mod rrule;
+pub mod schedule;
 pub mod store;
 
 pub use definition::RoutineDefinition;

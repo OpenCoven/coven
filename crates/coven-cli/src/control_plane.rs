@@ -111,6 +111,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.create",
                     "coven.automations.update",
                     "coven.automations.delete",
+                    "coven.automations.tick",
                 ],
             },
             Capability {
@@ -234,6 +235,16 @@ pub fn route_action(payload: Value, conn: &rusqlite::Connection) -> (u16, Contro
             };
             (200, event)
         }
+        "coven.automations.tick" => {
+            let now = chrono::Utc::now();
+            let event = automation_event(
+                action,
+                origin,
+                intent_id,
+                automation_tick_payload(conn, now),
+            );
+            (200, event)
+        }
         _ => (
             400,
             rejected_action(action, format!("unknown action `{action}`")),
@@ -282,6 +293,21 @@ fn required_definition_field(
     };
     crate::automations::RoutineDefinition::from_json(definition)
         .map_err(|error| format!("{action}: {error}"))
+}
+
+fn automation_tick_payload(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    match crate::automations::occurrences::tick_planning(conn, now) {
+        Ok(report) => json!({
+            "planned": report.planned,
+            "alreadyFenced": report.already_fenced,
+            "pausedSkipped": report.paused_skipped,
+            "failed": report.failed,
+        }),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
 }
 
 fn automation_list_payload(conn: &rusqlite::Connection) -> Value {

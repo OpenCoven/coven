@@ -973,6 +973,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     ensure_session_external_columns(conn)?;
     conn.execute_batch(crate::automations::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
         .context("failed to initialize automation_definitions schema")?;
+    conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .context("failed to initialize automation_occurrences schema")?;
 
     backfill_events_fts_if_needed(conn)?;
 
