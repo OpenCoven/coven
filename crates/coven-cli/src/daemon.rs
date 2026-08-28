@@ -5578,9 +5578,11 @@ mod tests {
         // barely any room for scheduler jitter and flaked on a loaded macOS
         // runner; two seconds still catches a regression that reintroduces a
         // fixed post-deadline wait.
+        let elapsed = started.elapsed();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "start readiness materially overshot its 20ms budget"
+            elapsed < Duration::from_secs(2),
+            "start readiness materially overshot its 20ms budget: took {elapsed:?}, \
+             ceiling is 2s and a correct run lands near the probe's own 25ms sleep"
         );
         assert!(
             error
