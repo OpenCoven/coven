@@ -2,7 +2,8 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
@@ -1328,15 +1329,48 @@ function createGhReleaseClient({ repository = process.env.GITHUB_REPOSITORY } = 
       }
       return JSON.parse(result.stdout);
     },
+    /// Read the annotated tag's message through the API rather than asking
+    /// `gh release create --notes-from-tag` to do it. Recent `gh` refuses
+    /// `--notes-from-tag` together with `--repo` ("using `--notes-from-tag`
+    /// with `--repo` is not supported"), which silently became a release
+    /// blocker: v0.4.1 published to npm and then failed to produce any GitHub
+    /// Release. Dropping `--repo` is not an option -- this script does not
+    /// assume its cwd is the target repository -- so the notes are resolved
+    /// here and passed as a file instead.
+    async readTagAnnotation(releaseTag) {
+      const refEndpoint = `/repos/${repository}/git/ref/tags/${encodeURIComponent(releaseTag)}`;
+      const ref = JSON.parse(runCommand('gh', ['api', refEndpoint]));
+      if (ref?.object?.type !== 'tag') {
+        throw new Error(
+          `Refusing GitHub release: ${releaseTag} is not an annotated tag (object type ${ref?.object?.type ?? 'unknown'}).`
+        );
+      }
+      const tagEndpoint = `/repos/${repository}/git/tags/${encodeURIComponent(ref.object.sha)}`;
+      const message = JSON.parse(runCommand('gh', ['api', tagEndpoint]))?.message;
+      if (typeof message !== 'string' || message.trim().length === 0) {
+        throw new Error(`Refusing GitHub release: ${releaseTag} has an empty tag annotation.`);
+      }
+      return message;
+    },
     async createRelease({ releaseTag, title, notesFromTag, verifyTag }) {
       const args = ['release', 'create', releaseTag, '--repo', repository, '--title', title];
+      let notesPath;
       if (notesFromTag) {
-        args.push('--notes-from-tag');
+        const notes = await this.readTagAnnotation(releaseTag);
+        notesPath = path.join(mkdtempSync(path.join(tmpdir(), 'coven-release-notes-')), 'notes.md');
+        writeFileSync(notesPath, notes.endsWith('\n') ? notes : `${notes}\n`);
+        args.push('--notes-file', notesPath);
       }
       if (verifyTag) {
         args.push('--verify-tag');
       }
-      runCommand('gh', args);
+      try {
+        runCommand('gh', args);
+      } finally {
+        if (notesPath) {
+          rmSync(path.dirname(notesPath), { recursive: true, force: true });
+        }
+      }
       const release = await this.getReleaseByTag(releaseTag);
       if (!release) {
         throw new Error(`GitHub release ${releaseTag} was created but could not be reloaded.`);
