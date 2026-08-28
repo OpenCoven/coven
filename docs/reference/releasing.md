@@ -89,15 +89,20 @@ against the exact commit you intend to tag. Each report is a one-provider
 artifact and the destination must not already exist:
 
 ```sh
+mkdir -p cert
 coven setup codex   --verify-only --report-json cert/codex.json
 coven setup claude  --verify-only --report-json cert/claude.json
 coven setup copilot --verify-only --report-json cert/copilot.json
 ```
 
+Create the destination directory first: publication is fail-if-exists on the
+report file itself, but Coven does not create parent directories, so a missing
+`cert/` fails the command.
+
 Verification requires an interactive terminal and explicit network/cost
 consent, so this cannot run in CI — it is an operator step on a machine with
-all three providers authenticated. A non-interactive shell reports `non_tty`
-and publishes nothing.
+all three providers authenticated. Run non-interactively, the command exits
+nonzero and writes no report.
 
 Each report must show `"completed": true` and a `candidate_commit` equal to the
 commit being tagged:
@@ -178,6 +183,22 @@ gh release download vX.Y.Z --repo OpenCoven/coven --dir release-check
 cd release-check && shasum -a 256 -c SHA256SUMS
 ```
 
+`shasum -c` is macOS / Linux. On Windows PowerShell, compare hashes against the
+same file explicitly:
+
+```powershell
+gh release download vX.Y.Z --repo OpenCoven/coven --dir release-check
+cd release-check
+Get-Content SHA256SUMS | ForEach-Object {
+  $expected, $name = $_ -split '\s+', 2
+  $actual = (Get-FileHash -Algorithm SHA256 $name.Trim()).Hash.ToLower()
+  "$name $(if ($actual -eq $expected) { 'OK' } else { "FAILED ($actual)" })"
+}
+```
+
+All four archives must report `OK`. This is the one checksum surface, so a
+single mismatch fails the release regardless of what npm reports.
+
 ### Verify a fresh consumer install
 
 The dry-run and packed smoke prove the artifacts *build*; only a real install
@@ -188,21 +209,35 @@ and make a broken release look fine:
 
 ```sh
 npm install -g @opencoven/cli@X.Y.Z
-which -a coven          # must resolve to exactly one path
 coven --version         # must print X.Y.Z
 coven doctor            # exits 1 with setup guidance on a bare machine
 ```
 
-`which -a coven` returning more than one path means you are not testing the
-version you just installed. Resolve that before trusting any other result here.
+Confirm the `coven` you just ran is the only one on `PATH`. More than one
+result means you are not testing the version you installed, and you must
+resolve that before trusting any other result in this section:
 
-Verify the install is provenance-backed and pulled only the canonical five
-packages:
+```sh
+which -a coven                     # macOS / Linux
+```
+
+```powershell
+Get-Command coven -All             # Windows PowerShell
+```
+
+Verify the install is provenance-backed and resolved to the expected packages:
 
 ```sh
 npm audit signatures
 npm ls -g --depth 1 @opencoven/cli
 ```
+
+Expect exactly two entries: the `@opencoven/cli` wrapper and the one native
+package matching the current platform (for example `@opencoven/cli-macos` on
+Apple silicon), both at `X.Y.Z`. A native package for a *different* platform, a
+version mismatch between wrapper and native, or a missing native package are
+each a failed release — not a cosmetic difference. All five packages are never
+installed together on one machine; they are selected per platform.
 
 Repeat on each platform you can reach. The `npm-onboarding` CI matrix covers
 packed tarballs on all four targets, but it never installs from the public
