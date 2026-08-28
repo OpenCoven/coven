@@ -2342,6 +2342,26 @@ fn print_doctor_line(value: impl AsRef<str>) {
 
 fn print_doctor_prose(report: &DoctorReport) {
     println!("Coven doctor");
+    // Surfaced before anything else: if a shadowed install is answering, every
+    // line below describes a different binary than the operator believes they
+    // are running. Prose keeps the concrete paths -- the operator needs to know
+    // which file to remove -- unlike the JSON report, which redacts them.
+    let installations = install_conflict::current_installations("coven");
+    if installations.len() > 1 {
+        println!("\nInstalls:");
+        for (index, installation) in installations.iter().enumerate() {
+            let marker = if index == 0 { "OK" } else { "!!" };
+            let role = if index == 0 { "active" } else { "shadowed" };
+            print_doctor_line(format!(
+                "  [{marker}] {} ({role})",
+                installation.path.display()
+            ));
+        }
+        print_doctor_line(
+            "  The first entry wins. Remove the others or reorder PATH, then re-check with `coven --version`."
+                .to_string(),
+        );
+    }
     print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
         Some(root) => print_doctor_line(format!("Project: {}", root.display())),
@@ -2619,12 +2639,16 @@ fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     // to be visible. Paths stay concrete here because the whole point is to
     // tell the operator which file to remove.
     let installations = install_conflict::current_installations("coven");
-    if let Some(report_line) = install_conflict::conflict_report(&installations) {
+    if installations.len() > 1 {
+        // Deliberately path-free. Doctor JSON is routinely attached to bug
+        // reports and CI logs, and DoctorJsonPathRedactor exists to keep user
+        // and project directory names out of it. The concrete paths an operator
+        // needs are printed by the prose report instead.
         checks.push(DoctorCheck::warn(
             "install:conflicts",
-            format!("{} coven executables on PATH: {report_line}", installations.len()),
+            format!("{} coven executables on PATH", installations.len()),
             Some(
-                "the first entry wins; remove the others or reorder PATH, then re-check with `coven --version`"
+                "run `coven doctor` for the paths; the first entry wins, so remove the others or reorder PATH"
                     .to_string(),
             ),
         ));
