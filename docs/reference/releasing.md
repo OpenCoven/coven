@@ -82,7 +82,49 @@ You can leave the `npm-publish` environment itself in place or remove it — the
    ```
 4. Confirm the changelog and any README / brand updates have already landed on `main`.
 
+### Certification packet
+
+Produce the redacted certification report for every supported built-in harness
+against the exact commit you intend to tag. Each report is a one-provider
+artifact and the destination must not already exist:
+
+```sh
+coven setup codex   --verify-only --report-json cert/codex.json
+coven setup claude  --verify-only --report-json cert/claude.json
+coven setup copilot --verify-only --report-json cert/copilot.json
+```
+
+Verification requires an interactive terminal and explicit network/cost
+consent, so this cannot run in CI — it is an operator step on a machine with
+all three providers authenticated. A non-interactive shell reports `non_tty`
+and publishes nothing.
+
+Each report must show `"completed": true` and a `candidate_commit` equal to the
+commit being tagged:
+
+```sh
+jq -r '"\(.harness) \(.completed) \(.candidate_commit)"' cert/*.json
+```
+
+`candidate_commit` is baked into the binary at build time, so a report whose
+value does not match the release commit was produced by a different build and
+does not certify this release. Reports are success-only and published
+atomically; if verification fails, no file appears and the CLI exits nonzero.
+
+Keep the packet with the release record. It contains only `harness`,
+`cli_version`, `platform`, `candidate_commit`, `duration`, `exit_class`, and
+`completed` — no output, account data, tokens, or private paths — so it is safe
+to retain and share.
+
 ### Tag and push
+
+Release tags are **immutable**. A pushed release tag is never moved, deleted,
+recreated, or reused for different content, and a version that has been
+published to npm is never republished. Every recovery path in this document
+bumps forward to a new version instead. This is not a style preference: the
+tag is the object that the npm provenance attestation, the GitHub Release, and
+the certification packet all attest to, so moving it silently invalidates all
+three.
 
 The tag must be **annotated and cryptographically signed**. Lightweight tags (`git tag vX.Y.Z`) are refused by the workflow.
 
@@ -127,6 +169,60 @@ The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using t
 - `SHA256SUMS`
 
 `SHA256SUMS` contains exactly four lexically ordered entries naming only those four archive filenames. The GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
+
+Download the published assets and verify the checksums actually match, rather
+than trusting that the file exists:
+
+```sh
+gh release download vX.Y.Z --repo OpenCoven/coven --dir release-check
+cd release-check && shasum -a 256 -c SHA256SUMS
+```
+
+### Verify a fresh consumer install
+
+The dry-run and packed smoke prove the artifacts *build*; only a real install
+from the registry proves what a user actually gets. Do this in an environment
+that has never had Coven installed — a container, a fresh VM, or a throwaway
+user account — because a stale global install on `PATH` will shadow the new one
+and make a broken release look fine:
+
+```sh
+npm install -g @opencoven/cli@X.Y.Z
+which -a coven          # must resolve to exactly one path
+coven --version         # must print X.Y.Z
+coven doctor            # exits 1 with setup guidance on a bare machine
+```
+
+`which -a coven` returning more than one path means you are not testing the
+version you just installed. Resolve that before trusting any other result here.
+
+Verify the install is provenance-backed and pulled only the canonical five
+packages:
+
+```sh
+npm audit signatures
+npm ls -g --depth 1 @opencoven/cli
+```
+
+Repeat on each platform you can reach. The `npm-onboarding` CI matrix covers
+packed tarballs on all four targets, but it never installs from the public
+registry, so this step is the only check of the real dist-tag resolution and
+optional-dependency selection a user experiences.
+
+### Confirm the certification packet
+
+Re-check the preflight certification reports against what actually shipped:
+
+```sh
+jq -r '"\(.harness) \(.cli_version) \(.completed) \(.candidate_commit)"' cert/*.json
+git rev-list -n 1 vX.Y.Z
+```
+
+Every report's `candidate_commit` must equal the commit the tag resolves to,
+and every `completed` must be `true`. A mismatch means the packet certifies a
+different build than the one published, and the packet must be regenerated
+against the released commit before the release is considered closed out. File
+the reports with the release record alongside the checksum verification above.
 
 ### Recover GitHub Release assets without touching npm
 
