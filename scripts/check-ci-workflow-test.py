@@ -32,6 +32,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'rust-lint-linux',
             'rust-test-linux',
             'rust-test-windows',
+            'rust-test-macos',
             'afs-mount-linux',
             'afs-mount-macos',
         ]:
