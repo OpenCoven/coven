@@ -166,6 +166,32 @@ jobs:
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
 
+  # macOS runners bill at roughly ten times the Linux rate, so this follows the
+  # npm-onboarding split: a cheap matrix on pull requests, the full one on main.
+  # Gated on `rust` as well as the event so a docs-only merge does not spend a
+  # macOS runner. Before this existed the macOS workspace suite had no CI job at
+  # all -- only AFS mount coverage -- so that leg of the release reliability gate
+  # depended on an operator remembering to run it locally.
+  rust-test-macos:
+    name: Rust tests (macOS)
+    needs: changes
+    if: ${{ github.event_name == 'push' && needs.changes.outputs.rust == 'true' }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rust-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-rust-test-
+      - run: cargo test --workspace --locked
+
   afs-mount-linux:
     name: AFS mount backend (Linux)
     needs: changes
@@ -463,6 +489,7 @@ jobs:
       - rust-lint-linux
       - rust-test-linux
       - rust-test-windows
+      - rust-test-macos
       - afs-mount-linux
       - afs-mount-macos
       - performance-baseline
