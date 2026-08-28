@@ -88,21 +88,7 @@ pub fn run_routine_now(
     )
     .map_err(|error| format!("failed to record run start: {error:#}"))?;
 
-    let launch = SessionLaunch {
-        id: fresh_id("session"),
-        project_root: cwd.to_string(),
-        cwd: cwd.to_string(),
-        harness: definition.runtime.clone(),
-        model: definition.model.clone(),
-        launch_mode: HarnessLaunchMode::NonInteractive,
-        launch_policy: None,
-        prompt: definition.prompt.clone(),
-        title: definition.name.clone(),
-        conversation: None,
-        conversation_id: None,
-        familiar_id: definition.familiar_id.clone(),
-        caller_familiar_id: None,
-    };
+    let launch = build_session_launch(definition, cwd)?;
 
     match runtime.launch_session(&launch) {
         Ok(()) => {
@@ -149,6 +135,143 @@ pub fn run_routine_now(
             })
         }
     }
+}
+
+/// Builds the shared SessionLaunch for a routine run. Every run — manual or
+/// scheduled — dispatches through this exact launch shape.
+pub fn build_session_launch(
+    definition: &RoutineDefinition,
+    cwd: &str,
+) -> Result<SessionLaunch, String> {
+    Ok(SessionLaunch {
+        id: fresh_id("session"),
+        project_root: cwd.to_string(),
+        cwd: cwd.to_string(),
+        harness: definition.runtime.clone(),
+        model: definition.model.clone(),
+        launch_mode: HarnessLaunchMode::NonInteractive,
+        launch_policy: None,
+        prompt: definition.prompt.clone(),
+        title: definition.name.clone(),
+        conversation: None,
+        conversation_id: None,
+        familiar_id: definition.familiar_id.clone(),
+        caller_familiar_id: None,
+    })
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DispatchReport {
+    pub dispatched: Vec<String>,
+    pub failed: Vec<String>,
+}
+
+/// Dispatches every claimed occurrence that the scheduler has fenced: builds
+/// the launch, records the ledger row, launches through the shared runtime
+/// path, and settles occurrence + ledger together. Claimed occurrences whose
+/// routine has no cwd fail with a recorded reason instead of guessing a
+/// project.
+pub fn dispatch_claimed_occurrences(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+) -> Result<DispatchReport, String> {
+    let mut report = DispatchReport::default();
+
+    let claimed: Vec<(String, String)> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, automation_id FROM automation_occurrences
+                 WHERE state = 'claimed' ORDER BY scheduled_for ASC",
+            )
+            .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|error| format!("failed to read claim: {error}"))?);
+        }
+        out
+    };
+
+    for (occurrence_id, automation_id) in claimed {
+        let Some(definition) = load_definition_for_run(conn, &automation_id)? else {
+            let reason = format!("routine `{automation_id}` vanished during dispatch");
+            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
+            report.failed.push(reason);
+            continue;
+        };
+
+        let Some(cwd) = definition
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|cwd| !cwd.is_empty())
+        else {
+            let reason = format!("{automation_id}: routine has no cwd; add a cwd before running");
+            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
+            report.failed.push(reason);
+            continue;
+        };
+
+        let run_id = fresh_id("run");
+        let started = record_run_start(
+            conn,
+            &run_id,
+            &automation_id,
+            Some(&occurrence_id),
+            definition.familiar_id.as_deref(),
+            &definition.runtime,
+            now,
+        );
+        if let Err(error) = started {
+            report.failed.push(format!("{automation_id}: {error:#}"));
+            continue;
+        }
+
+        match build_session_launch(&definition, cwd).and_then(|launch| {
+            runtime
+                .launch_session(&launch)
+                .map(|()| launch)
+                .map_err(|error| format!("{error:#}"))
+        }) {
+            Ok(launch) => {
+                let _ = settle_occurrence(conn, &occurrence_id, "succeeded", None, now);
+                let _ = record_run_finish(
+                    conn,
+                    &run_id,
+                    RunFinish {
+                        status: "succeeded",
+                        exit_code: Some(0),
+                        session_id: Some(launch.id),
+                        log_json: None,
+                        output_commit: None,
+                    },
+                    now,
+                );
+                report.dispatched.push(run_id);
+            }
+            Err(reason) => {
+                let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
+                let _ = record_run_finish(
+                    conn,
+                    &run_id,
+                    RunFinish {
+                        status: "failed",
+                        exit_code: None,
+                        session_id: None,
+                        log_json: None,
+                        output_commit: None,
+                    },
+                    now,
+                );
+                report.failed.push(format!("{automation_id}: {reason}"));
+            }
+        }
+    }
+
+    Ok(report)
 }
 
 /// Reads and validates a stored definition for dispatch.
