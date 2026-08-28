@@ -42,6 +42,12 @@ jobs:
       - name: Install native link dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+      # Build the test binaries outside the timed loop. The stress harness
+      # applies --command-timeout-ms per cargo invocation, so on a cold cache
+      # the first surface spends its whole budget compiling and times out
+      # without ever running the test it is meant to bound.
+      - name: Warm the test build
+        run: cargo test --workspace --locked --no-run
       - name: Run bounded release stress
         timeout-minutes: 42
         run: node scripts/release-stress.mjs --suite unix --iterations 10 --command-timeout-ms 180000 --log "release-stress-${RUNNER_OS}.log"
@@ -72,6 +78,11 @@ jobs:
           key: ${{ runner.os }}-release-stress-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-release-stress-
+      # See the unix job: the per-command timeout must bound the test, not a
+      # cold compile. Windows is where this actually bit -- the first surface
+      # hit 180s while still downloading and compiling dependencies.
+      - name: Warm the test build
+        run: cargo test --workspace --locked --no-run
       - name: Run bounded release stress
         timeout-minutes: 42
         run: node scripts/release-stress.mjs --suite windows --iterations 10 --command-timeout-ms 180000 --log "release-stress-${env:RUNNER_OS}.log"
