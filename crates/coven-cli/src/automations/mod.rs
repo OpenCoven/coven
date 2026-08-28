@@ -8,6 +8,7 @@
 
 pub mod daemon_tick;
 pub mod definition;
+pub mod health;
 pub mod import_legacy;
 pub mod occurrences;
 pub mod rrule;

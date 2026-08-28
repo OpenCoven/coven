@@ -115,6 +115,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.runs",
                     "coven.automations.run",
                     "coven.automations.import",
+                    "coven.automations.health",
                 ],
             },
             Capability {
@@ -266,6 +267,20 @@ pub fn route_action(
             };
             (200, event)
         }
+        "coven.automations.health" => {
+            let id = required_id_field(&payload, action);
+            let now = chrono::Utc::now();
+            let event = match id {
+                Ok(id) => automation_event(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_health_payload(conn, &id, now),
+                ),
+                Err(error) => return (400, rejected_action(action, error)),
+            };
+            (200, event)
+        }
         "coven.automations.import" => {
             let event =
                 automation_event(action, origin, intent_id, automation_import_payload(conn));
@@ -347,6 +362,29 @@ fn automation_tick_payload(
             "recovered": report.recovered,
             "claimed": report.claimed,
             "failed": report.failed,
+        }),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
+}
+
+fn automation_health_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Value {
+    match crate::automations::health::routine_health(conn, id, now) {
+        Ok(health) => json!({
+            "health": {
+                "automationId": health.automation_id,
+                "nextDueAt": health.next_due_at,
+                "lastPlannedAt": health.last_planned_at,
+                "lastStartedAt": health.last_started_at,
+                "lastSuccessAt": health.last_success_at,
+                "consecutiveFailures": health.consecutive_failures,
+                "leaseOwner": health.lease_owner,
+                "leaseExpiresAt": health.lease_expires_at,
+                "staleReason": health.stale_reason,
+            }
         }),
         Err(error) => json!({ "error": format!("{error:#}") }),
     }
