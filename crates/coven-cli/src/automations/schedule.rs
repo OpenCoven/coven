@@ -5,9 +5,7 @@
 //! The planner in `occurrences.rs` walks this function forward to find the
 //! latest due slot for misfire-latest semantics.
 
-use chrono::{
-    DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday,
-};
+use chrono::{DateTime, Datelike, Duration, Local, LocalResult, NaiveDate, TimeZone, Utc, Weekday};
 
 use super::definition::RoutineTimezone;
 use super::rrule::{parse_rrule, ParsedRrule, RruleFrequency};
