@@ -109,8 +109,17 @@ pub fn installations_on_path(
                 continue;
             }
             // PATH routinely repeats directories; a repeat is not a second
-            // install.
-            if found.iter().any(|existing| existing.path == candidate) {
+            // install. On Windows the comparison must be case-insensitive:
+            // C:\\Tools and C:\\tools are the same directory, so a PATH listing
+            // both would otherwise report one file as two competing installs.
+            let already_found = found.iter().any(|existing| match platform {
+                Platform::Windows => existing
+                    .path
+                    .as_os_str()
+                    .eq_ignore_ascii_case(candidate.as_os_str()),
+                Platform::Unix => existing.path == candidate,
+            });
+            if already_found {
                 continue;
             }
             found.push(Installation {
@@ -272,6 +281,45 @@ mod tests {
             &probe(vec![at("/usr/bin", "coven")]),
         );
         assert_eq!(rendered(&found), vec![at("/usr/bin", "coven")]);
+    }
+
+    #[test]
+    fn windows_treats_a_case_differing_repeat_as_one_install() {
+        // Windows PATH lookups are case-insensitive, so C:/Tools and C:/tools
+        // name the same directory. A case-sensitive de-dupe would report one
+        // file as two competing installs and send an operator hunting for a
+        // second copy that does not exist.
+        let exe = at("C:/tools", "coven.exe");
+        let found = installations_on_path(
+            "coven",
+            Some("C:/Tools;C:/tools"),
+            Some(".EXE"),
+            Platform::Windows,
+            &windows_probe(vec![exe]),
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "same directory in two spellings is one install"
+        );
+        assert_eq!(conflict_report(&found), None);
+    }
+
+    #[test]
+    fn unix_treats_a_case_differing_repeat_as_two_installs() {
+        // Unix filesystems are case-sensitive, so /Opt/bin and /opt/bin really
+        // are different directories and both count.
+        let upper = at("/Opt/bin", "coven");
+        let lower = at("/opt/bin", "coven");
+        let found = installations_on_path(
+            "coven",
+            Some("/Opt/bin:/opt/bin"),
+            None,
+            Platform::Unix,
+            &probe(vec![upper.clone(), lower.clone()]),
+        );
+        assert_eq!(rendered(&found), vec![upper, lower]);
+        assert!(conflict_report(&found).is_some());
     }
 
     #[test]
