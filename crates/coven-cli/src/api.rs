@@ -1022,7 +1022,7 @@ fn normalize_api_route(route: &str) -> ApiRoute<'_> {
     ApiRoute::Route(Cow::Owned(format!("/{suffix}")))
 }
 
-fn store_path(coven_home: &Path) -> std::path::PathBuf {
+pub(crate) fn store_path(coven_home: &Path) -> std::path::PathBuf {
     coven_home.join("coven.sqlite3")
 }
 
