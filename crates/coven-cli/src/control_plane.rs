@@ -114,6 +114,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.tick",
                     "coven.automations.runs",
                     "coven.automations.run",
+                    "coven.automations.import",
                 ],
             },
             Capability {
@@ -265,6 +266,11 @@ pub fn route_action(
             };
             (200, event)
         }
+        "coven.automations.import" => {
+            let event =
+                automation_event(action, origin, intent_id, automation_import_payload(conn));
+            (200, event)
+        }
         "coven.automations.run" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -341,6 +347,17 @@ fn automation_tick_payload(
             "recovered": report.recovered,
             "claimed": report.claimed,
             "failed": report.failed,
+        }),
+        Err(error) => json!({ "error": format!("{error:#}") }),
+    }
+}
+
+fn automation_import_payload(conn: &rusqlite::Connection) -> Value {
+    match crate::automations::import_legacy::import_legacy_codex_automations(conn) {
+        Ok(report) => json!({
+            "imported": report.imported,
+            "skipped": report.skipped,
+            "failures": report.failures,
         }),
         Err(error) => json!({ "error": format!("{error:#}") }),
     }

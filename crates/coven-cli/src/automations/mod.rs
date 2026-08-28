@@ -7,6 +7,7 @@
 //! seams.
 
 pub mod definition;
+pub mod import_legacy;
 pub mod occurrences;
 pub mod rrule;
 pub mod runner;
