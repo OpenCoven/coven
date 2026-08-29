@@ -6,7 +6,10 @@
 //! claim/lease, and run delivery land in follow-up modules on the same
 //! seams.
 
+pub mod daemon_tick;
 pub mod definition;
+pub mod health;
+pub mod import_legacy;
 pub mod occurrences;
 pub mod rrule;
 pub mod runner;

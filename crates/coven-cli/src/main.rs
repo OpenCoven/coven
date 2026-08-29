@@ -32,6 +32,7 @@ mod engine_install;
 mod eval_loop;
 mod event_writer;
 mod execution_binding;
+mod install_conflict;
 #[rustfmt::skip]
 #[allow(dead_code)]
 mod request_adoption;
@@ -2341,6 +2342,25 @@ fn print_doctor_line(value: impl AsRef<str>) {
 
 fn print_doctor_prose(report: &DoctorReport) {
     println!("Coven doctor");
+    // Surfaced before anything else: if a shadowed install is answering, every
+    // line below describes a different binary than the operator believes they
+    // are running. Prose keeps the concrete paths -- the operator needs to know
+    // which file to remove -- unlike the JSON report, which redacts them.
+    let installations = install_conflict::current_installations("coven");
+    if installations.len() > 1 {
+        println!("\nInstalls:");
+        for (index, installation) in installations.iter().enumerate() {
+            let marker = if index == 0 { "OK" } else { "!!" };
+            let role = if index == 0 { "active" } else { "shadowed" };
+            print_doctor_line(format!(
+                "  [{marker}] {} ({role})",
+                installation.path.display()
+            ));
+        }
+        print_doctor_line(
+            "  The first entry wins. Remove the others or reorder PATH, then re-check with `coven --version`.",
+        );
+    }
     print_doctor_line(format!("Store: {}", report.home.display()));
     match &report.project_root {
         Some(root) => print_doctor_line(format!("Project: {}", root.display())),
@@ -2611,6 +2631,35 @@ impl DoctorJsonPathRedactor {
 fn doctor_checks(report: &DoctorReport) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     let paths = DoctorJsonPathRedactor::new(report);
+
+    // Shadowed installs answer every command silently, so an upgrade appears to
+    // do nothing and the operator concludes Coven is broken. Warn rather than
+    // fail: several installs is legitimate on a developer machine, it just has
+    // to be visible. Paths stay concrete here because the whole point is to
+    // tell the operator which file to remove.
+    let installations = install_conflict::current_installations("coven");
+    if installations.len() > 1 {
+        // Deliberately path-free. Doctor JSON is routinely attached to bug
+        // reports and CI logs, and DoctorJsonPathRedactor exists to keep user
+        // and project directory names out of it. The concrete paths an operator
+        // needs are printed by the prose report instead.
+        checks.push(DoctorCheck::warn(
+            "install:conflicts",
+            format!("{} coven executables on PATH", installations.len()),
+            Some(
+                "run `coven doctor` for the paths; the first entry wins, so remove the others or reorder PATH"
+                    .to_string(),
+            ),
+        ));
+    } else {
+        checks.push(DoctorCheck::pass(
+            "install:conflicts",
+            match installations.len() {
+                0 => "coven is not on PATH (running from an explicit path)".to_string(),
+                _ => "one coven on PATH".to_string(),
+            },
+        ));
+    }
 
     checks.push(match &report.daemon {
         Some(daemon::DaemonStatusState::Running(status)) => DoctorCheck::pass(
@@ -4406,6 +4455,7 @@ fn run_session(
                 session_id: record.id.clone(),
                 harness_session_id: None,
                 error: None,
+                usage: None,
             }))?;
         }
         return Ok(());
@@ -4475,6 +4525,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
                 return Err(error);
             }
@@ -4500,6 +4551,7 @@ fn run_session(
             session_id: record.id.clone(),
             harness_session_id: None,
             error: None,
+            usage: None,
         }))?;
         if archive {
             let archived_at = current_timestamp();
@@ -4587,6 +4639,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
             }
             return Err(error);
@@ -4627,6 +4680,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
                 return Err(error);
             }
@@ -4666,6 +4720,7 @@ fn run_session(
             session_id: record.id.clone(),
             harness_session_id: outcome.harness_session_id.clone(),
             error: outcome.error.clone(),
+            usage: outcome.usage.clone(),
         }))?;
         if archive {
             let archived_at = current_timestamp();
@@ -4785,6 +4840,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: None,
+                    usage: None,
                 }))?;
             }
             if archive {
@@ -4833,6 +4889,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
             }
             Err(error)

@@ -47,6 +47,11 @@ pub struct CodexJsonRunResult {
     pub harness_session_id: Option<String>,
     pub error: Option<String>,
     pub emitted_assistant: bool,
+    /// Codex's terminal `turn.completed.usage`, normalized to the snake_case
+    /// contract Cave's `parseStreamJsonUsage` reads (`input_tokens`,
+    /// `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`).
+    /// `None` when Codex reported no usage — absent, not zero.
+    pub usage: Option<serde_json::Value>,
 }
 
 pub struct DetachedPtySession {
@@ -1311,6 +1316,7 @@ struct CodexJsonState {
     harness_session_id: Option<String>,
     protocol_error: Option<String>,
     emitted_assistant: bool,
+    usage: Option<serde_json::Value>,
 }
 
 /// Own a one-shot child process tree. A wrapper can outlive or outspawn the
@@ -2937,6 +2943,7 @@ where
         harness_session_id: state.harness_session_id,
         error: state.protocol_error,
         emitted_assistant: state.emitted_assistant,
+        usage: state.usage,
     })
 }
 
@@ -2965,6 +2972,14 @@ where
                 state.harness_session_id = Some(thread_id.to_string());
             }
         }
+        "turn.completed" => {
+            // Codex's terminal frame carries the turn's token usage. Normalize
+            // its field names to Cave's snake_case contract so the daemon does
+            // not leak a harness-specific shape downstream.
+            if let Some(usage) = event.get("usage").and_then(serde_json::Value::as_object) {
+                state.usage = Some(normalize_codex_usage(usage));
+            }
+        }
         "item.completed" => {
             let Some(item) = event.get("item") else {
                 return Ok(true);
@@ -2990,6 +3005,24 @@ where
         _ => {}
     }
     Ok(true)
+}
+
+/// Map Codex's usage field names onto Cave's snake_case contract. Only the
+/// fields Cave's `parseStreamJsonUsage` reads are forwarded; unknown counters
+/// (e.g. `reasoning_output_tokens`) are dropped rather than leaked.
+fn normalize_codex_usage(usage: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let mut normalized = serde_json::Map::new();
+    for (source, target) in [
+        ("input_tokens", "input_tokens"),
+        ("output_tokens", "output_tokens"),
+        ("cached_input_tokens", "cache_read_input_tokens"),
+        ("cache_write_input_tokens", "cache_creation_input_tokens"),
+    ] {
+        if let Some(value) = usage.get(source) {
+            normalized.insert(target.to_string(), value.clone());
+        }
+    }
+    serde_json::Value::Object(normalized)
 }
 
 fn append_bounded_tail(tail: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) {
@@ -9426,6 +9459,50 @@ exit 0
             Some("request rejected by Codex")
         );
         assert!(assistant.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_turn_completed_usage_is_normalized() -> anyhow::Result<()> {
+        let mut state = CodexJsonState::default();
+        let mut assistant = Vec::new();
+
+        let valid = handle_codex_json_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":11,"cached_input_tokens":3,"cache_write_input_tokens":2,"output_tokens":7,"reasoning_output_tokens":1}}"#,
+            &mut state,
+            &mut |text| {
+                assistant.push(text.to_string());
+                Ok(())
+            },
+        )?;
+
+        assert!(valid);
+        assert_eq!(
+            state.usage,
+            Some(serde_json::json!({
+                "input_tokens": 11,
+                "output_tokens": 7,
+                "cache_read_input_tokens": 3,
+                "cache_creation_input_tokens": 2,
+            }))
+        );
+        assert!(assistant.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_turn_completed_without_usage_leaves_no_meter() -> anyhow::Result<()> {
+        let mut state = CodexJsonState::default();
+        let mut assistant = Vec::new();
+
+        let valid =
+            handle_codex_json_line(r#"{"type":"turn.completed"}"#, &mut state, &mut |text| {
+                assistant.push(text.to_string());
+                Ok(())
+            })?;
+
+        assert!(valid);
+        assert!(state.usage.is_none(), "absent usage stays absent, not zero");
         Ok(())
     }
 

@@ -4282,6 +4282,7 @@ pub fn serve_forever(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
+    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
 
     let (tcp_thread, active_tcp_connection) = if let Some(addr) = tcp_addr {
         let tcp_listener = bind_tcp_listener(addr)?;
