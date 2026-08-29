@@ -4455,6 +4455,7 @@ fn run_session(
                 session_id: record.id.clone(),
                 harness_session_id: None,
                 error: None,
+                usage: None,
             }))?;
         }
         return Ok(());
@@ -4524,6 +4525,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
                 return Err(error);
             }
@@ -4549,6 +4551,7 @@ fn run_session(
             session_id: record.id.clone(),
             harness_session_id: None,
             error: None,
+            usage: None,
         }))?;
         if archive {
             let archived_at = current_timestamp();
@@ -4636,6 +4639,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
             }
             return Err(error);
@@ -4676,6 +4680,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
                 return Err(error);
             }
@@ -4715,6 +4720,7 @@ fn run_session(
             session_id: record.id.clone(),
             harness_session_id: outcome.harness_session_id.clone(),
             error: outcome.error.clone(),
+            usage: outcome.usage.clone(),
         }))?;
         if archive {
             let archived_at = current_timestamp();
@@ -4834,6 +4840,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: None,
+                    usage: None,
                 }))?;
             }
             if archive {
@@ -4882,6 +4889,7 @@ fn run_session(
                     session_id: record.id.clone(),
                     harness_session_id: None,
                     error: Some(format!("{error:#}")),
+                    usage: None,
                 }))?;
             }
             Err(error)
