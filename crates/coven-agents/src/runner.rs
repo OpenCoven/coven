@@ -128,6 +128,60 @@ where
         error
     }
 
+    /// Checks an agent's input guardrails against the run's original user
+    /// input.
+    ///
+    /// This is the single ingress path shared by direct starts and handoffs.
+    /// The evaluated input is always the original user input that started the
+    /// run — the same bounded string a direct start would check — so entering
+    /// an agent through a handoff cannot grant access that direct entry would
+    /// reject. A `GuardrailChecked` event is emitted per guardrail with the
+    /// owning agent's identity, and a policy rejection or guardrail
+    /// implementation error fails the run before the agent's next model turn
+    /// or tool execution.
+    async fn check_input_guardrails(
+        &self,
+        agent: &Agent<C>,
+        input: &str,
+        context: &C,
+    ) -> Result<(), RunError> {
+        for guardrail in &agent.input_guardrails {
+            let verdict = guardrail.check(input, context).await.map_err(|source| {
+                self.fail(
+                    &agent.id,
+                    RunFailureKind::InputGuardrail,
+                    RunError::GuardrailFailed {
+                        agent: agent.id.clone(),
+                        guardrail: guardrail.name().to_owned(),
+                        stage: GuardrailStage::Input,
+                        source,
+                    },
+                )
+            })?;
+            let allowed = verdict == GuardrailVerdict::Allow;
+            self.observer.on_event(&RunEvent::GuardrailChecked {
+                agent: agent.id.clone(),
+                guardrail: guardrail.name().to_owned(),
+                stage: GuardrailStage::Input,
+                allowed,
+            });
+            if let GuardrailVerdict::Reject { reason } = verdict {
+                return Err(self.fail(
+                    &agent.id,
+                    RunFailureKind::InputGuardrail,
+                    RunError::GuardrailRejected {
+                        agent: agent.id.clone(),
+                        guardrail: guardrail.name().to_owned(),
+                        stage: GuardrailStage::Input,
+                        reason,
+                    },
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Runs `starting_agent` to a final output.
     ///
     /// Every run emits exactly one `RunStarted` event followed by exactly one
@@ -139,6 +193,12 @@ where
     /// user message, assistant message, and tool calls that preceded it, so
     /// those items are handed back rather than dropped. The runner never
     /// appends a failed run's items to the session store.
+    ///
+    /// Input guardrails are enforced at every agent boundary: the starting
+    /// agent's before its first model turn, and each handoff target's against
+    /// the same original user input before that target's first model turn, so
+    /// a handoff cannot reach an agent that would have rejected the input as
+    /// the starting agent.
     pub async fn run(
         &self,
         starting_agent: impl Into<AgentId>,
@@ -188,39 +248,8 @@ where
             )
         })?;
 
-        for guardrail in &current.input_guardrails {
-            let verdict = guardrail.check(&input, context).await.map_err(|source| {
-                self.fail(
-                    &current.id,
-                    RunFailureKind::InputGuardrail,
-                    RunError::GuardrailFailed {
-                        agent: current.id.clone(),
-                        guardrail: guardrail.name().to_owned(),
-                        stage: GuardrailStage::Input,
-                        source,
-                    },
-                )
-            })?;
-            let allowed = verdict == GuardrailVerdict::Allow;
-            self.observer.on_event(&RunEvent::GuardrailChecked {
-                agent: current.id.clone(),
-                guardrail: guardrail.name().to_owned(),
-                stage: GuardrailStage::Input,
-                allowed,
-            });
-            if let GuardrailVerdict::Reject { reason } = verdict {
-                return Err(self.fail(
-                    &current.id,
-                    RunFailureKind::InputGuardrail,
-                    RunError::GuardrailRejected {
-                        agent: current.id.clone(),
-                        guardrail: guardrail.name().to_owned(),
-                        stage: GuardrailStage::Input,
-                        reason,
-                    },
-                ));
-            }
-        }
+        self.check_input_guardrails(&current, &input, context)
+            .await?;
 
         let mut model_items = match (&options.session_id, &self.session) {
             (Some(session_id), Some(session)) => {
@@ -460,6 +489,12 @@ where
                     name: handoff.name.clone(),
                 });
                 current = target;
+                // Ingress parity: the handoff target enforces the same input
+                // policy it would enforce as the starting agent, checked
+                // against the original user input, before its first model turn
+                // or tool execution.
+                self.check_input_guardrails(&current, &input, context)
+                    .await?;
                 continue;
             }
 
