@@ -669,7 +669,10 @@ mod tests {
         let first = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
         assert!(first.is_some());
         let second = claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now()).unwrap();
-        assert!(second.is_none(), "overlap=forbid must reject a second claim");
+        assert!(
+            second.is_none(),
+            "overlap=forbid must reject a second claim"
+        );
 
         // Settling the live run unblocks the next claim.
         let claimed_id = first.unwrap();
@@ -695,14 +698,9 @@ mod tests {
             .unwrap();
 
         // Running keeps the lease alive, so recovery leaves it alone.
-        assert!(mark_occurrence_running(
-            &conn,
-            &occurrence_id,
-            "daemon-a",
-            60,
-            real_now()
-        )
-        .unwrap());
+        assert!(
+            mark_occurrence_running(&conn, &occurrence_id, "daemon-a", 60, real_now()).unwrap()
+        );
         let (state, owner): (String, Option<String>) = conn
             .query_row(
                 "SELECT state, lease_owner FROM automation_occurrences WHERE id = ?1",
@@ -739,9 +737,7 @@ mod tests {
         let (_temp, conn) = temp_store();
         assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", 0, real_now()).is_err());
         let too_long = 24 * 60 + 1;
-        assert!(
-            mark_occurrence_running(&conn, "occ-x", "daemon-a", too_long, real_now()).is_err()
-        );
+        assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", too_long, real_now()).is_err());
     }
 
     #[test]

@@ -15,7 +15,7 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use super::occurrences::settle_occurrence;
-use super::runs::{record_run_finish, LOG_ENTRY_MAX_CHARS, RunFinish};
+use super::runs::{record_run_finish, RunFinish, LOG_ENTRY_MAX_CHARS};
 
 /// How many trailing normalized-stream events a bounded log captures. The
 /// budget keeps the newest events; older entries are replaced by a marker.
@@ -24,7 +24,12 @@ const BOUNDED_LOG_EVENT_LIMIT: usize = 200;
 /// Terminal session statuses, mirroring
 /// `store::update_session_terminal_if_active`.
 const SESSION_TERMINAL_STATUSES: [&str; 6] = [
-    "completed", "failed", "cancelled", "killed", "idle", "orphaned",
+    "completed",
+    "failed",
+    "cancelled",
+    "killed",
+    "idle",
+    "orphaned",
 ];
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -70,8 +75,8 @@ fn read_stream_tail(
         .map_err(|error| format!("failed to read session stream: {error}"))?;
     let mut events = Vec::new();
     for row in rows {
-        let (kind, payload_json, created_at) = row
-            .map_err(|error| format!("failed to read session stream: {error}"))?;
+        let (kind, payload_json, created_at) =
+            row.map_err(|error| format!("failed to read session stream: {error}"))?;
         let payload = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
         events.push(StreamEvent {
             kind,
@@ -158,7 +163,10 @@ pub fn deliver_output(target: &str, payload: &str) -> Result<(), String> {
         _ => PathBuf::from("."),
     };
     std::fs::create_dir_all(&parent).map_err(|error| {
-        format!("output commit failed: cannot create {}: {error}", parent.display())
+        format!(
+            "output commit failed: cannot create {}: {error}",
+            parent.display()
+        )
     })?;
     let file_name = target_path
         .file_name()
@@ -176,7 +184,10 @@ pub fn deliver_output(target: &str, payload: &str) -> Result<(), String> {
 
 fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), String> {
     std::fs::write(temp, payload).map_err(|error| {
-        format!("output commit failed: cannot write {}: {error}", temp.display())
+        format!(
+            "output commit failed: cannot write {}: {error}",
+            temp.display()
+        )
     })?;
     std::fs::rename(temp, target).map_err(|error| {
         format!(
@@ -636,7 +647,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(status, "failed", "a failed delivery must not report success");
+        assert_eq!(
+            status, "failed",
+            "a failed delivery must not report success"
+        );
         let reason: String = conn
             .query_row(
                 "SELECT failure_reason FROM automation_occurrences WHERE automation_id = 'daily'",
