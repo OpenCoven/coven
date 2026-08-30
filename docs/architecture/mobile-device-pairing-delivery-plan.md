@@ -29,6 +29,8 @@ Exit criteria: language-level tests and cross-implementation vectors pass.
 
 ### PR 3 — TUI enrollment and device administration
 
+Detailed slice plan: [`mobile-device-pairing-tui-bootstrap-plan.md`](mobile-device-pairing-tui-bootstrap-plan.md) (issue #785).
+
 - `coven device pair`
 - scope selection and permission preview
 - terminal QR plus copyable fallback
