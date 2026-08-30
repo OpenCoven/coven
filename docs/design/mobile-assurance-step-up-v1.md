@@ -347,7 +347,7 @@ DeviceGrant::authorize(required_scope, effective, now)   # grant.rs:157-194
   value for the request (the current re-check passes `Possession`,
   `auth.rs:174-181`; with step-up it must not fail a legitimately
   step-up-authorized request). `VerifiedMobileDevice`
-  (`auth.rs:96-101`) carries `effective_assurance` for that purpose.
+  (`auth.rs:96-101`) gains an `effective_assurance` field for that purpose.
 
 ### Transport (wire shape)
 
@@ -461,8 +461,12 @@ byte string is documented as hex (the wire encodes challenges, digests, and
 signatures as unpadded base64url; the vector stores raw bytes so any
 implementation can reproduce them). An implementation PR adds this as
 `crates/coven-cli/tests/fixtures/mobile-assurance-v1/assurance-vector.json`;
-Swift/Android implementations must reproduce `canonicalProofBytesHex` and the
-signature exactly.
+Swift/Android implementations must reproduce `canonicalProofBytesHex` exactly.
+ECDSA P-256 signatures are randomized (`k` is per-signature; neither Secure
+Enclave nor Android Keystore exposes deterministic RFC 6979 signing), so
+implementations are not expected to reproduce `signatureDERHex` byte-for-byte:
+they must **verify** it over `canonicalProofBytesHex` with
+`stepUpPublicKeyX963Hex`, and their own signatures must verify the same way.
 
 ```json
 {
