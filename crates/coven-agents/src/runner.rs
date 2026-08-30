@@ -272,7 +272,7 @@ where
         .await
         .map_err(|error| RunFailure {
             invocation,
-            error,
+            error: Box::new(error),
             new_items: progress.items,
             turns: progress.turns,
             handoffs: progress.handoffs,
