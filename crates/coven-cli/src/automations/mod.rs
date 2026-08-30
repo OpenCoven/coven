@@ -1,13 +1,17 @@
 //! Coven-native routine automations (coven#816).
 //!
 //! Routines replace harness-owned schedules with durable Coven definitions.
-//! This module owns definition parsing/validation, the RRULE vocabulary the
-//! scheduler understands, and definition persistence. Occurrence planning,
-//! claim/lease, and run delivery land in follow-up modules on the same
-//! seams.
+//! **Coven owns the schedule and the run ledger; runtimes are replaceable
+//! workers.** This module owns definition parsing/validation (stored under
+//! the Coven store, never a harness home), the RRULE vocabulary the
+//! scheduler understands, occurrence planning with a durable
+//! `UNIQUE(automation_id, scheduled_for)` fence, bounded claim/lease
+//! recovery, familiar-bound dispatch through the shared session-launch seam,
+//! the run ledger, and delivery of outputs.
 
 pub mod daemon_tick;
 pub mod definition;
+pub mod delivery;
 pub mod health;
 pub mod import_legacy;
 pub mod occurrences;

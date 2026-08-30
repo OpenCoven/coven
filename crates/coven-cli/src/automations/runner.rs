@@ -2,18 +2,19 @@
 //!
 //! A run is a claimed occurrence dispatched through the exact session-launch
 //! path every other launch uses: the definition is re-read, the familiar and
-//! runtime are re-validated per run, a SessionLaunch is built, and the
-//! occurrence plus the run ledger settle together. Coven (not a harness home)
-//! owns the record.
+//! runtime are re-validated per run, a SessionLaunch is built, and the run
+//! goes in flight under a bounded lease. Coven (not a harness home) owns the
+//! record; terminal status, bounded log, and output delivery land through
+//! the delivery reconciliation pass.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 use super::definition::RoutineDefinition;
-use super::occurrences::{settle_occurrence, PlanOutcome};
-use super::runs::{record_run_finish, record_run_start, RunFinish};
+use super::occurrences::{claim_occurrence_by_id, mark_occurrence_running, settle_occurrence};
+use super::runs::{record_run_finish, record_run_session, record_run_start, RunFinish};
 use crate::api::{SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
 
@@ -33,10 +34,34 @@ fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{millis}")
 }
 
+/// The dispatch lease for a routine run: the definition's own timeout,
+/// bounded to the same 1..=1440 minute window claims use. The lease must
+/// outlive a healthy run so lease recovery only ever catches genuinely
+/// wedged work (coven#816: "never let a stale running record block a
+/// routine forever").
+fn run_lease_minutes(definition: &RoutineDefinition) -> i64 {
+    i64::from(definition.timeout_minutes.clamp(1, 24 * 60))
+}
+
+fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
+    RunOutcome {
+        run_id: String::new(),
+        status: "failed".to_string(),
+        session_id: None,
+        error: Some(format!(
+            "overlap: another occurrence of `{}` is still running",
+            definition.id
+        )),
+    }
+}
+
 /// Runs a routine once, now: fences and claims an immediate occurrence,
 /// records a ledger row, dispatches through the shared session-launch path,
-/// and settles occurrence + ledger together. A missing cwd fails the run
-/// with a recorded reason instead of guessing a project.
+/// and leaves the run in flight with a bounded lease. Settlement — terminal
+/// status, exit code, bounded log, output delivery — happens through the
+/// reconciliation pass once the session finishes. A missing cwd fails the
+/// run with a recorded reason instead of guessing a project; a live
+/// previous occurrence fails the run (overlap: forbid).
 pub fn run_routine_now(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
@@ -64,17 +89,24 @@ pub fn run_routine_now(
             "INSERT OR IGNORE INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
              VALUES (?1, ?2, ?3, 'planned', 0, ?3, ?3)",
-            rusqlite::params![occurrence_id, definition.id, now_iso],
+            params![occurrence_id, definition.id, now_iso],
         )
         .map_err(|error| format!("failed to fence immediate occurrence: {error}"))?;
     if inserted == 0 {
         return Err("immediate occurrence fence collided; retry".to_string());
     }
-    let _ = PlanOutcome::Planned; // keep the import meaningful if API changes
 
-    let claimed =
-        super::occurrences::claim_due_occurrence(conn, &definition.id, "manual", 60, now)?;
-    let occurrence_id = claimed.unwrap_or(occurrence_id);
+    let claimed = claim_occurrence_by_id(conn, &occurrence_id, "manual", 60, now)?;
+    if claimed.is_none() {
+        // The claim was refused — in practice a live sibling run appeared
+        // first (overlap: forbid). Release our fence so the daemon can never
+        // dispatch it later, then fail visibly.
+        let _ = conn.execute(
+            "DELETE FROM automation_occurrences WHERE id = ?1 AND state = 'planned'",
+            params![occurrence_id],
+        );
+        return Ok(overlap_outcome(definition));
+    }
 
     let run_id = fresh_id("run");
     record_run_start(
@@ -92,22 +124,16 @@ pub fn run_routine_now(
 
     match runtime.launch_session(&launch) {
         Ok(()) => {
-            let _ = settle_occurrence(conn, &occurrence_id, "succeeded", None, now);
-            let _ = record_run_finish(
-                conn,
-                &run_id,
-                RunFinish {
-                    status: "succeeded",
-                    exit_code: Some(0),
-                    session_id: Some(launch.id.clone()),
-                    log_json: None,
-                    output_commit: None,
-                },
-                now,
-            );
+            // The run is in flight: keep the occurrence under a bounded
+            // lease, attach the session id, and let settlement happen from
+            // the Coven session store. Launch success is never reported as
+            // run success.
+            let lease = run_lease_minutes(definition);
+            let _ = mark_occurrence_running(conn, &occurrence_id, "manual", lease, now);
+            let _ = record_run_session(conn, &run_id, &launch.id);
             Ok(RunOutcome {
                 run_id,
-                status: "succeeded".to_string(),
+                status: "dispatched".to_string(),
                 session_id: Some(launch.id),
                 error: None,
             })
@@ -167,10 +193,12 @@ pub struct DispatchReport {
 }
 
 /// Dispatches every claimed occurrence that the scheduler has fenced: builds
-/// the launch, records the ledger row, launches through the shared runtime
-/// path, and settles occurrence + ledger together. Claimed occurrences whose
-/// routine has no cwd fail with a recorded reason instead of guessing a
-/// project.
+/// the launch, records the ledger row, and launches through the shared
+/// runtime path. A dispatched run stays in flight under a bounded lease —
+/// the reconciliation pass (`delivery::settle_finished_runs`) settles the
+/// occurrence and the ledger once the session finishes. Claimed occurrences
+/// whose routine has no cwd fail with a recorded reason instead of guessing
+/// a project.
 pub fn dispatch_claimed_occurrences(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
@@ -237,19 +265,13 @@ pub fn dispatch_claimed_occurrences(
                 .map_err(|error| format!("{error:#}"))
         }) {
             Ok(launch) => {
-                let _ = settle_occurrence(conn, &occurrence_id, "succeeded", None, now);
-                let _ = record_run_finish(
-                    conn,
-                    &run_id,
-                    RunFinish {
-                        status: "succeeded",
-                        exit_code: Some(0),
-                        session_id: Some(launch.id),
-                        log_json: None,
-                        output_commit: None,
-                    },
-                    now,
-                );
+                // The run is in flight: keep the occurrence under a bounded
+                // lease, attach the session id, and let settlement happen
+                // from the Coven session store. Launch success is never
+                // reported as run success (coven#816).
+                let lease = run_lease_minutes(&definition);
+                let _ = mark_occurrence_running(conn, &occurrence_id, "daemon", lease, now);
+                let _ = record_run_session(conn, &run_id, &launch.id);
                 report.dispatched.push(run_id);
             }
             Err(reason) => {
@@ -345,7 +367,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_run_settles_occurrence_and_ledger() {
+    fn successful_dispatch_leaves_the_run_in_flight() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily")).unwrap();
         let outcome = run_routine_now(
@@ -355,13 +377,11 @@ mod tests {
             Utc::now(),
         )
         .unwrap();
-        assert_eq!(outcome.status, "succeeded");
+        // Launch success is not run success: the run is dispatched and the
+        // settlement pass reports the terminal status from the Coven session
+        // store.
+        assert_eq!(outcome.status, "dispatched");
         assert!(outcome.session_id.is_some());
-
-        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, "succeeded");
-        assert_eq!(runs[0].familiar_id.as_deref(), Some("charm"));
 
         let state: String = conn
             .query_row(
@@ -370,7 +390,36 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state, "succeeded");
+        assert_eq!(state, "running");
+
+        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "running");
+        assert_eq!(runs[0].session_id, outcome.session_id);
+        assert_eq!(runs[0].familiar_id.as_deref(), Some("charm"));
+
+        // A live run blocks a second one (overlap: forbid).
+        let second = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("daily"),
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(second.status, "failed");
+        let second_error = second.error.clone().unwrap_or_default();
+        assert!(second_error.contains("overlap"), "{second_error}");
+        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        assert_eq!(runs.len(), 1, "the rejected run records no ledger row");
+    }
+
+    #[test]
+    fn build_session_launch_carries_familiar_and_runtime() {
+        let launch = build_session_launch(&definition("daily"), "/work/project").unwrap();
+        assert_eq!(launch.familiar_id.as_deref(), Some("charm"));
+        assert_eq!(launch.harness, "coven-code");
+        assert_eq!(launch.launch_mode, HarnessLaunchMode::NonInteractive);
+        assert_eq!(launch.project_root, "/work/project");
     }
 
     #[test]

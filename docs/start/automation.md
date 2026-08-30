@@ -12,6 +12,18 @@ Coven is the canonical shared local runtime for reusable automation. The chat/in
 user -> chat/intake client -> Coven -> adapters -> desktop/apps
 ```
 
+## Coven-native routine automations
+
+Recurring routine work (`coven.automations`) is **owned by Coven, end to
+end**: Coven stores the canonical routine definitions in its own store (never
+a harness home), its scheduler plans and fences every occurrence in durable
+state, dispatches runs with a fresh familiar + authority resolution, records
+the run ledger, and delivers outputs itself. An external runtime may execute
+an already-claimed occurrence, but it never owns the schedule and never owns
+the record — runtimes are replaceable workers. The `coven.scheduler`
+capability stays reserved for multi-host routing decisions and is not the
+recurring-work surface.
+
 Use the canonical [CLI reference](https://docs.opencoven.ai/docs/cli) for
 scriptable commands and the [local API guide](https://docs.opencoven.ai/docs/reference/api)
 for programmatic clients.
