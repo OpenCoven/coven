@@ -170,7 +170,7 @@ pub fn deliver_output(target: &str, payload: &str) -> Result<(), String> {
     })?;
     let file_name = target_path
         .file_name()
-        .map(|name| name.to_string_lossy().to_owned())
+        .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "output commit failed: output target has no file name".to_string())?;
     let pid = std::process::id();
     let millis = chrono::Utc::now().timestamp_millis();

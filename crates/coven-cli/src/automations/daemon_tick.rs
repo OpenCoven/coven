@@ -154,7 +154,7 @@ mod tests {
             &crate::store::EventRecord {
                 seq: 0,
                 id: "event-final".to_string(),
-                session_id: session_id,
+                session_id,
                 kind: "output".to_string(),
                 payload_json: serde_json::json!({ "data": "done" }).to_string(),
                 created_at: chrono::Utc::now().to_rfc3339(),
