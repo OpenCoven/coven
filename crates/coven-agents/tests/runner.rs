@@ -1036,9 +1036,10 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
     assert!(matches!(
         direct_failure.error,
         RunError::GuardrailRejected {
-            agent: ref agent,
+            ref agent,
             stage: GuardrailStage::Input,
             ref reason,
+            ..
         } if agent.as_str() == "specialist" && reason == "blocked by policy"
     ));
     assert_eq!(direct_model.calls.load(Ordering::SeqCst), 0);
@@ -1076,9 +1077,10 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
     assert!(matches!(
         failure.error,
         RunError::GuardrailRejected {
-            agent: ref agent,
+            ref agent,
             stage: GuardrailStage::Input,
             ref reason,
+            ..
         } if agent.as_str() == "specialist" && reason == "blocked by policy"
     ));
     assert_eq!(
@@ -1277,7 +1279,7 @@ async fn multi_hop_handoff_target_rejection_prevents_the_target_model_turn() {
     assert!(matches!(
         failure.error,
         RunError::GuardrailRejected {
-            agent: ref agent,
+            ref agent,
             stage: GuardrailStage::Input,
             ..
         } if agent.as_str() == "c"
@@ -1328,8 +1330,8 @@ async fn handoff_target_guardrail_error_is_distinguishable_from_a_rejection() {
     assert!(matches!(
         failure.error,
         RunError::GuardrailFailed {
-            agent: ref agent,
-            guardrail: ref guardrail,
+            ref agent,
+            ref guardrail,
             stage: GuardrailStage::Input,
             ..
         } if agent.as_str() == "specialist" && guardrail == "failing-input"
