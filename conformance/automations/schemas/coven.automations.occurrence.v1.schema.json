@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/coven.automations.occurrence.v1.schema.json",
+  "title": "Coven automation occurrence (coven.automations.occurrence.v1)",
+  "description": "One ledger row of scheduled work. The UNIQUE(automationId, scheduledFor) fence makes planning idempotent across ticks, replicas, and restarts; exactly one dispatch may exist per fence.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["id", "automationId", "scheduledFor", "state", "attempt", "createdAt", "updatedAt"],
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Deterministic fence id: automationId + '-' + epoch millis of scheduledFor."
+    },
+    "automationId": { "type": "string", "minLength": 1 },
+    "scheduledFor": { "type": "string", "description": "RFC3339 UTC instant of the scheduled slot, millisecond precision." },
+    "state": {
+      "enum": ["planned", "claimed", "running", "succeeded", "failed", "quarantined"],
+      "description": "planned -> claimed -> running -> succeeded|failed; expired leases recover to failed; exhausted retries quarantine. succeeded and failed are terminal and monotonic."
+    },
+    "leaseOwner": { "type": ["string", "null"] },
+    "leaseExpiresAt": { "type": ["string", "null"] },
+    "attempt": { "type": "integer", "minimum": 0 },
+    "failureReason": { "type": ["string", "null"] },
+    "createdAt": { "type": "string" },
+    "updatedAt": { "type": "string" }
+  }
+}

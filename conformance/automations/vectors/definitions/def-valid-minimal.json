@@ -1,0 +1,32 @@
+{
+  "vectorId": "definitions.valid-minimal",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "A minimal valid definition validates and parses with documented defaults",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816", "coven#855"],
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1,
+        "id": "daily-notes",
+        "name": "Daily notes",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Write the daily reflection."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "occurrences": [],
+    "doctor": { "noCodes": ["runs.repeated-failures", "authority.stale-identity"] }
+  }
+}

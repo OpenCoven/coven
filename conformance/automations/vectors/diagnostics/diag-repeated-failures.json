@@ -1,0 +1,31 @@
+{
+  "vectorId": "diagnostics.repeated-failures",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "diagnostics",
+  "title": "doctor reports repeatedly failing routines after three consecutive failures",
+  "deterministic": true,
+  "artifacts": ["diagnostics.doctor.v1", "coven.automations.run.v1"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "setRetryPolicy", "maxAttempts": 1, "backoffSeconds": 0 },
+      { "op": "runtimeBehavior", "behavior": "unavailable" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "one", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "two", "at": "2026-03-01T10:01:00.000Z" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "three", "at": "2026-03-01T10:02:00.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "daily", "status": "failed", "count": 3 }],
+    "doctor": { "findingCodes": ["runs.repeated-failures"] }
+  }
+}

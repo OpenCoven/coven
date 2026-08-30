@@ -1,0 +1,30 @@
+{
+  "vectorId": "golden.11-runtime-lost-after-side-effect",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "scenario",
+  "title": "Golden 11: runtime lost after a possible side effect is surfaced as ambiguous and never retried blindly",
+  "deterministic": true,
+  "artifacts": ["coven.automations.run.v1", "diagnostics.doctor.v1"],
+  "specRefs": ["coven#856", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "runtimeBehavior", "behavior": "lost-after-side-effect" },
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "tick", "at": "2026-03-01T11:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "routine", "status": "failed", "ambiguous": true, "count": 1 }],
+    "dispatchCount": 1,
+    "doctor": { "findingCodes": ["runs.ambiguous-outcome"] }
+  }
+}

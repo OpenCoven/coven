@@ -1,0 +1,29 @@
+{
+  "vectorId": "state-machines.planned-never-settles-without-claim",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "state-machines",
+  "title": "A PLANNED occurrence is refused settlement: only claimed work can settle, so a crashed adoption leaves untouched planned state",
+  "deterministic": true,
+  "artifacts": ["coven.automations.occurrence.v1"],
+  "specRefs": ["coven#816"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "crash", "during": "adoption" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "manual-1", "at": "2026-03-01T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [{ "automationId": "daily", "state": "planned", "attempt": 0 }],
+    "runs": [],
+    "dispatchCount": 0
+  }
+}

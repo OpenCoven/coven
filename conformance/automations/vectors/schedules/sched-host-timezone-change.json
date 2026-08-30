@@ -1,0 +1,32 @@
+{
+  "vectorId": "schedules.host-timezone-change",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "schedules",
+  "title": "A host timezone change between passes does not re-fence or duplicate the already-fenced local slot",
+  "deterministic": true,
+  "artifacts": ["coven.automations.occurrence.v1"],
+  "specRefs": ["coven#856"],
+  "virtualTime": { "start": "2026-06-01T12:00:00.000Z", "hostTimezone": "America/New_York" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "local", "name": "Local", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "local", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-06-01T14:00:00.000Z" },
+      { "op": "setHostTimezone", "hostTimezone": "UTC" },
+      { "op": "tick", "at": "2026-06-01T20:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "local", "scheduledFor": "2026-06-01T13:00:00.000Z", "state": "succeeded" }
+    ],
+    "dispatchCount": 1,
+    "invariants": ["fence-uniqueness"]
+  }
+}

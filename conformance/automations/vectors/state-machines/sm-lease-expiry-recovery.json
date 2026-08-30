@@ -1,0 +1,67 @@
+{
+  "vectorId": "state-machines.lease-expiry-recovery",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "state-machines",
+  "title": "An expired lease recovers to failed with a stale reason; a stale lease never renders as live work",
+  "deterministic": true,
+  "artifacts": [
+    "coven.automations.occurrence.v1"
+  ],
+  "specRefs": [
+    "coven#816",
+    "coven#856"
+  ],
+  "virtualTime": {
+    "start": "2026-03-01T00:00:00.000Z"
+  },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1,
+        "id": "daily",
+        "name": "Daily",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      {
+        "op": "crash",
+        "during": "claim"
+      },
+      {
+        "op": "tick",
+        "at": "2026-03-01T10:00:00.000Z"
+      },
+      {
+        "op": "advance",
+        "at": "2026-03-01T13:00:00.000Z"
+      },
+      {
+        "op": "restart",
+        "at": "2026-03-01T13:00:00.000Z"
+      }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      {
+        "automationId": "daily",
+        "scheduledFor": "2026-03-01T09:00:00.000Z",
+        "state": "failed",
+        "failureReasonMatches": "lease expired"
+      }
+    ],
+    "invariants": [
+      "terminal-state-monotonicity"
+    ]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "vectorId": "golden.07-dst-fall-fold",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "scenario",
+  "title": "Golden 7: DST fall fold runs the earliest pass of the repeated 01:00 slot",
+  "deterministic": true,
+  "artifacts": ["coven.automations.occurrence.v1"],
+  "specRefs": ["coven#856", "coven#858"],
+  "virtualTime": { "start": "2026-11-01T04:00:00.000Z", "hostTimezone": "America/New_York" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=1", "timezone": "America/New_York", "misfire": "latest",
+        "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-11-01T07:00:00.000Z" }]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "routine", "scheduledFor": "2026-11-01T05:00:00.000Z", "state": "succeeded" }
+    ],
+    "dispatchCount": 1
+  }
+}

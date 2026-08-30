@@ -1,0 +1,27 @@
+{
+  "vectorId": "events.cursor-lag-finding",
+  "vectorVersion": 1,
+  "profile": "privacy",
+  "category": "events",
+  "title": "A subscriber left behind by more than a few events shows up as changefeed cursor lag",
+  "deterministic": true,
+  "artifacts": ["coven.automations.event.v1", "diagnostics.doctor.v1"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "subscribe", "afterCursor": 0 }
+    ]
+  },
+  "expected": {
+    "doctor": { "findingCodes": ["events.cursor-lag"] }
+  }
+}

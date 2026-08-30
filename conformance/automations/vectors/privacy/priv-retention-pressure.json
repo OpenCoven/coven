@@ -1,0 +1,29 @@
+{
+  "vectorId": "privacy.retention-pressure-finding",
+  "vectorVersion": 1,
+  "profile": "privacy",
+  "category": "privacy",
+  "title": "Retention is enforced without manual deletion: an over-budget changefeed raises disk.retention-pressure",
+  "deterministic": true,
+  "artifacts": ["diagnostics.doctor.v1", "coven.automations.event.v1"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "setRetention", "window": "1s" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "a", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "b", "at": "2026-03-01T10:01:00.000Z" },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "c", "at": "2026-03-01T10:02:00.000Z" }
+    ]
+  },
+  "expected": {
+    "doctor": { "findingCodes": ["disk.retention-pressure"] }
+  }
+}

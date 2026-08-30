@@ -1,0 +1,33 @@
+{
+  "vectorId": "diagnostics.quarantine",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "diagnostics",
+  "title": "Retry exhaustion quarantines the occurrence and doctor surfaces it",
+  "deterministic": true,
+  "artifacts": ["diagnostics.doctor.v1", "coven.automations.occurrence.v1"],
+  "specRefs": ["coven#856", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "setRetryPolicy", "maxAttempts": 2, "backoffSeconds": 60 },
+      { "op": "runtimeBehavior", "behavior": "unavailable" },
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "tick", "at": "2026-03-01T10:05:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "daily", "scheduledFor": "2026-03-01T09:00:00.000Z", "state": "quarantined", "attempt": 2 }
+    ],
+    "runs": [{ "automationId": "daily", "status": "failed", "count": 2 }],
+    "doctor": { "findingCodes": ["runs.quarantined"] }
+  }
+}

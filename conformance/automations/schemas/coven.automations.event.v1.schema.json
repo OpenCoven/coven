@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/coven.automations.event.v1.schema.json",
+  "title": "Coven automation event (coven.automations.event.v1)",
+  "description": "Changefeed event for automation lifecycle. Cursors are monotonic integers; replay from any cursor is deterministic and duplicate delivery is reduced exactly once per event id.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["cursor", "id", "type", "at"],
+  "properties": {
+    "cursor": { "type": "integer", "minimum": 0, "description": "Monotonic position in the automation changefeed." },
+    "id": { "type": "string", "minLength": 1, "description": "Globally unique event id; the reducer deduplicates on it." },
+    "type": {
+      "enum": [
+        "definition.created",
+        "definition.updated",
+        "definition.tombstoned",
+        "occurrence.planned",
+        "occurrence.claimed",
+        "occurrence.settled",
+        "run.started",
+        "run.finished",
+        "run.ambiguous",
+        "authority.refused",
+        "delivery.failed",
+        "receipt.sealed",
+        "approval.consumed"
+      ]
+    },
+    "automationId": { "type": "string" },
+    "occurrenceId": { "type": "string" },
+    "runId": { "type": "string" },
+    "at": { "type": "string", "description": "RFC3339 UTC instant the event was recorded." },
+    "payload": { "type": "object", "description": "Redacted event payload; never carries prompt text, credentials, or private memory." }
+  }
+}

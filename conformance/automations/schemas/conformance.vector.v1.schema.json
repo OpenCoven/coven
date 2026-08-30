@@ -1,0 +1,496 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/conformance.vector.v1.schema.json",
+  "title": "Coven automations conformance vector (conformance.vector.v1)",
+  "description": "A versioned, implementation-independent certification vector. Vectors are consumable without linking Coven private modules: input is a target-agnostic operation script over the coven.automations artifacts, expected is the exact observable outcome. Deterministic vectors must produce identical results on every conforming target.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "vectorId",
+    "vectorVersion",
+    "profile",
+    "category",
+    "title",
+    "input",
+    "expected"
+  ],
+  "properties": {
+    "vectorId": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9.-]*$",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "vectorVersion": {
+      "const": 1
+    },
+    "profile": {
+      "enum": [
+        "structural",
+        "scheduler-reliability",
+        "runtime-authority",
+        "continuity",
+        "privacy",
+        "interoperability",
+        "full"
+      ],
+      "description": "The single conformance profile this vector certifies. The full profile is the immutable v1 compatibility set of all required profiles."
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "definitions",
+        "schedules",
+        "state-machines",
+        "idempotency",
+        "events",
+        "identity-authority",
+        "receipts",
+        "privacy",
+        "diagnostics",
+        "scenario"
+      ]
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "deterministic": {
+      "type": "boolean",
+      "const": true,
+      "description": "Every v1 vector is deterministic under a virtual clock."
+    },
+    "prerequisites": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Artifact or capability ids the target must provide; unmet prerequisites mark the vector skipped, never failed."
+    },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Versioned artifact ids this vector pins (e.g. coven.automations.definition.v1)."
+    },
+    "specRefs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Coven issues/spec sections this vector's contract comes from."
+    },
+    "virtualTime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "type": "string",
+          "description": "RFC3339 UTC virtual clock start."
+        },
+        "hostTimezone": {
+          "type": "string",
+          "description": "IANA zone pinned as the host/local zone for this vector."
+        }
+      }
+    },
+    "input": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operations"
+      ],
+      "properties": {
+        "definitions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Definition documents the target must ingest before operations. A definition that must be refused is declared in expected.refusals instead."
+        },
+        "invalidDefinitions": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Definition documents the target must refuse; each pairs with an entry in expected.refusals."
+        },
+        "bindings": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "description": "Authority bindings (coven.automations.authority.v1) seeded into the target."
+        },
+        "operations": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/operation"
+          }
+        }
+      }
+    },
+    "expected": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "refusals": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "refusalId",
+              "reasonMatches"
+            ],
+            "properties": {
+              "refusalId": {
+                "type": "string"
+              },
+              "reasonMatches": {
+                "type": "string",
+                "description": "Substring the refusal reason must contain."
+              }
+            }
+          }
+        },
+        "occurrences": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "automationId",
+              "state"
+            ],
+            "properties": {
+              "automationId": {
+                "type": "string"
+              },
+              "scheduledFor": {
+                "type": "string"
+              },
+              "state": {
+                "type": "string"
+              },
+              "attempt": {
+                "type": "integer"
+              },
+              "failureReasonMatches": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "runs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "automationId",
+              "status"
+            ],
+            "properties": {
+              "automationId": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "ambiguous": {
+                "type": "boolean"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "outputCommit": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
+          }
+        },
+        "dispatchCount": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exact number of runtime launches; the no-duplicate-dispatch gate compares against this."
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string"
+              },
+              "automationId": {
+                "type": "string"
+              },
+              "count": {
+                "type": "integer",
+                "minimum": 1
+              }
+            }
+          }
+        },
+        "replay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "afterCursor",
+            "expectedEventTypes"
+          ],
+          "properties": {
+            "afterCursor": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "expectedEventTypes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "projection": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Expected reducer projection after replay including duplicate delivery."
+        },
+        "receipts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "allVerify": {
+              "type": "boolean"
+            },
+            "outcomes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "verifyAfterRedaction": {
+              "type": "boolean"
+            },
+            "verifyAfterTamper": {
+              "type": "boolean",
+              "description": "Set false to require that a tampered receipt fails verification."
+            }
+          }
+        },
+        "doctor": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "findingCodes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Finding codes doctor must report for the final state."
+            },
+            "noCodes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Finding codes doctor must not report."
+            }
+          }
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "forbiddenSubstrings"
+          ],
+          "properties": {
+            "forbiddenSubstrings": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 4
+              },
+              "description": "Substrings that must never appear in the report/doctor output for this vector (prompt text, secrets, private paths)."
+            }
+          }
+        },
+        "invariants": {
+          "type": "array",
+          "items": {
+            "enum": [
+              "no-duplicate-dispatch-per-fence",
+              "no-silent-eligible-occurrence-loss",
+              "no-false-success-under-injected-failure",
+              "terminal-state-monotonicity",
+              "fence-uniqueness",
+              "bounded-ledger-growth"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "operation": {
+      "type": "object",
+      "required": [
+        "op"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "op": {
+          "enum": [
+            "tick",
+            "advance",
+            "suspend",
+            "resume",
+            "setHostTimezone",
+            "activate",
+            "pause",
+            "runNow",
+            "cancel",
+            "crash",
+            "restart",
+            "runtimeBehavior",
+            "deliveryBehavior",
+            "setRetryPolicy",
+            "grantApproval",
+            "expireApprovals",
+            "revokeFamiliar",
+            "setRuntimeCapabilities",
+            "setAuthority",
+            "setDefinitionRevision",
+            "subscribe",
+            "deliver",
+            "verifyReceipts",
+            "tamperReceipt",
+            "redactReceipts",
+            "erase",
+            "setRetention",
+            "setLeader"
+          ]
+        },
+        "at": {
+          "type": "string",
+          "description": "RFC3339 UTC instant the operation runs at; virtual clock jumps here first when later than the current time."
+        },
+        "automationId": {
+          "type": "string"
+        },
+        "hostTimezone": {
+          "type": "string"
+        },
+        "behavior": {
+          "enum": [
+            "available",
+            "unavailable",
+            "timeout",
+            "lost-after-side-effect",
+            "duplicate-response",
+            "out-of-order-response"
+          ]
+        },
+        "delivery": {
+          "enum": [
+            "commit",
+            "commit-failure"
+          ]
+        },
+        "adoptionKey": {
+          "type": "string"
+        },
+        "during": {
+          "enum": [
+            "plan",
+            "claim",
+            "adoption",
+            "dispatch",
+            "session-create",
+            "first-event",
+            "terminal-observation",
+            "settlement",
+            "delivery",
+            "receipt",
+            "event-publication"
+          ],
+          "description": "Durable or external boundary the crash/failure is injected at."
+        },
+        "reason": {
+          "type": "string"
+        },
+        "available": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "nonce": {
+          "type": "string"
+        },
+        "ttlMinutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "afterCursor": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "times": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "label": {
+          "type": "string",
+          "description": "Labels a refusal expectation for a following operation."
+        },
+        "maxAttempts": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "backoffSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "window": {
+          "type": "string"
+        },
+        "status": {
+          "type": "boolean"
+        },
+        "orchestrator": {
+          "enum": [
+            "direct",
+            "psyche"
+          ]
+        },
+        "runId": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

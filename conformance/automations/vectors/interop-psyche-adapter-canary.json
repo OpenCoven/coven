@@ -1,0 +1,39 @@
+{
+  "vectorId": "canary.psyche-adapter-correlation",
+  "vectorVersion": 1,
+  "profile": "interoperability",
+  "category": "identity-authority",
+  "title": "Cross-repo canary: the Psyche adapter preserves automation/occurrence/run/attempt and binding correlation on pinned artifacts",
+  "deterministic": true,
+  "prerequisites": ["opencoven.psyche.adapter.v1@pinned"],
+  "artifacts": ["coven.automations.authority.v1", "opencoven.psyche.adapter.v1@pinned"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "canary", "name": "Canary", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "familiarId": "charm", "cwd": "work/proj",
+        "prompt": "Run the canary."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "canary",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"]
+      }
+    ],
+    "operations": [
+      { "op": "runNow", "automationId": "canary", "adoptionKey": "psyche-canary", "orchestrator": "psyche", "at": "2026-03-01T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "canary", "status": "succeeded" }],
+    "receipts": { "count": 1, "allVerify": true }
+  }
+}

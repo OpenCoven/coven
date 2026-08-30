@@ -1,0 +1,40 @@
+{
+  "vectorId": "authority.capability-downgrade-refused",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "identity-authority",
+  "title": "A runtime capability downgrade between decision and dispatch refuses the run",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1"],
+  "specRefs": ["coven#857"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "daily",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create", "fs.write"]
+      }
+    ],
+    "operations": [
+      { "op": "setRuntimeCapabilities", "automationId": "daily", "capabilities": ["session.create"] },
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "daily", "state": "failed", "failureReasonMatches": "capability downgrade" }
+    ],
+    "dispatchCount": 0
+  }
+}

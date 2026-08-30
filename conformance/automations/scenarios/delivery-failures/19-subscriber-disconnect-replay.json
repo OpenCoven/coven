@@ -1,0 +1,49 @@
+{
+  "vectorId": "golden.19-subscriber-disconnect-replay",
+  "vectorVersion": 1,
+  "profile": "interoperability",
+  "category": "scenario",
+  "title": "Golden 19: a subscriber disconnects and replays with duplicates; the projection is identical",
+  "deterministic": true,
+  "artifacts": ["coven.automations.event.v1"],
+  "specRefs": ["coven#855", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "subscribe", "afterCursor": 0 },
+      { "op": "deliver", "afterCursor": 0, "times": 2 }
+    ]
+  },
+  "expected": {
+    "replay": {
+      "afterCursor": 0,
+      "expectedEventTypes": [
+        "definition.created",
+        "occurrence.planned",
+        "occurrence.claimed",
+        "run.started",
+        "occurrence.settled",
+        "run.finished",
+        "receipt.sealed"
+      ]
+    },
+    "projection": {
+      "eventCount": 7,
+      "definition.created": 1,
+      "occurrence.planned": 1,
+      "occurrence.claimed": 1,
+      "run.started": 1,
+      "occurrence.settled": 1,
+      "run.finished": 1,
+      "receipt.sealed": 1
+    }
+  }
+}

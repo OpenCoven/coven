@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/coven.automations.authority.v1.schema.json",
+  "title": "Coven automation authority binding (coven.automations.authority.v1)",
+  "description": "The exact identity and authority a run is authorized under. Dispatch is fail-closed: a run never launches without a binding that verifies at dispatch time, not only at decision time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["automationId", "principalId", "familiarId", "familiarRevision", "runtime", "requiredCapabilities"],
+  "properties": {
+    "automationId": { "type": "string", "minLength": 1 },
+    "principalId": { "type": "string", "minLength": 1 },
+    "familiarId": { "type": "string", "minLength": 1 },
+    "familiarRevision": { "type": "integer", "minimum": 1, "description": "Exact familiar contract revision the run binds to; a revoked or stale revision fails dispatch." },
+    "runtime": { "type": "string", "minLength": 1 },
+    "requiredCapabilities": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Capability set the runtime must hold at dispatch; a downgrade between decision and dispatch refuses the run."
+    },
+    "approval": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required": { "type": "boolean" },
+        "ttlMinutes": { "type": "integer", "minimum": 1 },
+        "nonce": { "type": "string", "description": "Single-use approval nonce; replay is refused and consumption is recorded once." }
+      }
+    }
+  }
+}

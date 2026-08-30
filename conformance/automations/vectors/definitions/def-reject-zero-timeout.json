@@ -1,0 +1,31 @@
+{
+  "vectorId": "definitions.reject-zero-timeout",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "A zero timeout is refused; timeouts are bounded and required",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816", "coven#856"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 1,
+        "id": "no-timeout",
+        "name": "No timeout",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 0,
+        "runtime": "coven-code",
+        "prompt": "Do the thing."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "below minimum 1" }]
+  }
+}

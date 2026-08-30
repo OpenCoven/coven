@@ -1,0 +1,30 @@
+{
+  "vectorId": "definitions.reject-missing-prompt",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "A definition without a prompt is refused",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 1,
+        "id": "no-prompt",
+        "name": "No prompt",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code"
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "missing required property" }]
+  }
+}

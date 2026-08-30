@@ -1,0 +1,423 @@
+#!/usr/bin/env node
+// Coven automations conformance runner (coven.automations.conformance v1).
+//
+//   node conformance.mjs --profile all --target reference --report reports/last-run.json
+//
+// Standalone and dependency-free: loads the versioned manifest, schemas, and
+// vectors, validates every vector against the envelope schema, and executes
+// them against a target. The default target is the plane's own reference
+// oracle. A daemon endpoint or packaged release can be certified the same way
+// once it advertises `coven.automations.conformance.v1`; until then those
+// vectors are reported as skipped, never silently passed.
+//
+// Output is machine-readable (conformance.report.v1), carries exact source
+// revisions and artifact digests, and is redacted before writing.
+
+import { createHash } from 'node:crypto';
+import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { validateAgainstSchema } from './lib/schema.mjs';
+import { evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
+import { redactText, REDACTION_RULES } from './lib/redact.mjs';
+
+export const PLANE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+export const PLANE_VERSION = '1.0.0';
+export const PROFILES = [
+  'structural',
+  'scheduler-reliability',
+  'runtime-authority',
+  'continuity',
+  'privacy',
+  'interoperability',
+  'full'
+];
+const REQUIRED_PROFILES = [
+  'structural',
+  'scheduler-reliability',
+  'runtime-authority',
+  'continuity',
+  'privacy',
+  'interoperability'
+];
+
+async function walkJsonFiles(root) {
+  const files = [];
+  let entries;
+  try {
+    entries = await readdir(root, { withFileTypes: true });
+  } catch {
+    return files;
+  }
+  for (const entry of entries.sort((a, b) => (a.name < b.name ? -1 : 1))) {
+    const full = join(root, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...(await walkJsonFiles(full)));
+    } else if (entry.name.endsWith('.json')) {
+      files.push(full);
+    }
+  }
+  return files;
+}
+
+// Loads and validates every vector file. Throws with the file name when a
+// vector fails the envelope schema, so a malformed vector can never count as
+// a passing certification.
+export async function loadVectors(planeRoot = PLANE_ROOT) {
+  const envelopeSchema = JSON.parse(
+    await readFile(join(planeRoot, 'schemas', 'conformance.vector.v1.schema.json'), 'utf8')
+  );
+  const definitionSchema = JSON.parse(
+    await readFile(
+      join(planeRoot, 'schemas', 'coven.automations.definition.v1.schema.json'),
+      'utf8'
+    )
+  );
+  const vectors = [];
+  for (const root of ['vectors', 'scenarios']) {
+    for (const file of await walkJsonFiles(join(planeRoot, root))) {
+      const document = JSON.parse(await readFile(file, 'utf8'));
+      const errors = validateAgainstSchema(document, envelopeSchema);
+      if (errors.length > 0) {
+        throw new Error(
+          `vector ${relative(planeRoot, file)} failed the conformance.vector.v1 envelope:\n  ${errors.join('\n  ')}`
+        );
+      }
+      vectors.push({ file: relative(planeRoot, file), vector: document });
+    }
+  }
+  return { vectors, definitionSchema };
+}
+
+// Runs one vector on a target. The reference oracle executes everything;
+// daemon and packaged targets must advertise the conformance capability and
+// are otherwise recorded as skipped.
+export async function runOnTarget(vector, target) {
+  const capabilities = target.capabilities ?? [];
+  const unmet = (vector.prerequisites ?? []).filter(
+    (prerequisite) => !capabilities.includes(prerequisite)
+  );
+  if (unmet.length > 0) {
+    return {
+      status: 'skipped',
+      failures: [],
+      reason: `prerequisites not met on this target: ${unmet.join(', ')}`
+    };
+  }
+  if (target.kind === 'reference-oracle') {
+    const { failures } = evaluateVector(vector, { definitionSchema: target.definitionSchema });
+    return { status: failures.length === 0 ? 'passed' : 'failed', failures };
+  }
+  const capability = await target.probe?.();
+  if (!capability) {
+    return { status: 'skipped', failures: [], reason: 'target does not advertise coven.automations.conformance.v1' };
+  }
+  const result = await target.evaluate?.(vector);
+  if (!result) {
+    return { status: 'skipped', failures: [], reason: 'target adapter has no evaluator for this vector' };
+  }
+  return result;
+}
+
+function sha256File(buffer) {
+  return `sha256-${createHash('sha256').update(buffer).digest('hex')}`;
+}
+
+function gitCommit() {
+  const result = spawnSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
+// Scrubs prompts and irrelevant absolute paths from anything about to be
+// published (delegates to the shared redaction module).
+export function redactReportText(text, prompts) {
+  return redactText(text, prompts);
+}
+
+function profileResult(entries) {
+  const passed = entries.filter((entry) => entry.status === 'passed').length;
+  const failed = entries.filter((entry) => entry.status === 'failed').length;
+  const skipped = entries.filter((entry) => entry.status === 'skipped').length;
+  const artifacts = [
+    ...new Set(
+      entries
+        .filter((entry) => entry.status === 'passed')
+        .flatMap((entry) => entry.vector.artifacts ?? [])
+    )
+  ].sort();
+  return {
+    status: failed > 0 ? 'failed' : 'passed',
+    passed,
+    failed,
+    skipped,
+    artifacts,
+    vectorIds: entries.map((entry) => entry.vector.vectorId)
+  };
+}
+
+export function parseArgs(argv) {
+  const options = {
+    profile: 'all',
+    target: 'reference-oracle',
+    report: join(PLANE_ROOT, 'reports', 'last-run.json'),
+    vector: null,
+    slo: null,
+    fuzz: 0,
+    seed: 858,
+    list: false,
+    quiet: false
+  };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    const take = () => {
+      if (arg.includes('=')) return arg.slice(arg.indexOf('=') + 1);
+      index += 1;
+      return argv[index];
+    };
+    if (arg === '--list') options.list = true;
+    else if (arg === '--quiet') options.quiet = true;
+    else if (arg.startsWith('--profile')) options.profile = take();
+    else if (arg.startsWith('--target')) options.target = take();
+    else if (arg.startsWith('--report')) options.report = take();
+    else if (arg.startsWith('--vector')) options.vector = take();
+    else if (arg.startsWith('--slo')) options.slo = take();
+    else if (arg.startsWith('--fuzz')) options.fuzz = Number(take());
+    else if (arg.startsWith('--seed')) options.seed = Number(take());
+    else throw new Error(`unknown argument: ${arg}`);
+  }
+  if (!PROFILES.includes(options.profile) && options.profile !== 'all') {
+    throw new Error(`unknown profile: ${options.profile}`);
+  }
+  return options;
+}
+
+export async function runConformance(options, planeRoot = PLANE_ROOT) {
+  const { vectors, definitionSchema } = await loadVectors(planeRoot);
+  const selected = options.vector
+    ? vectors.filter((entry) => entry.vector.vectorId === options.vector)
+    : vectors.filter(
+        (entry) =>
+          options.profile === 'all' ||
+          entry.vector.profile === options.profile ||
+          options.profile === 'full'
+      );
+  if (selected.length === 0) {
+    throw new Error(`no vectors selected (profile=${options.profile}, vector=${options.vector})`);
+  }
+
+  const target = {
+    kind: options.target,
+    definitionSchema,
+    capabilities: options.target === 'reference-oracle' ? ['reference-oracle'] : []
+  };
+  const results = [];
+  for (const entry of selected) {
+    const outcome = await runOnTarget(entry.vector, target);
+    results.push({
+      vector: entry.vector,
+      file: entry.file,
+      status: outcome.status,
+      failures: outcome.failures ?? [],
+      reason: outcome.reason
+    });
+  }
+
+  const failures = results.flatMap((entry) =>
+    entry.failures.map((item) => ({ ...item, vectorId: item.vectorId ?? entry.vector.vectorId }))
+  );
+
+  // Randomized property testing folds into the scheduler profile.
+  let fuzz = null;
+  if (options.fuzz > 0) {
+    fuzz = fuzzInvariants({ operations: options.fuzz, seed: options.seed });
+    for (const violation of fuzz.violations) {
+      failures.push({
+        vectorId: `fuzz-seed-${options.seed}`,
+        profile: 'scheduler-reliability',
+        invariant: violation.invariant ?? 'randomized-invariant',
+        objectIds: [],
+        eventCursor: null,
+        expected: 'invariant holds under randomized operations',
+        observed: `step ${violation.step} (${violation.op}): ${violation.observed}`,
+        reproduction: `node conformance/automations/runner/conformance.mjs --fuzz ${options.fuzz} --seed ${options.seed}`
+      });
+    }
+  }
+
+  const profileEntries = (profile) =>
+    results.filter(
+      (entry) => entry.vector.profile === profile || (profile === 'full' && true)
+    );
+  const profiles = {};
+  for (const profile of PROFILES) {
+    const entries =
+      profile === 'full'
+        ? results
+        : results.filter((entry) => entry.vector.profile === profile);
+    const result = profileResult(entries);
+    profiles[profile] = result;
+  }
+
+  // Collect definition prompts so report text can be scrubbed.
+  const prompts = new Set();
+  for (const entry of vectors) {
+    for (const document of entry.vector.input?.definitions ?? []) {
+      if (document.prompt) prompts.add(document.prompt);
+    }
+    for (const document of entry.vector.input?.invalidDefinitions ?? []) {
+      if (document.prompt) prompts.add(document.prompt);
+    }
+  }
+
+  const artifactDigests = {};
+  for (const file of await walkJsonFiles(planeRoot)) {
+    artifactDigests[relative(planeRoot, file)] = sha256File(await readFile(file));
+  }
+  for (const file of ['manifest.json']) {
+    try {
+      artifactDigests[file] = sha256File(await readFile(join(planeRoot, file)));
+    } catch {
+      // manifest is optional for report assembly
+    }
+  }
+
+  const sloResult = { profile: null, status: 'not-run' };
+  if (options.slo) {
+    const gate = await evaluateSloGate(options.slo, planeRoot);
+    sloResult.profile = gate.profile;
+    sloResult.status = gate.status;
+  }
+
+  const executedProfiles = REQUIRED_PROFILES.filter((profile) => profiles[profile].passed + profiles[profile].failed > 0);
+  // A single-vector or single-profile run asserts exactly what it names;
+  // only a full-plane run (all/full) must cover every required profile.
+  const scopedRun = options.vector || (options.profile !== 'all' && options.profile !== 'full');
+  const missingProfiles = scopedRun
+    ? []
+    : REQUIRED_PROFILES.filter((profile) => profiles[profile].passed + profiles[profile].failed === 0);
+  const gateStatus =
+    failures.length === 0 && missingProfiles.length === 0 && (sloResult.status !== 'failed')
+      ? 'passed'
+      : 'failed';
+
+  const report = {
+    reportVersion: 1,
+    plane: 'coven.automations.conformance',
+    planeVersion: PLANE_VERSION,
+    generatedAt: new Date().toISOString(),
+    target: {
+      kind: options.target,
+      name: options.target === 'reference-oracle' ? 'reference-oracle' : options.target,
+      version: PLANE_VERSION,
+      revisions: { sourceCommit: gitCommit(), runnerVersion: PLANE_VERSION },
+      endpoint: null
+    },
+    environment: {
+      node: process.version,
+      os: process.platform,
+      arch: process.arch,
+      hostTimezone: Intl.DateTimeFormat().resolvedOptions().timeZone ?? null
+    },
+    artifactDigests,
+    profiles,
+    failures,
+    skipped: results
+      .filter((entry) => entry.status === 'skipped')
+      .map((entry) => ({ vectorId: entry.vector.vectorId, reason: entry.reason ?? 'skipped' })),
+    slo: sloResult,
+    redaction: {
+      applied: true,
+      rules: REDACTION_RULES
+    },
+    gate: {
+      status: gateStatus,
+      requiredProfiles: REQUIRED_PROFILES,
+      notes:
+        missingProfiles.length > 0
+          ? `profiles without executable vectors on this target: ${missingProfiles.join(', ')}`
+          : fuzz
+            ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
+            : undefined
+    }
+  };
+
+  // The redacted receipt is the report's only published form: write it here
+  // so every caller (CLI, agent-check, CI) gets the same artifact.
+  if (options.report) {
+    await mkdir(dirname(options.report), { recursive: true });
+    await writeFile(options.report, redactReportText(JSON.stringify(report, null, 2), [...prompts]) + '\n');
+  }
+
+  return { report, prompts, selectedCount: selected.length };
+}
+
+// SLO gate: validates a measured report against slo/slo.v1.json. Gates that
+// need the real binary stay 'provisional' until measured; the hard invariants
+// (no duplicate dispatch, no silent loss, no false success) come from the
+// conformance run itself.
+export async function evaluateSloGate(measuredPath, planeRoot = PLANE_ROOT) {
+  const slo = JSON.parse(await readFile(join(planeRoot, 'slo', 'slo.v1.json'), 'utf8'));
+  const measured = JSON.parse(await readFile(measuredPath, 'utf8'));
+  const values = new Map(
+    (measured.measures ?? []).map((measure) => [measure.id, measure.value])
+  );
+  let failed = false;
+  let measuredCount = 0;
+  for (const measure of slo.measures ?? []) {
+    const value = values.get(measure.id);
+    if (value === undefined) continue;
+    measuredCount += 1;
+    if (measure.direction === 'lower-is-better' && value > measure.gate) failed = true;
+    if (measure.direction === 'higher-is-better' && value < measure.gate) failed = true;
+  }
+  return {
+    profile: slo.profile ?? 'coven.automations.slo.v1',
+    status: measuredCount === 0 ? 'provisional' : failed ? 'failed' : 'passed'
+  };
+}
+
+export async function main(argv = process.argv.slice(2)) {
+  const options = parseArgs(argv);
+  if (options.list) {
+    const { vectors } = await loadVectors();
+    for (const entry of vectors) {
+      console.log(`${entry.vector.profile}\t${entry.vector.category}\t${entry.vector.vectorId}`);
+    }
+    return 0;
+  }
+  const { report, selectedCount } = await runConformance(options);
+  if (!options.quiet) {
+    const summary = {
+      plane: report.plane,
+      planeVersion: report.planeVersion,
+      target: report.target.kind,
+      vectors: selectedCount,
+      profiles: Object.fromEntries(
+        Object.entries(report.profiles).map(([name, result]) => [
+          name,
+          `${result.passed} passed / ${result.failed} failed / ${result.skipped} skipped`
+        ])
+      ),
+      failures: report.failures.length,
+      slo: report.slo.status,
+      gate: report.gate.status,
+      report: options.report
+    };
+    console.log(JSON.stringify(summary, null, 2));
+  }
+  return report.gate.status === 'passed' ? 0 : 1;
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      console.error(`conformance runner failed: ${error.message}`);
+      process.exitCode = 1;
+    });
+}

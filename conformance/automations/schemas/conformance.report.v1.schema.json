@@ -1,0 +1,133 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/conformance.report.v1.schema.json",
+  "title": "Coven automations conformance report (conformance.report.v1)",
+  "description": "Machine-readable certification output. Names exactly which profile and artifact versions were exercised, carries exact source/release revisions and artifact digests, and identifies failures by invariant, object ids, event cursor, expected/observed state, and a safe reproduction command. Reports redact secrets, raw credentials, private memory, unrestricted prompts, and irrelevant paths before writing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reportVersion", "plane", "planeVersion", "generatedAt", "target", "profiles", "gate"],
+  "properties": {
+    "reportVersion": { "const": 1 },
+    "plane": { "const": "coven.automations.conformance" },
+    "planeVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "generatedAt": { "type": "string" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "enum": ["reference-oracle", "in-process", "daemon", "packaged-release"] },
+        "name": { "type": "string" },
+        "version": { "type": ["string", "null"] },
+        "revisions": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] },
+          "description": "Exact source and release revisions, e.g. sourceCommit, releaseTag, runnerVersion."
+        },
+        "endpoint": { "type": ["string", "null"] }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": { "type": ["string", "null"] },
+        "os": { "type": ["string", "null"] },
+        "arch": { "type": ["string", "null"] },
+        "hostTimezone": { "type": ["string", "null"] }
+      }
+    },
+    "artifactDigests": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "sha256-... digests of the plane artifacts that produced this report."
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["structural", "scheduler-reliability", "runtime-authority", "continuity", "privacy", "interoperability", "full"],
+      "properties": {
+        "structural": { "$ref": "#/$defs/profileResult" },
+        "scheduler-reliability": { "$ref": "#/$defs/profileResult" },
+        "runtime-authority": { "$ref": "#/$defs/profileResult" },
+        "continuity": { "$ref": "#/$defs/profileResult" },
+        "privacy": { "$ref": "#/$defs/profileResult" },
+        "interoperability": { "$ref": "#/$defs/profileResult" },
+        "full": { "$ref": "#/$defs/profileResult" }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["vectorId", "profile", "invariant", "expected", "observed", "reproduction"],
+        "properties": {
+          "vectorId": { "type": "string" },
+          "profile": { "type": "string" },
+          "invariant": { "type": "string" },
+          "objectIds": { "type": "array", "items": { "type": "string" } },
+          "eventCursor": { "type": ["integer", "null"] },
+          "expected": { "type": ["string", "object"] },
+          "observed": { "type": ["string", "object"] },
+          "reproduction": { "type": "string", "description": "Exact safe command to reproduce this single failure." }
+        }
+      }
+    },
+    "skipped": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["vectorId", "reason"],
+        "properties": {
+          "vectorId": { "type": "string" },
+          "reason": { "type": "string" }
+        }
+      },
+      "description": "Vectors not exercised (unmet prerequisites, unsupported platform, external canary artifacts). Skips are reported separately from failures."
+    },
+    "slo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": ["string", "null"] },
+        "status": { "enum": ["not-run", "passed", "failed", "provisional"] }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied", "rules"],
+      "properties": {
+        "applied": { "type": "boolean" },
+        "rules": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["passed", "failed"] },
+        "requiredProfiles": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "profileResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "passed", "failed", "skipped", "artifacts"],
+      "properties": {
+        "status": { "enum": ["passed", "failed", "not-applicable"] },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 },
+        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Exact artifact versions this profile's passing vectors certify." },
+        "vectorIds": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}
