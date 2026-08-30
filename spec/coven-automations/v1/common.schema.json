@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/common.schema.json",
+  "title": "Coven Automations v1 shared definitions",
+  "description": "Shared value definitions for coven.automations.v1. Schemas in this directory reference these via relative $ref. Unknown-field rule: v1 objects set additionalProperties=false and carry optional data only through the explicit extensionBag.",
+  "$defs": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "coven.automations.v1"
+    },
+    "automationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Stable automation identifier; charset and bound match the #816 definition validator."
+    },
+    "occurrenceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "attemptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "receiptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "adoptionKey": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Stable request/adoption (idempotency) key supplied by the caller. Replays of the same command with the same key return the first committed outcome unchanged."
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{3})?Z$",
+      "description": "RFC 3339 UTC, millisecond precision, matching the #816 store encoding (chrono SecondsFormat::Millis)."
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "value"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "canonicalization": { "const": "jcs-rfc8785" },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "Lowercase hex SHA-256 over the RFC 8785 canonical serialization of the covered object."
+        }
+      }
+    },
+    "fenceToken": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic per-occurrence generation. Incremented on every accepted claim; a fence token owns at most one accepted run."
+    },
+    "sequenceNumber": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "principalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principalId"],
+      "properties": {
+        "principalId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+          "description": "Canonical principal identifier from the authority layer. This protocol binds but does not define principal semantics."
+        },
+        "displayName": { "type": "string", "maxLength": 160 }
+      }
+    },
+    "familiarRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["familiarId"],
+      "properties": {
+        "familiarId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Exact familiar identity binding; resolved and owned by the familiar identity layer."
+        }
+      }
+    },
+    "runtimeDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeId", "capabilities"],
+      "properties": {
+        "runtimeId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Harness/runtime identifier, for example coven-code."
+        },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 96 },
+          "uniqueItems": true,
+          "description": "Capability requirement keys the run depends on; advertised by the runtime descriptor layer."
+        },
+        "model": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "approvalRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["approvalPolicyRef"],
+      "properties": {
+        "approvalPolicyRef": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Reference into the authority/approval policy layer; this protocol records the binding, never the decision."
+        },
+        "approvalRecordRef": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "extensionBag": {
+      "type": "object",
+      "additionalProperties": { "$comment": "Extension values are opaque JSON; producers must keep them small and consumers must preserve but never interpret them until understood.", "type": ["object", "string", "number", "boolean", "array", "null"] },
+      "propertyNames": {
+        "pattern": "^(x-[a-z0-9-]+|[a-z0-9.-]+\\.[a-z0-9-]+\\.[a-z0-9-]+)$",
+        "description": "Keys are either x-prefixed (vendor-local) or reverse-DNS namespaced (example com.acme.lift). Untyped keys are rejected."
+      },
+      "description": "Explicit extension bag. Extensions are preserved on round-trip, never required, never influence state, digests, or authorization until they are promoted into a new contract profile."
+    },
+    "misfireDisposition": {
+      "enum": ["none", "collapsed_to_latest", "skipped_overlap", "skipped_paused", "skipped_invalid"],
+      "description": "How planning disposed of this slot relative to the misfire policy. collapsed_to_latest is the #816 misfire-latest semantic."
+    },
+    "privacyClassification": {
+      "enum": ["public", "operational", "sensitive", "restricted"]
+    },
+    "retentionClass": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification"],
+      "properties": {
+        "classification": { "enum": ["ephemeral", "standard", "extended"] },
+        "deleteAfter": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "producerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "instanceId"],
+      "properties": {
+        "component": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "description": "Producing component, for example coven-daemon."
+        },
+        "instanceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Stable instance identifier of the producer."
+        },
+        "implementationVersion": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "Release version of the producing implementation. Never confused with the contract profile."
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["createdBy"],
+      "properties": {
+        "createdBy": { "$ref": "#/$defs/principalRef" },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedBy": { "$ref": "#/$defs/principalRef" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "importedFrom": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Legacy source marker for imported definitions, for example codex.automation.toml."
+        }
+      }
+    },
+    "activationWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "effectiveFrom": { "$ref": "#/$defs/timestamp" },
+        "effectiveUntil": { "$ref": "#/$defs/timestamp" }
+      },
+      "description": "Optional activation window. Outside the window the definition behaves as paused without changing lifecycle state."
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "protocol": "Coven Automations",
+  "contractProfile": "coven.automations.v1",
+  "objects": [
+    "AutomationDefinition",
+    "AutomationOccurrence",
+    "AutomationRun",
+    "AutomationAttempt",
+    "AutomationReceipt",
+    "CommandEnvelope",
+    "CommandResponse",
+    "ErrorEnvelope",
+    "EventEnvelope"
+  ],
+  "schemas": [
+    "common.schema.json",
+    "automation-definition.schema.json",
+    "automation-occurrence.schema.json",
+    "automation-run.schema.json",
+    "automation-attempt.schema.json",
+    "automation-receipt.schema.json",
+    "command-envelope.schema.json",
+    "error-envelope.schema.json",
+    "event-envelope.schema.json"
+  ],
+  "stateMachines": "state-machines.json",
+  "compatibilityMatrix": "compatibility-matrix.json",
+  "goldenVectors": "test-vectors.json",
+  "requiredSuites": [
+    "schema-validation",
+    "rust-round-trip",
+    "state-machine-property-tests",
+    "request-adoption-replay-and-conflict",
+    "expected-revision-conflict",
+    "duplicate-and-out-of-order-event-replay",
+    "typed-transport-domain-error-mapping",
+    "golden-vectors-external-runners",
+    "packed-artifact-canaries"
+  ],
+  "releaseState": "proposed",
+  "productionReady": false,
+  "canaryRequirements": {
+    "coven": "Consumes the schemas and vectors from this directory through a packed/released artifact, not source-relative imports.",
+    "sdk": "Consumes the pinned TypeScript declarations and golden vectors against the exact released artifact version.",
+    "cave": "Consumes the event envelope and read-model reducer vectors against the exact released artifact version."
+  }
+}

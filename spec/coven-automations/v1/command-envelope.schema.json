@@ -1,0 +1,362 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/command-envelope.schema.json",
+  "title": "Coven Automations v1 command and response envelopes",
+  "description": "Every mutating automations operation is one command envelope with a stable adoptionKey (idempotency), an expectedRevision where applicable, authenticated origin context, and explicit intent. Queries use the same envelope; only their semantics differ. A rejected or failed domain operation MUST produce outcome=rejected with a typed error — never an accepted wrapper around a failure. This document validates either a commandEnvelope or a commandResponse; consumers address each shape directly via the $defs pointer.",
+  "oneOf": [
+    { "$ref": "#/$defs/commandEnvelope" },
+    { "$ref": "#/$defs/commandResponse" }
+  ],
+  "$defs": {
+    "commandEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "command", "adoptionKey", "origin", "intent", "payload"],
+      "properties": {
+        "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+        "command": { "$ref": "#/$defs/commandName" },
+        "adoptionKey": { "$ref": "common.schema.json#/$defs/adoptionKey" },
+        "expectedRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required for definition-scoped mutating commands. The revision the caller believes is current; a mismatch commits nothing and returns REVISION_CONFLICT with the current revision."
+        },
+        "origin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["principal", "channel"],
+          "properties": {
+            "principal": { "$ref": "common.schema.json#/$defs/principalRef" },
+            "channel": {
+              "enum": ["daemon-ipc", "http", "control-action", "cli", "sdk", "cave"],
+              "description": "Authenticated transport the command arrived on. Transports that cannot authenticate the principal must be refused upstream; this field records, not decides."
+            },
+            "authenticationClass": { "type": "string", "maxLength": 64 },
+            "requestedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+            "correlationId": { "$ref": "common.schema.json#/$defs/correlationId" }
+          }
+        },
+        "intent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["statement"],
+          "properties": {
+            "statement": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1000,
+              "description": "Human-authored description of what this command intends. Recorded on events and receipts."
+            }
+          }
+        },
+        "payload": {
+          "$comment": "Shape is pinned normatively by the per-command correlation branches under allOf below — the union of payload shapes is deliberately not expressed here because definition.create.v1 and definition.revise.v1 payloads are shape-identical and a union would double-match.",
+          "type": "object"
+        }
+      },
+      "allOf": [
+        { "if": { "properties": { "command": { "const": "definition.create.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionCreate" } } } },
+        { "if": { "properties": { "command": { "const": "definition.revise.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionRevise" } } } },
+        { "if": { "properties": { "command": { "const": "definition.activate.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionTarget" } } } },
+        { "if": { "properties": { "command": { "const": "definition.pause.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionTarget" } } } },
+        { "if": { "properties": { "command": { "const": "definition.disable.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionTarget" } } } },
+        { "if": { "properties": { "command": { "const": "definition.tombstone.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionTarget" } } } },
+        { "if": { "properties": { "command": { "const": "occurrence.runNow.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/runNow" } } } },
+        { "if": { "properties": { "command": { "const": "occurrence.cancel.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/occurrenceCancel" } } } },
+        { "if": { "properties": { "command": { "const": "run.cancel.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/runCancel" } } } },
+        { "if": { "properties": { "command": { "const": "attempt.cancel.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/attemptCancel" } } } },
+        { "if": { "properties": { "command": { "const": "attempt.retry.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/attemptRetry" } } } },
+        { "if": { "properties": { "command": { "const": "occurrence.recover.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/occurrenceRecover" } } } },
+        { "if": { "properties": { "command": { "const": "definition.list.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionList" } } } },
+        { "if": { "properties": { "command": { "const": "definition.get.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionGet" } } } },
+        { "if": { "properties": { "command": { "const": "run.history.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/runHistory" } } } },
+        { "if": { "properties": { "command": { "const": "definition.health.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/definitionHealth" } } } },
+        { "if": { "properties": { "command": { "const": "events.read.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/eventsRead" } } } },
+        { "if": { "properties": { "command": { "const": "events.subscribe.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/eventsSubscribe" } } } },
+        { "if": { "properties": { "command": { "const": "legacy.import.v1" } } }, "then": { "properties": { "payload": { "$ref": "#/$defs/legacyImport" } } } },
+        { "if": { "properties": { "command": { "enum": ["definition.revise.v1", "definition.activate.v1", "definition.pause.v1", "definition.disable.v1", "definition.tombstone.v1"] } } }, "then": { "required": ["expectedRevision"] }, "else": { "not": { "required": ["expectedRevision"] } } }
+      ]
+    },
+    "commandName": {
+      "enum": [        "definition.create.v1",
+        "definition.revise.v1",
+        "definition.activate.v1",
+        "definition.pause.v1",
+        "definition.disable.v1",
+        "definition.tombstone.v1",
+        "occurrence.runNow.v1",
+        "occurrence.cancel.v1",
+        "run.cancel.v1",
+        "attempt.cancel.v1",
+        "attempt.retry.v1",
+        "occurrence.recover.v1",
+        "definition.list.v1",
+        "definition.get.v1",
+        "run.history.v1",
+        "definition.health.v1",
+        "events.read.v1",
+        "events.subscribe.v1",
+        "legacy.import.v1"
+      ]
+    },
+    "definitionCreate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition"],
+      "properties": {
+        "definition": { "$ref": "automation-definition.schema.json" }
+      }
+    },
+    "definitionRevise": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definition"],
+      "properties": {
+        "definition": {
+          "$ref": "automation-definition.schema.json",
+          "description": "The full next-revision definition body. The command's expectedRevision is the revision being replaced; the accepted response carries revision = expectedRevision + 1."
+        }
+      }
+    },
+    "definitionTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automationId"],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+        "reason": { "type": "string", "maxLength": 500 }
+      },
+      "description": "Payload for activate, pause, disable, and tombstone."
+    },
+    "runNow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automationId"],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+        "note": { "type": "string", "maxLength": 500 },
+        "bypassEligibility": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true the occurrence is planned and claimed immediately without condition evaluation; lifecycle state and policy (timeout, overlap) still apply."
+        }
+      }
+    },
+    "occurrenceCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["occurrenceId"],
+      "properties": {
+        "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+        "reason": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "runCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId"],
+      "properties": {
+        "runId": { "$ref": "common.schema.json#/$defs/runId" },
+        "reason": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "attemptCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attemptId"],
+      "properties": {
+        "attemptId": { "$ref": "common.schema.json#/$defs/attemptId" },
+        "reason": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "attemptRetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "priorAttemptNumber", "priorDisposition"],
+      "properties": {
+        "runId": { "$ref": "common.schema.json#/$defs/runId" },
+        "priorAttemptNumber": { "type": "integer", "minimum": 1 },
+        "priorDisposition": {
+          "enum": ["failed", "timed_out", "cancelled"],
+          "description": "Explicit prior disposition the retry is issued against. `ambiguous` is deliberately absent here: retrying ambiguous work requires occurrence.recover.v1 with an operator's explicit statement."
+        },
+        "note": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "occurrenceRecover": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["occurrenceId", "evidenceDetermination"],
+      "properties": {
+        "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+        "evidenceDetermination": {
+          "enum": ["failed_deterministic", "retry_with_new_attempt"],
+          "description": "The operator's explicit determination of the ambiguous work. failed_deterministic settles the occurrence failed; retry_with_new_attempt opens a new attempt carrying the ambiguous prior disposition."
+        },
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "Operator's signed-off rationale; recorded on the event and any receipt."
+        }
+      }
+    },
+    "definitionList": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "lifecycleState": {
+          "enum": ["draft", "paused", "active", "disabled", "invalid", "tombstoned", "all"]
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "cursor": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "definitionGet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automationId"],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Omit for the current revision; supply to read a historical revision, which is served immutable."
+        }
+      }
+    },
+    "runHistory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automationId"],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+        "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 },
+        "cursor": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "definitionHealth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["automationId"],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/automationId" }
+      }
+    },
+    "eventsRead": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream"],
+      "properties": {
+        "stream": { "$ref": "#/$defs/streamRef" },
+        "after": {
+          "$ref": "common.schema.json#/$defs/sequenceNumber",
+          "description": "Exclusive lower sequence bound. Omit with `from` to start from the stream beginning."
+        },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
+        "from": {
+          "$ref": "common.schema.json#/$defs/timestamp",
+          "description": "Alternative entry: replay from the first event recorded at or after this instant, resolving to a concrete cursor in the response."
+        }
+      }
+    },
+    "eventsSubscribe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stream"],
+      "properties": {
+        "stream": { "$ref": "#/$defs/streamRef" },
+        "after": { "$ref": "common.schema.json#/$defs/sequenceNumber" },
+        "checkpoint": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Opaque cursor from a prior read/subscribe response. Expired checkpoints yield CURSOR_EXPIRED with the expiry instant, never a silent rewind."
+        }
+      }
+    },
+    "legacyImport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "properties": {
+        "source": {
+          "enum": ["codex-automation-toml"],
+          "description": "v1 supports the #816 non-destructive Codex import; imported definitions are created PAUSED (draft in v1 lifecycle terms) with provenance.importedFrom set."
+        },
+        "dryRun": {
+          "type": "boolean",
+          "default": false,
+          "description": "Report what would import, skip, and fail without writing."
+        }
+      }
+    },
+    "streamRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": {
+          "enum": ["automation", "occurrence", "run", "feed"]
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 320,
+          "description": "automationId / occurrenceId / runId; empty string for the global feed."
+        }
+      }
+    },
+    "commandResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "command", "adoptionKey", "outcome"],
+      "properties": {
+        "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+        "command": { "$ref": "#/$defs/commandName" },
+        "adoptionKey": { "$ref": "common.schema.json#/$defs/adoptionKey" },
+        "outcome": {
+          "enum": ["committed", "replayed", "rejected"],
+          "description": "committed: first time this adoptionKey committed. replayed: this exact adoptionKey committed before; the original committed result is returned unchanged and idempotent. rejected: nothing committed; see error. There is no accepted-but-failed shape: a domain failure is always outcome=rejected."
+        },
+        "replay": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["firstCommittedAt"],
+          "properties": {
+            "firstCommittedAt": { "$ref": "common.schema.json#/$defs/timestamp" }
+          },
+          "description": "Present if and only if outcome=replayed."
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Definition revision after a committed or replayed definition-scoped mutation."
+        },
+        "result": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Command-specific committed result: definition/occurrence/run/attempt projections, health snapshot, event page, or import report. Present only for committed/replayed outcomes."
+        },
+        "error": {
+          "$ref": "error-envelope.schema.json#/$defs/errorEnvelope",
+          "description": "Present if and only if outcome=rejected."
+        },
+        "receiptRef": {
+          "$ref": "common.schema.json#/$defs/receiptId",
+          "description": "Receipt produced by this command, when one exists."
+        },
+        "eventRef": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["stream", "sequence"],
+          "properties": {
+            "stream": { "type": "string", "minLength": 1, "maxLength": 400 },
+            "sequence": { "$ref": "common.schema.json#/$defs/sequenceNumber" }
+          },
+          "description": "Position of the event this command appended, for clients that follow the changefeed."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/automation-occurrence.schema.json",
+  "title": "Coven Automations v1 AutomationOccurrence",
+  "description": "One scheduled or requested execution slot of one exact definition revision. Occurrences are immutable history anchors: their automationRevision never changes, and terminal states never regress. State transitions are governed by state-machines.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "occurrenceId",
+    "automationId",
+    "automationRevision",
+    "triggerIdentity",
+    "occurrenceKey",
+    "scheduledFor",
+    "state",
+    "stateReason",
+    "fence",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+    "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+    "automationRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Exact definition revision this occurrence executes against. Never rewritten when the definition is revised; historical occurrences are never reinterpreted by current definitions."
+    },
+    "triggerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": {
+          "enum": ["schedule.slot", "manual.request"]
+        },
+        "rruleRef": {
+          "type": "string",
+          "maxLength": 512,
+          "description": "Required for schedule.slot: the RRULE the slot was computed from."
+        },
+        "requestedBy": { "$ref": "common.schema.json#/$defs/principalRef" }
+      }
+    },
+    "occurrenceKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 320,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@:-]*$",
+      "description": "Canonical occurrence key: `automationId@scheduledFor` for schedule slots (scheduledFor in RFC 3339 millis), `automationId@manual-<adoptionKey>` for manual requests. The store fence UNIQUE(automation_id, scheduled_for) of #816 is the implementation of this key."
+    },
+    "scheduledFor": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "observedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the trigger was observed by the planner; may differ from scheduledFor by misfire disposition."
+    },
+    "eligibleAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the occurrence passed eligibility (conditions and policies) and became claimable."
+    },
+    "state": {
+      "enum": [
+        "planned",
+        "eligible",
+        "claimed",
+        "dispatching",
+        "running",
+        "recovering",
+        "recovery_required",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "skipped",
+        "superseded"
+      ],
+      "description": "Occurrence lifecycle state per state-machines.json."
+    },
+    "stateReason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500,
+      "description": "Machine-readable reason the current state was entered, for example lease_expired, launch_refused, overlap_forbid, superseded_by_revision_3."
+    },
+    "fence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["generation"],
+      "properties": {
+        "generation": { "$ref": "common.schema.json#/$defs/fenceToken" },
+        "claimedBy": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Claimant identity (scheduler or dispatcher instance)."
+        },
+        "leaseExpiresAt": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "misfireDisposition": {
+      "$ref": "common.schema.json#/$defs/misfireDisposition",
+      "default": "none"
+    },
+    "createdAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the occurrence was fenced; mirrors the #816 store column."
+    },
+    "updatedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the occurrence row last changed; mirrors the #816 store column."
+    },
+    "claimMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["claimedAt", "leaseMinutes"],
+      "properties": {
+        "claimedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "leaseMinutes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1440,
+          "description": "Bounded lease per #816 claim semantics (1..=1440 minutes)."
+        }
+      }
+    },
+    "activeRunRef": {
+      "$ref": "common.schema.json#/$defs/runId",
+      "description": "Present while exactly one accepted run owns this occurrence fence. At most one run may be accepted per fence generation."
+    },
+    "cancellation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestedAt"],
+      "properties": {
+        "requestedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "requestedBy": { "$ref": "common.schema.json#/$defs/principalRef" },
+        "acknowledgedAt": {
+          "$ref": "common.schema.json#/$defs/timestamp",
+          "description": "Cancellation is a request until acknowledged or reconciled; this field records the acknowledgment, not the intent."
+        },
+        "reconciledAt": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enteredAt"],
+      "properties": {
+        "enteredAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "evidence": {
+          "enum": ["lease_expired", "dispatch_unconfirmed", "runtime_lost"],
+          "description": "Expired or missing runtime evidence that moved this occurrence into recovering/recovery_required."
+        },
+        "resolvedDisposition": {
+          "enum": ["failed_deterministic", "failed_ambiguous"],
+          "description": "Set when recovery resolves. failed_deterministic means no side effects were possible; failed_ambiguous means side effects cannot be ruled out and no automatic retry may occur."
+        }
+      }
+    },
+    "eventWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["firstSequence", "lastSequence"],
+      "properties": {
+        "firstSequence": { "$ref": "common.schema.json#/$defs/sequenceNumber" },
+        "lastSequence": {
+          "$ref": "common.schema.json#/$defs/sequenceNumber",
+          "description": "Inclusive upper bound of this occurrence's stream events at the time this representation was read."
+        }
+      },
+      "description": "Event sequence boundaries in the occurrence's authoritative stream, enabling clients to resume change reading without gaps."
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensionBag" }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "protocol": "Coven Automations",
+  "contractProfile": "coven.automations.v1",
+  "version": 1,
+  "status": "proposed",
+  "canonicalization": "jcs-rfc8785",
+  "digestAlgorithm": "sha256",
+  "profiles": [
+    "coven.automations.v1"
+  ],
+  "refusedProfiles": [
+    "coven.automations.v0"
+  ],
+  "unknownProfileBehavior": "fail-closed",
+  "contractVersionVsRelease": {
+    "contractProfile": "Identifies the wire contract only. Changes if and only if the published schema, state machine, or compatibility rules change.",
+    "implementationVersion": "Carried by the producing implementation (for example the Coven daemon release) and is independent of the contract profile. Clients must never infer contract semantics from an implementation version.",
+    "producerIdentity": "Event and receipt envelopes carry the producing implementation's identity and version alongside the contract profile."
+  },
+  "wireNotes": [
+    "All objects in this profile are JSON per draft 2020-12 schemas in this directory.",
+    "Digests and any future signatures are computed over RFC 8785 (JCS) canonical JSON, never over ad-hoc serialization.",
+    "Timestamps are RFC 3339 UTC with millisecond precision (for example 2026-08-30T09:00:00.000Z), matching the #816 store encoding."
+  ]
+}

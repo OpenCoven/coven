@@ -1,0 +1,100 @@
+{
+  "contractProfile": "coven.automations.v1",
+  "version": 1,
+  "notes": [
+    "Machine-readable compatibility matrix for coven.automations.v1.",
+    "changeClass defines what a future change to any field or variant is, and what a v1 consumer/producer must do when it meets it.",
+    "Consumers and producers must refuse incompatible profiles explicitly with SCHEMA_VERSION_UNSUPPORTED; they never approximate or degrade silently."
+  ],
+  "changeClasses": [
+    {
+      "id": "additive-variant",
+      "definition": "A new trigger/condition/action variant or policy value is added to a union.",
+      "v1ConsumerBehavior": "fail-closed per variant: refuse with CAPABILITY_UNSUPPORTED naming the variant. Unions are open in future profiles, closed in v1 readers.",
+      "profileImpact": "none; same major profile, consumers negotiate via capabilities.json"
+    },
+    {
+      "id": "additive-extension",
+      "definition": "A new key inside `extensions`.",
+      "v1ConsumerBehavior": "preserve, never interpret; round-trip verbatim.",
+      "profileImpact": "none"
+    },
+    {
+      "id": "additive-optional-field",
+      "definition": "A new optional top-level or nested field is introduced.",
+      "v1ConsumerBehavior": "v1 readers reject unknown fields (additionalProperties=false). Producers introduce such fields only under a new minor profile (for example coven.automations.v1.1) and dual-emit while consumers migrate.",
+      "profileImpact": "minor profile bump"
+    },
+    {
+      "id": "incompatible-field-change",
+      "definition": "A field changes meaning, type, requirement, or is removed/renamed.",
+      "v1ConsumerBehavior": "refuse the profile explicitly with SCHEMA_VERSION_UNSUPPORTED.",
+      "profileImpact": "new major profile (coven.automations.v2); v1 is frozen"
+    },
+    {
+      "id": "state-machine-change",
+      "definition": "A state, transition, guard, or invariant in state-machines.json changes.",
+      "v1ConsumerBehavior": "refuse; lifecycle semantics are the contract's core and are never evolved additively.",
+      "profileImpact": "new major profile"
+    }
+  ],
+  "objectFields": [
+    { "object": "AutomationDefinition", "field": "schemaVersion", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "automationId", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "revision", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "integrity", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "lifecycleState", "status": "required-since-v1", "changeClass": "state-machine-change" },
+    { "object": "AutomationDefinition", "field": "deletion", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationDefinition", "field": "display", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "trigger", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationDefinition", "field": "conditions", "status": "optional-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationDefinition", "field": "action", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationDefinition", "field": "binding", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "runtimeRequirements", "status": "required-for-active", "changeClass": "additive-optional-field" },
+    { "object": "AutomationDefinition", "field": "policies", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationDefinition", "field": "provenance", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationDefinition", "field": "activation", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationDefinition", "field": "extensions", "status": "optional-since-v1", "changeClass": "additive-extension" },
+    { "object": "AutomationOccurrence", "field": "occurrenceKey", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationOccurrence", "field": "automationRevision", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationOccurrence", "field": "state", "status": "required-since-v1", "changeClass": "state-machine-change" },
+    { "object": "AutomationOccurrence", "field": "fence", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationOccurrence", "field": "misfireDisposition", "status": "optional-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationOccurrence", "field": "activeRunRef", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationOccurrence", "field": "cancellation", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationOccurrence", "field": "recovery", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationOccurrence", "field": "eventWindow", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationRun", "field": "binding", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationRun", "field": "state", "status": "required-since-v1", "changeClass": "state-machine-change" },
+    { "object": "AutomationRun", "field": "attemptCount", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationRun", "field": "terminalDisposition", "status": "required-when-terminal", "changeClass": "additive-optional-field" },
+    { "object": "AutomationRun", "field": "delivery", "status": "optional-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationRun", "field": "receiptRef", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationAttempt", "field": "attemptNumber", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationAttempt", "field": "adoptionKey", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationAttempt", "field": "dispatchFence", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationAttempt", "field": "priorDisposition", "status": "required-for-retries", "changeClass": "additive-optional-field" },
+    { "object": "AutomationAttempt", "field": "workerCorrelation", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationAttempt", "field": "leaseObservations", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationAttempt", "field": "outputCursors", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "AutomationAttempt", "field": "state", "status": "required-since-v1", "changeClass": "state-machine-change" },
+    { "object": "AutomationReceipt", "field": "receiptId", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationReceipt", "field": "integrity", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationReceipt", "field": "sideEffectClass", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationReceipt", "field": "privacy", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "EventEnvelope", "field": "eventId", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "EventEnvelope", "field": "stream", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "EventEnvelope", "field": "sequence", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "EventEnvelope", "field": "kind", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "EventEnvelope", "field": "causation", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "EventEnvelope", "field": "integrity", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
+    { "object": "CommandEnvelope", "field": "adoptionKey", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "CommandEnvelope", "field": "expectedRevision", "status": "required-for-definition-mutations", "changeClass": "incompatible-field-change" },
+    { "object": "CommandEnvelope", "field": "origin", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
+    { "object": "CommandEnvelope", "field": "intent", "status": "required-since-v1", "changeClass": "incompatible-field-change" }
+  ],
+  "profileRefusal": {
+    "rule": "A consumer that receives a schemaVersion it does not implement refuses the object with SCHEMA_VERSION_UNSUPPORTED and stops; it must not skip unknown versions, must not coerce, and must not reinterpret.",
+    "negotiation": "Producers advertise implemented profiles via protocol-version.json; callers pin the profile at session start."
+  }
+}

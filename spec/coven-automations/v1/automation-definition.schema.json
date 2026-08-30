@@ -1,0 +1,317 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/automation-definition.schema.json",
+  "title": "Coven Automations v1 AutomationDefinition",
+  "description": "Durable, Coven-owned automation definition. The definition is the identity and intent anchor; execution state lives in occurrences, runs, and attempts. Unknown top-level fields fail closed; optional data travels only in `extensions`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "automationId",
+    "revision",
+    "integrity",
+    "lifecycleState",
+    "display",
+    "trigger",
+    "action",
+    "binding",
+    "policies"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic per-automation revision. Incremented by exactly one on every accepted mutating command. Occurrences and runs pin the revision they were created and executed against, and are never reinterpreted by later revisions."
+    },
+    "integrity": {
+      "$ref": "common.schema.json#/$defs/digest",
+      "description": "SHA-256 over the RFC 8785 canonical serialization of this object with the `integrity` member removed. Pins the exact definition body a revision means."
+    },
+    "lifecycleState": {
+      "enum": ["draft", "paused", "active", "disabled", "invalid"],
+      "description": "Definition lifecycle per state-machines.json. New definitions start in draft; nothing runs until an explicit activate commits active. Tombstoning is not a state here: it is recorded by the deletion marker and this object is retained for history."
+    },
+    "deletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tombstoned", "requestedAt"],
+      "properties": {
+        "tombstoned": { "const": true },
+        "requestedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "requestedBy": { "$ref": "common.schema.json#/$defs/principalRef" },
+        "reason": { "type": "string", "maxLength": 500 }
+      },
+      "description": "Present if and only if the definition is tombstoned. A tombstoned definition never plans, claims, or runs; its historical occurrences, runs, attempts, and receipts are retained."
+    },
+    "display": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+        "description": { "type": "string", "maxLength": 2000 },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+          "maxItems": 64,
+          "uniqueItems": true
+        }
+      }
+    },
+    "trigger": {
+      "oneOf": [
+        { "$ref": "#/$defs/scheduleTrigger" }
+      ],
+      "description": "Exactly one versioned trigger union. v1 ships the schedule variant; the union admits future variants as new oneOf branches without redefining v1 fields. Consumers must fail closed on unrecognized variants (negative capability negotiation)."
+    },
+    "conditions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/condition" },
+      "maxItems": 16,
+      "default": [],
+      "description": "Zero or more versioned conditions. v1 defines none; the slot exists so future variants are additive."
+    },
+    "action": {
+      "oneOf": [
+        { "$ref": "#/$defs/familiarInvocationAction" }
+      ],
+      "description": "Exactly one versioned action union."
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["familiarBindingPolicy", "authority"],
+      "properties": {
+        "familiarBindingPolicy": {
+          "enum": ["exact"],
+          "description": "v1 ratifies exact binding only: the familiar recorded at activation is the familiar every run binds. Rebinding requires a new revision and re-activation."
+        },
+        "familiarId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Required when familiarBindingPolicy is exact. This protocol references familiar identity; it never defines it."
+        },
+        "authority": {
+          "$ref": "common.schema.json#/$defs/approvalRef",
+          "description": "Authority/approval policy reference. Approval decisions live in the canonical authority layer."
+        }
+      }
+    },
+    "runtimeRequirements": {
+      "$ref": "common.schema.json#/$defs/runtimeDescriptor",
+      "description": "Runtime descriptor and capability requirements every run must satisfy. Required for active definitions."
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["timeout", "retry", "concurrency", "misfire", "retention"],
+      "properties": {
+        "timeout": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["perRunMinutes"],
+          "properties": {
+            "perRunMinutes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 44640,
+              "description": "Bounded and required, matching the #816 validator (1..=44640 minutes)."
+            }
+          }
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["maxAttempts", "backoffPolicy"],
+          "properties": {
+            "maxAttempts": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 10,
+              "default": 1,
+              "description": "Maximum attempts per run. Attempts are new, individually fenced units; the prior attempt is never rewritten. Ambiguous dispositions are never auto-retried."
+            },
+            "backoffPolicy": {
+              "enum": ["none", "fixed", "exponential"],
+              "description": "Retry classification consumed by the dispatcher. Fixed backoff requires backoffSeconds."
+            },
+            "backoffSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 86400
+            },
+            "retryableClasses": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": ["transient_dispatch", "lease_expired", "runtime_unavailable"]
+              },
+              "description": "Failure classes eligible for an automatic next attempt. Everything else, especially ambiguous, requires an explicit recover command."
+            }
+          }
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["overlap"],
+          "properties": {
+            "overlap": {
+              "enum": ["forbid"],
+              "description": "v1 ratifies forbid only: a run is skipped when the previous occurrence has not settled (#816 semantic)."
+            }
+          }
+        },
+        "misfire": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["disposition"],
+          "properties": {
+            "disposition": {
+              "enum": ["latest"],
+              "description": "v1 ratifies latest only: on recovery, exactly the latest missed slot is fenced; earlier slots collapse and are recorded with misfireDisposition collapsed_to_latest."
+            }
+          }
+        },
+        "delivery": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "outputTarget": {
+              "type": "string",
+              "maxLength": 1024,
+              "description": "Optional atomic output path. Delivery commits there only on a completed, verified run."
+            },
+            "mode": {
+              "enum": ["atomic"],
+              "description": "Required when outputTarget is present. v1 supports atomic writes only."
+            }
+          }
+        },
+        "retention": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["occurrenceHistory"],
+          "properties": {
+            "occurrenceHistory": { "$ref": "common.schema.json#/$defs/retentionClass" },
+            "runLogs": { "$ref": "common.schema.json#/$defs/retentionClass" },
+            "receipts": { "$ref": "common.schema.json#/$defs/retentionClass" }
+          }
+        }
+      }
+    },
+    "provenance": {
+      "$ref": "common.schema.json#/$defs/provenance"
+    },
+    "activation": {
+      "$ref": "common.schema.json#/$defs/activationWindow"
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensionBag" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "lifecycleState": { "enum": ["active", "paused", "disabled"] } } },
+      "then": {
+        "required": ["runtimeRequirements"],
+        "properties": {
+          "binding": { "required": ["familiarBindingPolicy", "familiarId", "authority"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "policies": {
+            "properties": {
+              "delivery": { "required": ["outputTarget"] }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "policies": {
+            "properties": {
+              "delivery": { "required": ["outputTarget", "mode"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "policies": {
+            "properties": {
+              "retry": {
+                "properties": { "backoffPolicy": { "const": "fixed" } }
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "policies": {
+            "properties": {
+              "retry": { "required": ["maxAttempts", "backoffPolicy", "backoffSeconds"] }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "scheduleTrigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant", "version", "schedule"],
+      "properties": {
+        "variant": { "const": "schedule" },
+        "version": { "const": 1 },
+        "schedule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["rrule", "timezone"],
+          "properties": {
+            "rrule": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "Scoped RRULE text per the #816 scheduler vocabulary: FREQ=DAILY|WEEKLY, optional BYHOUR list, optional BYDAY list for weekly. Anything else is refused at validation."
+            },
+            "timezone": {
+              "enum": ["local", "utc"]
+            }
+          }
+        }
+      }
+    },
+    "condition": {
+      "$comment": "v1 defines zero condition variants. The boolean-false schema matches nothing, so any value in `conditions` fails validation until a future profile adds branches here additively.",
+      "not": {}
+    },
+    "familiarInvocationAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["variant", "version", "prompt"],
+      "properties": {
+        "variant": { "const": "familiarInvocation" },
+        "version": { "const": 1 },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000,
+          "description": "Non-empty prompt executed verbatim; mirrors the #816 prompt requirement."
+        },
+        "cwd": {
+          "type": "string",
+          "maxLength": 1024,
+          "description": "Working directory for the invocation. Runs without a resolvable cwd fail with a recorded reason rather than guessing a project (#816 runner semantic)."
+        }
+      }
+    }
+  }
+}
