@@ -1,0 +1,129 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/error-envelope.schema.json",
+  "title": "Coven Automations v1 typed error envelope",
+  "description": "Typed errors for every automations failure, with the HTTP and control-action status mapping. Domain failures are errors — they are never wrapped in an accepted/completed outer response merely because routing succeeded. The document root validates an errorEnvelope; the frozen statusMapping remains addressable at #/$defs/statusMapping.",
+  "$ref": "#/$defs/errorEnvelope",
+  "$defs": {
+    "errorCode": {
+      "enum": [
+        "SCHEMA_VERSION_UNSUPPORTED",
+        "VALIDATION_FAILED",
+        "ADOPTION_REPLAY_MISMATCH",
+        "REVISION_CONFLICT",
+        "NOT_FOUND",
+        "GONE_TOMBSTONED",
+        "CAPABILITY_UNSUPPORTED",
+        "ILLEGAL_TRANSITION",
+        "AUTHORITY_REQUIRED",
+        "APPROVAL_REQUIRED",
+        "CANCEL_PENDING",
+        "OVERLAP_FORBIDDEN",
+        "RETRY_DISPOSITION_INVALID",
+        "AMBIGUOUS_RETRY_FORBIDDEN",
+        "CURSOR_EXPIRED",
+        "STREAM_OUT_OF_ORDER",
+        "PAYLOAD_TOO_LARGE",
+        "DEADLINE_EXCEEDED",
+        "CONCURRENCY_LIMIT",
+        "INTERNAL"
+      ]
+    },
+    "errorEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "httpStatus", "message", "retryable"],
+      "properties": {
+        "code": { "$ref": "#/$defs/errorCode" },
+        "httpStatus": {
+          "type": "integer",
+          "minimum": 400,
+          "maximum": 599,
+          "description": "Canonical HTTP status for this error class when surfaced over HTTP or a control-action response."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "Human-readable, safe-to-display description."
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether an identical retry (same adoptionKey for mutations) could succeed after delay."
+        },
+        "details": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Structured specifics: the failing JSON-Schema path for VALIDATION_FAILED, the current revision for REVISION_CONFLICT, the unsupported variant for CAPABILITY_UNSUPPORTED, the expired instant for CURSOR_EXPIRED, and so on."
+        },
+        "adoption": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key"],
+          "properties": {
+            "key": { "$ref": "common.schema.json#/$defs/adoptionKey" },
+            "conflictOutcome": {
+              "enum": ["committed", "rejected"],
+              "description": "For ADOPTION_REPLAY_MISMATCH: what the key actually committed, so callers can reconcile instead of guessing."
+            }
+          },
+          "description": "Present when the error concerns the caller's adoption key."
+        },
+        "currentRevision": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "For REVISION_CONFLICT: the revision the caller must re-read before re-submitting."
+        }
+      }
+    },
+    "statusMapping": {
+      "type": "object",
+      "additionalProperties": { "type": "integer" },
+      "required": [
+        "SCHEMA_VERSION_UNSUPPORTED",
+        "VALIDATION_FAILED",
+        "ADOPTION_REPLAY_MISMATCH",
+        "REVISION_CONFLICT",
+        "NOT_FOUND",
+        "GONE_TOMBSTONED",
+        "CAPABILITY_UNSUPPORTED",
+        "ILLEGAL_TRANSITION",
+        "AUTHORITY_REQUIRED",
+        "APPROVAL_REQUIRED",
+        "CANCEL_PENDING",
+        "OVERLAP_FORBIDDEN",
+        "RETRY_DISPOSITION_INVALID",
+        "AMBIGUOUS_RETRY_FORBIDDEN",
+        "CURSOR_EXPIRED",
+        "STREAM_OUT_OF_ORDER",
+        "PAYLOAD_TOO_LARGE",
+        "DEADLINE_EXCEEDED",
+        "CONCURRENCY_LIMIT",
+        "INTERNAL"
+      ],
+      "properties": {
+        "SCHEMA_VERSION_UNSUPPORTED": { "const": 400 },
+        "VALIDATION_FAILED": { "const": 400 },
+        "ADOPTION_REPLAY_MISMATCH": { "const": 409 },
+        "REVISION_CONFLICT": { "const": 409 },
+        "NOT_FOUND": { "const": 404 },
+        "GONE_TOMBSTONED": { "const": 410 },
+        "CAPABILITY_UNSUPPORTED": { "const": 422 },
+        "ILLEGAL_TRANSITION": { "const": 422 },
+        "AUTHORITY_REQUIRED": { "const": 403 },
+        "APPROVAL_REQUIRED": { "const": 403 },
+        "CANCEL_PENDING": { "const": 409 },
+        "OVERLAP_FORBIDDEN": { "const": 409 },
+        "RETRY_DISPOSITION_INVALID": { "const": 422 },
+        "AMBIGUOUS_RETRY_FORBIDDEN": { "const": 422 },
+        "CURSOR_EXPIRED": { "const": 410 },
+        "STREAM_OUT_OF_ORDER": { "const": 409 },
+        "PAYLOAD_TOO_LARGE": { "const": 413 },
+        "DEADLINE_EXCEEDED": { "const": 504 },
+        "CONCURRENCY_LIMIT": { "const": 429 },
+        "INTERNAL": { "const": 500 }
+      },
+      "description": "Frozen mapping from typed code to HTTP status. Control-action responses surface the same code in the rejected envelope; the /actions transport maps 400/403/404/409/410/413/422/429/500/504 onto its existing status passthrough (api.rs json_response(status, ...))."
+    }
+  }
+}

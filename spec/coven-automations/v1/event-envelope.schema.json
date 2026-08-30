@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/event-envelope.schema.json",
+  "title": "Coven Automations v1 event/changefeed envelope",
+  "description": "Durable event envelope for the automations changefeed. Events are at-least-once, per-stream gaplessly sequenced, and the sole input to read-model rehydration. Consumers deduplicate on eventId, reject sequence regressions against their cursor, and resume from checkpoints that can expire (typed CURSOR_EXPIRED, never a silent rewind).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "stream",
+    "sequence",
+    "recordedAt",
+    "observedAt",
+    "producer",
+    "kind",
+    "summary",
+    "payload",
+    "privacy"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "eventId": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9]+$",
+      "description": "Globally unique, case-sensitive; duplicates of a delivered eventId are redeliveries and must be ignored, not re-applied."
+    },
+    "stream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "enum": ["automation", "occurrence", "run", "feed"] },
+        "id": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 320,
+          "description": "automationId / occurrenceId / runId; the global feed uses kind=feed and a composite id (feed.<recordedAtMillis>)."
+        }
+      }
+    },
+    "sequence": {
+      "$ref": "common.schema.json#/$defs/sequenceNumber",
+      "description": "Monotonically increasing, gapless within `stream`. Stream-local, starting at 0. Append is a compare-and-set on the stream head: out-of-order appends are refused (STREAM_OUT_OF_ORDER) rather than reordered."
+    },
+    "recordedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the authoritative store recorded the event. Read-model ordering uses (sequence, recordedAt), never observedAt."
+    },
+    "observedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "When the producing component observed the cause (may precede recordedAt)."
+    },
+    "producer": { "$ref": "common.schema.json#/$defs/producerIdentity" },
+    "causation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adoptionKey": { "$ref": "common.schema.json#/$defs/adoptionKey" },
+        "causeEventId": {
+          "type": "string",
+          "maxLength": 64,
+          "description": "eventId that caused this event, for chains."
+        },
+        "correlationId": { "$ref": "common.schema.json#/$defs/correlationId" }
+      },
+      "description": "Idempotency/causation/correlation context. adoptionKey ties the event to the command that committed it; replay consumers use it to prove command adoption happened exactly once."
+    },
+    "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+    "runId": { "$ref": "common.schema.json#/$defs/runId" },
+    "attemptId": { "$ref": "common.schema.json#/$defs/attemptId" },
+    "kind": { "$ref": "#/$defs/eventKind" },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 300,
+      "description": "User-safe summary for UI surfaces; must not contain secrets, prompts, or raw payloads."
+    },
+    "payload": {
+      "oneOf": [
+        { "$ref": "#/$defs/definitionLifecyclePayload" },
+        { "$ref": "#/$defs/transitionPayload" },
+        { "$ref": "#/$defs/misfirePayload" },
+        { "$ref": "#/$defs/receiptPayload" },
+        { "$ref": "#/$defs/snapshotPayload" }
+      ]
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "retention"],
+      "properties": {
+        "classification": { "$ref": "common.schema.json#/$defs/privacyClassification" },
+        "retention": { "$ref": "common.schema.json#/$defs/retentionClass" }
+      }
+    },
+    "integrity": {
+      "$ref": "common.schema.json#/$defs/digest",
+      "description": "Required where the deployment requires tamper evidence (for example receipt.recorded events): digest over the canonical envelope with this member removed."
+    }
+  },
+  "$defs": {
+    "eventKind": {
+      "enum": [
+        "definition.created",
+        "definition.revised",
+        "definition.activated",
+        "definition.paused",
+        "definition.disabled",
+        "definition.invalidated",
+        "definition.tombstoned",
+        "definition.imported",
+        "occurrence.transitioned",
+        "occurrence.misfire_recorded",
+        "run.transitioned",
+        "attempt.transitioned",
+        "receipt.recorded",
+        "feed.snapshot"
+      ]
+    },
+    "definitionLifecyclePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "definitionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "lifecycleState": {
+          "enum": ["draft", "paused", "active", "disabled", "invalid", "tombstoned"]
+        },
+        "importedFrom": { "type": "string", "maxLength": 200 }
+      }
+    },
+    "transitionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["entity", "from", "to", "reason"],
+      "properties": {
+        "entity": { "enum": ["occurrence", "run", "attempt"] },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "description": "Prior state; the literal `none` marks creation."
+        },
+        "to": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 },
+        "fenceGeneration": { "$ref": "common.schema.json#/$defs/fenceToken" },
+        "attemptNumber": { "type": "integer", "minimum": 1 },
+        "commandAdoptionKey": { "$ref": "common.schema.json#/$defs/adoptionKey" }
+      }
+    },
+    "misfirePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disposition", "collapsedSlots"],
+      "properties": {
+        "disposition": { "$ref": "common.schema.json#/$defs/misfireDisposition" },
+        "collapsedSlots": {
+          "type": "array",
+          "items": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "maxItems": 4096,
+          "description": "Missed slots this event accounts for (collapsed_to_latest). Recorded, never backfilled as occurrences."
+        }
+      }
+    },
+    "receiptPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receiptRef", "outcome"],
+      "properties": {
+        "receiptRef": { "$ref": "common.schema.json#/$defs/receiptId" },
+        "outcome": {
+          "enum": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"]
+        },
+        "sideEffectClass": {
+          "enum": [
+            "none",
+            "local_read",
+            "local_write",
+            "external_read",
+            "external_mutation",
+            "irreversible_external_mutation"
+          ]
+        }
+      }
+    },
+    "snapshotPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["throughSequence", "state"],
+      "properties": {
+        "throughSequence": {
+          "$ref": "common.schema.json#/$defs/sequenceNumber",
+          "description": "All events of the stream up to and including this sequence are compacted into `state`; a rehydrating consumer folds the snapshot then applies events strictly after it."
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Compacted read-model state for the stream, itself schema-validated per object type."
+        },
+        "reason": {
+          "enum": ["retention_compaction", "manual_snapshot"]
+        }
+      }
+    }
+  }
+}

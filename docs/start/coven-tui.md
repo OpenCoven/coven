@@ -139,7 +139,7 @@ Selecting a session and pressing `Enter` shows contextual actions. Rejoin, View 
 | **Archive** | session is not `running` and not archived | Hide from the active list; events preserved. |
 | **Sacrifice** | session is not `running` | Before the typed `sacrifice` confirmation, a store retention check runs; an adopted or reserved row returns the canonical `AdoptionRetentionError` denial instead and is left untouched. Once confirmed, the final delete repeats the retention and liveness checks and only removes a still-non-running row, closing the race window rather than trusting that earlier read. |
 
-The map between actions and CLI verbs is documented in [Session lifecycle](/SESSION-LIFECYCLE).
+The map between actions and CLI verbs is documented in [Session lifecycle](../SESSION-LIFECYCLE.md).
 
 ## Legacy SSH and remote use
 
@@ -167,6 +167,6 @@ These verbs produce stable, scriptable output and are the same ones the TUI ulti
 ## Related
 
 - [Get started with Coven](https://docs.opencoven.ai/docs/guide/getting-started)
-- [Session lifecycle](/SESSION-LIFECYCLE)
-- [CLI reference](/reference/cli)
+- [Session lifecycle](../SESSION-LIFECYCLE.md)
+- [CLI reference](https://docs.opencoven.ai/docs/cli)
 - [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting)

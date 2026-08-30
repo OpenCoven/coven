@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, HashSet},
     fs,
     io::Write,
@@ -17,6 +16,7 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::{
+    api_routes::{normalize_api_route, split_path_query, ApiRoute},
     control_plane,
     daemon::DaemonStatus,
     encrypted_artifacts::SensitiveArtifactStore,
@@ -28,10 +28,8 @@ use crate::{
 const MAX_EVENTS_LIMIT: i64 = 1_000;
 const EVENT_CANDIDATE_BATCH_LIMIT: usize = 16;
 const MAX_EVENT_CANDIDATE_BYTES: usize = coven_client::MAX_RESPONSE_BODY_BYTES;
-pub const COVEN_API_ROUTE_VERSION: &str = "v1";
 pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
 pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const SUPPORTED_API_ROUTE_VERSIONS: [&str; 1] = [COVEN_API_ROUTE_VERSION];
 
 fn proposal_decision_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -528,7 +526,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 "Unsupported API version.",
                 Some(json!({
                     "apiVersion": version,
-                    "supportedApiVersions": SUPPORTED_API_ROUTE_VERSIONS,
+                    "supportedApiVersions": crate::api_routes::SUPPORTED_API_ROUTE_VERSIONS,
                 })),
             );
         }
@@ -540,8 +538,8 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         ("GET", "/api-version") => json_response(
             200,
             &json!({
-                "apiVersion": COVEN_API_ROUTE_VERSION,
-                "supportedApiVersions": SUPPORTED_API_ROUTE_VERSIONS,
+                "apiVersion": crate::api_routes::COVEN_API_ROUTE_VERSION,
+                "supportedApiVersions": crate::api_routes::SUPPORTED_API_ROUTE_VERSIONS,
             }),
         ),
         ("GET", "/health") => json_response(
@@ -998,28 +996,6 @@ pub(crate) fn handle_request_with_runtime_and_authority(
         }
         _ => api_error(404, "not_found", "Route not found.", None),
     }
-}
-
-enum ApiRoute<'a> {
-    Route(Cow<'a, str>),
-    Unsupported(String),
-    Malformed,
-}
-
-fn normalize_api_route(route: &str) -> ApiRoute<'_> {
-    let Some(rest) = route.strip_prefix("/api/") else {
-        return ApiRoute::Route(Cow::Borrowed(route));
-    };
-    let Some((version, suffix)) = rest.split_once('/') else {
-        return ApiRoute::Malformed;
-    };
-    if version != COVEN_API_ROUTE_VERSION {
-        return ApiRoute::Unsupported(version.to_string());
-    }
-    if suffix.is_empty() {
-        return ApiRoute::Malformed;
-    }
-    ApiRoute::Route(Cow::Owned(format!("/{suffix}")))
 }
 
 pub(crate) fn store_path(coven_home: &Path) -> std::path::PathBuf {
@@ -8740,13 +8716,6 @@ pub(crate) fn parse_body(body: Option<&str>) -> Result<Value> {
     }
 }
 
-fn split_path_query(path: &str) -> (&str, Option<&str>) {
-    match path.split_once('?') {
-        Some((route, query)) => (route, Some(query)),
-        None => (path, None),
-    }
-}
-
 pub(crate) fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     query.split('&').find_map(|part| {
         let (candidate, value) = part.split_once('=')?;
@@ -8827,6 +8796,7 @@ pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
 
     thread_local! {
         /// Backing storage for the parent-correlation failpoint (issue #728
@@ -10583,6 +10553,45 @@ mod tests {
 
         assert_eq!(response.status, 404);
         assert!(response.body.contains(r#""code":"invalid_request""#));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_version_rejection_pins_full_envelope() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        let response = handle_request("GET", "/api/v2/health", temp_dir.path(), None)?;
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+        assert_eq!(response.status, 404);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert_eq!(body["error"]["message"], "Unsupported API version.");
+        assert_eq!(body["error"]["details"]["apiVersion"], "v2");
+        assert_eq!(
+            body["error"]["details"]["supportedApiVersions"],
+            json!(["v1"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_malformed_api_route_prefixes() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        // The gate (and the router's fallback for non-API passthroughs) must
+        // answer every unrouteable shape with the same 404 envelope: callers
+        // cannot distinguish where the path was refused.
+        for path in ["/api/v1/", "/api/v1", "/api/", "/api"] {
+            let response = handle_request("GET", path, temp_dir.path(), None)?;
+            let body: serde_json::Value = serde_json::from_str(&response.body)?;
+
+            assert_eq!(response.status, 404, "path {path:?}");
+            assert_eq!(body["error"]["code"], "not_found", "path {path:?}");
+            assert_eq!(
+                body["error"]["message"], "Route not found.",
+                "path {path:?}"
+            );
+        }
         Ok(())
     }
 

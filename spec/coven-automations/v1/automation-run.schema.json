@@ -1,0 +1,156 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/automation-run.schema.json",
+  "title": "Coven Automations v1 AutomationRun",
+  "description": "One accepted execution of one occurrence, binding the exact familiar, principal/authority, and runtime used. A run owns a sequence of attempts; retries create new attempts and never rewrite the run's recorded bindings.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "occurrenceId",
+    "automationId",
+    "automationRevision",
+    "binding",
+    "state",
+    "attemptCount",
+    "startedAt"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "runId": { "$ref": "common.schema.json#/$defs/runId" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+    "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+    "automationRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Exact definition revision the run was accepted under."
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["familiar", "authority", "runtime"],
+      "properties": {
+        "familiar": {
+          "$ref": "common.schema.json#/$defs/familiarRef",
+          "description": "Exact familiar identity at dispatch time."
+        },
+        "authority": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["principal"],
+          "properties": {
+            "principal": { "$ref": "common.schema.json#/$defs/principalRef" },
+            "approval": { "$ref": "common.schema.json#/$defs/approvalRef" },
+            "authenticationClass": {
+              "type": "string",
+              "maxLength": 64,
+              "description": "Authentication class presented at dispatch, recorded verbatim from the authority layer."
+            }
+          },
+          "description": "Exact principal/authority/approval binding. This protocol records the binding; authority semantics live in their canonical layer."
+        },
+        "runtime": {
+          "$ref": "common.schema.json#/$defs/runtimeDescriptor",
+          "description": "Exact runtime descriptor and capabilities observed at dispatch."
+        }
+      }
+    },
+    "state": {
+      "enum": [
+        "accepted",
+        "running",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "ambiguous"
+      ],
+      "description": "Run lifecycle per state-machines.json. accepted commits before any consequential side effect; terminal states never regress."
+    },
+    "stateReason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "attemptCount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100,
+      "description": "Total attempts opened under this run, including retries. Monotonic."
+    },
+    "currentAttemptId": {
+      "$ref": "common.schema.json#/$defs/attemptId",
+      "description": "Present while the run is accepted/running: the attempt that may still settle."
+    },
+    "terminalDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["outcome"],
+      "properties": {
+        "outcome": {
+          "enum": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"]
+        },
+        "failureClass": {
+          "enum": [
+            "launch_refused",
+            "runtime_error",
+            "timeout",
+            "cancelled_by_request",
+            "lease_expired",
+            "ambiguous_evidence"
+          ]
+        },
+        "detail": { "type": "string", "maxLength": 2000 }
+      }
+    },
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {
+          "enum": ["none", "pending", "committed", "refused", "rolled_back"],
+          "description": "Output-target delivery state. committed may be recorded only after a completed, verified run (#816 atomic delivery rule)."
+        },
+        "target": { "type": "string", "maxLength": 1024 },
+        "artifactRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ref"],
+            "properties": {
+              "ref": { "type": "string", "minLength": 1, "maxLength": 512 },
+              "digest": { "$ref": "common.schema.json#/$defs/digest" }
+            }
+          },
+          "maxItems": 64
+        }
+      }
+    },
+    "resultDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "receiptRef": {
+      "$ref": "common.schema.json#/$defs/receiptId",
+      "description": "Receipt recording this run's terminal disposition, if one has been produced."
+    },
+    "startedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "finishedAt": {
+      "$ref": "common.schema.json#/$defs/timestamp",
+      "description": "Required once the run reaches a terminal state; absent otherwise."
+    },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensionBag" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "state": { "enum": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"] }
+        }
+      },
+      "then": {
+        "required": ["finishedAt", "terminalDisposition"]
+      }
+    }
+  ]
+}

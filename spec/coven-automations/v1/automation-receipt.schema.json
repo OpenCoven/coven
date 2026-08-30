@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/automation-receipt.schema.json",
+  "title": "Coven Automations v1 AutomationReceipt",
+  "description": "Immutable, versioned proof of what one attempt actually did. A receipt is written once, never revised, and binds digests of everything that determined the outcome. Receipts are the audit anchor for ambiguous-evidence questions.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "receiptId",
+    "automationId",
+    "automationRevision",
+    "occurrenceId",
+    "runId",
+    "attemptId",
+    "identity",
+    "outcome",
+    "sideEffectClass",
+    "producedAt",
+    "producer",
+    "integrity",
+    "privacy"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "receiptId": { "$ref": "common.schema.json#/$defs/receiptId" },
+    "automationId": { "$ref": "common.schema.json#/$defs/automationId" },
+    "automationRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Exact definition revision executed; the receipt also carries the definition digest so the meaning of that revision is pinned even if the definition store is lost."
+    },
+    "definitionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+    "occurrenceFenceGeneration": { "$ref": "common.schema.json#/$defs/fenceToken" },
+    "runId": { "$ref": "common.schema.json#/$defs/runId" },
+    "attemptId": { "$ref": "common.schema.json#/$defs/attemptId" },
+    "attemptNumber": { "type": "integer", "minimum": 1 },
+    "identity": {
+      "$ref": "common.schema.json#/$defs/familiarRef",
+      "description": "Exact familiar identity that executed."
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principal"],
+      "properties": {
+        "principal": { "$ref": "common.schema.json#/$defs/principalRef" },
+        "approval": { "$ref": "common.schema.json#/$defs/approvalRef" }
+      }
+    },
+    "runtime": {
+      "$ref": "common.schema.json#/$defs/runtimeDescriptor",
+      "description": "Runtime descriptor and capabilities actually exercised."
+    },
+    "deliveryDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "resultDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "exercisedCapabilities": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 96 },
+      "uniqueItems": true,
+      "maxItems": 128,
+      "description": "Capability keys the run actually exercised, as observed by the runtime."
+    },
+    "sideEffectClass": {
+      "enum": [
+        "none",
+        "local_read",
+        "local_write",
+        "external_read",
+        "external_mutation",
+        "irreversible_external_mutation"
+      ],
+      "description": "Most severe side-effect class the attempt reached. Drives whether an ambiguous disposition may be resolved as failed_deterministic."
+    },
+    "outcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["disposition"],
+      "properties": {
+        "disposition": {
+          "enum": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"]
+        },
+        "failureClass": { "type": "string", "maxLength": 96 },
+        "detail": { "type": "string", "maxLength": 2000 },
+        "partialFailures": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["step", "reason"],
+            "properties": {
+              "step": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },
+              "recovered": { "type": "boolean" }
+            }
+          },
+          "description": "Per-step partial failures with recovery disposition."
+        },
+        "recoveryDisposition": {
+          "enum": ["not_required", "recovered_inline", "deferred_to_operator"]
+        }
+      }
+    },
+    "producedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "producer": { "$ref": "common.schema.json#/$defs/producerIdentity" },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "value"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "canonicalization": { "const": "jcs-rfc8785" },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "authentication": {
+          "enum": ["none", "producer-hmac", "cosign"],
+          "description": "Authentication applied over the digest by the producing deployment. Receipts without authentication are integrity-checked but not provenance-proof; consumers must surface the distinction."
+        }
+      },
+      "description": "SHA-256 over the RFC 8785 canonical serialization of this receipt with the `integrity` member removed. The immutable body plus this field is the receipt's integrity/authentication story in v1."
+    },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["classification", "retention"],
+      "properties": {
+        "classification": { "$ref": "common.schema.json#/$defs/privacyClassification" },
+        "retention": { "$ref": "common.schema.json#/$defs/retentionClass" },
+        "notes": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "Privacy-relevant facts a reviewer must know, for example whether the prompt body is retained."
+        }
+      }
+    }
+  }
+}

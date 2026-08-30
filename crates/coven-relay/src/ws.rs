@@ -129,7 +129,7 @@ impl RelayState {
                     return;
                 };
                 let slot = room.slot_mut(role);
-                if !slot.as_ref().is_some_and(|peer| peer.id == peer_id) {
+                if slot.as_ref().is_none_or(|peer| peer.id != peer_id) {
                     return;
                 }
                 *slot = None;

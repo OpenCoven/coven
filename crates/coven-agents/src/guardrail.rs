@@ -17,9 +17,15 @@ impl GuardrailVerdict {
 }
 
 #[async_trait]
-/// Checks the original user input before the starting agent runs.
+/// Checks the bounded ingress of an agent before its first model turn.
 ///
-/// Input guardrails attached only to handoff targets do not run in this MVP.
+/// The runner evaluates the starting agent's input guardrails against the
+/// original user input before the run begins, and a handoff target's input
+/// guardrails against the same original user input before the target's first
+/// model turn, so entering an agent through a handoff cannot grant access that
+/// direct entry would reject. Input guardrails never inspect a serialized
+/// transcript; the structured task/context manifest for delegated invocations
+/// is a separate contract (see OpenCoven/coven#804).
 pub trait InputGuardrail<C>: Send + Sync
 where
     C: Sync,

@@ -59,7 +59,9 @@ The runner:
 2. runs starting-agent input guardrails before any model or tool side effect;
 3. loads optional session history;
 4. calls the active model;
-5. executes tool calls sequentially or changes active agent for one handoff;
+5. executes tool calls sequentially or changes active agent for one handoff,
+   running the target agent's input guardrails against the original user input
+   before its first model turn;
 6. repeats within explicit turn and handoff limits;
 7. runs final-agent output guardrails;
 8. appends successful runs to the session;

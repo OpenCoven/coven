@@ -10,7 +10,7 @@ Run Codex, Claude Code, GitHub Copilot CLI, and future coding harnesses inside e
 Launch, observe, attach, and coordinate agent work through one neutral runtime substrate.
 
 [![MIT License](https://img.shields.io/badge/license-MIT-9A8ECD?style=flat-square)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20x64-9A8ECD?style=flat-square)](#requirements)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows%20x64-9A8ECD?style=flat-square)](https://docs.opencoven.ai/docs/guide/platforms)
 [![npm](https://img.shields.io/badge/npm-%40opencoven%2Fcli-9A8ECD?style=flat-square)](https://www.npmjs.com/package/@opencoven/cli)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-9A8ECD?style=flat-square)](https://www.rust-lang.org/)
 
@@ -30,158 +30,26 @@ Launch, observe, attach, and coordinate agent work through one neutral runtime s
 
 ---
 
-## Table of Contents
-
-- [What is Coven?](#what-is-coven)
-- [Why Coven?](#why-coven)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Install](#install)
-- [Quick Start](#quick-start)
-- [Commands Reference](#commands-reference)
-- [Local API](#local-api)
-- [Architecture](#architecture)
-- [Repository Structure](#repository-structure)
-- [Configuration](#configuration)
-- [OpenCoven Integrations](#opencoven-integrations)
-- [Documentation](#documentation)
-- [FAQ](#faq)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [Code of Conduct](#code-of-conduct)
-- [Roadmap](#roadmap)
-- [Security](#security)
-- [License](#license)
-- [Community & Support](#community--support)
-
----
-
 ## What is Coven?
 
 Coven is the local harness substrate for the [OpenCoven](https://github.com/OpenCoven) ecosystem. It gives coding-agent CLIs like [Codex](https://github.com/openai/codex) and [Claude Code](https://docs.anthropic.com/en/docs/claude-code) a shared room where project work can happen visibly and safely.
 
 > **One project. Any harness. Visible work.**
 
-Coven doesn't replace your coding agent, your UI, or other clients. It acts as a neutral runtime layer:
-
 - **You choose the harness** — Codex, Claude Code, GitHub Copilot CLI, or future adapters.
 - **Coven owns the session** — project-scoped boundaries, PTY execution, event logging, SQLite persistence.
 - **Clients present the work** — CastCodes, the CLI/TUI, comux, or your own integration over the same-user local IPC API.
 
-The Rust daemon is the authority boundary. All clients — including the CLI itself — are convenience layers. Security decisions flow inward to the daemon, never outward to clients.
-
----
-
-## Why Coven?
-
-| Without Coven                                       | With Coven                                                  |
-| --------------------------------------------------- | ----------------------------------------------------------- |
-| Run `codex` directly; no persistent session history | Every run creates a session record with metadata and events |
-| No project boundary enforcement                     | Agent is locked to an explicit project root; cannot escape  |
-| Lose track of agent work when the terminal closes   | Sessions persist across daemon restarts via SQLite          |
-| Manually juggle multiple harness CLIs               | One unified `coven run` entry point for all harnesses       |
-| No API for clients to consume agent sessions        | Versioned `coven.daemon.v1` same-user local IPC API for all clients |
-| No standard way to observe or replay past work      | `coven sessions` browser with Rejoin, View Log, and Archive |
-
----
-
-## Features
-
-- **🏠 Project-root boundaries** — Every launch is tied to an explicit repository or project root. The daemon rejects working directories that escape the declared boundary.
-- **🔌 Harness-neutral runtime** — bundled support stays focused on Codex, Claude Code, and GitHub Copilot CLI; trusted opt-in recipes cover Hermes and OpenCode, while Grok Build is an experimental opt-in recipe.
-- **🖥️ Interactive session browser** — Live and completed work can be selected, rejoined, viewed, archived, or restored without memorizing IDs; eligible non-running, unadopted work can also be sacrificed.
-- **📡 Attachable PTY sessions** — Live sessions can be replayed or followed from explicit CLI verbs.
-- **🔌 Local daemon API** — CastCodes, comux, and the OpenClaw plugin coordinate through one versioned local IPC contract (`coven.daemon.v1`).
-- **🗄️ SQLite-backed history** — Session metadata and event logs survive daemon restarts.
-- **🦀 Rust authority layer** — Launch, cwd, input, kill, and path-sensitive requests are revalidated in Rust. Clients are never the trust boundary.
-- **🔒 External OpenClaw bridge** — `@opencoven/coven` is an opt-in plugin; OpenClaw core does not include Coven code.
-- **📦 @opencoven namespace** — CLI wrapper packages live under `@opencoven/*`; the user-facing command is always `coven`.
-- **🩺 System diagnostics** — `coven pc` (macOS-first) surfaces CPU, memory, disk, and process health without launching a harness.
-
----
-
-## Requirements
-
-| Requirement                  | Notes                                                                       |
-| ---------------------------- | --------------------------------------------------------------------------- |
-| **Rust stable toolchain**    | Required only when building from source                                     |
-| **Git**                      | Required                                                                    |
-| **macOS arm64/x64, glibc-based Linux x64, or Windows x64** | Native npm packages are available for these targets |
-| **Node.js 18+**              | Required for the npm wrapper; `coven memory open` requires Node.js 24+      |
-| **At least one harness CLI** | Codex, Claude Code, and/or GitHub Copilot CLI (see below)                    |
-
-### Installing harness CLIs
-
-Run `coven doctor` first — it reports local readiness and points missing
-harnesses to `coven setup`. Doctor stays offline and does not verify provider
-authentication.
-
-**Codex (OpenAI):**
-
-```bash
-npm install -g @openai/codex
-# or: brew install --cask codex
-codex login
-```
-
-**Claude Code (Anthropic):**
-
-```bash
-npm install -g @anthropic-ai/claude-code
-claude auth login
-```
-
-**GitHub Copilot CLI (GitHub):**
-
-```bash
-npm install -g @github/copilot
-# or: brew install --cask copilot-cli
-copilot login
-```
-
-The recommended guided path is `coven setup codex`, `coven setup claude`, or
-`coven setup copilot`; `coven setup all` processes all three in order. Add
-`--verify` for a separately consented provider turn, or use `--verify-only`
-after an existing login. See the
-[`coven setup` reference](docs/reference/cli-setup.md).
-
-After setup, run `coven doctor` again to confirm the harness is detected. If
-Doctor still reports it missing, ensure the harness binary is on your `PATH`.
+The Rust daemon is the authority boundary. All clients — including the CLI itself — are convenience layers. Security decisions flow inward to the daemon, never outward to clients. OpenClaw integrates only through the opt-in `@opencoven/coven` plugin in `packages/openclaw-coven`; OpenClaw core contains no Coven code.
 
 ---
 
 ## Install
 
-Coven is available as an npm wrapper for the fastest install, or you can build from source.
-
-### npm (recommended)
-
-Install globally:
-
 ```bash
 npm install -g @opencoven/cli
 coven doctor
 ```
-
-The memory dashboard is an opt-in companion on its own release train, so a CLI
-install stays thin and never pulls the dashboard's application dependencies:
-
-```bash
-npm install -g @opencoven/coven-memory-dashboard
-coven memory open
-```
-
-`coven memory open` starts or reuses the installed local Coven daemon before
-launching that companion. It does not require a checkout or running development
-server from the `coven-memory` repository. Without the companion installed it
-prints the install command above and exits; every other Coven command is
-unaffected.
-
-The core npm wrapper supports Node.js 18 or newer. The memory dashboard
-requires Node.js 24 or newer; on an older runtime, only `coven memory open` is
-blocked and prints an upgrade instruction.
-
-**Available npm packages:**
 
 | Package                    | Platform                                       |
 | -------------------------- | ---------------------------------------------- |
@@ -190,41 +58,17 @@ blocked and prints an upgrade instruction.
 | `@opencoven/cli-macos-x64` | macOS Intel x64                                |
 | `@opencoven/cli-linux-x64` | glibc-based Linux x64 (Alpine unsupported)    |
 | `@opencoven/cli-windows`   | Windows x64                                    |
-| `@opencoven/coven-memory-dashboard` | Opt-in loopback memory dashboard companion (installed separately) |
 
-### Build from source (recommended for contributors)
+The memory dashboard is an opt-in companion installed separately with
+`npm install -g @opencoven/coven-memory-dashboard` (Node.js 24+); see
+[`docs/reference/cli-observe.md`](docs/reference/cli-observe.md).
 
-```bash
-git clone https://github.com/OpenCoven/coven.git
-cd coven
-cargo build --workspace
-cargo run -p coven-cli -- doctor
-```
-
-> **Note:** Building from source requires Rust stable. See [Requirements](#requirements).
+Install routes (npm, cargo, source), platform behavior, service managers, and
+containers are documented at **https://docs.opencoven.ai/docs/guide/install**.
 
 ---
 
-## Quick Start
-
-### Option A — Interactive UI (recommended for new users)
-
-```bash
-cd /path/to/your/project
-coven
-# or explicitly:
-coven chat
-```
-
-Bare `coven` opens the interactive Coven UI, powered by the **Coven engine**.
-The first time you run it, `coven` offers to download and install the engine
-automatically (or install it anytime with `coven engine install`); it's a
-version-pinned, checksum-verified binary that `coven` manages for you — there's
-no separate package to install. You can also pass a task directly —
-`coven "fix the failing tests"` — and Coven will show a plan card and run it in
-a recorded session.
-
-### Option B — Direct commands
+## Quick start
 
 ```bash
 cd /path/to/your/project
@@ -240,8 +84,6 @@ coven daemon start
 
 # 4. Launch a session
 coven run codex "fix the failing tests"
-# or with Claude Code:
-coven run claude "polish this UI"
 
 # 5. Browse and manage sessions
 coven sessions
@@ -250,294 +92,9 @@ coven sessions
 coven daemon stop
 ```
 
-### Option C — OpenClaw rescue loop
-
-If OpenClaw breaks, Coven provides a predictable repair room:
-
-```bash
-coven patch openclaw
-```
-
-Choose a repo, choose a harness, get a verified patch.
-
----
-
-## Commands Reference
-
-The canonical command reference lives at
-[docs.opencoven.ai/docs/cli](https://docs.opencoven.ai/docs/cli). The core
-verbs:
-
-| Command | Action | Details |
-| --- | --- | --- |
-| `coven` / `coven chat` | Open the interactive Coven UI (engine auto-installed on first run); `coven "<task>"` plans and runs a free-text task | [Interactive UI](https://docs.opencoven.ai/docs/cli/interactive) |
-| `coven doctor` | Detect supported harness CLIs and print install hints | [Doctor](https://docs.opencoven.ai/docs/cli/doctor) |
-| `coven setup [<codex\|claude\|copilot\|all>]` | Run provider-owned login and optional explicitly consented verification | [Setup](docs/reference/cli-setup.md) |
-| `coven daemon start/status/restart/stop` | Manage the local daemon | [Daemon commands](https://docs.opencoven.ai/docs/cli/daemon) |
-| `coven run <harness> <prompt>` | Launch a project-scoped harness session (`--cwd`, `--title`, `--model`, `--continue`, `--stream-json`, …) | [Run](https://docs.opencoven.ai/docs/cli/run) |
-| `coven sessions` | Browse, search, and inspect sessions (`--plain`, `--json`, `--all`, `search`, `show`, `events`, `log`) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
-| `coven attach <id>` | Replay/follow session output and forward input | [Sessions](https://docs.opencoven.ai/docs/cli/sessions#attach) |
-| `coven archive` / `summon` / `sacrifice` | Session rituals (see below) | [Sessions](https://docs.opencoven.ai/docs/cli/sessions) |
-| `coven kill` | Stop a live session on Unix-like hosts; Windows-capable integrations request `POST /api/v1/sessions/:id/kill` through daemon local IPC | [CLI reference](https://docs.opencoven.ai/docs/cli) |
-| `coven adapter list/doctor/install` | Inspect harness adapters; opt into trusted adapter recipes (e.g. `coven adapter install grok`) | [Repository workflow](https://docs.opencoven.ai/docs/cli/repo-workflow) |
-| `coven status` / `familiars` / `skills` / `research` / `calls` / `hub` | Read-only observability with `--json`, mirroring the daemon API routes | [Observability](https://docs.opencoven.ai/docs/cli/observe) |
-| `coven memory` / `coven memory --json` / `coven memory open` | Preserve the memory list output or launch the private loopback dashboard | [Memory](https://docs.opencoven.ai/docs/memory-models) |
-| `coven memory import` / `coven memory restore` | Preview, apply, verify, and logically restore one familiar's memory migration | [Memory](https://docs.opencoven.ai/docs/memory-models) |
-| `coven wt` / `claim` / `hooks` | Parallel work protocol: worktrees, TTL-bounded claims, git hooks | [Repository workflow](https://docs.opencoven.ai/docs/cli/repo-workflow) |
-| `coven pc` | macOS-first system diagnostics; write operations require `--confirm` | [PC diagnostics](https://docs.opencoven.ai/docs/cli/pc) |
-| `coven patch openclaw` / `logs prune` / `vacuum` | OpenClaw rescue loop, log-retention pruning, store repair | [CLI reference](https://docs.opencoven.ai/docs/cli) |
-| `coven completions <shell>` | Generate shell completions (bash, zsh, fish, elvish, powershell) | [CLI reference](https://docs.opencoven.ai/docs/cli) |
-
-> Session-id arguments (`attach`, `summon`, `archive`, `sacrifice`, `kill`, and
-> the `sessions show/events/log` subcommands) accept a unique prefix of the id
-> (e.g. `coven attach 9099`), so you don't have to paste full UUIDs.
-
-> **Session rituals are intentionally explicit.** Archive is reversible and keeps the full event ledger. Summon brings an archived session back. Sacrifice is destructive, applies only to eligible non-running sessions without adopted/reserved evidence, and requires `--yes`.
-
-| Ritual        | Reversible? | Works on             | Description                                                  |
-| ------------- | ----------- | -------------------- | ------------------------------------------------------------ |
-| **Archive**   | ✅ Yes      | Non-running sessions | Hides from active list; all events preserved                 |
-| **Summon**    | N/A         | Archived sessions    | Restores to active list                                      |
-| **Sacrifice** | ❌ No       | Eligible non-running, unadopted sessions | Permanently deletes session and all events; adopted/reserved evidence is retained; requires `--yes` |
-| **Rejoin**    | N/A         | Live sessions        | Reattaches to running session                                |
-
----
-
-## Local API
-
-The daemon exposes a versioned HTTP API over same-user local IPC. On Unix-like
-hosts, this is `<COVEN_HOME>/coven.sock`; on Windows, it is an owner-only named
-pipe selected by `COVEN_HOME`. Windows clients discover the fully qualified
-pipe path as `state.daemon_ipc` from `coven config paths --json`; they must not
-construct a pipe name from the Unix convention or use health/status transport
-metadata as a named-pipe path. The current public contract is
-`coven.daemon.v1` (prefix: `/api/v1`).
-
-The public API guide and interactive endpoint reference live at
-[docs.opencoven.ai/docs/reference/api](https://docs.opencoven.ai/docs/reference/api).
-[`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) remains beside the code as the
-normative versioned source contract: shapes, error codes, cursor pagination,
-and compatibility rules.
-
-### Recommended client handshake
-
-All API clients should start with a health negotiation:
-
-```bash
-# Unix-like example: health check via Unix socket
-curl --unix-socket ~/.coven/coven.sock http://localhost/api/v1/health
-```
-
-**Before depending on any other endpoint:**
-
-1. Call `GET /api/v1/health`
-2. Verify `apiVersion === "coven.daemon.v1"` and `capabilities.structuredErrors === true`
-3. Check `capabilities.sessions === true` before using session endpoints and
-   `capabilities.events === true` before reading events
-4. Check `capabilities.eventCursor === "sequence"` before using `afterSeq` pagination
-5. Only then depend on the documented `v1` sessions/events shapes
-
-All API errors use a structured `{ "error": { "code", "message", "details" } }` envelope. Branch on `error.code`, never on `error.message`.
-
-Local dashboards use `GET /api/v1/memory`, `GET /api/v1/memory/overview`,
-and `GET /api/v1/memory/:id`. The daemon resolves and validates memory files;
-clients must not open the archival database, vector index, manifest, or memory
-paths directly.
-
-`coven memory open` establishes local daemon readiness before delegating to the
-installed `@opencoven/coven-memory-dashboard` executable. The npm wrapper
-supplies only the installed Node executable and dashboard entrypoint; memory
-data and daemon transport proofs are never passed through the environment.
-The companion is not a dependency of the wrapper; install it globally with
-`npm install -g @opencoven/coven-memory-dashboard`, which also puts
-`coven-memory-dashboard` on `PATH` for direct native binary installs. The
-dashboard requires Node.js 24 or newer; the rest of the npm-wrapped CLI remains
-available on Node.js 18 or newer.
-
-Treat the local IPC API as the product contract. Clients may validate for better UX, but the Rust daemon remains the authority boundary.
-
----
-
-## Architecture
-
-### Runtime topology
-
-Coven is a local-first harness substrate. The Rust daemon is the authority boundary. All clients — including the CLI/TUI — are untrusted for enforcement purposes.
-
-```
-Developer
-  │
-  ├── CastCodes workspace ─────────────────────┐
-  ├── coven CLI / TUI ─────────────────────────┤ HTTP over local IPC
-  ├── comux (legacy/reference) ────────────────┤ local IPC API
-  └── @opencoven/coven (OpenClaw plugin) ───────┘
-                                                │
-                                ┌───────────────▼──────────────────┐
-                                │         Coven Rust Daemon         │
-                                │                                   │
-                                │  ┌───────────────────────────┐   │
-                                │  │    Authority boundary      │   │
-                                │  │  • Canonicalize project root│  │
-                                │  │  • Validate cwd in root   │   │
-                                │  │  • Allowlist harness id   │   │
-                                │  │  • Validate session state │   │
-                                │  │  • Route action via policy │  │
-                                │  └────────────┬──────────────┘   │
-                                │               │                   │
-                                │  ┌────────────▼─────────────┐    │
-                                │  │   Harness adapter router  │    │
-                                │  └───────┬──────────────┬───┘    │
-                                │          │              │          │
-                                │      ┌───▼──┐      ┌───▼───┐     │
-                                │      │Codex │      │Claude │     │
-                                │      │ PTY  │      │  PTY  │     │
-                                │      └───┬──┘      └───┬───┘     │
-                                │          │              │          │
-                                │  ┌───────▼──────────────▼──────┐  │
-                                │  │  SQLite session ledger +     │  │
-                                │  │  append-only event log       │  │
-                                │  └──────────────────────────────┘  │
-                                └───────────────────────────────────┘
-```
-
-### Authority boundary
-
-The Rust daemon validates every request before acting:
-
-1. `projectRoot` must be explicit — no fallback
-2. `cwd` must canonicalize inside the declared project root
-3. Harness ID must be allowlisted (`codex`, `claude`, `copilot`)
-4. Session IDs must exist and be in the expected state
-5. All harness commands are built with argv APIs — never `sh -c`
-
-Clients may improve UX by validating early, but they are never the enforcement boundary. A client cannot widen the project boundary, bypass the harness allowlist, or escape session state validation.
-
-### Session lifecycle
-
-```
-coven run codex "fix tests"
-        │
-        ▼
-POST /api/v1/sessions  { projectRoot, cwd, harness, prompt }
-        │
-        ▼
-Daemon: canonicalize → validate → spawn or reject
-        │
-        ▼
-Session record created in SQLite
-        │
-        ▼
-Harness spawned in PTY → output events streamed to SQLite
-        │
-        ▼
-coven sessions → Rejoin / View Log / Archive / Sacrifice
-```
-
-For full architecture diagrams (including Mermaid flow charts), see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
----
-
-## Repository Structure
-
-```
-coven/
-├── .github/                    # GitHub Actions workflows, issue templates
-├── assets/opencoven/           # Project assets (logos, icons for npm packages)
-├── brand/                      # OpenCoven brand system
-│   ├── icons/                  # Brand icon set (trident, agent-node, etc.)
-│   ├── social/                 # Social media assets (X, GitHub)
-│   └── ui/                     # CSS color tokens and typography scale
-├── crates/
-│   ├── coven-cli/              # Main Rust binary — the `coven` command
-│   └── coven-relay/            # Internal relay crate
-├── docs/                       # Source-adjacent contracts, maintainer docs, plans, and historical records
-├── npm/                        # npm wrapper package source for @opencoven/cli
-├── packages/
-│   └── openclaw-coven/         # External OpenClaw bridge plugin (@opencoven/coven)
-├── scripts/
-│   └── check-secrets.py        # CI / pre-release secret scanner
-├── skills/opencoven-design/    # Design skill files
-├── web/                        # Web surface files
-├── Cargo.lock                  # Locked Rust dependency tree
-├── Cargo.toml                  # Rust workspace manifest
-├── CONTRIBUTING.md             # Contribution guidelines
-├── DESIGN.md                   # Full brand and design system reference
-├── LICENSE                     # MIT license
-├── README.md                   # This file
-└── SECURITY.md                 # Security policy
-```
-
-**Key directories:**
-
-- **`crates/coven-cli`** — Everything that becomes the `coven` binary. This is where daemon, PTY adapter, session store, local IPC API, and CLI surface live in Rust.
-- **`packages/openclaw-coven`** — The opt-in bridge between OpenClaw and Coven. Lives here (not in OpenClaw core) to keep the trust boundary clean. Published as `@opencoven/coven`.
-- **`scripts/check-secrets.py`** — Required pre-release and pre-PR scan. Run it before pushing to avoid leaking credentials into git history.
-- **`docs/`** — Source-adjacent contracts, maintainer/development guidance,
-  implementation plans, and historical records. Public user documentation is
-  canonical at [docs.opencoven.ai](https://docs.opencoven.ai/).
-
----
-
-## Configuration
-
-Coven works with zero configuration. State lives under `COVEN_HOME` (default `~/.coven`); privacy and retention knobs are optional. The deep detail lives in the docs:
-
-| Surface                              | What it controls                                                                          | Reference                                                        |
-| ------------------------------------ | ------------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
-| `COVEN_HOME`                         | Root directory for daemon state: SQLite database, same-user local IPC, logs, encryption keys | [Daemon configuration](https://docs.opencoven.ai/docs/daemon/configuration) |
-| Daemon environment and `privacy.toml` | Raw-artifact persistence (`COVEN_PERSIST_RAW_ARTIFACTS`), retention windows, redaction     | [Daemon configuration](https://docs.opencoven.ai/docs/daemon/configuration) |
-| `~/.config/coven/settings.json`      | CLI settings under `covenCli.*`: repo registry, privacy keys, fuzzy paths                  | [`docs/SETTINGS.md`](docs/SETTINGS.md)                           |
-
-> **Tip:** If you run Coven in CI or need isolated environments, set `COVEN_HOME` to a unique path per environment. Coven will create the directory if it doesn't exist.
-
-Retention defaults (30 days for redacted event logs, 7 days for optional raw encrypted artifacts) and manual pruning via `coven logs prune` are covered in [`docs/reference/cli-logs.md`](docs/reference/cli-logs.md).
-
-For debugging local state without deleting an entire profile, use `coven reset`
-to preview selected familiar, project, GitHub/Copilot, or runtime-adapter state,
-plus secret, cache, session, or metadata state. Runtime
-selectors cover Coven-local Claude, OpenClaw, Hermes, OpenCode, Grok Build, and
-Gemini records only; mobile gateway state has its own selector. After
-`coven daemon stop` and after other active Coven commands finish, Unix
-`--apply` moves only the selected state into `COVEN_HOME/reset-backups/`.
-Windows currently supports preview only. Reset never changes a provider CLI,
-login, or account, and project reset never deletes a checkout.
-Session reset keeps encrypted artifact records and their key together. See
-[`docs/reference/cli-reset.md`](docs/reference/cli-reset.md).
-
-Never commit runtime state: `.coven/`, `*.sqlite*`, `*.db`, `*.sock`, `.env*`, and `*.key` are covered by `.gitignore`. Before submitting any PR, run the secret scanner (`python scripts/check-secrets.py`) — see [Security](#security).
-
----
-
-## OpenCoven Integrations
-
-Coven is the runtime layer. Other surfaces in the OpenCoven ecosystem sit above
-it and connect through same-user local IPC: a Unix socket at
-`COVEN_HOME/coven.sock` on Unix-like hosts or an owner-only named pipe on
-Windows, whose fully qualified client path is `state.daemon_ipc` from
-`coven config paths --json`.
-
-| Integration                                              | Role                                                                       | How it connects                          |
-| -------------------------------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------- |
-| **[CastCodes](https://github.com/OpenCoven/cast-codes)** | Primary public workspace; the local-first AI coding product built on Coven | HTTP over same-user local IPC            |
-| **comux**                                                | Legacy terminal cockpit (useful reference; not the future public story)    | HTTP over same-user local IPC            |
-| **OpenClaw**                                             | External coding agent; integrates via opt-in plugin only                   | `@opencoven/coven` plugin → local IPC    |
-
-> **Important:** OpenClaw core does not contain Coven code. The integration lives exclusively in `packages/openclaw-coven` and publishes as `@opencoven/coven`. This separation keeps the trust boundary clean — the plugin is treated as an untrusted socket client, and the Rust daemon revalidates every request it makes.
-
-### CastCodes
-
-CastCodes is the primary product users open: terminal/code workspace, visible agent lanes, review flows, and approval UX. It is the first-contact public story for Coven.
-
-The intended flow is:
-
-```
-User → CastCodes → coven run → Coven daemon → Harness PTY
-Harness output → Coven event log → CastCodes session view
-```
-
-### comux (legacy reference)
-
-comux is a standalone terminal cockpit that proved the tmux-cockpit model for parallel agent work. Its useful primitives (worktree isolation, pane menus, agent launcher registry) are being folded into CastCodes-native concepts. comux is no longer the future-facing public surface.
+Bare `coven` opens the interactive Coven UI instead — see
+[Interactive UI](https://docs.opencoven.ai/docs/cli/interactive). The command
+reference lives at [docs.opencoven.ai/docs/cli](https://docs.opencoven.ai/docs/cli).
 
 ---
 
@@ -545,6 +102,15 @@ comux is a standalone terminal cockpit that proved the tmux-cockpit model for pa
 
 Public installation, CLI, daemon, harness, API, memory, and troubleshooting
 documentation is canonical at **[docs.opencoven.ai](https://docs.opencoven.ai/)**.
+Start with:
+
+- [Getting started](https://docs.opencoven.ai/docs/guide/getting-started)
+- [CLI reference](https://docs.opencoven.ai/docs/cli)
+- [Daemon](https://docs.opencoven.ai/docs/daemon)
+- [Harnesses](https://docs.opencoven.ai/docs/harnesses)
+- [Local API](https://docs.opencoven.ai/docs/reference/api)
+- [Memory](https://docs.opencoven.ai/docs/memory-models)
+- [Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting) — or run `coven doctor` first
 
 This repository keeps only documentation that must evolve with the source:
 
@@ -560,267 +126,24 @@ This repository keeps only documentation that must evolve with the source:
 
 ---
 
-## FAQ
-
-**Q: What is Coven, exactly?**
-
-Coven is a local Rust daemon and CLI that supervises coding-agent CLI sessions
-(like Codex or Claude Code) inside explicit project boundaries, records
-everything to SQLite, and exposes it through a versioned HTTP API over
-same-user local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like
-hosts or an owner-only named pipe on Windows.
-
-**Q: Does Coven replace Codex or Claude Code?**
-
-No. Coven wraps them. You still use the harness CLI for its AI capabilities — Coven adds project-scoped boundaries, session persistence, and a unified API on top.
-
-**Q: Does Coven require an internet connection or an account?**
-
-Core Coven operation and `coven doctor` are local. Your harness CLIs require
-their own provider authentication and network access. Coven stores no provider
-credentials; only an explicitly consented `coven setup --verify` or a harness
-session launches a provider turn.
-
-**Q: Is Windows supported?**
-
-Yes. `@opencoven/cli-windows` ships a native Windows x64 binary, and the universal `@opencoven/cli` wrapper selects it automatically. Run `coven doctor` from the same PowerShell, Windows Terminal, or WSL2 environment where your harness CLI is installed.
-
-**Q: What is `coven pc`?**
-
-A macOS-first system diagnostics and relief tool built into the CLI. It shows CPU, memory, disk, and process health without launching a harness — useful when sessions feel slow or the daemon is sluggish to start. All read operations are side-effect-free. Write operations (kill, cache clear) require an explicit `--confirm` flag and cannot be bypassed.
-
-**Q: What does "Sacrifice" mean?**
-
-Sacrifice is Coven's intentionally explicit verb for permanently deleting an eligible non-running session and all its event history. It requires `--yes`. Sessions with adopted or historical reserved evidence are retained; O3 defines no retention/fence release. Archive + Summon are the reversible alternatives.
-
-**Q: What is `COVEN_HOME`?**
-
-The directory where Coven stores all local state: SQLite database, same-user
-local IPC, logs, and encryption keys. On Unix-like hosts, IPC uses
-`COVEN_HOME/coven.sock`; on Windows, it uses an owner-only named pipe.
-Defaults to `~/.coven`. To isolate environments (e.g., in CI), set
-`COVEN_HOME` to a separate path for each environment.
-
-**Q: Is CastCodes the same as Coven?**
-
-No. CastCodes is a separate product — the local-first AI coding workspace and primary public-facing product that runs on top of Coven. Coven is the runtime substrate. CastCodes is the workspace you open.
-
-**Q: What is the relationship with OpenClaw?**
-
-OpenClaw is an external coding agent that can optionally integrate with Coven through the `@opencoven/coven` plugin package. OpenClaw core contains no Coven code. The integration is strictly opt-in and requires installing the plugin separately.
-
-**Q: Can I build my own client on top of Coven?**
-
-Yes. The daemon exposes a stable `coven.daemon.v1` HTTP API over same-user
-local IPC: a Unix socket at `COVEN_HOME/coven.sock` on Unix-like hosts or an
-owner-only named pipe on Windows. Windows clients discover the fully qualified
-pipe path as `state.daemon_ipc` from `coven config paths --json`. All clients
-are untrusted for enforcement, but the API surface is stable and versioned.
-See [`docs/API-CONTRACT.md`](docs/API-CONTRACT.md) and
-[`docs/CLIENT-INTEGRATION.md`](docs/CLIENT-INTEGRATION.md).
-
-**Q: What if I want to add a new harness (like Aider or Gemini)?**
-
-See [`docs/HARNESS-ADAPTERS.md`](docs/HARNESS-ADAPTERS.md) for the adapter contract. The supported set is Codex, Claude Code, and GitHub Copilot CLI — new harnesses are planned for later milestones after adapter contracts are stable.
-
----
-
-## Troubleshooting
-
-The fastest first step for any broken setup:
-
-```bash
-coven doctor
-```
-
-`coven doctor` checks store readiness, project detection, daemon status, and harness availability — and prints specific next steps for every failure branch.
-
-### Quick reference
-
-| Symptom                                     | First step                                                                             |
-| ------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `coven: command not found`                  | Run `npm install -g @opencoven/cli`; verify binary is on `PATH`                        |
-| `doctor` reports missing harness            | Install and authenticate the harness CLI (see [Requirements](#requirements))           |
-| Daemon won't start                          | Run `coven daemon restart`; check `$COVEN_HOME` ownership and permissions              |
-| Session browser shows a table, not a UI     | Terminal isn't interactive; use `coven sessions --manage` to force the browser         |
-| `cwd` rejected at launch                    | The working directory resolves outside the project root; use a path inside it          |
-| Stale "running" sessions after daemon crash | Run `coven daemon restart` to mark dead sessions `orphaned`, then archive them; sacrifice is only for eligible rows without adopted/reserved evidence |
-| Sessions feel slow / daemon sluggish        | Run `coven pc status` to check system pressure; `coven pc top --n 10` for CPU culprits |
-| `coven attach` won't accept input           | The session is not live; attach replays logs for completed or archived sessions        |
-| Secret scan fails                           | Remove the secret from your working tree; rotate it if it entered git history          |
-| Local familiar/project/integration state is broken | Preview `coven reset --list-features`, then reset only the affected local category with `--apply` |
-| API version mismatch                        | Update Coven to match the client's expected contract, or update the client             |
-
-For the full diagnostic flowchart and detailed resolution steps, see
-[Troubleshooting](https://docs.opencoven.ai/docs/reference/troubleshooting).
-
----
-
 ## Contributing
 
-> **Contribution Status — Updated July 2026**
->
-> External Pull Requests are open. Please start from an issue for larger changes
-> and include the readiness packet requested by the PR template.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the first-10-minutes checkout path,
+the full local development loop, and the PR readiness packet. The short rules:
 
-### First 10 minutes (source checkout)
+- **Rust is the authority layer.** Launch, cwd validation, PTY lifecycle, session persistence, and IPC enforcement are Rust's responsibility; clients are never the trust boundary.
+- **Keep harness support focused** on Codex, Claude Code, and GitHub Copilot CLI until adapter contracts are stable.
+- **Run `python scripts/check-secrets.py` before every PR**, including docs-only changes, and never commit runtime state (`.coven/`, `*.sqlite*`, `*.sock`, `.env*`, `*.key`).
 
-```bash
-git clone https://github.com/OpenCoven/coven.git
-cd coven
-cargo build --workspace
-cargo run -p coven-cli -- doctor
-cargo test -p coven-cli --test smoke -- --nocapture
-```
-
-A healthy first pass: the workspace builds, `doctor` prints setup status, and the smoke test passes. The smoke test uses an isolated temporary `COVEN_HOME` and injects a fake `codex` binary into `PATH` — it does not require real harness credentials or a network connection.
-
-### Local development loop
-
-```bash
-# Build
-cargo build --workspace
-
-# Rust checks (required before any PR)
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-
-# Secret scanner (required before any PR)
-python scripts/check-secrets.py
-
-# Smoke test (required for daemon/session/attach/ritual changes)
-cargo test -p coven-cli --test smoke -- --nocapture
-
-# Manual smoke run — use a throwaway project, not a real repository
-cargo run -p coven-cli -- daemon start
-cargo run -p coven-cli -- run codex "say hello from coven"
-cargo run -p coven-cli -- sessions
-cargo run -p coven-cli -- daemon stop
-```
-
-### CLI performance baselines
-
-Build the native binary first, then run the isolated benchmark fixture:
+Performance baselines collect trend data without gating merges:
 
 ```bash
 cargo build -p coven-cli --locked
 node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output /tmp/coven-perf.json
-cargo test -p coven-cli --bin coven tui::chat::events::tests::benchmark_schedule_metrics_emit_json --locked -- --ignored --nocapture
-```
-
-The runner uses disposable `COVEN_HOME` directories, a fixture-only fake Codex
-executable, and the same-user local IPC API. It records command startup, cold daemon
-start-to-health, daemon session-listing, event-tail, and harness-first-output
-timings without reading real configuration, prompts, or session logs. Each cold
-start sample gets a fresh home and a matching daemon stop. The ignored Rust test
-prints deterministic TUI poll/draw counters. These outputs are trend data: CI
-uploads them as artifacts and validates fixture construction, but does not fail
-pull requests on wall-clock thresholds. Cave's managed-start contract retains
-its 8-second hard deadline; benchmark p50/p95/p99 values do not replace that
-product-level timeout.
-
-### Concurrent runtime baseline
-
-Run the complementary concurrent-session baseline before making a throughput,
-storage, or cancellation optimization:
-
-```bash
-cargo build -p coven-cli --locked
 node scripts/benchmark-chaos.mjs --binary target/debug/coven --output /tmp/coven-chaos.json
 ```
 
-The command always exercises 1, 8, and 32 concurrent deterministic harness
-sessions, records launch-to-first-output percentiles, throughput, cancellation
-to-terminal latency, SQLite file growth, writer connection/transaction deltas,
-maximum sampled writer backlog, and sampled daemon RSS, and writes a redacted
-JSON report. The writer queue values are periodic samples rather than
-daemon-maintained high-water marks. Writer measurements come from the live
-health contract; RSS is resolved by the exact daemon PID through
-`coven pc top --json`, without retaining process names or command lines. Cave
-owns the slow-WebSocket-consumer lane in #4317.
-
-Unsafe host-level faults use deterministic equivalents rather than filling a
-real disk or killing an unrelated process: the report names the exact Rust
-regressions for the free-disk watermark, real SQLite lock/retry behavior, and
-persisted-session crash recovery. These coverage entries remain separate from
-trend measurements, so a timing artifact cannot be mistaken for a passing
-failure-path test.
-
-CI runs this step as `continue-on-error`, so it collects trend data without
-gating merges — matching how the rest of this section describes these
-baselines. The deterministic fixture tests (`benchmark-chaos.test.mjs`) still
-gate. On timeout, the collector reports fixture execution count, session/event
-state, and a bounded event-writer health snapshot. The event writer retries
-only transient SQLite busy/locked commit failures before latching a permanent
-failure; unrelated persistence errors remain fail-fast.
-
-### Architecture rules for contributors
-
-- **Rust is the authority layer.** Process launch, cwd/project-root validation, PTY lifecycle, session persistence, and local IPC request enforcement are all Rust's responsibility. TypeScript clients improve UX but are never the trust boundary.
-- **All clients are untrusted for enforcement** — this includes comux and the OpenClaw plugin.
-- **Keep harness support focused.** Supported harnesses are Codex, Claude Code, and GitHub Copilot CLI only until adapter contracts are stable.
-- **OpenClaw separation.** Do not place Coven code in OpenClaw core. The integration belongs in `packages/openclaw-coven` as `@opencoven/coven`.
-- **No future orchestration commands as user-facing** until they exist in the CLI and local IPC API.
-
-### Documentation rules
-
-- Use **OpenCoven** for the ecosystem and organization. Use **Coven** for the CLI and daemon product.
-- The user-facing command is always `coven` — never `opencoven` or `@opencoven` in user-facing documentation.
-- Use canonical community references: `discord.gg/opencoven` and `@OpenCvn`.
-- Use placeholders in all examples: `/path/to/project`, `/Users/example`, `session-1`, `intent-1`.
-- Run `python scripts/check-secrets.py` before submitting any PR, including docs-only changes.
-- Update docs whenever command behavior, API behavior, or trust boundaries change.
-
-### Maintainer release checklist
-
-```bash
-cargo fmt --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --locked
-python scripts/check-secrets.py
-# For package releases: verify package contents with dry run, attach checksums for native binaries
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development loop, release checklist, and documentation standards.
-
----
-
-## Code of Conduct
-
-OpenCoven is committed to building a welcoming, respectful community where people of all backgrounds and experience levels can contribute and learn.
-
-**We expect all contributors and community members to:**
-
-- Be respectful and kind in all interactions — issues, PRs, Discord, and X
-- Focus criticism on ideas and code, not people
-- Welcome newcomers and answer questions with patience
-- Assume good faith before assuming bad
-
-**We do not tolerate:**
-
-- Harassment, discrimination, or abuse in any form
-- Personal attacks or derogatory language
-- Sustained or repeated disruptive behavior
-
-To report unacceptable behavior, contact the maintainers privately through GitHub or Discord. Reports will be handled with discretion.
-
----
-
-## Roadmap
-
-> **Last updated: May 2026.** See [`docs/ROADMAP.md`](docs/ROADMAP.md) for detailed milestone checklists with individual items.
-
-| Status          | Milestone                         | Summary                                                                                                                       |
-| --------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| ✅ **Shipped**  | A: Local runtime foundation       | `coven` CLI, Rust daemon, PTY sessions, SQLite ledger, versioned `coven.daemon.v1` API, Codex + Claude adapters, npm packages |
-| 🔄 **Now**      | B: CastCodes workspace            | CastCodes as primary public workspace; Cast Agent + Coven integration direction                                               |
-| 🔄 **Now**      | C: Community transparency         | Public roadmap, Discord update cadence, public issue board                                                                    |
-| 📋 **Next**     | D: Harness expansion              | Generic command adapter from real usage, third harness proof, compatibility docs                                              |
-| 🔬 **Next/Lab** | E: Visible lane → verify → review | CastCodes-native agent lanes, live session display, verification gates, explicit PR/merge workflow                            |
-| 🔭 **Later**    | F: Multi-harness orchestration    | Handoff protocol, capability routing, multi-instance coordination, audit dashboard (Phases 1–4)                               |
-
-The roadmap is written as a community-facing progress ledger, not an internal promise sheet. Items move when they are designed, implemented, tested, and released. Dates are avoided unless a release is already scheduled.
+Both use disposable `COVEN_HOME` directories and a fixture-only fake harness; `scripts/benchmark-chaos.test.mjs` gates deterministically in CI.
 
 ---
 
@@ -829,34 +152,21 @@ The roadmap is written as a community-facing progress ledger, not an internal pr
 Coven is pre-1.0 software. Treat it accordingly:
 
 - **Do not run untrusted harnesses or prompts in sensitive repositories.** Session logs capture harness output; if the harness dumps secrets, Coven logs them.
-- **Do not commit runtime state.** `.coven/`, `*.sqlite`, `*.sock`, `.env*` files, and encryption keys should never enter source control.
 - **Do not paste secrets into prompts.** Event payloads are redacted before API display, but defense in depth starts with not having secrets in prompts.
 
-**Reporting vulnerabilities:** Please use [GitHub Security Advisories](https://github.com/OpenCoven/coven/security/advisories) for this repository. If advisories are unavailable, contact the maintainer privately. Do not post exploit details in public issues.
+**Reporting vulnerabilities:** Please use [GitHub Security Advisories](https://github.com/OpenCoven/coven/security/advisories) for this repository. See [SECURITY.md](SECURITY.md) for the policy and [Safety](https://docs.opencoven.ai/docs/reference/safety) for the public trust boundary.
 
-See [SECURITY.md](SECURITY.md) for vulnerability reporting and
-[Safety](https://docs.opencoven.ai/docs/reference/safety) for the public trust
-boundary and local access model.
+---
+
+## Roadmap
+
+The milestone ledger lives in [`docs/ROADMAP.md`](docs/ROADMAP.md); items move when they are designed, implemented, tested, and released.
 
 ---
 
 ## License
 
 MIT © Valentina Alexander and the OpenCoven contributors — see [LICENSE](LICENSE) for full terms.
-
----
-
-## Community & Support
-
-| Channel                 | Link                                                       |
-| ----------------------- | ---------------------------------------------------------- |
-| 🌐 Website              | [opencoven.ai](https://opencoven.ai/)                      |
-| 📝 Feedback             | [feedback.opencoven.ai](https://feedback.opencoven.ai/)    |
-| 💬 Discord              | [discord.gg/opencoven](https://discord.gg/opencoven)       |
-| 🐦 X / Twitter          | [@OpenCvn](https://x.com/OpenCvn)                          |
-| 🐛 Issues & Bug Reports | [GitHub Issues](https://github.com/OpenCoven/coven/issues) |
-| 📖 Documentation        | [docs.opencoven.ai](https://docs.opencoven.ai/)             |
-| 🗺️ Public Roadmap       | [docs/ROADMAP.md](docs/ROADMAP.md)                         |
 
 ---
 
