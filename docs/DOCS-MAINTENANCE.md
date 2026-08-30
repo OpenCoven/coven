@@ -35,6 +35,49 @@ When moving a topic:
 4. Keep normative details here only when the public page links back to the
    source contract.
 
+## Public-doc directory boundary
+
+The repository's public-doc directories may contain only two kinds of pages:
+
+- **Canonical pointers** — a stable repository entry point whose body links to
+  the canonical `docs.opencoven.ai` route. Use this shape:
+
+  ```md
+  ---
+  title: "<existing page title>"
+  description: "Pointer to the canonical <topic> guidance."
+  ---
+
+  Canonical <topic> guidance: **https://docs.opencoven.ai/docs/<route>**
+
+  <optional one-line note retaining a source-adjacent contract link>
+  ```
+
+- **Source-adjacent exceptions** — a page that must evolve with the code
+  (contracts, maintainer source maps, verification procedures). Every retained
+  page states its source-adjacent ownership reason, either in the page itself
+  or in the ownership table in [`README.md`](../README.md) and
+  [`docs/index.md`](index.md).
+
+Public-doc directories today: `docs/install/`, `docs/platforms/`,
+`docs/start/`, `docs/help/`, `docs/harnesses/`, `docs/models/`,
+`docs/memory/`, `docs/guides/`, `docs/reference/`, and the public operation
+pages of `docs/daemon/`. Source-adjacent trees (`docs/design/`,
+`docs/development/`, `docs/superpowers/`, `docs/architecture/`,
+`docs/security/`) and the top-level normative contracts are exempt.
+
+Do not add a new public page to these directories, and do not restore
+duplicated prose. If a canonical target is missing, the local page stays
+unchanged until the canonical coverage lands in `coven-docs` — topical
+similarity alone is not duplication, and an absent canonical target blocks
+removal, never forces a rewrite here.
+
+Public user guidance pages that remain because their canonical target is still
+pending (for example the platform pages retained until
+`scripts/onboarding-docs-test.mjs` is migrated to canonical-pointer
+expectations) are listed as pending exceptions in the tracking issue, not
+silently kept.
+
 ## Public content stance
 
 All committed documentation is public. It should describe OpenCoven and Coven

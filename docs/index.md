@@ -28,3 +28,5 @@ implementation:
   implementation decisions, plans, and historical records.
 
 See [`DOCS-MAINTENANCE.md`](DOCS-MAINTENANCE.md) before adding or moving a page.
+Its public-doc directory boundary defines which directories may contain only
+canonical pointers or source-adjacent exceptions.
