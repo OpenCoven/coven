@@ -45,6 +45,14 @@ coven sessions --json | jq '.sessions[] | { id, harness, status, title }'
 
 Use `coven sessions --all --json` only when archived history is relevant. Treat ids as opaque strings and do not record session titles or event content in public logs without a privacy review.
 
+## Discover the command inventory without scraping help
+
+```sh
+coven help --all --json | jq -r '.groups[] | .title, (.commands[] | "  \(.name)  \(.summary)")'
+```
+
+The catalog is a deterministic, versioned JSON contract (`schemaVersion: 1`): fixed ordering, no ANSI escapes, and one entry per public command. Parse it instead of scraping `--help` output, and gate on `schemaVersion` before trusting new fields. The full field reference lives in the [developer core-functionality guide](/development/cli-core-functionality).
+
 ## Pick the right integration boundary
 
 - Use the CLI JSON commands for local shell automation and maintainer checks.

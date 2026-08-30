@@ -46,6 +46,43 @@ Progressive help is part of that parser contract:
 - `coven help <command>` should stay equivalent in useful content to `coven <command> --help`.
 - Hidden/internal entrypoints such as `process-supervisor` and `coven daemon serve` stay absent from the public help surfaces and JSON catalog.
 
+## JSON help contract
+
+`coven help --all --json` prints the public command catalog as a single deterministic JSON document on stdout. Automation parses this document instead of scraping human help output. The example below is abbreviated; the real document lists every public command across all six groups.
+
+```json
+{
+  "schemaVersion": 1,
+  "groups": [
+    {
+      "id": "start-and-launch",
+      "title": "Start and launch",
+      "commands": [
+        {
+          "name": "doctor",
+          "summary": "Check local setup and print next steps (exits 1 when a blocking problem is found)",
+          "docsUrl": "https://docs.opencoven.ai/docs/cli/doctor"
+        }
+      ]
+    }
+  ]
+}
+```
+
+The contract to preserve:
+
+- `schemaVersion` is a number, currently `1`. The key set of a given schema version is exact: no missing fields and no extras. Changing the shape or field semantics means shipping a new schema version, not mutating this one.
+- `groups` is a non-empty array. Group ids are lowercase kebab-case and fixed in this order: `start-and-launch`, `configure-and-extend`, `session-lifecycle`, `observe-your-coven`, `coordinate-parallel-work`, `repair-and-administer`.
+- Each command carries a kebab-case `name`, a one-line `summary`, and an absolute `docsUrl` on the stable `https://docs.opencoven.ai/docs/` origin with no query parameters and a lowercase kebab-case fragment when one is present.
+- Output is byte-identical across runs and machines: fixed group and command ordering, no ANSI escapes even under `--color=always`, no machine-specific paths, and no dependence on locale, clock, or environment. stderr stays empty on success.
+- Coverage is complete and leak-free: every public top-level command appears exactly once, and internal entrypoints such as `process-supervisor` and `coven daemon serve` never appear.
+
+Drift fails loudly instead of silently: `crates/coven-cli/src/help.rs` errors at render time when a public command lacks catalog metadata or when the catalog names an unknown command, so adding, renaming, or hiding a public command requires updating `HELP_GROUPS` in the same change. `scripts/export-cli-help-contract.mjs` validates a catalog snapshot's shape, leak checks, and URL constraints from a built binary, which keeps packaged consumers and CI honest:
+
+```sh
+node scripts/export-cli-help-contract.mjs --binary target/debug/coven --output help-contract.json
+```
+
 ## Access paths developers should exercise
 
 Run these from a clean, representative project directory. They are ordered from read-only inspection to daemon activation; the final launch is intentionally opt-in.

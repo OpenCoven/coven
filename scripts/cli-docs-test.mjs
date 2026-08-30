@@ -5,7 +5,16 @@ import test from 'node:test';
 const coreGuideDocs = [
   {
     path: 'docs/development/cli-core-functionality.md',
-    required: ['Command ownership', 'Access contract', 'coven doctor --json', 'coven daemon status --json']
+    required: [
+      'Command ownership',
+      'Access contract',
+      'coven doctor --json',
+      'coven daemon status --json',
+      'coven help --all --json',
+      '"schemaVersion": 1',
+      'docsUrl',
+      'scripts/export-cli-help-contract.mjs'
+    ]
   },
   {
     path: 'docs/guides/index.md',
@@ -21,7 +30,7 @@ const coreGuideDocs = [
   },
   {
     path: 'docs/guides/automation-json.md',
-    required: ['coven doctor --json', 'coven daemon status --json', 'coven sessions --json']
+    required: ['coven doctor --json', 'coven daemon status --json', 'coven sessions --json', 'coven help --all --json', 'schemaVersion']
   },
   {
     path: 'docs/guides/multi-agent-worktrees.md',
