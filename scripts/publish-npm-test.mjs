@@ -1623,8 +1623,8 @@ test('release workflow publishes every package unconditionally', () => {
   assert.match(workflow, /npm-dry-run:[\s\S]*?needs: \[build-platform, verify-tag\]/);
   assert.match(
     publish,
-    /needs: \[build-platform, npm-dry-run, performance-baseline, verify-tag\]/,
-    'publish job must consume verified release context after the performance gate'
+    /needs: \[build-platform, npm-dry-run, performance-baseline, verify-tag, exact-source-gate\]/,
+    'publish job must consume verified release context after the performance and exact-source gates'
   );
   assert.doesNotMatch(
     publish,
