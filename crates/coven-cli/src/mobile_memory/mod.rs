@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::{
     io::{Read, Write},
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
@@ -22,6 +23,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
+
+#[cfg(unix)]
+use self::pairing::PairingState;
 
 pub const MOBILE_PROTOCOL_VERSION: u16 = 1;
 pub const MAX_MOBILE_REQUEST_BYTES: usize = 64 * 1024;
@@ -192,12 +196,73 @@ struct LocalPairingInvitation {
 #[cfg(unix)]
 #[derive(Deserialize)]
 struct LocalPairingStatus {
+    state: PairingState,
     phrase: Option<[String; 6]>,
+}
+
+#[cfg(unix)]
+static PAIRING_INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_pairing_interrupt(sig: libc::c_int) {
+    // Only async-signal-safe work belongs here. AtomicBool uses a lock-free
+    // primitive on Coven's supported Unix targets; no allocation, lock, or
+    // destructor runs in the handler itself. (Same pattern as the daemon's
+    // termination handler.)
+    PAIRING_INTERRUPT_REQUESTED.store(true, Ordering::Release);
+    let _ = sig;
+}
+
+#[cfg(unix)]
+fn install_pairing_interrupt_handler() -> Result<()> {
+    // SAFETY: sigaction is the documented POSIX API for installing signal
+    // handlers; we pass a zero-initialized struct, our handler pointer, and
+    // an empty signal mask. Failure returns -1 and sets errno.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handle_pairing_interrupt as *const () as usize;
+        libc::sigemptyset(&mut action.sa_mask);
+        // Intentionally no SA_RESTART: blocking stdin reads observe the
+        // interrupt instead of waiting it out, and std retries the
+        // interrupted read so the prompt keeps working.
+        action.sa_flags = 0;
+        if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to install the pairing interrupt handler");
+        }
+    }
+    Ok(())
+}
+
+/// Best-effort cancellation of a pending pairing through the owner-only daemon
+/// control route. If the daemon is unreachable, its in-memory pending pairings
+/// are already gone, so a failed request never leaves a live pairing behind.
+#[cfg(unix)]
+fn cancel_pending_pairing(coven_home: &Path, pairing_id: Uuid) -> &'static str {
+    let path = format!("/api/v1/internal/mobile/pairings/{pairing_id}/cancel");
+    let Ok((200, body)) = post_mobile_control(coven_home, &path, "{}") else {
+        return "the pending pairing could not be confirmed cancelled with the daemon";
+    };
+    match serde_json::from_str::<serde_json::Value>(&body)
+        .ok()
+        .and_then(|value| value["state"].as_str().map(str::to_owned))
+        .as_deref()
+    {
+        Some("cancelled") => "the pending pairing was cancelled",
+        Some("already_completed") => {
+            "the pairing had already completed; the paired device was kept"
+        }
+        Some("already_terminal") => "the pairing was already cancelled or expired",
+        _ => "the pending pairing state was not reported by the daemon",
+    }
 }
 
 #[cfg(unix)]
 fn run_pair_unix() -> Result<()> {
     let coven_home = crate::coven_home_dir()?;
+    // The handler stays installed for the lifetime of this pairing flow; the
+    // command runs to process exit, so no restore step is needed.
+    install_pairing_interrupt_handler()?;
     let (status, body) =
         post_mobile_control(&coven_home, "/api/v1/internal/mobile/pairings", "{}")?;
     if status != 201 {
@@ -211,6 +276,10 @@ fn run_pair_unix() -> Result<()> {
         if Utc::now() >= invitation.expires_at {
             bail!("mobile pairing expired before the device enrolled");
         }
+        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+            let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            bail!("mobile pairing interrupted before the device enrolled; {outcome}");
+        }
         let path = format!("/api/v1/internal/mobile/pairings/{}/status", invitation.id);
         let (status, body) = post_mobile_control(&coven_home, &path, "{}")?;
         if status != 200 {
@@ -218,6 +287,11 @@ fn run_pair_unix() -> Result<()> {
         }
         let status: LocalPairingStatus =
             serde_json::from_str(&body).context("daemon returned invalid pairing status")?;
+        match status.state {
+            PairingState::Cancelled => bail!("mobile pairing was cancelled before completion"),
+            PairingState::Expired => bail!("mobile pairing expired before the device enrolled"),
+            _ => {}
+        }
         if let Some(phrase) = status.phrase {
             break phrase;
         }
@@ -230,11 +304,19 @@ fn run_pair_unix() -> Result<()> {
     }
     println!("Type `confirm` only if all six words match:");
     let mut confirmation = String::new();
-    std::io::stdin()
-        .read_line(&mut confirmation)
-        .context("failed to read pairing confirmation")?;
+    if let Err(error) = std::io::stdin().read_line(&mut confirmation) {
+        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+            let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            bail!("mobile pairing interrupted before host confirmation; {outcome}");
+        }
+        return Err(error).context("failed to read pairing confirmation");
+    }
     if confirmation.trim() != "confirm" {
-        bail!("mobile pairing cancelled without host confirmation");
+        let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+            bail!("mobile pairing interrupted; {outcome}");
+        }
+        bail!("mobile pairing declined; {outcome}");
     }
     let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
     let body = serde_json::json!({ "phrase": phrase }).to_string();
