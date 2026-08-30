@@ -27,6 +27,22 @@ from session history. Results correlate to calls by id, so the runner rejects a
 response that reuses one before running any tool in that response, with
 `RunError::DuplicateToolCallId`.
 
+Every run carries one stable `InvocationId` from its `InvocationStarted` event
+through its terminal event. Callers pin the identity through
+`RunOptions::invocation_id`; when they do not, the runner generates a
+process-scoped one that is not durable across restarts. Nested work correlates
+to its parent through `RunOptions::parent_invocation`, so observers can
+reconstruct parent/child relationships without parsing model prose. The
+canonical `InvocationEvent` stream, delivered to an `InvocationObserver`,
+reports the validated `AgentRef` target (with an optional revision pin) at
+start, the agent that completed or failed at the terminal event, and the
+invocation's `RunFailureKind` on failure. The legacy pointer-swap handoff is
+reported as `ControlTransferred`: it moves control inside one invocation and is
+not durable A2A delegation — an explicit delegation contract replaces it in a
+later slice. The `RunObserver` stream remains unchanged during migration and
+will be folded into the canonical events; `Runner::run` remains the
+compatibility facade while that migration is incomplete.
+
 `GoalLoopRunner` composes the single-run `Runner` into a bounded
 `loop-until-done` primitive. An injected `LoopEvaluator` decides whether each
 result satisfies the goal or supplies the next input, while an injected
@@ -43,8 +59,13 @@ does not own SQLite, daemon scheduling, GitHub labels, or UI state.
 
 The crate deliberately does not include an OpenAI client, a daemon command,
 MCP, sandbox execution, voice, or realtime transport. Those are adapters and
-application concerns. Keeping this crate as a workspace leaf also allows it to
-move into its own repository if the API stabilizes.
+application concerns. This crate is Coven's agent behavior/execution component:
+it owns the one-agent model/tool/policy loop. Invocation and delegation
+ownership belongs to the Psyche orchestration contracts, process and harness
+execution to the Coven daemon, and remote placement to the existing Coven hub.
+It must not grow into a second distributed A2A runtime. Keeping this crate as a
+workspace leaf also allows it to move into its own repository if the API
+stabilizes.
 
 The implementation was derived from public behavioral documentation and
 OpenCoven's existing runtime requirements, not from another SDK's source code.

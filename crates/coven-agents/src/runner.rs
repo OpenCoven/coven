@@ -4,16 +4,24 @@ use std::{
 };
 
 use crate::{
-    Agent, AgentId, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition, ModelAction,
-    ModelRequest, NoopObserver, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
+    Agent, AgentId, AgentRef, ConfigError, GuardrailStage, GuardrailVerdict, HandoffDefinition,
+    InvocationEvent, InvocationId, InvocationObserver, ModelAction, ModelRequest,
+    NoopInvocationObserver, NoopObserver, RunError, RunEvent, RunFailure, RunFailureKind, RunItem,
     RunObserver, SessionStore,
 };
 
+/// Options for one [`Runner::run`] invocation.
+///
+/// `invocation_id` pins the run's stable invocation identity; when it is
+/// absent the runner generates a process-scoped one. `parent_invocation`
+/// correlates nested work to the invocation that requested it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOptions {
     pub max_turns: usize,
     pub max_handoffs: usize,
     pub session_id: Option<String>,
+    pub invocation_id: Option<InvocationId>,
+    pub parent_invocation: Option<InvocationId>,
 }
 
 impl Default for RunOptions {
@@ -22,6 +30,8 @@ impl Default for RunOptions {
             max_turns: 16,
             max_handoffs: 8,
             session_id: None,
+            invocation_id: None,
+            parent_invocation: None,
         }
     }
 }
@@ -30,6 +40,9 @@ impl Default for RunOptions {
 pub struct RunResult {
     pub final_output: String,
     pub final_agent: AgentId,
+    /// The stable invocation identity that correlated this run from its
+    /// started event through its terminal event.
+    pub invocation: InvocationId,
     pub new_items: Vec<RunItem>,
     pub turns: usize,
     pub handoffs: usize,
@@ -53,6 +66,7 @@ where
     agents: BTreeMap<AgentId, Arc<Agent<C>>>,
     session: Option<Arc<dyn SessionStore>>,
     observer: Arc<dyn RunObserver>,
+    invocation_observer: Arc<dyn InvocationObserver>,
 }
 
 impl<C> Runner<C>
@@ -107,6 +121,7 @@ where
             agents: registered,
             session: None,
             observer: Arc::new(NoopObserver),
+            invocation_observer: Arc::new(NoopInvocationObserver),
         })
     }
 
@@ -120,11 +135,28 @@ where
         self
     }
 
-    fn fail(&self, agent: &AgentId, kind: RunFailureKind, error: RunError) -> RunError {
+    pub fn with_invocation_observer(mut self, observer: Arc<dyn InvocationObserver>) -> Self {
+        self.invocation_observer = observer;
+        self
+    }
+
+    fn fail(
+        &self,
+        invocation: &InvocationId,
+        agent: &AgentId,
+        kind: RunFailureKind,
+        error: RunError,
+    ) -> RunError {
         self.observer.on_event(&RunEvent::RunFailed {
             agent: agent.clone(),
             kind,
         });
+        self.invocation_observer
+            .on_invocation_event(&InvocationEvent::InvocationFailed {
+                invocation: invocation.clone(),
+                target: AgentRef::from_agent(agent.clone()),
+                kind,
+            });
         error
     }
 
@@ -141,6 +173,7 @@ where
     /// or tool execution.
     async fn check_input_guardrails(
         &self,
+        invocation: &InvocationId,
         agent: &Agent<C>,
         input: &str,
         context: &C,
@@ -148,6 +181,7 @@ where
         for guardrail in &agent.input_guardrails {
             let verdict = guardrail.check(input, context).await.map_err(|source| {
                 self.fail(
+                    invocation,
                     &agent.id,
                     RunFailureKind::InputGuardrail,
                     RunError::GuardrailFailed {
@@ -167,6 +201,7 @@ where
             });
             if let GuardrailVerdict::Reject { reason } = verdict {
                 return Err(self.fail(
+                    invocation,
                     &agent.id,
                     RunFailureKind::InputGuardrail,
                     RunError::GuardrailRejected {
@@ -184,9 +219,23 @@ where
 
     /// Runs `starting_agent` to a final output.
     ///
-    /// Every run emits exactly one `RunStarted` event followed by exactly one
-    /// terminal `RunCompleted` or `RunFailed` event, including when the
-    /// starting agent is unregistered, so observers can pair per-run state.
+    /// This signature is the compatibility facade while the invocation and
+    /// delegation contracts migrate: orchestration, durability, and remote
+    /// execution concerns will move out of it in later slices, and callers
+    /// keep working unchanged until then.
+    ///
+    /// Every run carries exactly one stable [`InvocationId`], resolved from
+    /// `options.invocation_id` or generated for the process, from its
+    /// `InvocationStarted` event through its terminal event. The identity is
+    /// returned on [`RunResult`] and carried on [`RunFailure`], so a caller
+    /// can correlate partial-failure evidence with the same id the observer
+    /// saw. Nested work passes the parent identity through
+    /// `options.parent_invocation`.
+    ///
+    /// On the legacy [`RunObserver`] stream, every run emits exactly one
+    /// `RunStarted` event followed by exactly one terminal `RunCompleted` or
+    /// `RunFailed` event, including when the starting agent is unregistered,
+    /// so observers can pair per-run state.
     ///
     /// A failure returns [`RunFailure`], which carries the transcript the run
     /// produced before it failed. A tool that fails mid-turn does not erase the
@@ -206,9 +255,14 @@ where
         context: &C,
         options: RunOptions,
     ) -> Result<RunResult, RunFailure> {
+        let invocation = options
+            .invocation_id
+            .clone()
+            .unwrap_or_else(InvocationId::generate);
         let mut progress = RunProgress::default();
 
         self.run_loop(
+            invocation.clone(),
             starting_agent.into(),
             input.into(),
             context,
@@ -217,6 +271,7 @@ where
         )
         .await
         .map_err(|error| RunFailure {
+            invocation,
             error,
             new_items: progress.items,
             turns: progress.turns,
@@ -226,12 +281,19 @@ where
 
     async fn run_loop(
         &self,
+        invocation: InvocationId,
         starting_agent: AgentId,
         input: String,
         context: &C,
         options: RunOptions,
         progress: &mut RunProgress,
     ) -> Result<RunResult, RunError> {
+        self.invocation_observer
+            .on_invocation_event(&InvocationEvent::InvocationStarted {
+                invocation: invocation.clone(),
+                parent: options.parent_invocation.clone(),
+                target: AgentRef::from_agent(starting_agent.clone()),
+            });
         self.observer.on_event(&RunEvent::RunStarted {
             starting_agent: starting_agent.clone(),
         });
@@ -242,19 +304,21 @@ where
 
         let mut current = self.agents.get(&starting_agent).cloned().ok_or_else(|| {
             self.fail(
+                &invocation,
                 &starting_agent,
                 RunFailureKind::Configuration,
                 RunError::UnknownStartingAgent(starting_agent.clone()),
             )
         })?;
 
-        self.check_input_guardrails(&current, &input, context)
+        self.check_input_guardrails(&invocation, &current, &input, context)
             .await?;
 
         let mut model_items = match (&options.session_id, &self.session) {
             (Some(session_id), Some(session)) => {
                 let mut items = session.load(session_id).await.map_err(|source| {
                     self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::Session,
                         RunError::SessionFailed {
@@ -268,6 +332,7 @@ where
             }
             (Some(_), None) => {
                 return Err(self.fail(
+                    &invocation,
                     &current.id,
                     RunFailureKind::Session,
                     RunError::SessionUnavailable,
@@ -318,6 +383,7 @@ where
                 .await
                 .map_err(|source| {
                     self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::Model,
                         RunError::ModelFailed {
@@ -339,6 +405,7 @@ where
             if response.actions.is_empty() {
                 let output = response.assistant_message.ok_or_else(|| {
                     self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -352,6 +419,7 @@ where
                 for guardrail in &current.output_guardrails {
                     let verdict = guardrail.check(&output, context).await.map_err(|source| {
                         self.fail(
+                            &invocation,
                             &current.id,
                             RunFailureKind::OutputGuardrail,
                             RunError::GuardrailFailed {
@@ -371,6 +439,7 @@ where
                     });
                     if let GuardrailVerdict::Reject { reason } = verdict {
                         return Err(self.fail(
+                            &invocation,
                             &current.id,
                             RunFailureKind::OutputGuardrail,
                             RunError::GuardrailRejected {
@@ -389,6 +458,7 @@ where
                         .await
                         .map_err(|source| {
                             self.fail(
+                                &invocation,
                                 &current.id,
                                 RunFailureKind::Session,
                                 RunError::SessionFailed {
@@ -404,9 +474,17 @@ where
                     turns: turn,
                     handoffs: progress.handoffs,
                 });
+                self.invocation_observer
+                    .on_invocation_event(&InvocationEvent::InvocationCompleted {
+                        invocation: invocation.clone(),
+                        final_target: AgentRef::from_agent(current.id.clone()),
+                        turns: turn,
+                        control_transfers: progress.handoffs,
+                    });
                 return Ok(RunResult {
                     final_output: output,
                     final_agent: current.id.clone(),
+                    invocation,
                     new_items: std::mem::take(&mut progress.items),
                     turns: turn,
                     handoffs: progress.handoffs,
@@ -421,6 +499,7 @@ where
             if handoff_actions > 0 {
                 if response.actions.len() != 1 {
                     return Err(self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -432,6 +511,7 @@ where
                 progress.handoffs += 1;
                 if progress.handoffs > options.max_handoffs {
                     return Err(self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::Limit,
                         RunError::MaxHandoffsExceeded {
@@ -442,6 +522,7 @@ where
 
                 let [ModelAction::Handoff(call)] = response.actions.as_slice() else {
                     return Err(self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -456,6 +537,7 @@ where
                     .find(|handoff| handoff.name == call.name)
                     .ok_or_else(|| {
                         self.fail(
+                            &invocation,
                             &current.id,
                             RunFailureKind::Handoff,
                             RunError::UnknownHandoff {
@@ -466,6 +548,7 @@ where
                     })?;
                 let target = self.agents.get(&handoff.target).cloned().ok_or_else(|| {
                     self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::Configuration,
                         RunError::InvalidConfiguration {
@@ -488,12 +571,18 @@ where
                     to: target.id.clone(),
                     name: handoff.name.clone(),
                 });
+                self.invocation_observer
+                    .on_invocation_event(&InvocationEvent::ControlTransferred {
+                        invocation: invocation.clone(),
+                        from: AgentRef::from_agent(current.id.clone()),
+                        to: AgentRef::from_agent(target.id.clone()),
+                    });
                 current = target;
                 // Ingress parity: the handoff target enforces the same input
                 // policy it would enforce as the starting agent, checked
                 // against the original user input, before its first model turn
                 // or tool execution.
-                self.check_input_guardrails(&current, &input, context)
+                self.check_input_guardrails(&invocation, &current, &input, context)
                     .await?;
                 continue;
             }
@@ -507,6 +596,7 @@ where
                 };
                 if !seen_call_ids.insert(call.id.clone()) {
                     return Err(self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::DuplicateToolCallId {
@@ -520,6 +610,7 @@ where
             for action in response.actions {
                 let ModelAction::ToolCall(call) = action else {
                     return Err(self.fail(
+                        &invocation,
                         &current.id,
                         RunFailureKind::InvalidResponse,
                         RunError::InvalidModelResponse {
@@ -534,6 +625,7 @@ where
                     .find(|tool| tool.definition.name == call.name)
                     .ok_or_else(|| {
                         self.fail(
+                            &invocation,
                             &current.id,
                             RunFailureKind::Tool,
                             RunError::UnknownTool {
@@ -559,6 +651,7 @@ where
                         .await
                         .map_err(|source| {
                             self.fail(
+                                &invocation,
                                 &current.id,
                                 RunFailureKind::Tool,
                                 RunError::ToolFailed {
@@ -585,6 +678,7 @@ where
         }
 
         Err(self.fail(
+            &invocation,
             &current.id,
             RunFailureKind::Limit,
             RunError::MaxTurnsExceeded {
