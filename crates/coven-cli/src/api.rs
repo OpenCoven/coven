@@ -10587,7 +10587,10 @@ mod tests {
 
             assert_eq!(response.status, 404, "path {path:?}");
             assert_eq!(body["error"]["code"], "not_found", "path {path:?}");
-            assert_eq!(body["error"]["message"], "Route not found.", "path {path:?}");
+            assert_eq!(
+                body["error"]["message"], "Route not found.",
+                "path {path:?}"
+            );
         }
         Ok(())
     }
