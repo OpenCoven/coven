@@ -40,8 +40,8 @@ this token. Beads state is cited only from the maintainer comment above.
 
 PR #834 `feat(cli): add progressive public help`
 (`OpenCoven:finish/670-progressive-help` → `main`) merged 2026-08-25T12:08:08Z
-as commit `3724f26455a9488e80eaa9d8379ee7833f69e52d` (+1828/−15 across 8
-files). Delivered on main:
+as commit `3724f26455a9488e80eaa9d8379ee7833f69e52d` (1828 insertions,
+15 deletions across 8 files). Delivered on main:
 
 - `crates/coven-cli/src/help.rs` — default top-level help lists exactly eight
   commands (doctor, setup, run, sessions, attach, daemon, status, help) via
@@ -51,11 +51,11 @@ files). Delivered on main:
 - Coverage enforcement: help.rs fails when any visible command lacks public
   metadata (`public help metadata is missing visible command(s)`,
   `public command ... is missing an about string`).
-- `crates/coven-cli/tests/help_disclosure.rs` (+464) asserts the curated
+- `crates/coven-cli/tests/help_disclosure.rs` (464 lines) asserts the curated
   top-level command list and that internal commands (`chat`, `config`) are not
   listed.
-- `scripts/export-cli-help-contract.mjs` (+279) and
-  `scripts/export-cli-help-contract-test.mjs` (+323) export a deterministic
+- `scripts/export-cli-help-contract.mjs` (279 lines) and
+  `scripts/export-cli-help-contract-test.mjs` (323 lines) export a deterministic
   JSON help contract (schemaVersion 1) and reject duplicate commands, internal
   leakage (`process-supervisor`, `serve`), non-canonical docs URLs (must be
   stable `https://docs.opencoven.ai/docs/...`), ANSI escapes, and
@@ -73,7 +73,7 @@ are covered by CI.
 
 PR #835 `test(cli): add packaged first-session E2E journey`
 (`OpenCoven:finish/777-packaged-journey` → `main`) merged 2026-08-25T13:47:31Z
-(+2686/−177, 13 files); issue #777 closed 2026-08-25. Delivered on main:
+(2686 insertions, 177 deletions, 13 files); issue #777 closed 2026-08-25. Delivered on main:
 
 - `scripts/user-journey-e2e.mjs` — hermetic journey through the installed npm
   wrapper with isolated `COVEN_HOME`: bare-runner `coven doctor` fails closed
