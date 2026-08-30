@@ -1,0 +1,186 @@
+{
+  "contractProfile": "coven.automations.v1",
+  "version": 1,
+  "notes": [
+    "Authoritative state machines for coven.automations.v1. Clients do not author state: transitions are committed by command handlers or the scheduler, never by arbitrary client writes.",
+    "`on` names the cause class; `actor` names who may commit the transition; `guard` names the condition that must hold. Property tests consume this file to prove invariant preservation."
+  ],
+  "machines": [
+    {
+      "id": "occurrence.v1",
+      "entity": "occurrence",
+      "initial": "planned",
+      "terminalStates": ["succeeded", "failed", "cancelled", "timed_out", "skipped", "superseded"],
+      "states": [
+        { "name": "planned", "terminal": false },
+        { "name": "eligible", "terminal": false },
+        { "name": "claimed", "terminal": false },
+        { "name": "dispatching", "terminal": false },
+        { "name": "running", "terminal": false },
+        { "name": "recovering", "terminal": false },
+        { "name": "recovery_required", "terminal": false },
+        { "name": "succeeded", "terminal": true },
+        { "name": "failed", "terminal": true },
+        { "name": "cancelled", "terminal": true },
+        { "name": "timed_out", "terminal": true },
+        { "name": "skipped", "terminal": true },
+        { "name": "superseded", "terminal": true }
+      ],
+      "transitions": [
+        { "from": "planned", "to": "eligible", "on": "eligibility_passed", "actor": "scheduler" },
+        { "from": "planned", "to": "skipped", "on": "misfire", "actor": "scheduler", "guard": "misfire policy disposes this slot (e.g. overlap_forbid, paused, invalid)" },
+        { "from": "planned", "to": "superseded", "on": "definition_superseded", "actor": "scheduler", "guard": "a newer revision replaced the definition before this slot was claimed" },
+        { "from": "planned", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation command committed before any claim" },
+        { "from": "eligible", "to": "claimed", "on": "claim", "actor": "scheduler", "guard": "compare-and-set on state='eligible' or 'planned' with lease set; increments fence generation" },
+        { "from": "eligible", "to": "skipped", "on": "misfire", "actor": "scheduler" },
+        { "from": "eligible", "to": "superseded", "on": "definition_superseded", "actor": "scheduler" },
+        { "from": "eligible", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
+        { "from": "claimed", "to": "dispatching", "on": "attempt_adopted", "actor": "dispatcher", "guard": "attempt created with adoptionKey; fence generation matches the claim" },
+        { "from": "claimed", "to": "recovering", "on": "lease_expired", "actor": "scheduler", "guard": "leaseExpiresAt < now and no runtime evidence recorded" },
+        { "from": "claimed", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation reconciled before dispatch" },
+        { "from": "dispatching", "to": "running", "on": "runtime_started", "actor": "dispatcher", "guard": "runtime acknowledged the session start (attempt started)" },
+        { "from": "dispatching", "to": "failed", "on": "launch_refused", "actor": "dispatcher", "guard": "launch failed deterministically before any side effect; occurrence settles failed with reason launch_refused" },
+        { "from": "dispatching", "to": "recovering", "on": "lease_expired", "actor": "scheduler", "guard": "no runtime evidence before lease expiry" },
+        { "from": "dispatching", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "no attempt reached started; otherwise cancellation waits for reconciliation" },
+        { "from": "running", "to": "succeeded", "on": "run_settled", "actor": "dispatcher", "guard": "runtime evidence proves completion; receipt recorded" },
+        { "from": "running", "to": "failed", "on": "run_settled", "actor": "dispatcher", "guard": "runtime evidence proves failure" },
+        { "from": "running", "to": "timed_out", "on": "timeout", "actor": "scheduler", "guard": "perRunMinutes elapsed without settled evidence" },
+        { "from": "running", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged by runtime or reconciled by recovery" },
+        { "from": "running", "to": "recovery_required", "on": "evidence_lost", "actor": "scheduler", "guard": "runtime lost mid-run: outcome cannot be determined automatically" },
+        { "from": "recovering", "to": "failed", "on": "recovery_determined", "actor": "scheduler", "guard": "no side effects were possible (sideEffectClass bounds proven)" },
+        { "from": "recovering", "to": "recovery_required", "on": "recovery_ambiguous", "actor": "scheduler", "guard": "side effects cannot be ruled out; requires explicit operator recovery" },
+        { "from": "recovery_required", "to": "failed", "on": "operator_recovery_failed", "actor": "command_handler", "guard": "occurrence.recover.v1 with evidenceDetermination=failed_deterministic" },
+        { "from": "recovery_required", "to": "dispatching", "on": "operator_recovery_attempt", "actor": "command_handler", "guard": "occurrence.recover.v1 with evidenceDetermination=retry_with_new_attempt; opens a new attempt carrying priorDisposition=ambiguous" }
+      ]
+    },
+    {
+      "id": "attempt.v1",
+      "entity": "attempt",
+      "initial": "adopted",
+      "terminalStates": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"],
+      "states": [
+        { "name": "adopted", "terminal": false },
+        { "name": "dispatching", "terminal": false },
+        { "name": "started", "terminal": false },
+        { "name": "observing", "terminal": false },
+        { "name": "succeeded", "terminal": true },
+        { "name": "failed", "terminal": true },
+        { "name": "cancelled", "terminal": true },
+        { "name": "timed_out", "terminal": true },
+        { "name": "ambiguous", "terminal": true }
+      ],
+      "transitions": [
+        { "from": "adopted", "to": "dispatching", "on": "dispatch", "actor": "dispatcher", "guard": "dispatch generation incremented; exactly one dispatch in flight per attempt" },
+        { "from": "adopted", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation committed before dispatch" },
+        { "from": "dispatching", "to": "started", "on": "runtime_started", "actor": "dispatcher", "guard": "runtime session bound; a second session bind is ILLEGAL_TRANSITION" },
+        { "from": "dispatching", "to": "failed", "on": "launch_refused", "actor": "dispatcher", "guard": "deterministic pre-side-effect refusal" },
+        { "from": "dispatching", "to": "ambiguous", "on": "dispatch_unconfirmed", "actor": "dispatcher", "guard": "dispatch sent but no deterministic ack before lease expiry; terminal for the attempt" },
+        { "from": "dispatching", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged before runtime start" },
+        { "from": "started", "to": "observing", "on": "evidence_stream_open", "actor": "worker", "guard": "output/event cursors established" },
+        { "from": "started", "to": "succeeded", "on": "run_settled", "actor": "worker", "guard": "terminal evidence without an observing phase" },
+        { "from": "started", "to": "ambiguous", "on": "evidence_lost", "actor": "scheduler", "guard": "session vanished before evidence" },
+        { "from": "observing", "to": "succeeded", "on": "run_settled", "actor": "worker", "guard": "verified completion evidence" },
+        { "from": "observing", "to": "failed", "on": "run_settled", "actor": "worker", "guard": "verified failure evidence" },
+        { "from": "observing", "to": "timed_out", "on": "timeout", "actor": "scheduler", "guard": "perRunMinutes elapsed" },
+        { "from": "observing", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler", "guard": "cancellation acknowledged by runtime" },
+        { "from": "observing", "to": "ambiguous", "on": "evidence_lost", "actor": "scheduler", "guard": "heartbeat/lease evidence expired mid-observation" }
+      ]
+    },
+    {
+      "id": "run.v1",
+      "entity": "run",
+      "initial": "accepted",
+      "terminalStates": ["succeeded", "failed", "cancelled", "timed_out", "ambiguous"],
+      "states": [
+        { "name": "accepted", "terminal": false },
+        { "name": "running", "terminal": false },
+        { "name": "succeeded", "terminal": true },
+        { "name": "failed", "terminal": true },
+        { "name": "cancelled", "terminal": true },
+        { "name": "timed_out", "terminal": true },
+        { "name": "ambiguous", "terminal": true }
+      ],
+      "transitions": [
+        { "from": "accepted", "to": "running", "on": "attempt_started", "actor": "dispatcher", "guard": "command adoption committed before any side effect; currentAttemptId set" },
+        { "from": "accepted", "to": "failed", "on": "launch_refused", "actor": "dispatcher", "guard": "every attempt failed deterministically before evidence" },
+        { "from": "accepted", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
+        { "from": "running", "to": "succeeded", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled succeeded; receipt recorded" },
+        { "from": "running", "to": "failed", "on": "attempt_settled", "actor": "dispatcher", "guard": "an attempt settled failed and retry policy opens no further attempt" },
+        { "from": "running", "to": "timed_out", "on": "timeout", "actor": "scheduler" },
+        { "from": "running", "to": "cancelled", "on": "cancel_acknowledged", "actor": "command_handler" },
+        { "from": "running", "to": "ambiguous", "on": "attempt_ambiguous", "actor": "dispatcher", "guard": "the current attempt settled ambiguous and no operator recovery has resolved it" }
+      ]
+    },
+    {
+      "id": "definition.v1",
+      "entity": "definition",
+      "initial": "draft",
+      "terminalStates": ["tombstoned"],
+      "states": [
+        { "name": "draft", "terminal": false },
+        { "name": "paused", "terminal": false },
+        { "name": "active", "terminal": false },
+        { "name": "disabled", "terminal": false },
+        { "name": "invalid", "terminal": false },
+        { "name": "tombstoned", "terminal": true }
+      ],
+      "transitions": [
+        { "from": "draft", "to": "paused", "on": "definition_revise_committed", "actor": "command_handler", "guard": "definition validated; revision incremented" },
+        { "from": "draft", "to": "tombstoned", "on": "definition_tombstoned", "actor": "command_handler" },
+        { "from": "paused", "to": "active", "on": "definition_activated", "actor": "command_handler", "guard": "familiar, authority, and runtime requirements validated" },
+        { "from": "paused", "to": "disabled", "on": "definition_disabled", "actor": "command_handler" },
+        { "from": "paused", "to": "tombstoned", "on": "definition_tombstoned", "actor": "command_handler" },
+        { "from": "active", "to": "paused", "on": "definition_paused", "actor": "command_handler" },
+        { "from": "active", "to": "disabled", "on": "definition_disabled", "actor": "command_handler" },
+        { "from": "active", "to": "invalid", "on": "definition_invalidated", "actor": "command_handler", "guard": "a revise committed an invalid body or dependencies (familiar/runtime/authority) became unsatisfiable" },
+        { "from": "active", "to": "tombstoned", "on": "definition_tombstoned", "actor": "command_handler" },
+        { "from": "disabled", "to": "paused", "on": "definition_reenabled", "actor": "command_handler", "guard": "explicit re-enable; disabled never auto-reactivates" },
+        { "from": "disabled", "to": "tombstoned", "on": "definition_tombstoned", "actor": "command_handler" },
+        { "from": "invalid", "to": "paused", "on": "definition_revise_committed", "actor": "command_handler", "guard": "a revise repaired the body and validation passed" },
+        { "from": "invalid", "to": "tombstoned", "on": "definition_tombstoned", "actor": "command_handler" }
+      ]
+    }
+  ],
+  "invariants": [
+    {
+      "id": "adoption-before-side-effects",
+      "statement": "Command adoption commits before any consequential side effect is issued; a run is accepted (run.v1 accepted) before dispatch begins."
+    },
+    {
+      "id": "one-fence-one-run",
+      "statement": "One occurrence fence generation cannot own two accepted runs: acceptance requires a compare-and-set on the occurrence fence generation, and a second acceptance with the same generation is a typed conflict."
+    },
+    {
+      "id": "one-attempt-one-session",
+      "statement": "One attempt cannot bind two runtime sessions; a second session bind on the same attempt is ILLEGAL_TRANSITION and commits nothing."
+    },
+    {
+      "id": "terminal-no-regress",
+      "statement": "Terminal states never regress; no transition in any machine above leaves a terminal state."
+    },
+    {
+      "id": "no-evidence-no-success",
+      "statement": "Absence of runtime evidence can never become success; the only transitions out of evidence loss are failed, recovery paths, ambiguous, or timed_out."
+    },
+    {
+      "id": "cancellation-is-a-request",
+      "statement": "Cancellation is a request until acknowledged or reconciled; CANCEL_PENDING is returned while a running attempt has not acknowledged, and the occurrence settles cancelled only after acknowledgment or reconciliation."
+    },
+    {
+      "id": "retry-new-attempt",
+      "statement": "Retry creates a new attempt with attemptNumber incremented and priorDisposition set; the prior attempt's record is never rewritten."
+    },
+    {
+      "id": "ambiguous-never-auto-retried",
+      "statement": "Ambiguous mutating work is not automatically retried; only occurrence.recover.v1 with an explicit operator determination can open work after an ambiguous disposition."
+    },
+    {
+      "id": "revision-pins-history",
+      "statement": "Definition revision changes never rewrite historical occurrences, runs, attempts, or receipts; each pins the automationRevision and definition digest it was created and executed against."
+    },
+    {
+      "id": "tombstone-preserves-history",
+      "statement": "Deleting a definition tombstones it without erasing required history; tombstoned definitions never plan, claim, or run, and their records remain readable."
+    }
+  ]
+}

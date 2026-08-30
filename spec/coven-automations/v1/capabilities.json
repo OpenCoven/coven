@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "contractProfile": "coven.automations.v1",
+  "description": "Machine-readable variant negotiation for coven.automations.v1. A producer lists the trigger, condition, action, and policy variants it executes. A definition referencing a variant absent from `supported` (and, where explicitly flagged, `experimental`) MUST be refused with the typed error `CAPABILITY_UNSUPPORTED`; the error payload names the unsupported variant. This is the negative negotiation path: nothing about an unknown variant is guessed, defaulted, or silently downgraded.",
+  "supported": {
+    "triggers": [
+      {
+        "variant": "schedule",
+        "profile": "coven.automations.v1",
+        "notes": "RRULE vocabulary per the #816 scheduler: FREQ=DAILY|WEEKLY, optional BYHOUR list, optional BYDAY list for weekly."
+      }
+    ],
+    "conditions": [],
+    "actions": [
+      {
+        "variant": "familiarInvocation",
+        "profile": "coven.automations.v1",
+        "notes": "One prompt, one familiar, one runtime descriptor per definition; dispatch through the shared SessionLaunch path."
+      }
+    ],
+    "triggerPolicies": [
+      { "variant": "misfire.latest", "notes": "On recovery only the latest missed slot runs; earlier slots collapse, never backfill." },
+      { "variant": "overlap.forbid", "notes": "A run is skipped when the previous occurrence has not settled." },
+      { "variant": "timeout.required", "notes": "Every definition carries a bounded per-run timeout, 1..=44640 minutes." }
+    ],
+    "deliveryPolicies": [
+      { "variant": "outputTarget.atomic", "notes": "Optional atomic output path; commits only after a completed, verified run." }
+    ],
+    "retentionPolicies": [
+      { "variant": "retention.standard" }
+    ]
+  },
+  "experimental": [],
+  "refused": [
+    {
+      "variant": "trigger.webhook",
+      "reason": "Not defined in v1; refuse with CAPABILITY_UNSUPPORTED rather than approximating with schedule."
+    },
+    {
+      "variant": "action.pipeline",
+      "reason": "Multi-step pipelines are out of scope (issue non-goal: not a general-purpose workflow language)."
+    },
+    {
+      "variant": "misfire.backfill",
+      "reason": "v1 misfire semantics collapse missed slots; backfill would change occurrence-key identity."
+    }
+  ],
+  "negotiationRules": [
+    "Producers advertise this file (or a generated equivalent) on the capability surface; consumers read it before authoring definitions.",
+    "Refusal is per-variant and additive: refusing `trigger.webhook` says nothing about `action.familiarInvocation`.",
+    "Unknown policy values inside a supported variant are still unknown variants and fail closed.",
+    "A consumer must treat `experimental` entries as unavailable unless it explicitly opts in; opting in is a local decision and never changes wire semantics."
+  ]
+}

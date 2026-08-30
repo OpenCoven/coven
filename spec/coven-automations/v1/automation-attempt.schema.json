@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/automation-attempt.schema.json",
+  "title": "Coven Automations v1 AutomationAttempt",
+  "description": "One dispatch unit of one run. Attempts are individually fenced and individually terminal: a retry always creates a new attempt and never rewrites a prior attempt. An attempt binds at most one runtime session.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "attemptId",
+    "runId",
+    "occurrenceId",
+    "attemptNumber",
+    "adoptionKey",
+    "dispatchFence",
+    "state"
+  ],
+  "properties": {
+    "schemaVersion": { "$ref": "common.schema.json#/$defs/schemaVersion" },
+    "attemptId": { "$ref": "common.schema.json#/$defs/attemptId" },
+    "runId": { "$ref": "common.schema.json#/$defs/runId" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/occurrenceId" },
+    "attemptNumber": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monotonic within the run, starting at 1. attemptNumber n is never reused within a run."
+    },
+    "adoptionKey": {
+      "$ref": "common.schema.json#/$defs/adoptionKey",
+      "description": "Request/adoption key for this dispatch. Workers adopt by key; replays of the same key return the same attempt rather than creating a second one. Derived deterministically from the run id and attempt number unless the caller supplies one."
+    },
+    "priorDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attemptNumber", "outcome"],
+      "properties": {
+        "attemptNumber": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "The prior attempt this attempt retries, when applicable."
+        },
+        "outcome": {
+          "enum": ["failed", "timed_out", "ambiguous", "cancelled"],
+          "description": "Explicit prior disposition the retry is issued against. Retrying requires stating this; an ambiguous prior disposition forbids automatic retry and requires an explicit recover command."
+        }
+      },
+      "description": "Required when attemptNumber > 1: every retry names the disposition it retries."
+    },
+    "dispatchFence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["occurrenceFenceGeneration", "dispatchGeneration"],
+      "properties": {
+        "occurrenceFenceGeneration": { "$ref": "common.schema.json#/$defs/fenceToken" },
+        "dispatchGeneration": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Monotonic dispatch counter guarding double-dispatch of the same attempt."
+        }
+      }
+    },
+    "workerCorrelation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workerId"],
+      "properties": {
+        "workerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Dispatcher/worker instance that adopted this attempt."
+        },
+        "sessionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Runtime session bound to this attempt. At most one session may bind to one attempt; a second bind is a typed error (ILLEGAL_TRANSITION), never a silent overwrite."
+        },
+        "adoptedAt": { "$ref": "common.schema.json#/$defs/timestamp" }
+      }
+    },
+    "retryClassification": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "classification": {
+          "enum": ["initial", "automatic_retry", "operator_retry", "operator_recovery"]
+        },
+        "eligibleClasses": {
+          "type": "array",
+          "items": {
+            "enum": ["transient_dispatch", "lease_expired", "runtime_unavailable"]
+          },
+          "description": "Snapshot of retryable classes from the definition's retry policy when this attempt was opened."
+        }
+      }
+    },
+    "leaseObservations": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observedAt", "heartbeatOk"],
+        "properties": {
+          "observedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+          "heartbeatOk": { "type": "boolean" },
+          "note": { "type": "string", "maxLength": 200 }
+        }
+      },
+      "description": "Heartbeat/lease observations. Expired evidence moves work to recovery; it can never be reinterpreted as success."
+    },
+    "outputCursors": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "eventCursor": { "$ref": "common.schema.json#/$defs/sequenceNumber" },
+        "logCursor": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Cursor into the bounded run log the worker has consumed."
+        }
+      },
+      "description": "Output/event cursors a resuming worker uses to continue observing without re-emitting."
+    },
+    "state": {
+      "enum": [
+        "adopted",
+        "dispatching",
+        "started",
+        "observing",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "ambiguous"
+      ],
+      "description": "Attempt lifecycle per state-machines.json. ambiguous is terminal: absence of runtime evidence cannot become success, and ambiguous work is never automatically retried."
+    },
+    "stateReason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 500
+    },
+    "openedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "settledAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "extensions": { "$ref": "common.schema.json#/$defs/extensionBag" }
+  }
+}
