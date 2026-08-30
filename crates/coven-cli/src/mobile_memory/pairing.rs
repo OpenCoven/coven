@@ -1363,56 +1363,47 @@ mod tests {
 
     #[test]
     fn cancelled_pairings_expire_like_naturally_expired_pairings() {
-        let harness = PairingHarness::new();
-        let cancelled_id = harness.pairing_id;
-        let expired_id = Uuid::from_u128(2);
-        let expired_nonce = [31_u8; 32];
-        harness
-            .manager
-            .begin_pairing_with_id(
-                expired_id,
-                expired_nonce,
-                harness.now + Duration::minutes(5),
-            )
-            .unwrap();
-        let cancelled_phrase = harness.enroll().phrase;
-        let expired_phrase = harness
-            .manager
-            .enroll(
-                expired_id,
-                expired_nonce,
-                harness.request.clone(),
-                [3; 32],
-                harness.now,
-            )
-            .unwrap()
-            .phrase;
+        // Two independent managers: past the deadline any operation sweeps
+        // entries it is not addressing, so a shared manager would let the
+        // first probe evict the second pairing before it is probed.
+        let cancelled_harness = PairingHarness::new();
+        let expired_harness = PairingHarness::new();
+        let cancelled_phrase = cancelled_harness.enroll().phrase;
+        let expired_phrase = expired_harness.enroll().phrase;
         assert_eq!(
-            harness.manager.cancel(cancelled_id, harness.now).unwrap(),
+            cancelled_harness
+                .manager
+                .cancel(cancelled_harness.pairing_id, cancelled_harness.now)
+                .unwrap(),
             PairingCancellation::Cancelled
         );
-        let after = harness.now + Duration::minutes(6);
+        let after = cancelled_harness.now + Duration::minutes(6);
 
-        for (pairing_id, nonce, phrase) in [
-            (cancelled_id, harness.pairing_nonce, cancelled_phrase),
-            (expired_id, expired_nonce, expired_phrase),
+        for (harness, phrase) in [
+            (&cancelled_harness, cancelled_phrase),
+            (&expired_harness, expired_phrase),
         ] {
             assert_eq!(
                 harness
                     .manager
-                    .confirm_device(pairing_id, &phrase, after)
+                    .confirm_device(harness.pairing_id, &phrase, after)
                     .unwrap_err(),
                 PairingError::PairingExpired
             );
             assert_eq!(
                 harness
                     .manager
-                    .enroll_by_nonce(nonce, harness.request.clone(), [3; 32], after)
+                    .enroll_by_nonce(
+                        harness.pairing_nonce,
+                        harness.request.clone(),
+                        [3; 32],
+                        after
+                    )
                     .unwrap_err(),
                 PairingError::PairingExpired
             );
+            assert!(harness.devices().is_empty());
         }
-        assert!(harness.devices().is_empty());
     }
 
     #[test]
