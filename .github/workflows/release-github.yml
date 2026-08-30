@@ -38,6 +38,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
+      checks: read
       contents: write
     steps:
       - name: Refuse non-default-branch manual recovery
@@ -68,6 +69,24 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --source-run-id "$SOURCE_RUN_ID" \
             --source-run-attempt "$SOURCE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      - name: Verify exact source commit required checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-commit-gate.mjs verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit-sha "${{ steps.source.outputs.head_sha }}" \
+            --manifest scripts/release-required-checks.json \
+            --release-tag "${{ steps.source.outputs.release_tag }}" \
+            --tag-object-sha "${{ steps.source.outputs.tag_object_sha }}" \
+            --receipt-output release-commit-gate-receipt.json
+      - name: Upload exact source acceptance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: coven-release-commit-gate-${{ steps.source.outputs.release_tag }}
+          path: release-commit-gate-receipt.json
+          if-no-files-found: error
       - name: Verify npm provenance for every published package
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
