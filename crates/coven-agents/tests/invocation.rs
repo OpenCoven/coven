@@ -85,9 +85,15 @@ fn event_invocation(event: &InvocationEvent) -> &InvocationId {
 /// exactly one `InvocationStarted`, closes with exactly one terminal event,
 /// and every event in between carries the same invocation identity.
 fn assert_single_invocation_identity(events: &[InvocationEvent]) -> InvocationId {
-    assert!(!events.is_empty(), "an invocation must emit at least one event");
     assert!(
-        matches!(events.first(), Some(InvocationEvent::InvocationStarted { .. })),
+        !events.is_empty(),
+        "an invocation must emit at least one event"
+    );
+    assert!(
+        matches!(
+            events.first(),
+            Some(InvocationEvent::InvocationStarted { .. })
+        ),
         "InvocationStarted must be the first event, got {events:?}"
     );
     let terminal = events
@@ -138,7 +144,12 @@ async fn one_identity_carries_from_started_to_terminal_event() {
         other => panic!("the first event must be InvocationStarted, got {other:?}"),
     }
     match events.last().expect("non-empty stream") {
-        InvocationEvent::InvocationCompleted { final_target, turns, control_transfers, .. } => {
+        InvocationEvent::InvocationCompleted {
+            final_target,
+            turns,
+            control_transfers,
+            ..
+        } => {
             assert_eq!(final_target.agent(), &AgentId::from("a"));
             assert_eq!(*turns, 1);
             assert_eq!(*control_transfers, 0);
@@ -204,7 +215,11 @@ async fn parent_identity_correlates_nested_work() {
     let events = observer.events();
     assert_single_invocation_identity(&events);
     match &events[0] {
-        InvocationEvent::InvocationStarted { invocation, parent: observed, .. } => {
+        InvocationEvent::InvocationStarted {
+            invocation,
+            parent: observed,
+            ..
+        } => {
             assert_eq!(*observed, Some(parent.clone()));
             assert_ne!(*invocation, parent);
         }
@@ -221,11 +236,16 @@ async fn legacy_handoff_is_reported_as_a_control_transfer() {
         ModelResponse::final_output("done from b"),
     ]));
     let agents = [
-        Agent::new("a", "A", "Delegate.", model.clone())
-            .with_handoff(Handoff::new("to_b", "Hand off to b", "b")),
+        Agent::new("a", "A", "Delegate.", model.clone()).with_handoff(Handoff::new(
+            "to_b",
+            "Hand off to b",
+            "b",
+        )),
         Agent::new("b", "B", "Answer.", model),
     ];
-    let runner = Runner::new(agents).unwrap().with_invocation_observer(observer.clone());
+    let runner = Runner::new(agents)
+        .unwrap()
+        .with_invocation_observer(observer.clone());
 
     let result = runner
         .run("a", "Hello", &(), RunOptions::default())
@@ -240,7 +260,11 @@ async fn legacy_handoff_is_reported_as_a_control_transfer() {
         .iter()
         .filter(|event| matches!(event, InvocationEvent::ControlTransferred { .. }))
         .collect();
-    assert_eq!(transfers.len(), 1, "expected one control transfer, got {events:?}");
+    assert_eq!(
+        transfers.len(),
+        1,
+        "expected one control transfer, got {events:?}"
+    );
     match transfers[0] {
         InvocationEvent::ControlTransferred { from, to, .. } => {
             assert_eq!(from.agent(), &AgentId::from("a"));
@@ -249,7 +273,11 @@ async fn legacy_handoff_is_reported_as_a_control_transfer() {
         other => panic!("expected a control transfer, got {other:?}"),
     }
     match events.last().expect("non-empty stream") {
-        InvocationEvent::InvocationCompleted { final_target, control_transfers, .. } => {
+        InvocationEvent::InvocationCompleted {
+            final_target,
+            control_transfers,
+            ..
+        } => {
             assert_eq!(final_target.agent(), &AgentId::from("b"));
             assert_eq!(*control_transfers, 1);
         }
@@ -276,7 +304,11 @@ async fn failed_run_carries_the_identity_to_the_terminal_event() {
     assert_eq!(failure.invocation, identity);
     assert_eq!(identity.as_str(), "inv-doomed");
     match events.last().expect("non-empty stream") {
-        InvocationEvent::InvocationFailed { target, kind: RunFailureKind::Model, .. } => {
+        InvocationEvent::InvocationFailed {
+            target,
+            kind: RunFailureKind::Model,
+            ..
+        } => {
             assert_eq!(target.agent(), &AgentId::from("a"));
         }
         other => panic!("the last event must be InvocationFailed, got {other:?}"),
@@ -323,7 +355,10 @@ async fn both_observer_streams_stay_paired_for_one_run() {
 fn invocation_contract_types_roundtrip_through_serde() {
     let id = InvocationId::try_new("inv-42").unwrap();
     assert_eq!(serde_json::to_string(&id).unwrap(), "\"inv-42\"");
-    assert_eq!(serde_json::from_str::<InvocationId>("\"inv-42\"").unwrap(), id);
+    assert_eq!(
+        serde_json::from_str::<InvocationId>("\"inv-42\"").unwrap(),
+        id
+    );
 
     let reference = AgentRef::try_new(AgentId::from("triage"))
         .unwrap()

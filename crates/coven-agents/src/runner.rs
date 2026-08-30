@@ -474,13 +474,14 @@ where
                     turns: turn,
                     handoffs: progress.handoffs,
                 });
-                self.invocation_observer
-                    .on_invocation_event(&InvocationEvent::InvocationCompleted {
+                self.invocation_observer.on_invocation_event(
+                    &InvocationEvent::InvocationCompleted {
                         invocation: invocation.clone(),
                         final_target: AgentRef::from_agent(current.id.clone()),
                         turns: turn,
                         control_transfers: progress.handoffs,
-                    });
+                    },
+                );
                 return Ok(RunResult {
                     final_output: output,
                     final_agent: current.id.clone(),
@@ -571,12 +572,13 @@ where
                     to: target.id.clone(),
                     name: handoff.name.clone(),
                 });
-                self.invocation_observer
-                    .on_invocation_event(&InvocationEvent::ControlTransferred {
+                self.invocation_observer.on_invocation_event(
+                    &InvocationEvent::ControlTransferred {
                         invocation: invocation.clone(),
                         from: AgentRef::from_agent(current.id.clone()),
                         to: AgentRef::from_agent(target.id.clone()),
-                    });
+                    },
+                );
                 current = target;
                 // Ingress parity: the handoff target enforces the same input
                 // policy it would enforce as the starting agent, checked

@@ -156,7 +156,7 @@ impl AgentRef {
 impl fmt::Display for AgentRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.revision {
-            Some(revision) => write!(formatter, "{revision}@{}", self.agent),
+            Some(revision) => write!(formatter, "{}@{revision}", self.agent),
             None => self.agent.fmt(formatter),
         }
     }
@@ -268,7 +268,9 @@ mod tests {
     #[test]
     fn agent_ref_requires_a_valid_agent_and_revision() {
         assert_eq!(
-            AgentRef::try_new(AgentId::from("")).unwrap_err().to_string(),
+            AgentRef::try_new(AgentId::from(""))
+                .unwrap_err()
+                .to_string(),
             "agent reference agent must not be empty"
         );
         let reference = AgentRef::try_new(AgentId::from("triage")).unwrap();
@@ -290,7 +292,9 @@ mod tests {
         assert_eq!(reference.revision(), Some("v7"));
         assert_eq!(reference.to_string(), "triage@v7");
         assert_eq!(
-            AgentRef::try_new(AgentId::from("triage")).unwrap().to_string(),
+            AgentRef::try_new(AgentId::from("triage"))
+                .unwrap()
+                .to_string(),
             "triage"
         );
     }
