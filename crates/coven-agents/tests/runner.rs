@@ -1034,7 +1034,7 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
         .unwrap_err();
 
     assert!(matches!(
-        direct_failure.error,
+        *direct_failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1075,7 +1075,7 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1277,7 +1277,7 @@ async fn multi_hop_handoff_target_rejection_prevents_the_target_model_turn() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1328,7 +1328,7 @@ async fn handoff_target_guardrail_error_is_distinguishable_from_a_rejection() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailFailed {
             ref agent,
             ref guardrail,
@@ -1412,7 +1412,7 @@ async fn handoff_cannot_be_combined_with_tool_calls() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::InvalidModelResponse { ref reason, .. } if reason == "a handoff cannot be combined with other actions"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
