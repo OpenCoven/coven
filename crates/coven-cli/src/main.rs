@@ -20,6 +20,7 @@ use uuid::Uuid;
 mod afs;
 mod afs_mount;
 mod api;
+mod api_routes;
 mod capabilities;
 mod cockpit_sources;
 mod config_paths;
