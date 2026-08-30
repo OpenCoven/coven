@@ -1,0 +1,35 @@
+{
+  "schema": "coven.release-required-checks/v1",
+  "source_workflow": {
+    "name": "CI",
+    "path": ".github/workflows/ci.yml",
+    "event": "push",
+    "branch": "main"
+  },
+  "policy": {
+    "aggregate_run": "The CI workflow run for the exact release SHA must exist on main, be completed, and conclude success. Routed jobs legitimately skip by path classification, but any job failure fails the run conclusion, so a green run on the exact SHA proves every job that ran succeeded. A green run for an ancestor SHA or any unrelated workflow is insufficient.",
+    "strict": "Runs on every push to main. For the exact release SHA the check must exist, be completed, and conclude success. Missing, skipped, in-flight, cancelled, or otherwise non-success is rejected.",
+    "routed": "Routed by scripts/classify-ci-changes.py. Absent or skipped for the exact release SHA is legitimate path classification; any other non-success conclusion is rejected."
+  },
+  "strict_checks": [
+    { "name": "Classify changes", "job_id": "changes" },
+    { "name": "Policy guard", "job_id": "policy-guard" },
+    { "name": "AFS mount backend (macOS)", "job_id": "afs-mount-macos" },
+    { "name": "CLI performance baseline", "job_id": "performance-baseline" },
+    { "name": "engine contract", "job_id": "engine-contract" },
+    { "name": "Dependency audit", "job_id": "cargo-deny" },
+    { "name": "npm onboarding smoke (linux-x64)", "job_id": "npm-onboarding-main" },
+    { "name": "npm onboarding smoke (macos)", "job_id": "npm-onboarding-main" },
+    { "name": "npm onboarding smoke (macos-x64)", "job_id": "npm-onboarding-main" },
+    { "name": "npm onboarding smoke (windows)", "job_id": "npm-onboarding-main" }
+  ],
+  "routed_checks": [
+    { "name": "Rust lint (Linux)", "job_id": "rust-lint-linux" },
+    { "name": "Rust tests (Linux)", "job_id": "rust-test-linux" },
+    { "name": "Rust tests (Windows)", "job_id": "rust-test-windows" },
+    { "name": "Rust tests (macOS)", "job_id": "rust-test-macos" },
+    { "name": "AFS mount backend (Linux)", "job_id": "afs-mount-linux" },
+    { "name": "Channels package", "job_id": "channels" },
+    { "name": "OpenClaw bridge", "job_id": "openclaw-bridge" }
+  ]
+}
