@@ -97,7 +97,8 @@ a draft spec or design goal is in
 
 The privacy guard is deliberately a **baseline for new changes**: it applies to
 newly staged and PR-changed files while the repository's legacy path examples
-are inventoried and converted to placeholders. It does not claim that
+are inventoried and converted to placeholders. It rejects sensitive examples,
+including invite/handoff URLs containing tokens. It does not claim that
 historical commits satisfy the newer privacy rules, and rewriting public
 history requires explicit maintainer approval.
 
