@@ -161,6 +161,42 @@ impl OutputGuardrail<()> for RejectOutput {
 }
 
 #[derive(Default)]
+struct RecordingInputGuardrail {
+    seen: Mutex<Vec<String>>,
+}
+
+impl RecordingInputGuardrail {
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl InputGuardrail<()> for RecordingInputGuardrail {
+    fn name(&self) -> &str {
+        "record-input"
+    }
+
+    async fn check(&self, input: &str, _context: &()) -> Result<GuardrailVerdict, BoxError> {
+        self.seen.lock().unwrap().push(input.to_owned());
+        Ok(GuardrailVerdict::Allow)
+    }
+}
+
+struct FailingInputGuardrail;
+
+#[async_trait]
+impl InputGuardrail<()> for FailingInputGuardrail {
+    fn name(&self) -> &str {
+        "failing-input"
+    }
+
+    async fn check(&self, _input: &str, _context: &()) -> Result<GuardrailVerdict, BoxError> {
+        Err(Box::new(io::Error::other("input guardrail exploded")) as BoxError)
+    }
+}
+
+#[derive(Default)]
 struct RecordingObserver {
     events: Mutex<Vec<RunEvent>>,
 }
@@ -981,4 +1017,403 @@ async fn unique_tool_call_ids_preserve_tool_execution() {
             .count(),
         2
     );
+}
+
+#[tokio::test]
+async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
+    let direct_model = Arc::new(QueueModel::new([ModelResponse::final_output(
+        "should not run",
+    )]));
+    let direct = Agent::new("specialist", "Specialist", "Be safe.", direct_model.clone())
+        .with_input_guardrail(Arc::new(RejectInput));
+    let direct_runner = Runner::new([direct]).unwrap();
+
+    let direct_failure = direct_runner
+        .run("specialist", "blocked input", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        direct_failure.error,
+        RunError::GuardrailRejected {
+            ref agent,
+            stage: GuardrailStage::Input,
+            ref reason,
+            ..
+        } if agent.as_str() == "specialist" && reason == "blocked by policy"
+    ));
+    assert_eq!(direct_model.calls.load(Ordering::SeqCst), 0);
+
+    let triage_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-specialist")),
+    ])]));
+    let specialist_model = Arc::new(QueueModel::new([ModelResponse::final_output(
+        "must not run either",
+    )]));
+    let target_tool_calls = Arc::new(AtomicUsize::new(0));
+    let triage = Agent::new("triage", "Triage", "Route the request.", triage_model).with_handoff(
+        Handoff::new("to-specialist", "Use for specialist work", "specialist"),
+    );
+    let specialist = Agent::new(
+        "specialist",
+        "Specialist",
+        "Handle specialist work.",
+        specialist_model.clone(),
+    )
+    .with_input_guardrail(Arc::new(RejectInput))
+    .with_tool(Arc::new(CountingCallTool {
+        calls: target_tool_calls.clone(),
+    }));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([triage, specialist])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let failure = runner
+        .run("triage", "blocked input", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::GuardrailRejected {
+            ref agent,
+            stage: GuardrailStage::Input,
+            ref reason,
+            ..
+        } if agent.as_str() == "specialist" && reason == "blocked by policy"
+    ));
+    assert_eq!(
+        specialist_model.calls.load(Ordering::SeqCst),
+        0,
+        "a handoff target that rejects the input must not receive a model call"
+    );
+    assert_eq!(
+        target_tool_calls.load(Ordering::SeqCst),
+        0,
+        "a handoff target that rejects the input must not execute tools"
+    );
+    assert_eq!(failure.turns, 1, "only the source agent's turn ran");
+    assert_eq!(failure.handoffs, 1);
+    assert!(matches!(
+        failure.new_items.as_slice(),
+        [RunItem::UserMessage { .. }, RunItem::Handoff { to, .. }] if to.as_str() == "specialist"
+    ));
+    let events = observer.events();
+    assert_paired_lifecycle(&events);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::GuardrailChecked {
+            agent,
+            stage: GuardrailStage::Input,
+            allowed: false,
+            ..
+        } if agent.as_str() == "specialist"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunEvent::RunFailed {
+            kind: RunFailureKind::InputGuardrail,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn handoff_target_input_guardrail_runs_before_the_target_model_turn() {
+    let triage_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-specialist")),
+    ])]));
+    let specialist_model = Arc::new(QueueModel::new([ModelResponse::final_output(
+        "Handled by the specialist.",
+    )]));
+    let specialist_guardrail = Arc::new(RecordingInputGuardrail::default());
+    let triage = Agent::new("triage", "Triage", "Route the request.", triage_model).with_handoff(
+        Handoff::new("to-specialist", "Use for specialist work", "specialist"),
+    );
+    let specialist = Agent::new(
+        "specialist",
+        "Specialist",
+        "Handle specialist work.",
+        specialist_model,
+    )
+    .with_input_guardrail(specialist_guardrail.clone());
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([triage, specialist])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let result = runner
+        .run("triage", "Please route this.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_agent.as_str(), "specialist");
+    assert_eq!(
+        specialist_guardrail.seen(),
+        ["Please route this."],
+        "the target's ingress policy evaluates the original user input, the same value a direct start would check"
+    );
+
+    let events = observer.events();
+    let handoff_position = events
+        .iter()
+        .position(
+            |event| matches!(event, RunEvent::Handoff { to, .. } if to.as_str() == "specialist"),
+        )
+        .unwrap();
+    let checked_position = events
+        .iter()
+        .position(|event| {
+            matches!(event, RunEvent::GuardrailChecked { agent, .. } if agent.as_str() == "specialist")
+        })
+        .unwrap();
+    let target_model_position = events
+        .iter()
+        .position(|event| {
+            matches!(event, RunEvent::ModelRequested { agent, .. } if agent.as_str() == "specialist")
+        })
+        .unwrap();
+    assert!(
+        handoff_position < checked_position && checked_position < target_model_position,
+        "the target's ingress check must land between the handoff and the target's first model turn, got {events:?}"
+    );
+    assert!(matches!(
+        &events[checked_position],
+        RunEvent::GuardrailChecked {
+            stage: GuardrailStage::Input,
+            allowed: true,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn multi_hop_handoff_enforces_input_policy_at_every_boundary() {
+    let a_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-b")),
+    ])]));
+    let b_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-c")),
+    ])]));
+    let c_model = Arc::new(QueueModel::new([ModelResponse::final_output("Done by c.")]));
+    let b_guardrail = Arc::new(RecordingInputGuardrail::default());
+    let c_guardrail = Arc::new(RecordingInputGuardrail::default());
+    let a = Agent::new("a", "A", "Route.", a_model).with_handoff(Handoff::new(
+        "to-b",
+        "Route to b",
+        "b",
+    ));
+    let b = Agent::new("b", "B", "Route.", b_model)
+        .with_handoff(Handoff::new("to-c", "Route to c", "c"))
+        .with_input_guardrail(b_guardrail.clone());
+    let c = Agent::new("c", "C", "Answer.", c_model).with_input_guardrail(c_guardrail.clone());
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([a, b, c])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let result = runner
+        .run("a", "Cross the coven.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(result.final_agent.as_str(), "c");
+    assert_eq!(result.handoffs, 2);
+    assert_eq!(result.turns, 3);
+    assert_eq!(b_guardrail.seen(), ["Cross the coven."]);
+    assert_eq!(c_guardrail.seen(), ["Cross the coven."]);
+
+    let events = observer.events();
+    let b_check = events
+        .iter()
+        .position(|event| {
+            matches!(event, RunEvent::GuardrailChecked { agent, .. } if agent.as_str() == "b")
+        })
+        .unwrap();
+    let c_check = events
+        .iter()
+        .position(|event| {
+            matches!(event, RunEvent::GuardrailChecked { agent, .. } if agent.as_str() == "c")
+        })
+        .unwrap();
+    assert!(
+        b_check < c_check,
+        "each hop must clear its own ingress policy before the next model turn, got {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn multi_hop_handoff_target_rejection_prevents_the_target_model_turn() {
+    let a_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-b")),
+    ])]));
+    let b_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-c")),
+    ])]));
+    let c_model = Arc::new(QueueModel::new([ModelResponse::final_output(
+        "must not run",
+    )]));
+    let a = Agent::new("a", "A", "Route.", a_model).with_handoff(Handoff::new(
+        "to-b",
+        "Route to b",
+        "b",
+    ));
+    let b = Agent::new("b", "B", "Route.", b_model).with_handoff(Handoff::new(
+        "to-c",
+        "Route to c",
+        "c",
+    ));
+    let c = Agent::new("c", "C", "Answer.", c_model.clone())
+        .with_input_guardrail(Arc::new(RejectInput));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([a, b, c])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let failure = runner
+        .run("a", "blocked input", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::GuardrailRejected {
+            ref agent,
+            stage: GuardrailStage::Input,
+            ..
+        } if agent.as_str() == "c"
+    ));
+    assert_eq!(
+        c_model.calls.load(Ordering::SeqCst),
+        0,
+        "the rejecting target must not receive a model call"
+    );
+    assert_eq!(failure.turns, 2, "only the upstream agents' turns ran");
+    assert_eq!(failure.handoffs, 2);
+    assert_paired_lifecycle(&observer.events());
+    assert!(observer.events().iter().any(|event| matches!(
+        event,
+        RunEvent::RunFailed {
+            kind: RunFailureKind::InputGuardrail,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn handoff_target_guardrail_error_is_distinguishable_from_a_rejection() {
+    let triage_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-specialist")),
+    ])]));
+    let specialist_model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let triage = Agent::new("triage", "Triage", "Route the request.", triage_model).with_handoff(
+        Handoff::new("to-specialist", "Use for specialist work", "specialist"),
+    );
+    let specialist = Agent::new(
+        "specialist",
+        "Specialist",
+        "Handle specialist work.",
+        specialist_model.clone(),
+    )
+    .with_input_guardrail(Arc::new(FailingInputGuardrail));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([triage, specialist])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let failure = runner
+        .run("triage", "Any input.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::GuardrailFailed {
+            ref agent,
+            ref guardrail,
+            stage: GuardrailStage::Input,
+            ..
+        } if agent.as_str() == "specialist" && guardrail == "failing-input"
+    ));
+    assert_eq!(
+        failure.to_string(),
+        "input guardrail `failing-input` for agent `specialist` failed",
+        "an implementation error must not read as a policy rejection"
+    );
+    assert_eq!(
+        specialist_model.calls.load(Ordering::SeqCst),
+        0,
+        "a guardrail implementation error must still stop the target model turn"
+    );
+    assert_paired_lifecycle(&observer.events());
+}
+
+#[tokio::test]
+async fn failing_input_guardrail_is_distinguishable_from_a_rejection() {
+    let model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let agent = Agent::new("safe", "Safe", "Be safe.", model.clone())
+        .with_input_guardrail(Arc::new(FailingInputGuardrail));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let failure = runner
+        .run("safe", "Any input.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        failure.to_string(),
+        "input guardrail `failing-input` for agent `safe` failed"
+    );
+    assert_eq!(model.calls.load(Ordering::SeqCst), 0);
+    assert_paired_lifecycle(&observer.events());
+    assert!(observer.events().iter().any(|event| matches!(
+        event,
+        RunEvent::RunFailed {
+            kind: RunFailureKind::InputGuardrail,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn handoff_cannot_be_combined_with_tool_calls() {
+    let model = Arc::new(QueueModel::new([ModelResponse {
+        assistant_message: Some("Routing and calculating.".to_owned()),
+        actions: vec![
+            ModelAction::Handoff(HandoffCall::new("to-worker")),
+            ModelAction::ToolCall(ToolCall::new(
+                "call-1",
+                "add",
+                json!({ "left": 1, "right": 2 }),
+            )),
+        ],
+    }]));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let worker_model = Arc::new(QueueModel::new([ModelResponse::final_output("unused")]));
+    let triage = Agent::new("triage", "Triage", "Route.", model).with_handoff(Handoff::new(
+        "to-worker",
+        "Route to worker",
+        "worker",
+    ));
+    let worker = Agent::new("worker", "Worker", "Use tools.", worker_model).with_tool(Arc::new(
+        CountingCallTool {
+            calls: calls.clone(),
+        },
+    ));
+    let runner = Runner::new([triage, worker]).unwrap();
+
+    let failure = runner
+        .run("triage", "Route and add.", &(), RunOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        failure.error,
+        RunError::InvalidModelResponse { ref reason, .. } if reason == "a handoff cannot be combined with other actions"
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
 }
