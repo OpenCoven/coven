@@ -30,10 +30,11 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         ON automation_runs(automation_id, started_at DESC);
 ";
 
-#[allow(dead_code)]
-const LOG_ENTRY_MAX_CHARS: usize = 64 * 1024;
+/// Per-run bounded log budget: a stored ledger log never exceeds this many
+/// characters. The delivery capture keeps the tail (latest events) when a
+/// session's normalized stream exceeds it.
+pub const LOG_ENTRY_MAX_CHARS: usize = 64 * 1024;
 
-#[allow(dead_code)]
 fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -54,7 +55,6 @@ pub struct RunRecord {
     pub finished_at: Option<String>,
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub fn record_run_start(
     conn: &Connection,
     run_id: &str,
@@ -81,7 +81,18 @@ pub fn record_run_start(
     Ok(())
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
+/// Attaches the launched session id to a still-running ledger row. The run
+/// has been dispatched but not settled: its terminal status, exit code, and
+/// bounded log arrive later via the reconciliation pass.
+pub fn record_run_session(conn: &Connection, run_id: &str, session_id: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE automation_runs SET session_id = ?2 WHERE id = ?1 AND status = 'running'",
+        params![run_id, session_id],
+    )
+    .context("failed to attach session id to run")?;
+    Ok(())
+}
+
 pub struct RunFinish {
     pub status: &'static str,
     pub exit_code: Option<i64>,
@@ -90,7 +101,6 @@ pub struct RunFinish {
     pub output_commit: Option<String>,
 }
 
-#[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub fn record_run_finish(
     conn: &Connection,
     run_id: &str,

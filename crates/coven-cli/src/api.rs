@@ -10789,13 +10789,65 @@ mod tests {
             Some(&run_body),
         )?;
         assert_eq!(response.status, 200);
+        // Run-now dispatches through the shared launch path and leaves the
+        // run in flight; the ledger settles from the session store.
         assert!(
-            response.body.contains(r#""status":"succeeded""#),
+            response.body.contains(r#""status":"dispatched""#),
             "{}",
             response.body
         );
         assert!(
             response.body.contains(r#""sessionId":"session-"#),
+            "{}",
+            response.body
+        );
+
+        // The dispatched session then finishes (as the PTY writer would
+        // record); the automations tick settles the ledger from the session
+        // store.
+        let conn = crate::store::open_store(&store_path(temp_dir.path()))?;
+        let session_id: String = conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE automation_id = 'daily-notes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::store::insert_session(
+            &conn,
+            &crate::store::SessionRecord {
+                id: session_id,
+                project_root: "/work/project".to_string(),
+                harness: "coven-code".to_string(),
+                title: "Daily notes".to_string(),
+                status: "completed".to_string(),
+                exit_code: Some(0),
+                archived_at: None,
+                created_at: "2026-08-28T09:00:00Z".to_string(),
+                updated_at: "2026-08-28T09:05:00Z".to_string(),
+                conversation_id: None,
+                familiar_id: Some("charm".to_string()),
+                execution_binding: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let tick_body = json!({ "action": "coven.automations.tick" }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tick_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(
+            response.body.contains(r#""settledSucceeded":1"#),
             "{}",
             response.body
         );
@@ -10816,6 +10868,11 @@ mod tests {
         assert!(response.body.contains(r#""runs":[{""#), "{}", response.body);
         assert!(
             response.body.contains(r#""status":"succeeded""#),
+            "{}",
+            response.body
+        );
+        assert!(
+            response.body.contains(r#""exitCode":0"#),
             "{}",
             response.body
         );

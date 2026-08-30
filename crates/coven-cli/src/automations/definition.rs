@@ -16,33 +16,43 @@ pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
 /// scheduler key occurrences by this id.
 pub const AUTOMATION_ID_MAX_CHARS: usize = 96;
 
-/// Accepted `status` values. New definitions default to PAUSED so nothing
-/// runs until a human opts in (coven#816 acceptance: "default PAUSED").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum RoutineStatus {
-    Active,
-    Paused,
+/// Wire default for `runtime`: Coven's native runtime executes routine work
+/// unless a definition explicitly selects another adapter (coven#816).
+fn default_runtime() -> String {
+    "coven-code".to_string()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Accepted `status` values. New definitions default to PAUSED so nothing
+/// runs until a human opts in (coven#816 acceptance: "default PAUSED").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum RoutineStatus {
+    #[default]
+    Paused,
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutineTimezone {
+    #[default]
     Local,
     Utc,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutineMisfire {
     /// On recovery, only the latest missed occurrence runs.
+    #[default]
     Latest,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoutineOverlap {
     /// A run is skipped when the previous occurrence has not settled.
+    #[default]
     Forbid,
 }
 
@@ -54,15 +64,29 @@ pub struct RoutineDefinition {
     pub schema_version: u32,
     pub id: String,
     pub name: String,
+    /// Omitted on the wire this defaults to PAUSED: nothing runs until a
+    /// human activates the routine (coven#816 fail-closed default).
+    #[serde(default)]
     pub status: RoutineStatus,
     /// RRULE text, e.g. `FREQ=DAILY;BYHOUR=9,17`.
     pub rrule: String,
+    /// Omitted on the wire this defaults to `local` (coven#816 import parity).
+    #[serde(default)]
     pub timezone: RoutineTimezone,
+    /// Omitted on the wire this defaults to `latest`: after a restart only
+    /// the latest missed occurrence runs (coven#816 default misfire).
+    #[serde(default)]
     pub misfire: RoutineMisfire,
+    /// Omitted on the wire this defaults to `forbid`: a routine never runs
+    /// over its own unsettled previous occurrence (coven#816 overlap rule).
+    #[serde(default)]
     pub overlap: RoutineOverlap,
     /// Per-run wall-clock timeout in minutes. Bounded and required.
     pub timeout_minutes: u32,
-    /// Runtime identifier (harness), default `coven-code`.
+    /// Runtime identifier (harness). Omitted on the wire this defaults to
+    /// `coven-code`, Coven's native runtime; Codex/Claude/Copilot remain
+    /// selectable workers but none may own the schedule (coven#816).
+    #[serde(default = "default_runtime")]
     pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub familiar_id: Option<String>,
@@ -213,5 +237,23 @@ mod tests {
             .insert("timeoutMinutes".to_string(), json!(0));
         let error = RoutineDefinition::from_json(&value).unwrap_err();
         assert!(error.contains("timeoutMinutes"), "{error}");
+    }
+
+    #[test]
+    fn wire_defaults_are_fail_closed_and_coven_native() {
+        let value = json!({
+            "schemaVersion": 1,
+            "id": "defaults",
+            "name": "Defaults",
+            "rrule": "FREQ=DAILY;BYHOUR=9,17",
+            "timeoutMinutes": 30,
+            "prompt": "Twice daily."
+        });
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+        assert_eq!(definition.status, RoutineStatus::Paused);
+        assert_eq!(definition.runtime, "coven-code");
+        assert_eq!(definition.misfire, RoutineMisfire::Latest);
+        assert_eq!(definition.overlap, RoutineOverlap::Forbid);
+        assert_eq!(definition.timezone, RoutineTimezone::Local);
     }
 }

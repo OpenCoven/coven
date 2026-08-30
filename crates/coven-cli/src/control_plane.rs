@@ -354,17 +354,25 @@ fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
-    match crate::automations::occurrences::tick(conn, now) {
-        Ok(report) => json!({
-            "planned": report.planned,
-            "alreadyFenced": report.already_fenced,
-            "pausedSkipped": report.paused_skipped,
-            "recovered": report.recovered,
-            "claimed": report.claimed,
-            "failed": report.failed,
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
-    }
+    let report = match crate::automations::occurrences::tick(conn, now) {
+        Ok(report) => report,
+        Err(error) => return json!({ "error": format!("{error:#}") }),
+    };
+    let settled = match crate::automations::delivery::settle_finished_runs(conn, now) {
+        Ok(settled) => settled,
+        Err(error) => return json!({ "error": error }),
+    };
+    json!({
+        "planned": report.planned,
+        "alreadyFenced": report.already_fenced,
+        "pausedSkipped": report.paused_skipped,
+        "recovered": report.recovered,
+        "claimed": report.claimed,
+        "settledSucceeded": settled.settled_succeeded,
+        "settledFailed": settled.settled_failed,
+        "failures": settled.failures,
+        "failed": report.failed,
+    })
 }
 
 fn automation_health_payload(
