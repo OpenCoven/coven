@@ -53,6 +53,8 @@ Exit criteria: relay cannot read plaintext or impersonate endpoints; NAT-separat
 
 ### PR 5 — Pocket credentials and biometric authorization
 
+Detailed slice plan: [`mobile-device-credentials-biometric-authorization-plan.md`](mobile-device-credentials-biometric-authorization-plan.md) (issue #786).
+
 - device key generation and protected storage
 - platform assurance mapping
 - enrollment request signing
