@@ -1,0 +1,206 @@
+{
+  "schema": "coven.automations-v1.tracker-mapping",
+  "schema_version": 1,
+  "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#859). GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
+  "sync": {
+    "last_sync": "2026-08-30T15:05:00Z",
+    "source_branch": "agent/issue-859-p0-control-operationalize-coven-automations-v1",
+    "writer": "One canonical writer/process is designated for this setup; see docs/superpowers/plans/2026-08-30-issue-859-coven-automations-v1-tracker-operationalization.md (Decision D1). Persisted tracker changes land only through reviewed PRs.",
+    "canonical_bead_store": "OpenCoven/coven-cave embedded Dolt database `cave`; provisioning is routed through OpenCoven/coven-cave#5220. A competing Beads database must not be initialized in OpenCoven/coven (operational correction on OpenCoven/coven#859, 2026-08-30).",
+    "public_bead_export": "OpenCoven/coven-cave `.beads/issues.jsonl` is a public-scrubbed review export, never canonical state and never a hand-edited sync mechanism.",
+    "beads_tool_reference": "Beads 1.2.2, schema v53, as recorded in docs/superpowers/plans/2026-08-20-coven-v0.4.1-release-program.md; live schema/version verification is owned by OpenCoven/coven-cave#5220.",
+    "drift_check": "node docs/roadmaps/drift-check.mjs (add --beads-export <issues.jsonl> to cross-check an export; --selftest to verify detection rules)",
+    "priority_policy": {
+      "P0": "Current v1 correctness, security, data-loss/duplicate-execution risk, authority violation, broken migration, or certification blocker.",
+      "P1": "Committed SDK/product/docs/ecosystem work required to make the certified core usable and operable.",
+      "P2": "Post-v1 expansion or research that must not silently enter the release critical path."
+    }
+  },
+  "program": "https://github.com/OpenCoven/coven/issues/854",
+  "outcomes": [
+    {
+      "slug": "program",
+      "role": "program",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 854,
+        "url": "https://github.com/OpenCoven/coven/issues/854",
+        "title": "Program: Coven Automations v1 — reliable, identity-bound familiar routines",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/program",
+        "surface": "shared",
+        "title": "Coven Automations v1 program (GitHub OpenCoven/coven#854)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220",
+        "disposition": "active:release-gate-ownership",
+        "gate": "Owns release gates and cross-repository rollup; final #854 release rollup must be generable from reconciled tracker state and exact evidence. Must not be used as a catch-all implementation task.",
+        "evidence_status": "none",
+        "evidence": []
+      },
+      "depends_on": [],
+      "depends_on_external": [],
+      "notes": "Priority is P0 program/control: it gates the release but must not absorb implementation work."
+    },
+    {
+      "slug": "foundation",
+      "role": "p0-foundation",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 816,
+        "url": "https://github.com/OpenCoven/coven/issues/816",
+        "title": "Native familiar automations: replace harness-owned schedules with durable Coven routines",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/foundation",
+        "surface": "shared",
+        "title": "Coven Automations v1 — native routine foundation (GitHub OpenCoven/coven#816)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220 (no pre-existing bead found in the public-scrubbed export at sync time; reuse-if-present check owned by OpenCoven/coven-cave#5220)",
+        "disposition": "active:reconciling-landed-evidence",
+        "gate": "#816 evidence checklist: landed commit/PR series linked with an exact final foundation revision; clean-clone automation-test verification; pre-automations schema migration and rollback proof; daemon startup/tick/shutdown/restart proof on supported platforms; one scheduled and one manual run shown to traverse the same claim/ledger/runtime/delivery path; stale lease cannot block the next eligible occurrence indefinitely; failed output delivery cannot report success; every original acceptance criterion reconciled as implemented, deferred, or superseded; Cave ownership migration (OpenCoven/coven-cave#4990) linked with remaining compatibility facade documented.",
+        "evidence_status": "partial",
+        "evidence": [
+          "https://github.com/OpenCoven/coven/pull/846 (merged 2026-08-28; routine definitions and control actions, part 1)",
+          "https://github.com/OpenCoven/coven/pull/847 (merged 2026-08-28; legacy import series, parts 5-8)",
+          "https://github.com/OpenCoven/coven/issues/816 (program-status section of the issue body, updated 2026-08-30: landed inventory and open evidence checklist)"
+        ]
+      },
+      "depends_on": [],
+      "depends_on_external": [],
+      "notes": "Implementation materially landed on main 2026-08-28 (crates/coven-cli/src/automations/); the issue stays open for foundation reconciliation and exact evidence."
+    },
+    {
+      "slug": "protocol",
+      "role": "p0-workstream",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 855,
+        "url": "https://github.com/OpenCoven/coven/issues/855",
+        "title": "P0: Specify coven.automations.v1 schemas, state machines, idempotency, and changefeed",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/protocol",
+        "surface": "shared",
+        "title": "Coven Automations v1 — protocol schemas, state, idempotency, changefeed (GitHub OpenCoven/coven#855)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220",
+        "disposition": "blocked:pending-foundation-reconciliation-and-bead-provisioning",
+        "gate": "coven.automations.v1 schemas, state machines, idempotency rules, and changefeed contract are specified, reviewed, and covered by tests; schema/conformance artifact revisions recorded as evidence.",
+        "evidence_status": "none",
+        "evidence": []
+      },
+      "depends_on": ["foundation"],
+      "depends_on_external": [],
+      "notes": "Feeds SDK read/types/changefeed (P1), SDK mutations/approvals (P1), Cave oversight/recovery (P1), and Psyche adapter (P1) once those outcomes are created."
+    },
+    {
+      "slug": "scheduler",
+      "role": "p0-workstream",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 856,
+        "url": "https://github.com/OpenCoven/coven/issues/856",
+        "title": "P0: Harden automation time, retries, cancellation, fencing, and crash recovery",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/scheduler",
+        "surface": "shared",
+        "title": "Coven Automations v1 — time, retry, cancel, fencing, recovery (GitHub OpenCoven/coven#856)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220",
+        "disposition": "blocked:pending-foundation-reconciliation-and-bead-provisioning",
+        "gate": "Time, retry, cancellation, fencing, and crash-recovery behaviors verified by tests, including stale-lease recovery, misfire semantics, and cancellation without duplicate execution.",
+        "evidence_status": "none",
+        "evidence": []
+      },
+      "depends_on": ["foundation", "protocol"],
+      "depends_on_external": [],
+      "notes": "Depends on #816 and #855 where state/error semantics are required."
+    },
+    {
+      "slug": "authority",
+      "role": "p0-workstream",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 857,
+        "url": "https://github.com/OpenCoven/coven/issues/857",
+        "title": "P0: Bind automation runs to principal authority, familiar revisions, capabilities, approvals, and receipts",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/authority",
+        "surface": "shared",
+        "title": "Coven Automations v1 — principal/familiar/authority/approval/receipt binding (GitHub OpenCoven/coven#857)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220",
+        "disposition": "blocked:pending-foundation-reconciliation-and-bead-provisioning",
+        "gate": "Runs are bound to principal authority, familiar revisions, capabilities, approvals, and receipts; negative tests prove authority bypass fails closed; receipts are tamper-evident and out of tracker scope.",
+        "evidence_status": "none",
+        "evidence": []
+      },
+      "depends_on": ["foundation", "protocol"],
+      "depends_on_external": [],
+      "notes": "Additionally depends on upstream Familiar Contract and Threads profile outcomes once created; no such cross-repository outcomes existed at sync time, so depends_on_external is empty and must be made explicit when they appear."
+    },
+    {
+      "slug": "certification",
+      "role": "p0-workstream",
+      "github": {
+        "repo": "OpenCoven/coven",
+        "issue": 858,
+        "url": "https://github.com/OpenCoven/coven/issues/858",
+        "title": "P0: Build automations conformance, chaos, SLO, and operator diagnostics",
+        "state": "open",
+        "priority": "P0",
+        "owner": "BunsDev"
+      },
+      "bead": {
+        "label": "automations-v1/certification",
+        "surface": "shared",
+        "title": "Coven Automations v1 — conformance, chaos, SLO, operator diagnostics (GitHub OpenCoven/coven#858)",
+        "id": null,
+        "provisioning": "pending:OpenCoven/coven-cave#5220",
+        "disposition": "blocked:pending-p0-workstreams-and-bead-provisioning",
+        "gate": "Conformance, chaos, SLO, and operator-diagnostics suites exist and run without ambient production credentials; the v1 release gate report is produced from them and linked here.",
+        "evidence_status": "none",
+        "evidence": []
+      },
+      "depends_on": ["protocol", "scheduler", "authority"],
+      "depends_on_external": [],
+      "notes": "Certification blocker for the v1 release gate owned by the program outcome."
+    }
+  ],
+  "cross_repository_children": [],
+  "cross_repository_children_policy": "One Bead per SDK, Cave, Psyche, docs, organization-canary, Familiar Contract, and Threads outcome created under OpenCoven/coven#854, mapped one-to-one in this file as each is created. They generally depend on the protocol outcome and, where authority-bearing, the authority outcome; exact dependencies must be explicit rather than inferred from the program parent.",
+  "p2_exclusions": [
+    "Event triggers",
+    "Multi-host routing",
+    "Hosted execution",
+    "Broad external action adapters"
+  ],
+  "p2_exclusions_policy": "These remain post-v1 (P2) and must not be encoded as implicit P0 blockers anywhere in the graph.",
+  "invariants": [
+    "Each GitHub outcome maps to exactly one Bead; each Bead maps to exactly one GitHub outcome.",
+    "Dependencies and P0/P1/P2 priorities in Beads match this file and the roadmap table generated from it.",
+    "A P0 Bead has one accountable owner, one canonical GitHub outcome, explicit dependencies, a current acceptance gate, an active or explicitly blocked disposition, evidence requirements, and no contradictory closed public mirror.",
+    "A Bead closes only when the corresponding GitHub acceptance criteria are satisfied or the outcome is explicitly cancelled/superseded with rationale.",
+    "Generated mirror bodies (including the generated mapping table in docs/roadmaps/coven-automations-v1.md) change only through the generator contract (node docs/roadmaps/drift-check.mjs --render).",
+    "Tracker data is never queried as production automation state; the Coven runtime owns definitions, occurrences, runs, attempts, leases, approvals, artifacts, events, and receipts.",
+    "Tracker output must not contain secrets, private prompts, terminal dumps, credentials, unrestricted personal paths, or sensitive identity/authority payloads."
+  ]
+}
