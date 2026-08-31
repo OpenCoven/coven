@@ -43,7 +43,7 @@ What does **not** exist yet, and what this plan adds: trusted-device introductio
 
 ## 3. Protocol objects
 
-New objects are added to the pairing protocol family at object version 1. Their canonical encoding is deterministic CBOR in a COSE envelope, exactly like the v1 objects (`spec/device-pairing/v1/conformance-manifest.json`); the JSON below is the diagnostic form, in the style of `spec/device-pairing/v1/device-grant.schema.json`. The implementation PR lands these schemas as files under `spec/device-pairing/v2/` and registers the new objects in a v2 conformance manifest.
+New objects are added to the pairing protocol family at object version 1. Their canonical encoding is deterministic CBOR in a COSE envelope, exactly like the v1 objects (`spec/device-pairing/v1/conformance-manifest.json`); the JSON below is the diagnostic form, in the style of `spec/device-pairing/v1/device-grant.schema.json`. The implementation PR lands these schemas as files under `spec/device-pairing/v2/` and registers the new objects in a v2 conformance manifest. Adding `trust_domain_epoch` to `DeviceGrant` and the introduction state to stored devices is a device-registry format migration (registry v2 → v3, `registry.rs` is at version 2 today). That migration is a shared decision with the #786 credentials plan: the implementation PR that lands first in the delivery plan performs it once, later tracks consume the migrated format, and no plan in this track forks the registry format. Existing v2-era records migrate with `trust_domain_epoch: 0` and unchanged authority — never widened.
 
 New domain-separation labels (to be appended to `spec/device-pairing/v1/domain-separation.md`; code-level short forms follow the `COVEN-PAIR/2` convention in `pairing.rs`):
 
@@ -358,7 +358,7 @@ Append-only audit record, same storage discipline as `audit.jsonl` in `audit.rs`
   "description": "Explicit, auditable record of a recovery or rotation ceremony. Never contains private keys, passkey identifiers, or account-provider identifiers.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "eventId", "kind", "subject", "actors", "epoch", "occurredAt"],
+  "required": ["version", "eventId", "kind", "subject", "actors", "trustDomainEpoch", "occurredAt"],
   "properties": {
     "version": { "const": 1 },
     "eventId": { "type": "string", "pattern": "^[A-Za-z0-9_-]{22}$" },
@@ -376,7 +376,7 @@ Append-only audit record, same storage discipline as `audit.jsonl` in `audit.rs`
       "items": { "enum": ["passkey_account", "recovery_key", "trusted_device", "owner_root_credential", "attested_device", "n_of_m_devices"] }
     },
     "epoch": {
-      "description": "revocation_epoch value after this event; rotations increment it.",
+      "description": "Trust-domain (issuer) epoch after this event; identity and root rotations increment it. Grants and resumption material issued under an older epoch are invalid (§6.2).",
       "type": "integer", "minimum": 0
     },
     "rotatesIdentity": { "type": "boolean" },
@@ -590,7 +590,7 @@ export interface RecoveryEvent {
   kind: RecoveryEventKind;
   subject: { type: 'owner' | 'installation' | 'device' | 'trust-domain' | 'familiar'; id: string };
   actors: RecoveryFactor[];
-  epoch: number;
+  trustDomainEpoch: number; // issuer epoch after this event (§6.2)
   rotatesIdentity?: boolean;
   outOfBandContext?: string;
   occurredAt: number;
@@ -670,6 +670,7 @@ The approval MUST bind, in the signed `introductionTranscriptHash`:
 - the single-use `nonce` and `expiresAt`;
 - the human-readable `deviceContext` (digest of the rendered text the approver saw);
 - the target `installationFingerprint` and trust domain;
+- the trust-domain (issuer) epoch the new grant will be issued under (§6.2);
 - the grant template the authority will issue.
 
 Any change to any of these changes the transcript hash and invalidates every collected approval. This is the same fail-closed principle as capability substitution defense in the threat model, and it reuses the canonical-bytes discipline of `DeviceActionIntent::canonical_bytes` (`grant.rs`).
@@ -796,9 +797,9 @@ recovery_started                             identity_rotated proposed
   │ factors collected per RecoveryPolicy       │ quorum per introductionPolicy.rootMinApprovals
   ▼                                            ▼
 access_restored                              rotation quorum met
-  │ same familiar/installation identity         │ revocation_epoch += 1 (DeviceGrant.revocation_epoch)
-  │ new DeviceGrant(s) for the new endpoint     │ old keys revoked; new keys enrolled
-  │ familiar identity untouched                 │ familiar identity key replaced deliberately
+  │ same familiar/installation identity         │ trust_domain_epoch += 1 (§6.2 issuer epoch)
+  │ new DeviceGrant(s) for the new endpoint     │ atomic revocation of all pre-epoch
+  │ familiar identity untouched                 │ grants, keys, challenges, resumption material
   ▼                                            ▼
 RecoveryEvent(kind: access_restored,         RecoveryEvent(kind: identity_rotated,
               rotatesIdentity: false)                       rotatesIdentity: true)
@@ -807,8 +808,15 @@ RecoveryEvent(kind: access_restored,         RecoveryEvent(kind: identity_rotate
 Invariants:
 
 - Recovery NEVER rotates, deletes, or rewrites familiar identity or memory (threat-model invariant: "Revoking a device does not rotate or destroy familiar identity").
-- Rotation is always explicit: it requires the root-level threshold (§4.6), produces `RecoveryEvent` records with `rotatesIdentity: true`, bumps `revocation_epoch` (the same epoch semantics `DeviceGrant` and `registry.rs` already use to invalidate pre-rotation state), and is refused while any recovery ceremony is mid-flight.
+- Rotation is always explicit: it requires the root-level threshold (§4.6), produces `RecoveryEvent` records with `rotatesIdentity: true`, bumps the trust-domain (issuer) epoch with atomic revocation of all pre-epoch authority (below), and is refused while any recovery ceremony is mid-flight.
 - Every step of both ceremonies appends `RecoveryEvent` records to the same private append-only audit stream as `audit.rs` — recovery events and key rotations are explicit and auditable.
+
+**Trust-domain (issuer) epoch.** A per-device `revocation_epoch` alone cannot invalidate pre-rotation authority: it says nothing about the grants every *other* device holds, and copies of pre-rotation resumption material are unaffected by a bump on one device's grant. Identity and root rotation therefore operate on a **trust-domain (issuer) epoch**:
+
+- v2 `DeviceGrant`s — and every piece of session-resumption material — record the `trust_domain_epoch` they were issued under; the introduction transcript commits to it (§4.2) and every grant authorization re-checks it. A grant or resumption attempt carrying an epoch older than the domain's current epoch is invalid, fail-closed, regardless of its own `revocation_epoch`.
+- `identity_rotated` / `root_rotated` increments the trust-domain epoch **and** atomically revokes — in one registry transaction, under the same atomic-replace discipline as `registry.rs` — every grant, step-up authorization key, outstanding assurance challenge, and resumption material issued under the previous epoch. The per-device `revocation_epoch` (existing `DeviceGrant`/`registry.rs` semantics) remains the single-device revocation mechanism and is unchanged.
+- The epoch increment and the revocation are one atomic step: the new epoch is not observable before the old-epoch state is gone, so no window exists in which pre-rotation authority remains valid. A crash mid-way leaves the old epoch active with the old state — rotation is retried, never half-applied.
+- The `RecoveryEvent` for the rotation records the new `trustDomainEpoch`, making the invalidation boundary explicit and auditable.
 
 ### 6.3 Golden example — recovery event after a lost laptop
 
@@ -821,7 +829,7 @@ Example literals in this section are intentionally synthetic placeholders (repea
   "kind": "access_restored",
   "subject": { "type": "device", "id": "trust-alpha:pairwise-7f3a91" },
   "actors": ["passkey_account", "trusted_device"],
-  "epoch": 4,
+  "trustDomainEpoch": 4,
   "rotatesIdentity": false,
   "outOfBandContext": "Lost laptop re-enrolled as replacement endpoint after passkey account auth and phone approval",
   "occurredAt": 1790000000
@@ -911,6 +919,7 @@ Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening 
 - **Passkey/account provider compromise**: cannot enroll endpoints (§4.7); cannot read or forge E2EE sessions; can at most request attention.
 - **Attestation forgery**: verifier compromise yields only assurance attributes, which cannot mint authority; owner policy that never sets `requireFor` is unaffected. Attributes are never self-asserted: a claim is valid only under an owner-pinned verifier anchor and the normative attribute/evidence matrix (§7.1, §7.2), so an unpinned or retired verifier signature is worthless, and removing an anchor invalidates a compromised verifier's claims at the next evaluation.
 - **Recovery-ceremony phishing**: transcript-bound `COVEN-ASSURANCE/1` proofs with server-issued single-use challenges make collected approvals useless for any other request; recovery events are user-visible in `coven memory mobile status` output (which already surfaces device/grant state, `registry.list_status`).
+- **Stale pre-rotation authority**: identity or root rotation cannot be outlived by grants, step-up keys, challenges, or resumption material issued under a previous trust-domain epoch — the issuer-epoch bump with atomic revocation (§6.2) closes the gap a per-device `revocation_epoch` cannot cover.
 
 ## 10. Acceptance criteria mapping
 
@@ -958,4 +967,4 @@ Implementation PRs must add, at minimum:
 - `COVEN-ASSURANCE/1` proof tests: challenge single-use/atomic consumption, proof replay, proof bound to a different transcript, proof against a stale grant or revocation epoch, possession-key signature offered as a step-up proof (must fail), expired proof window, effective assurance computed server-side (claimed level above the enrolled-class ceiling is capped);
 - integration tests with a malicious relay/account shim: no enrollment without valid approvals; account service compromise reduces to a no-op on the authority path;
 - privacy tests: no passkey credential IDs, attestation receipts, hardware IDs, or biometric metadata in any protocol object, audit record, or log line (extends `scripts/check-coven-privacy.py` coverage);
-- revocation/rotation tests: epoch bump invalidates pre-rotation grants and resumption material while leaving familiar identity untouched.
+- revocation/rotation tests: per-device epoch bump invalidates that device's pre-revocation grants; trust-domain epoch bump invalidates **every** grant, step-up authorization key, outstanding assurance challenge, and resumption material issued under the previous epoch, atomically (no partial state after an interrupted rotation), while leaving familiar identity untouched; grants and resumption material issued under the new epoch keep working;
