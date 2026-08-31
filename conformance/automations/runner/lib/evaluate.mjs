@@ -11,7 +11,7 @@ import { applyOperation } from './ops.mjs';
 import { ConformanceModel } from './model.mjs';
 import { doctorFindings } from './doctor.mjs';
 import { validateAgainstSchema } from './schema.mjs';
-import { redactText } from './redact.mjs';
+import { redactPublishedText } from './redact.mjs';
 
 const TERMINAL_OCCURRENCE = new Set(['succeeded', 'failed', 'quarantined']);
 const TERMINAL_RUN = new Set(['succeeded', 'failed', 'cancelled']);
@@ -199,15 +199,17 @@ export function checkInvariants(model) {
 }
 
 // Redaction scan: every forbidden substring must be absent from everything
-// the plane would publish about this vector's final state.
+// the plane would publish about this vector's final state. The published
+// form goes through the full pipeline — sensitive values replaced before
+// serialization, then the serialized text scrubbed again.
 export function scanRedaction(vector, model) {
   const forbidden = vector.expected?.redaction?.forbiddenSubstrings ?? [];
   if (forbidden.length === 0) return [];
   const prompts = (vector.input?.definitions ?? [])
     .map((document) => document.prompt)
     .filter((prompt) => typeof prompt === 'string');
-  const published = redactText(
-    JSON.stringify({
+  const published = redactPublishedText(
+    {
       definitions: [...model.definitions.values()].map((record) => record.definition),
       occurrences: [...model.occurrences.values()],
       runs: [...model.runs.values()],
@@ -215,7 +217,7 @@ export function scanRedaction(vector, model) {
       refusals: model.refusals,
       receipts: [...model.receipts.values()],
       doctor: doctorFindings(model)
-    }),
+    },
     prompts
   );
   const violations = [];

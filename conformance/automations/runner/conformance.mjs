@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 
 import { validateAgainstSchema } from './lib/schema.mjs';
 import { evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
-import { redactText, REDACTION_RULES } from './lib/redact.mjs';
+import { redactPublishedText, REDACTION_RULES } from './lib/redact.mjs';
 
 export const PLANE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 export const PLANE_VERSION = '1.0.0';
@@ -132,10 +132,11 @@ function gitCommit() {
   return result.stdout.trim() || null;
 }
 
-// Scrubs prompts and irrelevant absolute paths from anything about to be
-// published (delegates to the shared redaction module).
-export function redactReportText(text, prompts) {
-  return redactText(text, prompts);
+// Scrubs anything about to be published: sensitive structured values are
+// replaced before serialization and the serialized text is scrubbed again
+// (delegates to the shared redaction module).
+export function redactReportValue(value, prompts) {
+  return redactPublishedText(value, prompts);
 }
 
 function profileResult(entries) {
@@ -274,15 +275,18 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
     profiles[profile] = result;
   }
 
-  // Collect definition prompts so report text can be scrubbed.
+  // Collect every definition prompt — valid and invalid fixtures alike — so
+  // report text can be scrubbed. Prompts of any length are collected; the
+  // redaction module handles short ones.
   const prompts = new Set();
+  const collectPrompts = (document) => {
+    if (typeof document?.prompt === 'string' && document.prompt.trim() !== '') {
+      prompts.add(document.prompt);
+    }
+  };
   for (const entry of vectors) {
-    for (const document of entry.vector.input?.definitions ?? []) {
-      if (document.prompt) prompts.add(document.prompt);
-    }
-    for (const document of entry.vector.input?.invalidDefinitions ?? []) {
-      if (document.prompt) prompts.add(document.prompt);
-    }
+    for (const document of entry.vector.input?.definitions ?? []) collectPrompts(document);
+    for (const document of entry.vector.input?.invalidDefinitions ?? []) collectPrompts(document);
   }
 
   const artifactDigests = {};
@@ -366,7 +370,7 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
   // is the redacted text, so that exact artifact is what gets validated.
   const publishErrors = validateReport(report, planeRoot);
   if (options.report) {
-    const redacted = redactReportText(JSON.stringify(report, null, 2), [...prompts]) + '\n';
+    const redacted = redactReportValue(report, [...prompts]) + '\n';
     publishErrors.push(...validateReport(JSON.parse(redacted), planeRoot));
     if (publishErrors.length > 0) {
       throw new Error(

@@ -37,6 +37,7 @@ import {
 import { canonicalJson, ConformanceModel } from './lib/model.mjs';
 import { checkInvariants, evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
 import { applyOperation } from './lib/ops.mjs';
+import { redactPublishedText, redactText, scrubString } from './lib/redact.mjs';
 import { evaluateSloGate } from './conformance.mjs';
 
 test('every vector passes the envelope schema and loads', async () => {
@@ -188,6 +189,85 @@ test('planner walk reaches the latest due slot after a year-long gap', () => {
     latestDueSlot('FREQ=DAILY;BYHOUR=9', 'utc', cursor, now),
     parseIso('2028-02-29T09:00:00.000Z')
   );
+});
+
+test('redaction covers short, multiline, and quoted prompts', () => {
+  const prompts = ['hi', 'Draft the reply\nfrom the private\njournal.', 'summarize the log'];
+  const published = redactPublishedText(
+    {
+      a: { prompt: 'hi' },
+      b: { prompt: 'Draft the reply\nfrom the private\njournal.' },
+      c: 'the operator said: "summarize the log" and left',
+      d: "echo 'hi' done"
+    },
+    prompts
+  );
+  assert.ok(!published.includes('"hi"'), `short prompt leaked: ${published}`);
+  assert.ok(!published.includes('private'), `multiline prompt leaked: ${published}`);
+  assert.ok(!published.includes('summarize the log'), `quoted prompt leaked: ${published}`);
+  assert.ok(published.includes('[redacted]'), 'placeholders must appear');
+});
+
+test('redaction scrubs credentials of every covered form', () => {
+  const published = scrubString(
+    JSON.stringify({
+      aws: 'AKIAIOSFODNN7EXAMPLE in a log line',
+      github: 'ghp_16Charactersffffffffffffffffffffffffffff'.slice(0, 43),
+      openai: 'sk-proj-abcdefghijklmnopqrstuvwxyz1234567890',
+      bearer: 'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig',
+      password: 'db password=hunter2 persisted',
+      pem: '-----BEGIN RSA PRIVATE KEY-----\nMIIB\n-----END RSA PRIVATE KEY-----',
+      url: 'postgres://admin:s3cret@db.internal:5432/coven'
+    })
+  );
+  assert.ok(!published.includes('AKIAIOSFODNN7EXAMPLE'), published);
+  assert.ok(!published.includes('ghp_16Characters'), published);
+  assert.ok(!published.includes('sk-proj-abcdefghij'), published);
+  assert.ok(!published.includes('eyJhbGciOiJIUzI1NiJ9'), published);
+  assert.ok(!published.includes('hunter2'), published);
+  assert.ok(!published.includes('MIIB'), published);
+  assert.ok(!published.includes('s3cret'), published);
+});
+
+test('redaction scrubs Windows paths and /private/ macOS paths', () => {
+  const published = scrubString(
+    JSON.stringify({
+      win: 'wrote C:\\Users\\dev\\secrets\\notes.txt ok',
+      winEnv: 'config at %USERPROFILE%\\coven\\config.toml',
+      unc: 'mounted \\\\fileserver\\share\\prompt.txt',
+      macPrivate: 'spill file /private/var/folders/zz/x/T/conformance.json',
+      macTmp: '/private/tmp/leak.txt',
+      posixHome: '/Users/alice/notes/daily.md',
+      linuxHome: '/home/bob/.coven/history'
+    })
+  );
+  assert.ok(!published.includes('C:\\Users\\dev'), published);
+  assert.ok(!published.includes('%USERPROFILE%\\coven'), published);
+  assert.ok(!published.includes('\\\\fileserver\\share'), published);
+  assert.ok(!published.includes('/private/var/folders'), published);
+  assert.ok(!published.includes('/private/tmp'), published);
+  assert.ok(!published.includes('/Users/alice'), published);
+  assert.ok(!published.includes('/home/bob'), published);
+  assert.ok(published.split('[redacted-path]').length >= 7, `placeholders missing: ${published}`);
+});
+
+test('redaction replaces sensitive structured values before serialization', () => {
+  const published = redactPublishedText(
+    {
+      prompt: 'never publish this',
+      cwd: 'C:\\Users\\dev\\proj',
+      outputTarget: '/Users/alice/out.md',
+      token: 'ghp_16Charactersffffffffffffffffffffffffffff'.slice(0, 43),
+      nested: { statement: 'also secret', keep: 'plain value' }
+    },
+    ['never publish this', 'also secret']
+  );
+  assert.ok(!published.includes('never publish this'), published);
+  assert.ok(!published.includes('C:\\\\Users'), published);
+  assert.ok(!published.includes('/Users/alice'), published);
+  assert.ok(!published.includes('ghp_'), published);
+  assert.ok(!published.includes('also secret'), published);
+  assert.ok(published.includes('plain value'), 'non-sensitive values survive');
 });
 
 test('canonical JSON is stable and sorted', () => {
