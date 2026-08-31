@@ -380,6 +380,19 @@ export type Capability =
   | 'identity.admin' | 'devices.enroll' | 'devices.revoke'
   | 'identity.export' | 'memory.export';
 
+/**
+ * Attestation policy classes (underscore form) — a distinct vocabulary from
+ * Capability ids (dot form). These are the only values accepted by
+ * `RecoveryPolicy.attestationPolicy.requireFor` (see the §3.3 JSON Schema).
+ */
+export type AttestationPolicyClass =
+  | 'secrets_read'
+  | 'identity_admin'
+  | 'devices_enroll'
+  | 'devices_revoke'
+  | 'identity_export'
+  | 'memory_export';
+
 export type Assurance =
   | 'possession' | 'recent_user_verification' | 'fresh_user_verification'
   | 'fresh_biometric' | 'step_up';
@@ -438,7 +451,7 @@ export interface RecoveryPolicy {
   };
   recoveryFactors: RecoveryFactor[];
   recoveryThreshold?: { of: number; minimum: number };
-  attestationPolicy: { default: 'ignore' | 'prefer'; requireFor: Capability[] };
+  attestationPolicy: { default: 'ignore' | 'prefer'; requireFor: AttestationPolicyClass[] };
   updatedAt: number;
 }
 
@@ -549,7 +562,7 @@ Rules:
 | Enrollment class | Default policy | Rationale |
 | --- | --- | --- |
 | Standard endpoint (conversation/message scopes) | `standardMinApprovals: 1` | Matches the QR bootstrap trust level; friction proportional to risk. |
-| Elevated endpoint (`tools.approve`, `secrets_read`) | `standardMinApprovals: 1` + `attestationPolicy.requireFor` or narrower grant | Scope narrowing substitutes for ceremony overhead. |
+| Elevated endpoint (`tools.approve` capability, `secrets_read` attestation class) | `standardMinApprovals: 1` + `attestationPolicy.requireFor` or narrower grant | Scope narrowing substitutes for ceremony overhead. |
 | Root-level endpoint (`identity.admin`, `devices.enroll`, `devices.revoke`, `identity.export`, `memory.export`) | `rootMinApprovals: 2` with `requireDistinctApprovers: true` | A single compromised trusted device must not be able to mint root-level authority silently. |
 
 Alternatives considered: (a) always N-of-M — rejected as the default because a sole owner with one phone could never bootstrap; (b) always 1 — rejected for root-level classes because it concentrates trust in one device; (c) time-delayed approval (24 h cooling) — kept as an optional owner knob, not a default. The policy knob lives in `RecoveryPolicy.introductionPolicy`; the owner decides; the authority enforces.
@@ -686,7 +699,7 @@ Mapping notes: Apple App Attest and Android key attestation are evaluated by an 
 }
 ```
 
-With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transaction on `secrets_read` (see `DeviceActionIntent`, `grant.rs`) succeeds only when the approving device key carries a valid `verified_hardware_key` or `verified_official_app` claim. The same transaction from an `unattested_device` key fails with a policy error that names the missing attribute — never a generic denial.
+With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transaction touching a `secrets_read`-scoped grant (see `DeviceActionIntent`, `grant.rs`) succeeds only when the approving device key carries a valid `verified_hardware_key` or `verified_official_app` claim. The same transaction from an `unattested_device` key fails with a policy error that names the missing attribute — never a generic denial.
 
 ## 8. Policy examples (issue table, mapped)
 
