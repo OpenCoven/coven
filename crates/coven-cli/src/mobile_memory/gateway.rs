@@ -916,6 +916,15 @@ pub(crate) fn handle_local_control(
         match (method, action) {
             ("POST", "status") => {
                 let report = state.pairing.status(id, Utc::now())?;
+                if matches!(
+                    report.state,
+                    PairingState::Cancelled | PairingState::Expired
+                ) {
+                    // Terminal replay of this pairing: retry any pending
+                    // cancellation audit delivery whose append failed when the
+                    // pairing was cancelled.
+                    super::audit::flush_pending_pairing_cancellations(&state.coven_home);
+                }
                 crate::api::json_response(
                     200,
                     &LocalPairingStatus {
@@ -927,12 +936,39 @@ pub(crate) fn handle_local_control(
             ("POST", "cancel") => {
                 let outcome = state.pairing.cancel(id, Utc::now())?;
                 if outcome == PairingCancellation::Cancelled {
-                    append_event(
+                    // Persist an idempotent audit-pending token before
+                    // attempting delivery: if the append below fails, any
+                    // later terminal replay retries the record instead of the
+                    // cancellation being permanently unrecorded. The token is
+                    // best-effort — persistence problems never delay the
+                    // fail-closed cancellation response.
+                    if let Err(error) =
+                        super::audit::record_pending_pairing_cancelled(&state.coven_home, id)
+                    {
+                        eprintln!(
+                            "coven mobile gateway: pairing cancellation audit token was not persisted: {error:#}"
+                        );
+                    }
+                    match append_event(
                         &state.coven_home,
                         Utc::now(),
                         MobileAuditEvent::PairingCancelled,
                         None,
-                    )?;
+                    ) {
+                        Ok(()) => {
+                            let _ =
+                                super::audit::remove_pending_pairing_cancelled(&state.coven_home, id);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "coven mobile gateway: pairing cancellation audit record is pending: {error:#}"
+                            );
+                        }
+                    }
+                } else {
+                    // Terminal replay: retry pending cancellation audit
+                    // delivery before answering.
+                    super::audit::flush_pending_pairing_cancellations(&state.coven_home);
                 }
                 crate::api::json_response(200, &LocalPairingCancellation { state: outcome })
             }
@@ -1595,6 +1631,75 @@ mod tests {
             "already_terminal"
         );
 
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+        let outbox =
+            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert_eq!(outbox.trim(), "[]");
+    }
+
+    #[test]
+    fn pairing_cancellation_audit_survives_a_failed_delivery_until_replay() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let response = handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+            .unwrap()
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Break audit delivery only: a symlinked audit file fails the
+        // private-file validation and the O_NOFOLLOW open while the mobile
+        // directory holding the outbox stays writable.
+        std::fs::remove_file(temp.path().join("mobile/audit.jsonl")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/dev/null", temp.path().join("mobile/audit.jsonl")).unwrap();
+
+        let cancel_path = format!("/api/v1/internal/mobile/pairings/{id}/cancel");
+        let cancel = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        // The fail-closed cancellation is neither delayed nor masked by the
+        // audit persistence failure.
+        assert_eq!(cancel.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cancel.body).unwrap()["state"],
+            "cancelled"
+        );
+        // The record is owed, not lost: the tombstone token is pending.
+        let outbox =
+            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert!(outbox.contains(&id));
+
+        // A later terminal replay of the pairing delivers the pending record.
+        std::fs::remove_file(temp.path().join("mobile/audit.jsonl")).unwrap();
+        let status = handle_local_control(
+            "POST",
+            &format!("/api/v1/internal/mobile/pairings/{id}/status"),
+            Some("{}"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.status, 200);
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+        let outbox =
+            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert_eq!(outbox.trim(), "[]");
+
+        // Repeated terminal replays stay idempotent.
+        let _ = handle_local_control(
+            "POST",
+            &format!("/api/v1/internal/mobile/pairings/{id}/status"),
+            Some("{}"),
+        )
+        .unwrap()
+        .unwrap();
         let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
         assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
     }
