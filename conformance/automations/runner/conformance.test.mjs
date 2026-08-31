@@ -39,6 +39,7 @@ import { canonicalJson, ConformanceModel } from './lib/model.mjs';
 import { checkInvariants, evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
 import { applyOperation } from './lib/ops.mjs';
 import { redactPublishedText, redactText, scrubString } from './lib/redact.mjs';
+import { createTarget } from './lib/adapters/index.mjs';
 import { evaluateSloGate } from './conformance.mjs';
 
 test('every vector passes the envelope schema and loads', async () => {
@@ -482,6 +483,40 @@ test('a selected vector that cannot execute fails the gate', async () => {
     report.gate.notes.includes('did not execute'),
     `gate notes must name the non-executed vectors: ${report.gate.notes}`
   );
+});
+
+test('unwired adapter targets certify nothing and fail the gate', async () => {
+  for (const target of ['daemon', 'in-process', 'packaged-release']) {
+    const { report } = await runConformance({
+      profile: 'structural',
+      target,
+      report: null,
+      vector: null,
+      slo: null,
+      fuzz: 0,
+      seed: 858,
+      list: false,
+      quiet: true
+    });
+    assert.equal(
+      report.gate.status,
+      'failed',
+      `unwired ${target} target must not pass: ${JSON.stringify(report.notApplicable.slice(0, 2))}`
+    );
+    assert.ok(
+      report.notApplicable.length > 0,
+      `every vector is not-applicable on an unwired ${target} target`
+    );
+    assert.ok(
+      report.gate.notes.includes('never advertised'),
+      `gate must state that ${target} never advertised the capability`
+    );
+  }
+});
+
+test('unknown targets and adapters fail loudly', async () => {
+  assert.throws(() => parseArgs(['--target', 'emulator']), /unknown target/);
+  assert.throws(() => createTarget('emulator'), /unknown target kind/);
 });
 
 test('reports carry revisions, digests, and redaction before writing', async () => {

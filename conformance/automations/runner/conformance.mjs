@@ -1,14 +1,18 @@
 #!/usr/bin/env node
 // Coven automations conformance runner (coven.automations.conformance v1).
 //
-//   node conformance.mjs --profile all --target reference --report conformance/automations/reports/last-run.json
+//   node conformance.mjs --profile all --target reference-oracle --report conformance/automations/reports/last-run.json
 //
 // Standalone and dependency-free: loads the versioned manifest, schemas, and
 // vectors, validates every vector against the envelope schema, and executes
 // them against a target. The default target is the plane's own reference
-// oracle. A daemon endpoint or packaged release can be certified the same way
-// once it advertises `coven.automations.conformance.v1`; until then those
-// vectors are reported as skipped, never silently passed.
+// oracle; those runs are VECTOR SELF-TESTS, not product certification.
+// Real certification requires a wired adapter (lib/adapters) against a
+// daemon endpoint (--endpoint), a linked in-process implementation
+// (COVEN_CONFORMANCE_INPROCESS_MODULE), or a packed release artifact
+// (COVEN_CONFORMANCE_PACKAGE_BIN) that advertises
+// `coven.automations.conformance.v1`; until a target's probe succeeds its
+// vectors are not-applicable and the gate fails.
 //
 // Output is machine-readable (conformance.report.v1), carries exact source
 // revisions and artifact digests, and is redacted before writing.
@@ -22,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 
 import { validateAgainstSchema } from './lib/schema.mjs';
 import { evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
+import { createTarget, TARGET_KINDS, TARGETS_CAPABILITY } from './lib/adapters/index.mjs';
 import { redactPublishedText, REDACTION_RULES } from './lib/redact.mjs';
 
 export const PLANE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -202,6 +207,7 @@ export function parseArgs(argv) {
   const options = {
     profile: 'all',
     target: 'reference-oracle',
+    endpoint: null,
     report: join(PLANE_ROOT, 'reports', 'last-run.json'),
     vector: null,
     slo: null,
@@ -221,6 +227,7 @@ export function parseArgs(argv) {
     else if (arg === '--quiet') options.quiet = true;
     else if (arg.startsWith('--profile')) options.profile = take();
     else if (arg.startsWith('--target')) options.target = take();
+    else if (arg.startsWith('--endpoint')) options.endpoint = take();
     else if (arg.startsWith('--report')) options.report = take();
     else if (arg.startsWith('--vector')) options.vector = take();
     else if (arg.startsWith('--slo')) options.slo = take();
@@ -230,6 +237,9 @@ export function parseArgs(argv) {
   }
   if (!PROFILES.includes(options.profile) && options.profile !== 'all') {
     throw new Error(`unknown profile: ${options.profile}`);
+  }
+  if (!TARGET_KINDS.includes(options.target)) {
+    throw new Error(`unknown target: ${options.target} (known: ${TARGET_KINDS.join(', ')})`);
   }
   return options;
 }
@@ -260,11 +270,15 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
     throw new Error(`no vectors selected (profile=${options.profile}, vector=${options.vector})`);
   }
 
-  const target = {
-    kind: options.target,
+  // Target selection: the reference oracle is the plane's own deterministic
+  // implementation (vector self-tests); in-process, daemon, and
+  // packaged-release targets run through the adapters in lib/adapters and
+  // must advertise coven.automations.conformance.v1 via probe() before any
+  // vector executes on them (finding 3).
+  const target = createTarget(options.target, {
     definitionSchema,
-    capabilities: options.target === 'reference-oracle' ? ['reference-oracle'] : []
-  };
+    endpoint: options.endpoint
+  });
   const results = [];
   for (const entry of selected) {
     const outcome = await runOnTarget(entry.vector, target);
@@ -376,15 +390,20 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
       ? 'passed'
       : 'failed';
 
+  const unwiredAdapter =
+    options.target !== 'reference-oracle' &&
+    results.every((entry) => entry.status === 'not-applicable');
   const gateNotes =
-    missingProfiles.length > 0
-      ? `profiles not fully certified on this target: ${missingProfiles.join(', ')}`
-      : scopedRun && selectedNotApplicable.length > 0
-        ? `selected vectors that did not execute: ${selectedNotApplicable.map((entry) => entry.vector.vectorId).join(', ')}`
-        : fuzz
-          ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
-          : sloResult.status === 'not-run'
-            ? 'SLO evidence not provided: vector conformance only, no SLO certification'
+    unwiredAdapter
+      ? `target "${options.target}" never advertised ${TARGETS_CAPABILITY}; the adapter is scaffolding until wired (COVEN_CONFORMANCE_ENDPOINT / COVEN_CONFORMANCE_INPROCESS_MODULE / COVEN_CONFORMANCE_PACKAGE_BIN) — this run certifies nothing`
+      : missingProfiles.length > 0
+        ? `profiles not fully certified on this target: ${missingProfiles.join(', ')}`
+        : scopedRun && selectedNotApplicable.length > 0
+          ? `selected vectors that did not execute: ${selectedNotApplicable.map((entry) => entry.vector.vectorId).join(', ')}`
+          : fuzz
+            ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
+            : sloResult.status === 'not-run'
+              ? 'SLO evidence not provided: vector conformance only, no SLO certification'
             : null;
   const gate = {
     status: gateStatus,

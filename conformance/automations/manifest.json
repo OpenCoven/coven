@@ -36,10 +36,10 @@
     "interoperability"
   ],
   "targets": {
-    "reference-oracle": "the plane's own deterministic oracle (runner/lib); always available, zero dependencies",
-    "in-process": "a linked Coven implementation; requires the coven.automations.conformance.v1 capability",
-    "daemon": "a running daemon endpoint over the local socket API; requires the coven.automations.conformance.v1 capability",
-    "packaged-release": "a packed npm artifact's binary; requires the coven.automations.conformance.v1 capability"
+    "reference-oracle": "the plane's own deterministic oracle (runner/lib); always available, zero dependencies. Reference-oracle runs are vector self-tests, not product certification.",
+    "in-process": "a linked Coven implementation module exporting probe()/evaluate(); adapter runner/lib/adapters/index.mjs, module via COVEN_CONFORMANCE_INPROCESS_MODULE; requires the coven.automations.conformance.v1 capability",
+    "daemon": "a running daemon endpoint over HTTP; adapter runner/lib/adapters/index.mjs, endpoint via --endpoint or COVEN_CONFORMANCE_ENDPOINT; requires the coven.automations.conformance.v1 capability",
+    "packaged-release": "a packed npm artifact's binary; adapter runner/lib/adapters/index.mjs, binary via COVEN_CONFORMANCE_PACKAGE_BIN; requires the coven.automations.conformance.v1 capability"
   },
   "targetsCapability": "coven.automations.conformance.v1",
   "invariants": [

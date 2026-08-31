@@ -42,9 +42,13 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_ci_runs_the_automations_conformance_plane(self) -> None:
         job = CI_TEXT.split("\n  automations-conformance:\n", 1)[1].split("\n  rust-lint-linux:", 1)[0]
-        self.assertIn("name: Automations conformance", job)
+        # CI exercises vector self-tests on the reference oracle and must be
+        # labeled as such: it is not product certification (finding 3 of the
+        # #882 review).
+        self.assertIn("name: Automations conformance vector self-tests (reference oracle)", job)
         self.assertIn("scripts/agent-bootstrap", job)
         self.assertIn("scripts/agent-check automations-conformance", job)
+        self.assertIn("not product certification", job)
         # The conformance plane gates pull requests through the PR gate.
         gate = CI_TEXT.split("\n  pr-gate:\n", 1)[1]
         self.assertIn("- automations-conformance", gate)

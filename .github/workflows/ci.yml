@@ -98,7 +98,7 @@ jobs:
       - run: scripts/check-workflows.sh
 
   automations-conformance:
-    name: Automations conformance
+    name: Automations conformance vector self-tests (reference oracle)
     needs: changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -109,7 +109,7 @@ jobs:
           node-version: 24
       - name: Agent bootstrap
         run: scripts/agent-bootstrap
-      - name: Certify the automations conformance plane
+      - name: Run conformance vector self-tests on the reference oracle (not product certification)
         run: scripts/agent-check automations-conformance
 
   rust-lint-linux:
