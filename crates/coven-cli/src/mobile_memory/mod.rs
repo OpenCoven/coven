@@ -214,6 +214,25 @@ extern "C" fn handle_pairing_interrupt(sig: libc::c_int) {
 }
 
 #[cfg(unix)]
+fn current_sigint_disposition() -> Result<libc::sigaction> {
+    // SAFETY: sigaction with a null act queries the current disposition for
+    // SIGINT into the caller-provided storage; it changes nothing.
+    unsafe {
+        let mut previous: libc::sigaction = std::mem::zeroed();
+        if libc::sigaction(
+            libc::SIGINT,
+            std::ptr::null(),
+            &mut previous,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to query the current SIGINT disposition");
+        }
+        Ok(previous)
+    }
+}
+
+#[cfg(unix)]
 fn install_pairing_interrupt_handler() -> Result<()> {
     // SAFETY: sigaction is the documented POSIX API for installing signal
     // handlers; we pass a zero-initialized struct, our handler pointer, and
@@ -223,8 +242,8 @@ fn install_pairing_interrupt_handler() -> Result<()> {
         action.sa_sigaction = handle_pairing_interrupt as *const () as usize;
         libc::sigemptyset(&mut action.sa_mask);
         // Intentionally no SA_RESTART: blocking stdin reads observe the
-        // interrupt instead of waiting it out, and std retries the
-        // interrupted read so the prompt keeps working.
+        // interrupt as ErrorKind::Interrupted instead of waiting it out, so
+        // the pairing prompt can react to Ctrl-C instead of retrying.
         action.sa_flags = 0;
         if libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut()) != 0 {
             return Err(std::io::Error::last_os_error())
@@ -232,6 +251,73 @@ fn install_pairing_interrupt_handler() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Scoped owner of the process-global pairing SIGINT state.
+///
+/// Installing a signal handler is a process-global mutation, so it is undone
+/// on scope exit: the previous SIGINT disposition captured at install time is
+/// restored and the latched flag is reset. Every path out of the pairing flow
+/// — success, error, or panic — passes through [`Drop::drop`], so the handler
+/// never outlives the pairing session it belongs to.
+#[cfg(unix)]
+struct PairingInterruptGuard {
+    previous: libc::sigaction,
+}
+
+#[cfg(unix)]
+impl PairingInterruptGuard {
+    fn install() -> Result<Self> {
+        let previous = current_sigint_disposition()?;
+        install_pairing_interrupt_handler()?;
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PairingInterruptGuard {
+    fn drop(&mut self) {
+        // SAFETY: sigaction restores the disposition captured when the guard
+        // was installed; the pointer refers to guard-owned storage.
+        unsafe {
+            libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+        }
+        PAIRING_INTERRUPT_REQUESTED.store(false, Ordering::Release);
+    }
+}
+
+/// True when a SIGINT arrived since the last reset.
+#[cfg(unix)]
+fn pairing_interrupted() -> bool {
+    PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Read one line from `input`, reacting to SIGINT instead of retrying past it.
+///
+/// The interrupt handler is installed without SA_RESTART, so an interrupted
+/// read surfaces as `ErrorKind::Interrupted` rather than being restarted
+/// in place; this loop treats every such error as a chance to observe the
+/// flag and, once it is set, to stop reading entirely. The caller must then
+/// cancel the pairing and exit immediately — no further input is consumed.
+/// Ok(None) means the pairing was interrupted; Ok(Some(line)) is the input
+/// read so far, including the empty line at EOF.
+#[cfg(unix)]
+fn read_confirmation_line(
+    input: &mut dyn std::io::BufRead,
+    interrupt: &AtomicBool,
+) -> std::io::Result<Option<String>> {
+    let mut buffer = String::new();
+    loop {
+        if interrupt.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        buffer.clear();
+        match input.read_line(&mut buffer) {
+            Ok(_) => return Ok(Some(buffer)),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 /// Best-effort cancellation of a pending pairing through the owner-only daemon
@@ -260,9 +346,9 @@ fn cancel_pending_pairing(coven_home: &Path, pairing_id: Uuid) -> &'static str {
 #[cfg(unix)]
 fn run_pair_unix() -> Result<()> {
     let coven_home = crate::coven_home_dir()?;
-    // The handler stays installed for the lifetime of this pairing flow; the
-    // command runs to process exit, so no restore step is needed.
-    install_pairing_interrupt_handler()?;
+    // The handler is restored and the flag reset when this scope exits, on
+    // every path out of the pairing flow.
+    let _interrupt_guard = PairingInterruptGuard::install()?;
     let (status, body) =
         post_mobile_control(&coven_home, "/api/v1/internal/mobile/pairings", "{}")?;
     if status != 201 {
@@ -276,7 +362,7 @@ fn run_pair_unix() -> Result<()> {
         if Utc::now() >= invitation.expires_at {
             bail!("mobile pairing expired before the device enrolled");
         }
-        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+        if pairing_interrupted() {
             let outcome = cancel_pending_pairing(&coven_home, invitation.id);
             bail!("mobile pairing interrupted before the device enrolled; {outcome}");
         }
@@ -303,20 +389,38 @@ fn run_pair_unix() -> Result<()> {
         println!("{}. {word}", index + 1);
     }
     println!("Type `confirm` only if all six words match:");
-    let mut confirmation = String::new();
-    if let Err(error) = std::io::stdin().read_line(&mut confirmation) {
-        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+    let stdin = std::io::stdin();
+    let confirmation = match read_confirmation_line(&mut stdin.lock(), &PAIRING_INTERRUPT_REQUESTED)
+    {
+        Ok(Some(confirmation)) => confirmation,
+        // An interrupt while waiting for input cancels the pairing and exits
+        // immediately; nothing else is read or sent.
+        Ok(None) => {
             let outcome = cancel_pending_pairing(&coven_home, invitation.id);
             bail!("mobile pairing interrupted before host confirmation; {outcome}");
         }
-        return Err(error).context("failed to read pairing confirmation");
-    }
+        // The read itself failed, but an interrupt observed now still wins:
+        // the pairing is cancelled and the process exits immediately.
+        Err(_error) if pairing_interrupted() => {
+            let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            bail!("mobile pairing interrupted before host confirmation; {outcome}");
+        }
+        Err(error) => return Err(error).context("failed to read pairing confirmation"),
+    };
     if confirmation.trim() != "confirm" {
+        let interrupted = pairing_interrupted();
         let outcome = cancel_pending_pairing(&coven_home, invitation.id);
-        if PAIRING_INTERRUPT_REQUESTED.load(Ordering::Acquire) {
+        if interrupted {
             bail!("mobile pairing interrupted; {outcome}");
         }
         bail!("mobile pairing declined; {outcome}");
+    }
+    // Recheck the interrupt state immediately before confirmation: a Ctrl-C
+    // that races with the user pressing Enter must not let the pairing be
+    // confirmed.
+    if pairing_interrupted() {
+        let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+        bail!("mobile pairing interrupted before host confirmation; {outcome}");
     }
     let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
     let body = serde_json::json!({ "phrase": phrase }).to_string();
@@ -370,4 +474,151 @@ fn post_mobile_control(coven_home: &Path, path: &str, body: &str) -> Result<(u16
         .split_once("\r\n\r\n")
         .context("mobile pairing control response omitted a body")?;
     Ok((status, body.to_owned()))
+}
+
+#[cfg(all(test, unix))]
+mod pairing_flow_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::io::{BufRead, Read};
+
+    /// Stdin stand-in whose reads replay a scripted sequence of byte chunks
+    /// and I/O errors, so the confirmation loop can be driven without a tty.
+    struct ScriptedInput {
+        steps: VecDeque<std::io::Result<Vec<u8>>>,
+        buffer: Vec<u8>,
+        position: usize,
+    }
+
+    impl ScriptedInput {
+        fn new(steps: Vec<std::io::Result<Vec<u8>>>) -> Self {
+            Self {
+                steps: steps.into(),
+                buffer: Vec::new(),
+                position: 0,
+            }
+        }
+    }
+
+    impl Read for ScriptedInput {
+        fn read(&mut self, target: &mut [u8]) -> std::io::Result<usize> {
+            let available = self.fill_buf()?;
+            let amount = available.len().min(target.len());
+            target[..amount].copy_from_slice(&available[..amount]);
+            self.consume(amount);
+            Ok(amount)
+        }
+    }
+
+    impl BufRead for ScriptedInput {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if self.position >= self.buffer.len() {
+                match self.steps.pop_front() {
+                    Some(Ok(chunk)) => {
+                        self.buffer = chunk;
+                        self.position = 0;
+                    }
+                    Some(Err(error)) => return Err(error),
+                    None => {
+                        self.buffer.clear();
+                        self.position = 0;
+                    }
+                }
+            }
+            Ok(&self.buffer[self.position..])
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.position = (self.position + amount).min(self.buffer.len());
+        }
+    }
+
+    fn interrupted_error() -> std::io::Error {
+        std::io::Error::from_raw_os_error(libc::EINTR)
+    }
+
+    #[test]
+    fn interrupt_guard_restores_disposition_and_resets_flag() {
+        let before = current_sigint_disposition().unwrap();
+        let guard = PairingInterruptGuard::install().unwrap();
+
+        let installed = current_sigint_disposition().unwrap();
+        assert_eq!(
+            installed.sa_sigaction,
+            handle_pairing_interrupt as *const () as usize
+        );
+
+        // The handler latches the flag; the guard must reset it and restore
+        // the previous disposition on scope exit.
+        handle_pairing_interrupt(libc::SIGINT);
+        assert!(pairing_interrupted());
+
+        drop(guard);
+        let after = current_sigint_disposition().unwrap();
+        assert!(!pairing_interrupted());
+        assert_eq!(after.sa_sigaction, before.sa_sigaction);
+        assert_eq!(after.sa_flags, before.sa_flags);
+    }
+
+    #[test]
+    fn interrupt_guard_restore_survives_a_double_install() {
+        let before = current_sigint_disposition().unwrap();
+        let outer = PairingInterruptGuard::install().unwrap();
+        let inner = PairingInterruptGuard::install().unwrap();
+        drop(inner);
+        // The outer guard still owns the restored-from state; dropping it
+        // returns to the disposition observed before either install.
+        drop(outer);
+        let after = current_sigint_disposition().unwrap();
+        assert_eq!(after.sa_sigaction, before.sa_sigaction);
+        assert!(!pairing_interrupted());
+    }
+
+    #[test]
+    fn confirmation_reader_returns_the_line_without_an_interrupt() {
+        let mut input =
+            ScriptedInput::new(vec![Err(interrupted_error()), Ok(b"confirm\n".to_vec())]);
+        let interrupt = AtomicBool::new(false);
+        let line = read_confirmation_line(&mut input, &interrupt).unwrap();
+        assert_eq!(line.as_deref(), Some("confirm\n"));
+    }
+
+    #[test]
+    fn confirmation_reader_stops_before_reading_when_already_interrupted() {
+        let mut input = ScriptedInput::new(vec![Ok(b"confirm\n".to_vec())]);
+        let interrupt = AtomicBool::new(true);
+        // The pending line must not be consumed: an interrupted pairing is
+        // cancelled and exits before any further input is read.
+        let line = read_confirmation_line(&mut input, &interrupt).unwrap();
+        assert_eq!(line, None);
+        assert_eq!(input.fill_buf().unwrap(), b"confirm\n");
+    }
+
+    #[test]
+    fn confirmation_reader_observes_an_interrupt_that_races_the_read() {
+        let mut input = ScriptedInput::new(vec![
+            Err(interrupted_error()),
+            Ok(b"confirm\n".to_vec()),
+        ]);
+        let interrupt = AtomicBool::new(false);
+        interrupt.store(true, Ordering::Release);
+        let line = read_confirmation_line(&mut input, &interrupt).unwrap();
+        assert_eq!(line, None);
+    }
+
+    #[test]
+    fn confirmation_reader_propagates_unrelated_errors() {
+        let mut input = ScriptedInput::new(vec![Err(std::io::Error::other("closed"))]);
+        let interrupt = AtomicBool::new(false);
+        let error = read_confirmation_line(&mut input, &interrupt).unwrap_err();
+        assert_eq!(error.to_string(), "closed");
+    }
+
+    #[test]
+    fn confirmation_reader_treats_eof_as_an_empty_line() {
+        let mut input = ScriptedInput::new(vec![]);
+        let interrupt = AtomicBool::new(false);
+        let line = read_confirmation_line(&mut input, &interrupt).unwrap();
+        assert_eq!(line.as_deref(), Some(""));
+    }
 }
