@@ -255,7 +255,7 @@ Owner-controlled policy document, stored and interpreted by the authority layer 
   "title": "OpenCoven RecoveryPolicy v1 diagnostic JSON representation",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "trustDomain", "introductionPolicy", "recoveryFactors", "attestationPolicy", "updatedAt"],
+  "required": ["version", "trustDomain", "introductionPolicy", "recoveryRequirements", "attestationPolicy", "updatedAt"],
   "properties": {
     "version": { "const": 1 },
     "trustDomain": { "type": "string", "minLength": 8, "maxLength": 256 },
@@ -269,21 +269,40 @@ Owner-controlled policy document, stored and interpreted by the authority layer 
         "requireDistinctApprovers": { "type": "boolean" }
       }
     },
-    "recoveryFactors": {
-      "description": "Factor combination that is sufficient to restore owner access. At least two distinct factor kinds are REQUIRED by this plan.",
-      "type": "array", "minItems": 2, "uniqueItems": true,
-      "items": { "enum": [
-        "passkey_account", "recovery_key", "trusted_device",
-        "owner_root_credential", "attested_device", "n_of_m_devices"
-      ] }
-    },
-    "recoveryThreshold": {
+    "recoveryRequirements": {
+      "description": "Recovery-factor AND/OR semantics in disjunctive normal form: the policy is satisfied when AT LEAST ONE group in anyOf is satisfied; a group is satisfied when EVERY factor in its allOf is satisfied and, if deviceQuorum is present, the quorum is met by distinct active device grants (§6.1). Evaluated only by the authority layer.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["of", "minimum"],
+      "required": ["anyOf"],
       "properties": {
-        "of": { "type": "integer", "minimum": 1, "maximum": 9 },
-        "minimum": { "type": "integer", "minimum": 1, "maximum": 9 }
+        "anyOf": {
+          "type": "array", "minItems": 1, "maxItems": 9,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["allOf"],
+            "properties": {
+              "allOf": {
+                "description": "Factor kinds that must ALL be evidenced. A device may satisfy at most one factor kind within a group.",
+                "type": "array", "minItems": 1, "maxItems": 9, "uniqueItems": true,
+                "items": { "enum": [
+                  "passkey_account", "recovery_key", "trusted_device",
+                  "owner_root_credential", "attested_device"
+                ] }
+              },
+              "deviceQuorum": {
+                "description": "N-of-M quorum over distinct active device grants; valid only in a group whose allOf contains trusted_device. Validation: 1 <= minimum <= of (§3.3 policy validation, §6.1).",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["of", "minimum"],
+                "properties": {
+                  "of": { "type": "integer", "minimum": 1, "maximum": 9 },
+                  "minimum": { "type": "integer", "minimum": 1, "maximum": 9 }
+                }
+              }
+            }
+          }
+        }
       }
     },
     "attestationPolicy": {
@@ -346,6 +365,15 @@ Owner-controlled policy document, stored and interpreted by the authority layer 
 }
 ```
 
+**Policy validation (normative).** The authority refuses to store an invalid `RecoveryPolicy` — the previously stored policy stays active until a valid one replaces it:
+
+1. every group in `anyOf` has a non-empty `allOf` of distinct factor kinds;
+2. `deviceQuorum` appears only in a group whose `allOf` contains `trusted_device`, with `1 <= deviceQuorum.minimum <= deviceQuorum.of` (the `minimum <= of` check the flat list could not express);
+3. at least one group in `anyOf` does not contain `passkey_account` — the account-independent path required by §5.2;
+4. `recoveryRequirements` is the only factor-combination surface: N-of-M is expressed exclusively through `deviceQuorum`, never through a factor kind, so no implementation can invent its own threshold reading.
+
+At **evaluation time** the same rules re-apply against live state: a policy that has become unsatisfiable (for example, devices revoked below `deviceQuorum.minimum`) yields `recovery_denied` naming the unsatisfiable group — it never silently degrades to a weaker factor set.
+
 ### 3.4 RecoveryEvent
 
 Append-only audit record, same storage discipline as `audit.jsonl` in `audit.rs` (private directory, atomic append, no secret material).
@@ -371,9 +399,19 @@ Append-only audit record, same storage discipline as `audit.jsonl` in `audit.rs`
     },
     "subject": { "$ref": "#/$defs/identityReference" },
     "actors": {
-      "description": "Abstract factor kinds only (see privacy.md rule 8): no credential IDs, no key material.",
+      "description": "Abstract factor kinds only (see privacy.md rule 8): no credential IDs, no key material. A quorum-satisfied ceremony records trusted_device plus the quorum field.",
       "type": "array", "uniqueItems": true, "minItems": 1,
-      "items": { "enum": ["passkey_account", "recovery_key", "trusted_device", "owner_root_credential", "attested_device", "n_of_m_devices"] }
+      "items": { "enum": ["passkey_account", "recovery_key", "trusted_device", "owner_root_credential", "attested_device"] }
+    },
+    "quorum": {
+      "description": "Present when a device quorum satisfied the ceremony: the N-of-M that was met, by distinct active device grants.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["of", "minimum"],
+      "properties": {
+        "of": { "type": "integer", "minimum": 1, "maximum": 9 },
+        "minimum": { "type": "integer", "minimum": 1, "maximum": 9 }
+      }
     },
     "epoch": {
       "description": "Trust-domain (issuer) epoch after this event; identity and root rotations increment it. Grants and resumption material issued under an older epoch are invalid (§6.2).",
@@ -559,7 +597,20 @@ export interface IntroductionApproval {
 
 export type RecoveryFactor =
   | 'passkey_account' | 'recovery_key' | 'trusted_device'
-  | 'owner_root_credential' | 'attested_device' | 'n_of_m_devices';
+  | 'owner_root_credential' | 'attested_device';
+// N-of-M is expressed only via RecoveryRequirements deviceQuorum — never a factor kind.
+
+/**
+ * Recovery-factor AND/OR semantics (disjunctive normal form, §3.3/§6.1):
+ * satisfied when at least one group is satisfied; a group requires every
+ * factor in allOf plus, if present, the distinct-device quorum.
+ */
+export interface RecoveryRequirements {
+  anyOf: {
+    allOf: RecoveryFactor[];
+    deviceQuorum?: { of: number; minimum: number }; // validated: 1 <= minimum <= of
+  }[];
+}
 
 export interface RecoveryPolicy {
   version: 1;
@@ -569,8 +620,7 @@ export interface RecoveryPolicy {
     rootMinApprovals: number;
     requireDistinctApprovers: boolean;
   };
-  recoveryFactors: RecoveryFactor[];
-  recoveryThreshold?: { of: number; minimum: number };
+  recoveryRequirements: RecoveryRequirements;
   attestationPolicy: {
     default: 'ignore' | 'prefer';
     requireFor: AttestationRequirement[];
@@ -590,6 +640,7 @@ export interface RecoveryEvent {
   kind: RecoveryEventKind;
   subject: { type: 'owner' | 'installation' | 'device' | 'trust-domain' | 'familiar'; id: string };
   actors: RecoveryFactor[];
+  quorum?: { of: number; minimum: number }; // present when a device quorum satisfied the ceremony
   trustDomainEpoch: number; // issuer epoch after this event (§6.2)
   rotatesIdentity?: boolean;
   outOfBandContext?: string;
@@ -755,7 +806,7 @@ The property to hold: **a compromised relay or account service alone cannot enro
 | Use | Mechanism | Authority effect |
 | --- | --- | --- |
 | Optional OpenCoven account sign-in | WebAuthn/passkey ceremony against the (optional) account provider | Account-session only; no Coven authority |
-| Account/recovery authentication | Passkey ceremony as one `passkey_account` factor | Counts toward `RecoveryPolicy.recoveryFactors` |
+| Account/recovery authentication | Passkey ceremony as one `passkey_account` factor | Counts toward `RecoveryPolicy.recoveryRequirements` |
 | Remote enrollment authorization | Account-authenticated session *initiates* an introduction request delivery | Still requires trusted-device/owner approvals (§4.7) |
 | Approving a new installation from an already trusted device | Passkey as an additional factor on the approving device, never a substitute for its device key | Assurance attribute at most |
 | Cross-platform browser/native login | Standard WebAuthn; platform-neutral | Account-session only |
@@ -767,7 +818,7 @@ A passkey — in particular a synced passkey — MUST NOT be treated as:
 1. **the sole root key of a familiar** — familiar identity keys are managed by the authority layer and the identity resolver (`familiar_identity.rs`, `docs/familiars/identity.md`); a synced passkey exists in a platform sync fabric outside OpenCoven's control;
 2. **proof of one particular physical device** — a synced passkey may be available on every device in a platform account; it proves account possession, not device possession. Device identity remains the pairwise, non-exportable device key (`grant.rs` `subject_key_id`);
 3. **a globally reused familiar/device identifier** — passkey credential IDs are scoped to the account RP and MUST NOT appear in Coven protocol surfaces (privacy rule 8);
-4. **the only recovery mechanism** — `RecoveryPolicy.recoveryFactors` must always offer at least one account-independent path (recovery key, owner root credential, or trusted-device quorum).
+4. **the only recovery mechanism** — `RecoveryPolicy.recoveryRequirements` must always offer at least one account-independent group (§3.3 validation rule 3): recovery key, owner root credential, or a trusted-device quorum.
 
 Mechanistically: a successful passkey ceremony yields an account-layer session that may *request* ceremonies and may contribute the `passkey_account` factor to recovery counting. It never signs `DeviceGrant`s, never appears in `DeviceGrant.subject_key_id`, and never substitutes for `fresh_user_verification`/`fresh_biometric` in an `IntroductionApproval`.
 
@@ -782,10 +833,29 @@ Recovery ceremonies are explicit objects and events (`RecoveryPolicy`, `Recovery
 | passkey/account + trusted device | Owner regains account, then approves re-enrollment from the trusted phone | Common "new laptop" path |
 | recovery key/seed | Offline, account-independent restoration | Generated at first enrollment, displayed once, stored by the owner outside OpenCoven; the seed never transits the account service |
 | another trusted device | Surviving-device approval of a new endpoint | §4 |
-| N-of-M trusted-device approval | Owner policy for high-assurance households/teams | `recoveryThreshold` |
+| N-of-M trusted-device approval | Owner policy for high-assurance households/teams | `recoveryRequirements` `deviceQuorum` |
 | owner root credential | Last-resort local ceremony on the installation itself | Works with all network paths down |
 
-Minimum viable default (recommended): **recovery key + passkey account**, with the trusted-device path always available while any enrolled device survives. All combinations are owner-selectable via `RecoveryPolicy`.
+**Evaluation semantics (formal).** A ceremony collects evidence, then evaluates the owner's groups — the authority is the only evaluator:
+
+```text
+satisfied(group):
+  1. every factor kind in group.allOf is evidenced:
+       passkey_account        ← fresh WebAuthn ceremony against the account provider
+       recovery_key           ← holder demonstrates the recovery key
+       trusted_device         ← a device with a currently active grant
+       owner_root_credential  ← owner root credential ceremony on the installation
+       attested_device        ← a trusted device that also holds a valid verified_* claim (§7.1)
+  2. if group.deviceQuorum is present: the number of DISTINCT active device grants
+     evidencing trusted_device is >= deviceQuorum.minimum
+     (and deviceQuorum.minimum <= deviceQuorum.of was validated at policy write, §3.3)
+  one device may evidence at most one factor kind within a group: the same device
+  cannot double-count as trusted_device and attested_device, and cannot count twice
+  toward a quorum
+policy satisfied ⇐ ∃ group in anyOf: satisfied(group)
+```
+
+Minimum viable default (recommended): `anyOf: [{ "allOf": ["recovery_key", "passkey_account"] }, { "allOf": ["trusted_device"] }]` — recovery key + passkey account, with the trusted-device path always available while any enrolled device survives; owners needing higher assurance add `deviceQuorum` to the trusted-device group. All combinations are owner-selectable via `RecoveryPolicy`; the authority enforces the §3.3 validation rules.
 
 ### 6.2 Recovering access ≠ rotating identity (issue requirement)
 
@@ -965,6 +1035,7 @@ Implementation PRs must add, at minimum:
 - negative tests: transcript substitution, scope substitution, expired/single-use nonce replay, threshold bypass, approval-for-another-request, unknown attribute/evidence values (fail closed), attestation claim expiry;
 - attestation trust-anchor tests: claim outside the §7.1 matrix rejected even with a valid verifier signature; claim from an unpinned `verifierId` or retired `verifierKeyId` rejected; anchor rotation overlap window honored and `validUntil` enforced; removing an anchor invalidates outstanding claims at the next gated operation; per-operation `requireFor` enforcement (attribute subsets do not satisfy an entry); empty-`verifiers` policy accepted only with empty `requireFor`;
 - `COVEN-ASSURANCE/1` proof tests: challenge single-use/atomic consumption, proof replay, proof bound to a different transcript, proof against a stale grant or revocation epoch, possession-key signature offered as a step-up proof (must fail), expired proof window, effective assurance computed server-side (claimed level above the enrolled-class ceiling is capped);
+- recovery-policy semantics tests: `minimum > of` and quorum-without-`trusted_device` policies rejected at write; a policy with no account-independent group rejected; unsatisfiable-at-evaluation policy (devices revoked below `deviceQuorum.minimum`) yields `recovery_denied` naming the group; a device cannot satisfy two factor kinds or count twice within one group; DNF evaluation vectors for AND/OR groups;
 - integration tests with a malicious relay/account shim: no enrollment without valid approvals; account service compromise reduces to a no-op on the authority path;
 - privacy tests: no passkey credential IDs, attestation receipts, hardware IDs, or biometric metadata in any protocol object, audit record, or log line (extends `scripts/check-coven-privacy.py` coverage);
 - revocation/rotation tests: per-device epoch bump invalidates that device's pre-revocation grants; trust-domain epoch bump invalidates **every** grant, step-up authorization key, outstanding assurance challenge, and resumption material issued under the previous epoch, atomically (no partial state after an interrupted rotation), while leaving familiar identity untouched; grants and resumption material issued under the new epoch keep working;
