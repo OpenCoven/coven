@@ -68,12 +68,13 @@ pub struct TickReport {
 const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
 
 /// Claims the earliest due PLANNED occurrence for a routine with a bounded
-/// lease. Returns the claimed occurrence id, or `None` when nothing is due.
-/// The compare-and-set WHERE clause makes claims race-safe across callers.
+/// lease. Returns the claimed occurrence id, or `None` when nothing is due
+/// — including when the routine already has a live claimed/running
+/// occurrence, which `overlap: forbid` keeps from racing a second run. The
+/// compare-and-set WHERE clause makes claims race-safe across callers.
 ///
-/// The runner (coven#816 part 4) is the production caller; until then tests
-/// and the daemon tick exercise the path directly.
-#[allow(dead_code)]
+/// The daemon tick claims through this path; manual run-now claims a specific
+/// fresh occurrence via `claim_occurrence_by_id`.
 pub fn claim_due_occurrence(
     conn: &Connection,
     automation_id: &str,
@@ -105,6 +106,11 @@ pub fn claim_due_occurrence(
                      AND scheduled_for <= ?2
                    ORDER BY scheduled_for ASC
                    LIMIT 1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_occurrences AS live
+                   WHERE live.automation_id = ?1
+                     AND live.state IN ('claimed', 'running')
                )",
             params![automation_id, now_iso, owner, expires_iso],
         )
@@ -120,6 +126,82 @@ pub fn claim_due_occurrence(
         )
         .map_err(|error| format!("failed to read claim: {error}"))?;
     Ok(Some(id))
+}
+
+/// Claims one specific occurrence (the manual run-now fence) with a bounded
+/// lease. Refused — returning `Ok(None)` — when the occurrence is not
+/// claimable, including when a sibling occurrence of the same routine is
+/// still live (`overlap: forbid`).
+pub fn claim_occurrence_by_id(
+    conn: &Connection,
+    occurrence_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
+        return Err("lease minutes must be 1..=1440".to_string());
+    }
+    let expires = now + chrono::Duration::minutes(lease_minutes);
+    let now_iso = iso(now);
+    let expires_iso = iso(expires);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'claimed',
+                 lease_owner = ?3,
+                 lease_expires_at = ?4,
+                 attempt = attempt + 1,
+                 updated_at = ?2
+             WHERE id = ?1
+               AND state = 'planned'
+               AND scheduled_for <= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_occurrences AS live
+                   WHERE live.automation_id = (
+                       SELECT automation_id FROM automation_occurrences WHERE id = ?1
+                   )
+                     AND live.state IN ('claimed', 'running')
+                     AND live.id != ?1
+             )",
+            params![occurrence_id, now_iso, owner, expires_iso],
+        )
+        .map_err(|error| format!("failed to claim occurrence: {error}"))?;
+    if changed == 0 {
+        return Ok(None);
+    }
+    Ok(Some(occurrence_id.to_string()))
+}
+
+/// Moves a claimed occurrence to `running` with a fresh bounded lease that
+/// outlives a healthy run of the routine (the definition timeout). A `running`
+/// row whose lease expires is recovered by `recover_expired_leases`, so a
+/// crashed dispatch never blocks the routine forever (coven#816).
+pub fn mark_occurrence_running(
+    conn: &Connection,
+    occurrence_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
+        return Err("lease minutes must be 1..=1440".to_string());
+    }
+    let expires = now + chrono::Duration::minutes(lease_minutes);
+    let now_iso = iso(now);
+    let expires_iso = iso(expires);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'running',
+                 lease_owner = ?3,
+                 lease_expires_at = ?4,
+                 updated_at = ?2
+             WHERE id = ?1 AND state IN ('claimed', 'running')",
+            params![occurrence_id, now_iso, owner, expires_iso],
+        )
+        .map_err(|error| format!("failed to mark occurrence running: {error}"))?;
+    Ok(changed > 0)
 }
 
 /// Marks occurrences whose lease has expired as failed with a stale reason.
@@ -145,7 +227,6 @@ pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<u
 
 /// Finalizes an occurrence into a terminal state. Releasing a PLANNED
 /// occurrence is refused — only claimed work can settle.
-#[allow(dead_code)]
 pub fn settle_occurrence(
     conn: &Connection,
     occurrence_id: &str,
@@ -551,6 +632,112 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn overlap_forbid_blocks_claims_while_a_run_is_live() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        let old_created = (real_now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            rusqlite::params![old_created],
+        )
+        .unwrap();
+        // Two due slots: the collapse test's fence keeps only the latest, so
+        // insert a second, earlier planned occurrence by hand.
+        tick_planning(&conn, real_now()).unwrap();
+        let planned: String = conn
+            .query_row(
+                "SELECT id FROM automation_occurrences WHERE automation_id = 'daily'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('daily-earlier', 'daily', '2020-01-01T09:00:00.000Z', 'planned', 0,
+                     '2020-01-01T09:00:00.000Z', '2020-01-01T09:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        // First claim wins; the second must be refused while it stays live,
+        // even though another planned occurrence is due.
+        let first = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
+        assert!(first.is_some());
+        let second = claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now()).unwrap();
+        assert!(
+            second.is_none(),
+            "overlap=forbid must reject a second claim"
+        );
+
+        // Settling the live run unblocks the next claim.
+        let claimed_id = first.unwrap();
+        assert!(settle_occurrence(&conn, &claimed_id, "succeeded", None, real_now()).unwrap());
+        let third = claim_occurrence_by_id(&conn, &planned, "daemon-b", 60, real_now()).unwrap();
+        assert!(third.is_some());
+    }
+
+    #[test]
+    fn running_occurrences_carry_a_bounded_recoverable_lease() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        let old_created = (real_now() - chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            rusqlite::params![old_created],
+        )
+        .unwrap();
+        tick_planning(&conn, real_now()).unwrap();
+        let occurrence_id = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now())
+            .unwrap()
+            .unwrap();
+
+        // Running keeps the lease alive, so recovery leaves it alone.
+        assert!(
+            mark_occurrence_running(&conn, &occurrence_id, "daemon-a", 60, real_now()).unwrap()
+        );
+        let (state, owner): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, lease_owner FROM automation_occurrences WHERE id = ?1",
+                rusqlite::params![occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        assert_eq!(owner.as_deref(), Some("daemon-a"));
+        let report = tick(&conn, real_now()).unwrap();
+        assert_eq!(report.recovered, 0);
+
+        // After the lease expires, recovery fails the row: a stale running
+        // record never blocks the routine forever (coven#816).
+        conn.execute(
+            "UPDATE automation_occurrences SET lease_expires_at = '2020-01-01T00:00:00.000Z'",
+            [],
+        )
+        .unwrap();
+        let report = tick(&conn, real_now()).unwrap();
+        assert_eq!(report.recovered, 1);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = ?1",
+                rusqlite::params![occurrence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn rejects_an_out_of_range_lease() {
+        let (_temp, conn) = temp_store();
+        assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", 0, real_now()).is_err());
+        let too_long = 24 * 60 + 1;
+        assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", too_long, real_now()).is_err());
     }
 
     #[test]

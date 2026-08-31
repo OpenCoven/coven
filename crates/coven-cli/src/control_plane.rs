@@ -132,6 +132,7 @@ pub fn capabilities() -> CapabilityCatalog {
 
 pub fn route_action(
     payload: Value,
+    coven_home: &std::path::Path,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
 ) -> (u16, ControlActionResponse) {
@@ -249,7 +250,7 @@ pub fn route_action(
                 action,
                 origin,
                 intent_id,
-                automation_tick_payload(conn, now),
+                automation_tick_payload(coven_home, conn, runtime, now),
             );
             (200, event)
         }
@@ -294,7 +295,7 @@ pub fn route_action(
                     action,
                     origin,
                     intent_id,
-                    automation_run_payload(conn, runtime, &id, now),
+                    automation_run_payload(conn, coven_home, runtime, &id, now),
                 ),
                 Err(error) => return (400, rejected_action(action, error)),
             };
@@ -351,20 +352,32 @@ fn required_definition_field(
 }
 
 fn automation_tick_payload(
+    coven_home: &std::path::Path,
     conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
-    match crate::automations::occurrences::tick(conn, now) {
-        Ok(report) => json!({
-            "planned": report.planned,
-            "alreadyFenced": report.already_fenced,
-            "pausedSkipped": report.paused_skipped,
-            "recovered": report.recovered,
-            "claimed": report.claimed,
-            "failed": report.failed,
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
-    }
+    // The action shares the daemon's full tick: plan, recover, claim,
+    // dispatch every valid existing claim, and settle finished runs. A
+    // control-plane claim is dispatched by this same pass — never left
+    // stuck for a later tick (coven#816 finding 2).
+    let report = match crate::automations::full_tick(coven_home, conn, runtime, now) {
+        Ok(report) => report,
+        Err(error) => return json!({ "error": error }),
+    };
+    json!({
+        "planned": report.tick.planned,
+        "alreadyFenced": report.tick.already_fenced,
+        "pausedSkipped": report.tick.paused_skipped,
+        "recovered": report.tick.recovered,
+        "claimed": report.tick.claimed,
+        "dispatched": report.dispatch.dispatched,
+        "dispatchFailed": report.dispatch.failed,
+        "settledSucceeded": report.settlement.settled_succeeded,
+        "settledFailed": report.settlement.settled_failed,
+        "failures": report.settlement.failures,
+        "failed": report.tick.failed,
+    })
 }
 
 fn automation_health_payload(
@@ -403,13 +416,20 @@ fn automation_import_payload(conn: &rusqlite::Connection) -> Value {
 
 fn automation_run_payload(
     conn: &rusqlite::Connection,
+    coven_home: &std::path::Path,
     runtime: &dyn crate::api::SessionRuntime,
     id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
-            match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
+            match crate::automations::runner::run_routine_now(
+                coven_home,
+                conn,
+                runtime,
+                &definition,
+                now,
+            ) {
                 Ok(outcome) => json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
