@@ -243,8 +243,8 @@ Recommended canonical mapping (dot-form is the wire vocabulary; snake-form remai
 
 Gaps the implementation must resolve, with recommendation:
 
-- **Split `familiar_memory_admin` into `memory.familiar.read` / `memory.familiar.write`.** The Rust enum collapses read/write into one scope, while the spec (and least privilege generally) separates them. The contract module (`contract.rs` currently mirrors only `memory_read`; `capabilities.json` already models both read and write surfaces) can honor the split without a registry format change if the enum gains a variant and `LegacyDeviceScope` migration maps old grants to the pair.
-- **Split `device_admin` into `devices.enroll` / `devices.revoke`** to match the spec enum and the issue's "device enrollment/revocation" distinction; a device holding both is the exception, not the default.
+- **Split `familiar_memory_admin` into `memory.familiar.read` / `memory.familiar.write`.** The Rust enum collapses read/write into one scope, while the spec (and least privilege generally) separates them. The contract module (`contract.rs` currently mirrors only `memory_read`; `capabilities.json` already models both read and write surfaces) can honor the split if the enum gains variants and the explicit registry v2→v3 migration maps the coarse scope to the pair (§11.2 — `LegacyDeviceScope` is a v1 artifact and cannot carry v2 scopes); the registry format version moves to 3 for exactly this reason.
+- **Split `device_admin` into `devices.enroll` / `devices.revoke`** to match the spec enum and the issue's "device enrollment/revocation" distinction; a device holding both is the exception, not the default (same registry v2→v3 mapping, §11.2).
 - **Add `memory_read` to the spec vocabulary** (as `memory.read`) or deprecate it in favor of `conversations.read` during the Stage B registry migration (§11).
 - Unknown scopes already fail closed (`validate_scope_set`; `additionalProperties: false` in the schema; "Unknown capabilities MUST be rejected" in `mobile-device-pairing-v1.md`) — preserve that on every rename.
 
@@ -546,11 +546,47 @@ The issue requires audit events for enrollment, authentication, step-up approval
 
 Records stay free of private keys, biometric material, nonces, and signatures (the current test asserts exactly this class of redaction — extend it, do not weaken it).
 
-## 11. Registry migration
+## 11. Registry migration (v1 → v2 → v3)
 
-`registry.rs` already carries the legacy migration shape (`LegacyDeviceRecord`/`LegacyDeviceScope` → `GrantedDeviceRecord`), and `mobile-device-trust.md` Stage B prescribes: preserve v1 `memory_read` devices by representing them as grants with exactly their existing authority — one `memory_read` scope, `minimum_assurance: possession`, audience `local_coven_authority`, no expiry — and never widening access.
+Two migrations exist and must not be confused; `LegacyDeviceScope` participates only in the first.
 
-Deterministic migration rule: for each legacy device record, synthesize `DeviceGrant::for_device(device_id, public_key_x963, scopes_from_record, paired_at)`; keep the same `device_id` so audit history survives. Fail closed on unknown legacy scopes (`LegacyDeviceScope` must map 1:1 or the migration aborts) — the same unknown-value-fails-closed rule the schemas require.
+### 11.1 v1 → v2 (existing, unchanged)
+
+`registry.rs` already carries this migration (`LegacyDeviceRecord`/`LegacyDeviceScope` → `GrantedDeviceRecord`, `migrate_legacy_device`), and `mobile-device-trust.md` Stage B prescribes: preserve v1 `memory_read` devices by representing them as grants with exactly their existing authority — one `memory_read` scope, `minimum_assurance: possession`, audience `local_coven_authority`, no expiry — and never widening access.
+
+Deterministic rule: for each legacy device record, synthesize `DeviceGrant::for_device(device_id, public_key_x963, scopes_from_record, paired_at)`; keep the same `device_id` so audit history survives. The migration fails closed on any legacy scope other than `memory_read` (the code aborts unless the record holds exactly `MemoryRead`) and seeds `revocation_epoch = 1` so pre-grant resumption material cannot win.
+
+`LegacyDeviceScope` is a v1 artifact with a single variant: it cannot express — and must never be asked to migrate — the v2 coarse admin scopes (`familiar_memory_admin`, `device_admin`) that live in the current v2 registry. Those are migrated by the explicit v2→v3 mapping below.
+
+### 11.2 v2 → v3 (scope-vocabulary migration)
+
+When the §5.2 scope splits land, the registry format version moves 2 → 3 (`DEVICE_REGISTRY_VERSION`), migrating at load with the same atomic, idempotent, write-through pattern as `migrate_legacy_device`. The migration is a deterministic, total function over the v2 scope vocabulary — authority-preserving, never widening:
+
+| v2 `DeviceScope` | v3 successor(s) |
+| --- | --- |
+| `memory_read` | `memory_read` (unchanged; any Stage B deprecation is a later, separate decision — not a silent widening into `conversation_read`) |
+| `session_metadata_read` | `session_metadata_read` |
+| `conversation_read` | `conversation_read` |
+| `message_send` | `message_send` |
+| `tool_invocation_request` | `tool_invocation_request` |
+| `tool_execution_approve` | `tool_execution_approve` |
+| `secrets_read` | `secrets_read` |
+| `familiar_memory_admin` | `familiar_memory_read` + `familiar_memory_write` |
+| `device_admin` | `device_enroll` + `device_revoke` |
+| `identity_admin` | `identity_admin` |
+| `memory_export` | `memory_export` |
+| `identity_export` | `identity_export` |
+
+Rules:
+
+- **Authority preserved deterministically.** Each v2 coarse admin scope carried both halves of its v3 split, so the v3 pair reproduces exactly the v2 authority — no widening, no narrowing, no operator-visible change. Split pairs are inserted in v3 enum-declaration order so `validate_scope_set` continues to accept the set.
+- **Restrictions migrate through the same table.** `require_fresh_user_verification_for` entries map per the table (a v2 `familiar_memory_admin` entry becomes both v3 familiar-memory scopes; `device_admin` becomes both device scopes). `minimum_assurance`, validity windows, audience, and each device's id, grant id, and authorization epoch carry over unchanged.
+- **Unknown values fail closed.** A v2 registry containing a scope value outside the table aborts the migration and fails the load — never guess, drop, or default (the same unknown-value-fails-closed rule the schemas require). Serde's closed enums already reject unknown scope strings at parse time; the mapping layer must be exhaustive over `DeviceScope` with no catch-all arm.
+- **`LegacyDeviceScope` is not involved.** The v1→v2 path (§11.1) is unchanged by the split and must not be extended to carry v2 scopes.
+- **No downgrade.** A v3 registry fails to load on v2-era code with the existing unsupported-version error, matching today's behavior for unknown versions.
+- **Scope of the version bump.** Registry v3 is the scope-vocabulary migration only: the `COVEN-ASSURANCE/1` authorization-key store stays in its own `authorization-keys.json` (per `mobile-assurance-step-up-v1.md`'s decision table, which rejected nesting it in a registry version bump), and no other registry shape change rides along.
+
+The v2→v3 fixture test (§13) locks the table byte-for-byte: each v2 fixture record converts to exactly the expected v3 grant set without widening scopes, and the unknown-value case asserts a failed load.
 
 ## 12. Self-hosted and cloudless operation
 
@@ -576,7 +612,7 @@ Authority (Rust, host-side — citable paths for the test file locations):
 - revocation: mid-session revocation defeats `ensure_still_active` (epoch mismatch);
 - grant replacement: every authority-changing replacement mints a fresh grant id and strictly advances the authorization epoch — same-id or equal-epoch replacement is rejected (tightened over the current `replace_grant` behavior), and outstanding challenges/transaction state die with the old grant;
 - step-up: `COVEN-ASSURANCE/1` verification order — challenge single-use/expired/unknown/foreign-device/foreign-epoch rejection, possession-key-as-authorization-key rejection, `effective = min(requested, enrolled class ceiling)`, fail-closed `AssuranceRequired` on any proof failure, and `ensure_still_active` reusing the effective assurance at effect time (per `mobile-assurance-step-up-v1.md`'s adversarial test list);
-- migration: v1 registry fixture converts byte-for-byte to the expected grant set without widening scopes;
+- migration: v1 registry fixture converts byte-for-byte to the expected grant set without widening scopes; the v2→v3 fixture locks the §11.2 mapping (coarse admin scopes → their exact pair, all other scopes identity, restrictions mapped through the same table) and the unknown-scope case fails the load;
 - audit: taxonomy records are coarse-fields-only (extend the existing test).
 
 Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
@@ -613,7 +649,7 @@ Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
 
 - **Platform variance:** biometric-vs-credential distinction is only as strong as the platform reports it (e.g. Class 2 biometrics on Android are `BIOMETRIC_WEAK`). Mitigation: policy treats anything weaker than `BIOMETRIC_STRONG`/biometric-only LAContext as `device_credential`; grants that require `fresh_biometric` fail closed on platforms that cannot produce it.
 - **Assurance downgrade by configuration:** a self-hosted owner can set `minimum_assurance: possession` everywhere; the model permits it, the docs must say plainly that this trades security for convenience and that defaults derive from capability risk.
-- **Registry migration:** converting legacy records must be atomic and idempotent (`config.rs` already writes private files atomically); a partial migration must never leave a device authority-less or doubly-authorized — tests in §13.
+- **Registry migration:** converting stored records must be atomic and idempotent (`config.rs` already writes private files atomically) for both the v1→v2 legacy path and the v2→v3 scope-vocabulary migration (§11); both abort on unknown values and never leave a device authority-less or doubly-authorized — tests in §13.
 - **UX pressure to weaken step-up:** every "ask less often" request is a policy change; the design keeps the knobs in grant restrictions (`require_fresh_user_verification_for`, `maxIdleSeconds`) rather than in ad-hoc bypasses.
 - **Alias window for CLI:** two spellings for the same operations invite drift; deprecation window must be short and documented.
 
