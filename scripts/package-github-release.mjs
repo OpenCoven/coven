@@ -155,7 +155,9 @@ async function main() {
         releaseTag: requiredOption(options, 'release-tag'),
         artifactsDir: requiredOption(options, 'artifacts-dir'),
         outputDir: requiredOption(options, 'output-dir'),
-        sourceDateEpoch: requiredOption(options, 'source-date-epoch')
+        sourceDateEpoch: requiredOption(options, 'source-date-epoch'),
+        gateReceiptPath: options.get('gate-receipt') ?? null,
+        tagObjectPath: options.get('tag-object') ?? null
       });
       return;
     }
@@ -165,6 +167,7 @@ async function main() {
         outputDir: requiredOption(options, 'output-dir'),
         expectedTagObjectSha: requiredOption(options, 'expected-tag-object-sha'),
         expectedHeadSha: requiredOption(options, 'expected-head-sha'),
+        includeReleaseEvidence: options.has('include-release-evidence'),
         releaseClient: createGhReleaseClient({
           repository: requiredOption(options, 'repository')
         })
@@ -176,6 +179,9 @@ async function main() {
   }
 }
 
+// Options that act as flags and take no value.
+const VALUELESS_OPTIONS = new Set(['include-release-evidence']);
+
 function parseOptions(args) {
   const options = new Map();
   for (let index = 0; index < args.length; index += 1) {
@@ -184,6 +190,10 @@ function parseOptions(args) {
       throw new Error(`Unexpected argument ${JSON.stringify(arg)}.`);
     }
     const key = arg.slice(2);
+    if (VALUELESS_OPTIONS.has(key)) {
+      options.set(key, 'true');
+      continue;
+    }
     const value = args[index + 1];
     if (!value || value.startsWith('--')) {
       throw new Error(`Missing value for --${key}.`);
@@ -209,11 +219,12 @@ function requireRepository(repository) {
   return repository;
 }
 
-export function canonicalReleaseAssetNames(releaseTag) {
+export function canonicalReleaseAssetNames(releaseTag, { includeReleaseEvidence = false } = {}) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   return [
     ...Object.values(PACKAGE_DEFINITIONS).map((definition) => definition.assetName(npmVersion)),
-    CHECKSUMS_NAME
+    CHECKSUMS_NAME,
+    ...(includeReleaseEvidence ? [releaseEvidenceAssetName(npmVersion)] : [])
   ];
 }
 
@@ -929,7 +940,98 @@ function assertReleasePackagesResolvedInLockfile({ auditDir, npmVersion }) {
   return entries;
 }
 
-export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sourceDateEpoch }) {
+const GATE_RECEIPT_SCHEMA = 'coven.release-commit-gate-receipt/v1';
+const RELEASE_EVIDENCE_SCHEMA = 'coven.release-evidence/v1';
+
+function releaseEvidenceAssetName(npmVersion) {
+  return `coven-v${npmVersion}-release-evidence.json`;
+}
+
+// Bundles the verified annotated tag object and the exact-commit acceptance
+// receipt into one deterministic JSON document. The release record can then
+// prove, from the release itself, which tag object and which required-check
+// evidence authorized it.
+export function buildReleaseEvidenceBundle({ releaseTag, gateReceipt, tagObject }) {
+  const { npmVersion } = parseReleaseTag(releaseTag);
+  if (!gateReceipt || typeof gateReceipt !== 'object' || Array.isArray(gateReceipt)) {
+    throw new Error('Refusing GitHub release: gate receipt is required to build the release evidence bundle.');
+  }
+  if (gateReceipt.schema !== GATE_RECEIPT_SCHEMA) {
+    throw new Error(
+      `Refusing GitHub release: gate receipt schema must be ${GATE_RECEIPT_SCHEMA}, got ${JSON.stringify(gateReceipt.schema ?? null)}.`
+    );
+  }
+  if (!isSha(gateReceipt.commit_sha)) {
+    throw new Error('Refusing GitHub release: gate receipt commit_sha must be a 40-hex git SHA.');
+  }
+  if (!isSha(gateReceipt.tag_object_sha)) {
+    throw new Error('Refusing GitHub release: gate receipt tag_object_sha must be a 40-hex git SHA.');
+  }
+  if (!tagObject || typeof tagObject !== 'object' || Array.isArray(tagObject)) {
+    throw new Error('Refusing GitHub release: verified tag object is required to build the release evidence bundle.');
+  }
+  if (tagObject.tag !== releaseTag) {
+    throw new Error(
+      `Refusing GitHub release: tag object must name tag ${releaseTag}, got ${JSON.stringify(tagObject.tag ?? null)}.`
+    );
+  }
+  if (tagObject.object?.type !== 'commit' || tagObject.object?.sha !== gateReceipt.commit_sha) {
+    throw new Error(
+      `Refusing GitHub release: tag object must target the accepted commit ${gateReceipt.commit_sha}, got ${JSON.stringify(tagObject.object ?? null)}.`
+    );
+  }
+  if (tagObject.sha !== undefined && tagObject.sha !== gateReceipt.tag_object_sha) {
+    throw new Error(
+      `Refusing GitHub release: tag object sha ${JSON.stringify(tagObject.sha)} does not match the accepted tag object ${gateReceipt.tag_object_sha}.`
+    );
+  }
+  return {
+    schema: RELEASE_EVIDENCE_SCHEMA,
+    release_tag: releaseTag,
+    npm_version: npmVersion,
+    commit_sha: gateReceipt.commit_sha,
+    tag_object_sha: gateReceipt.tag_object_sha,
+    gate_receipt: gateReceipt,
+    tag_object: tagObject
+  };
+}
+
+function writeReleaseEvidenceAsset({ releaseTag, outputDir, gateReceiptPath, tagObjectPath }) {
+  if (gateReceiptPath === null && tagObjectPath === null) {
+    return null;
+  }
+  if (gateReceiptPath === null || tagObjectPath === null) {
+    throw new Error(
+      'Refusing GitHub release: --gate-receipt and --tag-object must be provided together to persist the release evidence bundle.'
+    );
+  }
+  let gateReceipt;
+  let tagObject;
+  try {
+    gateReceipt = JSON.parse(readFileSync(path.resolve(String(gateReceiptPath)), 'utf8'));
+  } catch (error) {
+    throw new Error(`Refusing GitHub release: gate receipt is unreadable or not JSON (${error.message}).`);
+  }
+  try {
+    tagObject = JSON.parse(readFileSync(path.resolve(String(tagObjectPath)), 'utf8'));
+  } catch (error) {
+    throw new Error(`Refusing GitHub release: verified tag object is unreadable or not JSON (${error.message}).`);
+  }
+  const bundle = buildReleaseEvidenceBundle({ releaseTag, gateReceipt, tagObject });
+  const assetName = releaseEvidenceAssetName(bundle.npm_version);
+  const body = `${JSON.stringify(bundle, null, 2)}\n`;
+  writeFileSync(path.join(outputDir, assetName), body);
+  return { assetName, sha256: sha256Hex(Buffer.from(body, 'utf8')) };
+}
+
+export function packageGitHubRelease({
+  releaseTag,
+  artifactsDir,
+  outputDir,
+  sourceDateEpoch,
+  gateReceiptPath = null,
+  tagObjectPath = null
+}) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   const normalizedArtifactsDir = path.resolve(String(artifactsDir));
   const normalizedOutputDir = path.resolve(String(outputDir));
@@ -948,6 +1050,19 @@ export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sour
     checksumRecords.push({ assetName, sha256: sha256Hex(archiveBytes) });
   }
 
+  // Persist the tag object and the complete acceptance evidence as a
+  // checksummed release asset: the release itself carries what it was
+  // authorized by, not just the workflow log.
+  const evidenceAsset = writeReleaseEvidenceAsset({
+    releaseTag,
+    outputDir: normalizedOutputDir,
+    gateReceiptPath,
+    tagObjectPath
+  });
+  if (evidenceAsset) {
+    checksumRecords.push({ assetName: evidenceAsset.assetName, sha256: evidenceAsset.sha256 });
+  }
+
   const checksumText = renderChecksumManifest(checksumRecords);
   assertChecksumManifest(
     checksumText,
@@ -957,7 +1072,8 @@ export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sour
 
   return {
     assetNames: [...checksumRecords.map((record) => record.assetName), CHECKSUMS_NAME].sort(),
-    checksums: checksumRecords
+    checksums: checksumRecords,
+    evidenceAssetName: evidenceAsset?.assetName ?? null
   };
 }
 
@@ -1200,9 +1316,10 @@ export async function syncGitHubRelease({
   outputDir,
   expectedTagObjectSha,
   expectedHeadSha,
+  includeReleaseEvidence = false,
   releaseClient = createGhReleaseClient()
 }) {
-  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag).sort();
+  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag, { includeReleaseEvidence }).sort();
   const normalizedOutputDir = path.resolve(String(outputDir));
   const presentAssetNames = readdirSync(normalizedOutputDir).sort();
   if (presentAssetNames.join('\n') !== expectedAssetNames.join('\n')) {

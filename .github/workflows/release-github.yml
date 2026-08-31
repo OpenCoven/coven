@@ -178,6 +178,16 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --source-run-id "$SOURCE_RUN_ID" \
             --source-run-attempt "$SOURCE_RUN_ATTEMPT"
+      # Persist what authorized this release: the GitHub-verified annotated tag
+      # object, bundled with the exact-commit gate receipt into a checksummed
+      # release asset (coven-v<version>-release-evidence.json).
+      - name: Fetch verified tag object payload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA" > verified-release-tag-object.json
       - name: Package deterministic GitHub release assets
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -188,7 +198,9 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --artifacts-dir github-release-source \
             --output-dir github-release-assets \
-            --source-date-epoch "$SOURCE_DATE_EPOCH"
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --gate-receipt release-commit-gate-receipt.json \
+            --tag-object verified-release-tag-object.json
       - name: Upload packaged release assets for the publication job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
         with:
@@ -274,4 +286,5 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --output-dir github-release-assets \
             --expected-tag-object-sha "$TAG_OBJECT_SHA" \
-            --expected-head-sha "$HEAD_SHA"
+            --expected-head-sha "$HEAD_SHA" \
+            --include-release-evidence
