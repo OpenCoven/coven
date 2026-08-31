@@ -23,7 +23,11 @@ first reserves the run and occurrence with an idempotent token and content
 digest; a crash or post-rename durability failure remains visibly ambiguous
 and is never replayed automatically. Output chunks are streamed into a synced
 sibling spool while hashing, so aggregate output size does not become an
-in-memory buffer. Unix commits sync the file and parent directory; Windows
+in-memory buffer. The reservation digest binds the target and final byte
+stream, independent of how event-writer batches split those bytes. Spool
+identity and phase are persisted before creation; a restarted daemon removes
+only the exact recorded `.coven-delivery-*` sibling and never scans or deletes
+unrelated files. Unix commits sync the file and parent directory; Windows
 uses a write-through atomic replacement. At a run deadline Coven records one
 termination request and asks the runtime to kill the session, but keeps the
 overlap fence until terminal session evidence arrives; an unproven kill stays

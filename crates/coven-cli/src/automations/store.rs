@@ -287,6 +287,32 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
         ),
         (
             "automation_occurrences",
+            "delivery_spool_path",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_spool_path TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_spool_state",
+            "ALTER TABLE automation_occurrences
+             ADD COLUMN delivery_spool_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_spool_owner",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_spool_owner TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_spool_digest",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_spool_digest TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_spool_bytes",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_spool_bytes INTEGER",
+        ),
+        (
+            "automation_occurrences",
             "legacy_reconciled_at",
             "ALTER TABLE automation_occurrences ADD COLUMN legacy_reconciled_at TEXT",
         ),
@@ -351,6 +377,32 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "automation_runs",
             "delivery_error",
             "ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_spool_path",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_spool_path TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_spool_state",
+            "ALTER TABLE automation_runs
+             ADD COLUMN delivery_spool_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_runs",
+            "delivery_spool_owner",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_spool_owner TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_spool_digest",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_spool_digest TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_spool_bytes",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_spool_bytes INTEGER",
         ),
         (
             "automation_runs",
@@ -811,12 +863,16 @@ mod tests {
             ("automation_occurrences", "delivery_state"),
             ("automation_occurrences", "legacy_reconciled_at"),
             ("automation_occurrences", "termination_state"),
+            ("automation_occurrences", "delivery_spool_state"),
+            ("automation_occurrences", "delivery_spool_owner"),
             ("automation_runs", "definition_json"),
             ("automation_runs", "deadline_at"),
             ("automation_runs", "output_target"),
             ("automation_runs", "delivery_state"),
             ("automation_runs", "legacy_reconciled_at"),
             ("automation_runs", "termination_state"),
+            ("automation_runs", "delivery_spool_state"),
+            ("automation_runs", "delivery_spool_owner"),
         ] {
             let found: i64 = conn
                 .query_row(

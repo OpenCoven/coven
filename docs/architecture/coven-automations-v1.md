@@ -49,9 +49,13 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     expiry reserves one kill request but does not release overlap until the
     session store records a terminal transition; retained runtime ownership
     and unproven kills remain live/ambiguous. Delivery hashes ordered chunks
-    while streaming them to a bounded-memory sibling spool, then uses
-    file+directory sync on Unix or write-through atomic replacement on
-    Windows before recording `committed`.
+    while streaming them to a bounded-memory sibling spool. The digest frames
+    target length, target, total payload length, and final spool bytes, so
+    event chunk boundaries cannot change identity. Spool path/owner/phase are
+    durable before file creation and startup reconciliation removes only the
+    exact validated recorded sibling. Commit then uses file+directory sync on
+    Unix or write-through atomic replacement on Windows before recording
+    `committed`.
 
 ## Contract profile and versioning
 

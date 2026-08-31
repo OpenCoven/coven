@@ -9,7 +9,11 @@
 //! commit fails the run visibly instead of reporting success.
 
 use std::path::{Path, PathBuf};
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+    sync::LazyLock,
+};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
@@ -143,11 +147,17 @@ pub fn capture_bounded_log(conn: &Connection, session_id: &str) -> Option<String
 /// Streams every ordered output chunk into a synced sibling spool while
 /// hashing incrementally. Memory use is bounded by one stored event payload,
 /// regardless of the session's aggregate output size.
+#[cfg(test)]
 fn prepare_delivery_spool(
     conn: &Connection,
     session_id: &str,
     target: &str,
 ) -> Result<Option<DeliveryPlan>, String> {
+    let spool_path = new_delivery_spool_path(target)?;
+    stream_session_output_to_spool(conn, session_id, target, spool_path)
+}
+
+fn new_delivery_spool_path(target: &str) -> Result<PathBuf, String> {
     let target_path = Path::new(target);
     let parent = output_parent(target_path);
     std::fs::create_dir_all(&parent).map_err(|error| {
@@ -160,10 +170,18 @@ fn prepare_delivery_spool(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "output commit failed: output target has no file name".to_string())?;
-    let spool_path = parent.join(format!(
+    Ok(parent.join(format!(
         ".coven-delivery-{}-{file_name}",
         uuid::Uuid::new_v4()
-    ));
+    )))
+}
+
+fn stream_session_output_to_spool(
+    conn: &Connection,
+    session_id: &str,
+    target: &str,
+    spool_path: PathBuf,
+) -> Result<Option<DeliveryPlan>, String> {
     let mut spool = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -184,9 +202,6 @@ fn prepare_delivery_spool(
     let rows = statement
         .query_map(params![session_id], |row| row.get::<_, String>(0))
         .map_err(|error| format!("failed to read output stream: {error}"))?;
-    let mut digest = Sha256::new();
-    digest.update((target.len() as u64).to_be_bytes());
-    digest.update(target.as_bytes());
     let mut byte_len = 0_u64;
     let result = (|| -> Result<(), String> {
         for row in rows {
@@ -205,8 +220,6 @@ fn prepare_delivery_spool(
                         spool_path.display()
                     )
                 })?;
-                digest.update((bytes.len() as u64).to_be_bytes());
-                digest.update(bytes);
                 byte_len = byte_len.saturating_add(bytes.len() as u64);
             }
         }
@@ -227,14 +240,385 @@ fn prepare_delivery_spool(
         let _ = std::fs::remove_file(&spool_path);
         return Ok(None);
     }
-    let hash = digest.finalize();
-    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    let mut digest = Sha256::new();
+    digest.update((target.len() as u64).to_be_bytes());
+    digest.update(target.as_bytes());
+    digest.update(byte_len.to_be_bytes());
+    let digest_result = (|| -> Result<String, String> {
+        let mut spool_reader = std::fs::File::open(&spool_path).map_err(|error| {
+            format!(
+                "output commit failed: cannot reopen {} for hashing: {error}",
+                spool_path.display()
+            )
+        })?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = spool_reader.read(&mut buffer).map_err(|error| {
+                format!(
+                    "output commit failed: cannot hash {}: {error}",
+                    spool_path.display()
+                )
+            })?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        let hash = digest.finalize();
+        let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+        Ok(format!("sha256:{hex}"))
+    })();
+    let digest = match digest_result {
+        Ok(digest) => digest,
+        Err(error) => {
+            let _ = std::fs::remove_file(&spool_path);
+            return Err(error);
+        }
+    };
     Ok(Some(DeliveryPlan {
         target: target.to_string(),
         spool_path,
-        digest: format!("sha256:{hex}"),
+        digest,
         byte_len,
     }))
+}
+
+struct SpoolLedgerTarget<'a> {
+    run_id: &'a str,
+    occurrence_id: &'a str,
+    target: &'a str,
+}
+
+static DELIVERY_PROCESS_ID: LazyLock<String> =
+    LazyLock::new(|| format!("delivery-process-{}", uuid::Uuid::new_v4()));
+
+fn delivery_process_id() -> &'static str {
+    DELIVERY_PROCESS_ID.as_str()
+}
+
+fn prepare_tracked_delivery_spool(
+    conn: &Connection,
+    ledger: SpoolLedgerTarget<'_>,
+    session_id: &str,
+) -> Result<Option<DeliveryPlan>, String> {
+    let spool_path = new_delivery_spool_path(ledger.target)?;
+    begin_spool_preparation(conn, &ledger, &spool_path)?;
+    let prepared =
+        stream_session_output_to_spool(conn, session_id, ledger.target, spool_path.clone());
+    match prepared {
+        Ok(Some(plan)) => {
+            if let Err(error) = mark_spool_synced(conn, &ledger, &plan) {
+                let spool_path = plan.spool_path.clone();
+                drop(plan);
+                if remove_recorded_spool(&spool_path, ledger.target).is_ok() {
+                    clear_spool_ledger(conn, &ledger, &spool_path)?;
+                }
+                return Err(error);
+            }
+            Ok(Some(plan))
+        }
+        Ok(None) => {
+            clear_spool_ledger(conn, &ledger, &spool_path)?;
+            Ok(None)
+        }
+        Err(error) => {
+            if remove_recorded_spool(&spool_path, ledger.target).is_ok() {
+                clear_spool_ledger(conn, &ledger, &spool_path)?;
+            }
+            Err(error)
+        }
+    }
+}
+
+fn begin_spool_preparation(
+    conn: &Connection,
+    ledger: &SpoolLedgerTarget<'_>,
+    spool_path: &Path,
+) -> Result<(), String> {
+    let spool_path = spool_path.to_string_lossy();
+    let owner = delivery_process_id();
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin spool preparation: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+                 SET delivery_spool_path = ?2,
+                     delivery_spool_state = 'preparing',
+                     delivery_spool_owner = ?3,
+                     delivery_spool_digest = NULL,
+                     delivery_spool_bytes = NULL
+                 WHERE id = ?1
+                   AND status = 'running'
+                   AND delivery_state = 'none'
+                   AND delivery_spool_state = 'none'",
+            params![ledger.run_id, spool_path, owner],
+        )
+        .map_err(|error| format!("failed to record run spool preparation: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+                 SET delivery_spool_path = ?2,
+                     delivery_spool_state = 'preparing',
+                     delivery_spool_owner = ?3,
+                     delivery_spool_digest = NULL,
+                     delivery_spool_bytes = NULL
+                 WHERE id = ?1
+                   AND state IN ('claimed', 'running')
+                   AND delivery_state = 'none'
+                   AND delivery_spool_state = 'none'",
+            params![ledger.occurrence_id, spool_path, owner],
+        )
+        .map_err(|error| format!("failed to record occurrence spool preparation: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("spool preparation CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit spool preparation: {error}"))
+}
+
+fn mark_spool_synced(
+    conn: &Connection,
+    ledger: &SpoolLedgerTarget<'_>,
+    plan: &DeliveryPlan,
+) -> Result<(), String> {
+    let spool_path = plan.spool_path.to_string_lossy();
+    let owner = delivery_process_id();
+    let spool_bytes = i64::try_from(plan.byte_len)
+        .map_err(|_| "delivery spool exceeds SQLite integer range".to_string())?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin synced spool update: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+                 SET delivery_spool_state = 'spooled',
+                     delivery_spool_digest = ?3,
+                     delivery_spool_bytes = ?4
+                 WHERE id = ?1
+                   AND delivery_spool_state = 'preparing'
+                   AND delivery_spool_path = ?2
+                   AND delivery_spool_owner = ?5",
+            params![ledger.run_id, spool_path, plan.digest, spool_bytes, owner],
+        )
+        .map_err(|error| format!("failed to record synced run spool: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+                 SET delivery_spool_state = 'spooled',
+                     delivery_spool_digest = ?3,
+                     delivery_spool_bytes = ?4
+                 WHERE id = ?1
+                   AND delivery_spool_state = 'preparing'
+                   AND delivery_spool_path = ?2
+                   AND delivery_spool_owner = ?5",
+            params![
+                ledger.occurrence_id,
+                spool_path,
+                plan.digest,
+                spool_bytes,
+                owner
+            ],
+        )
+        .map_err(|error| format!("failed to record synced occurrence spool: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("synced spool update CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit synced spool update: {error}"))
+}
+
+fn clear_spool_ledger(
+    conn: &Connection,
+    ledger: &SpoolLedgerTarget<'_>,
+    spool_path: &Path,
+) -> Result<(), String> {
+    let spool_path = spool_path.to_string_lossy();
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin spool cleanup: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+                 SET delivery_spool_path = NULL,
+                     delivery_spool_state = 'none',
+                     delivery_spool_owner = NULL,
+                     delivery_spool_digest = NULL,
+                     delivery_spool_bytes = NULL
+                 WHERE id = ?1 AND delivery_spool_path = ?2",
+            params![ledger.run_id, spool_path],
+        )
+        .map_err(|error| format!("failed to clear run spool ledger: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+                 SET delivery_spool_path = NULL,
+                     delivery_spool_state = 'none',
+                     delivery_spool_owner = NULL,
+                     delivery_spool_digest = NULL,
+                     delivery_spool_bytes = NULL
+                 WHERE id = ?1 AND delivery_spool_path = ?2",
+            params![ledger.occurrence_id, spool_path],
+        )
+        .map_err(|error| format!("failed to clear occurrence spool ledger: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("spool cleanup CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit spool cleanup: {error}"))
+}
+
+fn remove_recorded_spool(spool_path: &Path, target: &str) -> Result<(), String> {
+    let file_name = spool_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "recorded delivery spool has no UTF-8 file name".to_string())?;
+    let suffix = file_name
+        .strip_prefix(".coven-delivery-")
+        .ok_or_else(|| "recorded delivery spool has an invalid name".to_string())?;
+    let suffix_bytes = suffix.as_bytes();
+    let uuid = suffix_bytes
+        .get(..36)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok());
+    if suffix_bytes.get(36) != Some(&b'-')
+        || suffix_bytes.get(37..).is_none_or(|bytes| bytes.is_empty())
+        || uuid.is_none_or(|uuid| uuid::Uuid::parse_str(uuid).is_err())
+        || spool_path.parent() != Some(output_parent(Path::new(target)).as_path())
+    {
+        return Err("recorded delivery spool is outside its target directory".to_string());
+    }
+    let metadata = match std::fs::symlink_metadata(spool_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect recorded delivery spool {}: {error}",
+                spool_path.display()
+            ));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "refusing to remove non-regular delivery spool {}",
+            spool_path.display()
+        ));
+    }
+    std::fs::remove_file(spool_path).map_err(|error| {
+        format!(
+            "failed to remove recorded delivery spool {}: {error}",
+            spool_path.display()
+        )
+    })
+}
+
+struct OrphanedSpool {
+    run_id: String,
+    occurrence_id: String,
+    target: String,
+    spool_path: String,
+    spool_state: String,
+}
+
+fn reconcile_orphaned_delivery_spools_for_owner(
+    conn: &Connection,
+    current_owner: &str,
+) -> Result<usize, String> {
+    let rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT r.id, o.id, r.output_target,
+                            r.delivery_spool_path, r.delivery_spool_state, r.delivery_spool_owner,
+                            o.delivery_spool_path, o.delivery_spool_state, o.delivery_spool_owner
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     WHERE r.delivery_spool_state != 'none'
+                        OR o.delivery_spool_state != 'none'
+                     ORDER BY r.id",
+            )
+            .map_err(|error| format!("failed to prepare orphan spool reconciliation: {error}"))?;
+        let mapped = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })
+            .map_err(|error| format!("failed to read orphan spool reconciliation: {error}"))?;
+        mapped
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to decode orphan spool reconciliation: {error}"))?
+    };
+    let mut removed = 0;
+    for (
+        run_id,
+        occurrence_id,
+        target,
+        run_path,
+        run_state,
+        run_owner,
+        occurrence_path,
+        occurrence_state,
+        occurrence_owner,
+    ) in rows
+    {
+        let owner = run_owner
+            .filter(|owner| !owner.is_empty())
+            .ok_or_else(|| format!("run {run_id} spool has no owner"))?;
+        if owner == current_owner {
+            continue;
+        }
+        if occurrence_owner.as_deref() != Some(owner.as_str())
+            || occurrence_path != run_path
+            || occurrence_state != run_state
+        {
+            return Err(format!(
+                "run {run_id} and occurrence {occurrence_id} have inconsistent spool evidence"
+            ));
+        }
+        let target = target.ok_or_else(|| format!("run {run_id} spool has no output target"))?;
+        let spool_path = run_path
+            .ok_or_else(|| format!("run {run_id} spool state `{run_state}` has no path"))?;
+        let spool = OrphanedSpool {
+            run_id,
+            occurrence_id,
+            target,
+            spool_path,
+            spool_state: run_state,
+        };
+        if !matches!(spool.spool_state.as_str(), "preparing" | "spooled") {
+            return Err(format!(
+                "run {} has invalid spool state `{}`",
+                spool.run_id, spool.spool_state
+            ));
+        }
+        let spool_path = PathBuf::from(&spool.spool_path);
+        remove_recorded_spool(&spool_path, &spool.target)?;
+        clear_spool_ledger(
+            conn,
+            &SpoolLedgerTarget {
+                run_id: &spool.run_id,
+                occurrence_id: &spool.occurrence_id,
+                target: &spool.target,
+            },
+            &spool_path,
+        )?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+pub(crate) fn reconcile_orphaned_delivery_spools(conn: &Connection) -> Result<usize, String> {
+    reconcile_orphaned_delivery_spools_for_owner(conn, delivery_process_id())
 }
 
 /// Atomically commits `payload` to `target`: the bytes land in a temp file in
@@ -458,6 +842,7 @@ struct Settlement {
     reason: Option<String>,
     delivery: Option<DeliveryPlan>,
     delivery_failure: bool,
+    delivery_required: bool,
 }
 
 struct DeliveryPlan {
@@ -534,13 +919,27 @@ enum SessionObservation {
     Terminal(Settlement),
 }
 
+struct SessionSettlementTarget<'a> {
+    run_id: &'a str,
+    occurrence_id: Option<&'a str>,
+    session_id: &'a str,
+    output_target: Option<&'a str>,
+    delivery_state: &'a str,
+}
+
 fn session_settlement(
     conn: &Connection,
-    session_id: &str,
-    output_target: Option<&str>,
+    target: SessionSettlementTarget<'_>,
     deadline: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<SessionObservation, String> {
+    let SessionSettlementTarget {
+        run_id,
+        occurrence_id,
+        session_id,
+        output_target,
+        delivery_state,
+    } = target;
     let session = crate::store::get_session(conn, session_id)
         .map_err(|error| format!("failed to read session {session_id}: {error:#}"))?;
     let Some(session) = session else {
@@ -589,28 +988,46 @@ fn session_settlement(
             reason: Some(reason),
             delivery: None,
             delivery_failure: false,
+            delivery_required: false,
         }));
     }
 
     // The run succeeded at the runtime. Delivery is Coven's job: commit the
     // final assistant payload to the configured target, and a failed commit
     // fails the run visibly (never reported as success).
-    let (status, reason, output_commit, delivery, delivery_failure) = match output_target {
-        None => ("succeeded", None, None, None, false),
-        Some(target) => match prepare_delivery_spool(conn, session_id, target) {
-            Err(error) => ("failed", Some(error), None, None, true),
-            Ok(None) => (
-                "failed",
-                Some(format!(
+    let (status, reason, output_commit, delivery, delivery_failure, delivery_required) =
+        match output_target {
+            None => ("succeeded", None, None, None, false, false),
+            Some(_target) if delivery_state == "pending" => {
+                ("succeeded", None, None, None, false, true)
+            }
+            Some(target) => {
+                let occurrence_id = occurrence_id
+                    .ok_or_else(|| format!("run {run_id} has no occurrence for delivery"))?;
+                match prepare_tracked_delivery_spool(
+                    conn,
+                    SpoolLedgerTarget {
+                        run_id,
+                        occurrence_id,
+                        target,
+                    },
+                    session_id,
+                ) {
+                    Err(error) => ("failed", Some(error), None, None, true, false),
+                    Ok(None) => (
+                        "failed",
+                        Some(format!(
                     "output commit failed: no assistant output captured for session {session_id}"
                 )),
-                None,
-                None,
-                true,
-            ),
-            Ok(Some(plan)) => ("succeeded", None, None, Some(plan), false),
-        },
-    };
+                        None,
+                        None,
+                        true,
+                        false,
+                    ),
+                    Ok(Some(plan)) => ("succeeded", None, None, Some(plan), false, true),
+                }
+            }
+        };
     Ok(SessionObservation::Terminal(Settlement {
         status,
         exit_code: session.exit_code.map(i64::from),
@@ -619,6 +1036,7 @@ fn session_settlement(
         reason,
         delivery,
         delivery_failure,
+        delivery_required,
     }))
 }
 
@@ -633,6 +1051,7 @@ fn timeout_settlement(exit_code: Option<i64>, log: Option<String>, session_id: &
         )),
         delivery: None,
         delivery_failure: false,
+        delivery_required: false,
     }
 }
 
@@ -778,6 +1197,8 @@ fn reserve_delivery(
         token: format!("delivery-{}", uuid::Uuid::new_v4()),
         digest: plan.digest.clone(),
     };
+    let spool_path = plan.spool_path.to_string_lossy();
+    let spool_owner = delivery_process_id();
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin delivery reservation: {error}"))?;
@@ -790,8 +1211,18 @@ fn reserve_delivery(
                  delivery_error = NULL
              WHERE id = ?1
                AND status = 'running'
-               AND delivery_state = 'none'",
-            params![target.run_id, reservation.token, reservation.digest],
+               AND delivery_state = 'none'
+               AND delivery_spool_state = 'spooled'
+               AND delivery_spool_path = ?4
+               AND delivery_spool_digest = ?3
+               AND delivery_spool_owner = ?5",
+            params![
+                target.run_id,
+                reservation.token,
+                reservation.digest,
+                spool_path,
+                spool_owner
+            ],
         )
         .map_err(|error| format!("failed to reserve run delivery: {error}"))?;
     if run_changed != 1 {
@@ -809,11 +1240,21 @@ fn reserve_delivery(
                  delivery_error = NULL
              WHERE id = ?1
                AND delivery_state = 'none'
+               AND delivery_spool_state = 'spooled'
+               AND delivery_spool_path = ?4
+               AND delivery_spool_digest = ?3
+               AND delivery_spool_owner = ?5
                AND (
                    state IN ('claimed', 'running')
                    OR (state = 'failed' AND failure_reason = 'lease expired')
                )",
-            params![occurrence_id, reservation.token, reservation.digest],
+            params![
+                occurrence_id,
+                reservation.token,
+                reservation.digest,
+                spool_path,
+                spool_owner
+            ],
         )
         .map_err(|error| format!("failed to reserve occurrence delivery: {error}"))?;
     if occurrence_changed != 1 {
@@ -861,7 +1302,12 @@ fn finalize_reserved_delivery(
         .execute(
             "UPDATE automation_runs
              SET delivery_state = ?4,
-                 delivery_error = ?5
+                 delivery_error = ?5,
+                 delivery_spool_path = NULL,
+                 delivery_spool_state = 'none',
+                 delivery_spool_owner = NULL,
+                 delivery_spool_digest = NULL,
+                 delivery_spool_bytes = NULL
              WHERE id = ?1
                AND status = 'running'
                AND delivery_state = 'pending'
@@ -891,6 +1337,11 @@ fn finalize_reserved_delivery(
                  lease_expires_at = NULL,
                  delivery_state = ?6,
                  delivery_error = ?5,
+                 delivery_spool_path = NULL,
+                 delivery_spool_state = 'none',
+                 delivery_spool_owner = NULL,
+                 delivery_spool_digest = NULL,
+                 delivery_spool_bytes = NULL,
                  updated_at = ?7
              WHERE id = ?1
                AND delivery_state = 'pending'
@@ -951,7 +1402,29 @@ fn settle_reserved_delivery(
     if plan.byte_len == 0 {
         return Err("prepared delivery spool is empty".to_string());
     }
-    let reservation = reserve_delivery(conn, &target, &plan)?;
+    let reservation = match reserve_delivery(conn, &target, &plan) {
+        Ok(reservation) => reservation,
+        Err(error) => {
+            let occurrence_id = target
+                .occurrence_id
+                .ok_or_else(|| format!("run {} has no occurrence for delivery", target.run_id))?;
+            let spool_path = plan.spool_path.clone();
+            let output_target = plan.target.clone();
+            drop(plan);
+            if remove_recorded_spool(&spool_path, &output_target).is_ok() {
+                clear_spool_ledger(
+                    conn,
+                    &SpoolLedgerTarget {
+                        run_id: target.run_id,
+                        occurrence_id,
+                        target: &output_target,
+                    },
+                    &spool_path,
+                )?;
+            }
+            return Err(error);
+        }
+    };
     let terminal = match commit_delivery_spool(&plan) {
         Ok(()) => DeliveryTerminalState::Committed,
         Err(failure) if failure.stage == DeliveryIoStage::BeforeRename => {
@@ -1175,6 +1648,7 @@ pub fn settle_finished_runs_with_runtime(
     runtime: &dyn crate::api::SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<ReconcileReport, String> {
+    reconcile_orphaned_delivery_spools(conn)?;
     let mut report = ReconcileReport::default();
 
     for row in running_ledger_rows(conn)? {
@@ -1199,9 +1673,18 @@ pub fn settle_finished_runs_with_runtime(
             .map(|instant| instant.with_timezone(&Utc))
             .map_err(|error| format!("running run {run_id} has invalid deadline: {error}"))?;
         let observation = match session_id.as_deref() {
-            Some(session_id) => {
-                session_settlement(conn, session_id, output_target.as_deref(), deadline, now)?
-            }
+            Some(session_id) => session_settlement(
+                conn,
+                SessionSettlementTarget {
+                    run_id: &run_id,
+                    occurrence_id: occurrence_id.as_deref(),
+                    session_id,
+                    output_target: output_target.as_deref(),
+                    delivery_state: &delivery_state,
+                },
+                deadline,
+                now,
+            )?,
             None if now >= deadline => SessionObservation::DeadlineUnresolved,
             None => SessionObservation::Pending,
         };
@@ -1224,6 +1707,7 @@ pub fn settle_finished_runs_with_runtime(
                     ),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_required: false,
                 })
             }
             SessionObservation::DeadlineUnresolved
@@ -1237,6 +1721,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some("occurrence settled without a run result".to_string()),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_required: false,
                 })
             }
             SessionObservation::DeadlineUnresolved => {
@@ -1274,6 +1759,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some(reason),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_required: false,
                 });
             } else if occurrence_state.as_deref() == Some("succeeded") {
                 // Defensive: an occurrence cannot legitimately settle success
@@ -1287,6 +1773,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some("occurrence settled without a run result".to_string()),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_required: false,
                 });
             }
         }
@@ -1305,29 +1792,27 @@ pub fn settle_finished_runs_with_runtime(
         };
         let (status, reason) = if settlement.delivery_failure {
             settle_delivery_preparation_failure(conn, target, settlement, now)?
+        } else if settlement.delivery_required && delivery_state == "pending" {
+            let delivery_reservation_id = delivery_token
+                .ok_or_else(|| format!("pending delivery for run {run_id} has no token"))?;
+            let digest = delivery_digest
+                .ok_or_else(|| format!("pending delivery for run {run_id} has no digest"))?;
+            let output_target = output_target
+                .as_deref()
+                .ok_or_else(|| format!("pending delivery for run {run_id} has no target"))?;
+            settle_interrupted_delivery(
+                conn,
+                target,
+                settlement,
+                delivery_reservation_id,
+                digest,
+                output_target,
+                now,
+            )?
         } else {
             match settlement.delivery.take() {
                 Some(plan) if delivery_state == "none" => {
                     settle_reserved_delivery(conn, target, settlement, plan, now)?
-                }
-                Some(_) if delivery_state == "pending" => {
-                    let delivery_reservation_id = delivery_token
-                        .ok_or_else(|| format!("pending delivery for run {run_id} has no token"))?;
-                    let digest = delivery_digest.ok_or_else(|| {
-                        format!("pending delivery for run {run_id} has no digest")
-                    })?;
-                    let output_target = output_target.as_deref().ok_or_else(|| {
-                        format!("pending delivery for run {run_id} has no target")
-                    })?;
-                    settle_interrupted_delivery(
-                        conn,
-                        target,
-                        settlement,
-                        delivery_reservation_id,
-                        digest,
-                        output_target,
-                        now,
-                    )?
                 }
                 Some(_) => {
                     return Err(format!(
@@ -1631,6 +2116,185 @@ mod tests {
         );
         assert!(prepared.digest.starts_with("sha256:"));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn delivery_digest_is_invariant_to_event_chunk_boundaries_and_binds_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("same-target.txt");
+        let other_target = temp.path().join("other-target.txt");
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "chunked-a", "completed", Some(0));
+        session_record(&conn, "chunked-b", "completed", Some(0));
+        event(&conn, "chunked-a", "output", "a");
+        event(&conn, "chunked-a", "output", "bc");
+        event(&conn, "chunked-b", "output", "ab");
+        event(&conn, "chunked-b", "output", "c");
+
+        let first = prepare_delivery_spool(&conn, "chunked-a", target.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let second = prepare_delivery_spool(&conn, "chunked-b", target.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let rebound = prepare_delivery_spool(&conn, "chunked-b", other_target.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first.digest, second.digest);
+        assert_ne!(first.digest, rebound.digest);
+        assert_eq!(std::fs::read(&first.spool_path).unwrap(), b"abc");
+        assert_eq!(std::fs::read(&second.spool_path).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn restart_removes_preparing_spool_but_not_unrelated_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let unrelated = temp.path().join(".coven-delivery-unrelated");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        let spool_path = new_delivery_spool_path(target.to_str().unwrap()).unwrap();
+        let ledger = SpoolLedgerTarget {
+            run_id: "run-session-1",
+            occurrence_id: "occ-session-1",
+            target: target.to_str().unwrap(),
+        };
+        begin_spool_preparation(&conn, &ledger, &spool_path).unwrap();
+        let mut spool = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&spool_path)
+            .unwrap();
+        spool.write_all(b"crash point").unwrap();
+        spool.sync_all().unwrap();
+        drop(spool);
+
+        reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
+
+        assert!(!spool_path.exists());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep");
+        let states: (String, String) = conn
+            .query_row(
+                "SELECT o.delivery_spool_state, r.delivery_spool_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(states, ("none".to_string(), "none".to_string()));
+    }
+
+    #[test]
+    fn restart_removes_synced_spool_before_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let unrelated = temp.path().join("ordinary-file");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "spooled output");
+        let plan = prepare_tracked_delivery_spool(
+            &conn,
+            SpoolLedgerTarget {
+                run_id: "run-session-1",
+                occurrence_id: "occ-session-1",
+                target: target.to_str().unwrap(),
+            },
+            "session-1",
+        )
+        .unwrap()
+        .unwrap();
+        let spool_path = plan.spool_path.clone();
+        std::mem::forget(plan);
+
+        reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
+
+        assert!(!spool_path.exists());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep");
+        assert!(!target.exists());
+        let states: (String, String) = conn
+            .query_row(
+                "SELECT o.delivery_spool_state, r.delivery_spool_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(states, ("none".to_string(), "none".to_string()));
+    }
+
+    #[test]
+    fn restart_removes_reserved_spool_before_rename_and_marks_delivery_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let unrelated = temp.path().join(".coven-delivery-untracked");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "reserved output");
+        let plan = prepare_tracked_delivery_spool(
+            &conn,
+            SpoolLedgerTarget {
+                run_id: "run-session-1",
+                occurrence_id: "occ-session-1",
+                target: target.to_str().unwrap(),
+            },
+            "session-1",
+        )
+        .unwrap()
+        .unwrap();
+        reserve_delivery(
+            &conn,
+            &SettlementTarget {
+                run_id: "run-session-1",
+                occurrence_id: Some("occ-session-1"),
+                occurrence_state: Some("running"),
+                occurrence_failure: None,
+                session_id: Some("session-1".to_string()),
+            },
+            &plan,
+        )
+        .unwrap();
+        let spool_path = plan.spool_path.clone();
+        std::mem::forget(plan);
+
+        reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
+        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert!(!spool_path.exists());
+        assert!(!target.exists());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep");
+        assert_eq!(report.settled_failed, 1);
+        let states: (String, String, String, String) = conn
+            .query_row(
+                "SELECT o.state, o.delivery_state, r.status, r.delivery_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "failed".to_string(),
+                "ambiguous".to_string(),
+                "failed".to_string(),
+                "ambiguous".to_string()
+            )
+        );
     }
 
     #[test]

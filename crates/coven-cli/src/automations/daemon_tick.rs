@@ -74,6 +74,9 @@ pub fn start_automations_scheduler(
     coven_home: &Path,
     runtime: std::sync::Arc<dyn crate::api::SessionRuntime + Send + Sync>,
 ) -> Result<()> {
+    let conn = crate::store::open_store(&crate::api::store_path(coven_home))?;
+    super::delivery::reconcile_orphaned_delivery_spools(&conn).map_err(anyhow::Error::msg)?;
+    drop(conn);
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-automations-scheduler".into())

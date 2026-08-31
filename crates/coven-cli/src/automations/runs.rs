@@ -32,6 +32,11 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         delivery_token TEXT,
         delivery_digest TEXT,
         delivery_error TEXT,
+        delivery_spool_path TEXT,
+        delivery_spool_state TEXT NOT NULL DEFAULT 'none',
+        delivery_spool_owner TEXT,
+        delivery_spool_digest TEXT,
+        delivery_spool_bytes INTEGER,
         legacy_reconciled_at TEXT,
         termination_state TEXT NOT NULL DEFAULT 'none',
         termination_requested_at TEXT,
@@ -74,6 +79,11 @@ pub struct RunRecord {
     pub delivery_token: Option<String>,
     pub delivery_digest: Option<String>,
     pub delivery_error: Option<String>,
+    pub delivery_spool_path: Option<String>,
+    pub delivery_spool_state: String,
+    pub delivery_spool_owner: Option<String>,
+    pub delivery_spool_digest: Option<String>,
+    pub delivery_spool_bytes: Option<i64>,
     pub termination_state: String,
     pub termination_requested_at: Option<String>,
     pub termination_error: Option<String>,
@@ -216,7 +226,10 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
                     status, exit_code, log_json, output_commit, definition_revision,
                     definition_digest, output_target, deadline_at, delivery_state,
                     delivery_token, delivery_digest, delivery_error, termination_state,
-                    termination_requested_at, termination_error, started_at, finished_at
+                    termination_requested_at, termination_error, delivery_spool_path,
+                    delivery_spool_state, delivery_spool_owner, delivery_spool_digest,
+                    delivery_spool_bytes,
+                    started_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -247,8 +260,13 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
                 termination_state: row.get(18)?,
                 termination_requested_at: row.get(19)?,
                 termination_error: row.get(20)?,
-                started_at: row.get(21)?,
-                finished_at: row.get(22)?,
+                delivery_spool_path: row.get(21)?,
+                delivery_spool_state: row.get(22)?,
+                delivery_spool_owner: row.get(23)?,
+                delivery_spool_digest: row.get(24)?,
+                delivery_spool_bytes: row.get(25)?,
+                started_at: row.get(26)?,
+                finished_at: row.get(27)?,
             })
         })
         .context("failed to list runs")?;
