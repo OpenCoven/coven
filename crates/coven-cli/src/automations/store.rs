@@ -286,6 +286,11 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "ALTER TABLE automation_occurrences ADD COLUMN delivery_error TEXT",
         ),
         (
+            "automation_occurrences",
+            "legacy_reconciled_at",
+            "ALTER TABLE automation_occurrences ADD COLUMN legacy_reconciled_at TEXT",
+        ),
+        (
             "automation_runs",
             "definition_revision",
             "ALTER TABLE automation_runs ADD COLUMN definition_revision INTEGER",
@@ -330,6 +335,11 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "automation_runs",
             "delivery_error",
             "ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT",
+        ),
+        (
+            "automation_runs",
+            "legacy_reconciled_at",
+            "ALTER TABLE automation_runs ADD COLUMN legacy_reconciled_at TEXT",
         ),
     ] {
         ensure_column(conn, table, column, sql)?;
@@ -388,6 +398,8 @@ struct LegacyLinkedPair {
     run_id: String,
     occurrence_state: String,
     run_status: String,
+    occurrence_delivery_state: String,
+    run_delivery_state: String,
     output_commit: Option<String>,
 }
 
@@ -397,11 +409,18 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
     let pairs = {
         let mut statement = conn
             .prepare(
-                "SELECT o.id, r.id, o.state, r.status, r.output_commit
+                "SELECT o.id, r.id, o.state, r.status,
+                        o.delivery_state, r.delivery_state, r.output_commit
                  FROM automation_occurrences AS o
                  JOIN automation_runs AS r ON r.occurrence_id = o.id
-                 WHERE o.definition_json IS NULL
-                    OR r.definition_json IS NULL
+                 WHERE (
+                       o.definition_json IS NULL
+                       OR r.definition_json IS NULL
+                   )
+                   AND (
+                       o.legacy_reconciled_at IS NULL
+                       OR r.legacy_reconciled_at IS NULL
+                   )
                  ORDER BY o.id, r.id",
             )
             .context("failed to prepare legacy linked automation reconciliation")?;
@@ -412,7 +431,9 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
                     run_id: row.get(1)?,
                     occurrence_state: row.get(2)?,
                     run_status: row.get(3)?,
-                    output_commit: row.get(4)?,
+                    occurrence_delivery_state: row.get(4)?,
+                    run_delivery_state: row.get(5)?,
+                    output_commit: row.get(6)?,
                 })
             })
             .context("failed to read legacy linked automation reconciliation")?;
@@ -420,10 +441,20 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
     };
 
     for pair in pairs {
-        let (delivery_state, delivery_note) = if pair.output_commit.is_some() {
+        let prior_committed = pair.output_commit.is_some()
+            || pair.occurrence_delivery_state == "committed"
+            || pair.run_delivery_state == "committed";
+        let prior_ambiguous =
+            pair.occurrence_delivery_state == "ambiguous" || pair.run_delivery_state == "ambiguous";
+        let (delivery_state, delivery_note) = if prior_committed {
             (
                 "committed",
                 "committed delivery evidence preserved; terminal outcome remains ambiguous",
+            )
+        } else if prior_ambiguous {
+            (
+                "ambiguous",
+                "prior ambiguous delivery evidence preserved; delivery outcome remains ambiguous",
             )
         } else if pair.occurrence_state == "failed" && pair.run_status == "failed" {
             (
@@ -445,12 +476,18 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
             .execute(
                 "UPDATE automation_occurrences
                  SET state = 'failed',
-                     failure_reason = ?2,
+                     failure_reason = CASE
+                         WHEN failure_reason IS NULL OR trim(failure_reason) = '' THEN ?2
+                         ELSE failure_reason || '; ' || ?2
+                     END,
                      lease_owner = NULL,
                      lease_expires_at = NULL,
                      delivery_state = ?3,
-                     delivery_error = ?2,
-                     updated_at = ?4
+                     delivery_error = CASE
+                         WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?2
+                         ELSE delivery_error || '; ' || ?2
+                     END,
+                     legacy_reconciled_at = ?4
                  WHERE id = ?1",
                 params![pair.occurrence_id, reason, delivery_state, now],
             )
@@ -465,8 +502,12 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
                 "UPDATE automation_runs
                  SET status = 'failed',
                      delivery_state = ?3,
-                     delivery_error = ?2,
-                     finished_at = COALESCE(finished_at, ?4)
+                     delivery_error = CASE
+                         WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?2
+                         ELSE delivery_error || '; ' || ?2
+                     END,
+                     finished_at = COALESCE(finished_at, ?4),
+                     legacy_reconciled_at = ?4
                  WHERE id = ?1",
                 params![pair.run_id, reason, delivery_state, now],
             )
@@ -484,10 +525,14 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
                  lease_owner = NULL,
                  lease_expires_at = NULL,
                  delivery_state = 'failed',
-                 delivery_error = ?1,
-                 updated_at = ?2
+                 delivery_error = CASE
+                     WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?1
+                     ELSE delivery_error || '; ' || ?1
+                 END,
+                 legacy_reconciled_at = ?2
              WHERE state IN ('claimed', 'running')
                AND definition_json IS NULL
+               AND legacy_reconciled_at IS NULL
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs
                    WHERE automation_runs.occurrence_id = automation_occurrences.id
@@ -503,10 +548,15 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
                      WHEN status = 'failed' THEN 'failed'
                      ELSE 'ambiguous'
                  END,
-                 delivery_error = ?1,
-                 finished_at = ?2
+                 delivery_error = CASE
+                     WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?1
+                     ELSE delivery_error || '; ' || ?1
+                 END,
+                 finished_at = ?2,
+                 legacy_reconciled_at = ?2
              WHERE status = 'running'
                AND definition_json IS NULL
+               AND legacy_reconciled_at IS NULL
                AND (
                    occurrence_id IS NULL
                    OR NOT EXISTS (
@@ -719,10 +769,12 @@ mod tests {
             ("automation_occurrences", "definition_json"),
             ("automation_occurrences", "deadline_at"),
             ("automation_occurrences", "delivery_state"),
+            ("automation_occurrences", "legacy_reconciled_at"),
             ("automation_runs", "definition_json"),
             ("automation_runs", "deadline_at"),
             ("automation_runs", "output_target"),
             ("automation_runs", "delivery_state"),
+            ("automation_runs", "legacy_reconciled_at"),
         ] {
             let found: i64 = conn
                 .query_row(
@@ -958,5 +1010,97 @@ mod tests {
             )
             .unwrap();
         assert_eq!(states, ("succeeded".to_string(), "failed".to_string()));
+    }
+
+    #[test]
+    fn legacy_linked_pair_reconciliation_is_identical_after_second_startup() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("idempotent.sqlite");
+        let mut routine = definition("legacy");
+        routine.status = RoutineStatus::Active;
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_automation_tables(&conn);
+            insert_legacy_pair(
+                &conn,
+                &serde_json::to_string(&routine).unwrap(),
+                "failed",
+                "succeeded",
+                None,
+            );
+            conn.execute(
+                "UPDATE automation_occurrences
+                 SET failure_reason = 'original occurrence diagnostic'
+                 WHERE id = 'legacy-occ'",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "ALTER TABLE automation_runs
+                     ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none';
+                 ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT;
+                 UPDATE automation_runs
+                 SET delivery_error = 'original delivery diagnostic'
+                 WHERE id = 'legacy-run';",
+            )
+            .unwrap();
+        }
+
+        initialize_store(&path).unwrap();
+        let first = {
+            let conn = crate::store::open_store(&path).unwrap();
+            conn.query_row(
+                "SELECT o.state, o.failure_reason, o.delivery_state,
+                        r.status, r.delivery_state, r.delivery_error
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.id = 'legacy-occ'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        initialize_store(&path).unwrap();
+        let second = {
+            let conn = crate::store::open_store(&path).unwrap();
+            conn.query_row(
+                "SELECT o.state, o.failure_reason, o.delivery_state,
+                        r.status, r.delivery_state, r.delivery_error
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.id = 'legacy-occ'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+
+        assert_eq!(second, first);
+        assert_eq!(first.0, "failed");
+        assert_eq!(first.2, "ambiguous");
+        assert_eq!(first.3, "failed");
+        assert_eq!(first.4, "ambiguous");
+        assert!(first.1.contains("original occurrence diagnostic"));
+        assert!(first.5.contains("original delivery diagnostic"));
+        assert!(first.1.contains("occurrence=failed"));
+        assert!(first.5.contains("run=succeeded"));
     }
 }

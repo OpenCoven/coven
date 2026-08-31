@@ -271,7 +271,9 @@ Non-destructive, no data loss, no rewritten history:
    post-file-delivery/pre-ledger crash becomes explicit `delivery_state:
    ambiguous`, not `none`. Consistently failed pairs use `failed`. Existing
    session/exit/log/output evidence remains in place and receipts are never
-   fabricated.
+   fabricated. A durable per-row reconciliation timestamp excludes the pair
+   from later startup passes, so ambiguous delivery and appended original
+   diagnostics are byte-stable across repeated initialization.
 4. **Wire compatibility:** the legacy control actions (`coven.automations.*`, `control_plane.rs`) continue to respond during migration, each response additionally carrying the contract profile; new commands are additive. `coven.automations.import` maps to `legacy.import.v1` (`source: codex-automation-toml`), keeping the non-destructive, created-PAUSED/draft semantics of `import_legacy.rs`.
 5. **Nothing is deleted:** no definitions, occurrences, or run history are erased at any step (acceptance criterion), and the migration is idempotent (re-running adopts nothing twice — the adoption table marks it).
 

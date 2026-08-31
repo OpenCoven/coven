@@ -32,6 +32,7 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         delivery_token TEXT,
         delivery_digest TEXT,
         delivery_error TEXT,
+        legacy_reconciled_at TEXT,
         started_at TEXT NOT NULL,
         finished_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL

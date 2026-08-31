@@ -38,6 +38,7 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
         delivery_token TEXT,
         delivery_digest TEXT,
         delivery_error TEXT,
+        legacy_reconciled_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, scheduled_for)
