@@ -152,7 +152,7 @@ Platform PIN/passcode fallback is accepted when policy allows it, but it MUST be
 ### 4.6 Binding the device key to the #785 enrollment transcript
 
 - The enrollment request signs `{transcriptHash, deviceKey, pairwiseDeviceId, capabilities, nonce, expiresAt}` (`spec/device-pairing/v1/enrollment-request.schema.json`).
-- Current implementation: `pairing.rs` builds `PairingTranscript::for_request(...)` over the v2 offer (`COVEN-PAIR/2`, `COVEN-PAIR-OFFER/2` domains), derives the phrase and `transcript_hash`, and records the device public key in `PendingDevice`. The transcript fixture (`tests/fixtures/mobile-pairing-v2/transcript-vector.json`) locks the digest derivation.
+- Current implementation: `pairing.rs` builds `PairingTranscript::for_request(...)` over the v2 offer (`COVEN-PAIR/2`, `COVEN-PAIR-OFFER/2` domains), derives the phrase and `transcript_hash`, and records the device public key in `PendingDevice`. The transcript fixture (`crates/coven-cli/tests/fixtures/mobile-pairing-v2/transcript-vector.json`) locks the digest derivation.
 - Gap to close in #786's implementation slice: the *grant issuance* step must refuse to issue a grant whose subject key was not the key that signed the accepted enrollment request for the stored transcript hash. Today `enroll()` stores whatever public key the request carried; the issuance rule (§5.4) makes the binding explicit and testable (Gate C: "capability digest is bound from QR creation through grant issuance").
 
 ## 5. Device grant
@@ -183,7 +183,7 @@ Diagnostic JSON form of the same grant as the current Rust registry serializes i
   "id": "561413f5-3a57-5853-b386-29b04ffe59de",
   "subjectKeyId": "5f176879aa1dfa922aa8fcb3fd213537fce4047fe84455eb70a9664de65ca548",
   "audience": "local_coven_authority",
-  "scopes": ["conversations_read", "sessions_metadata_read", "tool_execution_approve", "tools_request"],
+  "scopes": ["conversation_read", "session_metadata_read", "tool_execution_approve", "tool_invocation_request"],
   "restrictions": {
     "transport": "any_authenticated",
     "requireFreshUserVerificationFor": ["tool_execution_approve"]
@@ -223,7 +223,7 @@ Recommended canonical mapping (dot-form is the wire vocabulary; snake-form remai
 
 Gaps the implementation must resolve, with recommendation:
 
-- **Split `familiar_memory_admin` into `memory.familiar.read` / `memory.familiar.write`.** The Rust enum collapses read/write into one scope, while the spec (and least privilege generally) separates them. The contract module (`contract.rs` already distinguishes read/write surfaces) can honor the split without a registry format change if the enum gains a variant and `LegacyDeviceScope` migration maps old grants to the pair.
+- **Split `familiar_memory_admin` into `memory.familiar.read` / `memory.familiar.write`.** The Rust enum collapses read/write into one scope, while the spec (and least privilege generally) separates them. The contract module (`contract.rs` currently mirrors only `memory_read`; `capabilities.json` already models both read and write surfaces) can honor the split without a registry format change if the enum gains a variant and `LegacyDeviceScope` migration maps old grants to the pair.
 - **Split `device_admin` into `devices.enroll` / `devices.revoke`** to match the spec enum and the issue's "device enrollment/revocation" distinction; a device holding both is the exception, not the default.
 - **Add `memory_read` to the spec vocabulary** (as `memory.read`) or deprecate it in favor of `conversations.read` during the Stage B registry migration (§11).
 - Unknown scopes already fail closed (`validate_scope_set`; `additionalProperties: false` in the schema; "Unknown capabilities MUST be rejected" in `mobile-device-pairing-v1.md`) — preserve that on every rename.
