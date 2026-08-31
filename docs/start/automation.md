@@ -18,7 +18,10 @@ Recurring routine work (`coven.automations`) is **owned by Coven, end to
 end**: Coven stores the canonical routine definitions in its own store (never
 a harness home), its scheduler plans and fences every occurrence in durable
 state, pins the accepted definition revision and delivery inputs, records the
-session and run before spawning, and delivers outputs itself. An external
+session and run before spawning, and delivers outputs itself. Output delivery
+first reserves the run and occurrence with an idempotent token and content
+digest; a crash or post-rename durability failure remains visibly ambiguous
+and is never replayed automatically. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions

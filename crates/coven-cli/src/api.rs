@@ -398,6 +398,7 @@ pub(crate) enum DurableSessionStore<'a> {
 pub(crate) enum DurableSessionLaunchError {
     Maintenance(anyhow::Error),
     Persistence(anyhow::Error),
+    PersistedState(anyhow::Error),
     Runtime(anyhow::Error),
     AlreadyDispatched,
     Rejected(ApiResponse),
@@ -450,10 +451,22 @@ pub(crate) fn launch_durable_session(
             .map_err(DurableSessionLaunchError::Persistence)?;
     persist_linked_state(&transaction)?;
     store::insert_session(&transaction, record).map_err(DurableSessionLaunchError::Persistence)?;
-    transaction
+    if let Err(error) = transaction
         .commit()
         .context("failed to commit durable session launch")
-        .map_err(DurableSessionLaunchError::Persistence)?;
+    {
+        store::update_session_status_if_current(
+            conn,
+            &record.id,
+            "running",
+            "failed",
+            None,
+            &current_timestamp(),
+        )
+        .context("failed to settle an ambiguously committed session launch")
+        .map_err(DurableSessionLaunchError::PersistedState)?;
+        return Err(DurableSessionLaunchError::PersistedState(error));
+    }
 
     let launch_result = match writer {
         Some(writer) => runtime.launch_session_with_writer(launch, writer),
@@ -469,7 +482,7 @@ pub(crate) fn launch_durable_session(
             &current_timestamp(),
         )
         .context("failed to terminally settle rejected session launch")
-        .map_err(DurableSessionLaunchError::Persistence)?;
+        .map_err(DurableSessionLaunchError::PersistedState)?;
         return Err(DurableSessionLaunchError::Runtime(error));
     }
     Ok(())
@@ -2314,7 +2327,8 @@ fn launch_session(
                 };
                 return api_error(423, code, &error.to_string(), details);
             }
-            DurableSessionLaunchError::Persistence(error) => {
+            DurableSessionLaunchError::Persistence(error)
+            | DurableSessionLaunchError::PersistedState(error) => {
                 return api_error(
                     500,
                     "launch_failed",

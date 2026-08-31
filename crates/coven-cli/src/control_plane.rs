@@ -491,6 +491,10 @@ fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) ->
                         "definitionDigest": record.definition_digest,
                         "outputTarget": record.output_target,
                         "deadlineAt": record.deadline_at,
+                        "deliveryState": record.delivery_state,
+                        "deliveryToken": record.delivery_token,
+                        "deliveryDigest": record.delivery_digest,
+                        "deliveryError": record.delivery_error,
                         "startedAt": record.started_at,
                         "finishedAt": record.finished_at,
                     })

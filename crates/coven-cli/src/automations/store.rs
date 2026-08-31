@@ -45,6 +45,7 @@ pub struct DefinitionSnapshot {
     pub digest: String,
     pub definition_json: String,
     pub output_target: Option<String>,
+    pub timeout_minutes: i64,
 }
 
 fn now_iso() -> String {
@@ -201,6 +202,12 @@ fn status_text(status: super::definition::RoutineStatus) -> &'static str {
 }
 
 pub fn definition_snapshot(record: &RoutineRecord) -> Result<DefinitionSnapshot> {
+    let actual_digest = definition_digest(&record.definition_json);
+    anyhow::ensure!(
+        record.definition_digest == actual_digest,
+        "stored routine `{}` definition digest does not match its JSON",
+        record.id
+    );
     let definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
         .with_context(|| format!("stored routine `{}` is unreadable", record.id))?;
     Ok(DefinitionSnapshot {
@@ -208,6 +215,7 @@ pub fn definition_snapshot(record: &RoutineRecord) -> Result<DefinitionSnapshot>
         digest: record.definition_digest.clone(),
         definition_json: record.definition_json.clone(),
         output_target: definition.output_target,
+        timeout_minutes: i64::from(definition.timeout_minutes),
     })
 }
 
@@ -257,6 +265,27 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "ALTER TABLE automation_occurrences ADD COLUMN deadline_at TEXT",
         ),
         (
+            "automation_occurrences",
+            "delivery_state",
+            "ALTER TABLE automation_occurrences
+             ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_token",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_token TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_digest",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_digest TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "delivery_error",
+            "ALTER TABLE automation_occurrences ADD COLUMN delivery_error TEXT",
+        ),
+        (
             "automation_runs",
             "definition_revision",
             "ALTER TABLE automation_runs ADD COLUMN definition_revision INTEGER",
@@ -281,11 +310,32 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "deadline_at",
             "ALTER TABLE automation_runs ADD COLUMN deadline_at TEXT",
         ),
+        (
+            "automation_runs",
+            "delivery_state",
+            "ALTER TABLE automation_runs
+             ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_runs",
+            "delivery_token",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_token TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_digest",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_digest TEXT",
+        ),
+        (
+            "automation_runs",
+            "delivery_error",
+            "ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT",
+        ),
     ] {
         ensure_column(conn, table, column, sql)?;
     }
     backfill_definition_digests(conn)?;
-    backfill_historical_snapshots(conn)?;
+    fail_unproven_legacy_executions(conn)?;
     Ok(())
 }
 
@@ -333,49 +383,30 @@ fn backfill_definition_digests(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn backfill_historical_snapshots(conn: &Connection) -> Result<()> {
-    let definitions = list_definitions(conn)?;
-    for record in definitions {
-        let snapshot = definition_snapshot(&record)?;
-        conn.execute(
-            "UPDATE automation_occurrences
-                 SET definition_revision = COALESCE(definition_revision, ?2),
-                     definition_digest = COALESCE(definition_digest, ?3),
-                     definition_json = COALESCE(definition_json, ?4),
-                     output_target = COALESCE(output_target, ?5),
-                     deadline_at = COALESCE(deadline_at, lease_expires_at)
-                 WHERE automation_id = ?1 AND definition_json IS NULL",
-            params![
-                record.id,
-                snapshot.revision,
-                snapshot.digest,
-                snapshot.definition_json,
-                snapshot.output_target
-            ],
-        )
-        .with_context(|| format!("failed to backfill occurrence snapshots for {}", record.id))?;
-        conn.execute(
-            "UPDATE automation_runs
-                 SET definition_revision = COALESCE(definition_revision, ?2),
-                     definition_digest = COALESCE(definition_digest, ?3),
-                     definition_json = COALESCE(definition_json, ?4),
-                     output_target = COALESCE(output_target, ?5),
-                     deadline_at = COALESCE(
-                         deadline_at,
-                         (SELECT deadline_at FROM automation_occurrences
-                          WHERE id = automation_runs.occurrence_id)
-                     )
-                 WHERE automation_id = ?1 AND definition_json IS NULL",
-            params![
-                record.id,
-                snapshot.revision,
-                snapshot.digest,
-                snapshot.definition_json,
-                snapshot.output_target
-            ],
-        )
-        .with_context(|| format!("failed to backfill run snapshots for {}", record.id))?;
-    }
+fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
+    const REASON: &str = "legacy automation immutable snapshot unavailable";
+    let now = now_iso();
+    conn.execute(
+        "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = ?1,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?2
+             WHERE state IN ('claimed', 'running')
+               AND definition_json IS NULL",
+        params![REASON, now],
+    )
+    .context("failed to fail legacy occurrences without immutable snapshots")?;
+    conn.execute(
+        "UPDATE automation_runs
+             SET status = 'failed',
+                 finished_at = ?1
+             WHERE status = 'running'
+               AND definition_json IS NULL",
+        params![now],
+    )
+    .context("failed to fail legacy runs without immutable snapshots")?;
     Ok(())
 }
 
@@ -463,6 +494,77 @@ mod tests {
         assert!(!delete_definition(&conn, "missing").unwrap());
     }
 
+    fn create_legacy_automation_tables(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE automation_occurrences (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'planned',
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(automation_id, scheduled_for)
+             );
+             CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                occurrence_id TEXT,
+                session_id TEXT,
+                familiar_id TEXT,
+                runtime TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                log_json TEXT,
+                output_commit TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+             );",
+        )
+        .unwrap();
+    }
+
+    fn insert_legacy_unsettled(conn: &Connection, definition_json: &str, occurrence_state: &str) {
+        conn.execute(
+            "INSERT INTO automation_definitions
+                (id, name, status, definition_json, created_at, updated_at)
+             VALUES ('legacy', 'legacy', 'ACTIVE', ?1,
+                     '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')",
+            rusqlite::params![definition_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, created_at, updated_at)
+             VALUES ('legacy-occ', 'legacy', '2026-01-02T09:00:00.000Z', ?1,
+                     'legacy-daemon', '2026-01-02T10:00:00.000Z', 1,
+                     '2026-01-02T09:00:00.000Z', '2026-01-02T09:00:00.000Z')",
+            rusqlite::params![occurrence_state],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
+                 status, started_at)
+             VALUES ('legacy-run', 'legacy', 'legacy-occ', 'legacy-session', NULL,
+                     'coven-code', 'running', '2026-01-02T09:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn legacy_automation_tables_migrate_snapshot_columns_in_place() {
         let temp = tempfile::tempdir().unwrap();
@@ -470,44 +572,7 @@ mod tests {
         let definition_json = serde_json::to_string(&definition("legacy")).unwrap();
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE automation_definitions (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    name TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    definition_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                 );
-                 CREATE TABLE automation_occurrences (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    automation_id TEXT NOT NULL,
-                    scheduled_for TEXT NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'planned',
-                    lease_owner TEXT,
-                    lease_expires_at TEXT,
-                    attempt INTEGER NOT NULL DEFAULT 0,
-                    failure_reason TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    UNIQUE(automation_id, scheduled_for)
-                 );
-                 CREATE TABLE automation_runs (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    automation_id TEXT NOT NULL,
-                    occurrence_id TEXT,
-                    session_id TEXT,
-                    familiar_id TEXT,
-                    runtime TEXT,
-                    status TEXT NOT NULL,
-                    exit_code INTEGER,
-                    log_json TEXT,
-                    output_commit TEXT,
-                    started_at TEXT NOT NULL,
-                    finished_at TEXT
-                 );",
-            )
-            .unwrap();
+            create_legacy_automation_tables(&conn);
             conn.execute(
                 "INSERT INTO automation_definitions
                     (id, name, status, definition_json, created_at, updated_at)
@@ -533,9 +598,11 @@ mod tests {
         for (table, column) in [
             ("automation_occurrences", "definition_json"),
             ("automation_occurrences", "deadline_at"),
+            ("automation_occurrences", "delivery_state"),
             ("automation_runs", "definition_json"),
             ("automation_runs", "deadline_at"),
             ("automation_runs", "output_target"),
+            ("automation_runs", "delivery_state"),
         ] {
             let found: i64 = conn
                 .query_row(
@@ -546,5 +613,93 @@ mod tests {
                 .unwrap();
             assert_eq!(found, 1, "{table}.{column} was not migrated");
         }
+    }
+
+    #[test]
+    fn legacy_unsettled_run_does_not_adopt_an_edited_current_definition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("edited.sqlite");
+        let mut original = definition("legacy");
+        original.status = RoutineStatus::Active;
+        original.timeout_minutes = 5;
+        original.prompt = "original prompt".to_string();
+        original.output_target = Some("/original/output".to_string());
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_automation_tables(&conn);
+            insert_legacy_unsettled(&conn, &serde_json::to_string(&original).unwrap(), "running");
+            let mut edited = original.clone();
+            edited.timeout_minutes = 60;
+            edited.prompt = "edited prompt".to_string();
+            edited.output_target = Some("/edited/output".to_string());
+            conn.execute(
+                "UPDATE automation_definitions
+                 SET definition_json = ?1, updated_at = '2026-01-03T00:00:00.000Z'",
+                rusqlite::params![serde_json::to_string(&edited).unwrap()],
+            )
+            .unwrap();
+        }
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let occurrence: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_reason, definition_json, output_target
+                 FROM automation_occurrences WHERE id = 'legacy-occ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence.0, "failed");
+        assert!(occurrence.1.contains("immutable snapshot unavailable"));
+        assert_eq!(occurrence.2, None);
+        assert_eq!(occurrence.3, None);
+        let run: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, definition_json, output_target
+                 FROM automation_runs WHERE id = 'legacy-run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run, ("failed".to_string(), None, None));
+    }
+
+    #[test]
+    fn legacy_unsettled_run_with_deleted_definition_is_preserved_and_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("deleted.sqlite");
+        let mut original = definition("legacy");
+        original.status = RoutineStatus::Active;
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_automation_tables(&conn);
+            insert_legacy_unsettled(&conn, &serde_json::to_string(&original).unwrap(), "claimed");
+            conn.execute("DELETE FROM automation_definitions WHERE id = 'legacy'", [])
+                .unwrap();
+        }
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let occurrence: (String, String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_reason, definition_json
+                 FROM automation_occurrences WHERE id = 'legacy-occ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence.0, "failed");
+        assert!(occurrence.1.contains("immutable snapshot unavailable"));
+        assert_eq!(occurrence.2, None);
+        let run: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT status, definition_json, output_target
+                 FROM automation_runs WHERE id = 'legacy-run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run, ("failed".to_string(), None, None));
     }
 }

@@ -20,13 +20,13 @@ This document specifies the contract. It does not change schedule authority, fam
 
 The #816 foundation is a valid v1 Rust implementation, but the public contract is still inferred from implementation. Each gap below cites the code as of this writing:
 
-1. **Definitions are schedule + prompt records.** `RoutineDefinition` (`crates/coven-cli/src/automations/definition.rs`) carries `schemaVersion`, `id`, `name`, `status` (`ACTIVE | PAUSED`), `rrule`, `timeoutMinutes`, `runtime`, `familiarId`, `prompt`, and little else. There is no revision counter, no integrity digest, no trigger/action unions, no lifecycle beyond two states, no provenance, and no retention policy.
+1. **Definitions are schedule + prompt records.** `RoutineDefinition` (`crates/coven-cli/src/automations/definition.rs`) carries `schemaVersion`, `id`, `name`, `status` (`ACTIVE | PAUSED`), `rrule`, `timeoutMinutes`, `runtime`, `familiarId`, `prompt`, and little else. The store now maintains a monotonic sidecar revision and SHA-256 digest used by immutable occurrence/run snapshots, but there are still no trigger/action unions, lifecycle beyond two states, provenance, or retention policy.
 2. **JSON payloads are assembled inside the control action router.** Every wire shape is hand-built in `control_plane.rs` (`automation_list_payload`, `automation_create_payload`, `automation_runs_payload`, ... at `crates/coven-cli/src/control_plane.rs`), so the router is the only specification of the payloads.
 3. **Domain failures hide inside accepted responses.** `automation_event` (`control_plane.rs`) always returns `ok: true, accepted: true, status: completed`; when the store call fails, the error is embedded as a `{"error": ...}` payload (for example `automation_tick_payload`, `automation_run_payload`, `automation_update_payload`). A client that trusts `accepted` cannot see the failure.
-4. **No revision/adoption model.** `update_definition` (`crates/coven-cli/src/automations/store.rs`) mutates the row in place; nothing records which revision a caller expected, and `intentId` on control actions (`control_plane.rs`) is echoed, never adopted, stored, or replay-checked.
+4. **No command adoption model.** Internal claims compare-and-set the exact stored revision/digest and refuse stale snapshots, but control actions still expose no caller `expectedRevision`; `intentId` is echoed, never adopted, stored, or replay-checked.
 5. **No versioned event envelope or replay reducer.** `ControlEvent` (`control_plane.rs`) has `kind/action/origin/intentId/payload` but no schema version, no event id, no per-stream sequence, and no timestamps; there is no changefeed at all — Cave polls list/get endpoints.
-6. **Lifecycle semantics are stringly typed and partial.** Occurrence states are free strings (`'planned'/'claimed'/'running'/'succeeded'/'failed'` in `crates/coven-cli/src/automations/occurrences.rs`), terminal states are exactly `[succeeded, failed]` (`OCCURRENCE_TERMINAL_STATES`), and lease recovery maps straight to `failed` with reason `lease expired` (`recover_expired_leases`). There are no eligible/dispatching/recovering/cancelled/timed_out/superseded states, no run state machine beyond `status` strings, and no attempt object at all — only an `attempt` counter incremented by claim (`claim_due_occurrence`).
-7. **No receipts, no digests, no integrity anywhere** in the automations module; run outcomes are ledger rows (`automation_runs.log_json`, `exit_code`) with no tamper-evident summary.
+6. **Lifecycle semantics are stringly typed and partial.** Occurrence states are free strings (`'planned'/'claimed'/'running'/'succeeded'/'failed'` in `crates/coven-cli/src/automations/occurrences.rs`), and terminal occurrence states remain exactly `[succeeded, failed]`. Deadline reconciliation and delivery reservation are now coupled, but there are no eligible/dispatching/recovering/cancelled/timed_out/superseded occurrence states, no typed run state machine, and no attempt object — only an `attempt` counter incremented by claim.
+7. **No receipts or end-to-end integrity model.** Definitions, occurrences, runs, and delivery reservations now pin digests, but run outcomes remain ledger rows (`automation_runs.log_json`, `exit_code`) with no immutable receipt or tamper-evident terminal summary.
 8. **No capability negotiation.** `capabilities()` (`control_plane.rs`) lists action ids, but nothing lets a client ask which trigger/action/policy variants an implementation executes, and nothing forces a definition with an unsupported variant to fail explicitly.
 9. **Adoption-key gaps.** Run, session, and manual occurrence ids now use UUID
    entropy, but `coven.automations.run` still has no caller adoption key. A
@@ -39,6 +39,12 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     delete/run/tick/import are restricted to owner-gated local IPC; loopback
     TCP is not an authenticated owner transport. The binding and receipt
     sections below specify the target v1 contract, not current #816 behavior.
+11. **Legacy unsettled rows cannot prove a historical definition snapshot.**
+    Migration preserves those occurrence/run rows but fails them without
+    copying the mutable current definition or fabricating delivery inputs.
+    New deliveries reserve a pending token and target+payload digest before
+    file I/O; interrupted pending work becomes explicit `ambiguous` delivery
+    state and is not automatically replayed.
 
 ## Contract profile and versioning
 
@@ -250,8 +256,18 @@ Digests (definition integrity, receipts, event integrity where required) are SHA
 Non-destructive, no data loss, no rewritten history:
 
 1. **Definitions:** on first contract adoption, each stored `automation_definitions` row gains sidecar columns (`revision` = 1, `integrity` = digest over its existing `definition_json` bytes, lifecycle mapping `ACTIVE → active`, `PAUSED → paused`, default `draft` for import). `definition_json` bytes stay byte-identical — the digest is computed over them, not written into them — so pre-migration rows remain verifiable.
-2. **Occurrences:** every existing row pins `automationRevision: 1` plus the definition digest; `attempt` counter maps to fence `generation` (claim already increments it in `claim_due_occurrence`); state strings map 1:1 (`planned/claimed/running/succeeded/failed`) with `succeeded/failed` becoming the v1 terminals of the same names.
-3. **Runs:** `automation_runs` rows map to v1 runs with `state` from `status`; the ledger's `exit_code/log_json/output_commit` columns carry into `terminalDisposition`/`delivery` without backfilling receipts — receipts exist only for runs that produce them after adoption (receipts are never fabricated for history).
+2. **Occurrences:** legacy terminal/planned history is preserved without
+   fabricating a snapshot. A legacy `claimed`/`running` row cannot prove which
+   historical definition revision it accepted, so migration fails it with
+   `legacy automation immutable snapshot unavailable`, clears its lease, and
+   leaves revision/digest/definition/delivery inputs null. New claims pin one
+   coherent current revision/digest and derive their deadline from that same
+   snapshot.
+3. **Runs:** legacy running rows without a provable immutable snapshot are
+   preserved and failed without delivery; current mutable definition fields
+   are never copied into them. Other historical `automation_runs` rows retain
+   their existing status/exit/log/output fields without fabricated snapshots
+   or receipts. Receipts exist only for runs that produce them after adoption.
 4. **Wire compatibility:** the legacy control actions (`coven.automations.*`, `control_plane.rs`) continue to respond during migration, each response additionally carrying the contract profile; new commands are additive. `coven.automations.import` maps to `legacy.import.v1` (`source: codex-automation-toml`), keeping the non-destructive, created-PAUSED/draft semantics of `import_legacy.rs`.
 5. **Nothing is deleted:** no definitions, occurrences, or run history are erased at any step (acceptance criterion), and the migration is idempotent (re-running adopts nothing twice — the adoption table marks it).
 

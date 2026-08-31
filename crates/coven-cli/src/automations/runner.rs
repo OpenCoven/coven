@@ -14,7 +14,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::definition::RoutineDefinition;
-use super::occurrences::{claim_occurrence_by_id, mark_occurrence_running, settle_occurrence};
+use super::occurrences::{
+    claim_occurrence_by_id_at_revision, fail_occurrence_nonterminal, mark_occurrence_running,
+    settle_occurrence,
+};
 use super::runs::{record_run_finish, record_run_start_pinned, PinnedRunStart, RunFinish};
 use super::store::DefinitionSnapshot;
 use crate::api::{DurableSessionLaunchError, DurableSessionStore, SessionLaunch, SessionRuntime};
@@ -30,15 +33,6 @@ pub struct RunOutcome {
 
 fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
-}
-
-/// The dispatch lease for a routine run: the definition's own timeout,
-/// using the same 1..=44640 minute window claims and validation support. The lease must
-/// outlive a healthy run so lease recovery only ever catches genuinely
-/// wedged work (coven#816: "never let a stale running record block a
-/// routine forever").
-fn run_lease_minutes(definition: &RoutineDefinition) -> i64 {
-    i64::from(definition.timeout_minutes)
 }
 
 fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
@@ -113,6 +107,7 @@ fn load_pinned_occurrence(
                 row.automation_id
             )
         })?;
+    let timeout_minutes = i64::from(definition.timeout_minutes);
     Ok(PinnedOccurrence {
         id: occurrence_id.to_string(),
         automation_id: row.automation_id,
@@ -122,6 +117,7 @@ fn load_pinned_occurrence(
             digest,
             definition_json,
             output_target: row.output_target,
+            timeout_minutes,
         },
         deadline_at,
     })
@@ -165,6 +161,7 @@ fn durable_error_text(error: DurableSessionLaunchError) -> String {
     match error {
         DurableSessionLaunchError::Maintenance(error)
         | DurableSessionLaunchError::Persistence(error)
+        | DurableSessionLaunchError::PersistedState(error)
         | DurableSessionLaunchError::Runtime(error) => format!("{error:#}"),
         DurableSessionLaunchError::AlreadyDispatched => {
             "occurrence was already dispatched".to_string()
@@ -176,6 +173,39 @@ fn durable_error_text(error: DurableSessionLaunchError) -> String {
 }
 
 fn settle_launch_failure(
+    conn: &Connection,
+    pinned: &PinnedOccurrence,
+    run_id: &str,
+    session_id: Option<&str>,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    match settle_launch_failure_with_run(conn, pinned, run_id, session_id, reason, now) {
+        Ok(()) => Ok(()),
+        Err(settlement_error) => {
+            let failed = fail_occurrence_nonterminal(conn, &pinned.id, reason, now)?;
+            if !failed {
+                let state: String = conn
+                    .query_row(
+                        "SELECT state FROM automation_occurrences WHERE id = ?1",
+                        params![pinned.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| {
+                        format!("failed to verify independently settled occurrence: {error}")
+                    })?;
+                if state != "failed" {
+                    return Err(format!(
+                        "{settlement_error}; occurrence remained in state `{state}`"
+                    ));
+                }
+            }
+            Err(settlement_error)
+        }
+    }
+}
+
+fn settle_launch_failure_with_run(
     conn: &Connection,
     pinned: &PinnedOccurrence,
     run_id: &str,
@@ -214,7 +244,7 @@ fn settle_launch_failure(
     let session_id = existing_session_id
         .flatten()
         .or_else(|| session_id.map(str::to_string));
-    if !settle_occurrence(&transaction, &pinned.id, "failed", Some(reason), now)? {
+    if !fail_occurrence_nonterminal(&transaction, &pinned.id, reason, now)? {
         return Err("failed to terminally settle rejected occurrence".to_string());
     }
     let finished = record_run_finish(
@@ -281,14 +311,9 @@ fn dispatch_pinned_occurrence(
         &launch,
         &record,
         |transaction| {
-            let marked = mark_occurrence_running(
-                transaction,
-                &pinned.id,
-                owner,
-                run_lease_minutes(&pinned.definition),
-                now,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let marked =
+                mark_occurrence_running(transaction, &pinned.id, owner, &pinned.deadline_at, now)
+                    .map_err(anyhow::Error::msg)?;
             if !marked {
                 return Err(DurableSessionLaunchError::AlreadyDispatched);
             }
@@ -323,16 +348,33 @@ fn dispatch_pinned_occurrence(
             error: None,
         }),
         Err(error) => {
-            let persisted_session = matches!(&error, DurableSessionLaunchError::Runtime(_));
+            let persisted_session = matches!(
+                &error,
+                DurableSessionLaunchError::Runtime(_)
+                    | DurableSessionLaunchError::PersistedState(_)
+            );
             let reason = durable_error_text(error);
-            settle_launch_failure(
+            let session_settlement = if persisted_session {
+                ensure_session_terminal_after_launch_failure(conn, &launch.id, &reason, now)
+            } else {
+                Ok(())
+            };
+            let linked_settlement = settle_launch_failure(
                 conn,
                 pinned,
                 &run_id,
                 persisted_session.then_some(launch.id.as_str()),
                 &reason,
                 now,
-            )?;
+            );
+            match (session_settlement, linked_settlement) {
+                (Ok(()), Ok(())) => {}
+                (Err(session_error), Ok(())) => return Err(session_error),
+                (Ok(()), Err(linked_error)) => return Err(linked_error),
+                (Err(session_error), Err(linked_error)) => {
+                    return Err(format!("{session_error}; {linked_error}"));
+                }
+            }
             Ok(RunOutcome {
                 run_id,
                 status: "failed".to_string(),
@@ -340,6 +382,44 @@ fn dispatch_pinned_occurrence(
                 error: Some(reason),
             })
         }
+    }
+}
+
+fn ensure_session_terminal_after_launch_failure(
+    conn: &Connection,
+    session_id: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let changed = crate::store::update_session_status_if_current(
+        conn,
+        session_id,
+        "running",
+        "failed",
+        None,
+        &now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
+    .map_err(|error| {
+        format!("failed to terminally settle session {session_id} after `{reason}`: {error:#}")
+    })?;
+    if changed {
+        return Ok(());
+    }
+    let Some(session) = crate::store::get_session(conn, session_id)
+        .map_err(|error| format!("failed to verify session {session_id}: {error:#}"))?
+    else {
+        return Ok(());
+    };
+    if matches!(
+        session.status.as_str(),
+        "completed" | "failed" | "cancelled" | "killed" | "idle" | "orphaned"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "session {session_id} remained nonterminal in state `{}` after launch failure",
+            session.status
+        ))
     }
 }
 
@@ -357,19 +437,15 @@ pub fn run_routine_now(
     definition: &RoutineDefinition,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
-    let Some(_cwd) = definition
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-    else {
-        return Ok(RunOutcome {
-            run_id: String::new(),
-            status: "failed".to_string(),
-            session_id: None,
-            error: Some("routine has no cwd; add a cwd before running".to_string()),
-        });
-    };
+    let expected_record = super::store::get_definition(conn, &definition.id)
+        .map_err(|error| format!("failed to read routine before manual run: {error:#}"))?
+        .ok_or_else(|| format!("routine `{}` vanished before manual run", definition.id))?;
+    let expected_definition: RoutineDefinition =
+        serde_json::from_str(&expected_record.definition_json).map_err(|error| {
+            format!("stored routine `{}` is unreadable: {error}", definition.id)
+        })?;
+    let expected_snapshot = super::store::definition_snapshot(&expected_record)
+        .map_err(|error| format!("failed to snapshot manual routine: {error:#}"))?;
 
     let occurrence_id = fresh_id("occ");
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -385,13 +461,34 @@ pub fn run_routine_now(
         return Err("immediate occurrence fence collided; retry".to_string());
     }
 
-    let claimed = claim_occurrence_by_id(
+    let claimed = match claim_occurrence_by_id_at_revision(
         conn,
         &occurrence_id,
         "manual",
-        run_lease_minutes(definition),
+        expected_record.revision,
+        &expected_record.definition_digest,
         now,
-    )?;
+    ) {
+        Ok(claimed) => claimed,
+        Err(reason) => {
+            let pinned = PinnedOccurrence {
+                id: occurrence_id,
+                automation_id: definition.id.clone(),
+                definition: expected_definition,
+                deadline_at: (now + chrono::Duration::minutes(expected_snapshot.timeout_minutes))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                snapshot: expected_snapshot,
+            };
+            let run_id = fresh_id("run");
+            settle_launch_failure(conn, &pinned, &run_id, None, &reason, now)?;
+            return Ok(RunOutcome {
+                run_id,
+                status: "failed".to_string(),
+                session_id: None,
+                error: Some(reason),
+            });
+        }
+    };
     if claimed.is_none() {
         // The claim was refused — in practice a live sibling run appeared
         // first (overlap: forbid). Release our fence so the daemon can never
@@ -405,7 +502,7 @@ pub fn run_routine_now(
         if deleted != 1 {
             return Err("refused occurrence changed before it could be released".to_string());
         }
-        return Ok(overlap_outcome(definition));
+        return Ok(overlap_outcome(&expected_definition));
     }
     let pinned = load_pinned_occurrence(conn, &occurrence_id)?;
     dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "manual", now)
@@ -473,7 +570,18 @@ pub fn dispatch_claimed_occurrences(
     };
 
     for occurrence_id in claimed {
-        let pinned = load_pinned_occurrence(conn, &occurrence_id)?;
+        let pinned = match load_pinned_occurrence(conn, &occurrence_id) {
+            Ok(pinned) => pinned,
+            Err(reason) => {
+                if !fail_occurrence_nonterminal(conn, &occurrence_id, &reason, now)? {
+                    return Err(format!(
+                        "{reason}; occurrence {occurrence_id} could not be terminally failed"
+                    ));
+                }
+                report.failed.push(format!("{occurrence_id}: {reason}"));
+                continue;
+            }
+        };
         let automation_id = pinned.automation_id.clone();
         if adopt_existing_run(conn, &pinned, now)? {
             continue;
@@ -527,13 +635,8 @@ fn adopt_existing_run(
     };
     if status == "running" {
         if session_id.is_some() {
-            let changed = mark_occurrence_running(
-                conn,
-                &pinned.id,
-                "daemon",
-                run_lease_minutes(&pinned.definition),
-                now,
-            )?;
+            let changed =
+                mark_occurrence_running(conn, &pinned.id, "daemon", &pinned.deadline_at, now)?;
             if !changed {
                 let state: String = conn
                     .query_row(
@@ -820,6 +923,27 @@ mod tests {
 
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs[0].status, "failed");
+        let session =
+            crate::store::get_session(&conn, outcome.session_id.as_deref().unwrap_or_default())
+                .unwrap();
+        assert!(
+            session.is_none(),
+            "failed outcomes do not expose a live session id"
+        );
+        let persisted_session: String = conn
+            .query_row(
+                "SELECT session_id FROM automation_runs WHERE automation_id = 'daily'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            crate::store::get_session(&conn, &persisted_session)
+                .unwrap()
+                .unwrap()
+                .status,
+            "failed"
+        );
 
         let state: String = conn
             .query_row(
@@ -862,6 +986,15 @@ mod tests {
         let runs = super::super::runs::list_runs(&conn, "unknown-familiar", 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "failed");
+        let occurrence_state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences
+                 WHERE automation_id = 'unknown-familiar'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "failed");
     }
 
     #[test]
@@ -891,6 +1024,103 @@ mod tests {
             "{error}"
         );
         assert_eq!(runtime.launches.get(), 0, "runtime must not spawn");
+        let (state, failure): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_reason FROM automation_occurrences
+                 WHERE automation_id = 'persistence-failure'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(failure
+            .as_deref()
+            .is_some_and(|reason| reason.contains("synthetic run persistence failure")));
+        assert_eq!(
+            super::super::runs::list_runs(&conn, "persistence-failure", 10)
+                .unwrap()
+                .len(),
+            0,
+            "an impossible run insert must not be retried forever"
+        );
+        assert!(crate::store::list_sessions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn session_insert_failure_still_terminally_settles_occurrence_and_run() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("session-persistence-failure");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_automation_session_insert
+             BEFORE INSERT ON sessions
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic session persistence failure');
+             END;",
+        )
+        .unwrap();
+        let runtime = CountingRuntime::default();
+
+        let outcome = run_routine_now(&conn, temp.path(), &runtime, &routine, Utc::now()).unwrap();
+
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("synthetic session persistence failure")));
+        assert_eq!(runtime.launches.get(), 0);
+        let (occurrence, run): (String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.automation_id = 'session-persistence-failure'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((occurrence.as_str(), run.as_str()), ("failed", "failed"));
+        assert!(crate::store::list_sessions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn claimed_occurrence_without_proven_snapshot_fails_immediately() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("unproven-claim");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, created_at, updated_at)
+             VALUES ('unproven-occ', 'unproven-claim', ?1, 'claimed', 'old-daemon',
+                     '2099-01-01T00:00:00.000Z', 1, ?1, ?1)",
+            params![now],
+        )
+        .unwrap();
+        let runtime = CountingRuntime::default();
+
+        let report =
+            dispatch_claimed_occurrences(&conn, temp.path(), &runtime, Utc::now()).unwrap();
+
+        assert_eq!(runtime.launches.get(), 0);
+        assert_eq!(report.failed.len(), 1);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'unproven-occ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
     }
 
     #[test]
@@ -910,5 +1140,21 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("no cwd"));
+        assert!(!outcome.run_id.is_empty());
+        let (occurrence_state, run_status): (String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.automation_id = 'nocwd'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (occurrence_state.as_str(), run_status.as_str()),
+            ("failed", "failed")
+        );
+        assert!(crate::store::list_sessions(&conn).unwrap().is_empty());
     }
 }

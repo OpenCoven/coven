@@ -34,6 +34,10 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
         definition_json TEXT,
         output_target TEXT,
         deadline_at TEXT,
+        delivery_state TEXT NOT NULL DEFAULT 'none',
+        delivery_token TEXT,
+        delivery_digest TEXT,
+        delivery_error TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, scheduled_for)
@@ -74,7 +78,14 @@ pub struct TickReport {
 }
 
 const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
+#[cfg(test)]
 const MAX_LEASE_MINUTES: i64 = super::definition::AUTOMATION_TIMEOUT_MAX_MINUTES as i64;
+
+struct ActiveDefinition {
+    definition: RoutineDefinition,
+    revision: i64,
+    digest: String,
+}
 
 /// Claims the earliest due PLANNED occurrence for a routine with a bounded
 /// lease. Returns the claimed occurrence id, or `None` when nothing is due
@@ -84,6 +95,7 @@ const MAX_LEASE_MINUTES: i64 = super::definition::AUTOMATION_TIMEOUT_MAX_MINUTES
 ///
 /// The daemon tick claims through this path; manual run-now claims a specific
 /// fresh occurrence via `claim_occurrence_by_id`.
+#[cfg(test)]
 pub fn claim_due_occurrence(
     conn: &Connection,
     automation_id: &str,
@@ -94,12 +106,32 @@ pub fn claim_due_occurrence(
     if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
         return Err("lease minutes must be 1..=44640".to_string());
     }
-    let expires = now + chrono::Duration::minutes(lease_minutes);
-    let now_iso = iso(now);
-    let expires_iso = iso(expires);
-    let tx = conn
-        .unchecked_transaction()
+    let record = super::store::get_definition(conn, automation_id)
+        .map_err(|error| format!("failed to read routine before claim: {error:#}"))?
+        .ok_or_else(|| format!("routine `{automation_id}` vanished before claim"))?;
+    claim_due_occurrence_at_revision(
+        conn,
+        automation_id,
+        owner,
+        record.revision,
+        &record.definition_digest,
+        now,
+    )
+}
+
+pub fn claim_due_occurrence_at_revision(
+    conn: &Connection,
+    automation_id: &str,
+    owner: &str,
+    expected_revision: i64,
+    expected_digest: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin occurrence claim: {error}"))?;
+    let snapshot = snapshot_for_claim(&tx, automation_id, expected_revision, expected_digest)?;
+    let expires_iso = iso(now + chrono::Duration::minutes(snapshot.timeout_minutes));
+    let now_iso = iso(now);
     let changed = tx
         .execute(
             "UPDATE automation_occurrences
@@ -107,6 +139,11 @@ pub fn claim_due_occurrence(
                  lease_owner = ?3,
                  lease_expires_at = ?4,
                  attempt = attempt + 1,
+                 definition_revision = ?5,
+                 definition_digest = ?6,
+                 definition_json = ?7,
+                 output_target = ?8,
+                 deadline_at = ?4,
                  updated_at = ?2
              WHERE automation_id = ?1
                AND state = 'planned'
@@ -124,7 +161,16 @@ pub fn claim_due_occurrence(
                    WHERE live.automation_id = ?1
                      AND live.state IN ('claimed', 'running')
                )",
-            params![automation_id, now_iso, owner, expires_iso],
+            params![
+                automation_id,
+                now_iso,
+                owner,
+                expires_iso,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target
+            ],
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
@@ -139,7 +185,6 @@ pub fn claim_due_occurrence(
             |row| row.get(0),
         )
         .map_err(|error| format!("failed to read claim: {error}"))?;
-    pin_occurrence_snapshot(&tx, &id, lease_minutes, now)?;
     tx.commit()
         .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
     Ok(Some(id))
@@ -149,6 +194,7 @@ pub fn claim_due_occurrence(
 /// lease. Refused — returning `Ok(None)` — when the occurrence is not
 /// claimable, including when a sibling occurrence of the same routine is
 /// still live (`overlap: forbid`).
+#[cfg(test)]
 pub fn claim_occurrence_by_id(
     conn: &Connection,
     occurrence_id: &str,
@@ -159,12 +205,46 @@ pub fn claim_occurrence_by_id(
     if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
         return Err("lease minutes must be 1..=44640".to_string());
     }
-    let expires = now + chrono::Duration::minutes(lease_minutes);
-    let now_iso = iso(now);
-    let expires_iso = iso(expires);
-    let tx = conn
-        .unchecked_transaction()
+    let automation_id: String = conn
+        .query_row(
+            "SELECT automation_id FROM automation_occurrences WHERE id = ?1",
+            params![occurrence_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read occurrence routine: {error}"))?;
+    let record = super::store::get_definition(conn, automation_id.as_str())
+        .map_err(|error| format!("failed to read routine before claim: {error:#}"))?
+        .ok_or_else(|| format!("routine `{automation_id}` vanished before claim"))?;
+    claim_occurrence_by_id_at_revision(
+        conn,
+        occurrence_id,
+        owner,
+        record.revision,
+        &record.definition_digest,
+        now,
+    )
+}
+
+pub fn claim_occurrence_by_id_at_revision(
+    conn: &Connection,
+    occurrence_id: &str,
+    owner: &str,
+    expected_revision: i64,
+    expected_digest: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin occurrence claim: {error}"))?;
+    let automation_id: String = tx
+        .query_row(
+            "SELECT automation_id FROM automation_occurrences WHERE id = ?1",
+            params![occurrence_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read occurrence routine: {error}"))?;
+    let snapshot = snapshot_for_claim(&tx, &automation_id, expected_revision, expected_digest)?;
+    let expires_iso = iso(now + chrono::Duration::minutes(snapshot.timeout_minutes));
+    let now_iso = iso(now);
     let changed = tx
         .execute(
             "UPDATE automation_occurrences
@@ -172,6 +252,11 @@ pub fn claim_occurrence_by_id(
                  lease_owner = ?3,
                  lease_expires_at = ?4,
                  attempt = attempt + 1,
+                 definition_revision = ?5,
+                 definition_digest = ?6,
+                 definition_json = ?7,
+                 output_target = ?8,
+                 deadline_at = ?4,
                  updated_at = ?2
              WHERE id = ?1
                AND state = 'planned'
@@ -184,7 +269,16 @@ pub fn claim_occurrence_by_id(
                      AND live.state IN ('claimed', 'running')
                      AND live.id != ?1
              )",
-            params![occurrence_id, now_iso, owner, expires_iso],
+            params![
+                occurrence_id,
+                now_iso,
+                owner,
+                expires_iso,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target
+            ],
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
@@ -192,54 +286,29 @@ pub fn claim_occurrence_by_id(
             .map_err(|error| format!("failed to commit empty occurrence claim: {error}"))?;
         return Ok(None);
     }
-    pin_occurrence_snapshot(&tx, occurrence_id, lease_minutes, now)?;
     tx.commit()
         .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
     Ok(Some(occurrence_id.to_string()))
 }
 
-fn pin_occurrence_snapshot(
+fn snapshot_for_claim(
     conn: &Connection,
-    occurrence_id: &str,
-    lease_minutes: i64,
-    now: DateTime<Utc>,
-) -> Result<(), String> {
-    let automation_id: String = conn
-        .query_row(
-            "SELECT automation_id FROM automation_occurrences WHERE id = ?1",
-            params![occurrence_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("failed to read occurrence routine: {error}"))?;
-    let record = super::store::get_definition(conn, &automation_id)
+    automation_id: &str,
+    expected_revision: i64,
+    expected_digest: &str,
+) -> Result<super::store::DefinitionSnapshot, String> {
+    let record = super::store::get_definition(conn, automation_id)
         .map_err(|error| format!("failed to read routine snapshot: {error:#}"))?
         .ok_or_else(|| format!("routine `{automation_id}` vanished before claim"))?;
+    if record.revision != expected_revision || record.definition_digest != expected_digest {
+        return Err(format!(
+            "routine `{automation_id}` changed before claim; retry with revision {}",
+            record.revision
+        ));
+    }
     let snapshot = super::store::definition_snapshot(&record)
         .map_err(|error| format!("failed to snapshot routine: {error:#}"))?;
-    let deadline = iso(now + chrono::Duration::minutes(lease_minutes));
-    let changed = conn
-        .execute(
-            "UPDATE automation_occurrences
-             SET definition_revision = ?2,
-                 definition_digest = ?3,
-                 definition_json = ?4,
-                 output_target = ?5,
-                 deadline_at = ?6
-             WHERE id = ?1 AND state = 'claimed'",
-            params![
-                occurrence_id,
-                snapshot.revision,
-                snapshot.digest,
-                snapshot.definition_json,
-                snapshot.output_target,
-                deadline
-            ],
-        )
-        .map_err(|error| format!("failed to pin routine snapshot: {error}"))?;
-    if changed != 1 {
-        return Err("occurrence changed while pinning its routine snapshot".to_string());
-    }
-    Ok(())
+    Ok(snapshot)
 }
 
 /// Compare-and-sets a claimed occurrence to `running` with a fresh bounded
@@ -250,15 +319,12 @@ pub fn mark_occurrence_running(
     conn: &Connection,
     occurrence_id: &str,
     owner: &str,
-    lease_minutes: i64,
+    deadline_at: &str,
     now: DateTime<Utc>,
 ) -> Result<bool, String> {
-    if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
-        return Err("lease minutes must be 1..=44640".to_string());
-    }
-    let expires = now + chrono::Duration::minutes(lease_minutes);
     let now_iso = iso(now);
-    let expires_iso = iso(expires);
+    chrono::DateTime::parse_from_rfc3339(deadline_at)
+        .map_err(|error| format!("occurrence deadline is invalid: {error}"))?;
     let changed = conn
         .execute(
             "UPDATE automation_occurrences
@@ -267,7 +333,7 @@ pub fn mark_occurrence_running(
                  lease_expires_at = ?4,
                  updated_at = ?2
              WHERE id = ?1 AND state = 'claimed'",
-            params![occurrence_id, now_iso, owner, expires_iso],
+            params![occurrence_id, now_iso, owner, deadline_at],
         )
         .map_err(|error| format!("failed to mark occurrence running: {error}"))?;
     Ok(changed > 0)
@@ -331,6 +397,27 @@ pub fn settle_occurrence(
     Ok(changed > 0)
 }
 
+pub fn fail_occurrence_nonterminal(
+    conn: &Connection,
+    occurrence_id: &str,
+    failure_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = ?1 AND state IN ('planned', 'claimed', 'running')",
+            params![occurrence_id, failure_reason, iso(now)],
+        )
+        .map_err(|error| format!("failed to fail nonterminal occurrence: {error}"))?;
+    Ok(changed > 0)
+}
+
 /// One full tick: plan due slots, recover expired leases, then claim the
 /// earliest due occurrence of every ACTIVE routine that has one.
 pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
@@ -338,7 +425,8 @@ pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     let definitions = active_definitions(conn)?;
-    for definition in &definitions {
+    for active in &definitions {
+        let definition = &active.definition;
         if !seen.insert(definition.id.clone()) {
             continue;
         }
@@ -353,17 +441,20 @@ pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
 
     report.recovered = recover_expired_leases(conn, now).map_err(anyhow::Error::msg)?;
 
-    for definition in &definitions {
-        match claim_due_occurrence(
+    for active in &definitions {
+        match claim_due_occurrence_at_revision(
             conn,
-            &definition.id,
+            &active.definition.id,
             "daemon",
-            i64::from(definition.timeout_minutes),
+            active.revision,
+            &active.digest,
             now,
         ) {
             Ok(Some(id)) => report.claimed.push(id),
             Ok(None) => {}
-            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
+            Err(error) => report
+                .failed
+                .push(format!("{}: {error}", active.definition.id)),
         }
     }
 
@@ -384,7 +475,7 @@ fn iso(instant: DateTime<Utc>) -> String {
 }
 
 /// Reads the ACTIVE definitions from the store as validated records.
-fn active_definitions(conn: &Connection) -> Result<Vec<RoutineDefinition>> {
+fn active_definitions(conn: &Connection) -> Result<Vec<ActiveDefinition>> {
     let records = super::store::list_definitions(conn)?;
     let mut definitions = Vec::new();
     for record in records {
@@ -396,7 +487,11 @@ fn active_definitions(conn: &Connection) -> Result<Vec<RoutineDefinition>> {
         if definition.status != RoutineStatus::Active {
             continue;
         }
-        definitions.push(definition);
+        definitions.push(ActiveDefinition {
+            definition,
+            revision: record.revision,
+            digest: record.definition_digest,
+        });
     }
     Ok(definitions)
 }
@@ -502,7 +597,8 @@ pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickRe
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
     let definitions = active_definitions(conn)?;
-    for definition in definitions {
+    for active in definitions {
+        let definition = active.definition;
         if !seen.insert(definition.id.clone()) {
             continue;
         }
@@ -742,6 +838,157 @@ mod tests {
     }
 
     #[test]
+    fn claim_deadline_uses_the_same_revision_as_the_pinned_inputs() {
+        let (_temp, conn) = temp_store();
+        let mut first = definition("coherent", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        first.timeout_minutes = 5;
+        first.prompt = "revision A".to_string();
+        insert_definition(&conn, &first).unwrap();
+        let now = real_now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('coherent-occ', 'coherent', ?1, 'planned', 0, ?1, ?1)",
+            rusqlite::params![now_iso],
+        )
+        .unwrap();
+
+        let mut second = first.clone();
+        second.timeout_minutes = 60;
+        second.prompt = "revision B".to_string();
+        super::super::store::update_definition(&conn, &second)
+            .unwrap()
+            .unwrap();
+
+        claim_occurrence_by_id(&conn, "coherent-occ", "daemon-a", 5, now)
+            .unwrap()
+            .unwrap();
+
+        let (revision, snapshot_json, deadline): (i64, String, String) = conn
+            .query_row(
+                "SELECT definition_revision, definition_json, deadline_at
+                 FROM automation_occurrences WHERE id = 'coherent-occ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, 2);
+        assert!(snapshot_json.contains("revision B"), "{snapshot_json}");
+        assert_eq!(
+            deadline,
+            (now + chrono::Duration::minutes(60))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        );
+    }
+
+    #[test]
+    fn claim_refuses_a_stale_definition_revision_without_partial_state() {
+        let (_temp, conn) = temp_store();
+        let first = definition("revision-race", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &first).unwrap();
+        let expected = super::super::store::get_definition(&conn, "revision-race")
+            .unwrap()
+            .unwrap();
+        let now = real_now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('revision-race-occ', 'revision-race', ?1, 'planned', 0, ?1, ?1)",
+            rusqlite::params![now_iso],
+        )
+        .unwrap();
+        let mut changed = first;
+        changed.timeout_minutes = 90;
+        super::super::store::update_definition(&conn, &changed)
+            .unwrap()
+            .unwrap();
+
+        let error = claim_occurrence_by_id_at_revision(
+            &conn,
+            "revision-race-occ",
+            "daemon-a",
+            expected.revision,
+            &expected.definition_digest,
+            now,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("changed before claim"), "{error}");
+        let state: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, definition_json, deadline_at
+                 FROM automation_occurrences WHERE id = 'revision-race-occ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("planned".to_string(), None, None));
+    }
+
+    #[test]
+    fn concurrent_definition_update_is_serialized_before_revision_claim() {
+        let (temp, conn) = temp_store();
+        let first = definition("concurrent-revision", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &first).unwrap();
+        let expected = super::super::store::get_definition(&conn, "concurrent-revision")
+            .unwrap()
+            .unwrap();
+        let now = real_now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('concurrent-revision-occ', 'concurrent-revision', ?1,
+                     'planned', 0, ?1, ?1)",
+            rusqlite::params![now_iso],
+        )
+        .unwrap();
+
+        let update_conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let update = rusqlite::Transaction::new_unchecked(
+            &update_conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )
+        .unwrap();
+        let mut changed = first;
+        changed.timeout_minutes = 120;
+        changed.prompt = "concurrent revision B".to_string();
+        super::super::store::update_definition(&update, &changed)
+            .unwrap()
+            .unwrap();
+
+        let store_path = temp.path().join("store.sqlite");
+        let expected_digest = expected.definition_digest.clone();
+        let expected_revision = expected.revision;
+        let claimant = std::thread::spawn(move || {
+            let claim_conn = crate::store::open_store(&store_path).unwrap();
+            claim_occurrence_by_id_at_revision(
+                &claim_conn,
+                "concurrent-revision-occ",
+                "daemon-a",
+                expected_revision,
+                &expected_digest,
+                now,
+            )
+        });
+        update.commit().unwrap();
+
+        let error = claimant.join().unwrap().unwrap_err();
+        assert!(error.contains("changed before claim"), "{error}");
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences
+                 WHERE id = 'concurrent-revision-occ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+    }
+
+    #[test]
     fn recovers_expired_leases_to_failed() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
@@ -836,10 +1083,18 @@ mod tests {
         let occurrence_id = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now())
             .unwrap()
             .unwrap();
+        let deadline: String = conn
+            .query_row(
+                "SELECT deadline_at FROM automation_occurrences WHERE id = ?1",
+                rusqlite::params![occurrence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         // Running keeps the lease alive, so recovery leaves it alone.
         assert!(
-            mark_occurrence_running(&conn, &occurrence_id, "daemon-a", 60, real_now()).unwrap()
+            mark_occurrence_running(&conn, &occurrence_id, "daemon-a", &deadline, real_now())
+                .unwrap()
         );
         let (state, owner): (String, Option<String>) = conn
             .query_row(
@@ -873,15 +1128,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_out_of_range_lease() {
+    fn maximum_timeout_claim_preserves_the_full_deadline() {
         let (_temp, conn) = temp_store();
-        assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", 0, real_now()).is_err());
-        assert!(
-            mark_occurrence_running(&conn, "occ-x", "daemon-a", 44_640, real_now()).is_ok(),
-            "the definition validator's maximum timeout must be supported without truncation"
+        let mut routine = definition("maximum-timeout", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        routine.timeout_minutes = 44_640;
+        insert_definition(&conn, &routine).unwrap();
+        let now = real_now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('maximum-timeout-occ', 'maximum-timeout', ?1,
+                     'planned', 0, ?1, ?1)",
+            rusqlite::params![now_iso],
+        )
+        .unwrap();
+
+        claim_occurrence_by_id(&conn, "maximum-timeout-occ", "daemon-a", 44_640, now)
+            .unwrap()
+            .unwrap();
+
+        let deadline: String = conn
+            .query_row(
+                "SELECT deadline_at FROM automation_occurrences
+                 WHERE id = 'maximum-timeout-occ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            deadline,
+            (now + chrono::Duration::minutes(44_640))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
         );
-        let too_long = 44_640 + 1;
-        assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", too_long, real_now()).is_err());
     }
 
     #[test]
