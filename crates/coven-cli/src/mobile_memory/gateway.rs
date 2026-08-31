@@ -27,7 +27,9 @@ use super::contract::{
     MobileOverviewTotals, MobileOverviewVerification, MobileSupersession, MobileVerificationState,
 };
 use super::identity::load_or_create_host_identity;
-use super::pairing::{PairingError, PairingManager, PairingProgress};
+use super::pairing::{
+    PairingCancellation, PairingError, PairingManager, PairingProgress, PairingState,
+};
 use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
@@ -787,7 +789,14 @@ struct LocalPairingInvitation {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalPairingStatus {
+    state: PairingState,
     phrase: Option<[String; 6]>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingCancellation {
+    state: PairingCancellation,
 }
 
 #[derive(serde::Deserialize)]
@@ -805,12 +814,46 @@ fn active_gateway() -> Result<Arc<MobileGatewayState>> {
         .context("mobile gateway is not running")
 }
 
+/// Version of the owner-local pairing control surface. Bumped whenever the
+/// request/response contract of the internal pairing routes changes in a way
+/// the `coven mobile pair` flow must negotiate before creating a pairing.
+pub(crate) const LOCAL_PAIRING_CONTROL_API_VERSION: u16 = 1;
+
+/// Additive capability advertisement for the owner-local pairing control
+/// surface. Older daemons do not expose the route at all; older CLIs ignore
+/// it. `pairing_cancellation` declares that this daemon serves the cancel
+/// route and that cancelling a live pairing fails closed, so the CLI can
+/// refuse to create a pairing it would not be able to retire on interrupt.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingCapabilities {
+    api_version: u16,
+    pairing_cancellation: bool,
+}
+
 pub(crate) fn handle_local_control(
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Option<Result<crate::api::ApiResponse>> {
     const ROOT: &str = "/api/v1/internal/mobile/pairings";
+    if path == "/api/v1/internal/mobile/capabilities" {
+        if method != "GET" {
+            return Some(crate::api::api_error(
+                405,
+                "method_not_allowed",
+                "Method not allowed.",
+                None,
+            ));
+        }
+        return Some(crate::api::json_response(
+            200,
+            &LocalPairingCapabilities {
+                api_version: LOCAL_PAIRING_CONTROL_API_VERSION,
+                pairing_cancellation: true,
+            },
+        ));
+    }
     if path == ROOT {
         if method != "POST" {
             return Some(crate::api::api_error(
@@ -871,12 +914,66 @@ pub(crate) fn handle_local_control(
     Some((|| {
         let state = active_gateway()?;
         match (method, action) {
-            ("POST", "status") => crate::api::json_response(
-                200,
-                &LocalPairingStatus {
-                    phrase: state.pairing.phrase(id, Utc::now())?,
-                },
-            ),
+            ("POST", "status") => {
+                let report = state.pairing.status(id, Utc::now())?;
+                if matches!(
+                    report.state,
+                    PairingState::Cancelled | PairingState::Expired
+                ) {
+                    // Terminal replay of this pairing: retry any pending
+                    // cancellation audit delivery whose append failed when the
+                    // pairing was cancelled.
+                    super::audit::flush_pending_pairing_cancellations(&state.coven_home);
+                }
+                crate::api::json_response(
+                    200,
+                    &LocalPairingStatus {
+                        state: report.state,
+                        phrase: report.phrase,
+                    },
+                )
+            }
+            ("POST", "cancel") => {
+                let outcome = state.pairing.cancel(id, Utc::now())?;
+                if outcome == PairingCancellation::Cancelled {
+                    // Persist an idempotent audit-pending token before
+                    // attempting delivery: if the append below fails, any
+                    // later terminal replay retries the record instead of the
+                    // cancellation being permanently unrecorded. The token is
+                    // best-effort — persistence problems never delay the
+                    // fail-closed cancellation response.
+                    if let Err(error) =
+                        super::audit::record_pending_pairing_cancelled(&state.coven_home, id)
+                    {
+                        eprintln!(
+                            "coven mobile gateway: pairing cancellation audit token was not persisted: {error:#}"
+                        );
+                    }
+                    match append_event(
+                        &state.coven_home,
+                        Utc::now(),
+                        MobileAuditEvent::PairingCancelled,
+                        None,
+                    ) {
+                        Ok(()) => {
+                            let _ = super::audit::remove_pending_pairing_cancelled(
+                                &state.coven_home,
+                                id,
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "coven mobile gateway: pairing cancellation audit record is pending: {error:#}"
+                            );
+                        }
+                    }
+                } else {
+                    // Terminal replay: retry pending cancellation audit
+                    // delivery before answering.
+                    super::audit::flush_pending_pairing_cancellations(&state.coven_home);
+                }
+                crate::api::json_response(200, &LocalPairingCancellation { state: outcome })
+            }
             ("POST", "confirm") => {
                 let confirmation: LocalPairingConfirmation =
                     serde_json::from_str(body.context("pairing confirmation omitted body")?)?;
@@ -1149,6 +1246,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn local_control_advertises_pairing_cancellation_capability() {
+        // The advertisement is static: it does not require a running mobile
+        // gateway, and it must be served before any pairing is created.
+        let response = handle_local_control("GET", "/api/v1/internal/mobile/capabilities", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let capabilities: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            capabilities["apiVersion"],
+            serde_json::json!(LOCAL_PAIRING_CONTROL_API_VERSION)
+        );
+        assert_eq!(capabilities["pairingCancellation"], serde_json::json!(true));
+
+        let rejected = handle_local_control("POST", "/api/v1/internal/mobile/capabilities", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.status, 405);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn malformed_mobile_config_does_not_disable_local_daemon_startup() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1278,6 +1397,23 @@ mod tests {
                 maximum: 1,
             },
         }
+    }
+
+    /// The device enrollment body as an untrusted caller would send it — the
+    /// request contract is deserialization-only, so tests encode raw JSON.
+    fn sample_pairing_body(nonce: [u8; 32]) -> Vec<u8> {
+        let signing_key = p256::SecretKey::from_slice(&[1; 32]).unwrap();
+        let public_key = signing_key.public_key().to_encoded_point(false);
+        serde_json::json!({
+            "protocolVersion": super::super::MOBILE_PROTOCOL_VERSION,
+            "pairingNonce": URL_SAFE_NO_PAD.encode(nonce),
+            "deviceName": "Synthetic phone",
+            "devicePublicKey": URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+            "appVersion": "1.0.0",
+            "supportedProtocol": { "minimum": 1, "maximum": 1 }
+        })
+        .to_string()
+        .into_bytes()
     }
 
     fn envelope_data(body: &str) -> serde_json::Value {
@@ -1462,5 +1598,249 @@ mod tests {
             200
         );
         assert_eq!(completions("replays"), 1);
+    }
+
+    #[test]
+    fn local_control_cancellation_is_idempotent_and_audits_once() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let invitation = state
+            .pairing
+            .begin_pairing([13; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let cancel_path = format!("/api/v1/internal/mobile/pairings/{}/cancel", invitation.id);
+
+        let first = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first.body).unwrap()["state"],
+            "cancelled"
+        );
+
+        let replay = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&replay.body).unwrap()["state"],
+            "already_terminal"
+        );
+
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert_eq!(outbox.trim(), "[]");
+    }
+
+    #[test]
+    fn pairing_cancellation_audit_survives_a_failed_delivery_until_replay() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let response = handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+            .unwrap()
+            .unwrap();
+        let id = serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        // Break audit delivery only: a symlinked audit file fails the
+        // private-file validation and the O_NOFOLLOW open while the mobile
+        // directory holding the outbox stays writable.
+        std::fs::remove_file(temp.path().join("mobile/audit.jsonl")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/dev/null", temp.path().join("mobile/audit.jsonl")).unwrap();
+
+        let cancel_path = format!("/api/v1/internal/mobile/pairings/{id}/cancel");
+        let cancel = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        // The fail-closed cancellation is neither delayed nor masked by the
+        // audit persistence failure.
+        assert_eq!(cancel.status, 200);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&cancel.body).unwrap()["state"],
+            "cancelled"
+        );
+        // The record is owed, not lost: the tombstone token is pending.
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert!(outbox.contains(&id));
+
+        // A later terminal replay of the pairing delivers the pending record.
+        std::fs::remove_file(temp.path().join("mobile/audit.jsonl")).unwrap();
+        let status = handle_local_control(
+            "POST",
+            &format!("/api/v1/internal/mobile/pairings/{id}/status"),
+            Some("{}"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(status.status, 200);
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        assert_eq!(outbox.trim(), "[]");
+
+        // Repeated terminal replays stay idempotent.
+        let _ = handle_local_control(
+            "POST",
+            &format!("/api/v1/internal/mobile/pairings/{id}/status"),
+            Some("{}"),
+        )
+        .unwrap()
+        .unwrap();
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+    }
+
+    #[test]
+    fn cancelled_pairings_fail_closed_for_device_callers() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let invitation = state
+            .pairing
+            .begin_pairing([17; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        assert_eq!(
+            state.pairing.cancel(invitation.id, now).unwrap(),
+            PairingCancellation::Cancelled
+        );
+
+        let enrollment = handle_pairing_enrollment(
+            &state,
+            MobileHttpRequest {
+                method: "POST".to_owned(),
+                target: "/api/v1/mobile/pairings".to_owned(),
+                headers: HashMap::new(),
+                body: sample_pairing_body(invitation.nonce),
+            },
+        );
+        assert_eq!(enrollment.status, 409);
+        assert!(enrollment.body.contains("pairing_consumed"));
+
+        let path = format!("/api/v1/mobile/pairings/{}/confirm", invitation.id);
+        let confirmation = handle_pairing_confirmation(
+            &state,
+            &path,
+            MobileHttpRequest {
+                method: "POST".to_owned(),
+                target: path.clone(),
+                headers: HashMap::new(),
+                body: serde_json::json!({ "phrase": ["a", "b", "c", "d", "e", "f"] })
+                    .to_string()
+                    .into_bytes(),
+            },
+        );
+        assert_eq!(confirmation.status, 409);
+        assert!(confirmation.body.contains("pairing_confirmation_required"));
+        assert!(state.registry.list_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn device_callers_cannot_distinguish_cancellation_from_a_consumed_pairing() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+        let state = active_gateway().unwrap();
+        let now = Utc::now();
+        let cancelled = state
+            .pairing
+            .begin_pairing([19; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let live = state
+            .pairing
+            .begin_pairing([23; 32], now + PAIRING_LIFETIME)
+            .unwrap();
+        let cancelled_phrase = state
+            .pairing
+            .enroll(
+                cancelled.id,
+                cancelled.nonce,
+                sample_pairing_request(cancelled.nonce),
+                state.host_fingerprint,
+                now,
+            )
+            .unwrap()
+            .phrase;
+        let live_phrase = state
+            .pairing
+            .enroll(
+                live.id,
+                live.nonce,
+                sample_pairing_request(live.nonce),
+                state.host_fingerprint,
+                now,
+            )
+            .unwrap()
+            .phrase;
+        assert_eq!(
+            state.pairing.cancel(cancelled.id, now).unwrap(),
+            PairingCancellation::Cancelled
+        );
+
+        let confirm_probe = |id: Uuid, phrase: &[String]| {
+            let path = format!("/api/v1/mobile/pairings/{id}/confirm");
+            handle_pairing_confirmation(
+                &state,
+                &path,
+                MobileHttpRequest {
+                    method: "POST".to_owned(),
+                    target: path.clone(),
+                    headers: HashMap::new(),
+                    body: serde_json::json!({ "phrase": phrase })
+                        .to_string()
+                        .into_bytes(),
+                },
+            )
+        };
+        let enroll_probe = |nonce: [u8; 32]| {
+            handle_pairing_enrollment(
+                &state,
+                MobileHttpRequest {
+                    method: "POST".to_owned(),
+                    target: "/api/v1/mobile/pairings".to_owned(),
+                    headers: HashMap::new(),
+                    body: sample_pairing_body(nonce),
+                },
+            )
+        };
+
+        let error_code = |response: &MobileHttpResponse| {
+            serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["error"]["code"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+
+        // Before the deadline a cancelled pairing answers exactly like the
+        // live, already-consumed control: consumed for enrollment, waiting
+        // for confirmation for a correct phrase.
+        for (cancelled_probe, live_probe) in [
+            (enroll_probe(cancelled.nonce), enroll_probe(live.nonce)),
+            (
+                confirm_probe(cancelled.id, &cancelled_phrase),
+                confirm_probe(live.id, &live_phrase),
+            ),
+        ] {
+            assert_eq!(cancelled_probe.status, live_probe.status);
+            assert_eq!(error_code(&cancelled_probe), error_code(&live_probe));
+        }
     }
 }

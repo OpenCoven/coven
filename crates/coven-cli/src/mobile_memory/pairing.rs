@@ -33,6 +33,16 @@ pub struct PendingPairing {
     pub device_confirmed: bool,
     pub consumed: bool,
     pub completed: Option<MobilePairedDevice>,
+    pub terminal: Option<PairingTerminal>,
+}
+
+/// Terminal lifecycle states reached before completion. `cancelled` is set by
+/// an explicit owner cancellation, `expired` by the natural deadline; both are
+/// terminal for further enrollment or confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingTerminal {
+    Cancelled,
+    Expired,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +77,44 @@ pub enum PairingProgress {
     },
 }
 
+/// Owner-visible pairing lifecycle. The waiting states distinguish a pairing
+/// that has not seen a device yet from one whose phrase is awaiting
+/// confirmation, and the terminal states report why a pairing can no longer
+/// complete. This surfaces on the owner-only local control route only — a
+/// device caller never observes `cancelled` as a distinct state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingState {
+    Created,
+    Enrolled,
+    PartiallyConfirmed,
+    Completed,
+    Cancelled,
+    Expired,
+}
+
+/// Owner-facing pairing status. The phrase is only present while the
+/// transcript it was derived from still exists, so terminal states never
+/// carry material.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingStatusReport {
+    pub state: PairingState,
+    pub phrase: Option<[String; 6]>,
+}
+
+/// Outcome of an explicit cancellation. Cancellation is idempotent: every
+/// non-`Cancelled` outcome leaves the pairing exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingCancellation {
+    /// A live pairing was retired; enrollment and confirmation now fail closed.
+    Cancelled,
+    /// The pairing had already completed; the registered device grant is kept.
+    AlreadyCompleted,
+    /// The pairing was already cancelled or expired, or the id is unknown.
+    AlreadyTerminal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingError {
     PairingExpired,
@@ -89,6 +137,54 @@ impl fmt::Display for PairingError {
 }
 
 impl std::error::Error for PairingError {}
+
+impl PendingPairing {
+    /// Lifecycle state for the owner-facing status surface. A terminal state
+    /// always wins, so an expired or cancelled pairing can never look alive
+    /// again.
+    fn state(&self) -> PairingState {
+        if let Some(terminal) = self.terminal {
+            return match terminal {
+                PairingTerminal::Cancelled => PairingState::Cancelled,
+                PairingTerminal::Expired => PairingState::Expired,
+            };
+        }
+        if self.completed.is_some() {
+            return PairingState::Completed;
+        }
+        match (
+            self.transcript_hash.is_some(),
+            self.host_confirmed || self.device_confirmed,
+        ) {
+            (false, _) => PairingState::Created,
+            (true, false) => PairingState::Enrolled,
+            (true, true) => PairingState::PartiallyConfirmed,
+        }
+    }
+
+    /// Retire a live, uncompleted pairing at its deadline, dropping every
+    /// device and transcript material it still holds. Completed pairings are
+    /// already terminal, and a terminal state is never overwritten: a
+    /// cancelled pairing stays cancelled after its deadline passes.
+    fn mark_expired(&mut self) {
+        if self.completed.is_some() || self.terminal.is_some() {
+            return;
+        }
+        self.terminal = Some(PairingTerminal::Expired);
+        self.transcript_hash = None;
+        self.device = None;
+    }
+
+    /// Retire a live, uncompleted pairing on explicit owner cancellation,
+    /// dropping the device record and transcript material immediately. The
+    /// nonce hash is kept so device callers still find the tombstone and fail
+    /// closed instead of treating the pairing as never having existed.
+    fn mark_cancelled(&mut self) {
+        self.terminal = Some(PairingTerminal::Cancelled);
+        self.transcript_hash = None;
+        self.device = None;
+    }
+}
 
 pub struct PairingManager {
     registry: Arc<DeviceRegistry>,
@@ -138,6 +234,7 @@ impl PairingManager {
             device_confirmed: false,
             consumed: false,
             completed: None,
+            terminal: None,
         };
         let mut pending = self
             .pending
@@ -197,7 +294,7 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            pairing.mark_expired();
             return Err(PairingError::PairingExpired);
         }
         if pairing.consumed {
@@ -206,6 +303,13 @@ impl PairingManager {
         pairing.consumed = true;
         if Sha256::digest(nonce).as_slice() != pairing.nonce_hash {
             return Err(PairingError::PairingPhraseMismatch);
+        }
+        if pairing.terminal.is_some() {
+            // A cancelled pairing must fail closed even for the correct nonce.
+            // Reporting it as consumed keeps the device answer identical to an
+            // already-used pairing, so cancellation stays indistinguishable
+            // from ordinary consumption until the deadline passes.
+            return Err(PairingError::PairingConsumed);
         }
         validate_pairing_request(&request)?;
         let public_key = URL_SAFE_NO_PAD
@@ -280,20 +384,60 @@ impl PairingManager {
         self.confirm(pairing_id, phrase, now, false)
     }
 
-    pub fn phrase(
+    /// Report the owner-visible lifecycle state of a pairing. Only the phrase
+    /// the owner already displays is exposed — never the nonce, transcript, or
+    /// device material.
+    pub fn status(
         &self,
         pairing_id: Uuid,
         now: DateTime<Utc>,
-    ) -> Result<Option<[String; 6]>, PairingError> {
+    ) -> Result<PairingStatusReport, PairingError> {
         let mut pending = self.lock_pending(now, pairing_id)?;
         let pairing = pending
-            .get(&pairing_id)
+            .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
-            return Err(PairingError::PairingExpired);
+            pairing.mark_expired();
         }
-        Ok(pairing.transcript_hash.map(phrase_for_hash))
+        Ok(PairingStatusReport {
+            state: pairing.state(),
+            phrase: pairing.transcript_hash.map(phrase_for_hash),
+        })
+    }
+
+    /// Cancel a pending pairing on owner request.
+    ///
+    /// Cancellation is bounded — it sweeps expired entries like every other
+    /// operation — and idempotent: cancelling an unknown, already cancelled,
+    /// or already expired pairing reports `AlreadyTerminal`, and cancelling a
+    /// completed pairing reports `AlreadyCompleted` while leaving the enrolled
+    /// device grant untouched. A cancelled pairing drops its transcript and
+    /// device material immediately, so enrollment and confirmation fail closed
+    /// at once. The tombstone stays until the original deadline and then
+    /// answers exactly like a naturally expired pairing, which keeps
+    /// cancellation and expiry indistinguishable to an untrusted mobile
+    /// caller.
+    pub fn cancel(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PairingCancellation, PairingError> {
+        let mut pending = self.lock_pending(now, pairing_id)?;
+        let Some(pairing) = pending.get_mut(&pairing_id) else {
+            return Ok(PairingCancellation::AlreadyTerminal);
+        };
+        if now >= pairing.expires_at {
+            pairing.mark_expired();
+            return Ok(PairingCancellation::AlreadyTerminal);
+        }
+        if pairing.completed.is_some() {
+            return Ok(PairingCancellation::AlreadyCompleted);
+        }
+        if pairing.terminal.is_some() {
+            return Ok(PairingCancellation::AlreadyTerminal);
+        }
+        pairing.mark_cancelled();
+        Ok(PairingCancellation::Cancelled)
     }
 
     fn confirm(
@@ -308,7 +452,7 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            pairing.mark_expired();
             return Err(PairingError::PairingExpired);
         }
         let transcript_hash = pairing
@@ -1018,10 +1162,11 @@ mod tests {
 
             let after_first_expiry = harness.now + Duration::minutes(6);
             match prune_via {
-                "phrase" => assert_eq!(
-                    harness.manager.phrase(live_id, after_first_expiry).unwrap(),
-                    None
-                ),
+                "phrase" => {
+                    let report = harness.manager.status(live_id, after_first_expiry).unwrap();
+                    assert_eq!(report.state, PairingState::Created);
+                    assert_eq!(report.phrase, None);
+                }
                 "confirm" => assert_eq!(
                     harness
                         .manager
@@ -1060,6 +1205,260 @@ mod tests {
             harness.enroll_after_expiry().unwrap_err(),
             PairingError::PairingExpired
         );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancel_before_enrollment_fails_closed() {
+        let harness = PairingHarness::new();
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled
+        );
+        assert_eq!(
+            harness
+                .enroll_with_nonce(harness.pairing_nonce)
+                .unwrap_err(),
+            PairingError::PairingConsumed
+        );
+        let report = harness
+            .manager
+            .status(harness.pairing_id, harness.now)
+            .unwrap();
+        assert_eq!(report.state, PairingState::Cancelled);
+        assert_eq!(report.phrase, None);
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancel_after_enrollment_blocks_confirmation_and_drops_material() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled
+        );
+        assert_eq!(
+            harness
+                .manager
+                .confirm_host(harness.pairing_id, &pending.phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingConfirmationRequired
+        );
+        assert_eq!(
+            harness
+                .manager
+                .confirm_device(harness.pairing_id, &pending.phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingConfirmationRequired
+        );
+        let report = harness
+            .manager
+            .status(harness.pairing_id, harness.now)
+            .unwrap();
+        assert_eq!(report.state, PairingState::Cancelled);
+        assert_eq!(report.phrase, None);
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancel_after_one_confirmation_registers_no_device() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled
+        );
+        assert_eq!(
+            harness
+                .manager
+                .confirm_device(harness.pairing_id, &pending.phrase, harness.now)
+                .unwrap_err(),
+            PairingError::PairingConfirmationRequired
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn repeated_cancellation_is_idempotent_and_cannot_resurrect() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled
+        );
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::AlreadyTerminal
+        );
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now + Duration::minutes(6))
+                .unwrap(),
+            PairingCancellation::AlreadyTerminal
+        );
+        assert_eq!(
+            harness
+                .enroll_with_nonce(harness.pairing_nonce)
+                .unwrap_err(),
+            PairingError::PairingConsumed
+        );
+        assert_eq!(
+            harness
+                .manager
+                .confirm_device(
+                    harness.pairing_id,
+                    &pending.phrase,
+                    harness.now + Duration::minutes(6),
+                )
+                .unwrap_err(),
+            PairingError::PairingExpired
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancel_of_completed_pairing_preserves_the_device_grant() {
+        let harness = PairingHarness::new();
+        let pending = harness.enroll();
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&pending.phrase), false);
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::AlreadyCompleted
+        );
+        assert_eq!(harness.devices().len(), 1);
+        assert_eq!(harness.devices()[0].id, device.id);
+        assert_eq!(
+            assert_complete(harness.confirm_host(&pending.phrase), true),
+            device
+        );
+    }
+
+    #[test]
+    fn cancelled_pairings_expire_like_naturally_expired_pairings() {
+        // Two independent managers: past the deadline any operation sweeps
+        // entries it is not addressing, so a shared manager would let the
+        // first probe evict the second pairing before it is probed.
+        let cancelled_harness = PairingHarness::new();
+        let expired_harness = PairingHarness::new();
+        let cancelled_phrase = cancelled_harness.enroll().phrase;
+        let expired_phrase = expired_harness.enroll().phrase;
+        assert_eq!(
+            cancelled_harness
+                .manager
+                .cancel(cancelled_harness.pairing_id, cancelled_harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled
+        );
+        let after = cancelled_harness.now + Duration::minutes(6);
+
+        for (harness, phrase) in [
+            (&cancelled_harness, cancelled_phrase),
+            (&expired_harness, expired_phrase),
+        ] {
+            assert_eq!(
+                harness
+                    .manager
+                    .confirm_device(harness.pairing_id, &phrase, after)
+                    .unwrap_err(),
+                PairingError::PairingExpired
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .enroll_by_nonce(
+                        harness.pairing_nonce,
+                        harness.request.clone(),
+                        [3; 32],
+                        after
+                    )
+                    .unwrap_err(),
+                PairingError::PairingExpired
+            );
+            assert!(harness.devices().is_empty());
+        }
+    }
+
+    #[test]
+    fn status_reports_each_lifecycle_state() {
+        let harness = PairingHarness::new();
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap()
+                .state,
+            PairingState::Created
+        );
+        let pending = harness.enroll();
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap()
+                .state,
+            PairingState::Enrolled
+        );
+        assert_eq!(
+            harness.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap()
+                .state,
+            PairingState::PartiallyConfirmed
+        );
+        assert_complete(harness.confirm_device(&pending.phrase), false);
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap()
+                .state,
+            PairingState::Completed
+        );
+    }
+
+    #[test]
+    fn status_reports_expiry_without_keeping_material() {
+        let harness = PairingHarness::new();
+        harness.enroll();
+        let report = harness
+            .manager
+            .status(harness.pairing_id, harness.now + Duration::minutes(6))
+            .unwrap();
+        assert_eq!(report.state, PairingState::Expired);
+        assert_eq!(report.phrase, None);
         assert!(harness.devices().is_empty());
     }
 
