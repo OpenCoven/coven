@@ -38,7 +38,7 @@ The mobile authority already lives in `crates/coven-cli/src/mobile_memory/` (the
 | Concern | Code | Notes |
 | --- | --- | --- |
 | Grant object | `crates/coven-cli/src/mobile_memory/grant.rs` — `DeviceGrant` | `version`, `id` (UUIDv5), `subject_key_id`, `audience`, `scopes`, `restrictions`, `minimum_assurance`, `issued_at`, `not_before`, `expires_at`, `revocation_epoch` |
-| Capability vocabulary | `grant.rs` — `DeviceScope` | 12 snake_case scopes, serialized canonically sorted/unique (`validate_scope_set`) |
+| Capability vocabulary | `grant.rs` — `DeviceScope` | 12 snake_case scopes, serialized canonically (strictly increasing enum order) and unique (`validate_scope_set`) |
 | Assurance ranks | `grant.rs` — `AssuranceLevel` | 5 ordered levels: `possession` < `recent_user_verification` < `fresh_user_verification` < `fresh_biometric` < `step_up` |
 | Grant authorization | `grant.rs` — `DeviceGrant::authorize()` | scope membership + assurance-rank comparison + validity window; per-scope fresh-verification floor via `restrictions.require_fresh_user_verification_for` |
 | Request authentication | `auth.rs` — `MobileAuthenticator::verify` | canonical request `COVEN-MEMORY/1\n{method}\n{path}\n{timestamp}\n{nonce}\n{body_digest}`; P-256 ECDSA (DER); ±300 s window (`MOBILE_REQUEST_WINDOW_SECONDS`, `mod.rs`); 10,000-entry replay cache; 120 req/60 s per-device rate limit |
@@ -150,9 +150,9 @@ Platform PIN/passcode fallback is accepted when policy allows it, but it MUST be
 
 ### 4.5 Pairwise / pseudonymous device identity
 
-- The device uses one keypair per Coven trust domain (per `mobile-device-pairing-v1.md`, "Device identity"). The enrollment request's `pairwiseDeviceId` is generated per trust domain; hardware serials, advertising IDs, and Apple/Google account identifiers are forbidden inputs.
+- The device uses one keypair per Coven trust domain, freshly generated at each pairing ceremony (C-5; per `mobile-device-pairing-v1.md`, "Device identity"). The enrollment request's `pairwiseDeviceId` is generated per trust domain; hardware serials, advertising IDs, and Apple/Google account identifiers are forbidden inputs.
 - `docs/design/mobile-device-trust.md` requires this; current code is compatible: `DeviceRecord.id` is a host-assigned UUID and the protocol transmits only the public key and a display name (`pairing.rs` `validate_pairing_request`).
-- Recommendation: keep per-relationship keys "where practical" as the issue words it — i.e. the client SHOULD regenerate a key when pairing to a second Coven, but a user-chosen reuse of a key across their own Covens is not a protocol violation; correlatability protection is a property the *verifier* must not depend on (unknown-key pairs still fail closed).
+- Key reuse across pairing ceremonies or trust domains is a client-conformance violation, not a sanctioned fallback: C-5's fresh-keypair-per-ceremony rule is normative, and the earlier "user-chosen reuse of a key across their own Covens is not a protocol violation" reading is withdrawn as contradictory. What the *verifier* must not do is depend on global unlinkability for security: enrollment and authorization are keyed on the presented key itself (unknown keys still fail closed), so correlatability resistance is client-side defense in depth, never a server-side guarantee.
 
 ### 4.6 Binding the device key to the #785 enrollment transcript
 
@@ -195,7 +195,7 @@ The canonical object is defined in `docs/architecture/mobile-device-pairing-v1.m
 | `confirmationKey` | (not modeled) | spec keeps subject/confirmation separate for future delegation; v1 MAY be the same key |
 | `signature` | (implicit — the grant is stored inside the private registry, not a portable token; registry integrity is enforced by file permissions and atomic replace) | signed portable grants arrive with the CBOR/COSE canonical form |
 
-Diagnostic JSON form of the same grant as the current Rust registry serializes it (`serde(rename_all = "camelCase")`, `deny_unknown_fields`). Digests and key ids are shown in hex here for readability; the registry encodes `subjectKeyId` as canonical base64url (`URL_SAFE_NO_PAD`, `grant.rs::subject_key_id`):
+Diagnostic JSON form of the same grant as the current Rust registry serializes it (`serde(rename_all = "camelCase")`, `deny_unknown_fields`). The `scopes` array is in canonical order — strictly increasing `DeviceScope` enum order as `validate_scope_set` enforces (declaration order, not alphabetical; an out-of-order set is rejected as `InvalidScopeSet`). Digests and key ids are shown in hex here for readability; the registry encodes `subjectKeyId` as canonical base64url (`URL_SAFE_NO_PAD`, `grant.rs::subject_key_id`):
 
 ```json
 {
@@ -203,7 +203,7 @@ Diagnostic JSON form of the same grant as the current Rust registry serializes i
   "id": "561413f5-3a57-5853-b386-29b04ffe59de",
   "subjectKeyId": "5f176879aa1dfa922aa8fcb3fd213537fce4047fe84455eb70a9664de65ca548",
   "audience": "local_coven_authority",
-  "scopes": ["conversation_read", "session_metadata_read", "tool_execution_approve", "tool_invocation_request"],
+  "scopes": ["session_metadata_read", "conversation_read", "tool_invocation_request", "tool_execution_approve"],
   "restrictions": {
     "transport": "any_authenticated",
     "requireFreshUserVerificationFor": ["tool_execution_approve"]
