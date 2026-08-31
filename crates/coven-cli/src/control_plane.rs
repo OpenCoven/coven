@@ -130,10 +130,24 @@ pub fn capabilities() -> CapabilityCatalog {
     }
 }
 
+pub(crate) fn automation_action_requires_owner_local(action: &str) -> bool {
+    matches!(
+        action,
+        "coven.automations.create"
+            | "coven.automations.update"
+            | "coven.automations.delete"
+            | "coven.automations.tick"
+            | "coven.automations.run"
+            | "coven.automations.import"
+    )
+}
+
 pub fn route_action(
     payload: Value,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
+    coven_home: &std::path::Path,
+    authority: crate::api::RequestAuthority,
 ) -> (u16, ControlActionResponse) {
     if !payload.is_object() {
         return (
@@ -166,6 +180,18 @@ pub fn route_action(
         .map(str::trim)
         .filter(|intent_id| !intent_id.is_empty())
         .map(ToOwned::to_owned);
+
+    if automation_action_requires_owner_local(action)
+        && authority != crate::api::RequestAuthority::OwnerLocalIpc
+    {
+        return (
+            403,
+            rejected_action(
+                action,
+                "automation mutation and execution require owner-gated local IPC",
+            ),
+        );
+    }
 
     match action {
         "coven.capabilities.refresh" => {
@@ -249,7 +275,7 @@ pub fn route_action(
                 action,
                 origin,
                 intent_id,
-                automation_tick_payload(conn, now),
+                automation_tick_payload(conn, coven_home, runtime, now),
             );
             (200, event)
         }
@@ -294,7 +320,7 @@ pub fn route_action(
                     action,
                     origin,
                     intent_id,
-                    automation_run_payload(conn, runtime, &id, now),
+                    automation_run_payload(conn, coven_home, runtime, &id, now),
                 ),
                 Err(error) => return (400, rejected_action(action, error)),
             };
@@ -352,26 +378,31 @@ fn required_definition_field(
 
 fn automation_tick_payload(
     conn: &rusqlite::Connection,
+    coven_home: &std::path::Path,
+    runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
-    let report = match crate::automations::occurrences::tick(conn, now) {
-        Ok(report) => report,
-        Err(error) => return json!({ "error": format!("{error:#}") }),
-    };
-    let settled = match crate::automations::delivery::settle_finished_runs(conn, now) {
-        Ok(settled) => settled,
-        Err(error) => return json!({ "error": error }),
-    };
+    let report =
+        match crate::automations::daemon_tick::run_full_tick(conn, coven_home, runtime, now) {
+            Ok(report) => report,
+            Err(error) => return json!({ "error": format!("{error:#}") }),
+        };
+    let failed = [
+        report.occurrences.failed.clone(),
+        report.dispatch.failed.clone(),
+    ]
+    .concat();
     json!({
-        "planned": report.planned,
-        "alreadyFenced": report.already_fenced,
-        "pausedSkipped": report.paused_skipped,
-        "recovered": report.recovered,
-        "claimed": report.claimed,
-        "settledSucceeded": settled.settled_succeeded,
-        "settledFailed": settled.settled_failed,
-        "failures": settled.failures,
-        "failed": report.failed,
+        "planned": report.occurrences.planned,
+        "alreadyFenced": report.occurrences.already_fenced,
+        "pausedSkipped": report.occurrences.paused_skipped,
+        "recovered": report.occurrences.recovered,
+        "claimed": report.occurrences.claimed,
+        "dispatched": report.dispatch.dispatched,
+        "settledSucceeded": report.settlement.settled_succeeded,
+        "settledFailed": report.settlement.settled_failed,
+        "failures": report.settlement.failures,
+        "failed": failed,
     })
 }
 
@@ -411,13 +442,20 @@ fn automation_import_payload(conn: &rusqlite::Connection) -> Value {
 
 fn automation_run_payload(
     conn: &rusqlite::Connection,
+    coven_home: &std::path::Path,
     runtime: &dyn crate::api::SessionRuntime,
     id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
-            match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
+            match crate::automations::runner::run_routine_now(
+                conn,
+                coven_home,
+                runtime,
+                &definition,
+                now,
+            ) {
                 Ok(outcome) => json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
@@ -449,6 +487,10 @@ fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) ->
                         "exitCode": record.exit_code,
                         "logJson": record.log_json,
                         "outputCommit": record.output_commit,
+                        "definitionRevision": record.definition_revision,
+                        "definitionDigest": record.definition_digest,
+                        "outputTarget": record.output_target,
+                        "deadlineAt": record.deadline_at,
                         "startedAt": record.started_at,
                         "finishedAt": record.finished_at,
                     })

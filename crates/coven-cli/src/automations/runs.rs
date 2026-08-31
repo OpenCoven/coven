@@ -9,6 +9,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{params, Connection};
 
+use super::store::DefinitionSnapshot;
+
 pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_runs (
         id TEXT PRIMARY KEY NOT NULL,
@@ -21,6 +23,11 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         exit_code INTEGER,
         log_json TEXT,
         output_commit TEXT,
+        definition_revision INTEGER,
+        definition_digest TEXT,
+        definition_json TEXT,
+        output_target TEXT,
+        deadline_at TEXT,
         started_at TEXT NOT NULL,
         finished_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
@@ -51,10 +58,15 @@ pub struct RunRecord {
     pub exit_code: Option<i64>,
     pub log_json: Option<String>,
     pub output_commit: Option<String>,
+    pub definition_revision: Option<i64>,
+    pub definition_digest: Option<String>,
+    pub output_target: Option<String>,
+    pub deadline_at: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
 }
 
+#[cfg(test)]
 pub fn record_run_start(
     conn: &Connection,
     run_id: &str,
@@ -81,15 +93,41 @@ pub fn record_run_start(
     Ok(())
 }
 
-/// Attaches the launched session id to a still-running ledger row. The run
-/// has been dispatched but not settled: its terminal status, exit code, and
-/// bounded log arrive later via the reconciliation pass.
-pub fn record_run_session(conn: &Connection, run_id: &str, session_id: &str) -> Result<()> {
+pub struct PinnedRunStart<'a> {
+    pub run_id: &'a str,
+    pub automation_id: &'a str,
+    pub occurrence_id: &'a str,
+    pub session_id: Option<&'a str>,
+    pub familiar_id: Option<&'a str>,
+    pub runtime: &'a str,
+    pub snapshot: &'a DefinitionSnapshot,
+    pub deadline_at: &'a str,
+    pub now: DateTime<Utc>,
+}
+
+pub fn record_run_start_pinned(conn: &Connection, start: PinnedRunStart<'_>) -> Result<()> {
     conn.execute(
-        "UPDATE automation_runs SET session_id = ?2 WHERE id = ?1 AND status = 'running'",
-        params![run_id, session_id],
+        "INSERT INTO automation_runs
+            (id, automation_id, occurrence_id, session_id, familiar_id, runtime, status,
+             definition_revision, definition_digest, definition_json, output_target,
+             deadline_at, started_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            start.run_id,
+            start.automation_id,
+            start.occurrence_id,
+            start.session_id,
+            start.familiar_id,
+            start.runtime,
+            start.snapshot.revision,
+            start.snapshot.digest,
+            start.snapshot.definition_json,
+            start.snapshot.output_target,
+            start.deadline_at,
+            iso(start.now)
+        ],
     )
-    .context("failed to attach session id to run")?;
+    .context("failed to record pinned run start")?;
     Ok(())
 }
 
@@ -160,7 +198,8 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     let mut statement = conn
         .prepare(
             "SELECT id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                    status, exit_code, log_json, output_commit, started_at, finished_at
+                    status, exit_code, log_json, output_commit, definition_revision,
+                    definition_digest, output_target, deadline_at, started_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -180,8 +219,12 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
                 exit_code: row.get(7)?,
                 log_json: row.get(8)?,
                 output_commit: row.get(9)?,
-                started_at: row.get(10)?,
-                finished_at: row.get(11)?,
+                definition_revision: row.get(10)?,
+                definition_digest: row.get(11)?,
+                output_target: row.get(12)?,
+                deadline_at: row.get(13)?,
+                started_at: row.get(14)?,
+                finished_at: row.get(15)?,
             })
         })
         .context("failed to list runs")?;

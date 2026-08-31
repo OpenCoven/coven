@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::rrule::{parse_rrule, ParsedRrule};
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
+pub const AUTOMATION_TIMEOUT_MAX_MINUTES: u32 = 60 * 24 * 31;
 
 /// An automation identifier. Keep it stable across edits: the ledger and the
 /// scheduler key occurrences by this id.
@@ -143,7 +144,7 @@ impl RoutineDefinition {
         }
         let _: ParsedRrule = parse_rrule(&self.rrule)
             .map_err(|error| format!("rrule failed validation: {error}"))?;
-        if self.timeout_minutes == 0 || self.timeout_minutes > 60 * 24 * 31 {
+        if self.timeout_minutes == 0 || self.timeout_minutes > AUTOMATION_TIMEOUT_MAX_MINUTES {
             return Err("timeoutMinutes must be 1..=44640".to_string());
         }
         if self.runtime.trim().is_empty() || self.runtime.len() > 64 {

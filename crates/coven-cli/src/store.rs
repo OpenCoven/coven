@@ -977,6 +977,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation_occurrences schema")?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
+    crate::automations::store::ensure_snapshot_schema(conn)
+        .context("failed to migrate automation snapshot schema")?;
 
     backfill_events_fts_if_needed(conn)?;
 

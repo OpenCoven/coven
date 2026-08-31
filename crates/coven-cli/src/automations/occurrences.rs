@@ -1,7 +1,7 @@
 //! Occurrence planning with misfire-latest semantics (coven#816).
 //!
-//! The planner walks each ACTIVE routine's schedule forward from a bounded
-//! lookback and plans exactly the latest due slot: if the daemon was down
+//! The planner computes each ACTIVE routine's true latest due slot directly:
+//! if the daemon was down
 //! for three days of a daily routine, only the most recent missed slot is
 //! fenced — earlier slots are collapsed, never backfilled. The
 //! `UNIQUE(automation_id, scheduled_for)` fence makes planning idempotent
@@ -14,7 +14,10 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 
 use super::definition::{RoutineDefinition, RoutineStatus};
-use crate::automations::schedule::next_due;
+use crate::automations::schedule::latest_due;
+
+const OCCURRENCE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6f80_c451_5b65_4b02_a67c_0a4e_1279_eef1);
 
 pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_occurrences (
@@ -26,6 +29,11 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
         lease_expires_at TEXT,
         attempt INTEGER NOT NULL DEFAULT 0,
         failure_reason TEXT,
+        definition_revision INTEGER,
+        definition_digest TEXT,
+        definition_json TEXT,
+        output_target TEXT,
+        deadline_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(automation_id, scheduled_for)
@@ -66,6 +74,7 @@ pub struct TickReport {
 }
 
 const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
+const MAX_LEASE_MINUTES: i64 = super::definition::AUTOMATION_TIMEOUT_MAX_MINUTES as i64;
 
 /// Claims the earliest due PLANNED occurrence for a routine with a bounded
 /// lease. Returns the claimed occurrence id, or `None` when nothing is due
@@ -82,13 +91,16 @@ pub fn claim_due_occurrence(
     lease_minutes: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<String>, String> {
-    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
-        return Err("lease minutes must be 1..=1440".to_string());
+    if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
+        return Err("lease minutes must be 1..=44640".to_string());
     }
     let expires = now + chrono::Duration::minutes(lease_minutes);
     let now_iso = iso(now);
     let expires_iso = iso(expires);
-    let changed = conn
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin occurrence claim: {error}"))?;
+    let changed = tx
         .execute(
             "UPDATE automation_occurrences
              SET state = 'claimed',
@@ -116,15 +128,20 @@ pub fn claim_due_occurrence(
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
+        tx.commit()
+            .map_err(|error| format!("failed to commit empty occurrence claim: {error}"))?;
         return Ok(None);
     }
-    let id: String = conn
+    let id: String = tx
         .query_row(
             "SELECT id FROM automation_occurrences WHERE automation_id = ?1 AND state = 'claimed' AND lease_owner = ?2 ORDER BY scheduled_for ASC LIMIT 1",
             params![automation_id, owner],
             |row| row.get(0),
         )
         .map_err(|error| format!("failed to read claim: {error}"))?;
+    pin_occurrence_snapshot(&tx, &id, lease_minutes, now)?;
+    tx.commit()
+        .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
     Ok(Some(id))
 }
 
@@ -139,13 +156,16 @@ pub fn claim_occurrence_by_id(
     lease_minutes: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<String>, String> {
-    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
-        return Err("lease minutes must be 1..=1440".to_string());
+    if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
+        return Err("lease minutes must be 1..=44640".to_string());
     }
     let expires = now + chrono::Duration::minutes(lease_minutes);
     let now_iso = iso(now);
     let expires_iso = iso(expires);
-    let changed = conn
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin occurrence claim: {error}"))?;
+    let changed = tx
         .execute(
             "UPDATE automation_occurrences
              SET state = 'claimed',
@@ -168,15 +188,64 @@ pub fn claim_occurrence_by_id(
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
+        tx.commit()
+            .map_err(|error| format!("failed to commit empty occurrence claim: {error}"))?;
         return Ok(None);
     }
+    pin_occurrence_snapshot(&tx, occurrence_id, lease_minutes, now)?;
+    tx.commit()
+        .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
     Ok(Some(occurrence_id.to_string()))
 }
 
-/// Moves a claimed occurrence to `running` with a fresh bounded lease that
-/// outlives a healthy run of the routine (the definition timeout). A `running`
-/// row whose lease expires is recovered by `recover_expired_leases`, so a
-/// crashed dispatch never blocks the routine forever (coven#816).
+fn pin_occurrence_snapshot(
+    conn: &Connection,
+    occurrence_id: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let automation_id: String = conn
+        .query_row(
+            "SELECT automation_id FROM automation_occurrences WHERE id = ?1",
+            params![occurrence_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read occurrence routine: {error}"))?;
+    let record = super::store::get_definition(conn, &automation_id)
+        .map_err(|error| format!("failed to read routine snapshot: {error:#}"))?
+        .ok_or_else(|| format!("routine `{automation_id}` vanished before claim"))?;
+    let snapshot = super::store::definition_snapshot(&record)
+        .map_err(|error| format!("failed to snapshot routine: {error:#}"))?;
+    let deadline = iso(now + chrono::Duration::minutes(lease_minutes));
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET definition_revision = ?2,
+                 definition_digest = ?3,
+                 definition_json = ?4,
+                 output_target = ?5,
+                 deadline_at = ?6
+             WHERE id = ?1 AND state = 'claimed'",
+            params![
+                occurrence_id,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target,
+                deadline
+            ],
+        )
+        .map_err(|error| format!("failed to pin routine snapshot: {error}"))?;
+    if changed != 1 {
+        return Err("occurrence changed while pinning its routine snapshot".to_string());
+    }
+    Ok(())
+}
+
+/// Compare-and-sets a claimed occurrence to `running` with a fresh bounded
+/// lease that outlives a healthy run of the routine. Linked running rows are
+/// reconciled against their pinned deadline; only unlinked stale rows use
+/// lease recovery.
 pub fn mark_occurrence_running(
     conn: &Connection,
     occurrence_id: &str,
@@ -184,8 +253,8 @@ pub fn mark_occurrence_running(
     lease_minutes: i64,
     now: DateTime<Utc>,
 ) -> Result<bool, String> {
-    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
-        return Err("lease minutes must be 1..=1440".to_string());
+    if lease_minutes <= 0 || lease_minutes > MAX_LEASE_MINUTES {
+        return Err("lease minutes must be 1..=44640".to_string());
     }
     let expires = now + chrono::Duration::minutes(lease_minutes);
     let now_iso = iso(now);
@@ -197,15 +266,17 @@ pub fn mark_occurrence_running(
                  lease_owner = ?3,
                  lease_expires_at = ?4,
                  updated_at = ?2
-             WHERE id = ?1 AND state IN ('claimed', 'running')",
+             WHERE id = ?1 AND state = 'claimed'",
             params![occurrence_id, now_iso, owner, expires_iso],
         )
         .map_err(|error| format!("failed to mark occurrence running: {error}"))?;
     Ok(changed > 0)
 }
 
-/// Marks occurrences whose lease has expired as failed with a stale reason.
-/// A stale lease must never render as live work (coven#816).
+/// Marks unresolved occurrences whose lease has expired as failed. Running
+/// rows with a linked running ledger entry are reconciled by `delivery`, which
+/// compares the session's actual completion time with the pinned deadline;
+/// blindly failing them here could create occurrence/run contradictions.
 pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<usize, String> {
     let now_iso = iso(now);
     let changed = conn
@@ -218,7 +289,12 @@ pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<u
                  updated_at = ?1
              WHERE state IN ('claimed', 'running')
                AND lease_expires_at IS NOT NULL
-               AND lease_expires_at < ?1",
+               AND lease_expires_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs AS run
+                   WHERE run.occurrence_id = automation_occurrences.id
+                     AND run.status = 'running'
+               )",
             params![now_iso],
         )
         .map_err(|error| format!("failed to recover expired leases: {error}"))?;
@@ -275,10 +351,16 @@ pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
         }
     }
 
-    report.recovered = recover_expired_leases(conn, now).unwrap_or(0);
+    report.recovered = recover_expired_leases(conn, now).map_err(anyhow::Error::msg)?;
 
     for definition in &definitions {
-        match claim_due_occurrence(conn, &definition.id, "daemon", 60, now) {
+        match claim_due_occurrence(
+            conn,
+            &definition.id,
+            "daemon",
+            i64::from(definition.timeout_minutes),
+            now,
+        ) {
             Ok(Some(id)) => report.claimed.push(id),
             Ok(None) => {}
             Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
@@ -340,21 +422,7 @@ fn latest_due_slot_after(
     cursor: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, String> {
-    let mut walk = cursor;
-    let mut latest: Option<DateTime<Utc>> = None;
-
-    for _ in 0..96 {
-        let Some(next) = next_due(&definition.rrule, definition.timezone, walk)? else {
-            break;
-        };
-        if next > now {
-            break;
-        }
-        latest = Some(next);
-        walk = next;
-    }
-
-    Ok(latest)
+    latest_due(&definition.rrule, definition.timezone, cursor, now)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +466,11 @@ pub fn plan_latest_due_occurrence(
 
     let slot_iso = iso(slot);
     let now_iso = iso(now);
-    let id = format!("{}-{}", definition.id, slot.timestamp_millis());
+    let occurrence_key = format!("{}@{slot_iso}", definition.id);
+    let id = format!(
+        "occ-{}",
+        uuid::Uuid::new_v5(&OCCURRENCE_ID_NAMESPACE, occurrence_key.as_bytes())
+    );
     let changed = conn
         .execute(
             "INSERT OR IGNORE INTO automation_occurrences
@@ -462,7 +534,7 @@ mod tests {
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
-    use chrono::Timelike;
+    use chrono::{TimeZone, Timelike};
     use serde_json::json;
 
     fn temp_store() -> (tempfile::TempDir, Connection) {
@@ -563,6 +635,53 @@ mod tests {
     }
 
     #[test]
+    fn daily_latest_misfire_is_correct_beyond_ninety_six_slots() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("long-gap", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        let created = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 12, 0, 0).unwrap();
+
+        plan_latest_due_occurrence(&conn, &routine, created, now).unwrap();
+
+        let scheduled: String = conn
+            .query_row(
+                "SELECT scheduled_for FROM automation_occurrences WHERE automation_id = 'long-gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled, "2026-08-28T09:00:00.000Z");
+        let occurrence_id: String = conn
+            .query_row(
+                "SELECT id FROM automation_occurrences WHERE automation_id = 'long-gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        uuid::Uuid::parse_str(occurrence_id.trim_start_matches("occ-")).unwrap();
+    }
+
+    #[test]
+    fn twice_daily_latest_misfire_is_correct_beyond_ninety_six_slots() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("twice-long-gap", "ACTIVE", "FREQ=DAILY;BYHOUR=9,17");
+        let created = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 28, 20, 0, 0).unwrap();
+
+        plan_latest_due_occurrence(&conn, &routine, created, now).unwrap();
+
+        let scheduled: String = conn
+            .query_row(
+                "SELECT scheduled_for FROM automation_occurrences
+                 WHERE automation_id = 'twice-long-gap'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled, "2026-08-28T17:00:00.000Z");
+    }
+
+    #[test]
     fn future_slots_are_not_fenced() {
         let (_temp, conn) = temp_store();
         let now = real_now();
@@ -595,6 +714,27 @@ mod tests {
 
         let claimed = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
         assert!(claimed.is_some());
+        let (revision, digest, snapshot, deadline): (
+            Option<i64>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT definition_revision, definition_digest, definition_json, deadline_at
+                 FROM automation_occurrences WHERE id = ?1",
+                rusqlite::params![claimed.as_deref().unwrap()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(revision, Some(1));
+        assert!(digest
+            .as_deref()
+            .is_some_and(|value| value.starts_with("sha256:")));
+        assert!(snapshot
+            .as_deref()
+            .is_some_and(|value| value.contains("\"id\":\"daily\"")));
+        assert!(deadline.is_some());
 
         // A second claimant finds nothing left to claim.
         let second = claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now()).unwrap();
@@ -736,7 +876,11 @@ mod tests {
     fn rejects_an_out_of_range_lease() {
         let (_temp, conn) = temp_store();
         assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", 0, real_now()).is_err());
-        let too_long = 24 * 60 + 1;
+        assert!(
+            mark_occurrence_running(&conn, "occ-x", "daemon-a", 44_640, real_now()).is_ok(),
+            "the definition validator's maximum timeout must be supported without truncation"
+        );
+        let too_long = 44_640 + 1;
         assert!(mark_occurrence_running(&conn, "occ-x", "daemon-a", too_long, real_now()).is_err());
     }
 

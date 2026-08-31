@@ -1,21 +1,23 @@
 //! Routine run dispatch (coven#816).
 //!
 //! A run is a claimed occurrence dispatched through the exact session-launch
-//! path every other launch uses: the definition is re-read, the familiar and
-//! runtime are re-validated per run, a SessionLaunch is built, and the run
-//! goes in flight under a bounded lease. Coven (not a harness home) owns the
-//! record; terminal status, bounded log, and output delivery land through
-//! the delivery reconciliation pass.
+//! path every other launch uses. Claiming pins the immutable definition
+//! revision/digest and delivery inputs; dispatch revalidates the pinned
+//! familiar/runtime, durably links the occurrence, run, and session, and only
+//! then spawns. Coven (not a harness home) owns the record; terminal status,
+//! bounded log, and output delivery land through reconciliation.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
 
 use super::definition::RoutineDefinition;
 use super::occurrences::{claim_occurrence_by_id, mark_occurrence_running, settle_occurrence};
-use super::runs::{record_run_finish, record_run_session, record_run_start, RunFinish};
-use crate::api::{SessionLaunch, SessionRuntime};
+use super::runs::{record_run_finish, record_run_start_pinned, PinnedRunStart, RunFinish};
+use super::store::DefinitionSnapshot;
+use crate::api::{DurableSessionLaunchError, DurableSessionStore, SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,20 +29,16 @@ pub struct RunOutcome {
 }
 
 fn fresh_id(prefix: &str) -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0);
-    format!("{prefix}-{millis}")
+    format!("{prefix}-{}", Uuid::new_v4())
 }
 
 /// The dispatch lease for a routine run: the definition's own timeout,
-/// bounded to the same 1..=1440 minute window claims use. The lease must
+/// using the same 1..=44640 minute window claims and validation support. The lease must
 /// outlive a healthy run so lease recovery only ever catches genuinely
 /// wedged work (coven#816: "never let a stale running record block a
 /// routine forever").
 fn run_lease_minutes(definition: &RoutineDefinition) -> i64 {
-    i64::from(definition.timeout_minutes.clamp(1, 24 * 60))
+    i64::from(definition.timeout_minutes)
 }
 
 fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
@@ -55,6 +53,296 @@ fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
     }
 }
 
+struct PinnedOccurrence {
+    id: String,
+    automation_id: String,
+    definition: RoutineDefinition,
+    snapshot: DefinitionSnapshot,
+    deadline_at: String,
+}
+
+struct PinnedOccurrenceRow {
+    automation_id: String,
+    revision: Option<i64>,
+    digest: Option<String>,
+    definition_json: Option<String>,
+    output_target: Option<String>,
+    deadline_at: Option<String>,
+}
+
+fn load_pinned_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+) -> Result<PinnedOccurrence, String> {
+    let row = conn
+        .query_row(
+            "SELECT automation_id, definition_revision, definition_digest, definition_json,
+                    output_target, deadline_at
+             FROM automation_occurrences
+             WHERE id = ?1 AND state = 'claimed'",
+            params![occurrence_id],
+            |row| {
+                Ok(PinnedOccurrenceRow {
+                    automation_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    digest: row.get(2)?,
+                    definition_json: row.get(3)?,
+                    output_target: row.get(4)?,
+                    deadline_at: row.get(5)?,
+                })
+            },
+        )
+        .map_err(|error| format!("failed to read claimed occurrence: {error}"))?;
+    let revision = row
+        .revision
+        .ok_or_else(|| "claimed occurrence has no pinned revision".to_string())?;
+    let digest = row
+        .digest
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "claimed occurrence has no pinned definition digest".to_string())?;
+    let definition_json = row
+        .definition_json
+        .ok_or_else(|| "claimed occurrence has no pinned definition".to_string())?;
+    let deadline_at = row
+        .deadline_at
+        .ok_or_else(|| "claimed occurrence has no pinned deadline".to_string())?;
+    let definition: RoutineDefinition =
+        serde_json::from_str(&definition_json).map_err(|error| {
+            format!(
+                "pinned routine `{}` is unreadable: {error}",
+                row.automation_id
+            )
+        })?;
+    Ok(PinnedOccurrence {
+        id: occurrence_id.to_string(),
+        automation_id: row.automation_id,
+        definition,
+        snapshot: DefinitionSnapshot {
+            revision,
+            digest,
+            definition_json,
+            output_target: row.output_target,
+        },
+        deadline_at,
+    })
+}
+
+fn automation_launch(
+    coven_home: &Path,
+    pinned: &PinnedOccurrence,
+) -> Result<SessionLaunch, String> {
+    crate::session_launch::validate_harness(
+        &pinned.definition.runtime,
+        crate::session_launch::HarnessCheck::Configured,
+    )
+    .map_err(|error| format!("{error:#}"))?;
+    let cwd = pinned
+        .definition
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+        .ok_or_else(|| "routine has no cwd; add a cwd before running".to_string())?;
+    let paths = crate::session_launch::resolve_launch_paths(Path::new(cwd), Some(Path::new(cwd)))
+        .map_err(|error| match error {
+        crate::session_launch::LaunchPathError::ProjectRoot(error)
+        | crate::session_launch::LaunchPathError::Cwd(error) => format!("{error:#}"),
+    })?;
+    let familiar = crate::session_launch::resolve_familiar(
+        coven_home,
+        pinned.definition.familiar_id.as_deref(),
+    )
+    .map_err(crate::session_launch::FamiliarError::into_error)
+    .map_err(|error| format!("{error:#}"))?;
+    let mut launch = build_session_launch(&pinned.definition, &paths.cwd.to_string_lossy())?;
+    launch.project_root = paths.project_root.to_string_lossy().into_owned();
+    launch.cwd = paths.cwd.to_string_lossy().into_owned();
+    launch.familiar_id = familiar.as_ref().map(|context| context.id.clone());
+    Ok(launch)
+}
+
+fn durable_error_text(error: DurableSessionLaunchError) -> String {
+    match error {
+        DurableSessionLaunchError::Maintenance(error)
+        | DurableSessionLaunchError::Persistence(error)
+        | DurableSessionLaunchError::Runtime(error) => format!("{error:#}"),
+        DurableSessionLaunchError::AlreadyDispatched => {
+            "occurrence was already dispatched".to_string()
+        }
+        DurableSessionLaunchError::Rejected(response) => {
+            format!("durable automation launch was rejected: {}", response.body)
+        }
+    }
+}
+
+fn settle_launch_failure(
+    conn: &Connection,
+    pinned: &PinnedOccurrence,
+    run_id: &str,
+    session_id: Option<&str>,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin launch-failure settlement: {error}"))?;
+    let existing_session_id: Option<Option<String>> = transaction
+        .query_row(
+            "SELECT session_id FROM automation_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect launch-failure run: {error}"))?;
+    if existing_session_id.is_none() {
+        record_run_start_pinned(
+            &transaction,
+            PinnedRunStart {
+                run_id,
+                automation_id: &pinned.automation_id,
+                occurrence_id: &pinned.id,
+                session_id,
+                familiar_id: pinned.definition.familiar_id.as_deref(),
+                runtime: &pinned.definition.runtime,
+                snapshot: &pinned.snapshot,
+                deadline_at: &pinned.deadline_at,
+                now,
+            },
+        )
+        .map_err(|error| format!("failed to record rejected run: {error:#}"))?;
+    }
+    let session_id = existing_session_id
+        .flatten()
+        .or_else(|| session_id.map(str::to_string));
+    if !settle_occurrence(&transaction, &pinned.id, "failed", Some(reason), now)? {
+        return Err("failed to terminally settle rejected occurrence".to_string());
+    }
+    let finished = record_run_finish(
+        &transaction,
+        run_id,
+        RunFinish {
+            status: "failed",
+            exit_code: None,
+            session_id,
+            log_json: None,
+            output_commit: None,
+        },
+        now,
+    )
+    .map_err(|error| format!("failed to terminally settle rejected run: {error:#}"))?;
+    if !finished {
+        return Err("failed to terminally settle rejected run".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit launch-failure settlement: {error}"))
+}
+
+fn dispatch_pinned_occurrence(
+    conn: &Connection,
+    coven_home: &Path,
+    runtime: &dyn SessionRuntime,
+    pinned: &PinnedOccurrence,
+    owner: &str,
+    now: DateTime<Utc>,
+) -> Result<RunOutcome, String> {
+    let run_id = fresh_id("run");
+    let launch = match automation_launch(coven_home, pinned) {
+        Ok(launch) => launch,
+        Err(reason) => {
+            settle_launch_failure(conn, pinned, &run_id, None, &reason, now)?;
+            return Ok(RunOutcome {
+                run_id,
+                status: "failed".to_string(),
+                session_id: None,
+                error: Some(reason),
+            });
+        }
+    };
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let record =
+        crate::session_launch::new_session_record(crate::session_launch::NewSessionParams {
+            id: launch.id.clone(),
+            project_root: launch.project_root.clone(),
+            harness: launch.harness.clone(),
+            title: launch.title.clone(),
+            status: "running".to_string(),
+            now: now_iso,
+            conversation_id: None,
+            familiar_id: launch.familiar_id.clone(),
+            execution_binding: None,
+            labels: Vec::new(),
+            visibility: None,
+        });
+    let result = crate::api::launch_durable_session(
+        coven_home,
+        DurableSessionStore::Existing(conn),
+        runtime,
+        &launch,
+        &record,
+        |transaction| {
+            let marked = mark_occurrence_running(
+                transaction,
+                &pinned.id,
+                owner,
+                run_lease_minutes(&pinned.definition),
+                now,
+            )
+            .map_err(anyhow::Error::msg)?;
+            if !marked {
+                return Err(DurableSessionLaunchError::AlreadyDispatched);
+            }
+            record_run_start_pinned(
+                transaction,
+                PinnedRunStart {
+                    run_id: &run_id,
+                    automation_id: &pinned.automation_id,
+                    occurrence_id: &pinned.id,
+                    session_id: Some(&launch.id),
+                    familiar_id: launch.familiar_id.as_deref(),
+                    runtime: &launch.harness,
+                    snapshot: &pinned.snapshot,
+                    deadline_at: &pinned.deadline_at,
+                    now,
+                },
+            )?;
+            Ok(())
+        },
+    );
+    match result {
+        Ok(()) => Ok(RunOutcome {
+            run_id,
+            status: "dispatched".to_string(),
+            session_id: Some(launch.id),
+            error: None,
+        }),
+        Err(DurableSessionLaunchError::AlreadyDispatched) => Ok(RunOutcome {
+            run_id: String::new(),
+            status: "already_dispatched".to_string(),
+            session_id: None,
+            error: None,
+        }),
+        Err(error) => {
+            let persisted_session = matches!(&error, DurableSessionLaunchError::Runtime(_));
+            let reason = durable_error_text(error);
+            settle_launch_failure(
+                conn,
+                pinned,
+                &run_id,
+                persisted_session.then_some(launch.id.as_str()),
+                &reason,
+                now,
+            )?;
+            Ok(RunOutcome {
+                run_id,
+                status: "failed".to_string(),
+                session_id: None,
+                error: Some(reason),
+            })
+        }
+    }
+}
+
 /// Runs a routine once, now: fences and claims an immediate occurrence,
 /// records a ledger row, dispatches through the shared session-launch path,
 /// and leaves the run in flight with a bounded lease. Settlement — terminal
@@ -64,11 +352,12 @@ fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
 /// previous occurrence fails the run (overlap: forbid).
 pub fn run_routine_now(
     conn: &Connection,
+    coven_home: &Path,
     runtime: &dyn SessionRuntime,
     definition: &RoutineDefinition,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
-    let Some(cwd) = definition
+    let Some(_cwd) = definition
         .cwd
         .as_deref()
         .map(str::trim)
@@ -96,71 +385,30 @@ pub fn run_routine_now(
         return Err("immediate occurrence fence collided; retry".to_string());
     }
 
-    let claimed = claim_occurrence_by_id(conn, &occurrence_id, "manual", 60, now)?;
+    let claimed = claim_occurrence_by_id(
+        conn,
+        &occurrence_id,
+        "manual",
+        run_lease_minutes(definition),
+        now,
+    )?;
     if claimed.is_none() {
         // The claim was refused — in practice a live sibling run appeared
         // first (overlap: forbid). Release our fence so the daemon can never
         // dispatch it later, then fail visibly.
-        let _ = conn.execute(
-            "DELETE FROM automation_occurrences WHERE id = ?1 AND state = 'planned'",
-            params![occurrence_id],
-        );
+        let deleted = conn
+            .execute(
+                "DELETE FROM automation_occurrences WHERE id = ?1 AND state = 'planned'",
+                params![occurrence_id],
+            )
+            .map_err(|error| format!("failed to release refused occurrence: {error}"))?;
+        if deleted != 1 {
+            return Err("refused occurrence changed before it could be released".to_string());
+        }
         return Ok(overlap_outcome(definition));
     }
-
-    let run_id = fresh_id("run");
-    record_run_start(
-        conn,
-        &run_id,
-        &definition.id,
-        Some(&occurrence_id),
-        definition.familiar_id.as_deref(),
-        &definition.runtime,
-        now,
-    )
-    .map_err(|error| format!("failed to record run start: {error:#}"))?;
-
-    let launch = build_session_launch(definition, cwd)?;
-
-    match runtime.launch_session(&launch) {
-        Ok(()) => {
-            // The run is in flight: keep the occurrence under a bounded
-            // lease, attach the session id, and let settlement happen from
-            // the Coven session store. Launch success is never reported as
-            // run success.
-            let lease = run_lease_minutes(definition);
-            let _ = mark_occurrence_running(conn, &occurrence_id, "manual", lease, now);
-            let _ = record_run_session(conn, &run_id, &launch.id);
-            Ok(RunOutcome {
-                run_id,
-                status: "dispatched".to_string(),
-                session_id: Some(launch.id),
-                error: None,
-            })
-        }
-        Err(error) => {
-            let reason = format!("{error:#}");
-            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-            let _ = record_run_finish(
-                conn,
-                &run_id,
-                RunFinish {
-                    status: "failed",
-                    exit_code: None,
-                    session_id: None,
-                    log_json: None,
-                    output_commit: None,
-                },
-                now,
-            );
-            Ok(RunOutcome {
-                run_id,
-                status: "failed".to_string(),
-                session_id: None,
-                error: Some(reason),
-            })
-        }
-    }
+    let pinned = load_pinned_occurrence(conn, &occurrence_id)?;
+    dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "manual", now)
 }
 
 /// Builds the shared SessionLaunch for a routine run. Every run — manual or
@@ -201,20 +449,21 @@ pub struct DispatchReport {
 /// a project.
 pub fn dispatch_claimed_occurrences(
     conn: &Connection,
+    coven_home: &Path,
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<DispatchReport, String> {
     let mut report = DispatchReport::default();
 
-    let claimed: Vec<(String, String)> = {
+    let claimed: Vec<String> = {
         let mut statement = conn
             .prepare(
-                "SELECT id, automation_id FROM automation_occurrences
+                "SELECT id FROM automation_occurrences
                  WHERE state = 'claimed' ORDER BY scheduled_for ASC",
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| row.get(0))
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -223,77 +472,100 @@ pub fn dispatch_claimed_occurrences(
         out
     };
 
-    for (occurrence_id, automation_id) in claimed {
-        let Some(definition) = load_definition_for_run(conn, &automation_id)? else {
-            let reason = format!("routine `{automation_id}` vanished during dispatch");
-            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-            report.failed.push(reason);
-            continue;
-        };
-
-        let Some(cwd) = definition
-            .cwd
-            .as_deref()
-            .map(str::trim)
-            .filter(|cwd| !cwd.is_empty())
-        else {
-            let reason = format!("{automation_id}: routine has no cwd; add a cwd before running");
-            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-            report.failed.push(reason);
-            continue;
-        };
-
-        let run_id = fresh_id("run");
-        let started = record_run_start(
-            conn,
-            &run_id,
-            &automation_id,
-            Some(&occurrence_id),
-            definition.familiar_id.as_deref(),
-            &definition.runtime,
-            now,
-        );
-        if let Err(error) = started {
-            report.failed.push(format!("{automation_id}: {error:#}"));
+    for occurrence_id in claimed {
+        let pinned = load_pinned_occurrence(conn, &occurrence_id)?;
+        let automation_id = pinned.automation_id.clone();
+        if adopt_existing_run(conn, &pinned, now)? {
             continue;
         }
-
-        match build_session_launch(&definition, cwd).and_then(|launch| {
-            runtime
-                .launch_session(&launch)
-                .map(|()| launch)
-                .map_err(|error| format!("{error:#}"))
-        }) {
-            Ok(launch) => {
-                // The run is in flight: keep the occurrence under a bounded
-                // lease, attach the session id, and let settlement happen
-                // from the Coven session store. Launch success is never
-                // reported as run success (coven#816).
-                let lease = run_lease_minutes(&definition);
-                let _ = mark_occurrence_running(conn, &occurrence_id, "daemon", lease, now);
-                let _ = record_run_session(conn, &run_id, &launch.id);
-                report.dispatched.push(run_id);
-            }
-            Err(reason) => {
-                let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-                let _ = record_run_finish(
-                    conn,
-                    &run_id,
-                    RunFinish {
-                        status: "failed",
-                        exit_code: None,
-                        session_id: None,
-                        log_json: None,
-                        output_commit: None,
-                    },
-                    now,
-                );
-                report.failed.push(format!("{automation_id}: {reason}"));
-            }
+        let outcome =
+            dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "daemon", now)?;
+        if outcome.status == "dispatched" {
+            report.dispatched.push(outcome.run_id);
+        } else if outcome.status != "already_dispatched" {
+            report.failed.push(format!(
+                "{automation_id}: {}",
+                outcome.error.unwrap_or_else(|| "launch failed".to_string())
+            ));
         }
     }
 
     Ok(report)
+}
+
+fn adopt_existing_run(
+    conn: &Connection,
+    pinned: &PinnedOccurrence,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let run_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM automation_runs WHERE occurrence_id = ?1",
+            params![pinned.id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to count existing occurrence runs: {error}"))?;
+    if run_count > 1 {
+        return Err(format!(
+            "occurrence {} has contradictory duplicate run rows",
+            pinned.id
+        ));
+    }
+    let existing: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT status, session_id FROM automation_runs
+             WHERE occurrence_id = ?1
+             ORDER BY started_at ASC
+             LIMIT 1",
+            params![pinned.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect existing occurrence run: {error}"))?;
+    let Some((status, session_id)) = existing else {
+        return Ok(false);
+    };
+    if status == "running" {
+        if session_id.is_some() {
+            let changed = mark_occurrence_running(
+                conn,
+                &pinned.id,
+                "daemon",
+                run_lease_minutes(&pinned.definition),
+                now,
+            )?;
+            if !changed {
+                let state: String = conn
+                    .query_row(
+                        "SELECT state FROM automation_occurrences WHERE id = ?1",
+                        params![pinned.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| format!("failed to verify adopted occurrence: {error}"))?;
+                if state != "running" {
+                    return Err(format!(
+                        "existing run could not adopt occurrence state `{state}`"
+                    ));
+                }
+            }
+        }
+        return Ok(true);
+    }
+    let occurrence_status = if status == "succeeded" {
+        "succeeded"
+    } else {
+        "failed"
+    };
+    if !settle_occurrence(
+        conn,
+        &pinned.id,
+        occurrence_status,
+        Some("reconciled from existing terminal run"),
+        now,
+    )? {
+        return Err("failed to reconcile claim from its existing terminal run".to_string());
+    }
+    Ok(true)
 }
 
 /// Reads and validates a stored definition for dispatch.
@@ -318,12 +590,81 @@ mod tests {
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
     use serde_json::json;
+    use std::cell::Cell;
+    use std::path::PathBuf;
 
     struct RejectingRuntime;
 
     impl SessionRuntime for RejectingRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
             anyhow::bail!("synthetic launch failure")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct PersistenceInspectingRuntime {
+        store_path: PathBuf,
+        observed_durable_state: Cell<bool>,
+    }
+
+    #[derive(Default)]
+    struct CountingRuntime {
+        launches: Cell<usize>,
+    }
+
+    impl SessionRuntime for CountingRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            self.launches.set(self.launches.get() + 1);
+            Ok(())
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionRuntime for PersistenceInspectingRuntime {
+        fn launch_session(&self, launch: &SessionLaunch) -> anyhow::Result<()> {
+            let conn = crate::store::open_store(&self.store_path)?;
+            let session_exists = crate::store::get_session(&conn, &launch.id)?.is_some();
+            let (occurrence_state, lease_expires_at, run_session_id): (
+                String,
+                Option<String>,
+                Option<String>,
+            ) = conn.query_row(
+                "SELECT o.state, o.lease_expires_at, r.session_id
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.automation_id = 'durable'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            self.observed_durable_state.set(
+                session_exists
+                    && occurrence_state == "running"
+                    && lease_expires_at.is_some()
+                    && run_session_id.as_deref() == Some(launch.id.as_str()),
+            );
+            Ok(())
         }
 
         fn send_input(
@@ -368,12 +709,18 @@ mod tests {
 
     #[test]
     fn successful_dispatch_leaves_the_run_in_flight() {
-        let (_temp, conn) = temp_store();
-        insert_definition(&conn, &definition("daily")).unwrap();
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("daily");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
         let outcome = run_routine_now(
             &conn,
+            temp.path(),
             &crate::api::NoopSessionRuntime,
-            &definition("daily"),
+            &routine,
             Utc::now(),
         )
         .unwrap();
@@ -396,13 +743,14 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "running");
         assert_eq!(runs[0].session_id, outcome.session_id);
-        assert_eq!(runs[0].familiar_id.as_deref(), Some("charm"));
+        assert_eq!(runs[0].familiar_id, None);
 
         // A live run blocks a second one (overlap: forbid).
         let second = run_routine_now(
             &conn,
+            temp.path(),
             &crate::api::NoopSessionRuntime,
-            &definition("daily"),
+            &routine,
             Utc::now(),
         )
         .unwrap();
@@ -411,6 +759,40 @@ mod tests {
         assert!(second_error.contains("overlap"), "{second_error}");
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs.len(), 1, "the rejected run records no ledger row");
+    }
+
+    #[test]
+    fn dispatch_persists_linked_session_and_lease_before_runtime_spawn() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut durable = definition("durable");
+        durable.cwd = Some(project.to_string_lossy().into_owned());
+        durable.familiar_id = None;
+        insert_definition(&conn, &durable).unwrap();
+        let runtime = PersistenceInspectingRuntime {
+            store_path: temp.path().join("store.sqlite"),
+            observed_durable_state: Cell::new(false),
+        };
+
+        let outcome = run_routine_now(&conn, temp.path(), &runtime, &durable, Utc::now()).unwrap();
+
+        assert_eq!(outcome.status, "dispatched");
+        assert!(
+            runtime.observed_durable_state.get(),
+            "runtime spawn must observe the committed session/run/occurrence lease"
+        );
+    }
+
+    #[test]
+    fn generated_run_and_session_ids_use_uuid_entropy() {
+        for prefix in ["run", "session", "occ"] {
+            let id = fresh_id(prefix);
+            let suffix = id
+                .strip_prefix(&format!("{prefix}-"))
+                .expect("id keeps its readable prefix");
+            uuid::Uuid::parse_str(suffix).expect("id suffix is a UUID");
+        }
     }
 
     #[test]
@@ -424,10 +806,15 @@ mod tests {
 
     #[test]
     fn failed_launch_records_a_failed_run() {
-        let (_temp, conn) = temp_store();
-        insert_definition(&conn, &definition("daily")).unwrap();
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("daily");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
         let outcome =
-            run_routine_now(&conn, &RejectingRuntime, &definition("daily"), Utc::now()).unwrap();
+            run_routine_now(&conn, temp.path(), &RejectingRuntime, &routine, Utc::now()).unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("synthetic"));
 
@@ -445,14 +832,77 @@ mod tests {
     }
 
     #[test]
+    fn unknown_familiar_fails_before_runtime_and_settles_the_ledger() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("unknown-familiar");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = Some("ghost".to_string());
+        insert_definition(&conn, &routine).unwrap();
+
+        let outcome = run_routine_now(
+            &conn,
+            temp.path(),
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, "failed");
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("unknown familiar")),
+            "{outcome:?}"
+        );
+        assert!(crate::store::list_sessions(&conn).unwrap().is_empty());
+        let runs = super::super::runs::list_runs(&conn, "unknown-familiar", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+    }
+
+    #[test]
+    fn persistence_failure_prevents_spawn_and_is_returned() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("persistence-failure");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_automation_run_insert
+             BEFORE INSERT ON automation_runs
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic run persistence failure');
+             END;",
+        )
+        .unwrap();
+        let runtime = CountingRuntime::default();
+
+        let error = run_routine_now(&conn, temp.path(), &runtime, &routine, Utc::now())
+            .expect_err("persistence failure must be surfaced");
+
+        assert!(
+            error.contains("synthetic run persistence failure"),
+            "{error}"
+        );
+        assert_eq!(runtime.launches.get(), 0, "runtime must not spawn");
+    }
+
+    #[test]
     fn missing_cwd_fails_without_launching() {
-        let (_temp, conn) = temp_store();
+        let (temp, conn) = temp_store();
         let mut definition = definition("nocwd");
         definition.cwd = None;
         insert_definition(&conn, &definition).unwrap();
 
         let outcome = run_routine_now(
             &conn,
+            temp.path(),
             &crate::api::NoopSessionRuntime,
             &definition,
             Utc::now(),

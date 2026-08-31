@@ -17,12 +17,23 @@ user -> chat/intake client -> Coven -> adapters -> desktop/apps
 Recurring routine work (`coven.automations`) is **owned by Coven, end to
 end**: Coven stores the canonical routine definitions in its own store (never
 a harness home), its scheduler plans and fences every occurrence in durable
-state, dispatches runs with a fresh familiar + authority resolution, records
-the run ledger, and delivers outputs itself. An external runtime may execute
-an already-claimed occurrence, but it never owns the schedule and never owns
-the record — runtimes are replaceable workers. The `coven.scheduler`
-capability stays reserved for multi-host routing decisions and is not the
-recurring-work surface.
+state, pins the accepted definition revision and delivery inputs, records the
+session and run before spawning, and delivers outputs itself. An external
+runtime may execute an already-claimed occurrence, but it never owns the
+schedule and never owns the record — runtimes are replaceable workers. The
+`coven.scheduler` capability stays reserved for multi-host routing decisions
+and is not the recurring-work surface.
+
+Until the authority work tracked in #857 lands, automation create, update,
+delete, run, tick, and import operations are accepted only over the
+owner-gated local IPC transport. Loopback TCP does not establish process-owner
+authority and is read-only for this surface. The current routine format also
+does not bind a fresh authority or approval proof per run.
+
+Manual run-now creates one occurrence and one attempt. Coven does not
+automatically retry it or reinterpret a prior attempt; explicit retry and
+operator-recovery policy remains deferred to the versioned automations
+protocol work.
 
 Use the canonical [CLI reference](https://docs.opencoven.ai/docs/cli) for
 scriptable commands and the [local API guide](https://docs.opencoven.ai/docs/reference/api)

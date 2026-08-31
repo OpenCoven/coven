@@ -28,7 +28,17 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
 6. **Lifecycle semantics are stringly typed and partial.** Occurrence states are free strings (`'planned'/'claimed'/'running'/'succeeded'/'failed'` in `crates/coven-cli/src/automations/occurrences.rs`), terminal states are exactly `[succeeded, failed]` (`OCCURRENCE_TERMINAL_STATES`), and lease recovery maps straight to `failed` with reason `lease expired` (`recover_expired_leases`). There are no eligible/dispatching/recovering/cancelled/timed_out/superseded states, no run state machine beyond `status` strings, and no attempt object at all — only an `attempt` counter incremented by claim (`claim_due_occurrence`).
 7. **No receipts, no digests, no integrity anywhere** in the automations module; run outcomes are ledger rows (`automation_runs.log_json`, `exit_code`) with no tamper-evident summary.
 8. **No capability negotiation.** `capabilities()` (`control_plane.rs`) lists action ids, but nothing lets a client ask which trigger/action/policy variants an implementation executes, and nothing forces a definition with an unsupported variant to fail explicitly.
-9. **Adoption-key gaps.** Run and occurrence ids are wall-clock derived (`fresh_id`, `crates/coven-cli/src/automations/runner.rs` — `format!("{prefix}-{millis}")`), so a retried `coven.automations.run` command can create a second occurrence/run rather than replaying the first outcome.
+9. **Adoption-key gaps.** Run, session, and manual occurrence ids now use UUID
+   entropy, but `coven.automations.run` still has no caller adoption key. A
+   repeated manual command therefore creates a distinct occurrence/run rather
+   than replaying the first outcome; explicit retry/recovery remains deferred
+   to the versioned command protocol.
+10. **Authority binding is not implemented by the #816 format.** The current
+    routine and run rows do not carry a fresh principal, authority, approval,
+    or receipt proof. Until #857 implements those bindings, create/update/
+    delete/run/tick/import are restricted to owner-gated local IPC; loopback
+    TCP is not an authenticated owner transport. The binding and receipt
+    sections below specify the target v1 contract, not current #816 behavior.
 
 ## Contract profile and versioning
 
@@ -70,7 +80,8 @@ Specified by `automation-occurrence.schema.json`.
 - `fence` — monotonic `generation` per occurrence plus claimant and lease expiry; the contract-level form of the lease columns and `attempt` counter in `occurrences.rs`.
 - `state` + `stateReason` — the occurrence state machine (below).
 - `misfireDisposition` — `collapsed_to_latest` records the #816 misfire-latest collapse (`plan_latest_due_occurrence` walks forward from the later of creation time and the latest fenced slot and fences exactly one slot; `occurrences.rs`).
-- `claimMetadata` (bounded lease 1..=1440 minutes, per `claim_due_occurrence`).
+- `claimMetadata` (bounded lease 1..=44640 minutes, aligned with the validated
+  per-run timeout range).
 - `activeRunRef` — present while exactly one accepted run owns the fence generation.
 - `cancellation` — request vs acknowledgment vs reconciliation timestamps (cancellation is a request until acknowledged or reconciled).
 - `recovery` — evidence class and resolved disposition for the recovering/recovery_required path.

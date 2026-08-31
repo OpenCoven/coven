@@ -390,6 +390,91 @@ impl SessionRuntime for NoopSessionRuntime {
     }
 }
 
+pub(crate) enum DurableSessionStore<'a> {
+    Existing(&'a rusqlite::Connection),
+    OpenHome,
+}
+
+pub(crate) enum DurableSessionLaunchError {
+    Maintenance(anyhow::Error),
+    Persistence(anyhow::Error),
+    Runtime(anyhow::Error),
+    AlreadyDispatched,
+    Rejected(ApiResponse),
+}
+
+impl From<anyhow::Error> for DurableSessionLaunchError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Persistence(error)
+    }
+}
+
+/// The single durable boundary used by ordinary `/sessions` launches and
+/// Coven-owned automation launches. Maintenance admission happens before a
+/// new store is opened, session state and caller-owned linked state commit in
+/// one transaction, and only then may the runtime spawn. A runtime refusal
+/// terminally marks the durable session before it is returned to the caller.
+pub(crate) fn launch_durable_session(
+    coven_home: &Path,
+    store_source: DurableSessionStore<'_>,
+    runtime: &dyn SessionRuntime,
+    launch: &SessionLaunch,
+    record: &store::SessionRecord,
+    persist_linked_state: impl FnOnce(
+        &rusqlite::Connection,
+    ) -> std::result::Result<(), DurableSessionLaunchError>,
+) -> std::result::Result<(), DurableSessionLaunchError> {
+    let writer = crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
+        &launch.project_root,
+    ))
+    .and_then(|gate| match gate {
+        Some(gate) => gate
+            .acquire_writer(format!("daemon-session-{}", launch.id), "session")
+            .map(Some),
+        None => Ok(None),
+    })
+    .map_err(DurableSessionLaunchError::Maintenance)?;
+
+    let owned_conn;
+    let conn = match store_source {
+        DurableSessionStore::Existing(conn) => conn,
+        DurableSessionStore::OpenHome => {
+            owned_conn = store::open_store(&store_path(coven_home))
+                .map_err(DurableSessionLaunchError::Persistence)?;
+            &owned_conn
+        }
+    };
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .context("failed to begin durable session launch")
+            .map_err(DurableSessionLaunchError::Persistence)?;
+    persist_linked_state(&transaction)?;
+    store::insert_session(&transaction, record).map_err(DurableSessionLaunchError::Persistence)?;
+    transaction
+        .commit()
+        .context("failed to commit durable session launch")
+        .map_err(DurableSessionLaunchError::Persistence)?;
+
+    let launch_result = match writer {
+        Some(writer) => runtime.launch_session_with_writer(launch, writer),
+        None => runtime.launch_session(launch),
+    };
+    if let Err(error) = launch_result {
+        store::update_session_status_if_current(
+            conn,
+            &record.id,
+            "running",
+            "failed",
+            None,
+            &current_timestamp(),
+        )
+        .context("failed to terminally settle rejected session launch")
+        .map_err(DurableSessionLaunchError::Persistence)?;
+        return Err(DurableSessionLaunchError::Runtime(error));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestAuthority {
     /// Filesystem-permission-protected Unix socket or owner-only Windows pipe.
@@ -563,6 +648,22 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
+            let action = payload
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if control_plane::automation_action_requires_owner_local(action)
+                && authority != RequestAuthority::OwnerLocalIpc
+            {
+                return json_response(
+                    403,
+                    &control_plane::rejected_action(
+                        action,
+                        "automation mutation and execution require owner-gated local IPC",
+                    ),
+                );
+            }
             let conn = match store::open_store(&store_path(coven_home)) {
                 Ok(conn) => conn,
                 Err(error) => {
@@ -575,7 +676,8 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
-            let (status, response) = control_plane::route_action(payload, &conn, runtime);
+            let (status, response) =
+                control_plane::route_action(payload, &conn, runtime, coven_home, authority);
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),
@@ -2152,35 +2254,6 @@ fn launch_session(
             parent_correlation_advisory_check_completed_failpoint();
         }
     }
-    let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
-        &launch.project_root,
-    ))
-    .and_then(|gate| match gate {
-        Some(gate) => gate
-            .acquire_writer(format!("daemon-session-{}", launch.id), "session")
-            .map(Some),
-        None => Ok(None),
-    }) {
-        Ok(writer) => writer,
-        Err(error) => {
-            let gate_error = error.downcast_ref::<crate::maintenance_gate::GateError>();
-            let (code, details) = match gate_error {
-                Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => (
-                    "maintenance_locked",
-                    Some(json!({ "owner": owner, "sessionId": launch.id })),
-                ),
-                Some(_) => (
-                    "maintenance_state_invalid",
-                    Some(json!({ "sessionId": launch.id })),
-                ),
-                None => (
-                    "maintenance_gate_unavailable",
-                    Some(json!({ "sessionId": launch.id })),
-                ),
-            };
-            return api_error(423, code, &error.to_string(), details);
-        }
-    };
     let now = current_timestamp();
     let record = session_launch::new_session_record(session_launch::NewSessionParams {
         id: launch.id.clone(),
@@ -2195,71 +2268,77 @@ fn launch_session(
         labels: Vec::new(),
         visibility: None,
     });
-    // Reuse the connection opened for a child binding's parent lookup, if
-    // any; otherwise open (and thereby initialize) the store only now, after
-    // the maintenance gate has already admitted this launch. Root/unbound
-    // launches take the `None` arm here and below, preserving the existing
-    // maintenance-before-store-open precedence unchanged: no parent to
-    // revalidate means no reason to pay for a transaction.
-    let mut conn = match opened_conn {
-        Some(conn) => conn,
-        None => store::open_store(&store_path(coven_home))?,
-    };
-    match record
-        .execution_binding
+    let store_source = opened_conn
         .as_ref()
-        .and_then(|binding| binding.parent.as_ref())
-    {
-        Some(parent) => {
-            // BLOCKER 1 (#728 final review): the pre-gate correlation above
-            // is advisory only — a concurrent writer can sacrifice/delete
-            // `parent`'s session between that check and this insert. Re-read
-            // and revalidate it here, inside a SQLite IMMEDIATE transaction
-            // on the very connection that performs the insert, and commit
-            // both together. That makes final parent validation and child
-            // admission a single atomic unit against concurrent writers,
-            // with no persistent FK/uniqueness constraint added to the
-            // schema.
-            let caller_familiar_id = raw_caller_familiar_id.as_str();
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if let Err(response) = correlate_child_parent(&tx, parent, caller_familiar_id)? {
-                // Dropping `tx` without calling `commit()` rolls it back:
-                // no child row is ever inserted on a revalidation failure.
-                return Ok(response);
+        .map(DurableSessionStore::Existing)
+        .unwrap_or(DurableSessionStore::OpenHome);
+    let durable_result = launch_durable_session(
+        coven_home,
+        store_source,
+        runtime,
+        &launch,
+        &record,
+        |conn| {
+            if let Some(parent) = record
+                .execution_binding
+                .as_ref()
+                .and_then(|binding| binding.parent.as_ref())
+            {
+                if let Err(response) =
+                    correlate_child_parent(conn, parent, raw_caller_familiar_id.as_str())?
+                {
+                    return Err(DurableSessionLaunchError::Rejected(response));
+                }
             }
-            store::insert_session(&tx, &record)?;
-            tx.commit()?;
+            Ok(())
+        },
+    );
+    if let Err(error) = durable_result {
+        match error {
+            DurableSessionLaunchError::Rejected(response) => return Ok(response),
+            DurableSessionLaunchError::Maintenance(error) => {
+                let gate_error = error.downcast_ref::<crate::maintenance_gate::GateError>();
+                let (code, details) = match gate_error {
+                    Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => (
+                        "maintenance_locked",
+                        Some(json!({ "owner": owner, "sessionId": launch.id })),
+                    ),
+                    Some(_) => (
+                        "maintenance_state_invalid",
+                        Some(json!({ "sessionId": launch.id })),
+                    ),
+                    None => (
+                        "maintenance_gate_unavailable",
+                        Some(json!({ "sessionId": launch.id })),
+                    ),
+                };
+                return api_error(423, code, &error.to_string(), details);
+            }
+            DurableSessionLaunchError::Persistence(error) => {
+                return api_error(
+                    500,
+                    "launch_failed",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": record.id })),
+                );
+            }
+            DurableSessionLaunchError::Runtime(error) => {
+                return api_error(
+                    500,
+                    "launch_failed",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": record.id })),
+                );
+            }
+            DurableSessionLaunchError::AlreadyDispatched => {
+                return api_error(
+                    409,
+                    "launch_failed",
+                    "Session launch was already dispatched.",
+                    Some(json!({ "sessionId": record.id })),
+                );
+            }
         }
-        None => {
-            store::insert_session(&conn, &record)?;
-        }
-    }
-    if let Err(error) = match writer {
-        Some(writer) => runtime.launch_session_with_writer(&launch, writer),
-        None => runtime.launch_session(&launch),
-    } {
-        // Don't propagate to the accept loop — that crashes the daemon.
-        // Runtime launch failures are user-facing (missing harness CLI,
-        // missing auth, child closed stdin during stream-mode init):
-        // mark the session row failed and return a structured response
-        // so the client surfaces the cause and the daemon stays up.
-        // Cancellation can win while a large launch-time stdin prompt is
-        // still being delivered. Preserve that terminal decision: only a row
-        // that is still owned by the failing launch may transition to failed.
-        let _ = store::update_session_status_if_current(
-            &conn,
-            &record.id,
-            "running",
-            "failed",
-            None,
-            &current_timestamp(),
-        )?;
-        return api_error(
-            500,
-            "launch_failed",
-            &error.to_string(),
-            Some(json!({ "sessionId": record.id })),
-        );
     }
     // Record the inter-familiar delegation in cave-coven-calls.json so the
     // Coven Calls graph in coven-cave has data to render. Best-effort: a
@@ -10748,6 +10827,8 @@ mod tests {
     #[test]
     fn control_action_runs_a_routine_through_the_ledger() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        let project = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
         let create_body = json!({
             "action": "coven.automations.create",
             "definition": {
@@ -10761,8 +10842,7 @@ mod tests {
                 "overlap": "forbid",
                 "timeoutMinutes": 30,
                 "runtime": "coven-code",
-                "cwd": "/work/project",
-                "familiarId": "charm",
+                "cwd": project,
                 "prompt": "Write the daily reflection."
             }
         })
@@ -10813,26 +10893,12 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        crate::store::insert_session(
+        crate::store::update_session_status(
             &conn,
-            &crate::store::SessionRecord {
-                id: session_id,
-                project_root: "/work/project".to_string(),
-                harness: "coven-code".to_string(),
-                title: "Daily notes".to_string(),
-                status: "completed".to_string(),
-                exit_code: Some(0),
-                archived_at: None,
-                created_at: "2026-08-28T09:00:00Z".to_string(),
-                updated_at: "2026-08-28T09:05:00Z".to_string(),
-                conversation_id: None,
-                familiar_id: Some("charm".to_string()),
-                execution_binding: None,
-                labels: Vec::new(),
-                visibility: "private".to_string(),
-                external: false,
-                transcript_path: None,
-            },
+            &session_id,
+            "completed",
+            Some(0),
+            &chrono::Utc::now().to_rfc3339(),
         )
         .unwrap();
         drop(conn);
@@ -10909,6 +10975,123 @@ mod tests {
         assert_eq!(response.status, 400);
         assert!(response.body.contains(r#""accepted":false"#));
         assert!(response.body.contains("coven.automations.create"));
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_rejects_automation_mutation_before_store_change_or_launch() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let runtime = RecordingRuntime::default();
+        let definition = json!({
+                "schemaVersion": 1,
+                "id": "tcp-routine",
+                "name": "TCP routine",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be accepted over TCP."
+        });
+        for payload in [
+            json!({"action": "coven.automations.create", "definition": definition.clone()}),
+            json!({"action": "coven.automations.update", "definition": definition.clone()}),
+            json!({"action": "coven.automations.delete", "id": "tcp-routine"}),
+            json!({"action": "coven.automations.run", "id": "tcp-routine"}),
+            json!({"action": "coven.automations.tick"}),
+            json!({"action": "coven.automations.import"}),
+        ] {
+            let body = payload.to_string();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+                &runtime,
+                RequestAuthority::Tcp,
+            )?;
+
+            assert_eq!(response.status, 403, "{}", response.body);
+            assert!(response.body.contains(r#""accepted":false"#));
+            assert!(response.body.contains("owner-gated local IPC"));
+        }
+        assert!(runtime.launches.borrow().is_empty());
+        assert!(
+            !store_path(temp_dir.path()).exists(),
+            "authority refusal must precede opening or migrating the writable store"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owner_control_tick_dispatches_preexisting_claimable_work() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let project = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let create_body = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "tick-dispatch",
+                "name": "Tick dispatch",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": project,
+                "prompt": "Dispatch me."
+            }
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('tick-existing', 'tick-dispatch', '2020-01-01T09:00:00.000Z',
+                     'planned', 0, '2020-01-01T09:00:00.000Z',
+                     '2020-01-01T09:00:00.000Z')",
+            [],
+        )?;
+        drop(conn);
+
+        let tick_body = json!({"action": "coven.automations.tick"}).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tick_body),
+        )?;
+
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"]["dispatched"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let state: String = conn.query_row(
+            "SELECT state FROM automation_occurrences WHERE id = 'tick-existing'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(state, "running");
         Ok(())
     }
 

@@ -22,6 +22,23 @@ pub fn next_due(
     Ok(next_due_parsed(&parsed, timezone, from))
 }
 
+/// The latest schedule instant strictly after `after` and at or before
+/// `through`. The supported DAILY/WEEKLY vocabulary can be solved by
+/// inspecting at most the current local date plus the preceding week, so a
+/// long daemon outage never requires slot-by-slot iteration.
+pub fn latest_due(
+    rrule_text: &str,
+    timezone: RoutineTimezone,
+    after: DateTime<Utc>,
+    through: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, String> {
+    if through <= after {
+        return Ok(None);
+    }
+    let parsed = parse_rrule(rrule_text)?;
+    Ok(latest_due_parsed(&parsed, timezone, after, through))
+}
+
 /// Interprets a naive local date+hour in the definition's timezone and
 /// returns the UTC instant, skipping wall-clock times that do not exist
 /// (DST spring-forward gaps).
@@ -89,6 +106,55 @@ fn next_due_parsed(
         for hour in &parsed.by_hour {
             if let Some(instant) = resolve_local(timezone, date, *hour) {
                 if instant > from {
+                    return Some(instant);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn latest_due_parsed(
+    parsed: &ParsedRrule,
+    timezone: RoutineTimezone,
+    after: DateTime<Utc>,
+    through: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let window_end = match timezone {
+        RoutineTimezone::Utc => through.date_naive(),
+        RoutineTimezone::Local => through.with_timezone(&Local).date_naive(),
+    };
+    let allowed_days: Vec<u32> = match parsed.frequency {
+        RruleFrequency::Daily => (0..7).collect(),
+        RruleFrequency::Weekly => parsed
+            .by_day
+            .iter()
+            .filter_map(|day| match day.as_str() {
+                "MO" => Some(0),
+                "TU" => Some(1),
+                "WE" => Some(2),
+                "TH" => Some(3),
+                "FR" => Some(4),
+                "SA" => Some(5),
+                "SU" => Some(6),
+                _ => None,
+            })
+            .collect(),
+    };
+
+    for offset in 0..=7i64 {
+        let date = window_end - Duration::days(offset);
+        let is_allowed_day = match parsed.frequency {
+            RruleFrequency::Daily => true,
+            RruleFrequency::Weekly => allowed_days.contains(&weekday_index(date.weekday())),
+        };
+        if !is_allowed_day {
+            continue;
+        }
+        for hour in parsed.by_hour.iter().rev() {
+            if let Some(instant) = resolve_local(timezone, date, *hour) {
+                if instant <= through && instant > after {
                     return Some(instant);
                 }
             }
@@ -174,5 +240,18 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next, utc(2026, 8, 29, 9, 0));
+    }
+
+    #[test]
+    fn latest_due_skips_directly_across_a_long_gap() {
+        let latest = latest_due(
+            "FREQ=DAILY;BYHOUR=9,17",
+            RoutineTimezone::Utc,
+            utc(2026, 1, 1, 0, 0),
+            utc(2026, 8, 28, 20, 0),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(latest, utc(2026, 8, 28, 17, 0));
     }
 }

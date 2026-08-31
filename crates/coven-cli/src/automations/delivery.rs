@@ -9,12 +9,12 @@
 //! commit fails the run visibly instead of reporting success.
 
 use std::path::{Path, PathBuf};
+use std::{fs::OpenOptions, io::Write};
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use super::occurrences::settle_occurrence;
 use super::runs::{record_run_finish, RunFinish, LOG_ENTRY_MAX_CHARS};
 
 /// How many trailing normalized-stream events a bounded log captures. The
@@ -139,18 +139,30 @@ pub fn capture_bounded_log(conn: &Connection, session_id: &str) -> Option<String
     serde_json::to_string(&log_entries).ok()
 }
 
-/// The final assistant payload of a session: the text of its last `output`
-/// event. `None` when the session produced no output.
+/// The complete ordered assistant payload of a session. Event-writer batches
+/// coalesce adjacent chunks, but a long response may span many batches, so
+/// delivery reconstructs every `output` event without the bounded-log tail
+/// limit. `None` when the session produced no output.
 pub fn final_output_text(conn: &Connection, session_id: &str) -> Option<String> {
-    let events = read_stream_tail(conn, session_id, BOUNDED_LOG_EVENT_LIMIT).ok()?;
-    events
-        .iter()
-        .rev()
-        .find(|event| event.kind == "output")
-        .and_then(|event| event.payload.get("data"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .filter(|text| !text.is_empty())
+    let mut statement = conn
+        .prepare(
+            "SELECT payload_json FROM events
+             WHERE session_id = ?1 AND kind = 'output'
+             ORDER BY rowid ASC",
+        )
+        .ok()?;
+    let rows = statement
+        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .ok()?;
+    let mut output = String::new();
+    for row in rows {
+        let payload_json = row.ok()?;
+        let payload: Value = serde_json::from_str(&payload_json).ok()?;
+        if let Some(data) = payload.get("data").and_then(Value::as_str) {
+            output.push_str(data);
+        }
+    }
+    (!output.is_empty()).then_some(output)
 }
 
 /// Atomically commits `payload` to `target`: the bytes land in a temp file in
@@ -172,9 +184,10 @@ pub fn deliver_output(target: &str, payload: &str) -> Result<(), String> {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .ok_or_else(|| "output commit failed: output target has no file name".to_string())?;
-    let pid = std::process::id();
-    let millis = chrono::Utc::now().timestamp_millis();
-    let temp = parent.join(format!(".coven-delivery-{pid}-{millis}-{file_name}"));
+    let temp = parent.join(format!(
+        ".coven-delivery-{}-{file_name}",
+        uuid::Uuid::new_v4()
+    ));
     let result = write_atomically(&temp, target_path, payload);
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
@@ -183,19 +196,55 @@ pub fn deliver_output(target: &str, payload: &str) -> Result<(), String> {
 }
 
 fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), String> {
-    std::fs::write(temp, payload).map_err(|error| {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(temp)
+        .map_err(|error| {
+            format!(
+                "output commit failed: cannot create {}: {error}",
+                temp.display()
+            )
+        })?;
+    file.write_all(payload.as_bytes()).map_err(|error| {
         format!(
             "output commit failed: cannot write {}: {error}",
             temp.display()
         )
     })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "output commit failed: cannot sync {}: {error}",
+            temp.display()
+        )
+    })?;
+    drop(file);
     std::fs::rename(temp, target).map_err(|error| {
         format!(
             "output commit failed: cannot rename {} → {}: {error}",
             temp.display(),
             target.display()
         )
-    })
+    })?;
+    sync_parent_directory(target)
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(target: &Path) -> Result<(), String> {
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "output commit failed: cannot sync directory {}: {error}",
+                parent.display()
+            )
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_target: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 struct Settlement {
@@ -213,13 +262,15 @@ struct RunningLedgerRow {
     occurrence_id: Option<String>,
     occurrence_state: Option<String>,
     occurrence_failure: Option<String>,
+    output_target: Option<String>,
+    deadline_at: Option<String>,
 }
 
 fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, String> {
     let mut statement = conn
         .prepare(
             "SELECT r.id, r.automation_id, r.session_id, r.occurrence_id,
-                    o.state, o.failure_reason
+                    o.state, o.failure_reason, r.output_target, r.deadline_at
              FROM automation_runs AS r
              LEFT JOIN automation_occurrences AS o ON o.id = r.occurrence_id
              WHERE r.status = 'running'",
@@ -234,6 +285,8 @@ fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, Strin
                 occurrence_id: row.get(3)?,
                 occurrence_state: row.get(4)?,
                 occurrence_failure: row.get(5)?,
+                output_target: row.get(6)?,
+                deadline_at: row.get(7)?,
             })
         })
         .map_err(|error| format!("failed to list running runs: {error}"))?;
@@ -249,19 +302,41 @@ fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, Strin
 /// bounds how long that can block the routine).
 fn session_settlement(
     conn: &Connection,
-    automation_id: &str,
     session_id: &str,
+    output_target: Option<&str>,
+    deadline: DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Result<Option<Settlement>, String> {
     let session = crate::store::get_session(conn, session_id)
         .map_err(|error| format!("failed to read session {session_id}: {error:#}"))?;
     let Some(session) = session else {
+        if now >= deadline {
+            return Ok(Some(timeout_settlement(None, None, session_id)));
+        }
         return Ok(None);
     };
     if !is_terminal_session_status(&session.status) {
+        if now >= deadline {
+            return Ok(Some(timeout_settlement(
+                session.exit_code.map(i64::from),
+                capture_bounded_log(conn, session_id),
+                session_id,
+            )));
+        }
         return Ok(None);
     }
 
     let log = capture_bounded_log(conn, session_id);
+    let completed_at = chrono::DateTime::parse_from_rfc3339(&session.updated_at)
+        .map(|instant| instant.with_timezone(&Utc))
+        .map_err(|error| format!("session {session_id} has invalid completion time: {error}"))?;
+    if completed_at > deadline {
+        return Ok(Some(timeout_settlement(
+            session.exit_code.map(i64::from),
+            log,
+            session_id,
+        )));
+    }
     let exit_zero = session.exit_code.unwrap_or(0) == 0;
     let succeeded = matches!(session.status.as_str(), "completed" | "idle") && exit_zero;
     if !succeeded {
@@ -281,10 +356,7 @@ fn session_settlement(
     // The run succeeded at the runtime. Delivery is Coven's job: commit the
     // final assistant payload to the configured target, and a failed commit
     // fails the run visibly (never reported as success).
-    let definition = super::runner::load_definition_for_run(conn, automation_id)
-        .map_err(|error| format!("failed to load routine {automation_id}: {error}"))?;
-    let output_target = definition.and_then(|routine| routine.output_target);
-    let (status, reason, output_commit) = match output_target.as_deref() {
+    let (status, reason, output_commit) = match output_target {
         None => ("succeeded", None, None),
         Some(target) => match final_output_text(conn, session_id) {
             None => (
@@ -309,6 +381,95 @@ fn session_settlement(
     }))
 }
 
+fn timeout_settlement(exit_code: Option<i64>, log: Option<String>, session_id: &str) -> Settlement {
+    Settlement {
+        status: "failed",
+        exit_code,
+        log,
+        output_commit: None,
+        reason: Some(format!(
+            "deadline exceeded before session {session_id} completed"
+        )),
+    }
+}
+
+struct SettlementTarget<'a> {
+    run_id: &'a str,
+    occurrence_id: Option<&'a str>,
+    occurrence_state: Option<&'a str>,
+    occurrence_failure: Option<&'a str>,
+    session_id: Option<String>,
+}
+
+fn settle_linked_state(
+    conn: &Connection,
+    target: SettlementTarget<'_>,
+    settlement: Settlement,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin run settlement: {error}"))?;
+
+    if let Some(occurrence_id) = target.occurrence_id {
+        let recoverable_lease_failure = target.occurrence_state == Some("failed")
+            && target.occurrence_failure == Some("lease expired");
+        let unsettled = matches!(target.occurrence_state, Some("claimed" | "running"));
+        if !unsettled && !recoverable_lease_failure {
+            return Err(format!(
+                "contradictory terminal occurrence state `{}` for running run {}",
+                target.occurrence_state.unwrap_or("missing"),
+                target.run_id
+            ));
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE automation_occurrences
+                 SET state = ?2,
+                     failure_reason = ?3,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     updated_at = ?4
+                 WHERE id = ?1
+                   AND (
+                       state IN ('claimed', 'running')
+                       OR (state = 'failed' AND failure_reason = 'lease expired')
+                   )",
+                params![
+                    occurrence_id,
+                    settlement.status,
+                    settlement.reason,
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                ],
+            )
+            .map_err(|error| format!("failed to settle occurrence with run: {error}"))?;
+        if changed != 1 {
+            return Err(format!(
+                "occurrence {occurrence_id} changed during run settlement"
+            ));
+        }
+    }
+    let finished = record_run_finish(
+        &transaction,
+        target.run_id,
+        RunFinish {
+            status: settlement.status,
+            exit_code: settlement.exit_code,
+            session_id: target.session_id,
+            log_json: settlement.log,
+            output_commit: settlement.output_commit,
+        },
+        now,
+    )
+    .map_err(|error| format!("failed to settle run: {error:#}"))?;
+    if !finished {
+        return Err(format!("run {} changed during settlement", target.run_id));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit run settlement: {error}"))
+}
+
 /// Settles every running ledger row whose work has finished. A row settles
 /// when its session reached a terminal state, or when its occurrence already
 /// settled through lease recovery. The matching occurrence settles alongside
@@ -328,15 +489,32 @@ pub fn settle_finished_runs(
             occurrence_id,
             occurrence_state,
             occurrence_failure,
+            output_target,
+            deadline_at,
         } = row;
 
+        let deadline_at =
+            deadline_at.ok_or_else(|| format!("running run {run_id} has no pinned deadline"))?;
+        let deadline = chrono::DateTime::parse_from_rfc3339(&deadline_at)
+            .map(|instant| instant.with_timezone(&Utc))
+            .map_err(|error| format!("running run {run_id} has invalid deadline: {error}"))?;
         let mut settlement = match session_id.as_deref() {
-            Some(session_id) => session_settlement(conn, &automation_id, session_id)?,
+            Some(session_id) => {
+                session_settlement(conn, session_id, output_target.as_deref(), deadline, now)?
+            }
+            None if now >= deadline => Some(Settlement {
+                status: "failed",
+                exit_code: None,
+                log: None,
+                output_commit: None,
+                reason: Some("deadline exceeded before a session was attached".to_string()),
+            }),
             None => None,
         };
         if settlement.is_none() {
             if occurrence_state.as_deref() == Some("failed") {
                 let reason = occurrence_failure
+                    .clone()
                     .filter(|reason| !reason.trim().is_empty())
                     .unwrap_or_else(|| "lease expired".to_string());
                 settlement = Some(Settlement {
@@ -365,32 +543,25 @@ pub fn settle_finished_runs(
             continue;
         };
 
-        if let Some(occurrence_id) = occurrence_id.as_deref() {
-            let _ = settle_occurrence(
-                conn,
-                occurrence_id,
-                settlement.status,
-                settlement.reason.as_deref(),
-                now,
-            );
-        }
-        let _ = record_run_finish(
+        let status = settlement.status;
+        let reason = settlement.reason.clone();
+        settle_linked_state(
             conn,
-            &run_id,
-            RunFinish {
-                status: settlement.status,
-                exit_code: settlement.exit_code,
+            SettlementTarget {
+                run_id: &run_id,
+                occurrence_id: occurrence_id.as_deref(),
+                occurrence_state: occurrence_state.as_deref(),
+                occurrence_failure: occurrence_failure.as_deref(),
                 session_id: session_id.clone(),
-                log_json: settlement.log,
-                output_commit: settlement.output_commit,
             },
+            settlement,
             now,
-        );
-        if settlement.status == "succeeded" {
+        )?;
+        if status == "succeeded" {
             report.settled_succeeded += 1;
         } else {
             report.settled_failed += 1;
-            if let Some(reason) = settlement.reason {
+            if let Some(reason) = reason {
                 report.failures.push(format!("{automation_id}: {reason}"));
             }
         }
@@ -483,12 +654,26 @@ mod tests {
     /// leaves them before reconciliation.
     fn live_run(conn: &Connection, automation_id: &str, session_id: &str) -> String {
         let now = "2026-08-28T09:00:00.000Z";
+        let record = super::super::store::get_definition(conn, automation_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = super::super::store::definition_snapshot(&record).unwrap();
         conn.execute(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
-                 attempt, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'running', 'daemon', '2026-08-28T10:00:00.000Z', 1, ?3, ?3)",
-            rusqlite::params![format!("occ-{session_id}"), automation_id, now],
+                 attempt, definition_revision, definition_digest, definition_json,
+                 output_target, deadline_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'running', 'daemon', '2026-08-28T10:00:00.000Z', 1,
+                     ?4, ?5, ?6, ?7, '2026-08-28T10:00:00.000Z', ?3, ?3)",
+            rusqlite::params![
+                format!("occ-{session_id}"),
+                automation_id,
+                now,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target
+            ],
         )
         .unwrap();
         let run_id = format!("run-{session_id}");
@@ -503,16 +688,26 @@ mod tests {
         session_id: &str,
         now: &str,
     ) {
+        let record = super::super::store::get_definition(conn, automation_id)
+            .unwrap()
+            .unwrap();
+        let snapshot = super::super::store::definition_snapshot(&record).unwrap();
         conn.execute(
             "INSERT INTO automation_runs
                 (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                 status, started_at)
-             VALUES (?1, ?2, ?3, ?4, 'charm', 'coven-code', 'running', ?5)",
+                 status, definition_revision, definition_digest, definition_json,
+                 output_target, deadline_at, started_at)
+             VALUES (?1, ?2, ?3, ?4, 'charm', 'coven-code', 'running',
+                     ?5, ?6, ?7, ?8, '2026-08-28T10:00:00.000Z', ?9)",
             rusqlite::params![
                 run_id,
                 automation_id,
                 format!("occ-{session_id}"),
                 session_id,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target,
                 now
             ],
         )
@@ -564,18 +759,64 @@ mod tests {
     }
 
     #[test]
-    fn final_output_text_picks_the_last_output_event() {
+    fn final_output_text_reconstructs_every_ordered_output_chunk() {
         let (_temp, conn) = temp_store();
         session_record(&conn, "session-1", "completed", Some(0));
-        event(&conn, "session-1", "output", "draft");
+        event(&conn, "session-1", "output", "first ");
         event(&conn, "session-1", "input", "keep going");
-        event(&conn, "session-1", "output", "final answer");
+        event(&conn, "session-1", "output", "second ");
+        for _ in 0..205 {
+            event(&conn, "session-1", "output", "x");
+        }
+        event(&conn, "session-1", "output", " final");
 
+        let expected = format!("first second {} final", "x".repeat(205));
         assert_eq!(
             final_output_text(&conn, "session-1").as_deref(),
-            Some("final answer")
+            Some(expected.as_str())
         );
         assert_eq!(final_output_text(&conn, "session-missing"), None);
+    }
+
+    #[test]
+    fn settlement_uses_the_output_target_pinned_when_the_run_started() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_target = first.path().join("payload.md");
+        let second_target = second.path().join("payload.md");
+        let (_temp, conn) = temp_store();
+        insert_definition(
+            &conn,
+            &definition("daily", Some(first_target.to_str().unwrap())),
+        )
+        .unwrap();
+        live_run(&conn, "daily", "session-1");
+        super::super::store::update_definition(
+            &conn,
+            &definition("daily", Some(second_target.to_str().unwrap())),
+        )
+        .unwrap();
+        super::super::store::delete_definition(&conn, "daily").unwrap();
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "immutable delivery");
+
+        let report = settle_finished_runs(
+            &conn,
+            chrono::DateTime::parse_from_rfc3339("2026-08-28T09:30:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
+
+        assert_eq!(report.settled_succeeded, 1);
+        assert_eq!(
+            std::fs::read_to_string(&first_target).unwrap(),
+            "immutable delivery"
+        );
+        assert!(
+            !second_target.exists(),
+            "an in-flight run must never reload a revised delivery target"
+        );
     }
 
     #[test]
@@ -716,13 +957,109 @@ mod tests {
     }
 
     #[test]
+    fn completion_before_deadline_repairs_a_stale_lease_failure_consistently() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        conn.execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed', failure_reason = 'lease expired'
+             WHERE automation_id = 'daily'",
+            [],
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert_eq!(report.settled_succeeded, 1);
+        let (occurrence, run): (String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.automation_id = 'daily'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (occurrence.as_str(), run.as_str()),
+            ("succeeded", "succeeded")
+        );
+    }
+
+    #[test]
+    fn completion_after_deadline_fails_occurrence_and_run_consistently() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        conn.execute(
+            "UPDATE sessions SET updated_at = '2026-08-28T10:05:00.000Z'
+             WHERE id = 'session-1'",
+            [],
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert_eq!(report.settled_failed, 1);
+        let (occurrence, run, reason): (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status, o.failure_reason
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.automation_id = 'daily'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((occurrence.as_str(), run.as_str()), ("failed", "failed"));
+        assert!(reason.contains("deadline"), "{reason}");
+    }
+
+    #[test]
+    fn contradictory_terminal_occurrence_is_reported_not_silently_overwritten() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        conn.execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed', failure_reason = 'operator decision'
+             WHERE automation_id = 'daily'",
+            [],
+        )
+        .unwrap();
+
+        let error = settle_finished_runs(&conn, Utc::now()).unwrap_err();
+
+        assert!(error.contains("contradictory"), "{error}");
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = 'run-session-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "running");
+    }
+
+    #[test]
     fn still_running_rows_are_left_alone() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", None)).unwrap();
         live_run(&conn, "daily", "session-1");
         session_record(&conn, "session-1", "running", None);
 
-        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+        let report = settle_finished_runs(
+            &conn,
+            chrono::DateTime::parse_from_rfc3339("2026-08-28T09:30:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
         assert_eq!(report.still_running, 1);
         let status: String = conn
             .query_row(
