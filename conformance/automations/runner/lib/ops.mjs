@@ -14,6 +14,7 @@ const CRASH_BOUNDARIES = new Set([
   'adoption',
   'dispatch',
   'session-create',
+  'first-event',
   'terminal-observation',
   'delivery',
   'settlement',

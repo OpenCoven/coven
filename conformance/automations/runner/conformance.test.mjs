@@ -19,6 +19,7 @@ import {
   loadVectors,
   parseArgs,
   runConformance,
+  validateReport,
   PLANE_ROOT,
   PLANE_VERSION,
   PROFILES
@@ -34,6 +35,7 @@ import {
 } from './lib/clock.mjs';
 import { canonicalJson, ConformanceModel } from './lib/model.mjs';
 import { checkInvariants, evaluateVector, fuzzInvariants } from './lib/evaluate.mjs';
+import { applyOperation } from './lib/ops.mjs';
 import { evaluateSloGate } from './conformance.mjs';
 
 test('every vector passes the envelope schema and loads', async () => {
@@ -107,6 +109,11 @@ test('rrule parser mirrors the scoped vocabulary', () => {
   assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=9,9'), RruleError);
   assert.throws(() => parseRrule('BYHOUR=9'), RruleError);
   assert.throws(() => parseRrule('FREQ=DAILY;BYDAY=XX'), RruleError);
+  // Negative hours are schema-invalid and must be refused, not silently
+  // normalized into slots.
+  assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=-9'), RruleError);
+  assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=9,-3'), RruleError);
+  assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=-0'), RruleError);
 });
 
 test('clock resolves DST gaps, folds, and IANA zones deterministically', () => {
@@ -338,6 +345,66 @@ test('parseArgs validates arguments', () => {
   assert.equal(parseArgs(['--fuzz', '10']).fuzz, 10);
   assert.throws(() => parseArgs(['--bogus']), /unknown argument/);
   assert.throws(() => parseArgs(['--profile=nope']), /unknown profile/);
+});
+
+test('the first-event crash boundary publishes exactly one event then dies', () => {
+  const model = new ConformanceModel({ start: '2026-03-01T00:00:00.000Z' });
+  model.insertDefinition({
+    schemaVersion: 1,
+    id: 'routine',
+    name: 'Routine',
+    status: 'ACTIVE',
+    rrule: 'FREQ=DAILY;BYHOUR=9',
+    timezone: 'utc',
+    misfire: 'latest',
+    overlap: 'forbid',
+    timeoutMinutes: 30,
+    runtime: 'coven-code',
+    cwd: 'work/proj',
+    prompt: 'Run the routine.'
+  });
+  applyOperation(model, { op: 'crash', during: 'first-event' });
+  applyOperation(model, { op: 'tick', at: '2026-03-01T10:00:00.000Z' });
+  assert.equal(model.dead, true, 'the pass dies at the first-event boundary');
+  assert.equal(model.events.length, 1, 'exactly the first event is durably published');
+  assert.ok(
+    model.eventCursor > model.events.length,
+    `the rest of the pass's events are lost with the crash (emitted ${model.eventCursor}, published ${model.events.length})`
+  );
+  // A restart reconciles: the occurrence state is intact, the changefeed
+  // resumes from the published cursor, and nothing re-dispatches.
+  applyOperation(model, { op: 'restart', at: '2026-03-01T10:05:00.000Z' });
+  assert.equal(model.dead, false);
+  assert.ok(
+    [...model.occurrences.values()].every(
+      (occurrence) => !['claimed', 'running'].includes(occurrence.state)
+    ),
+    'no occurrence is left mid-flight after the boundary crash'
+  );
+});
+
+test('reports validate against conformance.report.v1 before publication', async () => {
+  const { report } = await runConformance({
+    profile: 'structural',
+    target: 'reference-oracle',
+    report: null,
+    vector: null,
+    slo: null,
+    fuzz: 0,
+    seed: 858,
+    list: false,
+    quiet: true
+  });
+  assert.deepEqual(validateReport(report), [], 'a real report must satisfy its schema');
+  const broken = structuredClone(report);
+  delete broken.gate.status;
+  assert.ok(validateReport(broken).length > 0, 'a report missing gate.status must be refused');
+  const drifted = structuredClone(report);
+  drifted.plane = 'some.other.plane';
+  assert.ok(
+    validateReport(drifted).some((error) => error.includes('plane')),
+    'a drifted plane id must be refused'
+  );
 });
 
 test('structural vectors refuse invalid definitions with matching reasons', async () => {

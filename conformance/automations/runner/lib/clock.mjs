@@ -57,6 +57,7 @@ export function parseRrule(text) {
         if (!Number.isInteger(parsedHour) || String(parsedHour) !== trimmed) {
           throw new RruleError(`BYHOUR entry \`${trimmed}\` is not an integer`);
         }
+        if (parsedHour < 0) throw new RruleError(`BYHOUR entry ${parsedHour} is negative`);
         if (parsedHour > 23) throw new RruleError(`BYHOUR entry ${parsedHour} exceeds 23`);
         if (hours.includes(parsedHour)) {
           throw new RruleError(`BYHOUR repeats entry ${parsedHour}`);

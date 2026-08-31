@@ -14,6 +14,7 @@
 // revisions and artifact digests, and is redacted before writing.
 
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { readdir, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { dirname, join, relative, resolve } from 'node:path';
@@ -194,6 +195,18 @@ export function parseArgs(argv) {
   return options;
 }
 
+// Validates a report against conformance.report.v1.schema.json. Returns the
+// error list; a non-empty list means the report must not be published.
+export function validateReport(report, planeRoot = PLANE_ROOT) {
+  return validateAgainstSchema(report, loadReportSchema(planeRoot));
+}
+
+function loadReportSchema(planeRoot = PLANE_ROOT) {
+  return JSON.parse(
+    readFileSync(join(planeRoot, 'schemas', 'conformance.report.v1.schema.json'), 'utf8')
+  );
+}
+
 export async function runConformance(options, planeRoot = PLANE_ROOT) {
   const { vectors, definitionSchema } = await loadVectors(planeRoot);
   const selected = options.vector
@@ -303,6 +316,18 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
       ? 'passed'
       : 'failed';
 
+  const gateNotes =
+    missingProfiles.length > 0
+      ? `profiles without executable vectors on this target: ${missingProfiles.join(', ')}`
+      : fuzz
+        ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
+        : null;
+  const gate = {
+    status: gateStatus,
+    requiredProfiles: REQUIRED_PROFILES
+  };
+  if (gateNotes !== null) gate.notes = gateNotes;
+
   const report = {
     reportVersion: 1,
     plane: 'coven.automations.conformance',
@@ -332,23 +357,28 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
       applied: true,
       rules: REDACTION_RULES
     },
-    gate: {
-      status: gateStatus,
-      requiredProfiles: REQUIRED_PROFILES,
-      notes:
-        missingProfiles.length > 0
-          ? `profiles without executable vectors on this target: ${missingProfiles.join(', ')}`
-          : fuzz
-            ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
-            : undefined
-    }
+    gate
   };
 
-  // The redacted receipt is the report's only published form: write it here
-  // so every caller (CLI, agent-check, CI) gets the same artifact.
+  // The report must satisfy conformance.report.v1 before it is published:
+  // a report that violates its own schema can never back a certification,
+  // so validation failures abort the run (fail closed). The published form
+  // is the redacted text, so that exact artifact is what gets validated.
+  const publishErrors = validateReport(report, planeRoot);
   if (options.report) {
+    const redacted = redactReportText(JSON.stringify(report, null, 2), [...prompts]) + '\n';
+    publishErrors.push(...validateReport(JSON.parse(redacted), planeRoot));
+    if (publishErrors.length > 0) {
+      throw new Error(
+        `conformance report violates conformance.report.v1; refusing to publish:\n  ${publishErrors.join('\n  ')}`
+      );
+    }
     await mkdir(dirname(options.report), { recursive: true });
-    await writeFile(options.report, redactReportText(JSON.stringify(report, null, 2), [...prompts]) + '\n');
+    await writeFile(options.report, redacted);
+  } else if (publishErrors.length > 0) {
+    throw new Error(
+      `conformance report violates conformance.report.v1; refusing to certify:\n  ${publishErrors.join('\n  ')}`
+    );
   }
 
   return { report, prompts, selectedCount: selected.length };

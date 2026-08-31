@@ -259,11 +259,28 @@ export function retryableDispatchFailure(model, occurrence, runId, reason, now) 
   });
 }
 
+// Publishes buffered changefeed events durably, one at a time. The
+// 'first-event' crash boundary lands after the first event of the pass is
+// durable: that event survives, the rest of the buffer is lost with the
+// crash, and the pass dies. When nothing is buffered the boundary never
+// fires (there is no first event to crash after).
+export function publishEvents(model, boundary = null) {
+  let published = 0;
+  while (model.eventBuffer.length > 0) {
+    model.events.push(model.eventBuffer.shift());
+    published += 1;
+    if (boundary !== null && hitCrashBoundary(model, boundary)) {
+      return { published, aborted: boundary };
+    }
+  }
+  return { published, aborted: null };
+}
+
 // One scheduler pass: plan due slots, recover expired leases, claim due
-// occurrences, dispatch. Events are buffered and flushed only when the pass
-// completes, so a crash loses the pass's changefeed entries, never state.
-// Crash boundaries are consumed in place by hitCrashBoundary as the pass
-// reaches them.
+// occurrences, dispatch. Events are buffered and published only when the
+// pass completes, so a crash loses the pass's changefeed entries, never
+// state. Crash boundaries are consumed in place by hitCrashBoundary as the
+// pass reaches them.
 export function runPass(model, now) {
   if (model.dead) return { skipped: true, reason: 'process is dead' };
   enforceTimeouts(model, now);
@@ -284,7 +301,8 @@ export function runPass(model, now) {
     model.eventBuffer = [];
     return { aborted: 'event-publication' };
   }
-  model.flushEvents();
+  const published = publishEvents(model, 'first-event');
+  if (published.aborted !== null) return { aborted: published.aborted };
   model.recordSuccessfulPass(now, activeDefinitions(model).map((record) => record.definition.id));
   return { ok: true };
 }
@@ -335,7 +353,8 @@ export function runNowPass(model, op) {
   if (hitCrashBoundary(model, 'claim')) return { aborted: 'claim' };
   if (hitCrashBoundary(model, 'dispatch')) return { aborted: 'dispatch' };
   dispatchOne(model, occurrence, model.now);
-  model.flushEvents();
+  const published = publishEvents(model, 'first-event');
+  if (published.aborted !== null) return { aborted: published.aborted };
   return { ok: true };
 }
 
