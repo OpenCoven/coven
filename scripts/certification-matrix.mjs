@@ -22,8 +22,63 @@
 // `Skipped` is not in the vocabulary on purpose: it is not a terminal outcome
 // for a required certification row.
 
-export const SUPPORT_MATRIX_VERSION = '1.0.0';
+export const SUPPORT_MATRIX_VERSION = '1.1.0';
 export const RECEIPT_VERSION = 1;
+
+// Canonical support inventory: the machine-readable support contract that row
+// applicability is derived from. A row may never claim coverage for a platform
+// that is not declared here, and every platform declared here must be covered
+// by at least one certification row (both enforced by the test suite).
+//
+// `releaseBuildRunner` is the runner that compiles the tag-built package for
+// the platform in `.github/workflows/release-npm.yml`. `releaseOnboardingRunner`
+// is the runner that *executes* the packaged onboarding verification of that
+// tag-built package at tag time; `null` means no such leg exists in the release
+// workflow, so release-time coverage for the platform cannot be claimed — rows
+// covering it must stay `required-unknown` at the release channel instead of
+// asserting coverage that does not run.
+export const SUPPORT_INVENTORY = {
+  version: 1,
+  wrapperPackage: '@opencoven/cli',
+  channels: ['source-checkout', 'release-tag'],
+  platforms: [
+    {
+      id: 'linux-x64-gnu',
+      package: '@opencoven/cli-linux-x64',
+      ciRunner: 'ubuntu-latest',
+      releaseBuildRunner: 'ubuntu-latest',
+      releaseOnboardingRunner: 'ubuntu-latest'
+    },
+    {
+      id: 'windows-x64',
+      package: '@opencoven/cli-windows',
+      ciRunner: 'windows-latest',
+      releaseBuildRunner: 'windows-latest',
+      // The release workflow's npm-dry-run leg executes on ubuntu-latest only;
+      // no Windows runner exercises the tag-built Windows package.
+      releaseOnboardingRunner: null
+    },
+    {
+      id: 'macos-arm64',
+      package: '@opencoven/cli-macos',
+      ciRunner: 'macos-26',
+      releaseBuildRunner: 'macos-26',
+      // The release workflow builds macOS packages on macOS runners but the
+      // onboarding/dry-run verification leg runs on ubuntu-latest only.
+      releaseOnboardingRunner: null
+    },
+    {
+      id: 'macos-x64',
+      package: '@opencoven/cli-macos-x64',
+      ciRunner: 'macos-15-intel',
+      releaseBuildRunner: 'macos-15-intel',
+      releaseOnboardingRunner: null
+    }
+  ]
+};
+
+export const SOURCE_CHECKOUT_CHANNEL = 'source-checkout';
+export const RELEASE_TAG_CHANNEL = 'release-tag';
 
 export const OUTCOMES = {
   REQUIRED_PASSED: 'required-passed',
@@ -225,6 +280,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'B1',
     lane: 'B',
     claim: 'Linux x64: packaged tarball onboarding plus source-equivalent checks pass in CI.',
+    platforms: ['linux-x64-gnu'],
     outcome: OUTCOMES.REQUIRED_PASSED,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#npm-onboarding-pr' },
@@ -236,6 +292,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'B2',
     lane: 'B',
     claim: 'Windows x64: packaged tarball onboarding plus the Rust suite pass in CI.',
+    platforms: ['windows-x64'],
     outcome: OUTCOMES.REQUIRED_PASSED,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#npm-onboarding-pr' },
@@ -247,6 +304,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'B3',
     lane: 'B',
     claim: 'macOS Apple Silicon: Rust suite, packaged onboarding, and AFS-mount legs run per push and at release tags.',
+    platforms: ['macos-arm64'],
     outcome: OUTCOMES.REQUIRED_PASSED,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#rust-test-macos' },
@@ -259,6 +317,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'B4',
     lane: 'B',
     claim: 'macOS Intel x64: a distinct public package path exists and its CI leg runs per push and at release tags.',
+    platforms: ['macos-x64'],
     outcome: OUTCOMES.REQUIRED_PASSED,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#npm-onboarding-main' },
@@ -270,6 +329,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'B5',
     lane: 'B',
     claim: 'Real-hardware confirmation per platform: registry install, doctor, and a first session on end-user machines.',
+    platforms: ['linux-x64-gnu', 'windows-x64', 'macos-arm64', 'macos-x64'],
     outcome: OUTCOMES.DEFERRED,
     evidence: [
       { kind: 'runbook', ref: 'docs/reference/releasing.md' },
@@ -784,6 +844,9 @@ export const CERTIFICATION_MATRIX = [
     id: 'J1',
     lane: 'J',
     claim: 'Exact release/tag target has every required check success.',
+    // Release-only requirement: applicable as soon as the candidate carries a
+    // release tag, regardless of the statically declared outcome below.
+    applicableWhen: { channels: [RELEASE_TAG_CHANNEL] },
     outcome: OUTCOMES.NOT_APPLICABLE,
     evidence: [
       { kind: 'workflow', ref: '.github/workflows/release-npm.yml' },
@@ -804,6 +867,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'J3',
     lane: 'J',
     claim: 'Signed tag/trusted signer/provenance/SBOM or declared dependency receipt passes.',
+    applicableWhen: { channels: [RELEASE_TAG_CHANNEL] },
     outcome: OUTCOMES.NOT_APPLICABLE,
     evidence: [
       { kind: 'workflow', ref: '.github/workflows/release-npm.yml' },
@@ -839,6 +903,7 @@ export const CERTIFICATION_MATRIX = [
     id: 'J6',
     lane: 'J',
     claim: 'Artifact/package digests used by E2E match the published artifacts.',
+    applicableWhen: { channels: [RELEASE_TAG_CHANNEL] },
     outcome: OUTCOMES.NOT_APPLICABLE,
     evidence: [
       { kind: 'runbook', ref: 'docs/reference/releasing.md' },
@@ -907,6 +972,7 @@ export function validateMatrix(rows = CERTIFICATION_MATRIX) {
   const errors = [];
   const seen = new Set();
   const laneIds = new Set(LANES.map((lane) => lane.id));
+  const platformIds = new Set(SUPPORT_INVENTORY.platforms.map((platform) => platform.id));
 
   for (const row of rows) {
     const where = `row ${row.id ?? '<missing id>'}`;
@@ -942,6 +1008,29 @@ export function validateMatrix(rows = CERTIFICATION_MATRIX) {
     ) {
       errors.push(`${where}: outcome '${row.outcome}' requires a justification`);
     }
+    if (row.applicableWhen !== undefined) {
+      const channels = row.applicableWhen?.channels;
+      if (
+        !Array.isArray(channels) ||
+        channels.length === 0 ||
+        !channels.every((channel) => SUPPORT_INVENTORY.channels.includes(channel))
+      ) {
+        errors.push(
+          `${where}: applicableWhen.channels must be a non-empty subset of ${SUPPORT_INVENTORY.channels.join(', ')}`
+        );
+      }
+    }
+    if (row.platforms !== undefined) {
+      if (
+        !Array.isArray(row.platforms) ||
+        row.platforms.length === 0 ||
+        !row.platforms.every((platform) => platformIds.has(platform))
+      ) {
+        errors.push(
+          `${where}: platforms must be a non-empty subset of the support inventory (${[...platformIds].join(', ')})`
+        );
+      }
+    }
     for (const ref of row.evidence ?? []) {
       if (!EVIDENCE_KINDS[ref.kind]) {
         errors.push(`${where}: evidence kind '${ref.kind}' is not defined`);
@@ -954,25 +1043,141 @@ export function validateMatrix(rows = CERTIFICATION_MATRIX) {
   return errors;
 }
 
+// The candidate context drives row applicability: the channel comes from how
+// the candidate is being certified (source checkout vs. release tag) and the
+// tag exists exactly when the channel is the release channel. This replaces
+// the old model where release-only rows were statically not-applicable and
+// could silently vanish from go/no-go even when a tag was in flight.
+export function resolveCandidateContext({ channel, tag = null } = {}) {
+  if (!SUPPORT_INVENTORY.channels.includes(channel)) {
+    throw new Error(
+      `unknown certification channel '${channel}'; expected one of ${SUPPORT_INVENTORY.channels.join(', ')}`
+    );
+  }
+  const releaseChannel = channel === RELEASE_TAG_CHANNEL;
+  if (releaseChannel) {
+    if (typeof tag !== 'string' || !/^v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(tag)) {
+      throw new Error(`release-tag candidates require a tag named vX.Y.Z[-suffix]; got '${tag ?? ''}'`);
+    }
+  } else if (tag != null) {
+    throw new Error(`channel '${channel}' must not carry a release tag; got '${tag}'`);
+  }
+  return Object.freeze({ channel, tag: releaseChannel ? tag : null });
+}
+
+// Whether a row applies to the candidate context, and why. Rows marked
+// `applicableWhen` apply whenever the candidate channel matches, which
+// overrides a statically declared not-applicable outcome (the release rows in
+// lane J). Everything else applies per its declared outcome.
+export function resolveApplicability(row, context) {
+  const declaredChannels = row.applicableWhen?.channels;
+  if (Array.isArray(declaredChannels)) {
+    if (declaredChannels.includes(context.channel)) {
+      return { applicable: true, basis: 'channel-matches-applicableWhen' };
+    }
+    return { applicable: false, basis: 'channel-not-in-applicableWhen' };
+  }
+  if (row.outcome === OUTCOMES.NOT_APPLICABLE) {
+    return { applicable: false, basis: 'declared-not-applicable' };
+  }
+  return { applicable: true, basis: 'declared-applicable' };
+}
+
 // The certification rule from the issue, executable: skipped/unknown are not
-// terminal outcomes for a required row, and a proven-failed required row is a
-// release blocker. Returns the open blockers for the current matrix.
-export function certificationBlockers(rows = CERTIFICATION_MATRIX) {
+// terminal outcomes for a required row, a proven-failed required row is a
+// release blocker, deferred rows are pending at the source channel and become
+// blockers at the release channel, and release-only rows apply as soon as the
+// candidate carries a tag. Returns the open blockers for the given context.
+export function certificationBlockers(rows = CERTIFICATION_MATRIX, context = null) {
+  const candidateContext = context ?? resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  const releaseChannel = candidateContext.channel === RELEASE_TAG_CHANNEL;
+  const blockers = [];
+  for (const row of rows) {
+    const applicability = resolveApplicability(row, candidateContext);
+    if (!applicability.applicable) {
+      continue;
+    }
+    if (row.outcome === OUTCOMES.NOT_APPLICABLE) {
+      // A release-only row whose channel arrived while the row is still
+      // statically not-applicable is exactly the drift this function exists to
+      // catch: the requirement is live but no evidence obligation is recorded.
+      if (applicability.basis === 'channel-matches-applicableWhen') {
+        blockers.push({
+          id: row.id,
+          lane: row.lane,
+          reason: `release-only row became applicable for channel '${candidateContext.channel}' but is still statically not-applicable with no evidence binding`,
+          ownerIssue: row.ownerIssue ?? null
+        });
+      }
+      continue;
+    }
+    if (row.outcome === OUTCOMES.REQUIRED_FAILED) {
+      blockers.push({
+        id: row.id,
+        lane: row.lane,
+        reason: `required row proven failed: ${row.justification ?? row.claim}`,
+        ownerIssue: row.ownerIssue ?? null
+      });
+    } else if (row.outcome === OUTCOMES.REQUIRED_UNKNOWN) {
+      blockers.push({
+        id: row.id,
+        lane: row.lane,
+        reason: `required row has an explicit unknown disposition: ${
+          row.justification ?? 'no justification recorded'
+        }`,
+        ownerIssue: row.ownerIssue ?? null
+      });
+    } else if (row.outcome === OUTCOMES.DEFERRED && releaseChannel) {
+      // Deferred rows must never disappear from a release go/no-go: at tag
+      // time each of them is an open requirement owned by its issue.
+      blockers.push({
+        id: row.id,
+        lane: row.lane,
+        reason: `release candidate still carries a deferred requirement owned by #${row.ownerIssue}: ${
+          row.justification ?? 'no justification recorded'
+        }`,
+        ownerIssue: row.ownerIssue ?? null
+      });
+    }
+  }
+  return blockers;
+}
+
+// Deferred rows stay visible in every go/no-go: at the source channel they are
+// pending (owned, not blocking), at the release channel they are blockers.
+export function pendingRows(rows = CERTIFICATION_MATRIX, context = null) {
+  const candidateContext = context ?? resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  if (candidateContext.channel === RELEASE_TAG_CHANNEL) {
+    return [];
+  }
   return rows
-    .filter(
-      (row) => row.outcome === OUTCOMES.REQUIRED_FAILED || row.outcome === OUTCOMES.REQUIRED_UNKNOWN
-    )
-    .map((row) => ({
-      id: row.id,
-      lane: row.lane,
-      reason:
-        row.outcome === OUTCOMES.REQUIRED_FAILED
-          ? `required row proven failed: ${row.justification ?? row.claim}`
-          : `required row has an explicit unknown disposition: ${
-              row.justification ?? 'no justification recorded'
-            }`,
-      ownerIssue: row.ownerIssue ?? null
-    }));
+    .filter((row) => row.outcome === OUTCOMES.DEFERRED)
+    .map((row) => ({ id: row.id, lane: row.lane, ownerIssue: row.ownerIssue ?? null }));
+}
+
+// The go/no-go verdict for a candidate context. `go` requires zero blockers,
+// zero pending rows at the release channel, and — at the release channel — an
+// approved reviewer decision recorded by release authorization (#805). The
+// receipt never self-certifies: without an approved decision record the
+// release channel cannot be `go`.
+export function goNoGo(rows = CERTIFICATION_MATRIX, context = null, { reviewerDecision = null } = {}) {
+  const candidateContext = context ?? resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  const releaseChannel = candidateContext.channel === RELEASE_TAG_CHANNEL;
+  const blockers = certificationBlockers(rows, candidateContext);
+  const pending = pendingRows(rows, candidateContext);
+  const verdict =
+    blockers.length === 0 && (!releaseChannel || (pending.length === 0 && reviewerDecision === 'approved'))
+      ? 'go'
+      : 'no-go';
+  return {
+    channel: candidateContext.channel,
+    tag: candidateContext.tag,
+    verdict,
+    blockers,
+    pending,
+    reviewerDecision: releaseChannel ? reviewerDecision : null,
+    summary: matrixSummary(rows)
+  };
 }
 
 export function matrixSummary(rows = CERTIFICATION_MATRIX) {

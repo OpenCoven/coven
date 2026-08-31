@@ -53,7 +53,7 @@ node scripts/certification-receipt.mjs --strict   # fail closed on open blockers
 ```
 
 The receipt is deterministic and keyed by the candidate digests, carries the
-support-matrix version (`1.0.0`), one entry per row, the summary counts, the
+support-matrix version (`1.1.0`), one entry per row, the summary counts, the
 open blockers, and a `reviewerDecision` that stays `null` until release
 authorization ([#805](https://github.com/OpenCoven/coven/issues/805)) sets it
 after human review. The receipt never self-certifies.
@@ -289,7 +289,7 @@ Generate the live counts with
 `node scripts/certification-receipt.mjs`; the summary partitions every row into
 `requiredPassed` / `requiredFailed` / `requiredUnknown` / `notApplicable` /
 `experimentalDisabled` / `deferred`, and `releaseBlockers` lists exactly the
-rows that keep certification open. As of support-matrix version `1.0.0` the
+rows that keep certification open. As of support-matrix version `1.1.0` the
 open blockers are the recovery/API-boundary/docs gaps named in lanes A, D, H,
 and I — all owned by [#807](https://github.com/OpenCoven/coven/issues/807) and
 [#778](https://github.com/OpenCoven/coven/issues/778) rather than silently

@@ -12,10 +12,17 @@ import {
   LANES,
   OUTCOMES,
   OUTCOME_LABELS,
+  RELEASE_TAG_CHANNEL,
+  SOURCE_CHECKOUT_CHANNEL,
+  SUPPORT_INVENTORY,
   SUPPORT_MATRIX_VERSION,
   TERMINAL_OUTCOMES,
   certificationBlockers,
+  goNoGo,
   matrixSummary,
+  pendingRows,
+  resolveApplicability,
+  resolveCandidateContext,
   validateMatrix
 } from './certification-matrix.mjs';
 import { buildReceipt, parseArgs, resolveCandidate } from './certification-receipt.mjs';
@@ -284,5 +291,149 @@ test('strict cli exits nonzero while the matrix carries open blockers', () => {
     assert.match(result.stderr, /open blocker/);
   } else {
     assert.equal(result.status, 0);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Applicability, the support inventory, and the go/no-go verdict.
+
+test('candidate contexts are validated against the support inventory', () => {
+  assert.deepEqual(resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL }), {
+    channel: SOURCE_CHECKOUT_CHANNEL,
+    tag: null
+  });
+  const tagged = resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'v1.2.3' });
+  assert.equal(tagged.channel, RELEASE_TAG_CHANNEL);
+  assert.equal(tagged.tag, 'v1.2.3');
+
+  assert.throws(() => resolveCandidateContext({ channel: 'vibes' }), /unknown certification channel/);
+  assert.throws(
+    () => resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'not-a-version' }),
+    /release-tag candidates require a tag/
+  );
+  assert.throws(
+    () => resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL }),
+    /release-tag candidates require a tag/
+  );
+  assert.throws(
+    () => resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL, tag: 'v1.2.3' }),
+    /must not carry a release tag/
+  );
+});
+
+test('release-only rows are derived applicable from the candidate channel/tag, not statically frozen', () => {
+  const sourceContext = resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  const releaseContext = resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'v9.9.9' });
+
+  for (const rowId of ['J1', 'J3', 'J6']) {
+    const row = CERTIFICATION_MATRIX.find((candidate) => candidate.id === rowId);
+    assert.deepEqual(
+      resolveApplicability(row, sourceContext),
+      { applicable: false, basis: 'channel-not-in-applicableWhen' },
+      `${rowId} must not apply to a source checkout`
+    );
+    assert.equal(
+      resolveApplicability(row, releaseContext).applicable,
+      true,
+      `${rowId} must apply to a tagged release candidate`
+    );
+  }
+});
+
+test('deferred rows cannot vanish from the release go/no-go', () => {
+  const sourceContext = resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  const releaseContext = resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'v9.9.9' });
+
+  const deferredIds = CERTIFICATION_MATRIX.filter((row) => row.outcome === OUTCOMES.DEFERRED).map(
+    (row) => row.id
+  );
+  assert.ok(deferredIds.length > 0, 'the matrix must carry deferred rows for this test to mean anything');
+
+  // Source channel: deferred rows are pending, owned, and not blockers.
+  const sourceBlockers = certificationBlockers(CERTIFICATION_MATRIX, sourceContext);
+  const sourcePending = pendingRows(CERTIFICATION_MATRIX, sourceContext);
+  for (const id of deferredIds) {
+    assert.ok(!sourceBlockers.some((blocker) => blocker.id === id), `${id} must not block a source checkout`);
+    assert.ok(sourcePending.some((row) => row.id === id), `${id} must stay visible as pending`);
+    assert.ok(sourcePending.find((row) => row.id === id).ownerIssue, `${id} must name its owner issue`);
+  }
+
+  // Release channel: every deferred row becomes an explicit blocker.
+  const releaseBlockers = certificationBlockers(CERTIFICATION_MATRIX, releaseContext);
+  for (const id of deferredIds) {
+    const blocker = releaseBlockers.find((entry) => entry.id === id);
+    assert.ok(blocker, `${id} must block a tagged release`);
+    assert.match(blocker.reason, /deferred requirement/);
+    assert.ok(blocker.ownerIssue, `${id} blocker must carry its owner issue`);
+  }
+  assert.equal(pendingRows(CERTIFICATION_MATRIX, releaseContext).length, 0);
+});
+
+test('statically not-applicable release rows become blockers once a tag is in flight', () => {
+  const releaseContext = resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'v9.9.9' });
+  const blockers = certificationBlockers(CERTIFICATION_MATRIX, releaseContext);
+  for (const rowId of ['J1', 'J3', 'J6']) {
+    const blocker = blockers.find((entry) => entry.id === rowId);
+    assert.ok(blocker, `${rowId} must block a tagged release while it carries no evidence binding`);
+    assert.match(blocker.reason, /became applicable/);
+  }
+  const sourceBlockers = certificationBlockers(CERTIFICATION_MATRIX);
+  for (const rowId of ['J1', 'J3', 'J6']) {
+    assert.ok(!sourceBlockers.some((entry) => entry.id === rowId));
+  }
+});
+
+test('go/no-go verdict requires zero blockers, no pending release rows, and an approved reviewer decision', () => {
+  const sourceContext = resolveCandidateContext({ channel: SOURCE_CHECKOUT_CHANNEL });
+  assert.equal(goNoGo(CERTIFICATION_MATRIX, sourceContext).verdict, 'no-go');
+  assert.ok(goNoGo(CERTIFICATION_MATRIX, sourceContext).blockers.length > 0);
+
+  // A synthetic fully-passed matrix still cannot self-certify a release: the
+  // reviewer decision is missing.
+  const cleanMatrix = [
+    {
+      id: 'A1',
+      lane: 'A',
+      claim: 'synthetic clean row used to exercise the go/no-go verdict',
+      outcome: OUTCOMES.REQUIRED_PASSED,
+      evidence: [{ kind: 'issue', ref: 'OpenCoven/coven#805' }]
+    }
+  ];
+  const releaseContext = resolveCandidateContext({ channel: RELEASE_TAG_CHANNEL, tag: 'v9.9.9' });
+  assert.equal(
+    goNoGo(cleanMatrix, releaseContext, { reviewerDecision: null }).verdict,
+    'no-go',
+    'a release without an approved reviewer decision must be no-go'
+  );
+  assert.equal(
+    goNoGo(cleanMatrix, releaseContext, { reviewerDecision: 'approved' }).verdict,
+    'go'
+  );
+  assert.equal(goNoGo(cleanMatrix, sourceContext, { reviewerDecision: null }).verdict, 'go');
+});
+
+test('support inventory and row platform coverage form a bijection', () => {
+  const platformIds = SUPPORT_INVENTORY.platforms.map((platform) => platform.id);
+  assert.equal(new Set(platformIds).size, platformIds.length, 'platform ids must be unique');
+  assert.ok(SUPPORT_INVENTORY.platforms.length > 0);
+
+  const covered = new Set();
+  for (const row of CERTIFICATION_MATRIX) {
+    if (row.platforms === undefined) {
+      continue;
+    }
+    for (const platform of row.platforms) {
+      assert.ok(
+        platformIds.includes(platform),
+        `row ${row.id} claims platform ${platform} which the support inventory does not declare`
+      );
+      covered.add(platform);
+    }
+  }
+  for (const platform of platformIds) {
+    assert.ok(
+      covered.has(platform),
+      `support inventory platform ${platform} is not covered by any certification row`
+    );
   }
 });
