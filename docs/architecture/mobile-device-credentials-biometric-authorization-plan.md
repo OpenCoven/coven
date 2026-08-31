@@ -7,6 +7,7 @@ Tracks: #786. Parent architecture: #784 (`mobile-device-trust.md`, `mobile-devic
 Companion documents:
 
 - [`mobile-device-pairing-v1.md`](mobile-device-pairing-v1.md) — the canonical protocol contract this plan implements
+- [`../design/mobile-assurance-step-up-v1.md`](../design/mobile-assurance-step-up-v1.md) — the `COVEN-ASSURANCE/1` step-up proof contract (#815, landed by #871); §§6–7 of this plan defer to it
 - [`../design/mobile-device-trust.md`](../design/mobile-device-trust.md) — accepted architecture and authority boundary
 - [`../security/mobile-device-pairing-threat-model.md`](../security/mobile-device-pairing-threat-model.md) — adversaries and required controls
 - [`../../spec/device-pairing/v1/`](../../spec/device-pairing/v1/README.md) — diagnostic schemas, capability vocabulary, conformance gates
@@ -21,7 +22,7 @@ This plan specifies:
 
 1. the platform device-credential policy (iOS Secure Enclave/Keychain, Android Keystore/BiometricPrompt) and how PIN/passcode fallback is kept distinct from biometric-only assurance;
 2. the device-grant object model as it maps onto the existing protocol schemas and the current Rust authority, including the capability/assurance vocabulary alignment the implementation needs;
-3. assurance-level policy (possession → recent user verification → fresh biometric → step-up) and where each level is enforced;
+3. assurance-level policy (possession → recent user verification → fresh biometric → step-up), where each level is enforced, and how anything above possession is proven — exclusively through the `COVEN-ASSURANCE/1` step-up proof contract (`../design/mobile-assurance-step-up-v1.md`, #815/#871);
 4. exact transaction authorization with a worked, reproducible golden example;
 5. the device-management command surface, lost-device workflow, key rotation, and audit-event taxonomy;
 6. the state machines and registry migration that generalize today's `memory_read`-only pairing into scoped grants.
@@ -90,11 +91,14 @@ expires:       2026-08-31T15:00:00Z (never auto-renews)
 revocationEpoch: 0
 
 # A deploy arrives from a familiar. The phone must approve it.
-#   1. daemon posts the action intent (operation/target/effect/nonce/expiry)
+#   1. daemon posts the action transaction (every displayed field; §7.2) and a
+#      COVEN-ASSURANCE/1 challenge
 #   2. phone renders EVERY digest-covered field, then Face ID
-#   3. Secure Enclave signs the canonical action bytes; nothing biometric leaves the phone
-# 4. daemon verifies signature + grant + assurance; the action executes once
-# 5. audit: step_up approved, grant id, device id — never the biometric, never the payload
+#   3. the authorization key signs the COVEN-ASSURANCE/1 action proof; nothing
+#      biometric leaves the phone
+#   4. daemon verifies possession request, challenge, and proof, and computes the
+#      effective assurance itself; the action executes once
+#   5. audit: step-up verified, grant id, device id — never the biometric, never the payload
 ```
 
 Reproducible golden vectors for that flow are in §7.3.
@@ -108,15 +112,16 @@ The device credential is a non-exportable signing key created at enrollment time
 Requirements (extending Gate E of `spec/device-pairing/v1/implementation-gates.md`):
 
 - C-1. The key MUST be generated inside the platform key facility on the device — never imported, never derivable from a seed the app stores.
-- C-2. The key MUST be bound to an access-control policy that gates every private-key operation (see §4.2/§4.3). The mobile client MUST NOT use a key whose use is ungated when the platform offers gating.
+- C-2. Key-use gating is role-scoped (§4.7): the possession key MUST remain usable without a user-verification prompt on every request, and any key enrolled as an authorization key MUST be bound to the platform access-control policy that enforces its declared assurance class (see §4.2/§4.3). The mobile client MUST NOT enroll as an authorization key a key whose use is ungated when the platform offers gating.
 - C-3. The private key MUST be non-extractable when the platform supports it. If a platform cannot provide hardware protection (older Android, developer devices), the client MUST fall back to software keys and the grant MUST record `unattested_device` attestation (`spec/device-pairing/v1/capabilities.json`), and policy MAY restrict what an unattested device may hold.
 - C-4. The key MUST be bound to the enrollment transcript from #785: enrollment signs the transcript hash (already required by the enrollment-request schema); if the key is destroyed the device re-enrolls as a new device — a key never silently re-binds to a new transcript.
 - C-5. One keypair per Coven relationship: the device generates a fresh keypair per pairing ceremony. No identifier derived from the key or hardware may be reused across unrelated trust domains (threat: cross-Coven correlation).
 - C-6. Losing the platform's unlock factors (biometrics re-enrolled, passcode change) MUST be detected via key invalidation (`biometryCurrentSet` on iOS, `setInvalidatedByBiometricEnrollment` on Android) and treated as a re-enrollment trigger, not silently retried.
+- C-7. The possession key and the step-up authorization key are distinct keys (`COVEN-ASSURANCE/1`, "Key separation"): one key MUST NOT serve both roles, the possession key stays prompt-free so ordinary requests remain frictionless, and all biometric/passcode gating attaches to the separate authorization key (§4.7, §6).
 
 ### 4.2 iOS evaluation (Secure Enclave + Keychain access control)
 
-Recommended client contract for the Pocket/iOS client:
+Recommended client contract for the Pocket/iOS client. The possession key is created with `kSecAccessControlPrivateKeyUsage` alone — no user-verification policy — so ordinary `COVEN-MEMORY/1` requests stay prompt-free (§4.7); the access-control choices below configure the separate **authorization key** (`COVEN-ASSURANCE/1`):
 
 - Generate the key with `kSecAttrTokenIDSecureEnclave`, algorithm P-256 (ECDSA/ES256) — the only algorithm Secure Enclave keys support. This matches the existing P-256 device-key profile (`auth.rs` verifies P-256 sec1 points; `docs/architecture/mobile-device-pairing-v1.md` allows "platform-native hardware keys MAY use P-256 with an explicitly encoded algorithm identifier").
 - Create the key with `SecAccessControlCreateFlags` combining `kSecAccessControlPrivateKeyUsage` and one of:
@@ -127,7 +132,7 @@ Recommended client contract for the Pocket/iOS client:
 
 ### 4.3 Android evaluation (Keystore + BiometricPrompt)
 
-- Generate the key in Android Keystore with `KeyGenParameterSpec` and hardware-backed storage; then attach the authentication policy that matches the assurance the credential may claim:
+- Generate the key in Android Keystore with `KeyGenParameterSpec` and hardware-backed storage; the possession key carries no `setUserAuthentication*` policy (§4.7), and the authorization key attaches the authentication policy that matches its declared assurance class:
   - `setUserAuthenticationParameters(0, AUTH_BIOMETRIC_STRONG)` — per-operation auth with the `KeyProperties` strong-biometric-only constant → the credential qualifies for `fresh_biometric`;
   - `setUserAuthenticationParameters(timeout, AUTH_BIOMETRIC_STRONG | AUTH_DEVICE_CREDENTIAL)` — time-window auth → maps to `recent_user_verification` while the window is open; the credential-fallback path is recorded as its own method (§4.4);
   - `setInvalidatedByBiometricEnrollment(true)` so new biometrics invalidate the key rather than silently widening access;
@@ -154,6 +159,21 @@ Platform PIN/passcode fallback is accepted when policy allows it, but it MUST be
 - The enrollment request signs `{transcriptHash, deviceKey, pairwiseDeviceId, capabilities, nonce, expiresAt}` (`spec/device-pairing/v1/enrollment-request.schema.json`).
 - Current implementation: `pairing.rs` builds `PairingTranscript::for_request(...)` over the v2 offer (`COVEN-PAIR/2`, `COVEN-PAIR-OFFER/2` domains), derives the phrase and `transcript_hash`, and records the device public key in `PendingDevice`. The transcript fixture (`crates/coven-cli/tests/fixtures/mobile-pairing-v2/transcript-vector.json`) locks the digest derivation.
 - Gap to close in #786's implementation slice: the *grant issuance* step must refuse to issue a grant whose subject key was not the key that signed the accepted enrollment request for the stored transcript hash. Today `enroll()` stores whatever public key the request carried; the issuance rule (§5.4) makes the binding explicit and testable (Gate C: "capability digest is bound from QR creation through grant issuance").
+
+### 4.7 Key separation and the `COVEN-ASSURANCE/1` authorization key
+
+Every paired device holds two distinct, non-exportable P-256 keys (`COVEN-ASSURANCE/1`, "Key separation"):
+
+- the **possession key**, enrolled via the #785 transcript, which authenticates every request under `COVEN-MEMORY/1` and stays prompt-free; and
+- the **step-up authorization key**, a separate key protected by the platform policy of its declared assurance class, which signs `COVEN-ASSURANCE/1` proofs only (§6).
+
+Rules:
+
+- One key MUST NOT serve both roles; the registry MUST reject an authorization key equal to the possession key (`COVEN-ASSURANCE/1`, "Key separation" rule 1).
+- The authorization key is optional and additive: devices without one keep exactly today's possession-only behavior, and grants whose policy demands more than possession fail closed for them (`AssuranceRequired`).
+- Enrollment binds the authorization public key and its declared class (`biometric_only` | `user_verification` | `device_credential`) into the pairing-v2 transcript, so the class is an enrollment fact confirmed by the human phrase comparison — never a runtime client assertion. The class caps what proofs from that key can ever prove: `biometric_only` → `fresh_biometric`; `user_verification` and `device_credential` → `fresh_user_verification`.
+- Authorization-key metadata lives in its own store (`authorization-keys.json`), not in the device registry, so the two lifecycles stay independent (`COVEN-ASSURANCE/1`, "Storage").
+- Only signatures cross the trust boundary at any point; biometric material never does (§6).
 
 ## 5. Device grant
 
@@ -238,7 +258,7 @@ Three vocabularies exist and disagree:
 | `spec/device-pairing/v1/capabilities.json` `assuranceLevels` and `device-grant.schema.json` `requiredAssurance` | `possession`, `recent_user_verification`, `fresh_biometric`, `step_up` |
 | `docs/design/mobile-device-trust.md` | 5 levels, including both `fresh user verification` and `fresh biometric-only` |
 
-Recommendation: extend the spec vocabulary to five levels (add `fresh_user_verification`) to match the implementation and the accepted architecture document. `capabilities.json` ranks are a total order; `authorize()` already relies on rank ordering (`presented_assurance < required_assurance`), so the extension is monotonic and backwards compatible. Alternative considered: collapse `fresh_user_verification` and `fresh_biometric` — rejected because the issue explicitly requires distinguishing biometric-only from broader device-credential fallback, and the Rust enum would lose the distinction it already encodes.
+Recommendation: extend the spec vocabulary to five levels (add `fresh_user_verification`) to match the implementation and the accepted architecture document. `capabilities.json` ranks are a total order; `authorize()` already relies on rank ordering (`presented_assurance < required_assurance`), so the extension is monotonic and backwards compatible. Alternative considered: collapse `fresh_user_verification` and `fresh_biometric` — rejected because the issue explicitly requires distinguishing biometric-only from broader device-credential fallback, and the Rust enum would lose the distinction it already encodes. The `COVEN-ASSURANCE/1` enrollment classes are the device-side counterparts of these levels and cap the claimable proof levels: `biometric_only` → `fresh_biometric`; `user_verification`, `device_credential` → `fresh_user_verification` (§4.7, §6.3).
 
 ### 5.4 Grant issuance and verification lifecycle
 
@@ -272,16 +292,16 @@ Verification (every protected interaction, already implemented and retained):
 
 The controlling insight: **assurance is enforced by which key operations the platform permits, not by claims the client makes.** The host never receives, and never evaluates, biometric data; it sees only signatures that could only have been produced if the platform's gating policy allowed a signing operation at that moment.
 
-| Level | Platform mechanism (what actually gates the key) | Host-side check |
+| Level | Platform mechanism (what actually gates the key) | Host-side proof |
 | --- | --- | --- |
-| 1 `possession` | Key usable; request signed | `auth.rs` canonical-request verification + grant `authorize` |
-| 2 `recent_user_verification` | Key access-control with a bounded reuse window (iOS `touchIDAuthenticationAllowableReuseDuration`; Android `setUserAuthenticationParameters(timeout, …)`) — the OS refuses to sign after the window lapses | same signature verification; freshness is the platform's to enforce |
-| 3 `fresh_user_verification` / `fresh_biometric` | Per-operation key use: iOS access-control flag on the key + `evaluatePolicy` immediately before signing; Android `setUserAuthenticationParameters(0, …)` + `BiometricPrompt` with `CryptoObject(Signature)` over the exact action digest | signature over the exact action digest; freshness is structurally guaranteed because the signature cannot exist otherwise |
-| 4 `step_up` | Second trusted device, recovery credential, or owner ceremony (#788) | policy outside this issue; reserved rank |
+| 1 `possession` | Possession key usable; request signed | `COVEN-MEMORY/1` canonical-request verification + grant `authorize` (`auth.rs`) |
+| 2 `recent_user_verification` | Authorization-key access control with a bounded reuse window (iOS `touchIDAuthenticationAllowableReuseDuration`; Android `setUserAuthenticationParameters(timeout, …)`) — the OS refuses to sign after the window lapses | server-side policy notion only: no ceremony exists to sign, so `COVEN-ASSURANCE/1` defines no proof class for it (`mobile-assurance-step-up-v1.md`) |
+| 3 `fresh_user_verification` / `fresh_biometric` | Per-operation key use on the authorization key: iOS access-control flag + `evaluatePolicy` immediately before signing; Android `setUserAuthenticationParameters(0, …)` + `BiometricPrompt` with `CryptoObject(Signature)` over the exact action digest | `COVEN-ASSURANCE/1` proof: authorization-key signature over a server-issued single-use challenge and a server-recomputed context digest; the server computes the effective assurance itself (§6.3) |
+| 4 `step_up` | Second trusted device, recovery credential, or owner ceremony (#788) | reserved rank, never minted by `COVEN-ASSURANCE/1` |
 
-Because level 3 signatures can only be produced when the platform just verified the user, "biometric material never leaves the platform biometric subsystem" holds by construction: Coven receives a signature, not an authentication state.
+Above `possession`, assurance is proven — never asserted — exactly as `COVEN-ASSURANCE/1` specifies (`../design/mobile-assurance-step-up-v1.md`, #815, landed by #871): the separate platform-gated authorization key (§4.7) signs canonical proof bytes binding the device, grant, authorization (revocation) epoch, a server-issued single-use challenge, and a context digest the server recomputes from the actual request or action bytes. The server caps the signed claim by the enrolled key's declared class and passes the resulting **effective assurance** to `DeviceGrant::authorize`; it never evaluates a client-declared level, and `ensure_still_active` revalidates with that same value at effect time (§6.3, §6.4).
 
-For audit and UI, the device MAY attach a signed **AssuranceAssertion** (§6.3) describing which class of local verification preceded a signature. The assertion is evidence for audit/display; the host MUST NOT treat it as authorization in place of the signature and grant checks.
+Because level-3 signatures can only be produced when the platform just verified the user, "biometric material never leaves the platform biometric subsystem" holds by construction: Coven receives a signature, not an authentication state.
 
 ### 6.2 Platform mapping matrix
 
@@ -289,38 +309,24 @@ For audit and UI, the device MAY attach a signed **AssuranceAssertion** (§6.3) 
 | --- | --- | --- | --- | --- |
 | iOS (Secure Enclave) | Secure Enclave P-256, `kSecAttrTokenIDSecureEnclave` | access control with bounded reuse duration | `.biometryCurrentSet` + `evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics)` just-in-time | `.deviceOwnerAuthenticationWithBiometrics` (biometric-only) vs `.deviceOwnerAuthentication` (biometric-or-passcode) are distinct APIs; use the former for level 3 |
 | Android (Keystore/TEE/StrongBox) | hardware-backed key, non-exportable | `setUserAuthenticationParameters(timeout > 0, …)` | per-operation auth (`timeout = 0`) + `BiometricPrompt` `CryptoObject`, strong-biometric class | the `BIOMETRIC_STRONG` vs `DEVICE_CREDENTIAL` authenticator classes (via `BiometricManager`); `canAuthenticate` result recorded as method class |
-| Fallback platforms | software key (exportable) | n/a | not claimable | grant records `unattested_device`; sensitive scopes require `step_up` |
+| Fallback platforms | software key (exportable) | n/a | not claimable | grant records `unattested_device`; scopes whose policy demands fresh verification fail closed — no enrolled authorization key ⇒ effective assurance stays `possession` ⇒ `AssuranceRequired` |
+
+The `COVEN-ASSURANCE/1` enrollment classes are the device-side declaration of this matrix: `biometric_only` (ceiling `fresh_biometric`), `user_verification` and `device_credential` (ceiling `fresh_user_verification`). The class is confirmed in the pairing transcript at enrollment (§4.7); the host trusts it only as an enrollment fact and caps every proof by it at verification time.
 
 Policy default proposal (derivable from `spec/device-pairing/v1/capabilities.json` risk classes): `low` → possession; `moderate`/`sensitive` → recent_user_verification; `high` → fresh_user_verification (fresh_biometric where the platform distinguishes it); `critical` → fresh_biometric, with `identity.admin`, `devices.*`, `*export` additionally requiring step_up. Defaults are issuance-time policy encoded in the grant's `restrictions` (`require_fresh_user_verification_for` / `requiredAssurance`), so self-hosted owners can override without code changes.
 
-### 6.3 AssuranceAssertion diagnostic schema (proposed)
+### 6.3 Step-up proofs are `COVEN-ASSURANCE/1`, not a client-signed assertion
 
-New diagnostic schema (proposed for `spec/device-pairing/v1/assurance-assertion.schema.json`; same draft-2020-12 style as its siblings):
+Earlier drafts of this plan proposed a device-signed **AssuranceAssertion** diagnostic object. That design is withdrawn: a client-signed assertion is precisely the "client upgrades assurance by sending an asserted enum" shortcut that [`COVEN-ASSURANCE/1`](../design/mobile-assurance-step-up-v1.md) (#815, landed by #871) exists to prevent. This plan defers to that contract in full — canonical proof bytes, challenge store, verification procedure, transport headers, portable golden vector — and records only the binding decisions #786 adds on top:
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://opencoven.ai/spec/device-pairing/v1/assurance-assertion.schema.json",
-  "title": "OpenCoven AssuranceAssertion v1 diagnostic JSON representation",
-  "description": "Device-signed, diagnostic-only record of which class of local user verification preceded a key operation. Evidence for audit and UI; never a substitute for signature and grant verification. Contains no biometric data — only the platform-reported verification class.",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["version", "deviceId", "grantId", "assurance", "method", "verifiedAt", "nonce", "signature"],
-  "properties": {
-    "version": {"const": 1},
-    "deviceId": {"type": "string", "minLength": 16, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"},
-    "grantId": {"type": "string", "pattern": "^[A-Za-z0-9_-]{22}$"},
-    "assurance": {"enum": ["possession", "recent_user_verification", "fresh_user_verification", "fresh_biometric", "step_up"]},
-    "method": {"enum": ["biometric_strong", "biometric_weak", "device_credential", "combined", "unknown"]},
-    "verifiedAt": {"type": "integer", "minimum": 0},
-    "expiresAt": {"type": "integer", "minimum": 0},
-    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
-    "signature": {"type": "string", "minLength": 1, "pattern": "^[A-Za-z0-9_-]+$"}
-  }
-}
-```
+- **Separate authorization key.** Proofs are signed by the enrolled step-up authorization key (§4.7) — never by the possession key that authenticates requests; the two are distinct keys and the registry rejects an authorization key equal to the possession key.
+- **Server-issued single-use challenge.** Every proof covers a 32-byte challenge minted by the possession-authenticated route `POST /api/v1/mobile/assurance/challenge`, bound to `(device_id, grant_id, revocation_epoch)`, atomically consumed on first successful verification within its ≤120 s window. Grant rotation or revocation immediately invalidates outstanding challenges; a daemon restart cannot resurrect a spent challenge.
+- **Server-recomputed context.** The server recomputes `context_digest` itself — the exact `COVEN-MEMORY/1` canonical request bytes (`request` mode) or the canonical action-transaction bytes (`action` mode, §7) — and never trusts a client-supplied digest; `context_mode` keeps the two domains non-substitutable.
+- **Server-computed effective assurance.** `effective = min(requested_assurance, class_ceiling)`; the claim lives inside the signature, the ceiling is the enrolled key's declared class, and any verification failure collapses the effective assurance to `possession`, after which the grant's own policy fails the request closed (`GrantError::AssuranceRequired`).
+- **Revalidation at effect time.** `ensure_still_active` re-checks grant id + `revocation_epoch` before the action executes and reuses the request's effective assurance (`VerifiedMobileDevice.effective_assurance`), so a grant replaced or revoked mid-flight kills the pending action — and a legitimately step-up-authorized request is not failed by the re-check.
+- **No biometric data.** The proof carries only the platform-reported verification *class* of the enrolled key, an enrollment-time fact; nothing biometric exists anywhere in the protocol. `recent_user_verification` remains a server-side policy notion with no proof class; `step_up` is reserved for #788.
 
-Notes: `method` records only the *class* of platform verification (strong biometric vs device credential) — exactly the distinction the issue's acceptance criteria demand, and nothing biometric. `expiresAt` bounds how long the assertion may be replayed for display; the canonical representation is COSE-signed like every other protocol object (per `spec/device-pairing/v1/README.md`).
+Any UI/display vocabulary for the verification method (strong biometric vs device credential) is derived locally from the enrolled class and is display-only; it is never a wire input to the authorization decision.
 
 ### 6.4 Step-up decision flow
 
@@ -329,16 +335,21 @@ request (scope S) arrives
   │ auth.rs verify: possession checks pass?
   ├─ no  → reject (audit AuthenticationRejected)
   ├─ grant lacks scope S → ScopeDenied
-  ├─ S ∈ restrictions.require_fresh_user_verification_for
-  │     and presented assurance < required floor
-  │   → 409-style "assurance required" challenge (fresh nonce)
-  │        device performs platform verification on the exact action digest
-  │        → signs AssuranceAssertion + action digest → host verifies → step-up recorded
-  ├─ rank(presented) ≥ rank(required) → authorize
-  └─ before executing: ensure_still_active re-checks grant + revocation epoch (TOCTOU)
+  ├─ S requires assurance above possession (restrictions / minimum_assurance)
+  │     → client fetches a COVEN-ASSURANCE/1 challenge (single-use, bound to
+  │        device_id / grant_id / revocation_epoch)
+  │        device performs the platform verification gating its authorization key
+  │        → authorization key signs the COVEN-ASSURANCE/1 proof over the
+  │          server-recomputed context (request or action bytes)
+  │        → server verifies: challenge unspent + unexpired, signature, ≤120 s window
+  │        → effective = min(requested, enrolled class ceiling)   (server-computed, §6.3)
+  ├─ rank(effective) ≥ rank(required) → authorize
+  │     any proof failure ⇒ effective = possession ⇒ AssuranceRequired ⇒ reject
+  └─ before executing: ensure_still_active re-checks grant id + revocation epoch
+        with the same effective assurance (revalidation at effect time; TOCTOU)
 ```
 
-The host never asks the device "is the user verified?"; it demands a signature that could only be produced under the required verification, and treats the absence of that capability as an authorization failure.
+The host never asks the device "is the user verified?"; it demands a `COVEN-ASSURANCE/1` proof that could only have been produced under the required verification, caps it by the enrolled key's own class, and treats the absence of that capability as an authorization failure.
 
 ## 7. Transaction authorization
 
@@ -473,7 +484,7 @@ The issue requires audit events for enrollment, authentication, step-up approval
 | --- | --- |
 | `DeviceEnrolled` | grant issued at enrollment completion (complements `PairingCompleted`) |
 | `AuthenticationSucceeded` | successful `MobileAuthenticator::verify` (device id only, never path/nonce) |
-| `StepUpRequested` / `StepUpApproved` / `StepUpRejected` / `StepUpExpired` | §6.4 flow outcomes |
+| `StepUpVerified` / `StepUpRejected` | §6.4 flow outcomes (names follow `COVEN-ASSURANCE/1`'s audit recommendation) |
 | `GrantIssued` / `GrantScopeNarrowed` / `GrantReissued` | §5.5 |
 | `DeviceRenamed` | §8.1 |
 | `DeviceKeyRotated` | §5.6 |
@@ -489,7 +500,7 @@ Deterministic migration rule: for each legacy device record, synthesize `DeviceG
 
 ## 12. Self-hosted and cloudless operation
 
-Acceptance criterion: self-hosted deployments use the credential/grant model without an OpenCoven cloud account. Current implementation satisfies the shape: the grant issuer is `DeviceGrantAudience::LocalCovenAuthority` (`grant.rs`), the registry/audit/state live under the local Coven home (`config.rs` private-file discipline: atomic replace, 0600, `O_NOFOLLOW`), and pairing runs over the local daemon socket (`mod.rs::run_pair`) and a TLS gateway on the private network. Nothing in this plan introduces a cloud dependency: the relay (#787) and any account/recovery service (#788) remain optional transports/factors that never mint authority. The plan's additions (assurance assertions, audit events, CLI verbs) are all local artifacts.
+Acceptance criterion: self-hosted deployments use the credential/grant model without an OpenCoven cloud account. Current implementation satisfies the shape: the grant issuer is `DeviceGrantAudience::LocalCovenAuthority` (`grant.rs`), the registry/audit/state live under the local Coven home (`config.rs` private-file discipline: atomic replace, 0600, `O_NOFOLLOW`), and pairing runs over the local daemon socket (`mod.rs::run_pair`) and a TLS gateway on the private network. Nothing in this plan introduces a cloud dependency: the relay (#787) and any account/recovery service (#788) remain optional transports/factors that never mint authority. The plan's additions (assurance challenges and proofs, audit events, CLI verbs) are all local artifacts, and the challenge issuer is the local daemon.
 
 ## 13. Test plan
 
@@ -500,7 +511,7 @@ Platform credential (device-side, where the platform allows):
 - key generated non-exportable; export attempts fail on hardware-backed profiles;
 - biometric-gated key refuses to sign without fresh verification (level 3);
 - time-window key refuses to sign after the reuse window (level 2 boundary);
-- PIN-only policy records `device_credential` method and never `fresh_biometric`;
+- PIN/passcode-only enrollment records the `device_credential` class (ceiling `fresh_user_verification`) and never `biometric_only`, so its proofs can never satisfy a `fresh_biometric` requirement;
 - biometric enrollment change invalidates `.biometryCurrentSet`/`setInvalidatedByBiometricEnrollment` keys → re-enrollment flow.
 
 Authority (Rust, host-side — citable paths for the test file locations):
@@ -509,20 +520,23 @@ Authority (Rust, host-side — citable paths for the test file locations):
 - transaction: canonical-byte binding for every field; operation/target charset and length limits; lifetime ≤ 300 s; nonce replay rejection at the intent layer;
 - stolen-grant-without-key: replayed grant bytes without the private key fail `verify_signature` (existing path in `auth.rs`);
 - revocation: mid-session revocation defeats `ensure_still_active` (epoch mismatch);
+- step-up: `COVEN-ASSURANCE/1` verification order — challenge single-use/expired/unknown/foreign-device/foreign-epoch rejection, possession-key-as-authorization-key rejection, `effective = min(requested, enrolled class ceiling)`, fail-closed `AssuranceRequired` on any proof failure, and `ensure_still_active` reusing the effective assurance at effect time (per `mobile-assurance-step-up-v1.md`'s adversarial test list);
 - migration: v1 registry fixture converts byte-for-byte to the expected grant set without widening scopes;
 - audit: taxonomy records are coarse-fields-only (extend the existing test).
 
 Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
 
-- golden vectors from §7.3 (canonical action bytes + digests) locked by the shared protocol library;
+- golden vectors from §7.4 (canonical action bytes + digests) locked by the shared protocol library;
 - grant diagnostic JSON validating against `device-grant.schema.json` for both the four-level and five-level vocabularies during the transition;
+- the `COVEN-ASSURANCE/1` portable vector: implementations verify the proof signature over `canonicalProofBytesHex` with the step-up public key (ECDSA signature randomness means signatures are verified, not byte-reproduced);
 - unknown capability/restriction/assurance values rejected.
 
 ## 14. Acceptance criteria mapping
 
 | Issue acceptance criterion | Satisfied by |
 | --- | --- |
-| Biometric material never leaves the platform biometric subsystem | §4 (key-use gating), §6.1 (enforcement model), §6.3 (assertion carries no biometric data), audit redaction invariant |
+| Biometric material never leaves the platform biometric subsystem | §4 (key-use gating), §6.1 (enforcement model), §6.3 (`COVEN-ASSURANCE/1` proofs carry no biometric data), audit redaction invariant |
+| Assurance above possession is proven, never asserted | §4.7, §6.1, §6.3 (`COVEN-ASSURANCE/1`: separate authorization key, server-issued single-use challenge, server-recomputed context, server-computed effective assurance, revalidation at effect time) |
 | Copying a grant/token without the device private key cannot authenticate | §2.1 (already enforced: ECDSA over canonical request against enrolled public key; `GrantError::SubjectMismatch`), §5.4 |
 | Revoking the phone invalidates its authority without rotating familiar/root identities | §8.3, §9.2 (epoch + `revoked_at`), registry revoke path; familiar identity is a distinct subject (`mobile-device-trust.md` credential table) |
 | High-risk approvals are nonce-bound, expiring, replay-resistant, transaction-specific | §7 (`DeviceActionIntent` canonicalization, 300 s cap, 32-byte nonce, replay cache, tests) |
