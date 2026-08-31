@@ -95,6 +95,7 @@ jobs:
       - run: python3 scripts/check-ci-workflow-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-stress-test.mjs
+      - run: node --test scripts/certification-receipt-test.mjs
       - run: scripts/check-workflows.sh
 
   rust-lint-linux:
