@@ -184,7 +184,7 @@ The canonical object is defined in `docs/architecture/mobile-device-pairing-v1.m
 | Spec field (`device-grant.schema.json`) | Rust (`DeviceGrant`, `grant.rs`) | Note |
 | --- | --- | --- |
 | `version` (1) | `DeviceGrant.version` (`DEVICE_GRANT_VERSION = 1`) | equal |
-| `grantId` (22-char b64url of 16 bytes) | `DeviceGrant.id: Uuid` (`Uuid::new_v5(&device_id, b"coven-device-grant-v1")`) | diagnostic encoding differs; same 128-bit id |
+| `grantId` (22-char b64url of 16 bytes) | `DeviceGrant.id: Uuid` (`Uuid::new_v5(&device_id, b"coven-device-grant-v1")`) | diagnostic encoding differs; same 128-bit id. v1's derivation is deterministic per device — the #786 contract requires a distinct id per issued grant (§5.5) |
 | `subject` keyReference | `subject_key_id: String` = SHA-256 over raw key bytes | spec carries full public key; Rust stores only the digest and binds it via `validate(public_key)` |
 | `issuer` identityReference | (not modeled) | Rust v1 has no issuer field; the issuing installation is implicit in the private registry. Portable, externally verifiable grants arrive with the CBOR/COSE canonical form (`mobile-device-pairing-v1.md`) in the shared-protocol-library slice |
 | `audience` identityReference | `DeviceGrantAudience::LocalCovenAuthority` (single variant) | spec allows owner/device/trust-domain forms |
@@ -266,7 +266,7 @@ Issuance (host authority):
 
 1. Enrollment completes with the #785 transcript bound (offer digest, host fingerprint, device public key, requested capability digest, nonce, expiry — `pairing.rs` transcript, `enrollment-request.schema.json`).
 2. The authority derives the grant from **what the operator approved in the UI**, never from what the device requested: scopes are the intersection of displayed/approved capabilities and policy floors (per-capability minimum assurance derived from the `risk` classes in `spec/device-pairing/v1/capabilities.json` — `critical` capabilities default to `fresh_biometric`/`step_up`).
-3. The grant is stored atomically with the device record (`registry.rs` `register_with_grant`); `grant_id = uuidv5(device_id, "coven-device-grant-v1")` keeps the audit chain stable per device.
+3. The grant is stored atomically with the device record (`registry.rs` `register_with_grant`). The **device id** is the stable audit anchor across a device's lifetime; each issued grant carries its own unique `grant_id` (v1 code derives it deterministically via `uuidv5`; the #786 contract requires per-issuance uniqueness — see §5.5, which also requires an epoch advance on every replacement).
 
 Verification (every protected interaction, already implemented and retained):
 
@@ -275,14 +275,14 @@ Verification (every protected interaction, already implemented and retained):
 
 ### 5.5 Scope editing and reissuance
 
-- Editing scope = issuing a **new grant** (`replace_grant` already exists in `registry.rs`); a grant never widens itself. The new grant gets a fresh `grant_id`; `ensure_still_active` rejects the old grant id at once, so narrowed authority takes effect at the next request without device cooperation.
+- Editing scope = issuing a **new grant** (`replace_grant` already exists in `registry.rs`); a grant never widens itself. Every authority-changing replacement (scope edit, restriction change, rotation, re-issuance) MUST mint a **fresh `grant_id`** — never a deterministic re-derivation of the old id — and MUST **monotonically advance the device's authorization (revocation) epoch by at least one**. Note the current code is weaker on both counts: `for_device` derives the id deterministically from the device id, and `replace_grant` only rejects epoch *decreases*, silently accepting equal epochs — the #786 implementation slice must enforce strict advance. After replacement, `ensure_still_active` rejects the old grant id and epoch at once, narrowed authority takes effect at the next request without device cooperation, and outstanding `COVEN-ASSURANCE/1` challenges and transaction replay state (both bound to `grant_id` + `revocation_epoch`) are invalidated.
 - Narrowing MUST be monotone at reissuance: the new scope set is a subset of the union of the current grant and the operator's explicit selection, validated by `validate_scope_set` (sorted, unique, non-empty).
-- Reissuance is an audited event (§10) that records old and new grant ids (digests only, per the audit redaction rules).
+- Reissuance is an audited event (§10) that records the old and new grant ids and the old and new authorization epoch (digests only, per the audit redaction rules).
 - Recommended API: `coven device rescope <device> --grant/--scope ...` writing a replacement grant through `replace_grant`; display the before/after scope diff before commit (same preview discipline as pairing scope selection).
 
 ### 5.6 Key rotation and re-enrollment
 
-- Rotation = new enrollment ceremony (#785) for a **new** key, followed by grant succession: issue the new grant (same or narrower scopes), then revoke the old key with `reason: key_rotation` (`revocation-record.schema.json`). Both events are audited; the succession is explicit, never implicit.
+- Rotation = new enrollment ceremony (#785) for a **new** key, followed by grant succession: issue the new grant (same or narrower scopes) — a fresh grant id and an advanced authorization epoch per §5.5 — then revoke the old key with `reason: key_rotation` (`revocation-record.schema.json`). Both events are audited; the succession is explicit, never implicit. Outstanding `COVEN-ASSURANCE/1` challenges and transaction state die with the old grant (they bind `grant_id` + `revocation_epoch`).
 - The registry keeps revoked records (revocation tombstones) so stale resumption is rejected by `active_device()`/`ensure_still_active`; rotation MUST NOT use `forget_all` (that path exists only for `coven memory mobile disable --forget-devices --confirm-forget-devices`, `mod.rs`).
 - Platform re-enrollment on the device is a fresh key generation (§4.1); no private material ever migrates between devices.
 
@@ -515,14 +515,14 @@ Invalid transitions fail closed; enrollment can only complete through the #785 c
 
 ```text
 absent → issued (active)
-issued → narrowed      (scope editing; new grant id)
-issued → reissued      (rotation/re-issue; new grant id, epoch preserved per device)
+issued → narrowed      (scope editing; new grant id, authorization epoch +≥1)
+issued → reissued      (rotation/re-issue; new grant id, authorization epoch +≥1)
 issued → expired       (expires_at passes; irreversible)
 issued → revoked       (revocation record + epoch bump; ensure_still_active kills sessions)
 revoked/expired → terminal; re-authorization requires a fresh enrollment ceremony
 ```
 
-`auth.rs::ensure_still_active` already enforces the epoch/grant-id check mid-session; the migration (§11) must preserve `revocation_epoch` monotonicity per device.
+`auth.rs::ensure_still_active` already enforces the epoch/grant-id check mid-session. The migration (§11) must preserve `revocation_epoch` monotonicity per device, and every authority-changing replacement advances it with a fresh grant id (§5.5) — grant-id or epoch reuse across replacements is an implementation error.
 
 ### 9.3 Assurance evaluation (host)
 
@@ -539,7 +539,7 @@ The issue requires audit events for enrollment, authentication, step-up approval
 | `DeviceEnrolled` | grant issued at enrollment completion (complements `PairingCompleted`) |
 | `AuthenticationSucceeded` | successful `MobileAuthenticator::verify` (device id only, never path/nonce) |
 | `StepUpVerified` / `StepUpRejected` | §6.4 flow outcomes (names follow `COVEN-ASSURANCE/1`'s audit recommendation) |
-| `GrantIssued` / `GrantScopeNarrowed` / `GrantReissued` | §5.5 |
+| `GrantIssued` / `GrantScopeNarrowed` / `GrantReissued` | §5.5 (record old + new grant id and old + new authorization epoch) |
 | `DeviceRenamed` | §8.1 |
 | `DeviceKeyRotated` | §5.6 |
 | (existing) `DeviceRevoked` | extend to record the reason class from §8.3 |
@@ -574,6 +574,7 @@ Authority (Rust, host-side — citable paths for the test file locations):
 - transaction: `COVEN-ACTION/2` canonical-byte binding for every field, including each effect member (repository, commit ids, verbs, summary); operation/target charset and length limits; closed canonical effect JSON (unknown members rejected); lifetime ≤ 300 s; single-use nonce consumption — replay, post-restart, and post-grant-replacement submissions rejected;
 - stolen-grant-without-key: replayed grant bytes without the private key fail `verify_signature` (existing path in `auth.rs`);
 - revocation: mid-session revocation defeats `ensure_still_active` (epoch mismatch);
+- grant replacement: every authority-changing replacement mints a fresh grant id and strictly advances the authorization epoch — same-id or equal-epoch replacement is rejected (tightened over the current `replace_grant` behavior), and outstanding challenges/transaction state die with the old grant;
 - step-up: `COVEN-ASSURANCE/1` verification order — challenge single-use/expired/unknown/foreign-device/foreign-epoch rejection, possession-key-as-authorization-key rejection, `effective = min(requested, enrolled class ceiling)`, fail-closed `AssuranceRequired` on any proof failure, and `ensure_still_active` reusing the effective assurance at effect time (per `mobile-assurance-step-up-v1.md`'s adversarial test list);
 - migration: v1 registry fixture converts byte-for-byte to the expected grant set without widening scopes;
 - audit: taxonomy records are coarse-fields-only (extend the existing test).
