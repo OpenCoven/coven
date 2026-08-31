@@ -139,7 +139,7 @@ fails closed when the referenced binding cannot be resolved.
 
 ## Side-effect classes and safe defaults
 
-Ratified risk vocabulary, aligned with organization-wide agent risk classes:
+Proposed risk vocabulary — to be ratified against the organization-wide agent risk classes before the authority module lands (slice 2):
 
 | Class | Meaning | Unattended default |
 |---|---|---|
