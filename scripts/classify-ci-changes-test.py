@@ -87,6 +87,17 @@ class ClassifyTest(unittest.TestCase):
                 self.assertTrue(result['npm_packaging'])
                 self.assertFalse(result['workflow'])
 
+    def test_release_gate_paths_route_to_npm_packaging(self):
+        for path in (
+            'scripts/release-required-checks.json',
+            'scripts/verify-release-commit-gate.mjs',
+            'scripts/verify-release-commit-gate-test.mjs',
+        ):
+            with self.subTest(path=path):
+                result = self.classify(path)
+                self.assertTrue(result['npm_packaging'])
+                self.assertFalse(result['workflow'])
+
     def test_engine_install(self):
         result = self.classify('crates/coven-cli/src/engine_install.rs')
         self.assertTrue(result['rust'])

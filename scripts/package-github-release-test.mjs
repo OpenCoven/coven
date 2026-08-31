@@ -9,9 +9,11 @@ import { gunzipSync } from 'node:zlib';
 import {
   PACKAGE_DEFINITIONS,
   assertChecksumManifest,
+  buildReleaseEvidenceBundle,
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
   packageGitHubRelease,
+  revalidateRemoteTag,
   resolveReleaseSource,
   syncGitHubRelease,
   verifyAnnotatedTag,
@@ -188,6 +190,87 @@ function baseTagObject() {
     }
   };
 }
+
+test('revalidateRemoteTag re-reads the remote tag and accepts the unchanged verified context', async () => {
+  const endpoints = [];
+  const ghApi = async (endpoint) => {
+    endpoints.push(endpoint);
+    if (endpoint.includes('/git/ref/tags/')) {
+      return baseTagRef();
+    }
+    return baseTagObject();
+  };
+  const context = await revalidateRemoteTag({
+    repository: 'OpenCoven/coven',
+    releaseTag: RELEASE_TAG,
+    expectedTagObjectSha: baseTagRef().object.sha,
+    expectedHeadSha: HEAD_SHA,
+    ghApi
+  });
+  assert.equal(context.tagObjectSha, baseTagRef().object.sha);
+  assert.equal(context.headSha, HEAD_SHA);
+  assert.deepEqual(endpoints, [
+    '/repos/OpenCoven/coven/git/ref/tags/v0.4.1',
+    '/repos/OpenCoven/coven/git/tags/1111111111111111111111111111111111111111'
+  ]);
+});
+
+test('revalidateRemoteTag refuses a moved, deleted, unsigned, or lightweight tag before any mutation', async () => {
+  const expectedTagObjectSha = baseTagRef().object.sha;
+  const movedRef = { ...baseTagRef(), object: { type: 'tag', sha: '2222222222222222222222222222222222222222' } };
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async (endpoint) =>
+          endpoint.includes('/git/ref/tags/')
+            ? movedRef
+            : { ...baseTagObject(), sha: movedRef.object.sha }
+      }),
+    /tag object SHA changed/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async () => {
+          throw new Error('HTTP 404: Not Found');
+        }
+      }),
+    /HTTP 404/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async () => ({ ...baseTagRef(), object: { type: 'commit', sha: HEAD_SHA } })
+      }),
+    /annotated/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async (endpoint) =>
+          endpoint.includes('/git/ref/tags/')
+            ? baseTagRef()
+            : { ...baseTagObject(), verification: { verified: false, reason: 'unsigned' } }
+      }),
+    /GitHub-verified signature/
+  );
+});
 
 function baseExistingRelease({
   tagName = RELEASE_TAG,
@@ -549,8 +632,44 @@ test('release-github workflow supports automatic and recovery triggers with pinn
         new RegExp(`actions/download-artifact@${DOWNLOAD_ARTIFACT_ACTION_SHA}`, 'g')
       ) ?? []
     ).length,
-    4
+    5,
+    'four source-run artifact downloads in the verification job plus the packaged-assets download in the publication job'
   );
+});
+
+test('release-github workflow splits read-only verification from the write-enabled publication job', () => {
+  const verifyJob = workflowText.slice(workflowText.indexOf('  verify-and-package:'));
+  const publishJob = workflowText.slice(workflowText.indexOf('  publish-release:'));
+  // The verification/packaging job can neither write to the repository nor
+  // keep checkout credentials, so nothing before publication is trusted with
+  // a mutation capability.
+  const verifyHeader = verifyJob.slice(0, verifyJob.indexOf('  publish-release:'));
+  assert.match(verifyHeader, /name: Verify source and package release assets/);
+  assert.match(verifyHeader, /contents: read/);
+  assert.doesNotMatch(verifyHeader, /contents: write/);
+  assert.match(verifyHeader, /persist-credentials: false/);
+  assert.match(publishJob, /contents: write/);
+  assert.match(publishJob, /persist-credentials: false/);
+  assert.match(publishJob, /needs: \[verify-and-package\]/);
+  // The publication job must re-prove authorization immediately before the
+  // mutating sync: fresh exact-commit gate evidence, the remote signed tag,
+  // and the source run attempt.
+  const revalidateAt = publishJob.indexOf('Revalidate exact checks and signed tag immediately before publication');
+  const syncAt = publishJob.indexOf('node scripts/package-github-release.mjs sync-release');
+  assert.ok(revalidateAt > -1 && syncAt > -1);
+  assert.ok(revalidateAt < syncAt);
+  assert.match(publishJob, /verify-release-commit-gate\.mjs verify[\s\S]*?--manifest verified-release-required-checks\.json/);
+  assert.match(publishJob, /package-github-release\.mjs revalidate-tag/);
+  assert.match(publishJob, /package-github-release\.mjs verify-source-run-attempt/);
+});
+
+test('release-github workflow digests the required-checks manifest from the verified source SHA', () => {
+  // Policy is data from the released commit, not whatever the default branch
+  // happens to contain at release time.
+  const occurrences = workflowText.split('git show "$HEAD_SHA:scripts/release-required-checks.json" > verified-release-required-checks.json').length - 1;
+  assert.equal(occurrences, 2, 'both the verification job and the publication job must digest the manifest from the verified SHA');
+  assert.match(workflowText, /--manifest verified-release-required-checks\.json/);
+  assert.doesNotMatch(workflowText, /--manifest scripts\/release-required-checks\.json/);
 });
 
 test('release-github workflow uses least privilege, default-branch code, and never publishes npm', () => {
@@ -1407,6 +1526,168 @@ test('packageGitHubRelease is byte-identical across repeated runs with identical
       );
     }
   });
+});
+
+const GATE_RECEIPT_FIXTURE = {
+  schema: 'coven.release-commit-gate-receipt/v1',
+  decision: 'accepted',
+  repository: 'OpenCoven/coven',
+  commit_sha: HEAD_SHA,
+  release_tag: RELEASE_TAG,
+  tag_object_sha: baseTagRef().object.sha,
+  required_checks_manifest: { schema: 'coven.release-required-checks/v1', sha256: 'f'.repeat(64), strict_count: 10, routed_count: 7 },
+  source_workflow: { name: 'CI', path: '.github/workflows/ci.yml', event: 'push', branch: 'main' },
+  workflow_run: { id: '501', run_number: 12, run_attempt: 1, head_sha: HEAD_SHA, conclusion: 'success', url: 'https://example.invalid/runs/501' },
+  checks: [{ name: 'Policy guard', job_id: 'policy-guard', class: 'strict', status: 'completed', conclusion: 'success' }],
+  generated_from: 'scripts/verify-release-commit-gate.mjs'
+};
+
+test('buildReleaseEvidenceBundle binds the verified tag object to the accepted commit and receipt', () => {
+  const bundle = buildReleaseEvidenceBundle({
+    releaseTag: RELEASE_TAG,
+    gateReceipt: GATE_RECEIPT_FIXTURE,
+    tagObject: { ...baseTagObject(), sha: baseTagRef().object.sha }
+  });
+  assert.equal(bundle.schema, 'coven.release-evidence/v1');
+  assert.equal(bundle.release_tag, RELEASE_TAG);
+  assert.equal(bundle.npm_version, NPM_VERSION);
+  assert.equal(bundle.commit_sha, HEAD_SHA);
+  assert.equal(bundle.tag_object_sha, baseTagRef().object.sha);
+  assert.equal(bundle.gate_receipt, GATE_RECEIPT_FIXTURE);
+  assert.equal(bundle.tag_object.tag, RELEASE_TAG);
+  assert.doesNotMatch(JSON.stringify(bundle), /token|password|created_at/);
+});
+
+test('buildReleaseEvidenceBundle refuses incoherent receipt/tag-object combinations', () => {
+  const tagObject = { ...baseTagObject(), sha: baseTagRef().object.sha };
+  const cases = [
+    {
+      gateReceipt: { ...GATE_RECEIPT_FIXTURE, schema: 'other/v1' },
+      tagObject,
+      message: /gate receipt schema must be/
+    },
+    {
+      gateReceipt: { ...GATE_RECEIPT_FIXTURE, commit_sha: 'deadbeef' },
+      tagObject,
+      message: /commit_sha must be a 40-hex git SHA/
+    },
+    {
+      gateReceipt: { ...GATE_RECEIPT_FIXTURE, tag_object_sha: null },
+      tagObject,
+      message: /tag_object_sha must be a 40-hex git SHA/
+    },
+    {
+      gateReceipt: GATE_RECEIPT_FIXTURE,
+      tagObject: { ...tagObject, tag: 'v0.4.2' },
+      message: /tag object must name tag v0\.4\.1/
+    },
+    {
+      gateReceipt: GATE_RECEIPT_FIXTURE,
+      tagObject: { ...tagObject, object: { type: 'commit', sha: '1'.repeat(40) } },
+      message: /tag object must target the accepted commit/
+    },
+    {
+      gateReceipt: GATE_RECEIPT_FIXTURE,
+      tagObject: { ...tagObject, sha: '2'.repeat(40) },
+      message: /does not match the accepted tag object/
+    }
+  ];
+  for (const { gateReceipt, tagObject: object, message } of cases) {
+    assert.throws(
+      () => buildReleaseEvidenceBundle({ releaseTag: RELEASE_TAG, gateReceipt, tagObject: object }),
+      message
+    );
+  }
+});
+
+test('packageGitHubRelease persists the tag object and gate receipt as a checksummed release asset', () => {
+  withScratchDir('evidence-asset', (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    const receiptPath = path.join(scratchDir, 'receipt.json');
+    const tagObjectPath = path.join(scratchDir, 'tag-object.json');
+    writeFileSync(receiptPath, JSON.stringify(GATE_RECEIPT_FIXTURE));
+    writeFileSync(tagObjectPath, JSON.stringify({ ...baseTagObject(), sha: baseTagRef().object.sha }));
+
+    const produced = packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH,
+      gateReceiptPath: receiptPath,
+      tagObjectPath
+    });
+
+    const evidenceName = `coven-v${NPM_VERSION}-release-evidence.json`;
+    assert.equal(produced.evidenceAssetName, evidenceName);
+    const expectedNames = [...EXPECTED_ASSET_NAMES, evidenceName].sort();
+    assert.deepEqual(readdirSync(outputDir).sort(), expectedNames);
+    assert.deepEqual(produced.assetNames.sort(), expectedNames);
+
+    const bundle = JSON.parse(readFileSync(path.join(outputDir, evidenceName), 'utf8'));
+    assert.equal(bundle.schema, 'coven.release-evidence/v1');
+    assert.equal(bundle.tag_object.tag, RELEASE_TAG);
+    assert.equal(bundle.gate_receipt.commit_sha, HEAD_SHA);
+
+    // The evidence asset is checksummed by SHA256SUMS like every other asset.
+    const checksums = readFileSync(path.join(outputDir, 'SHA256SUMS'), 'utf8');
+    assert.doesNotThrow(() => assertChecksumManifest(checksums, [...EXPECTED_ARCHIVES, evidenceName]));
+    const evidenceLine = checksums.split('\n').find((line) => line.endsWith(evidenceName));
+    assert.equal(evidenceLine.split('  ')[0], sha256Hex(readFileSync(path.join(outputDir, evidenceName))));
+  });
+});
+
+test('packageGitHubRelease refuses half-provided evidence inputs and remains backward compatible without them', () => {
+  withScratchDir('evidence-half', (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    const receiptPath = path.join(scratchDir, 'receipt.json');
+    writeFileSync(receiptPath, JSON.stringify(GATE_RECEIPT_FIXTURE));
+    assert.throws(
+      () =>
+        packageGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          artifactsDir,
+          outputDir: path.join(scratchDir, 'out-half'),
+          sourceDateEpoch: SOURCE_DATE_EPOCH,
+          gateReceiptPath: receiptPath
+        }),
+      /must be provided together/
+    );
+    // No evidence inputs: exactly the legacy canonical asset set.
+    const outputDir = path.join(scratchDir, 'out-legacy');
+    const produced = packageGitHubRelease({
+      releaseTag: RELEASE_TAG,
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+    assert.equal(produced.evidenceAssetName, null);
+    assert.deepEqual(readdirSync(outputDir).sort(), EXPECTED_ASSET_NAMES);
+  });
+});
+
+test('canonical and sync asset sets include the evidence asset only when requested', async () => {
+  assert.deepEqual(canonicalReleaseAssetNames(RELEASE_TAG).sort(), EXPECTED_ASSET_NAMES);
+  const evidenceName = `coven-v${NPM_VERSION}-release-evidence.json`;
+  assert.deepEqual(
+    canonicalReleaseAssetNames(RELEASE_TAG, { includeReleaseEvidence: true }).sort(),
+    [...EXPECTED_ASSET_NAMES, evidenceName].sort()
+  );
+});
+
+test('release-github workflow persists the evidence bundle and expects it at sync time', () => {
+  assert.match(workflowText, /name: Fetch verified tag object payload/);
+  assert.match(workflowText, /gh api "\/repos\/\$GITHUB_REPOSITORY\/git\/tags\/\$TAG_OBJECT_SHA" > verified-release-tag-object\.json/);
+  assert.match(
+    workflowText,
+    /package-github-release\.mjs package[\s\S]*?--gate-receipt release-commit-gate-receipt\.json[\s\S]*?--tag-object verified-release-tag-object\.json/
+  );
+  assert.match(
+    workflowText,
+    /package-github-release\.mjs sync-release[\s\S]*?--include-release-evidence/
+  );
 });
 
 test('packageGitHubRelease rejects missing or extra source artifact files', () => {

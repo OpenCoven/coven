@@ -24,21 +24,37 @@ on:
 permissions:
   contents: read
 
+# One stable-channel lock for ALL tags: the complete npm-to-GitHub release
+# transaction is serialized (the npm pipeline holds its own stable-channel
+# lock first), so GitHub Release publications for different versions can
+# never interleave either. Pending runs queue without cancelling.
 concurrency:
-  group: release-github-${{ github.event.workflow_run.head_branch || inputs.release_tag }}
+  group: release-github-stable-channel
   cancel-in-progress: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
-  publish-release:
-    name: Publish GitHub Release assets
+  # Read-only verification and packaging: proves the source run, the signed
+  # tag, the exact-commit required checks, npm provenance and registry
+  # signatures, then packages deterministic assets — all with contents: read
+  # and no persisted git credentials. Nothing here can mutate a release.
+  verify-and-package:
+    name: Verify source and package release assets
     if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: write
+      checks: read
+      contents: read
+    outputs:
+      release_tag: ${{ steps.source.outputs.release_tag }}
+      npm_version: ${{ steps.source.outputs.npm_version }}
+      head_sha: ${{ steps.source.outputs.head_sha }}
+      tag_object_sha: ${{ steps.source.outputs.tag_object_sha }}
+      source_run_id: ${{ steps.source.outputs.source_run_id }}
+      source_run_attempt: ${{ steps.source.outputs.source_run_attempt }}
     steps:
       - name: Refuse non-default-branch manual recovery
         if: ${{ github.event_name == 'workflow_dispatch' && github.ref_name != github.event.repository.default_branch }}
@@ -51,6 +67,8 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.repository.default_branch }}
+          # Verification is read-only; no git credentials may outlive checkout.
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
         with:
           node-version: 24
@@ -68,6 +86,34 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --source-run-id "$SOURCE_RUN_ID" \
             --source-run-attempt "$SOURCE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+      # Policy-as-data: the required-checks manifest is digested from the
+      # verified source SHA itself (git show <release sha>:...), not from the
+      # default-branch working tree, so what the release must prove is exactly
+      # what the released source declared — never a newer or older policy.
+      - name: Digest required-checks manifest from the verified source commit
+        env:
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git show "$HEAD_SHA:scripts/release-required-checks.json" > verified-release-required-checks.json
+      - name: Verify exact source commit required checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-commit-gate.mjs verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit-sha "${{ steps.source.outputs.head_sha }}" \
+            --manifest verified-release-required-checks.json \
+            --release-tag "${{ steps.source.outputs.release_tag }}" \
+            --tag-object-sha "${{ steps.source.outputs.tag_object_sha }}" \
+            --receipt-output release-commit-gate-receipt.json
+      - name: Upload exact source acceptance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: coven-release-commit-gate-${{ steps.source.outputs.release_tag }}
+          path: release-commit-gate-receipt.json
+          if-no-files-found: error
       - name: Verify npm provenance for every published package
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -132,6 +178,16 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --source-run-id "$SOURCE_RUN_ID" \
             --source-run-attempt "$SOURCE_RUN_ATTEMPT"
+      # Persist what authorized this release: the GitHub-verified annotated tag
+      # object, bundled with the exact-commit gate receipt into a checksummed
+      # release asset (coven-v<version>-release-evidence.json).
+      - name: Fetch verified tag object payload
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          gh api "/repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA" > verified-release-tag-object.json
       - name: Package deterministic GitHub release assets
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
@@ -142,13 +198,87 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --artifacts-dir github-release-source \
             --output-dir github-release-assets \
-            --source-date-epoch "$SOURCE_DATE_EPOCH"
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --gate-receipt release-commit-gate-receipt.json \
+            --tag-object verified-release-tag-object.json
+      - name: Upload packaged release assets for the publication job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: coven-release-assets-${{ steps.source.outputs.release_tag }}
+          path: github-release-assets
+          if-no-files-found: error
+
+  # Minimal write-enabled publication: the only mutating step in this workflow
+  # is the release create/upload here. It re-derives the verified context,
+  # re-validates the exact-commit gate and the remote signed tag immediately
+  # before the mutation, and then synchronizes the already-packaged,
+  # already-verified assets.
+  publish-release:
+    name: Publish GitHub Release
+    needs: [verify-and-package]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      checks: read
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+          # The publication job only runs verifier scripts and gh release
+          # calls; no git credentials may outlive checkout.
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: coven-release-assets-${{ needs.verify-and-package.outputs.release_tag }}
+          path: github-release-assets
+      - name: Digest required-checks manifest from the verified source commit
+        env:
+          HEAD_SHA: ${{ needs.verify-and-package.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          git show "$HEAD_SHA:scripts/release-required-checks.json" > verified-release-required-checks.json
+      # Point-of-mutation revalidation: everything verified in the read-only
+      # job could have changed while packaging ran. Immediately before the
+      # release mutation, re-decide the exact-commit gate on fresh check
+      # evidence, re-read the remote signed tag, and reconfirm the source run
+      # attempt, so a stale authorization can never be spent.
+      - name: Revalidate exact checks and signed tag immediately before publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+          HEAD_SHA: ${{ needs.verify-and-package.outputs.head_sha }}
+          TAG_OBJECT_SHA: ${{ needs.verify-and-package.outputs.tag_object_sha }}
+          SOURCE_RUN_ID: ${{ needs.verify-and-package.outputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ needs.verify-and-package.outputs.source_run_attempt }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-release-commit-gate.mjs verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit-sha "$HEAD_SHA" \
+            --manifest verified-release-required-checks.json \
+            --release-tag "$RELEASE_TAG" \
+            --tag-object-sha "$TAG_OBJECT_SHA"
+          node scripts/package-github-release.mjs revalidate-tag \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --expected-tag-object-sha "$TAG_OBJECT_SHA" \
+            --expected-head-sha "$HEAD_SHA"
+          node scripts/package-github-release.mjs verify-source-run-attempt \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT"
       - name: Synchronize canonical GitHub release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
-          TAG_OBJECT_SHA: ${{ steps.source.outputs.tag_object_sha }}
-          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          RELEASE_TAG: ${{ needs.verify-and-package.outputs.release_tag }}
+          TAG_OBJECT_SHA: ${{ needs.verify-and-package.outputs.tag_object_sha }}
+          HEAD_SHA: ${{ needs.verify-and-package.outputs.head_sha }}
         run: |
           set -euo pipefail
           node scripts/package-github-release.mjs sync-release \
@@ -156,4 +286,5 @@ jobs:
             --release-tag "$RELEASE_TAG" \
             --output-dir github-release-assets \
             --expected-tag-object-sha "$TAG_OBJECT_SHA" \
-            --expected-head-sha "$HEAD_SHA"
+            --expected-head-sha "$HEAD_SHA" \
+            --include-release-evidence
