@@ -58,6 +58,8 @@ OpenCoven/AttestationClaim/v1        (short form: COVEN-ATTEST-CLAIM/1)
 
 Shared `$defs` reused from the v1 schemas: `keyReference` (algorithm `Ed25519 | P-256`, `keyId`, `publicKey`), `identityReference` (type `owner | installation | device | trust-domain`), integer timestamps.
 
+Fresh step-up evidence reuses the `COVEN-ASSURANCE/1` proof contract from [`mobile-assurance-step-up-v1.md`](mobile-assurance-step-up-v1.md) (#815, #871): a signature by a separately enrolled, platform-policy-protected **step-up authorization key** over canonical bytes binding the device, its current grant and revocation epoch, the exact context digest, and a server-issued single-use challenge; the authority computes effective assurance server-side. This plan adds one context mode, `introduction`, whose context digest is the introduction transcript hash; every other rule of that contract (challenge issuance and atomic consumption, the ≤120 s window, class ceilings, fail-closed verification order) applies unchanged. Assurance proof requirements here are kept consistent with the #786 credentials plan, which applies the same rule — proofs bound to the transcript, the current grant/epoch, and a server-issued single-use challenge, with assurance computed server-side — to its step-up-gated operations.
+
 ### 3.1 IntroductionRequest
 
 Created by the **new endpoint**, delivered over the authenticated E2EE channel (#787) or shown as a follow-on request to an existing trusted device. It commits to everything the approval will be about.
@@ -151,12 +153,12 @@ Created by each **approving device** (or the owner root credential) after a fres
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://opencoven.ai/spec/device-pairing/v2/introduction-approval.schema.json",
   "title": "OpenCoven IntroductionApproval v1 diagnostic JSON representation",
-  "description": "One approval of an IntroductionRequest, signed by an existing trusted device key or the owner root credential after fresh local user verification.",
+  "description": "One approval of an IntroductionRequest, signed by an existing trusted device key or the owner root credential. Fresh user verification is proven by an attached COVEN-ASSURANCE/1 step-up proof (§4.3), never client-asserted.",
   "type": "object",
   "additionalProperties": false,
   "required": [
     "version", "introductionTranscriptHash", "approver", "approverRole",
-    "assurance", "assuranceNonce", "issuedAt", "expiresAt", "signature"
+    "assuranceProof", "issuedAt", "expiresAt", "signature"
   ],
   "properties": {
     "version": { "const": 1 },
@@ -165,14 +167,17 @@ Created by each **approving device** (or the owner root credential) after a fres
       "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"
     },
     "approver": { "$ref": "#/$defs/keyReference" },
-    "approverRole": { "enum": ["trusted-device", "owner-root", "recovery-provider"] },
-    "assurance": {
-      "description": "Locally verified step-up level at signing time; MUST be fresh_user_verification or fresh_biometric for trusted-device approvers.",
-      "enum": ["fresh_user_verification", "fresh_biometric", "step_up"]
+    "approverRole": {
+      "description": "Only roles that can hold enrollment authority. A trusted-device approver must hold an active devices.enroll grant (§4.4); owner-root approves from the owner root credential.",
+      "enum": ["trusted-device", "owner-root"]
     },
-    "assuranceNonce": {
-      "description": "32-byte value displayed/echoed by the step-up UI and bound into the signature; prevents evidence replay.",
-      "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"
+    "approverGrantId": {
+      "description": "The approving device's current DeviceGrant id at signing time (trusted-device approvers only; the authority re-resolves and re-checks it together with the proof's grant/epoch binding, §4.4).",
+      "type": "string", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "assuranceProof": {
+      "description": "COVEN-ASSURANCE/1 step-up proof by the approver's enrolled step-up authorization key (mobile-assurance-step-up-v1.md). Fresh user verification is proven, never asserted; see §4.3.",
+      "$ref": "#/$defs/assuranceProof"
     },
     "attestation": {
       "description": "Optional assurance attributes held by the approver, minimally included when policy requires them.",
@@ -186,6 +191,8 @@ Created by each **approving device** (or the owner root credential) after a fres
       "type": "string", "pattern": "^[A-Za-z0-9_-]+$"
     }
   },
+  "if": { "properties": { "approverRole": { "const": "trusted-device" } } },
+  "then": { "required": ["approverGrantId"] },
   "$defs": {
     "keyReference": {
       "type": "object",
@@ -195,6 +202,37 @@ Created by each **approving device** (or the owner root credential) after a fres
         "algorithm": { "enum": ["Ed25519", "P-256"] },
         "keyId": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
         "publicKey": { "type": "string", "minLength": 43, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" }
+      }
+    },
+    "assuranceProof": {
+      "description": "COVEN-ASSURANCE/1 proof fields (context_mode introduction). Canonical bytes are defined in docs/design/mobile-assurance-step-up-v1.md; the authority rebuilds them from its own state and never trusts a client-supplied digest (§4.3).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deviceId", "grantId", "revocationEpoch", "authorizationKeyId", "contextMode", "contextDigest", "challenge", "issuedAt", "expiresAt", "requestedAssurance", "signature"],
+      "properties": {
+        "deviceId": { "type": "string", "format": "uuid" },
+        "grantId": { "type": "string", "format": "uuid" },
+        "revocationEpoch": { "type": "integer", "minimum": 0 },
+        "authorizationKeyId": {
+          "description": "base64url SHA-256 over the enrolled step-up authorization public key (the grant.rs subject_key_id convention).",
+          "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "contextMode": { "const": "introduction" },
+        "contextDigest": {
+          "description": "SHA-256 over OpenCoven/IntroductionTranscript/v1 canonical bytes; MUST equal introductionTranscriptHash.",
+          "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "challenge": {
+          "description": "Server-issued, single-use 32-byte challenge (base64url) bound to (deviceId, grantId, revocationEpoch); consumed atomically at verification.",
+          "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"
+        },
+        "issuedAt": { "type": "integer", "minimum": 0 },
+        "expiresAt": { "type": "integer", "minimum": 0 },
+        "requestedAssurance": { "enum": ["fresh_user_verification", "fresh_biometric"] },
+        "signature": {
+          "description": "ECDSA P-256 over SHA-256, DER, base64url, by the enrolled step-up authorization key, over the COVEN-ASSURANCE/1 canonical bytes.",
+          "type": "string", "pattern": "^[A-Za-z0-9_-]+$"
+        }
       }
     }
   }
@@ -424,13 +462,33 @@ export interface IntroductionRequest {
   signature: string;
 }
 
+/**
+ * COVEN-ASSURANCE/1 step-up proof fields for the introduction context
+ * (context_mode "introduction"); canonical bytes per
+ * mobile-assurance-step-up-v1.md. The authority recomputes the context
+ * digest and computes effective assurance server-side — never client-asserted.
+ */
+export interface AssuranceProof {
+  deviceId: string; // approving device UUID
+  grantId: string; // approving device's current DeviceGrant id
+  revocationEpoch: number; // approver grant's revocation epoch at signing time
+  authorizationKeyId: string; // base64url SHA-256 over the step-up public key
+  contextMode: 'introduction';
+  contextDigest: string; // SHA-256 over the introduction transcript canonical bytes
+  challenge: string; // server-issued, single-use
+  issuedAt: number; // unix seconds
+  expiresAt: number; // unix seconds; issuedAt + ≤120 s
+  requestedAssurance: 'fresh_user_verification' | 'fresh_biometric';
+  signature: string; // base64url DER ECDSA P-256 by the step-up authorization key
+}
+
 export interface IntroductionApproval {
   version: 1;
   introductionTranscriptHash: string;
   approver: KeyReference;
-  approverRole: 'trusted-device' | 'owner-root' | 'recovery-provider';
-  assurance: 'fresh_user_verification' | 'fresh_biometric' | 'step_up';
-  assuranceNonce: string;
+  approverRole: 'trusted-device' | 'owner-root';
+  approverGrantId?: string; // required for trusted-device approvers (delegated authority, §4.4)
+  assuranceProof: AssuranceProof;
   attestation?: Exclude<AttestationAttribute, 'unattested_device'>[];
   issuedAt: number;
   expiresAt: number;
@@ -495,13 +553,17 @@ New Psyche/TUI node                       Existing trusted phone
       │ 1. IntroductionRequest                     │
       │─────────── over authenticated E2EE ───────▶│
       │                                           │ 2. render material fields
+      │                                           │    fetch server-issued assurance challenge
       │                                           │    fresh step-up (biometric / user verification)
       │                                           │    IntroductionApproval signed by device key
+      │                                           │    + COVEN-ASSURANCE/1 proof by step-up key (§4.3)
       │ 3. approvals collected                     │
       │◀───────────────────────────────────────────┘
       ▼
 Installation authority (Rust)
-      │ 4. verify signatures, count approvals vs RecoveryPolicy,
+      │ 4. verify signatures + COVEN-ASSURANCE/1 proofs,
+      │    check delegated authority (§4.4),
+      │    count approvals vs RecoveryPolicy,
       │    re-check transcript, bind grant to endpointKey
       ▼
 scoped grant → new installation (DeviceGrant, registry.rs)
@@ -522,14 +584,18 @@ The approval MUST bind, in the signed `introductionTranscriptHash`:
 
 Any change to any of these changes the transcript hash and invalidates every collected approval. This is the same fail-closed principle as capability substitution defense in the threat model, and it reuses the canonical-bytes discipline of `DeviceActionIntent::canonical_bytes` (`grant.rs`).
 
-### 4.3 Fresh step-up authentication (issue checkbox 2)
+### 4.3 Fresh step-up authentication — a `COVEN-ASSURANCE/1` proof, never client-asserted (issue checkbox 2)
 
-An introduction approval is a step-up operation by definition. The approving device MUST verify the local user immediately before signing:
+An introduction approval is a step-up operation by definition, and the approving device's ordinary possession key can never upgrade assurance by asserting it — the same gap `mobile-assurance-step-up-v1.md` (`COVEN-ASSURANCE/1`, #815/#871) closes for requests and `DeviceActionIntent`s. The approval therefore MUST carry a step-up proof signed by the approver's separately enrolled, platform-policy-protected **step-up authorization key** (`assuranceProof`, §3.2). A signature by the ordinary device key over the approval alone is not sufficient and never raises the approval's assurance above possession.
 
-- `assurance: fresh_biometric` where the platform enforces biometric policy (iOS LocalAuthentication / Android BiometricPrompt strong biometrics), otherwise `fresh_user_verification`;
-- the step-up result gates use of the device private key exactly as in `docs/design/mobile-device-trust.md` §"Biometrics and step-up authorization" — the biometric itself never enters the protocol;
-- `assuranceNonce` binds the approval to this specific step-up event, so captured approvals cannot be replayed for a different request;
-- passcode fallback is representable only as `fresh_user_verification`, never as `fresh_biometric` (threat model: "Biometric exfiltration or false representation").
+The proof is bound to:
+
+1. the **introduction transcript** — `contextMode: "introduction"` with `contextDigest = SHA-256(OpenCoven/IntroductionTranscript/v1 canonical bytes)`; the authority recomputes the transcript bytes from the request and grant template it holds, so a proof over any other transcript fails the digest check;
+2. the **approver's current grant and epoch** — the proof's `deviceId`/`grantId`/`revocationEpoch` must match the approver's active `DeviceGrant` in the registry at verification time (delegated authority, §4.4), so proofs minted against a stale or revoked grant do not count;
+3. a **server-issued, single-use challenge** obtained from the authority before signing, under exactly the issuance/consumption discipline of `mobile-assurance-step-up-v1.md` (bound to device, grant, and epoch; atomically consumed; grant rotation or revocation invalidates outstanding challenges) — proofs cannot be banked offline while the device is unlocked;
+4. a **≤120 s proof window** — the approval's own `expiresAt` may be longer, but proof freshness is what bounds the step-up.
+
+The authority verifies the proof in the normative order of `mobile-assurance-step-up-v1.md` and computes effective assurance itself — `min(requested_assurance, enrolled-class ceiling)` — requiring at least `fresh_user_verification` (ceiling `fresh_biometric` where the platform enforces biometric-only policy) for a `trusted-device` approval to count. Fail-closed: an absent, expired, replayed, or invalid proof means the approval does not count; a trusted-device approval can never be counted on the strength of its possession-key signature. The passcode-fallback rule is preserved: passcode fallback is representable only as `fresh_user_verification`, never `fresh_biometric` (threat model: "Biometric exfiltration or false representation"). The biometric itself never enters the protocol — only signatures cross the trust boundary.
 
 ### 4.4 Introduction state machine
 
@@ -717,7 +783,7 @@ Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening 
 - **Compromised trusted device**: can introduce one scoped endpoint within `expiresAt`; root-level classes require `rootMinApprovals ≥ 2` distinct approvers; the epoch bump and audit trail bound and expose the damage; owner revokes via the existing `registry.revoke` path.
 - **Passkey/account provider compromise**: cannot enroll endpoints (§4.6); cannot read or forge E2EE sessions; can at most request attention.
 - **Attestation forgery**: verifier compromise yields only assurance attributes, which cannot mint authority; owner policy that never sets `requireFor` is unaffected.
-- **Recovery-ceremony phishing**: `assuranceNonce` and transcript hashing make collected approvals useless for any other request; recovery events are user-visible in `coven memory mobile status` output (which already surfaces device/grant state, `registry.list_status`).
+- **Recovery-ceremony phishing**: transcript-bound `COVEN-ASSURANCE/1` proofs with server-issued single-use challenges make collected approvals useless for any other request; recovery events are user-visible in `coven memory mobile status` output (which already surfaces device/grant state, `registry.list_status`).
 
 ## 10. Acceptance criteria mapping
 
@@ -745,7 +811,8 @@ Merge gates: the repository gates (`cargo fmt --check`, `cargo clippy --workspac
 
 | Decision | Choice | Alternatives rejected/deferred |
 | --- | --- | --- |
-| Who may approve an introduction | Trusted-device keys and the owner root credential, after fresh step-up | Account service as approver — rejected (invariant 8); relay as approver — rejected |
+| Who may approve an introduction | Trusted-device keys and the owner root credential, after delegated authority is checked (§4.4) | Account service as approver — rejected (invariant 8); relay as approver — rejected; recovery-provider approvals — rejected (no enrollment authority, §4.4) |
+| Fresh step-up authentication | `COVEN-ASSURANCE/1` proof by the step-up authorization key over the introduction transcript, bound to grant/epoch and a server-issued single-use challenge (§4.3) | Client-asserted assurance enum — rejected (a possession-key signature cannot mint assurance; same rationale as #815/#871) |
 | 1 vs N-of-M | 1 by default, N-of-M for root classes via owner policy (§4.5) | Always-N — locks out single-device owners; always-1 — concentrates root trust |
 | Passkey → familiar root | Never; account-layer factor only (§5.2) | Synced-passkey-as-root — rejected by issue and architecture |
 | Recovery default factors | recovery key + passkey account + surviving trusted device (§6.1) | Hosted Shamir/social recovery — deferred (privacy tradeoff, needs its own threat model); security questions — rejected |
@@ -760,6 +827,7 @@ Implementation PRs must add, at minimum:
 
 - deterministic CBOR/COSE vectors for each new object (canonical-encoding suite, `conformance-manifest.json` suites);
 - negative tests: transcript substitution, scope substitution, expired/single-use nonce replay, threshold bypass, approval-for-another-request, unknown attribute/evidence values (fail closed), attestation claim expiry;
+- `COVEN-ASSURANCE/1` proof tests: challenge single-use/atomic consumption, proof replay, proof bound to a different transcript, proof against a stale grant or revocation epoch, possession-key signature offered as a step-up proof (must fail), expired proof window, effective assurance computed server-side (claimed level above the enrolled-class ceiling is capped);
 - integration tests with a malicious relay/account shim: no enrollment without valid approvals; account service compromise reduces to a no-op on the authority path;
 - privacy tests: no passkey credential IDs, attestation receipts, hardware IDs, or biometric metadata in any protocol object, audit record, or log line (extends `scripts/check-coven-privacy.py` coverage);
 - revocation/rotation tests: epoch bump invalidates pre-rotation grants and resumption material while leaving familiar identity untouched.
