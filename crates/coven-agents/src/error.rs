@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AgentId, RunItem};
+use crate::{AgentId, InvocationId, RunItem};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -34,6 +34,13 @@ pub enum ConfigError {
         agent: AgentId,
         handoff: String,
         target: AgentId,
+    },
+    #[error("invocation id {reason}")]
+    InvalidInvocationId { reason: &'static str },
+    #[error("agent reference {component} {reason}")]
+    InvalidAgentRef {
+        component: &'static str,
+        reason: &'static str,
     },
 }
 
@@ -105,9 +112,16 @@ pub enum RunError {
 /// The runner never writes `new_items` to the session store on failure, so a
 /// failed run cannot silently become durable history. Persisting a partial
 /// transcript is a deliberate caller decision.
+///
+/// The wrapped error is boxed to keep `RunFailure` small: the runner returns
+/// it by value on every failure path, and the workspace clippy policy rejects
+/// `Err` variants larger than 128 bytes.
 #[derive(Debug)]
 pub struct RunFailure {
-    pub error: RunError,
+    /// The stable invocation identity of the failed run, matching the identity
+    /// carried by its invocation events.
+    pub invocation: InvocationId,
+    pub error: Box<RunError>,
     /// Items produced during this run before it failed, in order. Always begins
     /// with the user message that started the run.
     pub new_items: Vec<RunItem>,
@@ -121,19 +135,19 @@ pub struct RunFailure {
 impl RunFailure {
     /// Discards the partial transcript and keeps only the error.
     pub fn into_error(self) -> RunError {
-        self.error
+        *self.error
     }
 }
 
 impl std::fmt::Display for RunFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Display::fmt(&self.error, formatter)
+        std::fmt::Display::fmt(self.error.as_ref(), formatter)
     }
 }
 
 impl std::error::Error for RunFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+        Some(self.error.as_ref())
     }
 }
 
@@ -144,7 +158,8 @@ mod tests {
     #[test]
     fn run_failure_exposes_the_wrapped_error_as_its_source() {
         let failure = RunFailure {
-            error: RunError::SessionUnavailable,
+            invocation: InvocationId::try_new("inv-test").unwrap(),
+            error: Box::new(RunError::SessionUnavailable),
             new_items: Vec::new(),
             turns: 0,
             handoffs: 0,

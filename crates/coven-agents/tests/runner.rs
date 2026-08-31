@@ -378,7 +378,7 @@ async fn blocking_input_guardrail_prevents_model_execution() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             stage: GuardrailStage::Input,
             ..
@@ -460,7 +460,7 @@ async fn rejected_output_is_not_appended_to_the_session() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             stage: GuardrailStage::Output,
             ..
@@ -498,7 +498,7 @@ async fn bounded_runner_stops_repeated_tool_turns() {
     let failure = runner.run("loop", "Loop.", &(), options).await.unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::MaxTurnsExceeded { limit: 2 }
     ));
     assert_eq!(failure.turns, 2);
@@ -540,7 +540,7 @@ async fn bounded_runner_stops_repeated_handoffs() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::MaxHandoffsExceeded { limit: 1 }
     ));
     assert_eq!(failure.handoffs, 2);
@@ -561,7 +561,7 @@ async fn rejects_empty_model_responses() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::InvalidModelResponse { .. }
     ));
 }
@@ -602,7 +602,7 @@ async fn unknown_starting_agent_reports_a_paired_run_lifecycle() {
         .unwrap_err();
 
     assert!(
-        matches!(failure.error, RunError::UnknownStartingAgent(ref id) if id.as_str() == "missing")
+        matches!(*failure.error, RunError::UnknownStartingAgent(ref id) if id.as_str() == "missing")
     );
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert_paired_lifecycle(&observer.events());
@@ -626,7 +626,7 @@ async fn missing_session_store_reports_a_paired_run_lifecycle() {
         .await
         .unwrap_err();
 
-    assert!(matches!(failure.error, RunError::SessionUnavailable));
+    assert!(matches!(*failure.error, RunError::SessionUnavailable));
     assert_eq!(model.calls.load(Ordering::SeqCst), 0);
     assert_paired_lifecycle(&observer.events());
 }
@@ -648,7 +648,7 @@ async fn tool_failure_reports_a_paired_run_lifecycle() {
         .await
         .unwrap_err();
 
-    assert!(matches!(failure.error, RunError::ToolFailed { ref tool, .. } if tool == "explode"));
+    assert!(matches!(*failure.error, RunError::ToolFailed { ref tool, .. } if tool == "explode"));
     let events = observer.events();
     assert_paired_lifecycle(&events);
     assert!(events.iter().any(|event| matches!(
@@ -706,7 +706,7 @@ async fn tool_failure_returns_the_partial_transcript() {
         .await
         .unwrap_err();
 
-    assert!(matches!(failure.error, RunError::ToolFailed { ref tool, .. } if tool == "explode"));
+    assert!(matches!(*failure.error, RunError::ToolFailed { ref tool, .. } if tool == "explode"));
     assert_eq!(
         failure.to_string(),
         "tool `explode` for agent `worker` failed"
@@ -769,7 +769,7 @@ async fn tool_failure_after_a_handoff_returns_the_whole_run_transcript() {
         .await
         .unwrap_err();
 
-    assert!(matches!(failure.error, RunError::ToolFailed { .. }));
+    assert!(matches!(*failure.error, RunError::ToolFailed { .. }));
     assert_eq!(failure.turns, 2);
     assert_eq!(failure.handoffs, 1);
 
@@ -815,7 +815,7 @@ async fn duplicate_tool_call_ids_in_one_response_execute_no_tools() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -866,7 +866,7 @@ async fn tool_call_id_reused_across_turns_executes_only_once() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
     ));
     assert_eq!(failure.turns, 2);
@@ -932,7 +932,7 @@ async fn resumed_history_rejects_reused_tool_call_id() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -978,7 +978,7 @@ async fn resumed_result_only_history_rejects_reused_tool_call_id() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::DuplicateToolCallId { ref call_id, .. } if call_id == "call-1"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -1034,7 +1034,7 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
         .unwrap_err();
 
     assert!(matches!(
-        direct_failure.error,
+        *direct_failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1075,7 +1075,7 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1277,7 +1277,7 @@ async fn multi_hop_handoff_target_rejection_prevents_the_target_model_turn() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailRejected {
             ref agent,
             stage: GuardrailStage::Input,
@@ -1328,7 +1328,7 @@ async fn handoff_target_guardrail_error_is_distinguishable_from_a_rejection() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::GuardrailFailed {
             ref agent,
             ref guardrail,
@@ -1412,7 +1412,7 @@ async fn handoff_cannot_be_combined_with_tool_calls() {
         .unwrap_err();
 
     assert!(matches!(
-        failure.error,
+        *failure.error,
         RunError::InvalidModelResponse { ref reason, .. } if reason == "a handoff cannot be combined with other actions"
     ));
     assert_eq!(calls.load(Ordering::SeqCst), 0);
