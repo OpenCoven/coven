@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/slo.measured.v1.schema.json",
+  "title": "Coven automations SLO measured report (slo.measured.v1)",
+  "description": "Evidence input for the SLO gate. A measured report is only valid when it binds the exact environment profile and the exact release artifact revisions the numbers were taken from, and when it carries a value for every measure the SLO profile declares. Partial, provisional, or unbound evidence can never pass the gate.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["measuredVersion", "environment", "artifact", "measures"],
+  "properties": {
+    "measuredVersion": { "const": 1 },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memory", "disk", "os", "store"],
+      "properties": {
+        "cpu": { "type": "string", "minLength": 1 },
+        "memory": { "type": "string", "minLength": 1 },
+        "disk": { "type": "string", "minLength": 1 },
+        "os": { "type": "string", "minLength": 1 },
+        "store": { "type": "string", "minLength": 1 }
+      },
+      "description": "The environment the numbers were measured under; the gate binds it to the SLO profile's supportedLocalProfile."
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceCommit", "artifactDigest"],
+      "properties": {
+        "sourceCommit": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Exact commit the measured artifact was built from." },
+        "releaseTag": { "type": "string", "minLength": 1 },
+        "artifactDigest": { "type": "string", "pattern": "^sha256-[0-9a-f]{64}$", "description": "Digest of the exact packed artifact that was measured." }
+      }
+    },
+    "measures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "value"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "value": { "type": "number" },
+          "unit": { "type": "string" }
+        }
+      },
+      "description": "One entry per measured value. The gate requires every measure id declared by the SLO profile to be present exactly once."
+    }
+  }
+}

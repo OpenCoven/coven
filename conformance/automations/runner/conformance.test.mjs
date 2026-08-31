@@ -515,21 +515,100 @@ test('reports carry revisions, digests, and redaction before writing', async () 
   await rm(dir, { recursive: true, force: true });
 });
 
-test('SLO gate evaluates measures and stays provisional without baselines', async () => {
+test('SLO gate passes only on a complete validated report bound to environment and artifact', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'conformance-slo-'));
   const measuredPath = join(dir, 'measured.json');
-  await writeFile(
-    measuredPath,
-    JSON.stringify({ measures: [{ id: 'planning.latency.p95', value: 120 }] })
-  );
+  const supported = {
+    cpu: '2 vCPU',
+    memory: '4 GB',
+    disk: 'local SSD',
+    os: 'linux x64',
+    store: 'SQLite WAL, single store, one daemon leader'
+  };
+  const sloProfile = JSON.parse(await readFile(join(PLANE_ROOT, 'slo', 'slo.v1.json'), 'utf8'));
+  const withinGates = (overrides = {}) =>
+    sloProfile.measures.map((measure) => ({
+      id: measure.id,
+      value:
+        overrides[measure.id] ??
+        (measure.direction === 'higher-is-better' ? measure.gate + 10 : measure.gate - 10)
+    }));
+  const fullReport = {
+    measuredVersion: 1,
+    environment: supported,
+    artifact: {
+      sourceCommit: 'a'.repeat(40),
+      artifactDigest: `sha256-${'b'.repeat(64)}`
+    },
+    measures: withinGates()
+  };
+  // A complete, bound, within-gates report is the only way to pass.
+  await writeFile(measuredPath, JSON.stringify(fullReport));
   assert.equal((await evaluateSloGate(measuredPath)).status, 'passed');
+  // A gate violation fails even with complete evidence.
   await writeFile(
     measuredPath,
-    JSON.stringify({ measures: [{ id: 'planning.latency.p95', value: 999 }] })
+    JSON.stringify({ ...fullReport, measures: withinGates({ 'planning.latency.p95': 9999 }) })
   );
-  assert.equal((await evaluateSloGate(measuredPath)).status, 'failed');
+  const gateFailed = await evaluateSloGate(measuredPath);
+  assert.equal(gateFailed.status, 'failed');
+  assert.ok(gateFailed.detail.includes('planning.latency.p95'));
+  // One missing measure: incomplete, never passed.
+  await writeFile(
+    measuredPath,
+    JSON.stringify({ ...fullReport, measures: fullReport.measures.slice(1) })
+  );
+  const incomplete = await evaluateSloGate(measuredPath);
+  assert.equal(incomplete.status, 'incomplete');
+  assert.ok(incomplete.detail.includes('definitions.per-minute'));
+  // Missing artifact binding: invalid.
+  const unbound = { ...fullReport };
+  delete unbound.artifact;
+  await writeFile(measuredPath, JSON.stringify(unbound));
+  const invalidArtifact = await evaluateSloGate(measuredPath);
+  assert.equal(invalidArtifact.status, 'invalid');
+  assert.ok(invalidArtifact.detail.includes('artifact'));
+  // A different environment profile than the supported one: invalid.
+  await writeFile(
+    measuredPath,
+    JSON.stringify({ ...fullReport, environment: { ...supported, os: 'windows arm64' } })
+  );
+  const invalidEnvironment = await evaluateSloGate(measuredPath);
+  assert.equal(invalidEnvironment.status, 'invalid');
+  assert.ok(invalidEnvironment.detail.includes('environment'));
+  // Malformed evidence: invalid.
+  await writeFile(measuredPath, '{ measures: [oops');
+  assert.equal((await evaluateSloGate(measuredPath)).status, 'invalid');
+  // An evidence file with a single recognized measure can no longer pass.
+  await writeFile(
+    measuredPath,
+    JSON.stringify({ measuredVersion: 1, environment: supported, artifact: fullReport.artifact, measures: [{ id: 'planning.latency.p95', value: 120 }] })
+  );
+  assert.equal((await evaluateSloGate(measuredPath)).status, 'incomplete');
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('the conformance gate fails when SLO evidence is provided and not passed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'conformance-slo-gate-'));
+  const measuredPath = join(dir, 'measured.json');
   await writeFile(measuredPath, JSON.stringify({ measures: [] }));
-  assert.equal((await evaluateSloGate(measuredPath)).status, 'provisional');
+  const { report } = await runConformance({
+    profile: 'structural',
+    target: 'reference-oracle',
+    report: null,
+    vector: null,
+    slo: measuredPath,
+    fuzz: 0,
+    seed: 858,
+    list: false,
+    quiet: true
+  });
+  assert.equal(report.slo.status, 'invalid');
+  assert.equal(
+    report.gate.status,
+    'failed',
+    'providing invalid SLO evidence must fail the run that claimed it'
+  );
   await rm(dir, { recursive: true, force: true });
 });
 

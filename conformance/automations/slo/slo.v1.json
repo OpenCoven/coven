@@ -1,8 +1,8 @@
 {
   "profile": "coven.automations.slo.v1",
   "version": 1,
-  "status": "provisional",
-  "description": "Release SLO gates for Coven Automations v1, ratified from measured baselines on the supported local profile. Measures are collected by the release certification harness against the exact release artifact; until a measured baseline lands, every gate is provisional and the gate reports 'provisional' rather than passing.",
+  "status": "enforced",
+  "description": "Release SLO gates for Coven Automations v1. The gate accepts only a complete slo.measured.v1 report bound to the supported local profile and to the exact release artifact revisions (source commit and packed artifact digest); it evaluates every declared measure. Absent, partial, unbound, or malformed evidence fails the gate - there is no provisional acceptance. Measures are collected by the release certification harness against the exact release artifact.",
   "supportedLocalProfile": {
     "cpu": "2 vCPU",
     "memory": "4 GB",
@@ -55,7 +55,7 @@
   ],
   "measurement": {
     "when": "release certification (scripts/agent-check full with COVEN_BIN set, and the release pipeline)",
-    "how": "the load harness drives the exact release artifact under the supported local profile, emits {measures:[{id,value}]} as JSON, and the runner gate evaluates it: node conformance/automations/runner/conformance.mjs --profile all --slo <measured.json>",
-    "ratification": "gates are ratified when a measured baseline lands on the release artifact; gates then move from provisional to enforced in CI"
+    "how": "the load harness drives the exact release artifact under the supported local profile and emits a slo.measured.v1 report ({measuredVersion, environment, artifact: {sourceCommit, artifactDigest}, measures: [{id, value}]}); the runner gate evaluates it: node conformance/automations/runner/conformance.mjs --profile all --slo <measured.json>",
+    "ratification": "the gate is enforced: only a complete, schema-valid, environment- and artifact-bound measured report can pass; anything else reports failed, invalid, incomplete, or not-run"
   }
 }

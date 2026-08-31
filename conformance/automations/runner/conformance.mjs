@@ -451,28 +451,81 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
   return { report, prompts, selectedCount: selected.length };
 }
 
-// SLO gate: validates a measured report against slo/slo.v1.json. Gates that
-// need the real binary stay 'provisional' until measured; the hard invariants
-// (no duplicate dispatch, no silent loss, no false success) come from the
-// conformance run itself.
+// SLO gate (finding 4 of the review): a measured report passes ONLY when it
+// is complete and valid — every measure the SLO profile declares, evaluated
+// against the gates, and bound to the exact environment profile and the
+// exact release artifact revisions the numbers came from. Absent, partial,
+// unbound, or malformed evidence is reported as incomplete, invalid, or
+// not-run and can never pass; there is no provisional acceptance.
 export async function evaluateSloGate(measuredPath, planeRoot = PLANE_ROOT) {
   const slo = JSON.parse(await readFile(join(planeRoot, 'slo', 'slo.v1.json'), 'utf8'));
-  const measured = JSON.parse(await readFile(measuredPath, 'utf8'));
-  const values = new Map(
-    (measured.measures ?? []).map((measure) => [measure.id, measure.value])
+  const measuredSchema = JSON.parse(
+    readFileSync(join(planeRoot, 'slo', 'slo.measured.v1.schema.json'), 'utf8')
   );
-  let failed = false;
-  let measuredCount = 0;
+  let measured;
+  try {
+    measured = JSON.parse(await readFile(measuredPath, 'utf8'));
+  } catch (error) {
+    return {
+      profile: slo.profile ?? 'coven.automations.slo.v1',
+      status: 'invalid',
+      detail: `measured report is not readable JSON: ${error.message}`
+    };
+  }
+  const schemaErrors = validateAgainstSchema(measured, measuredSchema);
+  if (schemaErrors.length > 0) {
+    return {
+      profile: slo.profile ?? 'coven.automations.slo.v1',
+      status: 'invalid',
+      detail: `measured report violates slo.measured.v1:\n  ${schemaErrors.join('\n  ')}`
+    };
+  }
+  const supported = slo.supportedLocalProfile ?? {};
+  const environmentMismatch = Object.entries(supported)
+    .filter(([key, expected]) => measured.environment[key] !== expected)
+    .map(([key, expected]) => `${key}: expected "${expected}", got "${measured.environment[key]}"`);
+  if (environmentMismatch.length > 0) {
+    return {
+      profile: slo.profile ?? 'coven.automations.slo.v1',
+      status: 'invalid',
+      detail: `measured report is bound to a different environment than the supported local profile: ${environmentMismatch.join('; ')}`
+    };
+  }
+  const values = new Map();
+  for (const entry of measured.measures) {
+    values.set(entry.id, values.has(entry.id) ? Number.NaN : entry.value);
+  }
+  const missing = (slo.measures ?? []).filter(
+    (measure) => !values.has(measure.id) || !Number.isFinite(values.get(measure.id))
+  );
+  if (missing.length > 0) {
+    return {
+      profile: slo.profile ?? 'coven.automations.slo.v1',
+      status: 'incomplete',
+      detail: `measured report is missing required measures: ${missing.map((measure) => measure.id).join(', ')}`
+    };
+  }
+  const violated = [];
   for (const measure of slo.measures ?? []) {
     const value = values.get(measure.id);
-    if (value === undefined) continue;
-    measuredCount += 1;
-    if (measure.direction === 'lower-is-better' && value > measure.gate) failed = true;
-    if (measure.direction === 'higher-is-better' && value < measure.gate) failed = true;
+    if (measure.direction === 'lower-is-better' && value > measure.gate) {
+      violated.push(`${measure.id}: ${value} exceeds gate ${measure.gate}`);
+    }
+    if (measure.direction === 'higher-is-better' && value < measure.gate) {
+      violated.push(`${measure.id}: ${value} below gate ${measure.gate}`);
+    }
+  }
+  if (violated.length > 0) {
+    return {
+      profile: slo.profile ?? 'coven.automations.slo.v1',
+      status: 'failed',
+      detail: violated.join('; ')
+    };
   }
   return {
     profile: slo.profile ?? 'coven.automations.slo.v1',
-    status: measuredCount === 0 ? 'provisional' : failed ? 'failed' : 'passed'
+    status: 'passed',
+    detail: `complete measured report for artifact ${measured.artifact.sourceCommit} (${measured.artifact.artifactDigest.slice(0, 19)}...) on ${measured.environment.os}`
   };
 }
 

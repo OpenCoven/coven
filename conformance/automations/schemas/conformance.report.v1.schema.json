@@ -93,7 +93,8 @@
       "additionalProperties": false,
       "properties": {
         "profile": { "type": ["string", "null"] },
-        "status": { "enum": ["not-run", "passed", "failed", "provisional"] }
+        "status": { "enum": ["not-run", "passed", "failed", "invalid", "incomplete"] },
+        "detail": { "type": "string", "description": "Gate detail: binding information on pass, or exactly which evidence failed, was incomplete, or was invalid." }
       }
     },
     "redaction": {
