@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/conformance.report.v1.schema.json",
+  "title": "Coven automations conformance report (conformance.report.v1)",
+  "description": "Machine-readable certification output. Names exactly which profile and artifact versions were exercised, carries exact source/release revisions and artifact digests, and identifies failures by invariant, object ids, event cursor, expected/observed state, and a safe reproduction command. Reports redact secrets, raw credentials, private memory, unrestricted prompts, and irrelevant paths before writing.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reportVersion", "plane", "planeVersion", "generatedAt", "target", "profiles", "gate"],
+  "properties": {
+    "reportVersion": { "const": 1 },
+    "plane": { "const": "coven.automations.conformance" },
+    "planeVersion": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
+    "generatedAt": { "type": "string" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": { "enum": ["reference-oracle", "in-process", "daemon", "packaged-release"] },
+        "name": { "type": "string" },
+        "version": { "type": ["string", "null"] },
+        "revisions": {
+          "type": "object",
+          "additionalProperties": { "type": ["string", "null"] },
+          "description": "Exact source and release revisions, e.g. sourceCommit, releaseTag, runnerVersion."
+        },
+        "endpoint": { "type": ["string", "null"] }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "node": { "type": ["string", "null"] },
+        "os": { "type": ["string", "null"] },
+        "arch": { "type": ["string", "null"] },
+        "hostTimezone": { "type": ["string", "null"] }
+      }
+    },
+    "artifactDigests": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "sha256-... digests of the plane artifacts that produced this report."
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["structural", "scheduler-reliability", "runtime-authority", "continuity", "privacy", "interoperability", "full"],
+      "properties": {
+        "structural": { "$ref": "#/$defs/profileResult" },
+        "scheduler-reliability": { "$ref": "#/$defs/profileResult" },
+        "runtime-authority": { "$ref": "#/$defs/profileResult" },
+        "continuity": { "$ref": "#/$defs/profileResult" },
+        "privacy": { "$ref": "#/$defs/profileResult" },
+        "interoperability": { "$ref": "#/$defs/profileResult" },
+        "full": { "$ref": "#/$defs/profileResult" }
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["vectorId", "profile", "invariant", "expected", "observed", "reproduction"],
+        "properties": {
+          "vectorId": { "type": "string" },
+          "profile": { "type": "string" },
+          "invariant": { "type": "string" },
+          "objectIds": { "type": "array", "items": { "type": "string" } },
+          "eventCursor": { "type": ["integer", "null"] },
+          "expected": { "type": ["string", "object"] },
+          "observed": { "type": ["string", "object"] },
+          "reproduction": { "type": "string", "description": "Exact safe command to reproduce this single failure." }
+        }
+      }
+    },
+    "notApplicable": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["vectorId", "required", "reason"],
+        "properties": {
+          "vectorId": { "type": "string" },
+          "required": { "type": "boolean", "description": "True when the vector is required for certification and its non-execution forces the profile incomplete; false for target-dependent vectors." },
+          "reason": { "type": "string" }
+        }
+      },
+      "description": "Selected vectors that did not execute on this target. A required vector that does not execute forces its profile incomplete and fails the gate."
+    },
+    "slo": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "profile": { "type": ["string", "null"] },
+        "status": { "enum": ["not-run", "passed", "failed", "invalid", "incomplete"] },
+        "detail": { "type": "string", "description": "Gate detail: binding information on pass, or exactly which evidence failed, was incomplete, or was invalid." }
+      }
+    },
+    "redaction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["applied", "rules"],
+      "properties": {
+        "applied": { "type": "boolean" },
+        "rules": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "gate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": { "enum": ["passed", "failed"] },
+        "requiredProfiles": { "type": "array", "items": { "type": "string" } },
+        "fullProfileStatus": {
+          "enum": ["passed", "failed", "incomplete", "not-applicable"],
+          "description": "Status of the full profile: only a full-plane run can report passed; scoped runs report not-applicable."
+        },
+        "notes": { "type": "string" }
+      }
+    }
+  },
+  "$defs": {
+    "profileResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "passed", "failed", "notApplicable", "artifacts"],
+      "properties": {
+        "status": {
+          "enum": ["passed", "failed", "incomplete", "not-applicable"],
+          "description": "passed: every selected vector executed and none failed. failed: at least one failure. incomplete: executed but a required vector did not. not-applicable: nothing executed."
+        },
+        "passed": { "type": "integer", "minimum": 0 },
+        "failed": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 },
+        "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Exact artifact versions this profile's passing vectors certify." },
+        "vectorIds": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

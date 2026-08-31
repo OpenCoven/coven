@@ -1,0 +1,37 @@
+{
+  "vectorId": "definitions.valid-full",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "A definition carrying every optional field validates",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816", "coven#855"],
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1,
+        "id": "weekly-review_1.prod",
+        "name": "Weekly review",
+        "status": "ACTIVE",
+        "rrule": "FREQ=WEEKLY;BYDAY=MO,WE,FR;BYHOUR=8,17",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 45,
+        "runtime": "coven-code",
+        "familiarId": "charm",
+        "cwd": "work/project",
+        "outputTarget": "out/review.md",
+        "model": "glm-5.3-flash",
+        "prompt": "Summarize the week.",
+        "tags": ["review", "weekly"]
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-02-27T09:00:00.000Z" }]
+  },
+  "expected": {
+    "occurrences": [{ "automationId": "weekly-review_1.prod", "state": "succeeded" }],
+    "runs": [{ "automationId": "weekly-review_1.prod", "status": "succeeded" }]
+  }
+}

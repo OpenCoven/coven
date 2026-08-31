@@ -1,0 +1,31 @@
+{
+  "vectorId": "schedules.dst-spring-gap",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "schedules",
+  "title": "DST spring gap: 02:00 America/New_York on 2026-03-08 does not exist and is skipped, never invented",
+  "deterministic": true,
+  "artifacts": ["coven.automations.occurrence.v1"],
+  "specRefs": ["coven#816", "coven#856"],
+  "virtualTime": { "start": "2026-03-08T05:00:00.000Z", "hostTimezone": "America/New_York" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "ny", "name": "New York", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=2", "timezone": "America/New_York", "misfire": "latest",
+        "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-08T07:00:00.000Z" },
+      { "op": "tick", "at": "2026-03-09T07:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "ny", "scheduledFor": "2026-03-09T06:00:00.000Z", "state": "succeeded" }
+    ],
+    "dispatchCount": 1
+  }
+}

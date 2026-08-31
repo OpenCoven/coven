@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/coven.automations.definition.v1.schema.json",
+  "title": "Coven automation definition (coven.automations.definition.v1)",
+  "description": "A durable, Coven-owned routine definition. Mirrors the wire form the scheduler, ledger, and conformance plane consume. Definitions are the source of truth for identity and lifecycle; execution state lives in the occurrence ledger. The canonical form refuses unknown fields (fail-closed normalization); see conformance vectors under vectors/definitions/.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "id",
+    "name",
+    "status",
+    "rrule",
+    "timezone",
+    "misfire",
+    "overlap",
+    "timeoutMinutes",
+    "runtime",
+    "prompt"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "description": "Stable identifier; the ledger and scheduler key occurrences by it."
+    },
+    "name": { "type": "string", "minLength": 1, "maxLength": 160 },
+    "status": { "enum": ["ACTIVE", "PAUSED"], "description": "New definitions default to PAUSED; nothing runs until a human opts in." },
+    "rrule": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Scoped recurrence vocabulary: FREQ=DAILY|WEEKLY, optional BYHOUR list (0-23, unique, canonicalized ascending), optional BYDAY list for WEEKLY (MO..SU, canonicalized to two-letter form). Any other key or frequency is refused, never silently downgraded."
+    },
+    "timezone": {
+      "description": "utc, local, or an IANA time zone name. utc and IANA names are deterministic; local resolves against the pinned host zone of the certification run.",
+      "oneOf": [
+        { "enum": ["utc", "local"] },
+        { "type": "string", "pattern": "^[A-Za-z0-9_+-]+/[A-Za-z0-9_+-]+$", "description": "IANA time zone identifier (Area/Location)." }
+      ]
+    },
+    "misfire": {
+      "enum": ["latest"],
+      "description": "On recovery only the latest missed occurrence runs; earlier slots are collapsed, never backfilled."
+    },
+    "overlap": {
+      "enum": ["forbid"],
+      "description": "A run is skipped while the previous occurrence of this routine has not settled."
+    },
+    "timeoutMinutes": { "type": "integer", "minimum": 1, "maximum": 44640, "description": "Per-run wall-clock timeout. Bounded and required." },
+    "runtime": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "familiarId": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "cwd": { "type": "string", "minLength": 1 },
+    "outputTarget": { "type": "string", "minLength": 1, "description": "Atomic output target; delivery lands there only on a completed, verified run." },
+    "prompt": { "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "tags": { "type": "array", "items": { "type": "string" } }
+  }
+}

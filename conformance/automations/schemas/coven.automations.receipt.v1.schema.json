@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/coven.automations.receipt.v1.schema.json",
+  "title": "Coven automation run receipt (coven.automations.receipt.v1)",
+  "description": "Sealed evidence that a run reached a verified outcome under a verified binding. The digest is taken over the canonical JSON form (RFC 8785 style: recursively sorted object keys, no insignificant whitespace). Redaction replaces redacted fields before digesting, so a redacted receipt verifies exactly as sealed.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["receiptVersion", "receiptId", "runId", "occurrenceId", "automationId", "outcome", "at", "digest"],
+  "properties": {
+    "receiptVersion": { "const": 1 },
+    "receiptId": { "type": "string", "minLength": 1 },
+    "runId": { "type": "string", "minLength": 1 },
+    "occurrenceId": { "type": "string", "minLength": 1 },
+    "automationId": { "type": "string", "minLength": 1 },
+    "bindingDigest": {
+      "type": "string",
+      "description": "Digest of the exact authority binding (principal, familiar revision, runtime capabilities) the run was authorized under."
+    },
+    "orchestrator": {
+      "enum": ["direct", "psyche"],
+      "description": "Which control path produced the run; direct and Psyche-orchestrated runs share one binding and receipt contract."
+    },
+    "outcome": { "enum": ["succeeded", "failed", "cancelled", "ambiguous"] },
+    "outputCommit": { "type": ["string", "null"] },
+    "delivery": { "enum": ["not-applicable", "committed", "failed"] },
+    "at": { "type": "string" },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Digests of the artifacts this run was produced against (definition, schedule vector, engine release)."
+    },
+    "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over the canonical form of the receipt with the digest field absent." }
+  }
+}

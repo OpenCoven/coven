@@ -1,0 +1,29 @@
+{
+  "vectorId": "privacy.report-no-prompt-leak",
+  "vectorVersion": 1,
+  "profile": "privacy",
+  "category": "privacy",
+  "title": "The diagnostics surface never publishes prompt text: the published view (definitions, occurrences, runs, events, findings) is scrubbed",
+  "deterministic": true,
+  "artifacts": ["diagnostics.doctor.v1"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj",
+        "prompt": "Reflect on the quarter using the private roadmap notes."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "redaction": {
+      "forbiddenSubstrings": ["private roadmap notes"]
+    }
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "vectorId": "golden.20-legacy-import-paused",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "scenario",
+  "title": "Golden 20: a legacy Codex import lands PAUSED and source-preserving — the scheduler fences nothing until a human activates it",
+  "deterministic": true,
+  "artifacts": [
+    "coven.automations.definition.v1"
+  ],
+  "specRefs": [
+    "coven#816",
+    "coven#858"
+  ],
+  "virtualTime": {
+    "start": "2026-03-01T00:00:00.000Z"
+  },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1,
+        "id": "imported",
+        "name": "Imported Codex routine",
+        "status": "PAUSED",
+        "rrule": "FREQ=WEEKLY;BYDAY=MO;BYHOUR=21",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "work/proj",
+        "prompt": "Run the imported routine."
+      }
+    ],
+    "operations": [
+      {
+        "op": "tick",
+        "at": "2026-03-02T22:00:00.000Z"
+      },
+      {
+        "op": "tick",
+        "at": "2026-03-09T22:00:00.000Z"
+      },
+      {
+        "op": "subscribe",
+        "afterCursor": 0
+      },
+      {
+        "op": "deliver",
+        "afterCursor": 0,
+        "times": 1
+      }
+    ]
+  },
+  "expected": {
+    "projection": {
+      "eventCount": 1,
+      "definition.created": 1
+    },
+    "dispatchCount": 0
+  }
+}

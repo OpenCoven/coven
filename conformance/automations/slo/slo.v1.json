@@ -1,0 +1,61 @@
+{
+  "profile": "coven.automations.slo.v1",
+  "version": 1,
+  "status": "enforced",
+  "description": "Release SLO gates for Coven Automations v1. The gate accepts only a complete slo.measured.v1 report bound to the supported local profile and to the exact release artifact revisions (source commit and packed artifact digest); it evaluates every declared measure. Absent, partial, unbound, or malformed evidence fails the gate - there is no provisional acceptance. Measures are collected by the release certification harness against the exact release artifact.",
+  "supportedLocalProfile": {
+    "cpu": "2 vCPU",
+    "memory": "4 GB",
+    "disk": "local SSD",
+    "os": "linux x64",
+    "store": "SQLite WAL, single store, one daemon leader"
+  },
+  "measures": [
+    { "id": "definitions.per-minute", "unit": "definitions/min", "direction": "higher-is-better", "gate": 500, "baseline": null },
+    { "id": "due-occurrences.per-minute", "unit": "occurrences/min", "direction": "higher-is-better", "gate": 2000, "baseline": null },
+    { "id": "planning.latency.p95", "unit": "ms", "direction": "lower-is-better", "gate": 250, "baseline": null },
+    { "id": "claim.latency.p95", "unit": "ms", "direction": "lower-is-better", "gate": 100, "baseline": null },
+    { "id": "dispatch.latency.p95", "unit": "ms", "direction": "lower-is-better", "gate": 500, "baseline": null },
+    { "id": "start.latency.p95", "unit": "ms", "direction": "lower-is-better", "gate": 1000, "baseline": null },
+    { "id": "scheduler.pass.duration.p95", "unit": "ms", "direction": "lower-is-better", "gate": 1000, "baseline": null },
+    { "id": "queue.depth.p95", "unit": "occurrences", "direction": "lower-is-better", "gate": 100, "baseline": null },
+    { "id": "oldest-eligible.age.p95", "unit": "s", "direction": "lower-is-better", "gate": 180, "baseline": null },
+    { "id": "active.runs.max", "unit": "runs", "direction": "lower-is-better", "gate": 64, "baseline": null },
+    { "id": "sqlite.busy-retries.max", "unit": "retries/pass", "direction": "lower-is-better", "gate": 10, "baseline": null },
+    { "id": "changefeed.throughput", "unit": "events/s", "direction": "higher-is-better", "gate": 500, "baseline": null },
+    { "id": "changefeed.replay-latency.p95", "unit": "ms", "direction": "lower-is-better", "gate": 500, "baseline": null },
+    { "id": "store.growth.per-day", "unit": "MB/day", "direction": "lower-is-better", "gate": 200, "baseline": null },
+    { "id": "restart.recovery-latency.p95", "unit": "s", "direction": "lower-is-better", "gate": 10, "baseline": null },
+    { "id": "cpu.idle", "unit": "%", "direction": "lower-is-better", "gate": 5, "baseline": null },
+    { "id": "cpu.load.p95", "unit": "%", "direction": "lower-is-better", "gate": 80, "baseline": null },
+    { "id": "memory.idle", "unit": "MB", "direction": "lower-is-better", "gate": 150, "baseline": null },
+    { "id": "memory.load.p95", "unit": "MB", "direction": "lower-is-better", "gate": 512, "baseline": null }
+  ],
+  "hardGates": [
+    {
+      "id": "zero-duplicate-dispatch",
+      "description": "zero duplicate dispatches for a single occurrence fence, under every injected failure and duplicate-process scenario",
+      "enforcedBy": "conformance invariants (no-duplicate-dispatch-per-fence) over all vectors, scenarios, and randomized operation sequences"
+    },
+    {
+      "id": "zero-silent-loss",
+      "description": "zero silent eligible-occurrence loss: every due slot of an active routine is fenced or visibly explained",
+      "enforcedBy": "conformance invariant no-silent-eligible-occurrence-loss plus doctor finding occurrences.missed-occurrence"
+    },
+    {
+      "id": "zero-false-success",
+      "description": "zero false success under injected failures: a run never reads succeeded unless the runtime outcome was observed and delivery committed",
+      "enforcedBy": "conformance invariant no-false-success-under-injected-failure over all fault-injection vectors"
+    },
+    {
+      "id": "bounded-recovery-growth",
+      "description": "bounded recovery latency and bounded resource growth over retention windows",
+      "enforcedBy": "conformance invariant bounded-ledger-growth plus restart.recovery-latency and growth measures on the release artifact"
+    }
+  ],
+  "measurement": {
+    "when": "release certification (scripts/agent-check full with COVEN_BIN set, and the release pipeline)",
+    "how": "the load harness drives the exact release artifact under the supported local profile and emits a slo.measured.v1 report ({measuredVersion, environment, artifact: {sourceCommit, artifactDigest}, measures: [{id, value}]}); the runner gate evaluates it: node conformance/automations/runner/conformance.mjs --profile all --slo <measured.json>",
+    "ratification": "the gate is enforced: only a complete, schema-valid, environment- and artifact-bound measured report can pass; anything else reports failed, invalid, incomplete, or not-run"
+  }
+}

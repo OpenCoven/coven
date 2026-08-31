@@ -1,0 +1,31 @@
+{
+  "vectorId": "definitions.reject-rrule-frequency",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "An unsupported RRULE frequency is refused so a definition can never silently schedule work the scheduler does not understand",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 1,
+        "id": "hourly",
+        "name": "Hourly",
+        "status": "PAUSED",
+        "rrule": "FREQ=HOURLY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Do the thing."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "not supported (DAILY or WEEKLY)" }]
+  }
+}

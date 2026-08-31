@@ -1,0 +1,39 @@
+{
+  "vectorId": "authority.forged-familiar-binding-refused",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "identity-authority",
+  "title": "A binding whose familiar revision does not match the registry is forged; dispatch refuses fail-closed",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1"],
+  "specRefs": ["coven#857"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "familiarId": "charm", "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "daily",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 7,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"]
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-01T10:00:00.000Z" }]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "daily", "state": "failed", "failureReasonMatches": "familiar revision stale or revoked" }
+    ],
+    "dispatchCount": 0,
+    "invariants": ["no-false-success-under-injected-failure"]
+  }
+}

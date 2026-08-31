@@ -1,0 +1,45 @@
+{
+  "vectorId": "authority.approval-required-approved-consumed",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "identity-authority",
+  "title": "Approval lifecycle: required dispatch waits, an approval authorizes exactly one run, and its nonce is consumed",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1", "coven.automations.event.v1"],
+  "specRefs": ["coven#857"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "daily",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"],
+        "approval": { "required": true, "nonce": "n1", "ttlMinutes": 120 }
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "grantApproval", "automationId": "daily", "nonce": "n1", "ttlMinutes": 120 },
+      { "op": "runNow", "automationId": "daily", "adoptionKey": "approved-run", "at": "2026-03-01T10:05:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "daily", "scheduledFor": "2026-03-01T09:00:00.000Z", "state": "failed", "failureReasonMatches": "approval required" },
+      { "automationId": "daily", "scheduledFor": "2026-03-01T10:05:00.000Z", "state": "succeeded" }
+    ],
+    "runs": [{ "automationId": "daily", "status": "succeeded", "count": 1 }],
+    "dispatchCount": 1,
+    "events": [{ "type": "approval.consumed", "count": 1 }]
+  }
+}

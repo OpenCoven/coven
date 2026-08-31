@@ -1,0 +1,28 @@
+{
+  "vectorId": "schedules.iana-tokyo",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "schedules",
+  "title": "An IANA time zone resolves 09:00 Asia/Tokyo to 00:00Z",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#855", "coven#856"],
+  "virtualTime": { "start": "2026-03-01T15:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "tokyo", "name": "Tokyo", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "Asia/Tokyo", "misfire": "latest",
+        "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T01:00:00.000Z" }]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "tokyo", "scheduledFor": "2026-03-02T00:00:00.000Z", "state": "succeeded" }
+    ],
+    "dispatchCount": 1
+  }
+}

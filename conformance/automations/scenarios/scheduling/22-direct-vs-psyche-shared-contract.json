@@ -1,0 +1,29 @@
+{
+  "vectorId": "golden.22-direct-vs-psyche-shared-contract",
+  "vectorVersion": 1,
+  "profile": "interoperability",
+  "category": "scenario",
+  "title": "Golden 22: a direct Coven run and a Psyche-orchestrated run share one binding and receipt contract",
+  "deterministic": true,
+  "artifacts": ["coven.automations.receipt.v1", "coven.automations.authority.v1"],
+  "specRefs": ["coven#857", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "runNow", "automationId": "routine", "adoptionKey": "direct-1", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "runNow", "automationId": "routine", "adoptionKey": "psyche-1", "orchestrator": "psyche", "at": "2026-03-01T10:05:00.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "routine", "status": "succeeded", "count": 2 }],
+    "receipts": { "count": 2, "allVerify": true, "outcomes": ["succeeded", "succeeded"] },
+    "dispatchCount": 2
+  }
+}

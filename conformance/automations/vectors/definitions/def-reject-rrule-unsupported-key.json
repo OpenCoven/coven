@@ -1,0 +1,31 @@
+{
+  "vectorId": "definitions.reject-rrule-unsupported-key",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "RRULE keys outside the scoped vocabulary are refused",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 1,
+        "id": "counted",
+        "name": "Counted",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;COUNT=3",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Do the thing."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "key `COUNT` is not supported" }]
+  }
+}

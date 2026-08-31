@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# Prepare an agent development environment for contributing to Coven.
+#
+#   scripts/agent-bootstrap [--json]
+#
+# Idempotent and cheap: verifies the toolchain, activates the pinned pnpm
+# when corepack exists, and reports platform capabilities. It never mutates
+# the worktree, so it is safe to run before any check. Rust checks are
+# reported as an unsupported-platform capability when cargo is missing —
+# that is a distinct status from failure (see scripts/agent-check).
+#
+# With --json the result is a single machine-readable receipt on stdout.
+
+set -euo pipefail
+
+JSON=0
+case "${1-}" in
+  --json) JSON=1 ;;
+  "") ;;
+  *) printf 'usage: %s [--json]\n' "$0" >&2; exit 2 ;;
+esac
+
+entries=()
+note() { # note <status> <name> <detail>
+  entries+=("{\"status\":\"$1\",\"name\":\"$2\",\"detail\":\"$3\"}")
+  if [ "$JSON" -eq 0 ]; then
+    case "$1" in
+      ok) printf '   \033[32mok\033[0m   %s: %s\n' "$2" "$3" ;;
+      unsupported-platform) printf '   \033[33mskip\033[0m  %s: %s\n' "$2" "$3" ;;
+      *) printf '   \033[31mFAIL\033[0m %s: %s\n' "$2" "$3" ;;
+    esac
+  fi
+}
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+note ok node "$(node --version 2>/dev/null || echo 'missing')"
+if command_exists git; then
+  note ok git "$(git --version 2>/dev/null || echo 'missing')"
+else
+  note fail git 'not installed; git 2.39+ is required'
+fi
+
+if command_exists corepack; then
+  if corepack enable pnpm >/dev/null 2>&1; then
+    note ok pnpm "activated via corepack ($(pnpm --version 2>/dev/null || echo 'pinned'))"
+  else
+    note unsupported-platform pnpm 'corepack present but pnpm activation failed; package work falls back to npm'
+  fi
+else
+  note unsupported-platform pnpm 'corepack not installed; package work falls back to npm'
+fi
+
+if command_exists cargo; then
+  note ok cargo "$(cargo --version 2>/dev/null || echo 'present')"
+else
+  note unsupported-platform cargo 'no Rust toolchain on this host; cargo fmt/clippy/test defer to CI'
+fi
+
+if command_exists python3; then
+  note ok python3 "$(python3 --version 2>/dev/null || echo 'present')"
+else
+  note unsupported-platform python3 'no python3; scripts/check-secrets.py and the privacy guard defer to CI'
+fi
+
+# Package installs stay cheap and side-effect free unless explicitly asked.
+if [ -f packages/openclaw-coven/pnpm-lock.yaml ] && command_exists pnpm; then
+  note ok packages 'pnpm lockfile present; run `pnpm install --ignore-scripts` in packages/openclaw-coven when touching package code'
+else
+  note ok packages 'no package install needed for docs/conformance work'
+fi
+
+if [ "$JSON" -eq 1 ]; then
+  joined=""
+  for entry in "${entries[@]}"; do
+    if [ -n "$joined" ]; then joined="$joined,"; fi
+    joined="$joined$entry"
+  done
+  printf '{"bootstrapVersion":1,"results":[%s]}\n' "$joined"
+fi
+exit 0

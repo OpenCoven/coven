@@ -1,0 +1,30 @@
+{
+  "vectorId": "schedules.weekly-default-monday",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "schedules",
+  "title": "WEEKLY without BYDAY canonicalizes to Monday; the slot is not fenced before it is due",
+  "deterministic": true,
+  "artifacts": ["coven.automations.occurrence.v1"],
+  "specRefs": ["coven#816", "coven#855"],
+  "virtualTime": { "start": "2026-03-03T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "weekly", "name": "Weekly", "status": "ACTIVE",
+        "rrule": "FREQ=WEEKLY", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-03T10:00:00.000Z" },
+      { "op": "tick", "at": "2026-03-09T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "weekly", "scheduledFor": "2026-03-09T09:00:00.000Z", "state": "succeeded" }
+    ],
+    "dispatchCount": 1
+  }
+}

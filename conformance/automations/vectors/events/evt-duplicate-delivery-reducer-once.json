@@ -1,0 +1,37 @@
+{
+  "vectorId": "events.duplicate-delivery-reducer-once",
+  "vectorVersion": 1,
+  "profile": "interoperability",
+  "category": "events",
+  "title": "Duplicate delivery reduces exactly once per event id",
+  "deterministic": true,
+  "artifacts": ["coven.automations.event.v1"],
+  "specRefs": ["coven#855"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "subscribe", "afterCursor": 0 },
+      { "op": "deliver", "afterCursor": 0, "times": 3 }
+    ]
+  },
+  "expected": {
+    "projection": {
+      "eventCount": 7,
+      "definition.created": 1,
+      "occurrence.planned": 1,
+      "occurrence.claimed": 1,
+      "run.started": 1,
+      "occurrence.settled": 1,
+      "run.finished": 1,
+      "receipt.sealed": 1
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "plane": "coven.automations.conformance",
+  "version": "1.0.0",
+  "description": "Certification plane for Coven Automations v1 (coven#858): versioned vectors, schemas, a standalone runner, golden scenarios, SLO gates, and the operator diagnostics contract. Vectors are implementation-independent and consumable without linking Coven private modules.",
+  "spec": {
+    "issue": "OpenCoven/coven#858",
+    "parent": "OpenCoven/coven#854",
+    "dependsOn": ["OpenCoven/coven#855", "OpenCoven/coven#856", "OpenCoven/coven#857"]
+  },
+  "artifacts": {
+    "definition": "coven.automations.definition.v1",
+    "occurrence": "coven.automations.occurrence.v1",
+    "run": "coven.automations.run.v1",
+    "event": "coven.automations.event.v1",
+    "receipt": "coven.automations.receipt.v1",
+    "authority": "coven.automations.authority.v1",
+    "doctor": "diagnostics.doctor.v1",
+    "vector": "conformance.vector.v1",
+    "report": "conformance.report.v1"
+  },
+  "profiles": {
+    "structural": "schema, canonicalization, state-machine, and compatibility validity",
+    "scheduler-reliability": "time, timezone/DST, occurrence fencing, misfire, overlap, retry, cancellation, lease, crash/restart, and backpressure",
+    "runtime-authority": "authenticated principal, familiar embodiment, capability/approval decision, runtime descriptor, and fail-closed dispatch",
+    "continuity": "exact familiar root/revision and historical rehydration/correlation semantics",
+    "privacy": "access control, minimization, redaction, retention, erasure/tombstone, and changefeed projection",
+    "interoperability": "clients consuming pinned artifacts and replaying events correctly across control paths",
+    "full": "all required v1 profiles at one immutable compatibility set"
+  },
+  "requiredProfiles": [
+    "structural",
+    "scheduler-reliability",
+    "runtime-authority",
+    "continuity",
+    "privacy",
+    "interoperability"
+  ],
+  "targets": {
+    "reference-oracle": "the plane's own deterministic oracle (runner/lib); always available, zero dependencies. Reference-oracle runs are vector self-tests, not product certification.",
+    "in-process": "a linked Coven implementation module exporting probe()/evaluate(); adapter runner/lib/adapters/index.mjs, module via COVEN_CONFORMANCE_INPROCESS_MODULE; requires the coven.automations.conformance.v1 capability",
+    "daemon": "a running daemon endpoint over HTTP; adapter runner/lib/adapters/index.mjs, endpoint via --endpoint or COVEN_CONFORMANCE_ENDPOINT; requires the coven.automations.conformance.v1 capability",
+    "packaged-release": "a packed npm artifact's binary; adapter runner/lib/adapters/index.mjs, binary via COVEN_CONFORMANCE_PACKAGE_BIN; requires the coven.automations.conformance.v1 capability"
+  },
+  "targetsCapability": "coven.automations.conformance.v1",
+  "invariants": [
+    "no-duplicate-dispatch-per-fence",
+    "no-silent-eligible-occurrence-loss",
+    "no-false-success-under-injected-failure",
+    "terminal-state-monotonicity",
+    "fence-uniqueness",
+    "bounded-ledger-growth"
+  ],
+  "hardGates": [
+    "zero duplicate dispatches for a single fence",
+    "zero silent eligible-occurrence loss",
+    "zero false success under injected failures",
+    "bounded recovery and resource growth"
+  ],
+  "runner": {
+    "entry": "runner/conformance.mjs",
+    "usage": "node conformance/automations/runner/conformance.mjs --profile all --target reference-oracle --report conformance/automations/reports/last-run.json",
+    "agentCheckFast": "node conformance/automations/runner/conformance.mjs --profile structural --fuzz 200"
+  }
+}

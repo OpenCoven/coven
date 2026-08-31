@@ -1,0 +1,26 @@
+{
+  "vectorId": "diagnostics.no-leader",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "diagnostics",
+  "title": "doctor reports a missing scheduler leader with safe next steps (never row deletion)",
+  "deterministic": true,
+  "artifacts": ["diagnostics.doctor.v1"],
+  "specRefs": ["coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "setLeader", "available": false }
+    ]
+  },
+  "expected": {
+    "doctor": { "findingCodes": ["scheduler.no-leader"] }
+  }
+}

@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# The agent check gate for Coven contributions.
+#
+#   scripts/agent-check fast                    # deterministic unit/schema/state vectors, no network
+#   scripts/agent-check full                    # fast + privacy/secret guards + every local profile
+#   scripts/agent-check automations-conformance # the certification plane only
+#   scripts/agent-check <mode> --json           # machine-readable receipt on stdout
+#
+# Every run leaves the worktree clean: receipts go to
+# conformance/automations/reports/ (gitignored). Unsupported platform
+# capabilities are reported as unsupported-platform entries - distinct from
+# failures - and defer to CI (for example cargo checks on a host without a
+# Rust toolchain).
+
+set -uo pipefail
+
+MODE="${1:-}"
+if [ "$MODE" != "fast" ] && [ "$MODE" != "full" ] && [ "$MODE" != "automations-conformance" ]; then
+  printf 'usage: %s {fast|full|automations-conformance} [--json]\n' "$0" >&2
+  exit 2
+fi
+
+JSON=0
+if [ "${2:-}" = "--json" ]; then JSON=1; fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+REPORTS="$ROOT/conformance/automations/reports"
+mkdir -p "$REPORTS"
+
+failures=0
+unsupported=""
+step_names=()
+step_status=()
+
+step() { # step <name> <exit-code>
+  local name="$1" code="$2" status
+  if [ "$code" -eq 0 ]; then
+    status="passed"
+  else
+    status="failed"
+    failures=$((failures + 1))
+  fi
+  step_names+=("$name")
+  step_status+=("$status")
+  if [ "$JSON" -eq 0 ]; then
+    if [ "$status" = "passed" ]; then
+      printf '   \033[32mok\033[0m   %s\n' "$name"
+    else
+      printf '   \033[31mFAIL\033[0m %s\n' "$name"
+    fi
+  fi
+  return 0
+}
+
+skip_platform() { # skip_platform <label> <detail>
+  unsupported="${unsupported:+$unsupported,}\"$1: $2\""
+  if [ "$JSON" -eq 0 ]; then
+    printf '   \033[33mskip\033[0m  unsupported platform: %s (deferred to CI)\n' "$1"
+  fi
+  return 0
+}
+
+CONFORMANCE="$ROOT/conformance/automations/runner/conformance.mjs"
+TESTS="$ROOT/conformance/automations/runner/conformance.test.mjs"
+
+code=0
+node --test "$TESTS" >/dev/null 2>&1 || code=$?
+step "conformance-runner-tests" "$code"
+
+case "$MODE" in
+  fast)
+    code=0
+    node "$CONFORMANCE" --profile structural --fuzz 250 --quiet \
+      --report "$REPORTS/fast-receipt.json" || code=$?
+    step "structural-profile-with-fuzz" "$code"
+    ;;
+  automations-conformance)
+    code=0
+    node "$CONFORMANCE" --profile all --fuzz 500 --quiet \
+      --report "$REPORTS/automations-conformance-receipt.json" || code=$?
+    step "automations-conformance-full-profile" "$code"
+    ;;
+  full)
+    code=0
+    node "$CONFORMANCE" --profile all --fuzz 500 --quiet \
+      --report "$REPORTS/full-receipt.json" || code=$?
+    step "automations-conformance-full-profile" "$code"
+    if command -v python3 >/dev/null 2>&1; then
+      code=0
+      python3 "$ROOT/scripts/check-secrets.py" >/dev/null 2>&1 || code=$?
+      step "secret-scan" "$code"
+      code=0
+      python3 "$ROOT/scripts/check-coven-privacy.py" --staged >/dev/null 2>&1 || code=$?
+      step "privacy-guard" "$code"
+    else
+      skip_platform "python3" "secrets and privacy guards defer to CI"
+    fi
+    if command -v cargo >/dev/null 2>&1; then
+      code=0
+      (cd "$ROOT" && cargo fmt --check >/dev/null 2>&1) || code=$?
+      step "cargo-fmt" "$code"
+      code=0
+      (cd "$ROOT" && cargo clippy --workspace --all-targets -- -D warnings >/dev/null 2>&1) || code=$?
+      step "cargo-clippy" "$code"
+      code=0
+      (cd "$ROOT" && cargo test --workspace --locked >/dev/null 2>&1) || code=$?
+      step "cargo-test" "$code"
+    else
+      skip_platform "cargo" "fmt, clippy, and tests defer to CI"
+    fi
+    ;;
+esac
+
+if [ "$JSON" -eq 1 ]; then
+  joined=""
+  index=0
+  while [ "$index" -lt "${#step_names[@]}" ]; do
+    if [ -n "$joined" ]; then joined="$joined,"; fi
+    joined="$joined{\"name\":\"${step_names[$index]}\",\"status\":\"${step_status[$index]}\"}"
+    index=$((index + 1))
+  done
+  printf '{"agentCheckVersion":1,"mode":"%s","steps":[%s],"unsupportedPlatform":[%s],"failures":%s}\n' \
+    "$MODE" "$joined" "${unsupported:-}" "$failures"
+else
+  if [ "$failures" -eq 0 ]; then
+    printf 'agent-check %s: passed\n' "$MODE"
+  else
+    printf 'agent-check %s: %s failure(s)\n' "$MODE" "$failures"
+  fi
+fi
+
+if [ "$failures" -eq 0 ]; then
+  exit 0
+fi
+exit 1

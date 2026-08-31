@@ -1,0 +1,43 @@
+{
+  "vectorId": "authority.toctou-decision-vs-dispatch",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "identity-authority",
+  "title": "TOCTOU: authority revoked after the claim still refuses the dispatch — the check runs at dispatch time",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1"],
+  "specRefs": ["coven#857"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "daily", "name": "Daily", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "daily",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"]
+      }
+    ],
+    "operations": [
+      { "op": "crash", "during": "claim" },
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "revokeFamiliar", "automationId": "daily" },
+      { "op": "restart", "at": "2026-03-01T10:05:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "daily", "scheduledFor": "2026-03-01T09:00:00.000Z", "state": "failed", "failureReasonMatches": "stale or revoked" }
+    ],
+    "dispatchCount": 0,
+    "invariants": ["no-false-success-under-injected-failure"]
+  }
+}

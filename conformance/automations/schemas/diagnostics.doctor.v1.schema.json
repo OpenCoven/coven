@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/schemas/diagnostics.doctor.v1.schema.json",
+  "title": "Coven automations doctor report (diagnostics.doctor.v1)",
+  "description": "Read-only operator diagnostic surface for Coven automations. Every supported unhealthy state maps to a stable finding code with a safe next step. No diagnostic ever recommends deleting rows or blindly rerunning ambiguous mutating work.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["doctorVersion", "generatedAt", "ok", "findings", "safeNextSteps"],
+  "properties": {
+    "doctorVersion": { "const": 1 },
+    "generatedAt": { "type": "string" },
+    "ok": { "type": "boolean", "description": "True when no error-severity findings exist." },
+    "leadership": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "isLeader": { "type": "boolean" },
+        "leaderId": { "type": ["string", "null"] },
+        "lastSuccessfulPassAt": { "type": ["string", "null"] },
+        "lastPassDurationMs": { "type": ["integer", "null"] }
+      }
+    },
+    "store": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "schemaVersion": { "type": ["integer", "null"] },
+        "integrity": { "enum": ["ok", "degraded", "unreadable", "unknown"] },
+        "migrationState": { "type": ["string", "null"] }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "due": { "type": "integer" },
+        "eligible": { "type": "integer" },
+        "claimed": { "type": "integer" },
+        "running": { "type": "integer" },
+        "recoveryRequired": { "type": "integer" },
+        "quarantined": { "type": "integer" }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["code", "severity", "subjectIds", "observed", "safeNextSteps"],
+        "properties": {
+          "code": {
+            "enum": [
+              "scheduler.no-leader",
+              "scheduler.stale-pass",
+              "scheduler.planning-lag",
+              "store.integrity-degraded",
+              "store.migration-pending",
+              "occurrences.due-backlog",
+              "occurrences.stale-lease",
+              "occurrences.recovery-required",
+              "occurrences.missed-occurrence",
+              "runs.repeated-failures",
+              "runs.quarantined",
+              "runs.ambiguous-outcome",
+              "runs.cancelled",
+              "authority.unresolved-refusal",
+              "authority.stale-identity",
+              "delivery.commit-failures",
+              "receipts.unverified",
+              "events.cursor-lag",
+              "disk.retention-pressure"
+            ]
+          },
+          "severity": { "enum": ["info", "warning", "error"] },
+          "subjectIds": { "type": "array", "items": { "type": "string" }, "description": "Automation/occurrence/run ids the finding is about; never row handles." },
+          "observed": { "type": "string", "description": "Redacted observation; no prompts, secrets, private memory, or raw paths." },
+          "safeNextSteps": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Exact safe commands or operator actions. Mutating commands always carry an expected-state guard or --dry-run first."
+          }
+        }
+      }
+    },
+    "safeNextSteps": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Ordered safe actions for the whole report."
+    },
+    "surface": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "The stable CLI/control-action diagnostic commands backing this report."
+    }
+  }
+}

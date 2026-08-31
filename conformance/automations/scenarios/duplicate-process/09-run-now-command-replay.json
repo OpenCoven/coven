@@ -1,0 +1,29 @@
+{
+  "vectorId": "golden.09-run-now-command-replay",
+  "vectorVersion": 1,
+  "profile": "scheduler-reliability",
+  "category": "scenario",
+  "title": "Golden 9: a replayed run-now command with the same adoption key is an idempotent no-op",
+  "deterministic": true,
+  "artifacts": ["coven.automations.run.v1"],
+  "specRefs": ["coven#855", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "operations": [
+      { "op": "runNow", "automationId": "routine", "adoptionKey": "cmd-1", "label": "first", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "runNow", "automationId": "routine", "adoptionKey": "cmd-1", "label": "replay", "at": "2026-03-01T10:00:02.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "routine", "status": "succeeded", "count": 1 }],
+    "dispatchCount": 1,
+    "refusals": [{ "refusalId": "replay", "reasonMatches": "adoption key already consumed" }]
+  }
+}

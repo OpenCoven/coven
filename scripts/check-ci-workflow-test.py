@@ -29,6 +29,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
 
     def test_ci_contains_expected_jobs(self) -> None:
         for job_name in [
+            'automations-conformance',
             'rust-lint-linux',
             'rust-test-linux',
             'rust-test-windows',
@@ -38,6 +39,19 @@ class CheckCiWorkflowTests(unittest.TestCase):
         ]:
             self.assertIn(f"\n  {job_name}:\n", CI_TEXT)
         self.assertNotIn("\n  rust:\n", CI_TEXT)
+
+    def test_ci_runs_the_automations_conformance_plane(self) -> None:
+        job = CI_TEXT.split("\n  automations-conformance:\n", 1)[1].split("\n  rust-lint-linux:", 1)[0]
+        # CI exercises vector self-tests on the reference oracle and must be
+        # labeled as such: it is not product certification (finding 3 of the
+        # #882 review).
+        self.assertIn("name: Automations conformance vector self-tests (reference oracle)", job)
+        self.assertIn("scripts/agent-bootstrap", job)
+        self.assertIn("scripts/agent-check automations-conformance", job)
+        self.assertIn("not product certification", job)
+        # The conformance plane gates pull requests through the PR gate.
+        gate = CI_TEXT.split("\n  pr-gate:\n", 1)[1]
+        self.assertIn("- automations-conformance", gate)
 
     def test_ci_uses_expected_timeouts_and_cache_policy(self) -> None:
         self.assertGreaterEqual(CI_TEXT.count('timeout-minutes: 20'), 10)

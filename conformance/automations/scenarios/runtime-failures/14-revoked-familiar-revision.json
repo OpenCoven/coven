@@ -1,0 +1,42 @@
+{
+  "vectorId": "golden.14-revoked-familiar-revision",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "scenario",
+  "title": "Golden 14: a revoked familiar revision stops dispatch fail-closed and shows up in doctor",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1", "diagnostics.doctor.v1"],
+  "specRefs": ["coven#857", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "familiarId": "charm", "cwd": "work/proj",
+        "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "routine",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"]
+      }
+    ],
+    "operations": [
+      { "op": "revokeFamiliar", "automationId": "routine" },
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" }
+    ]
+  },
+  "expected": {
+    "occurrences": [
+      { "automationId": "routine", "state": "failed", "failureReasonMatches": "stale or revoked" }
+    ],
+    "dispatchCount": 0,
+    "doctor": { "findingCodes": ["authority.stale-identity", "authority.unresolved-refusal"] }
+  }
+}

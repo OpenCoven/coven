@@ -1,0 +1,41 @@
+{
+  "vectorId": "golden.15-approval-required-approved-consumed",
+  "vectorVersion": 1,
+  "profile": "runtime-authority",
+  "category": "scenario",
+  "title": "Golden 15: approval required, approved, and consumed exactly once",
+  "deterministic": true,
+  "artifacts": ["coven.automations.authority.v1", "coven.automations.event.v1"],
+  "specRefs": ["coven#857", "coven#858"],
+  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "input": {
+    "definitions": [
+      {
+        "schemaVersion": 1, "id": "routine", "name": "Routine", "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
+        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the routine."
+      }
+    ],
+    "bindings": [
+      {
+        "automationId": "routine",
+        "principalId": "principal-1",
+        "familiarId": "charm",
+        "familiarRevision": 1,
+        "runtime": "coven-code",
+        "requiredCapabilities": ["session.create"],
+        "approval": { "required": true, "nonce": "n1", "ttlMinutes": 120 }
+      }
+    ],
+    "operations": [
+      { "op": "tick", "at": "2026-03-01T10:00:00.000Z" },
+      { "op": "grantApproval", "automationId": "routine", "nonce": "n1", "ttlMinutes": 120 },
+      { "op": "runNow", "automationId": "routine", "adoptionKey": "approved", "at": "2026-03-01T10:05:00.000Z" }
+    ]
+  },
+  "expected": {
+    "runs": [{ "automationId": "routine", "status": "succeeded", "count": 1 }],
+    "events": [{ "type": "approval.consumed", "count": 1 }],
+    "dispatchCount": 1
+  }
+}

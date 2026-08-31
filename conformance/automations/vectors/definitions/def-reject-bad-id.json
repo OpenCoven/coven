@@ -1,0 +1,31 @@
+{
+  "vectorId": "definitions.reject-bad-id",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "An identifier outside the ASCII alphabet is refused",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#816"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 1,
+        "id": "daily notes!",
+        "name": "Daily notes",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Do the thing."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "does not match pattern" }]
+  }
+}

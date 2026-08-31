@@ -1,0 +1,31 @@
+{
+  "vectorId": "definitions.reject-schema-version",
+  "vectorVersion": 1,
+  "profile": "structural",
+  "category": "definitions",
+  "title": "A definition with an unsupported schemaVersion is refused, never downgraded",
+  "deterministic": true,
+  "artifacts": ["coven.automations.definition.v1"],
+  "specRefs": ["coven#855"],
+  "input": {
+    "invalidDefinitions": [
+      {
+        "schemaVersion": 2,
+        "id": "future",
+        "name": "Future",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Do the thing."
+      }
+    ],
+    "operations": [{ "op": "tick", "at": "2026-03-02T00:10:00.000Z" }]
+  },
+  "expected": {
+    "refusals": [{ "refusalId": "def-0", "reasonMatches": "expected const 1" }]
+  }
+}
