@@ -521,10 +521,16 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
     conn.execute(
         "UPDATE automation_occurrences
              SET state = 'failed',
-                 failure_reason = ?1,
+                 failure_reason = CASE
+                     WHEN failure_reason IS NULL OR trim(failure_reason) = '' THEN ?1
+                     ELSE failure_reason || '; ' || ?1
+                 END,
                  lease_owner = NULL,
                  lease_expires_at = NULL,
-                 delivery_state = 'failed',
+                 delivery_state = CASE
+                     WHEN delivery_state IN ('committed', 'ambiguous') THEN delivery_state
+                     ELSE 'failed'
+                 END,
                  delivery_error = CASE
                      WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?1
                      ELSE delivery_error || '; ' || ?1
@@ -544,7 +550,9 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
         "UPDATE automation_runs
              SET status = 'failed',
                  delivery_state = CASE
-                     WHEN output_commit IS NOT NULL THEN 'committed'
+                     WHEN output_commit IS NOT NULL OR delivery_state = 'committed'
+                         THEN 'committed'
+                     WHEN delivery_state = 'ambiguous' THEN 'ambiguous'
                      WHEN status = 'failed' THEN 'failed'
                      ELSE 'ambiguous'
                  END,
@@ -552,7 +560,7 @@ fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
                      WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?1
                      ELSE delivery_error || '; ' || ?1
                  END,
-                 finished_at = ?2,
+                 finished_at = COALESCE(finished_at, ?2),
                  legacy_reconciled_at = ?2
              WHERE status = 'running'
                AND definition_json IS NULL
@@ -1102,5 +1110,169 @@ mod tests {
         assert!(first.5.contains("original delivery diagnostic"));
         assert!(first.1.contains("occurrence=failed"));
         assert!(first.5.contains("run=succeeded"));
+    }
+
+    #[test]
+    fn unlinked_legacy_occurrence_preserves_diagnostics_and_delivery_across_startups() {
+        for delivery_state in ["committed", "ambiguous"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp
+                .path()
+                .join(format!("unlinked-occurrence-{delivery_state}.sqlite"));
+            {
+                let conn = Connection::open(&path).unwrap();
+                create_legacy_automation_tables(&conn);
+                conn.execute_batch(
+                    "ALTER TABLE automation_occurrences
+                         ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none';
+                     ALTER TABLE automation_occurrences ADD COLUMN delivery_error TEXT;",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO automation_occurrences
+                        (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                         attempt, failure_reason, delivery_state, delivery_error,
+                         created_at, updated_at)
+                     VALUES ('unlinked-occ', 'missing-definition',
+                             '2026-01-02T09:00:00.000Z', 'running', 'legacy-daemon',
+                             '2026-01-02T10:00:00.000Z', 1,
+                             'original occurrence diagnostic', ?1,
+                             'original occurrence delivery diagnostic',
+                             '2026-01-02T09:00:00.000Z',
+                             '2026-01-02T09:00:00.000Z')",
+                    rusqlite::params![delivery_state],
+                )
+                .unwrap();
+            }
+
+            initialize_store(&path).unwrap();
+            let first: (String, String, String, String, Option<String>) = {
+                let conn = crate::store::open_store(&path).unwrap();
+                conn.query_row(
+                    "SELECT state, failure_reason, delivery_state, delivery_error,
+                            legacy_reconciled_at
+                     FROM automation_occurrences WHERE id = 'unlinked-occ'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+            initialize_store(&path).unwrap();
+            let second: (String, String, String, String, Option<String>) = {
+                let conn = crate::store::open_store(&path).unwrap();
+                conn.query_row(
+                    "SELECT state, failure_reason, delivery_state, delivery_error,
+                            legacy_reconciled_at
+                     FROM automation_occurrences WHERE id = 'unlinked-occ'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+
+            assert_eq!(second, first);
+            assert_eq!(first.0, "failed");
+            assert_eq!(first.2, delivery_state);
+            assert!(first.1.contains("original occurrence diagnostic"));
+            assert!(first.1.contains("immutable snapshot unavailable"));
+            assert!(first.3.contains("original occurrence delivery diagnostic"));
+            assert!(first.4.is_some());
+        }
+    }
+
+    #[test]
+    fn unlinked_legacy_run_preserves_diagnostics_and_delivery_across_startups() {
+        for delivery_state in ["committed", "ambiguous"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp
+                .path()
+                .join(format!("unlinked-run-{delivery_state}.sqlite"));
+            {
+                let conn = Connection::open(&path).unwrap();
+                create_legacy_automation_tables(&conn);
+                conn.execute_batch(
+                    "ALTER TABLE automation_runs
+                         ADD COLUMN delivery_state TEXT NOT NULL DEFAULT 'none';
+                     ALTER TABLE automation_runs ADD COLUMN delivery_error TEXT;",
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO automation_runs
+                        (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
+                         status, output_commit, delivery_state, delivery_error, started_at)
+                     VALUES ('unlinked-run', 'missing-definition', NULL, 'legacy-session',
+                             NULL, 'coven-code', 'running', NULL, ?1,
+                             'original run delivery diagnostic',
+                             '2026-01-02T09:00:00.000Z')",
+                    rusqlite::params![delivery_state],
+                )
+                .unwrap();
+            }
+
+            initialize_store(&path).unwrap();
+            let first: (String, String, String, Option<String>, Option<String>) = {
+                let conn = crate::store::open_store(&path).unwrap();
+                conn.query_row(
+                    "SELECT status, delivery_state, delivery_error,
+                            finished_at, legacy_reconciled_at
+                     FROM automation_runs WHERE id = 'unlinked-run'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+            initialize_store(&path).unwrap();
+            let second: (String, String, String, Option<String>, Option<String>) = {
+                let conn = crate::store::open_store(&path).unwrap();
+                conn.query_row(
+                    "SELECT status, delivery_state, delivery_error,
+                            finished_at, legacy_reconciled_at
+                     FROM automation_runs WHERE id = 'unlinked-run'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap()
+            };
+
+            assert_eq!(second, first);
+            assert_eq!(first.0, "failed");
+            assert_eq!(first.1, delivery_state);
+            assert!(first.2.contains("original run delivery diagnostic"));
+            assert!(first.2.contains("immutable snapshot unavailable"));
+            assert!(first.3.is_some());
+            assert!(first.4.is_some());
+        }
     }
 }
