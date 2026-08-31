@@ -65,7 +65,12 @@
       "items": {
         "type": "string"
       },
-      "description": "Artifact or capability ids the target must provide; unmet prerequisites mark the vector skipped, never failed."
+      "description": "Artifact or capability ids the target must provide; unmet prerequisites mark the vector not-applicable, never failed and never passed-by-skip."
+    },
+    "execution": {
+      "enum": ["required", "target-dependent"],
+      "default": "required",
+      "description": "required vectors must execute for their profile to count as passed; on a target without their prerequisites the profile is incomplete and the gate fails. target-dependent vectors (cross-repo canaries pinning artifacts outside this plane) are reported not-applicable on targets that lack them and never block certification."
     },
     "artifacts": {
       "type": "array",

@@ -20,6 +20,7 @@ import {
   parseArgs,
   runConformance,
   validateReport,
+  profileResult,
   PLANE_ROOT,
   PLANE_VERSION,
   PROFILES
@@ -396,12 +397,90 @@ test('all vectors pass against the reference oracle', async () => {
       0,
       `profile ${profile} has failures: ${JSON.stringify(report.failures.filter((f) => f.profile === profile))}`
     );
+    assert.equal(
+      report.profiles[profile].status,
+      'passed',
+      `profile ${profile} must be passed, got ${report.profiles[profile].status}`
+    );
   }
-  // Skips are external canaries and the ACL vector, reported separately.
-  assert.ok(report.skipped.length >= 6);
+  // Target-dependent canaries (cross-repo artifacts the reference oracle
+  // does not provide) are reported separately, never as skips that pass.
+  assert.ok(report.notApplicable.length >= 6);
   assert.ok(
-    report.skipped.every((skip) => skip.reason.includes('prerequisites not met')),
-    'every skip must be an explicit prerequisite gap'
+    report.notApplicable.every(
+      (entry) => entry.required === false && entry.reason.includes('prerequisites not met')
+    ),
+    'every not-applicable entry must be an explicit target-dependent gap'
+  );
+});
+
+test('profile results fail closed on gaps and partial execution', () => {
+  const vector = (vectorId, execution = 'required') => ({ vectorId, execution });
+  const passed = { vector: vector('v-pass'), status: 'passed', failures: [] };
+  const failed = { vector: vector('v-fail'), status: 'failed', failures: [{ invariant: 'x' }] };
+  const gap = { vector: vector('v-gap'), status: 'not-applicable', failures: [], reason: 'prereq' };
+  const optionalGap = {
+    vector: vector('v-opt', 'target-dependent'),
+    status: 'not-applicable',
+    failures: [],
+    reason: 'prereq'
+  };
+
+  assert.equal(profileResult([passed]).status, 'passed');
+  assert.equal(profileResult([passed, failed]).status, 'failed');
+  // A required vector that did not execute forces incomplete — never passed.
+  assert.equal(profileResult([passed, gap]).status, 'incomplete');
+  // Target-dependent gaps do not upgrade or downgrade an executed profile.
+  assert.equal(profileResult([passed, optionalGap]).status, 'passed');
+  // Nothing executed: not-applicable either way, never passed.
+  assert.equal(profileResult([gap]).status, 'not-applicable');
+  assert.equal(profileResult([optionalGap]).status, 'not-applicable');
+  assert.equal(profileResult([]).status, 'not-applicable');
+  const result = profileResult([passed, optionalGap]);
+  assert.equal(result.notApplicable, 1);
+  assert.equal(result.passed, 1);
+});
+
+test('a scoped run never reports the full profile passed', async () => {
+  const { report } = await runConformance({
+    profile: 'structural',
+    target: 'reference-oracle',
+    report: null,
+    vector: null,
+    slo: null,
+    fuzz: 0,
+    seed: 858,
+    list: false,
+    quiet: true
+  });
+  assert.equal(report.gate.status, 'passed', JSON.stringify(report.failures, null, 1));
+  assert.equal(report.profiles.structural.status, 'passed');
+  assert.equal(
+    report.profiles.full.status,
+    'not-applicable',
+    'a structural-only run must not certify the full profile'
+  );
+  assert.equal(report.gate.fullProfileStatus, 'not-applicable');
+});
+
+test('a selected vector that cannot execute fails the gate', async () => {
+  const { report } = await runConformance({
+    profile: 'all',
+    target: 'reference-oracle',
+    report: null,
+    vector: 'canary.packed-artifact-standalone',
+    slo: null,
+    fuzz: 0,
+    seed: 858,
+    list: false,
+    quiet: true
+  });
+  assert.equal(report.gate.status, 'failed', 'selecting a target-dependent canary on the oracle must fail the gate');
+  assert.equal(report.notApplicable.length, 1);
+  assert.equal(report.notApplicable[0].vectorId, 'canary.packed-artifact-standalone');
+  assert.ok(
+    report.gate.notes.includes('did not execute'),
+    `gate notes must name the non-executed vectors: ${report.gate.notes}`
   );
 });
 

@@ -74,18 +74,19 @@
         }
       }
     },
-    "skipped": {
+    "notApplicable": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["vectorId", "reason"],
+        "required": ["vectorId", "required", "reason"],
         "properties": {
           "vectorId": { "type": "string" },
+          "required": { "type": "boolean", "description": "True when the vector is required for certification and its non-execution forces the profile incomplete; false for target-dependent vectors." },
           "reason": { "type": "string" }
         }
       },
-      "description": "Vectors not exercised (unmet prerequisites, unsupported platform, external canary artifacts). Skips are reported separately from failures."
+      "description": "Selected vectors that did not execute on this target. A required vector that does not execute forces its profile incomplete and fails the gate."
     },
     "slo": {
       "type": "object",
@@ -111,6 +112,10 @@
       "properties": {
         "status": { "enum": ["passed", "failed"] },
         "requiredProfiles": { "type": "array", "items": { "type": "string" } },
+        "fullProfileStatus": {
+          "enum": ["passed", "failed", "incomplete", "not-applicable"],
+          "description": "Status of the full profile: only a full-plane run can report passed; scoped runs report not-applicable."
+        },
         "notes": { "type": "string" }
       }
     }
@@ -119,12 +124,15 @@
     "profileResult": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["status", "passed", "failed", "skipped", "artifacts"],
+      "required": ["status", "passed", "failed", "notApplicable", "artifacts"],
       "properties": {
-        "status": { "enum": ["passed", "failed", "not-applicable"] },
+        "status": {
+          "enum": ["passed", "failed", "incomplete", "not-applicable"],
+          "description": "passed: every selected vector executed and none failed. failed: at least one failure. incomplete: executed but a required vector did not. not-applicable: nothing executed."
+        },
         "passed": { "type": "integer", "minimum": 0 },
         "failed": { "type": "integer", "minimum": 0 },
-        "skipped": { "type": "integer", "minimum": 0 },
+        "notApplicable": { "type": "integer", "minimum": 0 },
         "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Exact artifact versions this profile's passing vectors certify." },
         "vectorIds": { "type": "array", "items": { "type": "string" } }
       }

@@ -5,16 +5,37 @@
   "category": "identity-authority",
   "title": "Cross-repo canary: Familiar Contract and Threads vectors bind to the exact familiar root/revision on pinned artifacts",
   "deterministic": true,
-  "prerequisites": ["opencoven.familiar-contract.v1@pinned", "opencoven.threads.v1@pinned"],
-  "artifacts": ["coven.automations.authority.v1", "opencoven.familiar-contract.v1@pinned", "opencoven.threads.v1@pinned"],
-  "specRefs": ["coven#858"],
-  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "prerequisites": [
+    "opencoven.familiar-contract.v1@pinned",
+    "opencoven.threads.v1@pinned"
+  ],
+  "execution": "target-dependent",
+  "artifacts": [
+    "coven.automations.authority.v1",
+    "opencoven.familiar-contract.v1@pinned",
+    "opencoven.threads.v1@pinned"
+  ],
+  "specRefs": [
+    "coven#858"
+  ],
+  "virtualTime": {
+    "start": "2026-03-01T00:00:00.000Z"
+  },
   "input": {
     "definitions": [
       {
-        "schemaVersion": 1, "id": "canary", "name": "Canary", "status": "ACTIVE",
-        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
-        "timeoutMinutes": 30, "runtime": "coven-code", "familiarId": "charm", "cwd": "work/proj",
+        "schemaVersion": 1,
+        "id": "canary",
+        "name": "Canary",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "familiarId": "charm",
+        "cwd": "work/proj",
         "prompt": "Run the canary."
       }
     ],
@@ -25,13 +46,28 @@
         "familiarId": "charm",
         "familiarRevision": 1,
         "runtime": "coven-code",
-        "requiredCapabilities": ["session.create"]
+        "requiredCapabilities": [
+          "session.create"
+        ]
       }
     ],
-    "operations": [{ "op": "tick", "at": "2026-03-01T10:00:00.000Z" }]
+    "operations": [
+      {
+        "op": "tick",
+        "at": "2026-03-01T10:00:00.000Z"
+      }
+    ]
   },
   "expected": {
-    "occurrences": [{ "automationId": "canary", "state": "succeeded" }],
-    "receipts": { "count": 1, "allVerify": true }
+    "occurrences": [
+      {
+        "automationId": "canary",
+        "state": "succeeded"
+      }
+    ],
+    "receipts": {
+      "count": 1,
+      "allVerify": true
+    }
   }
 }

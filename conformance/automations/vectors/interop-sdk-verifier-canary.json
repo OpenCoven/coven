@@ -5,21 +5,50 @@
   "category": "definitions",
   "title": "Cross-repo canary: SDK generated types and verifier accept every valid vector and reject every invalid one against pinned producer artifacts",
   "deterministic": true,
-  "prerequisites": ["opencoven.sdk.coven-automations.v1@pinned"],
-  "artifacts": ["coven.automations.definition.v1", "opencoven.sdk.coven-automations.v1@pinned"],
-  "specRefs": ["coven#858"],
-  "virtualTime": { "start": "2026-03-01T00:00:00.000Z" },
+  "prerequisites": [
+    "opencoven.sdk.coven-automations.v1@pinned"
+  ],
+  "execution": "target-dependent",
+  "artifacts": [
+    "coven.automations.definition.v1",
+    "opencoven.sdk.coven-automations.v1@pinned"
+  ],
+  "specRefs": [
+    "coven#858"
+  ],
+  "virtualTime": {
+    "start": "2026-03-01T00:00:00.000Z"
+  },
   "input": {
     "definitions": [
       {
-        "schemaVersion": 1, "id": "canary", "name": "Canary", "status": "ACTIVE",
-        "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "utc", "misfire": "latest", "overlap": "forbid",
-        "timeoutMinutes": 30, "runtime": "coven-code", "cwd": "work/proj", "prompt": "Run the canary."
+        "schemaVersion": 1,
+        "id": "canary",
+        "name": "Canary",
+        "status": "ACTIVE",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "cwd": "work/proj",
+        "prompt": "Run the canary."
       }
     ],
-    "operations": [{ "op": "tick", "at": "2026-03-01T10:00:00.000Z" }]
+    "operations": [
+      {
+        "op": "tick",
+        "at": "2026-03-01T10:00:00.000Z"
+      }
+    ]
   },
   "expected": {
-    "occurrences": [{ "automationId": "canary", "state": "succeeded" }]
+    "occurrences": [
+      {
+        "automationId": "canary",
+        "state": "succeeded"
+      }
+    ]
   }
 }

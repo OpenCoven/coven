@@ -93,8 +93,12 @@ export async function loadVectors(planeRoot = PLANE_ROOT) {
 }
 
 // Runs one vector on a target. The reference oracle executes everything;
-// daemon and packaged targets must advertise the conformance capability and
-// are otherwise recorded as skipped.
+// daemon and packaged targets must advertise the conformance capability.
+// A vector whose prerequisites the target does not meet is not-applicable —
+// distinct from passed and from failed: it never counts toward a profile
+// result and, for vectors marked `execution: "required"`, forces the
+// profile into `incomplete`. A target that advertises the capability but
+// cannot evaluate a selected vector is a hard failure, never a skip.
 export async function runOnTarget(vector, target) {
   const capabilities = target.capabilities ?? [];
   const unmet = (vector.prerequisites ?? []).filter(
@@ -102,7 +106,7 @@ export async function runOnTarget(vector, target) {
   );
   if (unmet.length > 0) {
     return {
-      status: 'skipped',
+      status: 'not-applicable',
       failures: [],
       reason: `prerequisites not met on this target: ${unmet.join(', ')}`
     };
@@ -113,11 +117,30 @@ export async function runOnTarget(vector, target) {
   }
   const capability = await target.probe?.();
   if (!capability) {
-    return { status: 'skipped', failures: [], reason: 'target does not advertise coven.automations.conformance.v1' };
+    return {
+      status: 'not-applicable',
+      failures: [],
+      reason: 'target does not advertise coven.automations.conformance.v1'
+    };
   }
   const result = await target.evaluate?.(vector);
   if (!result) {
-    return { status: 'skipped', failures: [], reason: 'target adapter has no evaluator for this vector' };
+    return {
+      status: 'failed',
+      failures: [
+        {
+          vectorId: vector.vectorId,
+          profile: vector.profile,
+          invariant: 'target-evaluator',
+          objectIds: [],
+          eventCursor: null,
+          expected: 'the target evaluates every selected vector it advertises',
+          observed: 'target advertised coven.automations.conformance.v1 but has no evaluator for this vector',
+          reproduction: `node conformance/automations/runner/conformance.mjs --profile ${vector.profile} --vector ${vector.vectorId} --target ${target.kind}`
+        }
+      ],
+      reason: 'target advertised the capability but has no evaluator for this vector'
+    };
   }
   return result;
 }
@@ -139,10 +162,25 @@ export function redactReportValue(value, prompts) {
   return redactPublishedText(value, prompts);
 }
 
-function profileResult(entries) {
+// Profile result with fail-closed statuses:
+//   passed          every selected vector executed, none failed
+//   failed          at least one failure
+//   incomplete      executed but a REQUIRED vector did not (unmet
+//                   prerequisites on this target) — never certifiable
+//   not-applicable  nothing executed (nothing selected, or only
+//                   target-dependent vectors whose prerequisites are absent)
+export function profileResult(entries) {
   const passed = entries.filter((entry) => entry.status === 'passed').length;
   const failed = entries.filter((entry) => entry.status === 'failed').length;
-  const skipped = entries.filter((entry) => entry.status === 'skipped').length;
+  const notApplicableEntries = entries.filter((entry) => entry.status === 'not-applicable');
+  const requiredGaps = notApplicableEntries.filter(
+    (entry) => entry.vector.execution !== 'target-dependent'
+  ).length;
+  let status;
+  if (failed > 0) status = 'failed';
+  else if (passed === 0) status = 'not-applicable';
+  else if (requiredGaps > 0) status = 'incomplete';
+  else status = 'passed';
   const artifacts = [
     ...new Set(
       entries
@@ -151,10 +189,10 @@ function profileResult(entries) {
     )
   ].sort();
   return {
-    status: failed > 0 ? 'failed' : 'passed',
+    status,
     passed,
     failed,
-    skipped,
+    notApplicable: notApplicableEntries.length,
     artifacts,
     vectorIds: entries.map((entry) => entry.vector.vectorId)
   };
@@ -261,18 +299,22 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
     }
   }
 
-  const profileEntries = (profile) =>
-    results.filter(
-      (entry) => entry.vector.profile === profile || (profile === 'full' && true)
-    );
+  // A single-vector or single-profile run asserts exactly what it names;
+  // only a full-plane run (all/full) certifies the full profile.
+  const scopedRun = options.vector || (options.profile !== 'all' && options.profile !== 'full');
+
   const profiles = {};
   for (const profile of PROFILES) {
+    // The full profile is the immutable v1 compatibility set: it only means
+    // something on a full-plane run. A scoped run reports it not-applicable
+    // instead of silently counting its subset as `full` passed.
     const entries =
       profile === 'full'
-        ? results
+        ? scopedRun
+          ? []
+          : results
         : results.filter((entry) => entry.vector.profile === profile);
-    const result = profileResult(entries);
-    profiles[profile] = result;
+    profiles[profile] = profileResult(entries);
   }
 
   // Collect every definition prompt — valid and invalid fixtures alike — so
@@ -308,27 +350,46 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
     sloResult.status = gate.status;
   }
 
-  const executedProfiles = REQUIRED_PROFILES.filter((profile) => profiles[profile].passed + profiles[profile].failed > 0);
   // A single-vector or single-profile run asserts exactly what it names;
   // only a full-plane run (all/full) must cover every required profile.
-  const scopedRun = options.vector || (options.profile !== 'all' && options.profile !== 'full');
+  // Fail-closed certification gate (finding 2 of the review):
+  //   - a single-vector or single-profile run asserts exactly what it names,
+  //     so every selected vector must have executed: any not-applicable
+  //     outcome fails the gate;
+  //   - only a full-plane run (all/full) certifies the full profile, and it
+  //     requires every required profile to be `passed` — not incomplete, not
+  //     not-applicable — plus zero failures. Target-dependent canaries that
+  //     this target cannot run are reported separately and never upgrade a
+  //     profile to passed-by-skip.
+  const profilesFullStatus = scopedRun
+    ? profileResult([]).status
+    : profiles.full.status;
   const missingProfiles = scopedRun
     ? []
-    : REQUIRED_PROFILES.filter((profile) => profiles[profile].passed + profiles[profile].failed === 0);
+    : REQUIRED_PROFILES.filter((profile) => profiles[profile].status !== 'passed');
+  const selectedNotApplicable = results.filter((entry) => entry.status === 'not-applicable');
   const gateStatus =
-    failures.length === 0 && missingProfiles.length === 0 && (sloResult.status !== 'failed')
+    failures.length === 0 &&
+    missingProfiles.length === 0 &&
+    (!scopedRun || selectedNotApplicable.length === 0) &&
+    (sloResult.status === 'not-run' || sloResult.status === 'passed')
       ? 'passed'
       : 'failed';
 
   const gateNotes =
     missingProfiles.length > 0
-      ? `profiles without executable vectors on this target: ${missingProfiles.join(', ')}`
-      : fuzz
-        ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
-        : null;
+      ? `profiles not fully certified on this target: ${missingProfiles.join(', ')}`
+      : scopedRun && selectedNotApplicable.length > 0
+        ? `selected vectors that did not execute: ${selectedNotApplicable.map((entry) => entry.vector.vectorId).join(', ')}`
+        : fuzz
+          ? `randomized property testing: ${fuzz.steps} steps, seed ${options.seed}`
+          : sloResult.status === 'not-run'
+            ? 'SLO evidence not provided: vector conformance only, no SLO certification'
+            : null;
   const gate = {
     status: gateStatus,
-    requiredProfiles: REQUIRED_PROFILES
+    requiredProfiles: REQUIRED_PROFILES,
+    fullProfileStatus: profilesFullStatus
   };
   if (gateNotes !== null) gate.notes = gateNotes;
 
@@ -353,9 +414,11 @@ export async function runConformance(options, planeRoot = PLANE_ROOT) {
     artifactDigests,
     profiles,
     failures,
-    skipped: results
-      .filter((entry) => entry.status === 'skipped')
-      .map((entry) => ({ vectorId: entry.vector.vectorId, reason: entry.reason ?? 'skipped' })),
+    notApplicable: selectedNotApplicable.map((entry) => ({
+      vectorId: entry.vector.vectorId,
+      required: entry.vector.execution !== 'target-dependent',
+      reason: entry.reason ?? 'not applicable on this target'
+    })),
     slo: sloResult,
     redaction: {
       applied: true,
@@ -432,7 +495,7 @@ export async function main(argv = process.argv.slice(2)) {
       profiles: Object.fromEntries(
         Object.entries(report.profiles).map(([name, result]) => [
           name,
-          `${result.passed} passed / ${result.failed} failed / ${result.skipped} skipped`
+          `${result.passed} passed / ${result.failed} failed / ${result.notApplicable} not-applicable (${result.status})`
         ])
       ),
       failures: report.failures.length,
