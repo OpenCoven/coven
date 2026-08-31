@@ -323,7 +323,7 @@ The migration is additive and staged:
 - `#785` — versioned pairing offer, transcript hardening, portable test vectors, and E2EE rendezvous handshake.
 - `#786` — generalized grants, assurance policy, exact-action authorization, device management, and registry migration.
 - `#787` — relay-first reconnect, local discovery fast path, session resumption, and push-as-wakeup semantics.
-- `#788` — trusted-device introduction, passkey/recovery contracts, threshold policy, and optional attestation.
+- `#788` — trusted-device introduction, passkey/recovery contracts, threshold policy, and optional attestation; planned in [`mobile-recovery-and-introduction-plan.md`](mobile-recovery-and-introduction-plan.md).
 
 ## Merge gates for implementation PRs
 
