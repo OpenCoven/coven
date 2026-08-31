@@ -621,6 +621,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             archived_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            terminal_at TEXT,
             conversation_id TEXT,
             labels TEXT,
             visibility TEXT NOT NULL DEFAULT 'private',
@@ -959,6 +960,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize ward_manifest schema")?;
     ensure_exit_code_column(conn)?;
     ensure_archived_at_column(conn)?;
+    ensure_terminal_at_column(conn)?;
     ensure_conversation_id_column(conn)?;
     ensure_event_privacy_columns(conn)?;
     ensure_sensitive_artifacts_table(conn)?;
@@ -1251,6 +1253,34 @@ fn ensure_archived_at_column(conn: &Connection) -> Result<()> {
             .context("failed to add sessions.archived_at column")?;
     }
 
+    Ok(())
+}
+
+fn ensure_terminal_at_column(conn: &Connection) -> Result<()> {
+    ensure_column(
+        conn,
+        "sessions",
+        "terminal_at",
+        "ALTER TABLE sessions ADD COLUMN terminal_at TEXT",
+    )?;
+    conn.execute(
+        "UPDATE sessions
+         SET terminal_at = (
+             SELECT MIN(events.created_at)
+             FROM events
+             WHERE events.session_id = sessions.id
+               AND events.kind = 'exit'
+         )
+         WHERE terminal_at IS NULL
+           AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle', 'orphaned')
+           AND EXISTS (
+               SELECT 1 FROM events
+               WHERE events.session_id = sessions.id
+                 AND events.kind = 'exit'
+           )",
+        [],
+    )
+    .context("failed to backfill immutable session terminal timestamps")?;
     Ok(())
 }
 
@@ -2459,12 +2489,13 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
         .map(serde_json::to_string)
         .transpose()
         .context("failed to serialize session execution binding")?;
+    let terminal_at = terminal_status_timestamp(&record.status, &record.updated_at);
     conn.execute(
         "INSERT INTO sessions (
             id, project_root, harness, title, status, exit_code, archived_at,
-            created_at, updated_at, conversation_id, labels, visibility, familiar_id,
-            external, transcript_path, execution_binding_json
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            created_at, updated_at, terminal_at, conversation_id, labels, visibility,
+            familiar_id, external, transcript_path, execution_binding_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         params![
             &record.id,
             &record.project_root,
@@ -2475,6 +2506,7 @@ pub fn insert_session(conn: &Connection, record: &SessionRecord) -> Result<()> {
             &record.archived_at,
             &record.created_at,
             &record.updated_at,
+            terminal_at,
             &record.conversation_id,
             labels_json,
             &record.visibility,
@@ -2501,13 +2533,14 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
         .map(serde_json::to_string)
         .transpose()
         .context("failed to serialize session execution binding")?;
+    let terminal_at = terminal_status_timestamp(&record.status, &record.updated_at);
     let affected = conn
         .execute(
             "INSERT OR IGNORE INTO sessions (
                 id, project_root, harness, title, status, exit_code, archived_at,
-                created_at, updated_at, conversation_id, labels, visibility, familiar_id,
-                external, transcript_path, execution_binding_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                created_at, updated_at, terminal_at, conversation_id, labels, visibility,
+                familiar_id, external, transcript_path, execution_binding_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 &record.id,
                 &record.project_root,
@@ -2518,6 +2551,7 @@ pub fn insert_session_if_absent(conn: &Connection, record: &SessionRecord) -> Re
                 &record.archived_at,
                 &record.created_at,
                 &record.updated_at,
+                terminal_at,
                 &record.conversation_id,
                 labels_json,
                 &record.visibility,
@@ -2538,13 +2572,21 @@ pub fn update_session_status(
     exit_code: Option<i32>,
     updated_at: &str,
 ) -> Result<()> {
+    let terminal = is_terminal_session_status(status);
     conn.execute(
         "UPDATE sessions
          SET status = ?2,
              exit_code = ?3,
-             updated_at = ?4
+             updated_at = ?4,
+             terminal_at = CASE
+                 WHEN terminal_at IS NULL
+                  AND status IN ('active', 'created', 'running')
+                  AND ?5
+                 THEN ?4
+                 ELSE terminal_at
+             END
          WHERE id = ?1",
-        params![session_id, status, exit_code, updated_at],
+        params![session_id, status, exit_code, updated_at, terminal],
     )
     .with_context(|| format!("failed to update session {session_id}"))?;
 
@@ -2559,14 +2601,29 @@ pub fn update_session_status_if_current(
     exit_code: Option<i32>,
     updated_at: &str,
 ) -> Result<bool> {
+    let terminal = is_terminal_session_status(status);
     let affected = conn
         .execute(
             "UPDATE sessions
              SET status = ?3,
                  exit_code = ?4,
-                 updated_at = ?5
+                 updated_at = ?5,
+                 terminal_at = CASE
+                     WHEN terminal_at IS NULL
+                      AND status IN ('active', 'created', 'running')
+                      AND ?6
+                     THEN ?5
+                     ELSE terminal_at
+                 END
              WHERE id = ?1 AND status = ?2",
-            params![session_id, current_status, status, exit_code, updated_at],
+            params![
+                session_id,
+                current_status,
+                status,
+                exit_code,
+                updated_at,
+                terminal
+            ],
         )
         .with_context(|| format!("failed to update session {session_id}"))?;
 
@@ -2580,16 +2637,16 @@ pub fn update_session_terminal_if_active(
     exit_code: Option<i32>,
     updated_at: &str,
 ) -> Result<bool> {
-    if !matches!(
-        status,
-        "completed" | "failed" | "cancelled" | "killed" | "idle" | "orphaned"
-    ) {
+    if !is_terminal_session_status(status) {
         bail!("invalid terminal session status `{status}`");
     }
     let affected = conn
         .execute(
             "UPDATE sessions
-             SET status = ?2, exit_code = ?3, updated_at = ?4
+             SET status = ?2,
+                 exit_code = ?3,
+                 updated_at = ?4,
+                 terminal_at = COALESCE(terminal_at, ?4)
              WHERE id = ?1 AND status IN ('created', 'running')",
             params![session_id, status, exit_code, updated_at],
         )
@@ -2626,7 +2683,8 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
         .execute(
             "UPDATE sessions
              SET status = 'orphaned',
-                 updated_at = ?1
+                 updated_at = ?1,
+                 terminal_at = COALESCE(terminal_at, ?1)
              WHERE status = 'running'
                AND external = 0",
             params![updated_at],
@@ -2653,7 +2711,8 @@ pub fn mark_stale_created_sessions_failed(
         .execute(
             "UPDATE sessions
              SET status = 'failed',
-                 updated_at = ?2
+                 updated_at = ?2,
+                 terminal_at = COALESCE(terminal_at, ?2)
              WHERE status = 'created' AND created_at < ?1
                AND NOT EXISTS (
                  SELECT 1 FROM request_adoptions
@@ -2664,6 +2723,17 @@ pub fn mark_stale_created_sessions_failed(
         )
         .context("failed to mark stale created sessions failed")?;
     Ok(updated)
+}
+
+fn is_terminal_session_status(status: &str) -> bool {
+    matches!(
+        status,
+        "completed" | "failed" | "cancelled" | "killed" | "idle" | "orphaned"
+    )
+}
+
+fn terminal_status_timestamp<'a>(status: &str, updated_at: &'a str) -> Option<&'a str> {
+    is_terminal_session_status(status).then_some(updated_at)
 }
 
 pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<SessionRecord>> {
@@ -2680,6 +2750,17 @@ pub fn get_session(conn: &Connection, session_id: &str) -> Result<Option<Session
         .query_row(params![session_id], session_record_from_row)
         .optional()
         .with_context(|| format!("failed to read session {session_id}"))
+}
+
+pub fn get_session_terminal_at(conn: &Connection, session_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT terminal_at FROM sessions WHERE id = ?1",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .with_context(|| format!("failed to read terminal timestamp for session {session_id}"))
+    .map(Option::flatten)
 }
 
 /// Resolve the most recently updated ledger row for a harness-native
@@ -6235,6 +6316,101 @@ END;
         assert_eq!(sessions[0].status, "completed");
         assert_eq!(sessions[0].exit_code, Some(0));
         assert_eq!(sessions[0].updated_at, "2026-04-27T06:01:00Z");
+        assert_eq!(
+            get_session_terminal_at(&conn, "session-1")?.as_deref(),
+            Some("2026-04-27T06:01:00Z")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_store_adds_terminal_timestamp_column_compatibly() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("legacy-terminal.sqlite");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );",
+            )?;
+        }
+
+        let conn = open_store(&path)?;
+        let mut session = session_record("legacy-terminal", "2026-04-27T06:00:00Z");
+        session.status = "running".to_string();
+        insert_session(&conn, &session)?;
+        update_session_terminal_if_active(
+            &conn,
+            "legacy-terminal",
+            "completed",
+            Some(0),
+            "2026-04-27T06:05:00Z",
+        )?;
+
+        assert_eq!(
+            get_session_terminal_at(&conn, "legacy-terminal")?.as_deref(),
+            Some("2026-04-27T06:05:00Z")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_terminal_timestamp_backfills_from_exit_event_not_updated_at() -> Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let path = temp_dir.path().join("legacy-terminal-exit.sqlite");
+        {
+            let conn = Connection::open(&path)?;
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    project_root TEXT NOT NULL,
+                    harness TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    exit_code INTEGER,
+                    archived_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE events (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    session_id TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    redaction_status TEXT NOT NULL DEFAULT 'redacted',
+                    sensitive INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO sessions (
+                    id, project_root, harness, title, status, exit_code,
+                    archived_at, created_at, updated_at
+                 ) VALUES (
+                    'legacy-exit', '/repo', 'codex', 'legacy', 'completed', 0,
+                    '2026-04-27T07:00:00Z', '2026-04-27T07:00:00Z',
+                    '2026-04-27T07:00:00Z'
+                 );
+                 INSERT INTO events (
+                    id, session_id, kind, payload_json, created_at
+                 ) VALUES (
+                    'legacy-exit-event', 'legacy-exit', 'exit', '{}',
+                    '2026-04-27T06:05:00Z'
+                 );",
+            )?;
+        }
+
+        let conn = open_store(&path)?;
+
+        assert_eq!(
+            get_session_terminal_at(&conn, "legacy-exit")?.as_deref(),
+            Some("2026-04-27T06:05:00Z")
+        );
         Ok(())
     }
 
@@ -11134,6 +11310,11 @@ END;
         assert_eq!(
             raw_before, raw_after,
             "normal status/archive updates must not touch the binding bytes"
+        );
+        assert_eq!(
+            get_session_terminal_at(&conn, "s1")?.as_deref(),
+            Some("2026-06-03T00:01:00Z"),
+            "archive and summon must not rewrite the terminal transition time"
         );
         let reread = get_session(&conn, "s1")?.expect("session still exists");
         assert_eq!(reread.execution_binding, Some(execution_binding_fixture()));

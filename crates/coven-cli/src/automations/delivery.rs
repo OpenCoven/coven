@@ -402,7 +402,14 @@ fn session_settlement(
     }
 
     let log = capture_bounded_log(conn, session_id);
-    let completed_at = chrono::DateTime::parse_from_rfc3339(&session.updated_at)
+    let terminal_at = crate::store::get_session_terminal_at(conn, session_id)
+        .map_err(|error| {
+            format!("failed to read session {session_id} terminal timestamp: {error:#}")
+        })?
+        .ok_or_else(|| {
+            format!("terminal session {session_id} has no immutable terminal timestamp")
+        })?;
+    let completed_at = chrono::DateTime::parse_from_rfc3339(&terminal_at)
         .map(|instant| instant.with_timezone(&Utc))
         .map_err(|error| format!("session {session_id} has invalid completion time: {error}"))?;
     if completed_at > deadline {
@@ -1563,15 +1570,56 @@ mod tests {
     }
 
     #[test]
+    fn archival_after_deadline_does_not_rewrite_pre_deadline_completion_time() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "running", None);
+        crate::store::update_session_status(
+            &conn,
+            "session-1",
+            "completed",
+            Some(0),
+            "2026-08-28T09:05:00.000Z",
+        )
+        .unwrap();
+        crate::store::archive_session(&conn, "session-1", "2026-08-28T10:30:00.000Z").unwrap();
+        crate::store::summon_session(&conn, "session-1", "2026-08-28T10:40:00.000Z").unwrap();
+
+        let report = settle_finished_runs(
+            &conn,
+            chrono::DateTime::parse_from_rfc3339("2026-08-28T11:00:00.000Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        )
+        .unwrap();
+
+        assert_eq!(report.settled_succeeded, 1);
+        let states: (String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(states, ("succeeded".to_string(), "succeeded".to_string()));
+    }
+
+    #[test]
     fn completion_after_deadline_fails_occurrence_and_run_consistently() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", None)).unwrap();
         live_run(&conn, "daily", "session-1");
-        session_record(&conn, "session-1", "completed", Some(0));
-        conn.execute(
-            "UPDATE sessions SET updated_at = '2026-08-28T10:05:00.000Z'
-             WHERE id = 'session-1'",
-            [],
+        session_record(&conn, "session-1", "running", None);
+        crate::store::update_session_status(
+            &conn,
+            "session-1",
+            "completed",
+            Some(0),
+            "2026-08-28T10:05:00.000Z",
         )
         .unwrap();
 
