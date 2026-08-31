@@ -56,6 +56,14 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     exact validated recorded sibling. Commit then uses file+directory sync on
     Unix or write-through atomic replacement on Windows before recording
     `committed`.
+13. **Loss and concurrent recovery fail closed.** `output_truncated` and output
+    gap markers make delivery ambiguous instead of committing partial bytes;
+    events for running automation runs are retention-pinned until settlement.
+    Log projection reads newest-first and constructs valid bounded JSON without
+    raw truncation. Settlement is process-serialized, and stale spool cleanup
+    degrades only the affected ledger pair when an artifact is unsafe or
+    undeletable, preserving the artifact and allowing daemon startup to
+    continue.
 
 ## Contract profile and versioning
 

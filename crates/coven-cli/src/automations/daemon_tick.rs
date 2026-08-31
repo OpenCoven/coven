@@ -75,7 +75,17 @@ pub fn start_automations_scheduler(
     runtime: std::sync::Arc<dyn crate::api::SessionRuntime + Send + Sync>,
 ) -> Result<()> {
     let conn = crate::store::open_store(&crate::api::store_path(coven_home))?;
-    super::delivery::reconcile_orphaned_delivery_spools(&conn).map_err(anyhow::Error::msg)?;
+    match super::delivery::reconcile_orphaned_delivery_spools(&conn) {
+        Ok(report) => {
+            for diagnostic in report.degraded {
+                crate::daemon::append_daemon_recovery_log(coven_home, &diagnostic);
+            }
+        }
+        Err(error) => crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("delivery spool recovery unavailable: {error}"),
+        ),
+    }
     drop(conn);
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()

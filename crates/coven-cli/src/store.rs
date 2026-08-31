@@ -51,6 +51,11 @@ const EVENT_NOT_PINNED_BY_UNRESOLVED_HANDOFF_SQL: &str = "NOT EXISTS (
   WHERE handoff.session_id = event.session_id
     AND handoff.state IN ('offered', 'claimed')
     AND event.rowid <= handoff.event_cursor
+)
+AND NOT EXISTS (
+  SELECT 1 FROM automation_runs AS automation_run
+  WHERE automation_run.session_id = event.session_id
+    AND automation_run.status = 'running'
 )";
 pub const DEFAULT_SESSION_PAGE_LIMIT: usize = 100;
 pub const MAX_SESSION_PAGE_LIMIT: usize = 1_000;
@@ -8267,6 +8272,52 @@ END;
             )?,
             acknowledged
         );
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_automation_run_pins_events_beyond_default_retention() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("retention.sqlite"))?;
+        let mut session = session_record("automation-retention", "2026-01-01T00:00:00Z");
+        session.status = "running".to_string();
+        insert_session(&conn, &session)?;
+        insert_json_event(
+            &conn,
+            "automation-retention",
+            "output",
+            &serde_json::json!({"data":"31-day automation output"}),
+            "2026-01-01T00:01:00Z",
+        )?;
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('retention-occ', 'retention-automation',
+                     '2026-01-01T00:00:00Z', 'running', 1,
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+             VALUES ('retention-run', 'retention-automation', 'retention-occ',
+                     'automation-retention', 'coven-code', 'running',
+                     '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+
+        let cutoff = "2026-01-31T00:00:00Z";
+        assert_eq!(count_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than(&conn, cutoff)?, 0);
+        assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 10)?, 0);
+        assert_eq!(list_events(&conn, "automation-retention")?.len(), 1);
+
+        conn.execute(
+            "UPDATE automation_runs SET status = 'failed' WHERE id = 'retention-run'",
+            [],
+        )?;
+        assert_eq!(prune_events_older_than_bounded(&conn, cutoff, 10)?, 1);
+        assert!(list_events(&conn, "automation-retention")?.is_empty());
         Ok(())
     }
 

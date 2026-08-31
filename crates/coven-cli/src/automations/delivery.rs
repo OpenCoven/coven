@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
-    sync::LazyLock,
+    sync::{LazyLock, Mutex, MutexGuard},
 };
 
 use chrono::{DateTime, Utc};
@@ -49,18 +49,23 @@ fn is_terminal_session_status(status: &str) -> bool {
     SESSION_TERMINAL_STATUSES.contains(&status)
 }
 
-struct StreamEvent {
-    kind: String,
-    payload: Value,
-    created_at: String,
-}
-
-/// Reads the trailing normalized stream for one session, newest last.
-fn read_stream_tail(
-    conn: &Connection,
-    session_id: &str,
-    limit: usize,
-) -> Result<Vec<StreamEvent>, String> {
+/// Captures a bounded JSON log of the session's normalized stream: the newest
+/// entries that fit the ledger's per-run budget, prefixed by a truncation
+/// marker when older entries were dropped. `None` when the session recorded
+/// nothing.
+pub fn capture_bounded_log(conn: &Connection, session_id: &str) -> Option<String> {
+    let total: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .ok()?
+        .try_into()
+        .ok()?;
+    if total == 0 {
+        return None;
+    }
     let mut statement = conn
         .prepare(
             "SELECT kind, payload_json, created_at FROM events
@@ -68,80 +73,79 @@ fn read_stream_tail(
              ORDER BY rowid DESC
              LIMIT ?2",
         )
-        .map_err(|error| format!("failed to read session stream: {error}"))?;
+        .ok()?;
     let rows = statement
-        .query_map(params![session_id, limit as i64], |row| {
+        .query_map(params![session_id, BOUNDED_LOG_EVENT_LIMIT as i64], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
         })
-        .map_err(|error| format!("failed to read session stream: {error}"))?;
-    let mut events = Vec::new();
+        .ok()?;
+    let mut kept_newest_first = Vec::new();
     for row in rows {
-        let (kind, payload_json, created_at) =
-            row.map_err(|error| format!("failed to read session stream: {error}"))?;
-        let payload = serde_json::from_str(&payload_json).unwrap_or(Value::Null);
-        events.push(StreamEvent {
-            kind,
-            payload,
-            created_at,
-        });
-    }
-    events.reverse();
-    Ok(events)
-}
-
-/// Captures a bounded JSON log of the session's normalized stream: the newest
-/// entries that fit the ledger's per-run budget, prefixed by a truncation
-/// marker when older entries were dropped. `None` when the session recorded
-/// nothing.
-pub fn capture_bounded_log(conn: &Connection, session_id: &str) -> Option<String> {
-    let events = read_stream_tail(conn, session_id, BOUNDED_LOG_EVENT_LIMIT).ok()?;
-    if events.is_empty() {
-        return None;
-    }
-    let entries: Vec<Value> = events
-        .iter()
-        .map(|event| {
-            json!({
-                "kind": event.kind,
-                "createdAt": event.created_at,
-                "payload": event.payload,
-            })
-        })
-        .collect();
-
-    // Keep the tail within the character budget: walk newest-first and stop
-    // at the first entry that no longer fits.
-    let mut kept: Vec<&Value> = Vec::new();
-    let mut budget = LOG_ENTRY_MAX_CHARS;
-    for entry in entries.iter().rev() {
-        let entry_chars = entry.to_string().chars().count() + 1;
-        if entry_chars > budget {
+        let (kind, payload_json, created_at) = row.ok()?;
+        let payload = serde_json::from_str::<Value>(&payload_json).unwrap_or(Value::Null);
+        let serialized = serde_json::to_string(&json!({
+            "kind": kind,
+            "createdAt": created_at,
+            "payload": payload,
+        }))
+        .ok()?;
+        kept_newest_first.push(serialized);
+        let dropped = total.saturating_sub(kept_newest_first.len());
+        if bounded_log_json_len(&kept_newest_first, dropped) > LOG_ENTRY_MAX_CHARS {
+            kept_newest_first.pop();
             break;
         }
-        budget -= entry_chars;
-        kept.push(entry);
     }
-    kept.reverse();
-    let dropped = entries.len() - kept.len();
+    let dropped = total.saturating_sub(kept_newest_first.len());
+    let marker = (dropped > 0)
+        .then(|| {
+            serde_json::to_string(&json!({
+                "kind": "logTruncated",
+                "droppedEntries": dropped,
+            }))
+        })
+        .transpose()
+        .ok()?;
+    let element_count = kept_newest_first.len() + usize::from(marker.is_some());
+    let mut log = String::with_capacity(bounded_log_json_len(&kept_newest_first, dropped));
+    log.push('[');
+    let mut written = 0;
+    if let Some(marker) = marker {
+        log.push_str(&marker);
+        written += 1;
+    }
+    for entry in kept_newest_first.iter().rev() {
+        if written > 0 {
+            log.push(',');
+        }
+        log.push_str(entry);
+        written += 1;
+    }
+    debug_assert_eq!(written, element_count);
+    log.push(']');
+    (log.len() <= LOG_ENTRY_MAX_CHARS).then_some(log)
+}
 
-    let mut log_entries = Vec::with_capacity(kept.len() + 1);
-    if dropped > 0 {
-        log_entries.push(json!({
+fn bounded_log_json_len(kept_newest_first: &[String], dropped: usize) -> usize {
+    let marker_len = if dropped > 0 {
+        serde_json::to_string(&json!({
             "kind": "logTruncated",
             "droppedEntries": dropped,
-        }));
-    }
-    if kept.is_empty() && dropped == 0 {
-        return None;
-    }
-    for entry in &kept {
-        log_entries.push((*entry).clone());
-    }
-    serde_json::to_string(&log_entries).ok()
+        }))
+        .map(|marker| marker.len())
+        .unwrap_or(usize::MAX)
+    } else {
+        0
+    };
+    let elements = kept_newest_first.len() + usize::from(dropped > 0);
+    2_usize
+        .saturating_add(marker_len)
+        .saturating_add(kept_newest_first.iter().map(String::len).sum::<usize>())
+        .saturating_add(elements.saturating_sub(1))
 }
 
 /// Streams every ordered output chunk into a synced sibling spool while
@@ -194,25 +198,36 @@ fn stream_session_output_to_spool(
         })?;
     let mut statement = conn
         .prepare(
-            "SELECT payload_json FROM events
-             WHERE session_id = ?1 AND kind = 'output'
+            "SELECT kind, payload_json FROM events
+             WHERE session_id = ?1
              ORDER BY rowid ASC",
         )
         .map_err(|error| format!("failed to prepare output stream: {error}"))?;
     let rows = statement
-        .query_map(params![session_id], |row| row.get::<_, String>(0))
+        .query_map(params![session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
         .map_err(|error| format!("failed to read output stream: {error}"))?;
     let mut byte_len = 0_u64;
     let result = (|| -> Result<(), String> {
         for row in rows {
-            let payload_json =
+            let (kind, payload_json) =
                 row.map_err(|error| format!("failed to read output event: {error}"))?;
+            if is_output_loss_marker(&kind) {
+                return Err(format!(
+                    "output incomplete: session {session_id} contains loss marker `{kind}`"
+                ));
+            }
+            if kind != "output" {
+                continue;
+            }
             let payload: Value = serde_json::from_str(&payload_json)
                 .map_err(|error| format!("output event payload is invalid: {error}"))?;
             if let Some(data) = payload.get("data").and_then(Value::as_str) {
                 if data.is_empty() {
                     continue;
                 }
+
                 let bytes = data.as_bytes();
                 spool.write_all(bytes).map_err(|error| {
                     format!(
@@ -283,6 +298,13 @@ fn stream_session_output_to_spool(
     }))
 }
 
+fn is_output_loss_marker(kind: &str) -> bool {
+    matches!(
+        kind,
+        "output_truncated" | "gap" | "output_gap" | "event_gap" | "stream_gap"
+    ) || kind.ends_with("_gap")
+}
+
 struct SpoolLedgerTarget<'a> {
     run_id: &'a str,
     occurrence_id: &'a str,
@@ -291,10 +313,55 @@ struct SpoolLedgerTarget<'a> {
 
 static DELIVERY_PROCESS_ID: LazyLock<String> =
     LazyLock::new(|| format!("delivery-process-{}", uuid::Uuid::new_v4()));
+static SETTLEMENT_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+struct SettlementPhaseHook {
+    run_id: String,
+    phase: &'static str,
+    reached: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static SETTLEMENT_PHASE_HOOK: Mutex<Option<SettlementPhaseHook>> = Mutex::new(None);
 
 fn delivery_process_id() -> &'static str {
     DELIVERY_PROCESS_ID.as_str()
 }
+
+fn lock_settlement() -> Result<MutexGuard<'static, ()>, String> {
+    SETTLEMENT_LOCK
+        .lock()
+        .map_err(|_| "automation settlement lock is poisoned".to_string())
+}
+
+#[cfg(test)]
+fn install_settlement_phase_hook(hook: SettlementPhaseHook) {
+    *SETTLEMENT_PHASE_HOOK.lock().unwrap() = Some(hook);
+}
+
+#[cfg(test)]
+fn pause_settlement_phase_for_test(run_id: &str, phase: &'static str) {
+    let hook = {
+        let mut installed = SETTLEMENT_PHASE_HOOK.lock().unwrap();
+        if installed
+            .as_ref()
+            .is_some_and(|hook| hook.run_id == run_id && hook.phase == phase)
+        {
+            installed.take()
+        } else {
+            None
+        }
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(()).unwrap();
+        hook.release.recv().unwrap();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_settlement_phase_for_test(_run_id: &str, _phase: &'static str) {}
 
 fn prepare_tracked_delivery_spool(
     conn: &Connection,
@@ -303,6 +370,7 @@ fn prepare_tracked_delivery_spool(
 ) -> Result<Option<DeliveryPlan>, String> {
     let spool_path = new_delivery_spool_path(ledger.target)?;
     begin_spool_preparation(conn, &ledger, &spool_path)?;
+    pause_settlement_phase_for_test(ledger.run_id, "preparing");
     let prepared =
         stream_session_output_to_spool(conn, session_id, ledger.target, spool_path.clone());
     match prepared {
@@ -315,6 +383,7 @@ fn prepare_tracked_delivery_spool(
                 }
                 return Err(error);
             }
+            pause_settlement_phase_for_test(ledger.run_id, "spooled");
             Ok(Some(plan))
         }
         Ok(None) => {
@@ -472,6 +541,9 @@ fn clear_spool_ledger(
 }
 
 fn remove_recorded_spool(spool_path: &Path, target: &str) -> Result<(), String> {
+    if take_spool_remove_failure_for_test() {
+        return Err("synthetic delivery spool removal failure".to_string());
+    }
     let file_name = spool_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -522,10 +594,16 @@ struct OrphanedSpool {
     spool_state: String,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct SpoolRecoveryReport {
+    pub removed: usize,
+    pub degraded: Vec<String>,
+}
+
 fn reconcile_orphaned_delivery_spools_for_owner(
     conn: &Connection,
     current_owner: &str,
-) -> Result<usize, String> {
+) -> Result<SpoolRecoveryReport, String> {
     let rows = {
         let mut statement = conn
             .prepare(
@@ -534,8 +612,8 @@ fn reconcile_orphaned_delivery_spools_for_owner(
                             o.delivery_spool_path, o.delivery_spool_state, o.delivery_spool_owner
                      FROM automation_runs AS r
                      JOIN automation_occurrences AS o ON o.id = r.occurrence_id
-                     WHERE r.delivery_spool_state != 'none'
-                        OR o.delivery_spool_state != 'none'
+                     WHERE r.delivery_spool_state IN ('preparing', 'spooled')
+                        OR o.delivery_spool_state IN ('preparing', 'spooled')
                      ORDER BY r.id",
             )
             .map_err(|error| format!("failed to prepare orphan spool reconciliation: {error}"))?;
@@ -558,7 +636,7 @@ fn reconcile_orphaned_delivery_spools_for_owner(
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|error| format!("failed to decode orphan spool reconciliation: {error}"))?
     };
-    let mut removed = 0;
+    let mut report = SpoolRecoveryReport::default();
     for (
         run_id,
         occurrence_id,
@@ -573,51 +651,132 @@ fn reconcile_orphaned_delivery_spools_for_owner(
     {
         let owner = run_owner
             .filter(|owner| !owner.is_empty())
-            .ok_or_else(|| format!("run {run_id} spool has no owner"))?;
+            .unwrap_or_default();
         if owner == current_owner {
             continue;
         }
-        if occurrence_owner.as_deref() != Some(owner.as_str())
-            || occurrence_path != run_path
-            || occurrence_state != run_state
-        {
-            return Err(format!(
-                "run {run_id} and occurrence {occurrence_id} have inconsistent spool evidence"
-            ));
+        let recovery = (|| -> Result<(), String> {
+            if owner.is_empty()
+                || occurrence_owner.as_deref() != Some(owner.as_str())
+                || occurrence_path != run_path
+                || occurrence_state != run_state
+            {
+                return Err(format!(
+                    "run {run_id} and occurrence {occurrence_id} have inconsistent spool evidence"
+                ));
+            }
+            let target =
+                target.ok_or_else(|| format!("run {run_id} spool has no output target"))?;
+            let spool_path = run_path
+                .ok_or_else(|| format!("run {run_id} spool state `{run_state}` has no path"))?;
+            let spool = OrphanedSpool {
+                run_id: run_id.clone(),
+                occurrence_id: occurrence_id.clone(),
+                target,
+                spool_path,
+                spool_state: run_state,
+            };
+            if !matches!(spool.spool_state.as_str(), "preparing" | "spooled") {
+                return Err(format!(
+                    "run {} has invalid spool state `{}`",
+                    spool.run_id, spool.spool_state
+                ));
+            }
+            let spool_path = PathBuf::from(&spool.spool_path);
+            remove_recorded_spool(&spool_path, &spool.target)?;
+            clear_spool_ledger(
+                conn,
+                &SpoolLedgerTarget {
+                    run_id: &spool.run_id,
+                    occurrence_id: &spool.occurrence_id,
+                    target: &spool.target,
+                },
+                &spool_path,
+            )?;
+            Ok(())
+        })();
+        match recovery {
+            Ok(()) => report.removed += 1,
+            Err(error) => {
+                let diagnostic = format!("delivery spool recovery degraded: {error}");
+                mark_spool_recovery_degraded(conn, &run_id, &occurrence_id, &diagnostic)?;
+                report.degraded.push(diagnostic);
+            }
         }
-        let target = target.ok_or_else(|| format!("run {run_id} spool has no output target"))?;
-        let spool_path = run_path
-            .ok_or_else(|| format!("run {run_id} spool state `{run_state}` has no path"))?;
-        let spool = OrphanedSpool {
-            run_id,
-            occurrence_id,
-            target,
-            spool_path,
-            spool_state: run_state,
-        };
-        if !matches!(spool.spool_state.as_str(), "preparing" | "spooled") {
-            return Err(format!(
-                "run {} has invalid spool state `{}`",
-                spool.run_id, spool.spool_state
-            ));
-        }
-        let spool_path = PathBuf::from(&spool.spool_path);
-        remove_recorded_spool(&spool_path, &spool.target)?;
-        clear_spool_ledger(
-            conn,
-            &SpoolLedgerTarget {
-                run_id: &spool.run_id,
-                occurrence_id: &spool.occurrence_id,
-                target: &spool.target,
-            },
-            &spool_path,
-        )?;
-        removed += 1;
     }
-    Ok(removed)
+    Ok(report)
 }
 
-pub(crate) fn reconcile_orphaned_delivery_spools(conn: &Connection) -> Result<usize, String> {
+fn mark_spool_recovery_degraded(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+    diagnostic: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin degraded spool recovery: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+             SET status = CASE WHEN status = 'running' THEN 'failed' ELSE status END,
+                 delivery_state = CASE
+                     WHEN delivery_state = 'committed' THEN 'committed'
+                     ELSE 'ambiguous'
+                 END,
+                 delivery_error = CASE
+                     WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?2
+                     ELSE delivery_error || '; ' || ?2
+                 END,
+                 delivery_spool_state = 'degraded',
+                 finished_at = CASE
+                     WHEN status = 'running' THEN COALESCE(finished_at, ?3)
+                     ELSE finished_at
+                 END
+             WHERE id = ?1",
+            params![run_id, diagnostic, now],
+        )
+        .map_err(|error| format!("failed to degrade run spool recovery: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = CASE
+                     WHEN state IN ('claimed', 'running') THEN 'failed'
+                     ELSE state
+                 END,
+                 failure_reason = CASE
+                     WHEN failure_reason IS NULL OR trim(failure_reason) = '' THEN ?2
+                     ELSE failure_reason || '; ' || ?2
+                 END,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 delivery_state = CASE
+                     WHEN delivery_state = 'committed' THEN 'committed'
+                     ELSE 'ambiguous'
+                 END,
+                 delivery_error = CASE
+                     WHEN delivery_error IS NULL OR trim(delivery_error) = '' THEN ?2
+                     ELSE delivery_error || '; ' || ?2
+                 END,
+                 delivery_spool_state = 'degraded',
+                 updated_at = ?3
+             WHERE id = ?1",
+            params![occurrence_id, diagnostic, now],
+        )
+        .map_err(|error| format!("failed to degrade occurrence spool recovery: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("degraded spool recovery CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit degraded spool recovery: {error}"))
+}
+
+pub(crate) fn reconcile_orphaned_delivery_spools(
+    conn: &Connection,
+) -> Result<SpoolRecoveryReport, String> {
+    let _guard = lock_settlement()?;
     reconcile_orphaned_delivery_spools_for_owner(conn, delivery_process_id())
 }
 
@@ -817,6 +976,7 @@ fn sync_parent_directory(_target: &Path) -> Result<(), String> {
 #[cfg(test)]
 thread_local! {
     static FAIL_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_SPOOL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -834,6 +994,21 @@ fn take_parent_sync_failure_for_test() -> bool {
     false
 }
 
+#[cfg(test)]
+fn set_spool_remove_failure_for_test(enabled: bool) {
+    FAIL_SPOOL_REMOVE.set(enabled);
+}
+
+#[cfg(test)]
+fn take_spool_remove_failure_for_test() -> bool {
+    FAIL_SPOOL_REMOVE.replace(false)
+}
+
+#[cfg(not(test))]
+fn take_spool_remove_failure_for_test() -> bool {
+    false
+}
+
 struct Settlement {
     status: &'static str,
     exit_code: Option<i64>,
@@ -842,6 +1017,7 @@ struct Settlement {
     reason: Option<String>,
     delivery: Option<DeliveryPlan>,
     delivery_failure: bool,
+    delivery_failure_ambiguous: bool,
     delivery_required: bool,
 }
 
@@ -988,6 +1164,7 @@ fn session_settlement(
             reason: Some(reason),
             delivery: None,
             delivery_failure: false,
+            delivery_failure_ambiguous: false,
             delivery_required: false,
         }));
     }
@@ -995,39 +1172,50 @@ fn session_settlement(
     // The run succeeded at the runtime. Delivery is Coven's job: commit the
     // final assistant payload to the configured target, and a failed commit
     // fails the run visibly (never reported as success).
-    let (status, reason, output_commit, delivery, delivery_failure, delivery_required) =
-        match output_target {
-            None => ("succeeded", None, None, None, false, false),
-            Some(_target) if delivery_state == "pending" => {
-                ("succeeded", None, None, None, false, true)
-            }
-            Some(target) => {
-                let occurrence_id = occurrence_id
-                    .ok_or_else(|| format!("run {run_id} has no occurrence for delivery"))?;
-                match prepare_tracked_delivery_spool(
-                    conn,
-                    SpoolLedgerTarget {
-                        run_id,
-                        occurrence_id,
-                        target,
-                    },
-                    session_id,
-                ) {
-                    Err(error) => ("failed", Some(error), None, None, true, false),
-                    Ok(None) => (
-                        "failed",
-                        Some(format!(
+    let (
+        status,
+        reason,
+        output_commit,
+        delivery,
+        delivery_failure,
+        delivery_failure_ambiguous,
+        delivery_required,
+    ) = match output_target {
+        None => ("succeeded", None, None, None, false, false, false),
+        Some(_target) if delivery_state == "pending" => {
+            ("succeeded", None, None, None, false, false, true)
+        }
+        Some(target) => {
+            let occurrence_id = occurrence_id
+                .ok_or_else(|| format!("run {run_id} has no occurrence for delivery"))?;
+            match prepare_tracked_delivery_spool(
+                conn,
+                SpoolLedgerTarget {
+                    run_id,
+                    occurrence_id,
+                    target,
+                },
+                session_id,
+            ) {
+                Err(error) => {
+                    let ambiguous = error.starts_with("output incomplete:");
+                    ("failed", Some(error), None, None, true, ambiguous, false)
+                }
+                Ok(None) => (
+                    "failed",
+                    Some(format!(
                     "output commit failed: no assistant output captured for session {session_id}"
                 )),
-                        None,
-                        None,
-                        true,
-                        false,
-                    ),
-                    Ok(Some(plan)) => ("succeeded", None, None, Some(plan), false, true),
-                }
+                    None,
+                    None,
+                    true,
+                    false,
+                    false,
+                ),
+                Ok(Some(plan)) => ("succeeded", None, None, Some(plan), false, false, true),
             }
-        };
+        }
+    };
     Ok(SessionObservation::Terminal(Settlement {
         status,
         exit_code: session.exit_code.map(i64::from),
@@ -1036,6 +1224,7 @@ fn session_settlement(
         reason,
         delivery,
         delivery_failure,
+        delivery_failure_ambiguous,
         delivery_required,
     }))
 }
@@ -1051,6 +1240,7 @@ fn timeout_settlement(exit_code: Option<i64>, log: Option<String>, session_id: &
         )),
         delivery: None,
         delivery_failure: false,
+        delivery_failure_ambiguous: false,
         delivery_required: false,
     }
 }
@@ -1425,6 +1615,7 @@ fn settle_reserved_delivery(
             return Err(error);
         }
     };
+    pause_settlement_phase_for_test(target.run_id, "pending");
     let terminal = match commit_delivery_spool(&plan) {
         Ok(()) => DeliveryTerminalState::Committed,
         Err(failure) if failure.stage == DeliveryIoStage::BeforeRename => {
@@ -1494,18 +1685,23 @@ fn settle_delivery_preparation_failure(
         .reason
         .clone()
         .ok_or_else(|| "delivery preparation failed without a reason".to_string())?;
+    let delivery_state = if settlement.delivery_failure_ambiguous {
+        "ambiguous"
+    } else {
+        "failed"
+    };
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin delivery failure settlement: {error}"))?;
     let run_changed = transaction
         .execute(
             "UPDATE automation_runs
-             SET delivery_state = 'failed',
+             SET delivery_state = ?3,
                  delivery_error = ?2
              WHERE id = ?1
                AND status = 'running'
                AND delivery_state = 'none'",
-            params![target.run_id, reason],
+            params![target.run_id, reason, delivery_state],
         )
         .map_err(|error| format!("failed to record run delivery failure: {error}"))?;
     let occurrence_changed = transaction
@@ -1515,7 +1711,7 @@ fn settle_delivery_preparation_failure(
                  failure_reason = ?2,
                  lease_owner = NULL,
                  lease_expires_at = NULL,
-                 delivery_state = 'failed',
+                 delivery_state = ?4,
                  delivery_error = ?2,
                  updated_at = ?3
              WHERE id = ?1
@@ -1527,7 +1723,8 @@ fn settle_delivery_preparation_failure(
             params![
                 occurrence_id,
                 reason,
-                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                delivery_state
             ],
         )
         .map_err(|error| format!("failed to record occurrence delivery failure: {error}"))?;
@@ -1648,8 +1845,10 @@ pub fn settle_finished_runs_with_runtime(
     runtime: &dyn crate::api::SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<ReconcileReport, String> {
-    reconcile_orphaned_delivery_spools(conn)?;
+    let _guard = lock_settlement()?;
     let mut report = ReconcileReport::default();
+    let spool_recovery = reconcile_orphaned_delivery_spools_for_owner(conn, delivery_process_id())?;
+    report.failures.extend(spool_recovery.degraded);
 
     for row in running_ledger_rows(conn)? {
         let RunningLedgerRow {
@@ -1707,6 +1906,7 @@ pub fn settle_finished_runs_with_runtime(
                     ),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_failure_ambiguous: false,
                     delivery_required: false,
                 })
             }
@@ -1721,6 +1921,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some("occurrence settled without a run result".to_string()),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_failure_ambiguous: false,
                     delivery_required: false,
                 })
             }
@@ -1759,6 +1960,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some(reason),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_failure_ambiguous: false,
                     delivery_required: false,
                 });
             } else if occurrence_state.as_deref() == Some("succeeded") {
@@ -1773,6 +1975,7 @@ pub fn settle_finished_runs_with_runtime(
                     reason: Some("occurrence settled without a run result".to_string()),
                     delivery: None,
                     delivery_failure: false,
+                    delivery_failure_ambiguous: false,
                     delivery_required: false,
                 });
             }
@@ -2066,6 +2269,64 @@ mod tests {
     }
 
     #[test]
+    fn bounded_log_reports_events_dropped_before_the_query_window() {
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "session-window", "completed", Some(0));
+        for index in 0..205 {
+            event(&conn, "session-window", "output", &format!("event-{index}"));
+        }
+
+        let log = capture_bounded_log(&conn, "session-window").unwrap();
+        let parsed: Value = serde_json::from_str(&log).unwrap();
+
+        assert_eq!(parsed[0]["kind"], "logTruncated");
+        assert_eq!(parsed[0]["droppedEntries"], 5);
+        assert!(log.len() <= LOG_ENTRY_MAX_CHARS);
+    }
+
+    #[test]
+    fn bounded_log_huge_event_is_valid_json_with_exact_truncation_marker() {
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "session-huge", "completed", Some(0));
+        event(
+            &conn,
+            "session-huge",
+            "output",
+            &"x".repeat(2 * 1024 * 1024),
+        );
+
+        let log = capture_bounded_log(&conn, "session-huge").unwrap();
+        let parsed: Value = serde_json::from_str(&log).unwrap();
+
+        assert!(log.len() <= LOG_ENTRY_MAX_CHARS);
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(parsed[0]["kind"], "logTruncated");
+        assert_eq!(parsed[0]["droppedEntries"], 1);
+    }
+
+    #[test]
+    fn bounded_log_near_limit_remains_valid_json_without_raw_truncation() {
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "session-near-limit", "completed", Some(0));
+        event(
+            &conn,
+            "session-near-limit",
+            "output",
+            &"x".repeat(63 * 1024),
+        );
+
+        let log = capture_bounded_log(&conn, "session-near-limit").unwrap();
+        let parsed: Value = serde_json::from_str(&log).unwrap();
+
+        assert!(log.len() <= LOG_ENTRY_MAX_CHARS);
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+        assert_eq!(
+            parsed[0]["payload"]["data"].as_str().unwrap().len(),
+            63 * 1024
+        );
+    }
+
+    #[test]
     fn spooled_output_reconstructs_every_ordered_output_chunk() {
         let target_dir = tempfile::tempdir().unwrap();
         let target = target_dir.path().join("output.txt");
@@ -2297,6 +2558,205 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_symlink_spool_is_left_untouched_and_only_affected_run_degrades() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let unrelated = temp.path().join("unrelated.txt");
+        std::fs::write(&unrelated, "keep").unwrap();
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        insert_definition(&conn, &definition("healthy", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        live_run(&conn, "healthy", "healthy-session");
+        let spool_path = new_delivery_spool_path(target.to_str().unwrap()).unwrap();
+        begin_spool_preparation(
+            &conn,
+            &SpoolLedgerTarget {
+                run_id: "run-session-1",
+                occurrence_id: "occ-session-1",
+                target: target.to_str().unwrap(),
+            },
+            &spool_path,
+        )
+        .unwrap();
+        symlink(&unrelated, &spool_path).unwrap();
+
+        let report = reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
+
+        assert_eq!(report.degraded.len(), 1);
+        assert!(spool_path
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(&unrelated).unwrap(), "keep");
+        let affected: (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status, r.delivery_spool_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            affected,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "degraded".to_string()
+            )
+        );
+        let healthy: String = conn
+            .query_row(
+                "SELECT status FROM automation_runs WHERE id = 'run-healthy-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healthy, "running");
+    }
+
+    #[test]
+    fn undeletable_spool_is_marked_degraded_without_aborting_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "orphaned spool");
+        let plan = prepare_tracked_delivery_spool(
+            &conn,
+            SpoolLedgerTarget {
+                run_id: "run-session-1",
+                occurrence_id: "occ-session-1",
+                target: target.to_str().unwrap(),
+            },
+            "session-1",
+        )
+        .unwrap()
+        .unwrap();
+        let spool_path = plan.spool_path.clone();
+        std::mem::forget(plan);
+        set_spool_remove_failure_for_test(true);
+
+        let report = reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
+
+        assert_eq!(report.removed, 0);
+        assert_eq!(report.degraded.len(), 1);
+        assert!(spool_path.exists());
+        let states: (String, String, String, String) = conn
+            .query_row(
+                "SELECT o.state, o.delivery_state, r.status, r.delivery_spool_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "failed".to_string(),
+                "ambiguous".to_string(),
+                "failed".to_string(),
+                "degraded".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn concurrent_reconcilers_serialize_preparing_spooled_and_pending_delivery() {
+        for phase in ["preparing", "spooled", "pending"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store_path = temp.path().join("store.sqlite");
+            initialize_store(&store_path).unwrap();
+            let conn = crate::store::open_store(&store_path).unwrap();
+            let target = temp.path().join(format!("{phase}.txt"));
+            let automation_id = format!("concurrent-{phase}");
+            let session_id = format!("session-{phase}");
+            let run_id = format!("run-{session_id}");
+            insert_definition(
+                &conn,
+                &definition(&automation_id, Some(target.to_str().unwrap())),
+            )
+            .unwrap();
+            live_run(&conn, &automation_id, &session_id);
+            session_record(&conn, &session_id, "completed", Some(0));
+            event(&conn, &session_id, "output", phase);
+            drop(conn);
+
+            let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+            let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+            install_settlement_phase_hook(SettlementPhaseHook {
+                run_id: run_id.clone(),
+                phase,
+                reached: reached_tx,
+                release: release_rx,
+            });
+
+            let first_path = store_path.clone();
+            let first = std::thread::spawn(move || {
+                let conn = crate::store::open_store(&first_path).unwrap();
+                settle_finished_runs_with_runtime(
+                    &conn,
+                    &crate::api::NoopSessionRuntime,
+                    Utc::now(),
+                )
+            });
+            reached_rx.recv().unwrap();
+
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let second_path = store_path.clone();
+            let second = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let conn = crate::store::open_store(&second_path).unwrap();
+                let result = settle_finished_runs_with_runtime(
+                    &conn,
+                    &crate::api::NoopSessionRuntime,
+                    Utc::now(),
+                );
+                done_tx.send(()).unwrap();
+                result
+            });
+            started_rx.recv().unwrap();
+            std::thread::yield_now();
+            assert!(
+                matches!(
+                    done_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "second reconciler must wait while `{phase}` is live"
+            );
+
+            release_tx.send(()).unwrap();
+            let first_report = first.join().unwrap().unwrap();
+            let second_report = second.join().unwrap().unwrap();
+            assert_eq!(
+                first_report.settled_succeeded + second_report.settled_succeeded,
+                1
+            );
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), phase);
+            let conn = crate::store::open_store(&store_path).unwrap();
+            let states: (String, String) = conn
+                .query_row(
+                    "SELECT status, delivery_state FROM automation_runs WHERE id = ?1",
+                    params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(states, ("succeeded".to_string(), "committed".to_string()));
+        }
+    }
+
     #[test]
     fn delivery_commit_strategy_matches_platform_durability_contract() {
         let expected = if cfg!(windows) {
@@ -2414,6 +2874,47 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "succeeded");
+    }
+
+    #[test]
+    fn output_loss_marker_refuses_partial_delivery_as_ambiguous() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "surviving prefix");
+        event(&conn, "session-1", "output_truncated", "dropped output");
+        event(&conn, "session-1", "output", "surviving suffix");
+
+        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert_eq!(report.settled_failed, 1);
+        assert!(!target.exists());
+        let states: (String, String, String, String) = conn
+            .query_row(
+                "SELECT o.state, o.delivery_state, r.status, r.delivery_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "failed".to_string(),
+                "ambiguous".to_string(),
+                "failed".to_string(),
+                "ambiguous".to_string()
+            )
+        );
+        assert!(report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("incomplete")));
     }
 
     #[test]

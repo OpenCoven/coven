@@ -31,7 +31,12 @@ unrelated files. Unix commits sync the file and parent directory; Windows
 uses a write-through atomic replacement. At a run deadline Coven records one
 termination request and asks the runtime to kill the session, but keeps the
 overlap fence until terminal session evidence arrives; an unproven kill stays
-explicitly ambiguous. An external
+explicitly ambiguous. Output-loss markers refuse delivery rather than
+committing surviving fragments, and unresolved automation sessions pin their
+events beyond ordinary log retention. Settlement is process-serialized so a
+concurrent tick cannot reinterpret another live spool as crash debris; unsafe
+or undeletable stale artifacts degrade only their own run and never block
+daemon startup. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions
