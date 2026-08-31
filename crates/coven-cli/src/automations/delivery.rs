@@ -140,30 +140,101 @@ pub fn capture_bounded_log(conn: &Connection, session_id: &str) -> Option<String
     serde_json::to_string(&log_entries).ok()
 }
 
-/// The complete ordered assistant payload of a session. Event-writer batches
-/// coalesce adjacent chunks, but a long response may span many batches, so
-/// delivery reconstructs every `output` event without the bounded-log tail
-/// limit. `None` when the session produced no output.
-pub fn final_output_text(conn: &Connection, session_id: &str) -> Option<String> {
+/// Streams every ordered output chunk into a synced sibling spool while
+/// hashing incrementally. Memory use is bounded by one stored event payload,
+/// regardless of the session's aggregate output size.
+fn prepare_delivery_spool(
+    conn: &Connection,
+    session_id: &str,
+    target: &str,
+) -> Result<Option<DeliveryPlan>, String> {
+    let target_path = Path::new(target);
+    let parent = output_parent(target_path);
+    std::fs::create_dir_all(&parent).map_err(|error| {
+        format!(
+            "output commit failed: cannot create {}: {error}",
+            parent.display()
+        )
+    })?;
+    let file_name = target_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "output commit failed: output target has no file name".to_string())?;
+    let spool_path = parent.join(format!(
+        ".coven-delivery-{}-{file_name}",
+        uuid::Uuid::new_v4()
+    ));
+    let mut spool = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&spool_path)
+        .map_err(|error| {
+            format!(
+                "output commit failed: cannot create {}: {error}",
+                spool_path.display()
+            )
+        })?;
     let mut statement = conn
         .prepare(
             "SELECT payload_json FROM events
              WHERE session_id = ?1 AND kind = 'output'
              ORDER BY rowid ASC",
         )
-        .ok()?;
+        .map_err(|error| format!("failed to prepare output stream: {error}"))?;
     let rows = statement
         .query_map(params![session_id], |row| row.get::<_, String>(0))
-        .ok()?;
-    let mut output = String::new();
-    for row in rows {
-        let payload_json = row.ok()?;
-        let payload: Value = serde_json::from_str(&payload_json).ok()?;
-        if let Some(data) = payload.get("data").and_then(Value::as_str) {
-            output.push_str(data);
+        .map_err(|error| format!("failed to read output stream: {error}"))?;
+    let mut digest = Sha256::new();
+    digest.update((target.len() as u64).to_be_bytes());
+    digest.update(target.as_bytes());
+    let mut byte_len = 0_u64;
+    let result = (|| -> Result<(), String> {
+        for row in rows {
+            let payload_json =
+                row.map_err(|error| format!("failed to read output event: {error}"))?;
+            let payload: Value = serde_json::from_str(&payload_json)
+                .map_err(|error| format!("output event payload is invalid: {error}"))?;
+            if let Some(data) = payload.get("data").and_then(Value::as_str) {
+                if data.is_empty() {
+                    continue;
+                }
+                let bytes = data.as_bytes();
+                spool.write_all(bytes).map_err(|error| {
+                    format!(
+                        "output commit failed: cannot write {}: {error}",
+                        spool_path.display()
+                    )
+                })?;
+                digest.update((bytes.len() as u64).to_be_bytes());
+                digest.update(bytes);
+                byte_len = byte_len.saturating_add(bytes.len() as u64);
+            }
         }
+        spool.sync_all().map_err(|error| {
+            format!(
+                "output commit failed: cannot sync {}: {error}",
+                spool_path.display()
+            )
+        })
+    })();
+    if let Err(error) = result {
+        drop(spool);
+        let _ = std::fs::remove_file(&spool_path);
+        return Err(error);
     }
-    (!output.is_empty()).then_some(output)
+    drop(spool);
+    if byte_len == 0 {
+        let _ = std::fs::remove_file(&spool_path);
+        return Ok(None);
+    }
+    let hash = digest.finalize();
+    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(Some(DeliveryPlan {
+        target: target.to_string(),
+        spool_path,
+        digest: format!("sha256:{hex}"),
+        byte_len,
+    }))
 }
 
 /// Atomically commits `payload` to `target`: the bytes land in a temp file in
@@ -185,12 +256,10 @@ struct DeliveryIoFailure {
     message: String,
 }
 
+#[cfg(test)]
 fn deliver_output_detailed(target: &str, payload: &str) -> Result<(), DeliveryIoFailure> {
     let target_path = Path::new(target);
-    let parent = match target_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
-    };
+    let parent = output_parent(target_path);
     std::fs::create_dir_all(&parent).map_err(|error| DeliveryIoFailure {
         stage: DeliveryIoStage::BeforeRename,
         message: format!(
@@ -216,6 +285,7 @@ fn deliver_output_detailed(target: &str, payload: &str) -> Result<(), DeliveryIo
     result
 }
 
+#[cfg(test)]
 fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), DeliveryIoFailure> {
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -244,7 +314,7 @@ fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), Del
         ),
     })?;
     drop(file);
-    std::fs::rename(temp, target).map_err(|error| DeliveryIoFailure {
+    replace_output_file(temp, target).map_err(|error| DeliveryIoFailure {
         stage: DeliveryIoStage::BeforeRename,
         message: format!(
             "output commit failed: cannot rename {} → {}: {error}",
@@ -258,9 +328,73 @@ fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), Del
     })
 }
 
+fn output_parent(target: &Path) -> PathBuf {
+    target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn replace_output_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    std::fs::rename(temp, target)
+}
+
+#[cfg(windows)]
+fn replace_output_file(temp: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    fn wide_path(path: &Path) -> std::io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "output path contains an interior NUL",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    let temp = wide_path(temp)?;
+    let target = wide_path(target)?;
+    // SAFETY: both paths are owned, NUL-terminated UTF-16 buffers that remain
+    // alive for the call. WRITE_THROUGH is the Windows durability boundary.
+    let moved = unsafe {
+        MoveFileExW(
+            temp.as_ptr(),
+            target.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn delivery_commit_strategy() -> &'static str {
+    if cfg!(windows) {
+        "windows-write-through-replace"
+    } else if cfg!(unix) {
+        "unix-file-and-directory-sync"
+    } else {
+        "unsupported-ambiguous"
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent_directory(target: &Path) -> Result<(), String> {
-    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     if take_parent_sync_failure_for_test() {
         return Err(format!(
             "output commit failed: cannot sync directory {}: synthetic parent sync failure",
@@ -277,7 +411,7 @@ fn sync_parent_directory(target: &Path) -> Result<(), String> {
         })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn sync_parent_directory(_target: &Path) -> Result<(), String> {
     if take_parent_sync_failure_for_test() {
         return Err(
@@ -285,7 +419,15 @@ fn sync_parent_directory(_target: &Path) -> Result<(), String> {
                 .to_string(),
         );
     }
+    // `replace_output_file` uses MOVEFILE_WRITE_THROUGH after syncing the
+    // staged file. Windows does not expose a portable directory-handle flush;
+    // the write-through replacement is the platform durability boundary.
     Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_parent_directory(_target: &Path) -> Result<(), String> {
+    Err("output commit failed: platform has no durable directory commit primitive".to_string())
 }
 
 #[cfg(test)]
@@ -315,12 +457,20 @@ struct Settlement {
     output_commit: Option<String>,
     reason: Option<String>,
     delivery: Option<DeliveryPlan>,
+    delivery_failure: bool,
 }
 
 struct DeliveryPlan {
     target: String,
-    payload: String,
+    spool_path: PathBuf,
     digest: String,
+    byte_len: u64,
+}
+
+impl Drop for DeliveryPlan {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.spool_path);
+    }
 }
 
 struct RunningLedgerRow {
@@ -335,6 +485,7 @@ struct RunningLedgerRow {
     delivery_state: String,
     delivery_token: Option<String>,
     delivery_digest: Option<String>,
+    termination_state: String,
 }
 
 fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, String> {
@@ -342,7 +493,8 @@ fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, Strin
         .prepare(
             "SELECT r.id, r.automation_id, r.session_id, r.occurrence_id,
                     o.state, o.failure_reason, r.output_target, r.deadline_at,
-                    r.delivery_state, r.delivery_token, r.delivery_digest
+                    r.delivery_state, r.delivery_token, r.delivery_digest,
+                    r.termination_state
              FROM automation_runs AS r
              LEFT JOIN automation_occurrences AS o ON o.id = r.occurrence_id
              WHERE r.status = 'running'",
@@ -362,6 +514,7 @@ fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, Strin
                 delivery_state: row.get(8)?,
                 delivery_token: row.get(9)?,
                 delivery_digest: row.get(10)?,
+                termination_state: row.get(11)?,
             })
         })
         .map_err(|error| format!("failed to list running runs: {error}"))?;
@@ -375,30 +528,32 @@ fn running_ledger_rows(conn: &Connection) -> Result<Vec<RunningLedgerRow>, Strin
 /// Builds the settlement for a run whose session exists, or `None` while the
 /// session is still live (or has no sessions row yet — the occurrence lease
 /// bounds how long that can block the routine).
+enum SessionObservation {
+    Pending,
+    DeadlineUnresolved,
+    Terminal(Settlement),
+}
+
 fn session_settlement(
     conn: &Connection,
     session_id: &str,
     output_target: Option<&str>,
     deadline: DateTime<Utc>,
     now: DateTime<Utc>,
-) -> Result<Option<Settlement>, String> {
+) -> Result<SessionObservation, String> {
     let session = crate::store::get_session(conn, session_id)
         .map_err(|error| format!("failed to read session {session_id}: {error:#}"))?;
     let Some(session) = session else {
         if now >= deadline {
-            return Ok(Some(timeout_settlement(None, None, session_id)));
+            return Ok(SessionObservation::DeadlineUnresolved);
         }
-        return Ok(None);
+        return Ok(SessionObservation::Pending);
     };
     if !is_terminal_session_status(&session.status) {
         if now >= deadline {
-            return Ok(Some(timeout_settlement(
-                session.exit_code.map(i64::from),
-                capture_bounded_log(conn, session_id),
-                session_id,
-            )));
+            return Ok(SessionObservation::DeadlineUnresolved);
         }
-        return Ok(None);
+        return Ok(SessionObservation::Pending);
     }
 
     let log = capture_bounded_log(conn, session_id);
@@ -413,7 +568,7 @@ fn session_settlement(
         .map(|instant| instant.with_timezone(&Utc))
         .map_err(|error| format!("session {session_id} has invalid completion time: {error}"))?;
     if completed_at > deadline {
-        return Ok(Some(timeout_settlement(
+        return Ok(SessionObservation::Terminal(timeout_settlement(
             session.exit_code.map(i64::from),
             log,
             session_id,
@@ -426,49 +581,44 @@ fn session_settlement(
             Some(code) => format!("session {} (exit code {code})", session.status),
             None => format!("session {}", session.status),
         };
-        return Ok(Some(Settlement {
+        return Ok(SessionObservation::Terminal(Settlement {
             status: "failed",
             exit_code: session.exit_code.map(i64::from),
             log,
             output_commit: None,
             reason: Some(reason),
             delivery: None,
+            delivery_failure: false,
         }));
     }
 
     // The run succeeded at the runtime. Delivery is Coven's job: commit the
     // final assistant payload to the configured target, and a failed commit
     // fails the run visibly (never reported as success).
-    let (status, reason, output_commit, delivery) = match output_target {
-        None => ("succeeded", None, None, None),
-        Some(target) => match final_output_text(conn, session_id) {
-            None => (
+    let (status, reason, output_commit, delivery, delivery_failure) = match output_target {
+        None => ("succeeded", None, None, None, false),
+        Some(target) => match prepare_delivery_spool(conn, session_id, target) {
+            Err(error) => ("failed", Some(error), None, None, true),
+            Ok(None) => (
                 "failed",
                 Some(format!(
                     "output commit failed: no assistant output captured for session {session_id}"
                 )),
                 None,
                 None,
+                true,
             ),
-            Some(payload) => (
-                "succeeded",
-                None,
-                None,
-                Some(DeliveryPlan {
-                    digest: delivery_digest(target, &payload),
-                    target: target.to_string(),
-                    payload,
-                }),
-            ),
+            Ok(Some(plan)) => ("succeeded", None, None, Some(plan), false),
         },
     };
-    Ok(Some(Settlement {
+    Ok(SessionObservation::Terminal(Settlement {
         status,
         exit_code: session.exit_code.map(i64::from),
         log,
         output_commit,
         reason,
         delivery,
+        delivery_failure,
     }))
 }
 
@@ -482,18 +632,119 @@ fn timeout_settlement(exit_code: Option<i64>, log: Option<String>, session_id: &
             "deadline exceeded before session {session_id} completed"
         )),
         delivery: None,
+        delivery_failure: false,
     }
 }
 
-fn delivery_digest(target: &str, payload: &str) -> String {
-    let mut digest = Sha256::new();
-    digest.update((target.len() as u64).to_be_bytes());
-    digest.update(target.as_bytes());
-    digest.update((payload.len() as u64).to_be_bytes());
-    digest.update(payload.as_bytes());
-    let hash = digest.finalize();
-    let hex: String = hash.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("sha256:{hex}")
+struct TerminationTarget<'a> {
+    run_id: &'a str,
+    occurrence_id: &'a str,
+    session_id: Option<&'a str>,
+    state: &'a str,
+}
+
+fn request_timeout_termination(
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+    target: TerminationTarget<'_>,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    if target.state == "kill_requested" || target.state == "ambiguous" {
+        return Ok(None);
+    }
+    if target.state != "none" {
+        return Err(format!(
+            "run {} has invalid termination state `{}`",
+            target.run_id, target.state
+        ));
+    }
+    let requested_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin timeout termination request: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+             SET termination_state = 'kill_requested',
+                 termination_requested_at = ?2,
+                 termination_error = NULL
+             WHERE id = ?1
+               AND status = 'running'
+               AND termination_state = 'none'",
+            params![target.run_id, requested_at],
+        )
+        .map_err(|error| format!("failed to reserve run termination: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET termination_state = 'kill_requested',
+                 termination_requested_at = ?2,
+                 termination_error = NULL
+             WHERE id = ?1
+               AND state IN ('claimed', 'running')
+               AND termination_state = 'none'",
+            params![target.occurrence_id, requested_at],
+        )
+        .map_err(|error| format!("failed to reserve occurrence termination: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("timeout termination reservation CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit timeout termination request: {error}"))?;
+
+    let Some(session_id) = target.session_id else {
+        let reason = "timeout termination is ambiguous because no session is attached".to_string();
+        mark_timeout_ambiguous(conn, target.run_id, target.occurrence_id, &reason)?;
+        return Ok(Some(reason));
+    };
+    match runtime.kill_session(session_id) {
+        Ok(()) => Ok(None),
+        Err(error) => {
+            let reason = format!("timeout termination could not be proven: {error:#}");
+            mark_timeout_ambiguous(conn, target.run_id, target.occurrence_id, &reason)?;
+            Ok(Some(reason))
+        }
+    }
+}
+
+fn mark_timeout_ambiguous(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin ambiguous timeout update: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+             SET termination_state = 'ambiguous',
+                 termination_error = ?2
+             WHERE id = ?1
+               AND status = 'running'
+               AND termination_state = 'kill_requested'",
+            params![run_id, reason],
+        )
+        .map_err(|error| format!("failed to mark run termination ambiguous: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET termination_state = 'ambiguous',
+                 termination_error = ?2
+             WHERE id = ?1
+               AND state IN ('claimed', 'running')
+               AND termination_state = 'kill_requested'",
+            params![occurrence_id, reason],
+        )
+        .map_err(|error| format!("failed to mark occurrence termination ambiguous: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("ambiguous timeout update CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit ambiguous timeout update: {error}"))
 }
 
 struct DeliveryReservation {
@@ -697,8 +948,11 @@ fn settle_reserved_delivery(
     plan: DeliveryPlan,
     now: DateTime<Utc>,
 ) -> Result<(&'static str, Option<String>), String> {
+    if plan.byte_len == 0 {
+        return Err("prepared delivery spool is empty".to_string());
+    }
     let reservation = reserve_delivery(conn, &target, &plan)?;
-    let terminal = match deliver_output_detailed(&plan.target, &plan.payload) {
+    let terminal = match commit_delivery_spool(&plan) {
         Ok(()) => DeliveryTerminalState::Committed,
         Err(failure) if failure.stage == DeliveryIoStage::BeforeRename => {
             DeliveryTerminalState::Failed(failure.message)
@@ -714,6 +968,22 @@ fn settle_reserved_delivery(
         &plan.target,
         now,
     )
+}
+
+fn commit_delivery_spool(plan: &DeliveryPlan) -> Result<(), DeliveryIoFailure> {
+    let target = Path::new(&plan.target);
+    replace_output_file(&plan.spool_path, target).map_err(|error| DeliveryIoFailure {
+        stage: DeliveryIoStage::BeforeRename,
+        message: format!(
+            "output commit failed: cannot rename {} → {}: {error}",
+            plan.spool_path.display(),
+            target.display()
+        ),
+    })?;
+    sync_parent_directory(target).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::AfterRename,
+        message,
+    })
 }
 
 fn settle_interrupted_delivery(
@@ -736,6 +1006,86 @@ fn settle_interrupted_delivery(
         output_target,
         now,
     )
+}
+
+fn settle_delivery_preparation_failure(
+    conn: &Connection,
+    target: SettlementTarget<'_>,
+    settlement: Settlement,
+    now: DateTime<Utc>,
+) -> Result<(&'static str, Option<String>), String> {
+    let occurrence_id = target
+        .occurrence_id
+        .ok_or_else(|| format!("run {} has no occurrence for delivery", target.run_id))?;
+    let reason = settlement
+        .reason
+        .clone()
+        .ok_or_else(|| "delivery preparation failed without a reason".to_string())?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin delivery failure settlement: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+             SET delivery_state = 'failed',
+                 delivery_error = ?2
+             WHERE id = ?1
+               AND status = 'running'
+               AND delivery_state = 'none'",
+            params![target.run_id, reason],
+        )
+        .map_err(|error| format!("failed to record run delivery failure: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 delivery_state = 'failed',
+                 delivery_error = ?2,
+                 updated_at = ?3
+             WHERE id = ?1
+               AND delivery_state = 'none'
+               AND (
+                   state IN ('claimed', 'running')
+                   OR (state = 'failed' AND failure_reason = 'lease expired')
+               )",
+            params![
+                occurrence_id,
+                reason,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .map_err(|error| format!("failed to record occurrence delivery failure: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("delivery failure settlement CAS rejected".to_string());
+    }
+    let finished = record_run_finish(
+        &transaction,
+        target.run_id,
+        RunFinish {
+            status: "failed",
+            exit_code: settlement.exit_code,
+            session_id: target.session_id,
+            log_json: settlement.log,
+            output_commit: None,
+        },
+        now,
+    )
+    .map_err(|error| {
+        format!("failed to finish run after delivery preparation failure: {error:#}")
+    })?;
+    if !finished {
+        return Err(format!(
+            "run {} changed during delivery failure settlement",
+            target.run_id
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit delivery failure settlement: {error}"))?;
+    Ok(("failed", Some(reason)))
 }
 
 fn settle_linked_state(
@@ -812,8 +1162,17 @@ fn settle_linked_state(
 /// settled through lease recovery. The matching occurrence settles alongside
 /// the ledger row; nothing here ever reports a run success that did not
 /// actually happen.
+#[cfg(test)]
 pub fn settle_finished_runs(
     conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<ReconcileReport, String> {
+    settle_finished_runs_with_runtime(conn, &crate::api::NoopSessionRuntime, now)
+}
+
+pub fn settle_finished_runs_with_runtime(
+    conn: &Connection,
+    runtime: &dyn crate::api::SessionRuntime,
     now: DateTime<Utc>,
 ) -> Result<ReconcileReport, String> {
     let mut report = ReconcileReport::default();
@@ -831,6 +1190,7 @@ pub fn settle_finished_runs(
             delivery_state,
             delivery_token,
             delivery_digest,
+            termination_state,
         } = row;
 
         let deadline_at =
@@ -838,19 +1198,67 @@ pub fn settle_finished_runs(
         let deadline = chrono::DateTime::parse_from_rfc3339(&deadline_at)
             .map(|instant| instant.with_timezone(&Utc))
             .map_err(|error| format!("running run {run_id} has invalid deadline: {error}"))?;
-        let mut settlement = match session_id.as_deref() {
+        let observation = match session_id.as_deref() {
             Some(session_id) => {
                 session_settlement(conn, session_id, output_target.as_deref(), deadline, now)?
             }
-            None if now >= deadline => Some(Settlement {
-                status: "failed",
-                exit_code: None,
-                log: None,
-                output_commit: None,
-                reason: Some("deadline exceeded before a session was attached".to_string()),
-                delivery: None,
-            }),
-            None => None,
+            None if now >= deadline => SessionObservation::DeadlineUnresolved,
+            None => SessionObservation::Pending,
+        };
+        let mut settlement = match observation {
+            SessionObservation::Terminal(settlement) => Some(settlement),
+            SessionObservation::Pending => None,
+            SessionObservation::DeadlineUnresolved
+                if occurrence_state.as_deref() == Some("failed") =>
+            {
+                Some(Settlement {
+                    status: "failed",
+                    exit_code: None,
+                    log: None,
+                    output_commit: None,
+                    reason: Some(
+                        occurrence_failure
+                            .clone()
+                            .filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or_else(|| "lease expired".to_string()),
+                    ),
+                    delivery: None,
+                    delivery_failure: false,
+                })
+            }
+            SessionObservation::DeadlineUnresolved
+                if occurrence_state.as_deref() == Some("succeeded") =>
+            {
+                Some(Settlement {
+                    status: "failed",
+                    exit_code: None,
+                    log: None,
+                    output_commit: None,
+                    reason: Some("occurrence settled without a run result".to_string()),
+                    delivery: None,
+                    delivery_failure: false,
+                })
+            }
+            SessionObservation::DeadlineUnresolved => {
+                let occurrence_id = occurrence_id
+                    .as_deref()
+                    .ok_or_else(|| format!("timed-out run {run_id} has no occurrence fence"))?;
+                if let Some(failure) = request_timeout_termination(
+                    conn,
+                    runtime,
+                    TerminationTarget {
+                        run_id: &run_id,
+                        occurrence_id,
+                        session_id: session_id.as_deref(),
+                        state: &termination_state,
+                    },
+                    now,
+                )? {
+                    report.failures.push(format!("{automation_id}: {failure}"));
+                }
+                report.still_running += 1;
+                continue;
+            }
         };
         if settlement.is_none() {
             if occurrence_state.as_deref() == Some("failed") {
@@ -865,6 +1273,7 @@ pub fn settle_finished_runs(
                     output_commit: None,
                     reason: Some(reason),
                     delivery: None,
+                    delivery_failure: false,
                 });
             } else if occurrence_state.as_deref() == Some("succeeded") {
                 // Defensive: an occurrence cannot legitimately settle success
@@ -877,6 +1286,7 @@ pub fn settle_finished_runs(
                     output_commit: None,
                     reason: Some("occurrence settled without a run result".to_string()),
                     delivery: None,
+                    delivery_failure: false,
                 });
             }
         }
@@ -893,43 +1303,48 @@ pub fn settle_finished_runs(
             occurrence_failure: occurrence_failure.as_deref(),
             session_id: session_id.clone(),
         };
-        let (status, reason) = match settlement.delivery.take() {
-            Some(plan) if delivery_state == "none" => {
-                settle_reserved_delivery(conn, target, settlement, plan, now)?
-            }
-            Some(_) if delivery_state == "pending" => {
-                let delivery_reservation_id = delivery_token
-                    .ok_or_else(|| format!("pending delivery for run {run_id} has no token"))?;
-                let digest = delivery_digest
-                    .ok_or_else(|| format!("pending delivery for run {run_id} has no digest"))?;
-                let output_target = output_target
-                    .as_deref()
-                    .ok_or_else(|| format!("pending delivery for run {run_id} has no target"))?;
-                settle_interrupted_delivery(
-                    conn,
-                    target,
-                    settlement,
-                    delivery_reservation_id,
-                    digest,
-                    output_target,
-                    now,
-                )?
-            }
-            Some(_) => {
-                return Err(format!(
-                    "running run {run_id} has invalid delivery state `{delivery_state}`"
-                ));
-            }
-            None if delivery_state == "none" => {
-                let status = settlement.status;
-                let reason = settlement.reason.clone();
-                settle_linked_state(conn, target, settlement, now)?;
-                (status, reason)
-            }
-            None => {
-                return Err(format!(
+        let (status, reason) = if settlement.delivery_failure {
+            settle_delivery_preparation_failure(conn, target, settlement, now)?
+        } else {
+            match settlement.delivery.take() {
+                Some(plan) if delivery_state == "none" => {
+                    settle_reserved_delivery(conn, target, settlement, plan, now)?
+                }
+                Some(_) if delivery_state == "pending" => {
+                    let delivery_reservation_id = delivery_token
+                        .ok_or_else(|| format!("pending delivery for run {run_id} has no token"))?;
+                    let digest = delivery_digest.ok_or_else(|| {
+                        format!("pending delivery for run {run_id} has no digest")
+                    })?;
+                    let output_target = output_target.as_deref().ok_or_else(|| {
+                        format!("pending delivery for run {run_id} has no target")
+                    })?;
+                    settle_interrupted_delivery(
+                        conn,
+                        target,
+                        settlement,
+                        delivery_reservation_id,
+                        digest,
+                        output_target,
+                        now,
+                    )?
+                }
+                Some(_) => {
+                    return Err(format!(
+                        "running run {run_id} has invalid delivery state `{delivery_state}`"
+                    ));
+                }
+                None if delivery_state == "none" => {
+                    let status = settlement.status;
+                    let reason = settlement.reason.clone();
+                    settle_linked_state(conn, target, settlement, now)?;
+                    (status, reason)
+                }
+                None => {
+                    return Err(format!(
                     "run {run_id} has delivery state `{delivery_state}` without a delivery plan"
                 ));
+                }
             }
         };
         if status == "succeeded" {
@@ -952,6 +1367,31 @@ mod tests {
     use crate::automations::store::insert_definition;
     use crate::store::{initialize_store, insert_event, insert_session, SessionRecord};
     use serde_json::json;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct FailingKillRuntime {
+        kills: Cell<usize>,
+    }
+
+    impl crate::api::SessionRuntime for FailingKillRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.kills.set(self.kills.get() + 1);
+            anyhow::bail!("synthetic unproven kill")
+        }
+    }
 
     fn temp_store() -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().unwrap();
@@ -1114,6 +1554,13 @@ mod tests {
         assert!(error.contains("output commit failed"), "{error}");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn bare_relative_target_syncs_the_current_directory_without_creating_artifacts() {
+        sync_parent_directory(Path::new("bare-output.md")).unwrap();
+        assert!(!Path::new("bare-output.md").exists());
+    }
+
     #[test]
     fn bounded_log_keeps_the_tail_within_the_budget() {
         let (_temp, conn) = temp_store();
@@ -1134,7 +1581,9 @@ mod tests {
     }
 
     #[test]
-    fn final_output_text_reconstructs_every_ordered_output_chunk() {
+    fn spooled_output_reconstructs_every_ordered_output_chunk() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target = target_dir.path().join("output.txt");
         let (_temp, conn) = temp_store();
         session_record(&conn, "session-1", "completed", Some(0));
         event(&conn, "session-1", "output", "first ");
@@ -1146,11 +1595,54 @@ mod tests {
         event(&conn, "session-1", "output", " final");
 
         let expected = format!("first second {} final", "x".repeat(205));
+        let prepared = prepare_delivery_spool(&conn, "session-1", target.to_str().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            final_output_text(&conn, "session-1").as_deref(),
-            Some(expected.as_str())
+            std::fs::read_to_string(&prepared.spool_path).unwrap(),
+            expected
         );
-        assert_eq!(final_output_text(&conn, "session-missing"), None);
+        assert!(
+            prepare_delivery_spool(&conn, "session-missing", target.to_str().unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn spooled_output_handles_many_large_chunks_without_aggregate_buffer() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("large-output.bin");
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "large-session", "completed", Some(0));
+        let chunk = "x".repeat(8 * 1024);
+        for _ in 0..512 {
+            event(&conn, "large-session", "output", &chunk);
+        }
+
+        let prepared = prepare_delivery_spool(&conn, "large-session", target.to_str().unwrap())
+            .unwrap()
+            .expect("large output spool");
+
+        assert_eq!(prepared.byte_len, 512 * 8 * 1024);
+        assert_eq!(
+            std::fs::metadata(&prepared.spool_path).unwrap().len(),
+            prepared.byte_len
+        );
+        assert!(prepared.digest.starts_with("sha256:"));
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn delivery_commit_strategy_matches_platform_durability_contract() {
+        let expected = if cfg!(windows) {
+            "windows-write-through-replace"
+        } else if cfg!(unix) {
+            "unix-file-and-directory-sync"
+        } else {
+            "unsupported-ambiguous"
+        };
+        assert_eq!(delivery_commit_strategy(), expected);
     }
 
     #[test]
@@ -1638,6 +2130,48 @@ mod tests {
             .unwrap();
         assert_eq!((occurrence.as_str(), run.as_str()), ("failed", "failed"));
         assert!(reason.contains("deadline"), "{reason}");
+    }
+
+    #[test]
+    fn unproven_timeout_kill_keeps_fence_and_records_ambiguity_without_retrying() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", None)).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "running", None);
+        let runtime = FailingKillRuntime::default();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-28T11:00:00.000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let first = settle_finished_runs_with_runtime(&conn, &runtime, now).unwrap();
+        let second = settle_finished_runs_with_runtime(&conn, &runtime, now).unwrap();
+
+        assert_eq!(runtime.kills.get(), 1, "ambiguous kill is not repeated");
+        assert_eq!(first.still_running, 1);
+        assert_eq!(second.still_running, 1);
+        let states: (String, String, String, String) = conn
+            .query_row(
+                "SELECT o.state, o.termination_state, r.status, r.termination_state
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "running".to_string(),
+                "ambiguous".to_string(),
+                "running".to_string(),
+                "ambiguous".to_string()
+            )
+        );
+        assert!(first
+            .failures
+            .iter()
+            .any(|failure| failure.contains("could not be proven")));
     }
 
     #[test]

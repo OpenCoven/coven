@@ -399,6 +399,7 @@ fn automation_tick_payload(
         "recovered": report.occurrences.recovered,
         "claimed": report.occurrences.claimed,
         "dispatched": report.dispatch.dispatched,
+        "ambiguous": report.dispatch.ambiguous,
         "settledSucceeded": report.settlement.settled_succeeded,
         "settledFailed": report.settlement.settled_failed,
         "failures": report.settlement.failures,
@@ -495,6 +496,9 @@ fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) ->
                         "deliveryToken": record.delivery_token,
                         "deliveryDigest": record.delivery_digest,
                         "deliveryError": record.delivery_error,
+                        "terminationState": record.termination_state,
+                        "terminationRequestedAt": record.termination_requested_at,
+                        "terminationError": record.termination_error,
                         "startedAt": record.started_at,
                         "finishedAt": record.finished_at,
                     })

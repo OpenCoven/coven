@@ -21,7 +21,13 @@ state, pins the accepted definition revision and delivery inputs, records the
 session and run before spawning, and delivers outputs itself. Output delivery
 first reserves the run and occurrence with an idempotent token and content
 digest; a crash or post-rename durability failure remains visibly ambiguous
-and is never replayed automatically. An external
+and is never replayed automatically. Output chunks are streamed into a synced
+sibling spool while hashing, so aggregate output size does not become an
+in-memory buffer. Unix commits sync the file and parent directory; Windows
+uses a write-through atomic replacement. At a run deadline Coven records one
+termination request and asks the runtime to kill the session, but keeps the
+overlap fence until terminal session evidence arrives; an unproven kill stays
+explicitly ambiguous. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions

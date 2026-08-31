@@ -33,6 +33,9 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         delivery_digest TEXT,
         delivery_error TEXT,
         legacy_reconciled_at TEXT,
+        termination_state TEXT NOT NULL DEFAULT 'none',
+        termination_requested_at TEXT,
+        termination_error TEXT,
         started_at TEXT NOT NULL,
         finished_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
@@ -71,6 +74,9 @@ pub struct RunRecord {
     pub delivery_token: Option<String>,
     pub delivery_digest: Option<String>,
     pub delivery_error: Option<String>,
+    pub termination_state: String,
+    pub termination_requested_at: Option<String>,
+    pub termination_error: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
 }
@@ -209,7 +215,8 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
             "SELECT id, automation_id, occurrence_id, session_id, familiar_id, runtime,
                     status, exit_code, log_json, output_commit, definition_revision,
                     definition_digest, output_target, deadline_at, delivery_state,
-                    delivery_token, delivery_digest, delivery_error, started_at, finished_at
+                    delivery_token, delivery_digest, delivery_error, termination_state,
+                    termination_requested_at, termination_error, started_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -237,8 +244,11 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
                 delivery_token: row.get(15)?,
                 delivery_digest: row.get(16)?,
                 delivery_error: row.get(17)?,
-                started_at: row.get(18)?,
-                finished_at: row.get(19)?,
+                termination_state: row.get(18)?,
+                termination_requested_at: row.get(19)?,
+                termination_error: row.get(20)?,
+                started_at: row.get(21)?,
+                finished_at: row.get(22)?,
             })
         })
         .context("failed to list runs")?;

@@ -400,6 +400,7 @@ pub(crate) enum DurableSessionLaunchError {
     Persistence(anyhow::Error),
     PersistedState(anyhow::Error),
     Runtime(anyhow::Error),
+    OwnershipRetained(anyhow::Error),
     AlreadyDispatched,
     Rejected(ApiResponse),
 }
@@ -473,6 +474,12 @@ pub(crate) fn launch_durable_session(
         None => runtime.launch_session(launch),
     };
     if let Err(error) = launch_result {
+        if error
+            .downcast_ref::<crate::daemon::RuntimeOwnershipRetainedError>()
+            .is_some()
+        {
+            return Err(DurableSessionLaunchError::OwnershipRetained(error));
+        }
         store::update_session_status_if_current(
             conn,
             &record.id,
@@ -2342,6 +2349,14 @@ fn launch_session(
                     "launch_failed",
                     &error.to_string(),
                     Some(json!({ "sessionId": record.id })),
+                );
+            }
+            DurableSessionLaunchError::OwnershipRetained(error) => {
+                return api_error(
+                    500,
+                    "launch_failed",
+                    &error.to_string(),
+                    Some(json!({ "sessionId": record.id, "ownershipRetained": true })),
                 );
             }
             DurableSessionLaunchError::AlreadyDispatched => {

@@ -45,6 +45,13 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     New deliveries reserve a pending token and target+payload digest before
     file I/O; interrupted pending work becomes explicit `ambiguous` delivery
     state and is not automatically replayed.
+12. **Timeout and output side effects retain explicit evidence.** Deadline
+    expiry reserves one kill request but does not release overlap until the
+    session store records a terminal transition; retained runtime ownership
+    and unproven kills remain live/ambiguous. Delivery hashes ordered chunks
+    while streaming them to a bounded-memory sibling spool, then uses
+    file+directory sync on Unix or write-through atomic replacement on
+    Windows before recording `committed`.
 
 ## Contract profile and versioning
 

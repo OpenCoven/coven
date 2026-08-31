@@ -291,6 +291,22 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "ALTER TABLE automation_occurrences ADD COLUMN legacy_reconciled_at TEXT",
         ),
         (
+            "automation_occurrences",
+            "termination_state",
+            "ALTER TABLE automation_occurrences
+             ADD COLUMN termination_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_occurrences",
+            "termination_requested_at",
+            "ALTER TABLE automation_occurrences ADD COLUMN termination_requested_at TEXT",
+        ),
+        (
+            "automation_occurrences",
+            "termination_error",
+            "ALTER TABLE automation_occurrences ADD COLUMN termination_error TEXT",
+        ),
+        (
             "automation_runs",
             "definition_revision",
             "ALTER TABLE automation_runs ADD COLUMN definition_revision INTEGER",
@@ -340,6 +356,22 @@ pub(crate) fn ensure_snapshot_schema(conn: &Connection) -> Result<()> {
             "automation_runs",
             "legacy_reconciled_at",
             "ALTER TABLE automation_runs ADD COLUMN legacy_reconciled_at TEXT",
+        ),
+        (
+            "automation_runs",
+            "termination_state",
+            "ALTER TABLE automation_runs
+             ADD COLUMN termination_state TEXT NOT NULL DEFAULT 'none'",
+        ),
+        (
+            "automation_runs",
+            "termination_requested_at",
+            "ALTER TABLE automation_runs ADD COLUMN termination_requested_at TEXT",
+        ),
+        (
+            "automation_runs",
+            "termination_error",
+            "ALTER TABLE automation_runs ADD COLUMN termination_error TEXT",
         ),
     ] {
         ensure_column(conn, table, column, sql)?;
@@ -778,11 +810,13 @@ mod tests {
             ("automation_occurrences", "deadline_at"),
             ("automation_occurrences", "delivery_state"),
             ("automation_occurrences", "legacy_reconciled_at"),
+            ("automation_occurrences", "termination_state"),
             ("automation_runs", "definition_json"),
             ("automation_runs", "deadline_at"),
             ("automation_runs", "output_target"),
             ("automation_runs", "delivery_state"),
             ("automation_runs", "legacy_reconciled_at"),
+            ("automation_runs", "termination_state"),
         ] {
             let found: i64 = conn
                 .query_row(

@@ -25,13 +25,13 @@ pub fn run_full_tick(
     runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<FullTickReport> {
-    let mut settlement =
-        super::delivery::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    let mut settlement = super::delivery::settle_finished_runs_with_runtime(conn, runtime, now)
+        .map_err(anyhow::Error::msg)?;
     let occurrences = super::occurrences::tick(conn, now)?;
     let dispatch = super::runner::dispatch_claimed_occurrences(conn, coven_home, runtime, now)
         .map_err(anyhow::Error::msg)?;
-    let after_dispatch =
-        super::delivery::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    let after_dispatch = super::delivery::settle_finished_runs_with_runtime(conn, runtime, now)
+        .map_err(anyhow::Error::msg)?;
     settlement.settled_succeeded += after_dispatch.settled_succeeded;
     settlement.settled_failed += after_dispatch.settled_failed;
     settlement.still_running = after_dispatch.still_running;
@@ -96,6 +96,33 @@ mod tests {
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::store::insert_definition;
     use serde_json::json;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct TimeoutRuntime {
+        launches: Cell<usize>,
+        kills: Cell<usize>,
+    }
+
+    impl crate::api::SessionRuntime for TimeoutRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> anyhow::Result<()> {
+            self.launches.set(self.launches.get() + 1);
+            Ok(())
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            self.kills.set(self.kills.get() + 1);
+            Ok(())
+        }
+    }
 
     fn definition(id: &str) -> RoutineDefinition {
         RoutineDefinition::from_json(&json!({
@@ -339,5 +366,115 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "running");
+    }
+
+    #[test]
+    fn timeout_requests_kill_without_releasing_overlap_before_terminal_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let mut routine = definition("timeout-fence");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        insert_definition(&conn, &routine).unwrap();
+        let record = crate::automations::store::get_definition(&conn, "timeout-fence")
+            .unwrap()
+            .unwrap();
+        let snapshot = crate::automations::store::definition_snapshot(&record).unwrap();
+        let now = chrono::Utc::now();
+        let started = now - chrono::Duration::minutes(31);
+        let deadline = now - chrono::Duration::minutes(1);
+        let started_iso = started.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let deadline_iso = deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, definition_revision, definition_digest, definition_json,
+                 output_target, deadline_at, created_at, updated_at)
+             VALUES ('timeout-running', 'timeout-fence', ?1, 'running', 'daemon', ?2, 1,
+                     ?3, ?4, ?5, ?6, ?2, ?1, ?1)",
+            rusqlite::params![
+                started_iso,
+                deadline_iso,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target
+            ],
+        )
+        .unwrap();
+        crate::automations::runs::record_run_start_pinned(
+            &conn,
+            crate::automations::runs::PinnedRunStart {
+                run_id: "timeout-run",
+                automation_id: "timeout-fence",
+                occurrence_id: "timeout-running",
+                session_id: Some("timeout-session"),
+                familiar_id: None,
+                runtime: "coven-code",
+                snapshot: &snapshot,
+                deadline_at: &deadline_iso,
+                now: started,
+            },
+        )
+        .unwrap();
+        crate::store::insert_session(
+            &conn,
+            &crate::store::SessionRecord {
+                id: "timeout-session".to_string(),
+                project_root: project.to_string_lossy().into_owned(),
+                harness: "coven-code".to_string(),
+                title: "timed run".to_string(),
+                status: "running".to_string(),
+                exit_code: None,
+                archived_at: None,
+                created_at: started_iso.clone(),
+                updated_at: started_iso.clone(),
+                conversation_id: None,
+                familiar_id: None,
+                execution_binding: None,
+                labels: Vec::new(),
+                visibility: "private".to_string(),
+                external: false,
+                transcript_path: None,
+            },
+        )
+        .unwrap();
+        let successor_time = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('timeout-successor', 'timeout-fence', ?1, 'planned', 0, ?1, ?1)",
+            rusqlite::params![successor_time],
+        )
+        .unwrap();
+        let runtime = TimeoutRuntime::default();
+
+        run_full_tick(&conn, home, &runtime, now).unwrap();
+
+        assert_eq!(runtime.kills.get(), 1);
+        assert_eq!(runtime.launches.get(), 0);
+        let states: (String, String, String) = conn
+            .query_row(
+                "SELECT current.state, run.status, successor.state
+                 FROM automation_occurrences AS current
+                 JOIN automation_runs AS run ON run.occurrence_id = current.id
+                 JOIN automation_occurrences AS successor
+                   ON successor.id = 'timeout-successor'
+                 WHERE current.id = 'timeout-running'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "running".to_string(),
+                "running".to_string(),
+                "planned".to_string()
+            )
+        );
     }
 }

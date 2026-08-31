@@ -162,7 +162,8 @@ fn durable_error_text(error: DurableSessionLaunchError) -> String {
         DurableSessionLaunchError::Maintenance(error)
         | DurableSessionLaunchError::Persistence(error)
         | DurableSessionLaunchError::PersistedState(error)
-        | DurableSessionLaunchError::Runtime(error) => format!("{error:#}"),
+        | DurableSessionLaunchError::Runtime(error)
+        | DurableSessionLaunchError::OwnershipRetained(error) => format!("{error:#}"),
         DurableSessionLaunchError::AlreadyDispatched => {
             "occurrence was already dispatched".to_string()
         }
@@ -346,6 +347,12 @@ fn dispatch_pinned_occurrence(
             status: "already_dispatched".to_string(),
             session_id: None,
             error: None,
+        }),
+        Err(DurableSessionLaunchError::OwnershipRetained(error)) => Ok(RunOutcome {
+            run_id,
+            status: "ambiguous".to_string(),
+            session_id: Some(launch.id),
+            error: Some(format!("{error:#}")),
         }),
         Err(error) => {
             let persisted_session = matches!(
@@ -534,6 +541,7 @@ pub fn build_session_launch(
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct DispatchReport {
     pub dispatched: Vec<String>,
+    pub ambiguous: Vec<String>,
     pub failed: Vec<String>,
 }
 
@@ -590,6 +598,8 @@ pub fn dispatch_claimed_occurrences(
             dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "daemon", now)?;
         if outcome.status == "dispatched" {
             report.dispatched.push(outcome.run_id);
+        } else if outcome.status == "ambiguous" {
+            report.ambiguous.push(outcome.run_id);
         } else if outcome.status != "already_dispatched" {
             report.failed.push(format!(
                 "{automation_id}: {}",
@@ -701,6 +711,28 @@ mod tests {
     impl SessionRuntime for RejectingRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
             anyhow::bail!("synthetic launch failure")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct RetainedOwnershipRuntime;
+
+    impl SessionRuntime for RetainedOwnershipRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            Err(anyhow::Error::new(
+                crate::daemon::RuntimeOwnershipRetainedError,
+            ))
         }
 
         fn send_input(
@@ -953,6 +985,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn retained_runtime_ownership_keeps_automation_state_live_for_reconciliation() {
+        let (temp, conn) = temp_store();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("retained");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+
+        let outcome = run_routine_now(
+            &conn,
+            temp.path(),
+            &RetainedOwnershipRuntime,
+            &routine,
+            Utc::now(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.status, "ambiguous");
+        let session_id = outcome.session_id.as_deref().expect("retained session id");
+        let states: (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE o.automation_id = 'retained'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            states,
+            (
+                "running".to_string(),
+                "running".to_string(),
+                "running".to_string()
+            )
+        );
+        assert_eq!(
+            crate::store::get_session(&conn, session_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "running"
+        );
     }
 
     #[test]
