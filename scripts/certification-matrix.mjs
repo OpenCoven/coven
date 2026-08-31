@@ -303,27 +303,35 @@ export const CERTIFICATION_MATRIX = [
   {
     id: 'B3',
     lane: 'B',
-    claim: 'macOS Apple Silicon: Rust suite, packaged onboarding, and AFS-mount legs run per push and at release tags.',
+    claim:
+      'macOS Apple Silicon: Rust suite, packaged onboarding, and AFS-mount legs run per push to main; tag-built macOS packages are never exercised on a macOS runner.',
     platforms: ['macos-arm64'],
-    outcome: OUTCOMES.REQUIRED_PASSED,
+    outcome: OUTCOMES.REQUIRED_UNKNOWN,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#rust-test-macos' },
       { kind: 'ci-job', ref: 'ci.yml#npm-onboarding-main' },
       { kind: 'ci-job', ref: 'ci.yml#afs-mount-macos' },
       { kind: 'workflow', ref: '.github/workflows/release-npm.yml' }
-    ]
+    ],
+    ownerIssue: 805,
+    justification:
+      'Per-push macOS coverage is real (rust-test-macos, npm-onboarding-main, and afs-mount-macos run on macos-26), but the release workflow builds the tag-built macOS packages on macOS runners and only dry-runs them on ubuntu-latest: no macOS runner executes the packaged onboarding at tag time. The support inventory records releaseOnboardingRunner: null for both macOS platforms, so this row claims per-push coverage only and stays unknown until a tag-built macOS onboarding leg exists.'
   },
   {
     id: 'B4',
     lane: 'B',
-    claim: 'macOS Intel x64: a distinct public package path exists and its CI leg runs per push and at release tags.',
+    claim:
+      'macOS Intel x64: a distinct public package path exists and its CI leg runs per push to main; the tag-built Intel package is never exercised on a macOS runner.',
     platforms: ['macos-x64'],
-    outcome: OUTCOMES.REQUIRED_PASSED,
+    outcome: OUTCOMES.REQUIRED_UNKNOWN,
     evidence: [
       { kind: 'ci-job', ref: 'ci.yml#npm-onboarding-main' },
       { kind: 'workflow', ref: '.github/workflows/release-npm.yml' },
       { kind: 'docs', ref: 'README.md' }
-    ]
+    ],
+    ownerIssue: 805,
+    justification:
+      'npm-onboarding-main runs the Intel package leg on macos-15-intel per push, but the release workflow only dry-runs the tag-built Intel package on ubuntu-latest; release-time coverage is unknown until a matching-runner release onboarding leg exists.'
   },
   {
     id: 'B5',

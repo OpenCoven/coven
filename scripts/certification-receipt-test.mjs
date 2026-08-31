@@ -437,3 +437,38 @@ test('support inventory and row platform coverage form a bijection', () => {
     );
   }
 });
+
+test('rows never claim release coverage a runner does not provide', () => {
+  const platformById = new Map(SUPPORT_INVENTORY.platforms.map((platform) => [platform.id, platform]));
+  for (const row of CERTIFICATION_MATRIX) {
+    if (row.platforms === undefined) {
+      continue;
+    }
+    const claimsReleaseCoverage = /at release tags?|release-time coverage|tag-built/i.test(row.claim);
+    const claimedUnknown = row.outcome === OUTCOMES.REQUIRED_UNKNOWN;
+    for (const platformId of row.platforms) {
+      const platform = platformById.get(platformId);
+      assert.ok(platform.releaseBuildRunner, `row ${row.id}: ${platformId} has no release build runner`);
+      if (platform.releaseOnboardingRunner === null && claimsReleaseCoverage && !claimedUnknown) {
+        assert.fail(
+          `row ${row.id} claims release coverage for ${platformId} but the inventory has no release onboarding leg for it (${platform.releaseBuildRunner} builds, nobody verifies)`
+        );
+      }
+      if (platform.releaseOnboardingRunner === null && claimedUnknown) {
+        assert.ok(
+          /releaseOnboardingRunner: null|dry-runs them on ubuntu-latest|dry-run/.test(row.justification),
+          `row ${row.id} must explain that ${platformId} has no release onboarding leg`
+        );
+      }
+    }
+  }
+
+  // The macOS rows are the review finding: they must be explicit unknowns
+  // owned by release authorization until matching-runner release legs exist.
+  for (const rowId of ['B3', 'B4']) {
+    const row = CERTIFICATION_MATRIX.find((candidate) => candidate.id === rowId);
+    assert.equal(row.outcome, OUTCOMES.REQUIRED_UNKNOWN, `${rowId} must stay an explicit unknown`);
+    assert.equal(row.ownerIssue, 805, `${rowId} must be owned by release authorization`);
+    assert.match(row.justification, /dry-runs them on ubuntu-latest|dry-runs the tag-built/);
+  }
+});

@@ -105,17 +105,27 @@ packages.
 | --- | --- | --- | --- |
 | B1 | Linux x64: packaged tarball onboarding plus source-equivalent checks pass in CI. | [`npm-onboarding-pr`](../../.github/workflows/ci.yml) · [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`rust-test-linux`](../../.github/workflows/ci.yml) | required / passed |
 | B2 | Windows x64: packaged tarball onboarding plus the Rust suite pass in CI. | [`npm-onboarding-pr`](../../.github/workflows/ci.yml) · [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`rust-test-windows`](../../.github/workflows/ci.yml) | required / passed |
-| B3 | macOS Apple Silicon: Rust suite, packaged onboarding, and AFS-mount legs run per push and at release tags. | [`rust-test-macos`](../../.github/workflows/ci.yml) · [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`afs-mount-macos`](../../.github/workflows/ci.yml) · [`release-npm.yml`](../../.github/workflows/release-npm.yml) | required / passed |
-| B4 | macOS Intel x64: a distinct public package path exists and its CI leg runs per push and at release tags. | [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`release-npm.yml`](../../.github/workflows/release-npm.yml) · [README](../../README.md) | required / passed |
+| B3 | macOS Apple Silicon: Rust suite, packaged onboarding, and AFS-mount legs run per push to main; tag-built macOS packages are never exercised on a macOS runner. | [`rust-test-macos`](../../.github/workflows/ci.yml) · [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`afs-mount-macos`](../../.github/workflows/ci.yml) · [`release-npm.yml`](../../.github/workflows/release-npm.yml) | required / unknown (open blocker) |
+| B4 | macOS Intel x64: a distinct public package path exists and its CI leg runs per push to main; the tag-built Intel package is never exercised on a macOS runner. | [`npm-onboarding-main`](../../.github/workflows/ci.yml) · [`release-npm.yml`](../../.github/workflows/release-npm.yml) · [README](../../README.md) | required / unknown (open blocker) |
 | B5 | Real-hardware confirmation per platform: registry install, doctor, and a first session on end-user machines. | [`releasing.md`](../../docs/reference/releasing.md) · [#805](https://github.com/OpenCoven/coven/issues/805) | deferred |
 | B6 | Any additional architecture/platform beyond the declared support matrix. | [README](../../README.md) | not applicable |
 
-B1–B4 are proven by GitHub-hosted CI on the declared OS images. **B5 is the
-external real-hardware lane**: the release runbook's fresh-consumer install
-verification (`npm install -g @opencoven/cli@X.Y.Z`, `coven --version`,
-`coven doctor` on a machine that never had Coven) is an operator step attached
-to the release record, owned by #805. B6 is justified by the support contract:
-Alpine and arm64 Linux are explicitly not claims.
+B1/B2 are proven by GitHub-hosted CI on the declared OS images for every PR
+merge commit and every push to `main`. **B3/B4 are open on purpose**: their
+per-push macOS legs are real, but the release workflow
+([`release-npm.yml`](../../.github/workflows/release-npm.yml)) builds the
+tag-built macOS packages on macOS runners and only dry-runs them on
+`ubuntu-latest` — no macOS runner executes the packaged onboarding at tag time,
+so release coverage is recorded as unknown (owner:
+[#805](https://github.com/OpenCoven/coven/issues/805)) rather than claimed. The
+support inventory in
+[`scripts/certification-matrix.mjs`](../../scripts/certification-matrix.mjs)
+encodes this as `releaseOnboardingRunner: null` for both macOS platforms.
+**B5 is the external real-hardware lane**: the release runbook's
+fresh-consumer install verification (`npm install -g @opencoven/cli@X.Y.Z`,
+`coven --version`, `coven doctor` on a machine that never had Coven) is an
+operator step attached to the release record, owned by #805. B6 is justified by
+the support contract: Alpine and arm64 Linux are explicitly not claims.
 
 ## Lane C — real harness/provider certification
 
@@ -290,10 +300,12 @@ Generate the live counts with
 `requiredPassed` / `requiredFailed` / `requiredUnknown` / `notApplicable` /
 `experimentalDisabled` / `deferred`, and `releaseBlockers` lists exactly the
 rows that keep certification open. As of support-matrix version `1.1.0` the
-open blockers are the recovery/API-boundary/docs gaps named in lanes A, D, H,
-and I — all owned by [#807](https://github.com/OpenCoven/coven/issues/807) and
-[#778](https://github.com/OpenCoven/coven/issues/778) rather than silently
-skipped.
+open blockers are the macOS release-coverage rows in lane B (owned by
+[#805](https://github.com/OpenCoven/coven/issues/805)) and the
+recovery/API-boundary/docs gaps named in lanes A, D, H, and I — all owned by
+[#807](https://github.com/OpenCoven/coven/issues/807),
+[#778](https://github.com/OpenCoven/coven/issues/778), and #805 rather than
+silently skipped.
 
 Rules for changing the matrix:
 
