@@ -88,7 +88,7 @@ async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
     throw new Error(
-      'Usage: package-github-release.mjs <verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
+      'Usage: package-github-release.mjs <verify-source-run|verify-source-run-attempt|revalidate-tag|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
     );
   }
 
@@ -121,6 +121,15 @@ async function main() {
         releaseTag: requiredOption(options, 'release-tag'),
         sourceRunId: requiredOption(options, 'source-run-id'),
         sourceRunAttempt: requiredOption(options, 'source-run-attempt')
+      });
+      return;
+    }
+    case 'revalidate-tag': {
+      await revalidateRemoteTag({
+        repository: requiredOption(options, 'repository'),
+        releaseTag: requiredOption(options, 'release-tag'),
+        expectedTagObjectSha: requiredOption(options, 'expected-tag-object-sha'),
+        expectedHeadSha: requiredOption(options, 'expected-head-sha')
       });
       return;
     }
@@ -191,6 +200,13 @@ function requiredOption(options, key) {
     throw new Error(`Missing required option --${key}.`);
   }
   return value;
+}
+
+function requireRepository(repository) {
+  if (typeof repository !== 'string' || repository.trim().length === 0) {
+    throw new Error('Refusing GitHub release: repository is required.');
+  }
+  return repository;
 }
 
 export function canonicalReleaseAssetNames(releaseTag) {
@@ -404,6 +420,32 @@ export async function verifyLatestSourceRunAttempt({
     releaseTag,
     expectedSourceRunId: normalizedSourceRunId,
     expectedSourceRunAttempt: sourceRunAttempt
+  });
+}
+
+// Point-of-mutation revalidation: immediately before any publication mutation
+// the remote tag is re-read from GitHub and compared against the verified
+// context. A moved, replaced, deleted, unsigned, or lightweight tag refuses
+// here, so a stale early authorization can never be spent on a different tag.
+export async function revalidateRemoteTag({
+  repository,
+  releaseTag,
+  expectedTagObjectSha,
+  expectedHeadSha,
+  ghApi = ghApiJson
+}) {
+  requireRepository(repository);
+  const tagRef = await ghApi(`/repos/${repository}/git/ref/tags/${encodeURIComponent(releaseTag)}`);
+  let tagObject = null;
+  if (tagRef?.object?.type === 'tag') {
+    tagObject = await ghApi(`/repos/${repository}/git/tags/${tagRef.object.sha}`);
+  }
+  return assertRemoteTagMatchesVerifiedContext({
+    releaseTag,
+    expectedTagObjectSha,
+    expectedHeadSha,
+    tagRef,
+    tagObject
   });
 }
 

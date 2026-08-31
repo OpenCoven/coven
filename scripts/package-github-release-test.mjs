@@ -12,6 +12,7 @@ import {
   captureCommandOutputToFile,
   canonicalReleaseAssetNames,
   packageGitHubRelease,
+  revalidateRemoteTag,
   resolveReleaseSource,
   syncGitHubRelease,
   verifyAnnotatedTag,
@@ -188,6 +189,87 @@ function baseTagObject() {
     }
   };
 }
+
+test('revalidateRemoteTag re-reads the remote tag and accepts the unchanged verified context', async () => {
+  const endpoints = [];
+  const ghApi = async (endpoint) => {
+    endpoints.push(endpoint);
+    if (endpoint.includes('/git/ref/tags/')) {
+      return baseTagRef();
+    }
+    return baseTagObject();
+  };
+  const context = await revalidateRemoteTag({
+    repository: 'OpenCoven/coven',
+    releaseTag: RELEASE_TAG,
+    expectedTagObjectSha: baseTagRef().object.sha,
+    expectedHeadSha: HEAD_SHA,
+    ghApi
+  });
+  assert.equal(context.tagObjectSha, baseTagRef().object.sha);
+  assert.equal(context.headSha, HEAD_SHA);
+  assert.deepEqual(endpoints, [
+    '/repos/OpenCoven/coven/git/ref/tags/v0.4.1',
+    '/repos/OpenCoven/coven/git/tags/1111111111111111111111111111111111111111'
+  ]);
+});
+
+test('revalidateRemoteTag refuses a moved, deleted, unsigned, or lightweight tag before any mutation', async () => {
+  const expectedTagObjectSha = baseTagRef().object.sha;
+  const movedRef = { ...baseTagRef(), object: { type: 'tag', sha: '2222222222222222222222222222222222222222' } };
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async (endpoint) =>
+          endpoint.includes('/git/ref/tags/')
+            ? movedRef
+            : { ...baseTagObject(), sha: movedRef.object.sha }
+      }),
+    /tag object SHA changed/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async () => {
+          throw new Error('HTTP 404: Not Found');
+        }
+      }),
+    /HTTP 404/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async () => ({ ...baseTagRef(), object: { type: 'commit', sha: HEAD_SHA } })
+      }),
+    /annotated/
+  );
+  await assert.rejects(
+    () =>
+      revalidateRemoteTag({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        expectedTagObjectSha,
+        expectedHeadSha: HEAD_SHA,
+        ghApi: async (endpoint) =>
+          endpoint.includes('/git/ref/tags/')
+            ? baseTagRef()
+            : { ...baseTagObject(), verification: { verified: false, reason: 'unsigned' } }
+      }),
+    /GitHub-verified signature/
+  );
+});
 
 function baseExistingRelease({
   tagName = RELEASE_TAG,

@@ -61,6 +61,7 @@ jobs:
       native_package_set: post-intel
       platform_matrix: ${{ steps.platform-matrix.outputs.platform_matrix }}
       head_sha: ${{ steps.tag-target.outputs.tagged_commit_sha }}
+      tag_object_sha: ${{ steps.tag-target.outputs.tag_object_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6.0.0
         with:
@@ -123,6 +124,7 @@ jobs:
             exit 1
           fi
           echo "tagged_commit_sha=$TAGGED_COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_object_sha=$TAG_OBJECT_SHA" >> "$GITHUB_OUTPUT"
           allowed_signers_raw="${NPM_RELEASE_ALLOWED_SIGNERS:-}"
           if [ -z "${allowed_signers_raw//[[:space:]]/}" ]; then
             echo "::error::Repository variable NPM_RELEASE_ALLOWED_SIGNERS must contain one or more SSH allowed-signers lines."
@@ -332,12 +334,20 @@ jobs:
     needs: [build-platform, npm-dry-run, performance-baseline, verify-tag, exact-source-gate]
     # OIDC trusted publishing: id-token:write lets the job mint a short-lived OIDC token
     # that `npm publish --provenance` exchanges with the npm registry for a one-shot
-    # publish credential. No NPM_TOKEN secret is read or written.
+    # publish credential. No NPM_TOKEN secret is read or written. actions/checks read
+    # access exists only so the point-of-mutation revalidation below can re-verify the
+    # exact-commit gate immediately before the first registry mutation.
     permissions:
       id-token: write
       contents: read
+      actions: read
+      checks: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6.0.0
+        with:
+          # The publication job runs scripts from the signed tag checkout and
+          # never pushes; no git credentials may outlive the checkout step.
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v6.0.0
         with:
           node-version: 24
@@ -391,6 +401,30 @@ jobs:
           require_package @opencoven/cli-windows
           require_package @opencoven/cli-macos-x64
           require_package @opencoven/cli-macos
+      # Point-of-mutation revalidation: the early gate (exact-source-gate) and
+      # tag verification ran minutes ago. Authorization is re-proven here,
+      # immediately before the first registry mutation, so a required check
+      # that re-ran to red, a moved/replaced tag, or a stale authorization can
+      # never be spent on a publication.
+      - name: Revalidate exact checks and signed tag immediately before publication
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.verify-tag.outputs.release_tag }}
+          HEAD_SHA: ${{ needs.verify-tag.outputs.head_sha }}
+          TAG_OBJECT_SHA: ${{ needs.verify-tag.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          node scripts/package-github-release.mjs revalidate-tag \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --expected-tag-object-sha "$TAG_OBJECT_SHA" \
+            --expected-head-sha "$HEAD_SHA"
+          node scripts/verify-release-commit-gate.mjs verify \
+            --repository "$GITHUB_REPOSITORY" \
+            --commit-sha "$HEAD_SHA" \
+            --manifest scripts/release-required-checks.json \
+            --release-tag "$RELEASE_TAG" \
+            --tag-object-sha "$TAG_OBJECT_SHA"
       - run: node scripts/publish-npm.mjs --target=linux-x64 --skip-build --publish --skip-wrapper
         env:
           COVEN_NPM_VERSION: ${{ needs.verify-tag.outputs.npm_version }}

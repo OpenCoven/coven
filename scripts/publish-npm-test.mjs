@@ -1731,6 +1731,33 @@ test('github release workflow is also locked to the stable channel', () => {
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
 
+test('npm publish revalidates the signed tag and exact checks immediately before publishing', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /tag_object_sha: \$\{\{ steps\.tag-target\.outputs\.tag_object_sha \}\}/);
+  assert.match(workflow, /TAG_OBJECT_SHA: \$\{\{ needs\.verify-tag\.outputs\.tag_object_sha \}\}/);
+  assert.match(workflow, /name: Revalidate exact checks and signed tag immediately before publication/);
+  assert.match(workflow, /package-github-release\.mjs revalidate-tag/);
+  assert.match(workflow, /--expected-tag-object-sha "\$TAG_OBJECT_SHA"/);
+  assert.match(
+    workflow,
+    /verify-release-commit-gate\.mjs verify[\s\S]*?--tag-object-sha "\$TAG_OBJECT_SHA"/
+  );
+  // The revalidation step must sit between the npm preflight reads and the
+  // first `--publish` mutation: authorization is spent at the point of use.
+  const revalidateAt = workflow.indexOf('Revalidate exact checks and signed tag immediately before publication');
+  const firstPublishAt = workflow.indexOf('--publish --skip-wrapper');
+  const preflightAt = workflow.indexOf('require_package @opencoven/cli-macos');
+  assert.ok(revalidateAt > -1 && firstPublishAt > -1 && preflightAt > -1);
+  assert.ok(preflightAt < revalidateAt && revalidateAt < firstPublishAt);
+  // The publication job must not persist checkout credentials.
+  const publishBlock = workflow.slice(workflow.indexOf('  npm-publish:'));
+  assert.match(publishBlock, /persist-credentials: false/);
+});
+
 test('releasing guide sends a partial publication forward, not backward', () => {
   const guide = readFileSync(
     new URL(['..', 'docs', 'reference', 'releasing.md'].join('/'), import.meta.url),
