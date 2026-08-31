@@ -383,30 +383,140 @@ fn backfill_definition_digests(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+struct LegacyLinkedPair {
+    occurrence_id: String,
+    run_id: String,
+    occurrence_state: String,
+    run_status: String,
+    output_commit: Option<String>,
+}
+
 fn fail_unproven_legacy_executions(conn: &Connection) -> Result<()> {
-    const REASON: &str = "legacy automation immutable snapshot unavailable";
+    const BASE_REASON: &str = "legacy automation immutable snapshot unavailable";
     let now = now_iso();
+    let pairs = {
+        let mut statement = conn
+            .prepare(
+                "SELECT o.id, r.id, o.state, r.status, r.output_commit
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.definition_json IS NULL
+                    OR r.definition_json IS NULL
+                 ORDER BY o.id, r.id",
+            )
+            .context("failed to prepare legacy linked automation reconciliation")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(LegacyLinkedPair {
+                    occurrence_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    occurrence_state: row.get(2)?,
+                    run_status: row.get(3)?,
+                    output_commit: row.get(4)?,
+                })
+            })
+            .context("failed to read legacy linked automation reconciliation")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    for pair in pairs {
+        let (delivery_state, delivery_note) = if pair.output_commit.is_some() {
+            (
+                "committed",
+                "committed delivery evidence preserved; terminal outcome remains ambiguous",
+            )
+        } else if pair.occurrence_state == "failed" && pair.run_status == "failed" {
+            (
+                "failed",
+                "coherent failed evidence excludes successful delivery",
+            )
+        } else {
+            (
+                "ambiguous",
+                "delivery outcome ambiguous; pre-ledger file delivery cannot be excluded",
+            )
+        };
+        let reason = format!(
+            "{BASE_REASON}; original occurrence={}; original run={}; \
+             reconciled outcome=failed; {delivery_note}",
+            pair.occurrence_state, pair.run_status
+        );
+        let occurrence_changed = conn
+            .execute(
+                "UPDATE automation_occurrences
+                 SET state = 'failed',
+                     failure_reason = ?2,
+                     lease_owner = NULL,
+                     lease_expires_at = NULL,
+                     delivery_state = ?3,
+                     delivery_error = ?2,
+                     updated_at = ?4
+                 WHERE id = ?1",
+                params![pair.occurrence_id, reason, delivery_state, now],
+            )
+            .with_context(|| {
+                format!(
+                    "failed to reconcile legacy occurrence {}",
+                    pair.occurrence_id
+                )
+            })?;
+        let run_changed = conn
+            .execute(
+                "UPDATE automation_runs
+                 SET status = 'failed',
+                     delivery_state = ?3,
+                     delivery_error = ?2,
+                     finished_at = COALESCE(finished_at, ?4)
+                 WHERE id = ?1",
+                params![pair.run_id, reason, delivery_state, now],
+            )
+            .with_context(|| format!("failed to reconcile legacy run {}", pair.run_id))?;
+        anyhow::ensure!(
+            occurrence_changed == 1 && run_changed == 1,
+            "legacy linked automation pair changed during reconciliation"
+        );
+    }
+
     conn.execute(
         "UPDATE automation_occurrences
              SET state = 'failed',
                  failure_reason = ?1,
                  lease_owner = NULL,
                  lease_expires_at = NULL,
+                 delivery_state = 'failed',
+                 delivery_error = ?1,
                  updated_at = ?2
              WHERE state IN ('claimed', 'running')
-               AND definition_json IS NULL",
-        params![REASON, now],
+               AND definition_json IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_runs.occurrence_id = automation_occurrences.id
+               )",
+        params![BASE_REASON, now],
     )
-    .context("failed to fail legacy occurrences without immutable snapshots")?;
+    .context("failed to fail unlinked legacy occurrences without immutable snapshots")?;
     conn.execute(
         "UPDATE automation_runs
              SET status = 'failed',
-                 finished_at = ?1
+                 delivery_state = CASE
+                     WHEN output_commit IS NOT NULL THEN 'committed'
+                     WHEN status = 'failed' THEN 'failed'
+                     ELSE 'ambiguous'
+                 END,
+                 delivery_error = ?1,
+                 finished_at = ?2
              WHERE status = 'running'
-               AND definition_json IS NULL",
-        params![now],
+               AND definition_json IS NULL
+               AND (
+                   occurrence_id IS NULL
+                   OR NOT EXISTS (
+                       SELECT 1 FROM automation_occurrences
+                       WHERE automation_occurrences.id = automation_runs.occurrence_id
+                   )
+               )",
+        params![BASE_REASON, now],
     )
-    .context("failed to fail legacy runs without immutable snapshots")?;
+    .context("failed to fail unlinked legacy runs without immutable snapshots")?;
     Ok(())
 }
 
@@ -536,6 +646,16 @@ mod tests {
     }
 
     fn insert_legacy_unsettled(conn: &Connection, definition_json: &str, occurrence_state: &str) {
+        insert_legacy_pair(conn, definition_json, occurrence_state, "running", None);
+    }
+
+    fn insert_legacy_pair(
+        conn: &Connection,
+        definition_json: &str,
+        occurrence_state: &str,
+        run_status: &str,
+        output_commit: Option<&str>,
+    ) {
         conn.execute(
             "INSERT INTO automation_definitions
                 (id, name, status, definition_json, created_at, updated_at)
@@ -557,10 +677,10 @@ mod tests {
         conn.execute(
             "INSERT INTO automation_runs
                 (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                 status, started_at)
+                 status, output_commit, started_at)
              VALUES ('legacy-run', 'legacy', 'legacy-occ', 'legacy-session', NULL,
-                     'coven-code', 'running', '2026-01-02T09:00:00.000Z')",
-            [],
+                     'coven-code', ?1, ?2, '2026-01-02T09:00:00.000Z')",
+            rusqlite::params![run_status, output_commit],
         )
         .unwrap();
     }
@@ -701,5 +821,142 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run, ("failed".to_string(), None, None));
+    }
+
+    fn migrated_legacy_pair(
+        occurrence_state: &str,
+        run_status: &str,
+        output_commit: Option<&str>,
+    ) -> (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("coherence.sqlite");
+        let mut routine = definition("legacy");
+        routine.status = RoutineStatus::Active;
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_automation_tables(&conn);
+            insert_legacy_pair(
+                &conn,
+                &serde_json::to_string(&routine).unwrap(),
+                occurrence_state,
+                run_status,
+                output_commit,
+            );
+        }
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        conn.query_row(
+            "SELECT o.state, o.failure_reason, o.delivery_state,
+                    r.status, r.delivery_state, r.delivery_error, r.output_commit
+             FROM automation_occurrences AS o
+             JOIN automation_runs AS r ON r.occurrence_id = o.id
+             WHERE o.id = 'legacy-occ'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_occurrence_failed_run_succeeded_reconciles_coherently() {
+        let migrated = migrated_legacy_pair("failed", "succeeded", None);
+
+        assert_eq!(migrated.0, "failed");
+        assert_eq!(migrated.3, "failed");
+        assert_eq!(migrated.2, "ambiguous");
+        assert_eq!(migrated.4, "ambiguous");
+        assert!(migrated.1.contains("occurrence=failed"));
+        assert!(migrated.1.contains("run=succeeded"));
+        assert!(migrated.5.contains("delivery outcome ambiguous"));
+    }
+
+    #[test]
+    fn legacy_occurrence_succeeded_run_failed_reconciles_coherently() {
+        let migrated = migrated_legacy_pair("succeeded", "failed", None);
+
+        assert_eq!(migrated.0, "failed");
+        assert_eq!(migrated.3, "failed");
+        assert_eq!(migrated.2, "ambiguous");
+        assert_eq!(migrated.4, "ambiguous");
+        assert!(migrated.1.contains("occurrence=succeeded"));
+        assert!(migrated.1.contains("run=failed"));
+        assert!(migrated.5.contains("delivery outcome ambiguous"));
+    }
+
+    #[test]
+    fn legacy_possible_delivery_before_ledger_crash_is_explicitly_ambiguous() {
+        let migrated = migrated_legacy_pair("running", "running", None);
+
+        assert_eq!(migrated.0, "failed");
+        assert_eq!(migrated.3, "failed");
+        assert_eq!(migrated.2, "ambiguous");
+        assert_eq!(migrated.4, "ambiguous");
+        assert!(migrated.1.contains("occurrence=running"));
+        assert!(migrated.1.contains("run=running"));
+        assert!(migrated.5.contains("delivery outcome ambiguous"));
+        assert_eq!(migrated.6, None);
+    }
+
+    #[test]
+    fn legacy_linked_pair_reconciliation_rolls_back_both_sides_on_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("atomic.sqlite");
+        let mut routine = definition("legacy");
+        routine.status = RoutineStatus::Active;
+        {
+            let conn = Connection::open(&path).unwrap();
+            create_legacy_automation_tables(&conn);
+            insert_legacy_pair(
+                &conn,
+                &serde_json::to_string(&routine).unwrap(),
+                "succeeded",
+                "failed",
+                None,
+            );
+            conn.execute_batch(
+                "CREATE TRIGGER reject_legacy_run_reconciliation
+                 BEFORE UPDATE ON automation_runs
+                 BEGIN
+                     SELECT RAISE(ABORT, 'synthetic legacy reconciliation failure');
+                 END;",
+            )
+            .unwrap();
+        }
+
+        let error = initialize_store(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("synthetic legacy reconciliation failure"),
+            "{error:#}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        let states: (String, String) = conn
+            .query_row(
+                "SELECT o.state, r.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE o.id = 'legacy-occ'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(states, ("succeeded".to_string(), "failed".to_string()));
     }
 }

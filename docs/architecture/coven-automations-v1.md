@@ -256,18 +256,22 @@ Digests (definition integrity, receipts, event integrity where required) are SHA
 Non-destructive, no data loss, no rewritten history:
 
 1. **Definitions:** on first contract adoption, each stored `automation_definitions` row gains sidecar columns (`revision` = 1, `integrity` = digest over its existing `definition_json` bytes, lifecycle mapping `ACTIVE → active`, `PAUSED → paused`, default `draft` for import). `definition_json` bytes stay byte-identical — the digest is computed over them, not written into them — so pre-migration rows remain verifiable.
-2. **Occurrences:** legacy terminal/planned history is preserved without
-   fabricating a snapshot. A legacy `claimed`/`running` row cannot prove which
-   historical definition revision it accepted, so migration fails it with
-   `legacy automation immutable snapshot unavailable`, clears its lease, and
-   leaves revision/digest/definition/delivery inputs null. New claims pin one
-   coherent current revision/digest and derive their deadline from that same
-   snapshot.
-3. **Runs:** legacy running rows without a provable immutable snapshot are
-   preserved and failed without delivery; current mutable definition fields
-   are never copied into them. Other historical `automation_runs` rows retain
-   their existing status/exit/log/output fields without fabricated snapshots
-   or receipts. Receipts exist only for runs that produce them after adoption.
+2. **Occurrences:** legacy planned/unlinked terminal history is preserved
+   without fabricating a snapshot. Every snapshot-less occurrence linked to a
+   run is reconciled with that run in the store initialization transaction,
+   even when one or both sides were already terminal. Both sides receive the
+   same conservative failed disposition, with their original states retained
+   in the migration reason; leases are cleared and revision/digest/definition
+   inputs remain null. New claims pin one coherent current revision/digest and
+   derive their deadline from that same snapshot.
+3. **Runs:** current mutable definition fields are never copied into legacy
+   rows. Linked run/occurrence contradictions are reconciled together rather
+   than updating only their nonterminal side. Existing `output_commit`
+   evidence remains committed; otherwise any state that cannot exclude a
+   post-file-delivery/pre-ledger crash becomes explicit `delivery_state:
+   ambiguous`, not `none`. Consistently failed pairs use `failed`. Existing
+   session/exit/log/output evidence remains in place and receipts are never
+   fabricated.
 4. **Wire compatibility:** the legacy control actions (`coven.automations.*`, `control_plane.rs`) continue to respond during migration, each response additionally carrying the contract profile; new commands are additive. `coven.automations.import` maps to `legacy.import.v1` (`source: codex-automation-toml`), keeping the non-destructive, created-PAUSED/draft semantics of `import_legacy.rs`.
 5. **Nothing is deleted:** no definitions, occurrences, or run history are erased at any step (acceptance criterion), and the migration is idempotent (re-running adopts nothing twice — the adoption table marks it).
 
