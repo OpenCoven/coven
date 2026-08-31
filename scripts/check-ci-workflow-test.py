@@ -92,7 +92,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
             RELEASE_GITHUB_TEXT.count(
                 "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}"
             ),
-            4,
+            5,
         )
         self.assertNotIn(
             "          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}",

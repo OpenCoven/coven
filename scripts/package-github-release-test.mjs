@@ -631,8 +631,44 @@ test('release-github workflow supports automatic and recovery triggers with pinn
         new RegExp(`actions/download-artifact@${DOWNLOAD_ARTIFACT_ACTION_SHA}`, 'g')
       ) ?? []
     ).length,
-    4
+    5,
+    'four source-run artifact downloads in the verification job plus the packaged-assets download in the publication job'
   );
+});
+
+test('release-github workflow splits read-only verification from the write-enabled publication job', () => {
+  const verifyJob = workflowText.slice(workflowText.indexOf('  verify-and-package:'));
+  const publishJob = workflowText.slice(workflowText.indexOf('  publish-release:'));
+  // The verification/packaging job can neither write to the repository nor
+  // keep checkout credentials, so nothing before publication is trusted with
+  // a mutation capability.
+  const verifyHeader = verifyJob.slice(0, verifyJob.indexOf('  publish-release:'));
+  assert.match(verifyHeader, /name: Verify source and package release assets/);
+  assert.match(verifyHeader, /contents: read/);
+  assert.doesNotMatch(verifyHeader, /contents: write/);
+  assert.match(verifyHeader, /persist-credentials: false/);
+  assert.match(publishJob, /contents: write/);
+  assert.match(publishJob, /persist-credentials: false/);
+  assert.match(publishJob, /needs: \[verify-and-package\]/);
+  // The publication job must re-prove authorization immediately before the
+  // mutating sync: fresh exact-commit gate evidence, the remote signed tag,
+  // and the source run attempt.
+  const revalidateAt = publishJob.indexOf('Revalidate exact checks and signed tag immediately before publication');
+  const syncAt = publishJob.indexOf('node scripts/package-github-release.mjs sync-release');
+  assert.ok(revalidateAt > -1 && syncAt > -1);
+  assert.ok(revalidateAt < syncAt);
+  assert.match(publishJob, /verify-release-commit-gate\.mjs verify[\s\S]*?--manifest verified-release-required-checks\.json/);
+  assert.match(publishJob, /package-github-release\.mjs revalidate-tag/);
+  assert.match(publishJob, /package-github-release\.mjs verify-source-run-attempt/);
+});
+
+test('release-github workflow digests the required-checks manifest from the verified source SHA', () => {
+  // Policy is data from the released commit, not whatever the default branch
+  // happens to contain at release time.
+  const occurrences = workflowText.split('git show "$HEAD_SHA:scripts/release-required-checks.json" > verified-release-required-checks.json').length - 1;
+  assert.equal(occurrences, 2, 'both the verification job and the publication job must digest the manifest from the verified SHA');
+  assert.match(workflowText, /--manifest verified-release-required-checks\.json/);
+  assert.doesNotMatch(workflowText, /--manifest scripts\/release-required-checks\.json/);
 });
 
 test('release-github workflow uses least privilege, default-branch code, and never publishes npm', () => {
