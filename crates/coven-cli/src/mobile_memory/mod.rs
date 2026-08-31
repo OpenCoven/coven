@@ -343,12 +343,116 @@ fn cancel_pending_pairing(coven_home: &Path, pairing_id: Uuid) -> &'static str {
     }
 }
 
+/// Owner-local pairing control capabilities as advertised by the daemon.
+///
+/// The field set is additive: older daemons do not serve the capabilities
+/// route at all (which this CLI treats as "no negotiated capability"), and
+/// future daemons may add fields this CLI ignores.
+#[cfg(unix)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingCapabilities {
+    api_version: u16,
+    pairing_cancellation: bool,
+}
+
+/// Negotiate the pairing control API with the daemon before creating a
+/// pairing.
+///
+/// A `coven mobile pair` process can be newer than the daemon it reaches, and
+/// the fail-closed flow below depends on the daemon-side cancel route: without
+/// it, an interrupt or error would abandon a live pairing until its deadline.
+/// The CLI therefore refuses to create a pairing unless the daemon reports the
+/// control API version this CLI was built against and declares the
+/// cancellation capability. Any transport, status, or parse failure fails
+/// negotiation the same way — a restart of the daemon recovers.
+#[cfg(unix)]
+fn validate_pairing_capabilities(status: u16, body: &str) -> Result<()> {
+    if status != 200 {
+        bail!(
+            "Coven daemon does not advertise mobile pairing capabilities (HTTP {status}); \
+             restart the daemon and retry"
+        );
+    }
+    let capabilities: LocalPairingCapabilities = serde_json::from_str(body)
+        .context("daemon returned invalid mobile pairing capabilities")?;
+    if capabilities.api_version != gateway::LOCAL_PAIRING_CONTROL_API_VERSION {
+        bail!(
+            "Coven daemon pairing control API version {} is not supported (expected {}); \
+             restart the daemon and retry",
+            capabilities.api_version,
+            gateway::LOCAL_PAIRING_CONTROL_API_VERSION
+        );
+    }
+    if !capabilities.pairing_cancellation {
+        bail!(
+            "Coven daemon does not support fail-closed pairing cancellation; \
+             restart the daemon and retry"
+        );
+    }
+    Ok(())
+}
+
+/// Cancels the pending pairing if the flow exits without reaching a terminal
+/// state or handing confirmation to the device.
+///
+/// Armed immediately after the daemon accepts pairing creation, this guard
+/// centralizes cleanup for every unexpected nonterminal exit — transport and
+/// HTTP failures, malformed status responses, unreadable stdin — so no error
+/// path can leave a live pairing behind. Paths that end in a terminal state
+/// (the pairing expired or was cancelled) or that hand off to the device
+/// (confirmation accepted) disarm the guard first.
+#[cfg(unix)]
+struct PendingPairingCleanup {
+    armed: bool,
+    cancel: Option<Box<dyn FnOnce() -> &'static str>>,
+}
+
+#[cfg(unix)]
+impl PendingPairingCleanup {
+    fn armed(coven_home: &Path, pairing_id: Uuid) -> Self {
+        let coven_home = coven_home.to_path_buf();
+        Self {
+            armed: true,
+            cancel: Some(Box::new(move || {
+                cancel_pending_pairing(&coven_home, pairing_id)
+            })),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PendingPairingCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(cancel) = self.cancel.take() {
+            let outcome = cancel();
+            eprintln!("coven mobile: pairing abandoned without confirmation; {outcome}");
+        }
+    }
+}
+
 #[cfg(unix)]
 fn run_pair_unix() -> Result<()> {
     let coven_home = crate::coven_home_dir()?;
     // The handler is restored and the flag reset when this scope exits, on
     // every path out of the pairing flow.
     let _interrupt_guard = PairingInterruptGuard::install()?;
+    // Negotiate before creating: a daemon that cannot fail closed must never
+    // be handed a live pairing.
+    let (status, body) = request_mobile_control(
+        &coven_home,
+        "GET",
+        "/api/v1/internal/mobile/capabilities",
+        "",
+    )?;
+    validate_pairing_capabilities(status, &body)?;
     let (status, body) =
         post_mobile_control(&coven_home, "/api/v1/internal/mobile/pairings", "{}")?;
     if status != 201 {
@@ -357,16 +461,26 @@ fn run_pair_unix() -> Result<()> {
     let invitation: LocalPairingInvitation =
         serde_json::from_str(&body).context("daemon returned an invalid pairing invitation")?;
     println!("{}", invitation.terminal_output);
+    // Every unexpected exit from here on retires the pairing; the guard is
+    // disarmed only by a terminal state or an accepted confirmation handoff.
+    // (A creation response whose invitation cannot be parsed never yields the
+    // pairing id, so it cannot be addressed; such a pairing relies on the
+    // daemon's own deadline, five minutes out.)
+    let mut cleanup = PendingPairingCleanup::armed(&coven_home, invitation.id);
 
     let phrase = loop {
         if Utc::now() >= invitation.expires_at {
+            cleanup.disarm();
             bail!("mobile pairing expired before the device enrolled");
         }
         if pairing_interrupted() {
             let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            cleanup.disarm();
             bail!("mobile pairing interrupted before the device enrolled; {outcome}");
         }
         let path = format!("/api/v1/internal/mobile/pairings/{}/status", invitation.id);
+        // Transport, HTTP, and parse failures here leave the pairing live in
+        // the daemon, so they fall through to the cleanup guard on bail.
         let (status, body) = post_mobile_control(&coven_home, &path, "{}")?;
         if status != 200 {
             bail!("Coven daemon rejected pairing status with HTTP {status}: {body}");
@@ -374,8 +488,16 @@ fn run_pair_unix() -> Result<()> {
         let status: LocalPairingStatus =
             serde_json::from_str(&body).context("daemon returned invalid pairing status")?;
         match status.state {
-            PairingState::Cancelled => bail!("mobile pairing was cancelled before completion"),
-            PairingState::Expired => bail!("mobile pairing expired before the device enrolled"),
+            // Terminal states need no cleanup: the pairing can no longer be
+            // enrolled or confirmed.
+            PairingState::Cancelled => {
+                cleanup.disarm();
+                bail!("mobile pairing was cancelled before completion")
+            }
+            PairingState::Expired => {
+                cleanup.disarm();
+                bail!("mobile pairing expired before the device enrolled")
+            }
             _ => {}
         }
         if let Some(phrase) = status.phrase {
@@ -397,19 +519,24 @@ fn run_pair_unix() -> Result<()> {
         // immediately; nothing else is read or sent.
         Ok(None) => {
             let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            cleanup.disarm();
             bail!("mobile pairing interrupted before host confirmation; {outcome}");
         }
         // The read itself failed, but an interrupt observed now still wins:
         // the pairing is cancelled and the process exits immediately.
         Err(_error) if pairing_interrupted() => {
             let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+            cleanup.disarm();
             bail!("mobile pairing interrupted before host confirmation; {outcome}");
         }
+        // A stdin failure without an interrupt is an unexpected nonterminal
+        // exit; the cleanup guard retires the pairing on the way out.
         Err(error) => return Err(error).context("failed to read pairing confirmation"),
     };
     if confirmation.trim() != "confirm" {
         let interrupted = pairing_interrupted();
         let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+        cleanup.disarm();
         if interrupted {
             bail!("mobile pairing interrupted; {outcome}");
         }
@@ -420,17 +547,22 @@ fn run_pair_unix() -> Result<()> {
     // confirmed.
     if pairing_interrupted() {
         let outcome = cancel_pending_pairing(&coven_home, invitation.id);
+        cleanup.disarm();
         bail!("mobile pairing interrupted before host confirmation; {outcome}");
     }
     let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
     let body = serde_json::json!({ "phrase": phrase }).to_string();
+    // A failed confirmation request leaves the pairing live, so failures here
+    // also fall through to the cleanup guard.
     let (status, response) = post_mobile_control(&coven_home, &path, &body)?;
     match status {
         200 => {
+            cleanup.disarm();
             println!("Mobile device paired.");
             Ok(())
         }
         409 => {
+            cleanup.disarm();
             println!("Host confirmed. Complete confirmation on the device before it expires.");
             Ok(())
         }
@@ -440,11 +572,21 @@ fn run_pair_unix() -> Result<()> {
 
 #[cfg(unix)]
 fn post_mobile_control(coven_home: &Path, path: &str, body: &str) -> Result<(u16, String)> {
+    request_mobile_control(coven_home, "POST", path, body)
+}
+
+#[cfg(unix)]
+fn request_mobile_control(
+    coven_home: &Path,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Result<(u16, String)> {
     use std::os::unix::net::UnixStream;
 
     let socket = crate::daemon::daemon_socket_path(coven_home);
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         body.len(),
         body
     );
@@ -481,6 +623,8 @@ mod pairing_flow_tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io::{BufRead, Read};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     /// Stdin stand-in whose reads replay a scripted sequence of byte chunks
     /// and I/O errors, so the confirmation loop can be driven without a tty.
@@ -620,5 +764,82 @@ mod pairing_flow_tests {
         let interrupt = AtomicBool::new(false);
         let line = read_confirmation_line(&mut input, &interrupt).unwrap();
         assert_eq!(line.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn pending_pairing_cleanup_cancels_once_when_still_armed_on_drop() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let cleanup = PendingPairingCleanup {
+            armed: true,
+            cancel: Some(Box::new({
+                let cancellations = Arc::clone(&cancellations);
+                move || {
+                    cancellations.fetch_add(1, Ordering::AcqRel);
+                    "the pending pairing was cancelled"
+                }
+            })),
+        };
+        drop(cleanup);
+        assert_eq!(cancellations.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn pending_pairing_cleanup_does_nothing_after_disarm() {
+        let cancellations = Arc::new(AtomicUsize::new(0));
+        let mut cleanup = PendingPairingCleanup {
+            armed: true,
+            cancel: Some(Box::new({
+                let cancellations = Arc::clone(&cancellations);
+                move || {
+                    cancellations.fetch_add(1, Ordering::AcqRel);
+                    "the pending pairing was cancelled"
+                }
+            })),
+        };
+        // Terminal state or accepted handoff: the pairing is no longer live,
+        // so dropping the guard must not touch the daemon.
+        cleanup.disarm();
+        drop(cleanup);
+        assert_eq!(cancellations.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn pairing_capabilities_reject_an_unsupported_daemon() {
+        let supported = serde_json::json!({
+            "apiVersion": gateway::LOCAL_PAIRING_CONTROL_API_VERSION,
+            "pairingCancellation": true,
+        })
+        .to_string();
+        validate_pairing_capabilities(200, &supported).unwrap();
+
+        // An older daemon does not serve the route at all.
+        let error = validate_pairing_capabilities(404, "not found").unwrap_err();
+        assert!(error.to_string().contains("capabilities"));
+
+        // A daemon speaking a different control API version.
+        let future = serde_json::json!({
+            "apiVersion": gateway::LOCAL_PAIRING_CONTROL_API_VERSION + 1,
+            "pairingCancellation": true,
+        })
+        .to_string();
+        assert!(validate_pairing_capabilities(200, &future)
+            .unwrap_err()
+            .to_string()
+            .contains("API version"));
+
+        // A daemon without the fail-closed cancellation capability.
+        let unable = serde_json::json!({
+            "apiVersion": gateway::LOCAL_PAIRING_CONTROL_API_VERSION,
+            "pairingCancellation": false,
+        })
+        .to_string();
+        assert!(validate_pairing_capabilities(200, &unable)
+            .unwrap_err()
+            .to_string()
+            .contains("fail-closed"));
+
+        // A malformed capabilities body fails negotiation rather than
+        // defaulting to "supported".
+        assert!(validate_pairing_capabilities(200, "{}").is_err());
     }
 }

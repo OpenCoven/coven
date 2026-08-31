@@ -814,12 +814,46 @@ fn active_gateway() -> Result<Arc<MobileGatewayState>> {
         .context("mobile gateway is not running")
 }
 
+/// Version of the owner-local pairing control surface. Bumped whenever the
+/// request/response contract of the internal pairing routes changes in a way
+/// the `coven mobile pair` flow must negotiate before creating a pairing.
+pub(crate) const LOCAL_PAIRING_CONTROL_API_VERSION: u16 = 1;
+
+/// Additive capability advertisement for the owner-local pairing control
+/// surface. Older daemons do not expose the route at all; older CLIs ignore
+/// it. `pairing_cancellation` declares that this daemon serves the cancel
+/// route and that cancelling a live pairing fails closed, so the CLI can
+/// refuse to create a pairing it would not be able to retire on interrupt.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingCapabilities {
+    api_version: u16,
+    pairing_cancellation: bool,
+}
+
 pub(crate) fn handle_local_control(
     method: &str,
     path: &str,
     body: Option<&str>,
 ) -> Option<Result<crate::api::ApiResponse>> {
     const ROOT: &str = "/api/v1/internal/mobile/pairings";
+    if path == "/api/v1/internal/mobile/capabilities" {
+        if method != "GET" {
+            return Some(crate::api::api_error(
+                405,
+                "method_not_allowed",
+                "Method not allowed.",
+                None,
+            ));
+        }
+        return Some(crate::api::json_response(
+            200,
+            &LocalPairingCapabilities {
+                api_version: LOCAL_PAIRING_CONTROL_API_VERSION,
+                pairing_cancellation: true,
+            },
+        ));
+    }
     if path == ROOT {
         if method != "POST" {
             return Some(crate::api::api_error(
@@ -1170,6 +1204,28 @@ mod tests {
             serde_json::Value::Null
         );
         assert!(!temp.path().join("mobile/pairings.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_control_advertises_pairing_cancellation_capability() {
+        // The advertisement is static: it does not require a running mobile
+        // gateway, and it must be served before any pairing is created.
+        let response = handle_local_control("GET", "/api/v1/internal/mobile/capabilities", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let capabilities: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            capabilities["apiVersion"],
+            serde_json::json!(LOCAL_PAIRING_CONTROL_API_VERSION)
+        );
+        assert_eq!(capabilities["pairingCancellation"], serde_json::json!(true));
+
+        let rejected = handle_local_control("POST", "/api/v1/internal/mobile/capabilities", None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rejected.status, 405);
     }
 
     #[cfg(unix)]
