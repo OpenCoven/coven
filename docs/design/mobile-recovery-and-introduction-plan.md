@@ -597,7 +597,18 @@ The proof is bound to:
 
 The authority verifies the proof in the normative order of `mobile-assurance-step-up-v1.md` and computes effective assurance itself — `min(requested_assurance, enrolled-class ceiling)` — requiring at least `fresh_user_verification` (ceiling `fresh_biometric` where the platform enforces biometric-only policy) for a `trusted-device` approval to count. Fail-closed: an absent, expired, replayed, or invalid proof means the approval does not count; a trusted-device approval can never be counted on the strength of its possession-key signature. The passcode-fallback rule is preserved: passcode fallback is representable only as `fresh_user_verification`, never `fresh_biometric` (threat model: "Biometric exfiltration or false representation"). The biometric itself never enters the protocol — only signatures cross the trust boundary.
 
-### 4.4 Introduction state machine
+### 4.4 Delegated authority of approvers and scope caps
+
+Signatures and approval counts alone do not authorize enrollment: an approval carries authority only from the approver's **current, active grant**. Before any approval is counted, the authority MUST, for every approver:
+
+1. **Resolve the approver to an active grant.** `approver.keyId` must resolve to a registered device whose active `DeviceGrant` matches `approverGrantId` and the proof's `grantId`/`revocationEpoch` (and trust-domain epoch, §6.2). Unresolved, revoked, expired, or epoch-stale ⇒ the approval does not count. An `owner-root` approver signs with the owner root credential instead and holds the full capability vocabulary by definition.
+2. **Check the delegation capability.** A `trusted-device` approver MUST hold `devices.enroll` in that active grant. No other capability, factor kind, or attestation attribute confers enrollment authority; a recovery provider (a role that exists only in recovery ceremonies, §6) can never approve an introduction.
+3. **Cap scopes to delegable authority.** The delegable authority of a `trusted-device` approver is exactly the capability set of its active grant; the delegable authority of an `owner-root` approver is the full capability vocabulary. The grant issued to the introduced device MUST satisfy `issuedScopes ⊆ ⋂ delegable(approver)` over every counted approval. Because the transcript commits to the exact `requestedScopes` (§4.2), a scope outside some approver's delegable set makes quorum unreachable — the introduction is denied with an error naming the missing delegation, not silently narrowed.
+4. **Issue from the grant template.** The issued grant's capabilities, `minimum_assurance`, restrictions, and expiry come from the transcript's grant template, re-verified at completion (§4.5); the authority never widens a grant beyond what was committed and delegated.
+
+An approver whose grant is revoked, expired, or epoch-bumped after signing but before completion fails the re-check at completion — collected approvals do not outlive their grant.
+
+### 4.5 Introduction state machine
 
 ```text
 drafted
@@ -606,7 +617,8 @@ drafted
 requested ── expiresAt / cancel / malformed ──▶ terminal (erased)
   │ approvals collected (one or more, per policy)
   ▼
-approved ── authority verifies + counts ──▶ denied → terminal (RecoveryEvent: recovery_denied)
+approved ── authority verifies proofs, delegated authority
+           (§4.4), counts ──▶ denied → terminal (RecoveryEvent: recovery_denied)
   │ transcript re-verified at authority
   ▼
 enrolling
@@ -619,9 +631,10 @@ Rules:
 
 - Nonces are single-use and bounded; expired requests are pruned like pairing invitations (`PairingManager::prune_expired`, `pairing.rs`).
 - Approval counting happens only in the authority layer; a relay, the account service, or the requesting endpoint can never count its own approvals.
+- Approval counting is preceded by the delegated-authority checks of §4.4: approvers without a currently valid enrollment authority never reach the count, regardless of valid signatures.
 - The completed introduction is auditable: the authority appends a `RecoveryEvent` with `kind: access_restored` (for recovery paths) or extends the device lifecycle events in `audit.rs` with the introduction outcome.
 
-### 4.5 One device or N-of-M? (issue checkbox 3)
+### 4.6 One device or N-of-M? (issue checkbox 3)
 
 **Recommendation:** one fresh-step-up trusted device is sufficient by default; root-level policy can require N-of-M.
 
@@ -633,7 +646,9 @@ Rules:
 
 Alternatives considered: (a) always N-of-M — rejected as the default because a sole owner with one phone could never bootstrap; (b) always 1 — rejected for root-level classes because it concentrates trust in one device; (c) time-delayed approval (24 h cooling) — kept as an optional owner knob, not a default. The policy knob lives in `RecoveryPolicy.introductionPolicy`; the owner decides; the authority enforces.
 
-### 4.6 Compromised relay / account service (issue checkbox 4)
+Quorum counting rules: approvals are distinct only when made by distinct device keys under distinct active grants (one device approving twice counts once, including re-approval after a transcript change); the requesting endpoint can never be its own approver; and every counted approval must independently pass the delegated-authority checks of §4.4.
+
+### 4.7 Compromised relay / account service (issue checkbox 4)
 
 The property to hold: **a compromised relay or account service alone cannot enroll an endpoint.**
 
@@ -650,7 +665,7 @@ The property to hold: **a compromised relay or account service alone cannot enro
 | --- | --- | --- |
 | Optional OpenCoven account sign-in | WebAuthn/passkey ceremony against the (optional) account provider | Account-session only; no Coven authority |
 | Account/recovery authentication | Passkey ceremony as one `passkey_account` factor | Counts toward `RecoveryPolicy.recoveryFactors` |
-| Remote enrollment authorization | Account-authenticated session *initiates* an introduction request delivery | Still requires trusted-device/owner approvals (§4.6) |
+| Remote enrollment authorization | Account-authenticated session *initiates* an introduction request delivery | Still requires trusted-device/owner approvals (§4.7) |
 | Approving a new installation from an already trusted device | Passkey as an additional factor on the approving device, never a substitute for its device key | Assurance attribute at most |
 | Cross-platform browser/native login | Standard WebAuthn; platform-neutral | Account-session only |
 
@@ -702,7 +717,7 @@ RecoveryEvent(kind: access_restored,         RecoveryEvent(kind: identity_rotate
 Invariants:
 
 - Recovery NEVER rotates, deletes, or rewrites familiar identity or memory (threat-model invariant: "Revoking a device does not rotate or destroy familiar identity").
-- Rotation is always explicit: it requires the root-level threshold (§4.5), produces `RecoveryEvent` records with `rotatesIdentity: true`, bumps `revocation_epoch` (the same epoch semantics `DeviceGrant` and `registry.rs` already use to invalidate pre-rotation state), and is refused while any recovery ceremony is mid-flight.
+- Rotation is always explicit: it requires the root-level threshold (§4.6), produces `RecoveryEvent` records with `rotatesIdentity: true`, bumps `revocation_epoch` (the same epoch semantics `DeviceGrant` and `registry.rs` already use to invalidate pre-rotation state), and is refused while any recovery ceremony is mid-flight.
 - Every step of both ceremonies appends `RecoveryEvent` records to the same private append-only audit stream as `audit.rs` — recovery events and key rotations are explicit and auditable.
 
 ### 6.3 Golden example — recovery event after a lost laptop
@@ -773,7 +788,7 @@ With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transac
 | --- | --- |
 | Normal conversation | Valid enrolled device: device key + live `DeviceGrant` (`possession`) — `auth.rs` request verification path |
 | Tool approval | Enrolled device + fresh local user verification — `DeviceActionIntent` with `require_fresh_user_verification_for` restriction (`grant.rs`) |
-| Secrets/root administration | Hardware-backed or attested device and/or second factor when `attestationPolicy.requireFor` / `rootMinApprovals` say so (§4.5, §7.2) |
+| Secrets/root administration | Hardware-backed or attested device and/or second factor when `attestationPolicy.requireFor` / `rootMinApprovals` say so (§4.6, §7.2) |
 | New-device enrollment | Fresh step-up on an existing trusted device; threshold approval per `introductionPolicy`; optionally attested approvers (§4) |
 
 ## 9. Threat-model deltas
@@ -781,7 +796,7 @@ With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transac
 Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening any existing control:
 
 - **Compromised trusted device**: can introduce one scoped endpoint within `expiresAt`; root-level classes require `rootMinApprovals ≥ 2` distinct approvers; the epoch bump and audit trail bound and expose the damage; owner revokes via the existing `registry.revoke` path.
-- **Passkey/account provider compromise**: cannot enroll endpoints (§4.6); cannot read or forge E2EE sessions; can at most request attention.
+- **Passkey/account provider compromise**: cannot enroll endpoints (§4.7); cannot read or forge E2EE sessions; can at most request attention.
 - **Attestation forgery**: verifier compromise yields only assurance attributes, which cannot mint authority; owner policy that never sets `requireFor` is unaffected.
 - **Recovery-ceremony phishing**: transcript-bound `COVEN-ASSURANCE/1` proofs with server-issued single-use challenges make collected approvals useless for any other request; recovery events are user-visible in `coven memory mobile status` output (which already surfaces device/grant state, `registry.list_status`).
 
@@ -792,9 +807,9 @@ Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening 
 | Recover/enroll remotely without exposing familiar/root private material to OpenCoven infrastructure | §4.1 (transcript-bound approvals), §5.1, §6.1 (recovery key stays owner-held); grants issued locally by the authority |
 | Synced passkeys do not masquerade as physical-device identity | §5.2 prohibitions; `subject_key_id` remains the pairwise device key |
 | Attestation increases assurance without breaking the open/self-hosted model | §7.2; `unattested_device` full participation; no mandatory proprietary dependency |
-| A compromised account service alone cannot mint arbitrary device authority | §4.6; threat-model invariant 8 |
+| A compromised account service alone cannot mint arbitrary device authority | §4.7; threat-model invariant 8 |
 | Recovery events and identity/key rotations are explicit and auditable | §3.4 `RecoveryEvent`, §6.2 ceremonies, §6.3 example; same audit stream as `audit.rs` |
-| Owner can choose stricter policies without imposing proprietary platforms on every Coven | §3.3 `RecoveryPolicy`, §4.5 defaults, §7.2 policy knobs |
+| Owner can choose stricter policies without imposing proprietary platforms on every Coven | §3.3 `RecoveryPolicy`, §4.6 defaults, §7.2 policy knobs |
 
 ## 11. Implementation staging
 
@@ -813,7 +828,7 @@ Merge gates: the repository gates (`cargo fmt --check`, `cargo clippy --workspac
 | --- | --- | --- |
 | Who may approve an introduction | Trusted-device keys and the owner root credential, after delegated authority is checked (§4.4) | Account service as approver — rejected (invariant 8); relay as approver — rejected; recovery-provider approvals — rejected (no enrollment authority, §4.4) |
 | Fresh step-up authentication | `COVEN-ASSURANCE/1` proof by the step-up authorization key over the introduction transcript, bound to grant/epoch and a server-issued single-use challenge (§4.3) | Client-asserted assurance enum — rejected (a possession-key signature cannot mint assurance; same rationale as #815/#871) |
-| 1 vs N-of-M | 1 by default, N-of-M for root classes via owner policy (§4.5) | Always-N — locks out single-device owners; always-1 — concentrates root trust |
+| 1 vs N-of-M | 1 by default, N-of-M for root classes via owner policy (§4.6) | Always-N — locks out single-device owners; always-1 — concentrates root trust |
 | Passkey → familiar root | Never; account-layer factor only (§5.2) | Synced-passkey-as-root — rejected by issue and architecture |
 | Recovery default factors | recovery key + passkey account + surviving trusted device (§6.1) | Hosted Shamir/social recovery — deferred (privacy tradeoff, needs its own threat model); security questions — rejected |
 | WebAuthn prf-derived owner keys | Deferred | Ties the owner root to account-provider availability; revisit only with an explicit owner opt-in |
