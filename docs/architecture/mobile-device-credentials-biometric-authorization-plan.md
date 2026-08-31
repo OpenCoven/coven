@@ -365,46 +365,100 @@ The host never asks the device "is the user verified?"; it demands a `COVEN-ASSU
 
 The issue's example fields map as: `operation: deploy`, `target: production-eu`, `repository`, `commit`, `effect: modifies production` → `operation` + `target` strings and the `effect_digest`; `nonce` and the short deadline are first-class validated fields.
 
-### 7.2 Presentation binding and the mobile UI MUST
+The gap: `effect_digest` is an opaque, client-contracted digest — the descriptor format it hashes is unspecified (decision point D5). The phone can render `operation` and `target`, but it cannot render `repository`, `commit`, or the effect text from a digest, so it cannot verify that what it displays is what it signs; display/authorize substitution on exactly those fields is undetectable on the device. §7.2 resolves D5 by folding the effect descriptor into one canonical typed transaction.
+
+### 7.2 Canonical typed transaction (`COVEN-ACTION/2`) — D5 resolution
+
+The #786 exact-action contract is **one canonical typed transaction**, `COVEN-ACTION/2`, superseding `COVEN-ACTION/1`'s opaque `effect_digest` for new implementations. Every displayed material field is a typed transaction field; nothing the user approves exists only as a digest of an unspecified input.
+
+Framing follows the repo's canonical-byte conventions: `"COVEN-ACTION/2\0"` then each field as a u32 big-endian length followed by its bytes — the same discipline as `DeviceActionIntent::canonical_bytes` and `COVEN-ASSURANCE/1`. Fields, in order:
+
+| # | Field | Encoding | Displayed |
+| --- | --- | --- | --- |
+| 1 | `device_id` | raw 16-byte UUID | actor reference (grant/device binding) |
+| 2 | `grant_id` | raw 16-byte UUID | actor reference (grant/device binding) |
+| 3 | `revocation_epoch` | u64 big-endian | validity/replay binding (§5.5) |
+| 4 | `scope` | UTF-8 snake-form `DeviceScope` | yes |
+| 5 | `operation` | UTF-8, ≤ 64 chars, `[a-z0-9._-]` | yes |
+| 6 | `target` | UTF-8, ≤ 512, trimmed, no control chars | yes |
+| 7 | `effect` | UTF-8 canonical JSON effect descriptor (below) | yes |
+| 8 | `request_digest` | raw 32-byte SHA-256 | binding only |
+| 9 | `presentation_digest` | raw 32-byte SHA-256 | binding only |
+| 10 | `nonce` | raw 32 bytes | yes (hex in this plan's vector; wire encoding is canonical base64url) |
+| 11 | `issued_at` | RFC 3339 UTC, millisecond precision | yes |
+| 12 | `expires_at` | RFC 3339 UTC, millisecond precision | yes (deadline) |
+
+- **Typed effect descriptor.** `effect` is canonical JSON (lexicographically sorted keys, no insignificant whitespace) with a closed schema (`additionalProperties: false`): `verbs` (non-empty array), `repository`, `commitIds` (array), and `summary` — for the deploy example exactly `{"commitIds":["abc1234"],"repository":"OpenCoven/psyche","summary":"modifies production","verbs":["deploy"]}`. Repository, commit ids, effect verbs, and the effect summary are therefore transaction fields the phone renders and signs; unknown effect members are rejected like any other unknown protocol value. The diagnostic effect schema ships next to `transaction-authorization.schema.json` in the implementation slice.
+- **Request binding.** `request_digest` = SHA-256 over the exact `COVEN-MEMORY/1` canonical request bytes that carried the transaction — recomputed by the server, never client-asserted (the same discipline as the `COVEN-ASSURANCE/1` context digest) — tying the approval to the request that submitted it.
+- **Presentation binding.** `presentation_digest` = SHA-256 over the canonical human-readable rendering (§7.3), as required by `transaction-authorization.schema.json` alongside `requestDigest`.
+- **Replay state.** The `nonce` plus a server-side consumption record make the transaction single-use: the server atomically marks `(device_id, grant_id, revocation_epoch, nonce)` consumed on acceptance — the same single-winner discipline as the challenge spend and `auth.rs::insert_nonce` — persisted so a daemon restart cannot resurrect it, inside the ≤ 300 s window (`MAX_ACTION_LIFETIME_SECONDS`). Grant replacement or revocation invalidates outstanding transaction state (§5.5 epoch rule).
+- **Authorization.** The transaction rides in the body of a possession-authenticated request: the `COVEN-MEMORY/1` signature covers it through the body digest, and `request_digest` binds the transaction to that exact request. Operations whose grant policy requires fresh verification additionally carry a `COVEN-ASSURANCE/1` `action`-mode proof (§6.3) whose server-recomputed `context_digest` is SHA-256 of these canonical transaction bytes; for `action` mode the proof window nests inside the transaction window. The host re-derives the canonical bytes from the received fields and verifies; any mismatch — including a display/authorize substitution — fails verification.
+
+### 7.3 Presentation binding and the mobile UI MUST
 
 The threat-model adversary "compromised middleware that changes an action after showing approval UI" is neutralized by a two-digest contract:
 
 1. **`presentationDigest`** — SHA-256 over the canonical human-readable rendering (exact field set rendered by the UI). The `TransactionAuthorization` diagnostic schema (`spec/device-pairing/v1/transaction-authorization.schema.json`) requires it alongside `requestDigest`.
-2. The mobile UI MUST render every material field covered by the signed digest — operation, target, effect, nonce, expiry — and MUST obtain its display strings from the same canonical object it signs. A UI that renders from any other source (push body, relay-provided preview, cached text) violates the contract.
+2. The mobile UI MUST render every material field covered by the transaction digests — operation, target, effect (verbs, repository, commit ids, summary), nonce, expiry — and MUST obtain its display strings from the same canonical transaction object it signs (§7.2). A UI that renders from any other source (push body, relay-provided preview, cached text) violates the contract.
 
 Golden test (required by Gate D and `mobile-device-pairing-v1.md` "Required security tests: transaction presentation/signature mismatch"): mutate any presented field after rendering and verify verification fails.
 
-### 7.3 Worked golden example
+### 7.4 Worked golden example
 
-Canonical action (issue's deploy example), computed with the exact `COVEN-ACTION/1` scheme from `grant.rs` (values are fixed so the vector is reproducible; the implementation should lock it alongside the shared protocol library vectors):
+Canonical `COVEN-ACTION/2` transaction (the issue's deploy example; values are fixed so the vector is reproducible from this text alone):
 
 ```text
-DeviceActionIntent {
-  version      = 1
-  scope        = tool_execution_approve
-  operation    = deploy.production
-  target       = production-eu
-  effect_digest = 34c6b1407e8785fb55c6e330dd844f74239fccf56df4db8ad0a5de5de9986aff
-                  (SHA-256 of "deploy|production-eu|OpenCoven/psyche|abc1234|modifies production")
-  nonce        = 3066336331653634613962323464356538633766306131643265336234633564
-  issued_at    = 2026-08-30T15:00:00.000Z
-  expires_at   = 2026-08-30T15:02:00.000Z        (120 s ≤ 300 s cap)
-}
+device_id            = 00000000-0000-4000-8000-00000000000a
+grant_id             = 0b6f2864-c085-57aa-93a0-a2634f3b946c
+                       (uuidv5(device_id, "coven-device-grant-v3:1") — §5.5 succession naming)
+revocation_epoch     = 0
+scope                = tool_execution_approve
+operation            = deploy.production
+target               = production-eu
+effect               = {"commitIds":["abc1234"],"repository":"OpenCoven/psyche","summary":"modifies production","verbs":["deploy"]}
+                       (canonical JSON: sorted keys, no whitespace — every displayed effect field present)
+request_digest       = 1111111111111111111111111111111111111111111111111111111111111111
+                       (synthetic fixed vector input; real values are the server-recomputed
+                       SHA-256 of the COVEN-MEMORY/1 canonical request that carried the
+                       transaction, never a client-asserted digest)
+presentation_digest  = 334d917e2208ea2a5e20a75aac4135fe4696da5d4d754dc1f5729276a8edd264
+                       (SHA-256 of the canonical rendering below, trailing newline included)
+nonce                = 30663363316536346139623234643565386337663061316432653362346335643630
+                       (the 32 ASCII bytes "0fc1e4a9b24d5e8c7f0a1d2e3b4c5d60"; displayed to
+                       the user in hex, this vector's convention)
+issued_at            = 2026-08-30T15:00:00.000Z
+expires_at           = 2026-08-30T15:02:00.000Z        (120 s ≤ 300 s cap)
 
 canonical bytes (hex):
-434f56454e2d414354494f4e2f310000000016746f6f6c5f657865637574696f6e5f617070726f766500000011
-6465706c6f792e70726f64756374696f6e0000000d70726f64756374696f6e2d65750000002b4e4d6178514836
-486866745678754d773359525064434f667a505674394e754b304b586558656d596176380000002b4d47597a59
-7a466c4e6a52684f5749794e4751315a54686a4e3259775954466b4d6d557a596a526a4e575100000018323032
-362d30382d33305431353a30303a30302e3030305a00000018323032362d30382d33305431353a30323a30302e
-3030305a
+434f56454e2d414354494f4e2f3200000000100000000000004000800000000000000
+a000000100b6f2864c08557aa93a0a2634f3b946c0000000800000000000000000000
+0016746f6f6c5f657865637574696f6e5f617070726f7665000000116465706c6f792
+e70726f64756374696f6e0000000d70726f64756374696f6e2d65750000006c7b2263
+6f6d6d6974496473223a5b2261626331323334225d2c227265706f7369746f7279223
+a224f70656e436f76656e2f707379636865222c2273756d6d617279223a226d6f6469
+666965732070726f64756374696f6e222c227665726273223a5b226465706c6f79225
+d7d000000201111111111111111111111111111111111111111111111111111111111
+11111100000020334d917e2208ea2a5e20a75aac4135fe4696da5d4d754dc1f572927
+6a8edd264000000203066633165346139623234643565386337663061316432653362
+34633564363000000018323032362d30382d33305431353a30303a30302e3030305a0
+0000018323032362d30382d33305431353a30323a30302e3030305a
 
-intent digest = SHA-256(canonical) = 4e87a8e1cc1276cf654ddfe520694042f893e9e66dfc10b6ae608a119a2bb464
+transaction digest = SHA-256(canonical) = 3919f1957068dec15460e244181204357f959f685a3f6018fffa543c932b8fbe
 ```
 
-Digests and the nonce are shown in hex; the protocol encodes these fields as canonical base64url (`URL_SAFE_NO_PAD` in `grant.rs` — the hex and base64url forms are the same bytes). The effect digest above is `SHA-256("deploy|production-eu|OpenCoven/psyche|abc1234|modifies production")` and the nonce is the 32-byte ASCII encoding of the fixed test value, chosen for reproducibility.
+The `presentation_digest` input — the canonical rendering the phone displays (trailing newline included; the nonce is shown in hex):
 
-The device signs those canonical bytes; the host re-derives them from the received fields and verifies. Every displayed field (operation, target, effect, nonce, expiry) is inside the digest, so display/authorize substitution is detected.
+```text
+operation  deploy.production
+target     production-eu
+repository OpenCoven/psyche
+commit     abc1234
+effect     modifies production
+nonce      3066633165346139623234643565386337663061316432653362346335643630
+expires    2026-08-30T15:02:00.000Z
+```
+
+Every displayed field — operation, target, repository, commit ids, effect verbs and summary, nonce, expiry — is inside the transaction digest, so display/authorize substitution is detected on the device. Digests and the nonce are shown in hex; the protocol encodes these fields as canonical base64url (`URL_SAFE_NO_PAD` in `grant.rs` — the hex and base64url forms are the same bytes). The implementation locks this vector (canonical bytes + digests) alongside the shared protocol library vectors; the `COVEN-ACTION/1` scheme and its tests remain the current-code baseline in `grant.rs`.
 
 ## 8. Device management
 
@@ -517,7 +571,7 @@ Platform credential (device-side, where the platform allows):
 Authority (Rust, host-side — citable paths for the test file locations):
 
 - grant: subject binding, scope-set canonicality, time windows, assurance floor per restricted scope (existing tests in `grant.rs`; extend for the five-level vocabulary and the split familiar-memory scopes);
-- transaction: canonical-byte binding for every field; operation/target charset and length limits; lifetime ≤ 300 s; nonce replay rejection at the intent layer;
+- transaction: `COVEN-ACTION/2` canonical-byte binding for every field, including each effect member (repository, commit ids, verbs, summary); operation/target charset and length limits; closed canonical effect JSON (unknown members rejected); lifetime ≤ 300 s; single-use nonce consumption — replay, post-restart, and post-grant-replacement submissions rejected;
 - stolen-grant-without-key: replayed grant bytes without the private key fail `verify_signature` (existing path in `auth.rs`);
 - revocation: mid-session revocation defeats `ensure_still_active` (epoch mismatch);
 - step-up: `COVEN-ASSURANCE/1` verification order — challenge single-use/expired/unknown/foreign-device/foreign-epoch rejection, possession-key-as-authorization-key rejection, `effective = min(requested, enrolled class ceiling)`, fail-closed `AssuranceRequired` on any proof failure, and `ensure_still_active` reusing the effective assurance at effect time (per `mobile-assurance-step-up-v1.md`'s adversarial test list);
@@ -539,7 +593,7 @@ Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
 | Assurance above possession is proven, never asserted | §4.7, §6.1, §6.3 (`COVEN-ASSURANCE/1`: separate authorization key, server-issued single-use challenge, server-recomputed context, server-computed effective assurance, revalidation at effect time) |
 | Copying a grant/token without the device private key cannot authenticate | §2.1 (already enforced: ECDSA over canonical request against enrolled public key; `GrantError::SubjectMismatch`), §5.4 |
 | Revoking the phone invalidates its authority without rotating familiar/root identities | §8.3, §9.2 (epoch + `revoked_at`), registry revoke path; familiar identity is a distinct subject (`mobile-device-trust.md` credential table) |
-| High-risk approvals are nonce-bound, expiring, replay-resistant, transaction-specific | §7 (`DeviceActionIntent` canonicalization, 300 s cap, 32-byte nonce, replay cache, tests) |
+| High-risk approvals are nonce-bound, expiring, replay-resistant, transaction-specific | §7 (`COVEN-ACTION/2` canonical typed transaction: every displayed field, request/presentation digests, 300 s cap, 32-byte nonce, single-use replay state, tests) |
 | Policy distinguishes biometric-only from device-credential fallback | §4.2–§4.4, §5.3 (five-level vocabulary), §6.2 (platform matrix) |
 | Self-hosted deployments need no OpenCoven cloud account | §12 |
 
@@ -549,7 +603,7 @@ Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
 - **D2 — Add `fresh_user_verification` to the spec assurance enum.** Recommended (§5.3); the implementation and accepted architecture already carry five levels. Alternative: drop `fresh_user_verification` from Rust — loses the documented recent/fresh distinction and forces passcode fallback into the biometric tier.
 - **D3 — Split `familiar_memory_admin` into read/write scopes.** Recommended (least privilege; `capabilities.json` already models both). Alternative: keep the coarse scope and rely on transaction authorization for writes — weaker and inconsistent with the capability taxonomy.
 - **D4 — `coven device` command tree vs `coven memory mobile devices`.** Recommended new top-level tree with alias window (§8.1). Alternative: leave as-is and document; the issue names the `device` verbs explicitly, so deferral only moves the rename later.
-- **D5 — Effect-descriptor canonicalization.** The `effect_digest` input format is unspecified (client contract). Recommended: define a canonical effect JSON (operation, targets, effect verbs, commit ids) digested with SHA-256, documented next to the action-intent vector; the golden example fixes one concrete input so vectors are reproducible.
+- **D5 — Effect-descriptor canonicalization (resolved in this revision).** Resolved as **one canonical typed transaction**: `COVEN-ACTION/2` (§7.2) makes every displayed material field — repository, commit ids, effect verbs, summary — a transaction field, adds `request_digest`/`presentation_digest`, and carries replay state (nonce + server-side single-use consumption bound to device, grant, and epoch). Alternative considered and rejected: keep the opaque `effect_digest` and only specify its input format — the phone still could not render and verify what it signs.
 - **D6 — Where assurance policy lives.** Recommended: policy is encoded in the grant at issuance (`restrictions.requiredAssurance` / `require_fresh_user_verification_for`), defaults derived from capability risk classes; per-host policy file as a later extension. Alternatives: per-request policy headers (widens the wire contract), device-side policy (unenforceable — the device would grade its own homework).
 - **D7 — Grant algorithm profile.** Keep P-256/ECDSA for device keys (matches iOS Secure Enclave and Android hardware keystores; already used end-to-end in `auth.rs`/`grant.rs`); Ed25519 remains the portable software-identity profile per `mobile-device-pairing-v1.md`. Alternative: Ed25519 device keys via platform support where available — rejected for v1 to keep one interoperability profile.
 - **D8 — Audit event extensibility.** Recommended: extend `MobileAuditEvent` in place (new variants, unchanged record shape) rather than versioning the JSONL format; the redaction test stays the invariant guard.
@@ -576,7 +630,7 @@ Conformance (spec level, feeding `spec/device-pairing/v1/test-vectors.json`):
 | Capability taxonomy (all ten listed classes) | §5.2 |
 | Assurance levels 1–4 | §6.1, §6.2 |
 | Transaction authorization, exact canonical action | §7 |
-| Mobile UI renders digest-covered fields | §7.2 |
+| Mobile UI renders digest-covered fields | §7.3 |
 | `coven device list/inspect/rename/revoke` | §8.1 |
 | Grant scope editing/reissuance | §5.5 |
 | Key rotation/re-enrollment | §5.6 |
