@@ -179,10 +179,13 @@ Created by each **approving device** (or the owner root credential) after a fres
       "description": "COVEN-ASSURANCE/1 step-up proof by the approver's enrolled step-up authorization key (mobile-assurance-step-up-v1.md). Fresh user verification is proven, never asserted; see §4.3.",
       "$ref": "#/$defs/assuranceProof"
     },
-    "attestation": {
-      "description": "Optional assurance attributes held by the approver, minimally included when policy requires them.",
+    "attestationClaims": {
+      "description": "Optional verifier-signed AttestationClaims held by the approver, minimally included when policy requires them. Attributes are never self-asserted: each claim MUST verify under the owner-pinned verifier anchor (§7.2) and the §7.1 attribute/evidence matrix.",
       "type": "array", "uniqueItems": true,
-      "items": { "enum": ["verified_official_app", "verified_hardware_key"] }
+      "items": {
+        "type": "object",
+        "description": "An AttestationClaim per §3.5 (spec/device-pairing/v2/attestation-claim.schema.json)."
+      }
     },
     "issuedAt": { "type": "integer", "minimum": 0 },
     "expiresAt": { "type": "integer", "minimum": 0 },
@@ -286,16 +289,59 @@ Owner-controlled policy document, stored and interpreted by the authority layer 
     "attestationPolicy": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["default", "requireFor"],
+      "required": ["default", "requireFor", "verifiers"],
       "properties": {
         "default": { "enum": ["ignore", "prefer"] },
         "requireFor": {
+          "description": "Per-operation required attributes: an operation listed here may proceed only when the acting device key carries a valid claim (§3.5) for EVERY attribute in the entry. Failure is closed and names the missing attribute.",
           "type": "array", "uniqueItems": true,
-          "items": { "enum": ["secrets_read", "identity_admin", "devices_enroll", "devices_revoke", "identity_export", "memory_export"] }
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation", "attributes"],
+            "properties": {
+              "operation": { "enum": ["secrets_read", "identity_admin", "devices_enroll", "devices_revoke", "identity_export", "memory_export"] },
+              "attributes": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": { "enum": ["verified_official_app", "verified_hardware_key"] }
+              }
+            }
+          }
+        },
+        "verifiers": {
+          "description": "Owner-pinned attestation-verifier trust anchors for this trust domain (§7.2). An empty list means no verifier is trusted: verified_* claims cannot be validated and requireFor MUST be empty.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["verifierId", "publicKey", "validFrom", "validUntil"],
+            "properties": {
+              "verifierId": { "type": "string", "minLength": 4, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+              "publicKey": { "$ref": "#/$defs/keyReference" },
+              "keyEpoch": {
+                "description": "Monotonic per verifierId; incremented on rotation.",
+                "type": "integer", "minimum": 1
+              },
+              "validFrom": { "type": "integer", "minimum": 0 },
+              "validUntil": { "type": "integer", "minimum": 0 }
+            }
+          }
         }
       }
     },
     "updatedAt": { "type": "integer", "minimum": 0 }
+  },
+  "$defs": {
+    "keyReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "keyId", "publicKey"],
+      "properties": {
+        "algorithm": { "enum": ["Ed25519", "P-256"] },
+        "keyId": { "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$" },
+        "publicKey": { "type": "string", "minLength": 43, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$" }
+      }
+    }
   }
 }
 ```
@@ -356,7 +402,7 @@ Append-only audit record, same storage discipline as `audit.jsonl` in `audit.rs`
 
 ### 3.5 AttestationClaim
 
-An **assurance attribute** bound to a device key inside one trust domain. It is evidence about the app/key environment, never an identity, and never sufficient by itself for anything.
+An **assurance attribute** bound to a device key inside one trust domain. It is evidence about the app/key environment, never an identity, and never sufficient by itself for anything. Only the attestation verifier mints a claim — attributes are never self-asserted — and a claim is valid only under the owner-pinned verifier trust anchor (§7.2) and the §7.1 attribute/evidence matrix.
 
 ```json
 {
@@ -365,20 +411,36 @@ An **assurance attribute** bound to a device key inside one trust domain. It is 
   "title": "OpenCoven AttestationClaim v1 diagnostic JSON representation",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "attribute", "evidence", "subject", "audience", "nonce", "issuedAt", "expiresAt", "verifierSignature"],
+  "required": ["version", "attribute", "evidence", "subject", "audience", "nonce", "verifierId", "verifierKeyId", "claimRef", "issuedAt", "expiresAt", "verifierSignature"],
   "properties": {
     "version": { "const": 1 },
-    "attribute": { "enum": ["verified_official_app", "verified_hardware_key", "unattested_device"] },
+    "attribute": {
+      "description": "Only positively verified attributes are claims. unattested_device is the default classification of every device without a claim; it is never signed and never appears in a claim.",
+      "enum": ["verified_official_app", "verified_hardware_key"]
+    },
     "evidence": {
-      "enum": ["apple_app_attest", "android_key_attestation", "android_play_integrity", "self_declared", "none"]
+      "description": "Evidence kind the verifier evaluated. Valid attribute/evidence combinations are normative (§7.1); a claim outside the matrix is invalid regardless of signature validity.",
+      "enum": ["apple_app_attest", "android_key_attestation", "android_play_integrity"]
     },
     "subject": { "$ref": "#/$defs/keyReference" },
     "audience": { "$ref": "#/$defs/identityReference" },
     "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "verifierId": {
+      "description": "Stable identifier of the attestation verifier that evaluated the evidence; must match a verifier pinned by the owner in RecoveryPolicy.attestationPolicy.verifiers (§7.2).",
+      "type": "string", "minLength": 4, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "verifierKeyId": {
+      "description": "keyId of the verifier signing key; must match an active pinned anchor key whose [validFrom, validUntil] window covers issuedAt (§7.2).",
+      "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"
+    },
+    "claimRef": {
+      "description": "Opaque verifier-side reference (e.g. receipt or evidence-log id) for audit lookup. Carries no attestation payload and no hardware, serial, or account identifiers (privacy rule 7).",
+      "type": "string", "minLength": 8, "maxLength": 128, "pattern": "^[A-Za-z0-9._:-]+$"
+    },
     "issuedAt": { "type": "integer", "minimum": 0 },
     "expiresAt": { "type": "integer", "minimum": 0 },
     "verifierSignature": {
-      "description": "Signature of the attestation verifier over OpenCoven/AttestationClaim/v1 canonical bytes.",
+      "description": "Signature of the attestation verifier over OpenCoven/AttestationClaim/v1 canonical bytes; MUST verify under the pinned anchor key named by verifierId/verifierKeyId.",
       "type": "string", "pattern": "^[A-Za-z0-9_-]+$"
     }
   },
@@ -489,7 +551,7 @@ export interface IntroductionApproval {
   approverRole: 'trusted-device' | 'owner-root';
   approverGrantId?: string; // required for trusted-device approvers (delegated authority, §4.4)
   assuranceProof: AssuranceProof;
-  attestation?: Exclude<AttestationAttribute, 'unattested_device'>[];
+  attestationClaims?: AttestationClaim[]; // verifier-signed; never self-asserted (§3.5, §7.1)
   issuedAt: number;
   expiresAt: number;
   signature: string;
@@ -509,7 +571,11 @@ export interface RecoveryPolicy {
   };
   recoveryFactors: RecoveryFactor[];
   recoveryThreshold?: { of: number; minimum: number };
-  attestationPolicy: { default: 'ignore' | 'prefer'; requireFor: AttestationPolicyClass[] };
+  attestationPolicy: {
+    default: 'ignore' | 'prefer';
+    requireFor: AttestationRequirement[];
+    verifiers: AttestationVerifierAnchor[];
+  };
   updatedAt: number;
 }
 
@@ -530,16 +596,40 @@ export interface RecoveryEvent {
   occurredAt: number;
 }
 
+/**
+ * A verifier-signed attestation claim. `unattested_device` is the default
+ * classification of a device without a claim — it is never signed and never
+ * appears in a claim. (attribute, evidence) combinations are normative (§7.1);
+ * validity requires a pinned verifier anchor (§7.2).
+ */
 export interface AttestationClaim {
   version: 1;
-  attribute: AttestationAttribute;
-  evidence: 'apple_app_attest' | 'android_key_attestation' | 'android_play_integrity' | 'self_declared' | 'none';
+  attribute: Exclude<AttestationAttribute, 'unattested_device'>;
+  evidence: 'apple_app_attest' | 'android_key_attestation' | 'android_play_integrity';
   subject: KeyReference;
   audience: { type: 'trust-domain' | 'installation'; id: string };
   nonce: string;
+  verifierId: string; // must match a pinned verifier anchor (§7.2)
+  verifierKeyId: string; // must match an active anchor key whose window covers issuedAt
+  claimRef: string; // opaque verifier-side evidence reference (privacy rule 7)
   issuedAt: number;
   expiresAt: number;
   verifierSignature: string;
+}
+
+/** RecoveryPolicy.attestationPolicy.verifiers[] — owner-pinned trust anchor. */
+export interface AttestationVerifierAnchor {
+  verifierId: string;
+  publicKey: KeyReference;
+  keyEpoch?: number; // monotonic per verifierId; incremented on rotation
+  validFrom: number; // unix seconds
+  validUntil: number; // unix seconds
+}
+
+/** RecoveryPolicy.attestationPolicy.requireFor[] — per-operation required attributes. */
+export interface AttestationRequirement {
+  operation: AttestationPolicyClass;
+  attributes: Exclude<AttestationAttribute, 'unattested_device'>[]; // ALL of these required
 }
 ```
 
@@ -750,17 +840,36 @@ Canonical snake_case values match `restrictions.attestation` in `spec/device-pai
 | `verified_official_app` | App binary provenance verified (e.g. Apple App Attest; Android Play integrity signals) | `apple_app_attest`, `android_play_integrity` |
 | `verified_hardware_key` | Key is hardware-protected (e.g. Secure Enclave; Android hardware-backed Keystore attestation) | `apple_app_attest` key assurance, `android_key_attestation` |
 
-Mapping notes: Apple App Attest and Android key attestation are evaluated by an optional verifier component; OpenCoven protocol surfaces see only the resulting `AttestationClaim` — opaque receipts, no attestation payloads, per privacy rule 7 ("attestation values are minimized to policy-relevant assurance claims").
+Mapping notes: Apple App Attest and Android key attestation are evaluated by an optional verifier component; OpenCoven protocol surfaces see only the resulting `AttestationClaim` — opaque receipts (`claimRef`), no attestation payloads, per privacy rule 7 ("attestation values are minimized to policy-relevant assurance claims").
 
-### 7.2 Policy integration and the open trust model
+The **attribute/evidence combination matrix is normative**. A claim whose `(attribute, evidence)` pair is outside the matrix is invalid, fail-closed, regardless of a valid verifier signature:
+
+| Attribute | Valid evidence | Invalid combinations (rejected) |
+| --- | --- | --- |
+| `verified_official_app` | `apple_app_attest`, `android_play_integrity` | everything else — in particular `self_declared`/`none`, and `android_key_attestation` (proves key protection, not app provenance) |
+| `verified_hardware_key` | `apple_app_attest` key assurance, `android_key_attestation` | everything else — in particular `self_declared`/`none` and Play-integrity-only signals (device integrity, not key hardware protection) |
+| `unattested_device` | — (never a claim) | a signed `unattested_device` claim is invalid by definition; self-built clients simply hold no claim |
+
+`self_declared` is therefore not expressible anywhere in the protocol: it names, in documentation only, the absence of a claim.
+
+### 7.2 Verifier trust anchors
+
+`verified_*` attributes are minted only by an attestation verifier, and a verifier means a key the **owner pinned** — never a self-declaration and never an unnamed signature:
+
+- **Identity.** Each verifier has a stable `verifierId` within the trust domain; its signing keys are pinned by the owner in `RecoveryPolicy.attestationPolicy.verifiers` as `{verifierId, publicKey, keyEpoch, validFrom, validUntil}` (§3.3). A claim is valid only if (a) `verifierId`/`verifierKeyId` match a pinned anchor, (b) the anchor's `[validFrom, validUntil]` window covers the claim's `issuedAt`, and (c) `verifierSignature` verifies under that anchor's public key. All three checks re-run against the **current** policy at every gated operation — a claim cache never outlives an anchor change (§11 7d).
+- **Rotation.** The replacement key is published with `keyEpoch + 1` and a `validFrom` no later than the old key's `validUntil`; the overlap keeps claims verifiable continuously while bounding the retired key's minting horizon (overlap SHOULD be ≤ 30 days). After `validUntil`, claims signed by the retired key fail regardless of signature validity. Rotation changes only the signing key, never attribute semantics.
+- **Compromise.** Removing an anchor invalidates that verifier's outstanding claims at the next evaluation; the owner should also re-issue or shorten the affected claim horizons. Verifier compromise mints no authority — only the attributes owner policy chooses to require (§7.3).
+- **Self-hosted / open model.** An owner may pin any verifier implementation that produces the same claim format — including their own — or pin none: with an empty `verifiers` list, `verified_*` claims cannot exist, `requireFor` MUST be empty, and every device is simply `unattested_device` (full participation, no proprietary dependency).
+
+### 7.3 Policy integration and the open trust model
 
 - Absence of attestation is **not** a protocol failure: `unattested_device` is a full participant subject to owner policy (threat model: "Attestation lock-in" controls).
-- `attestationPolicy.default` is `prefer` or `ignore`; `requireFor` may name only high-risk capabilities (`secrets_read`, `identity_admin`, device enrollment/revocation, exports) and only the owner can set it.
-- Attestation never replaces proof of possession, owner delegation, or local user verification; it can only *add* assurance to an operation that already passed those checks.
+- `attestationPolicy.default` is `prefer` or `ignore`; `requireFor` entries name one high-risk operation each (`secrets_read`, `identity_admin`, device enrollment/revocation, exports) and the exact attributes required for it (§3.3), and only the owner can set the policy.
+- Attestation never replaces proof of possession, delegated authority (§4.4), owner delegation, or local user verification; it can only *add* assurance to an operation that already passed those checks.
 - Attestation claims are audience-bound to one trust domain and expire; they cannot correlate a device across Covens (privacy rules 1 and 8).
-- Self-hosted deployments can run their own verifier or none at all; nothing in the protocol requires a proprietary service.
+- Self-hosted deployments can run their own verifier or none at all (§7.2); nothing in the protocol requires a proprietary service.
 
-### 7.3 Golden example — policy-gated secrets approval
+### 7.4 Golden example — policy-gated secrets approval
 
 ```json
 {
@@ -774,13 +883,16 @@ Mapping notes: Apple App Attest and Android key attestation are evaluated by an 
   },
   "audience": { "type": "trust-domain", "id": "trust-alpha" },
   "nonce": "nonce-nonce-nonce-nonce-nonce-nonce-nonce-n",
+  "verifierId": "trust-alpha.attest-verifier",
+  "verifierKeyId": "trust-alpha.attest-verifier.key-2026-01",
+  "claimRef": "claim-claim-claim-claim-claim-claim-cla",
   "issuedAt": 1790000000,
   "expiresAt": 1790086400,
   "verifierSignature": "sig-sig-sig-sig-sig-sig-sig-sig-sig-sig-sig-s"
 }
 ```
 
-With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transaction touching a `secrets_read`-scoped grant (see `DeviceActionIntent`, `grant.rs`) succeeds only when the approving device key carries a valid `verified_hardware_key` or `verified_official_app` claim. The same transaction from an `unattested_device` key fails with a policy error that names the missing attribute — never a generic denial.
+With `attestationPolicy.requireFor: [{"operation": "secrets_read", "attributes": ["verified_hardware_key"]}]` and `verifiers` pinning `trust-alpha.attest-verifier`, a `tools.approve` transaction touching a `secrets_read`-scoped grant (see `DeviceActionIntent`, `grant.rs`) succeeds only when the approving device key carries a valid `verified_hardware_key` claim — verifier-signed under the pinned anchor, inside the matrix above, unexpired. The same transaction from an `unattested_device` key, or with a claim from an unpinned or retired verifier key, fails with a policy error that names the missing attribute — never a generic denial.
 
 ## 8. Policy examples (issue table, mapped)
 
@@ -788,7 +900,7 @@ With `attestationPolicy.requireFor: ["secrets_read"]`, a `tools.approve` transac
 | --- | --- |
 | Normal conversation | Valid enrolled device: device key + live `DeviceGrant` (`possession`) — `auth.rs` request verification path |
 | Tool approval | Enrolled device + fresh local user verification — `DeviceActionIntent` with `require_fresh_user_verification_for` restriction (`grant.rs`) |
-| Secrets/root administration | Hardware-backed or attested device and/or second factor when `attestationPolicy.requireFor` / `rootMinApprovals` say so (§4.6, §7.2) |
+| Secrets/root administration | Hardware-backed or attested device and/or second factor when `attestationPolicy.requireFor` / `rootMinApprovals` say so (§4.6, §7.3) |
 | New-device enrollment | Fresh step-up on an existing trusted device; threshold approval per `introductionPolicy`; optionally attested approvers (§4) |
 
 ## 9. Threat-model deltas
@@ -797,7 +909,7 @@ Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening 
 
 - **Compromised trusted device**: can introduce one scoped endpoint within `expiresAt`; root-level classes require `rootMinApprovals ≥ 2` distinct approvers; the epoch bump and audit trail bound and expose the damage; owner revokes via the existing `registry.revoke` path.
 - **Passkey/account provider compromise**: cannot enroll endpoints (§4.7); cannot read or forge E2EE sessions; can at most request attention.
-- **Attestation forgery**: verifier compromise yields only assurance attributes, which cannot mint authority; owner policy that never sets `requireFor` is unaffected.
+- **Attestation forgery**: verifier compromise yields only assurance attributes, which cannot mint authority; owner policy that never sets `requireFor` is unaffected. Attributes are never self-asserted: a claim is valid only under an owner-pinned verifier anchor and the normative attribute/evidence matrix (§7.1, §7.2), so an unpinned or retired verifier signature is worthless, and removing an anchor invalidates a compromised verifier's claims at the next evaluation.
 - **Recovery-ceremony phishing**: transcript-bound `COVEN-ASSURANCE/1` proofs with server-issued single-use challenges make collected approvals useless for any other request; recovery events are user-visible in `coven memory mobile status` output (which already surfaces device/grant state, `registry.list_status`).
 
 ## 10. Acceptance criteria mapping
@@ -806,10 +918,10 @@ Extends `docs/security/mobile-device-pairing-threat-model.md` without weakening 
 | --- | --- |
 | Recover/enroll remotely without exposing familiar/root private material to OpenCoven infrastructure | §4.1 (transcript-bound approvals), §5.1, §6.1 (recovery key stays owner-held); grants issued locally by the authority |
 | Synced passkeys do not masquerade as physical-device identity | §5.2 prohibitions; `subject_key_id` remains the pairwise device key |
-| Attestation increases assurance without breaking the open/self-hosted model | §7.2; `unattested_device` full participation; no mandatory proprietary dependency |
+| Attestation increases assurance without breaking the open/self-hosted model | §7.3; `unattested_device` full participation; no mandatory proprietary dependency |
 | A compromised account service alone cannot mint arbitrary device authority | §4.7; threat-model invariant 8 |
 | Recovery events and identity/key rotations are explicit and auditable | §3.4 `RecoveryEvent`, §6.2 ceremonies, §6.3 example; same audit stream as `audit.rs` |
-| Owner can choose stricter policies without imposing proprietary platforms on every Coven | §3.3 `RecoveryPolicy`, §4.6 defaults, §7.2 policy knobs |
+| Owner can choose stricter policies without imposing proprietary platforms on every Coven | §3.3 `RecoveryPolicy`, §4.6 defaults, §7.3 policy knobs |
 
 ## 11. Implementation staging
 
@@ -832,7 +944,7 @@ Merge gates: the repository gates (`cargo fmt --check`, `cargo clippy --workspac
 | Passkey → familiar root | Never; account-layer factor only (§5.2) | Synced-passkey-as-root — rejected by issue and architecture |
 | Recovery default factors | recovery key + passkey account + surviving trusted device (§6.1) | Hosted Shamir/social recovery — deferred (privacy tradeoff, needs its own threat model); security questions — rejected |
 | WebAuthn prf-derived owner keys | Deferred | Ties the owner root to account-provider availability; revisit only with an explicit owner opt-in |
-| Attestation requirement | Optional, policy-gated, per-operation (§7.2) | Global mandatory attestation — rejected (breaks self-built/self-hosted clients) |
+| Attestation requirement | Optional, policy-gated, per-operation (§7.3) | Global mandatory attestation — rejected (breaks self-built/self-hosted clients) |
 | Attestation value space | Reuse the v1 grant restriction enum (§7.1) | New vocabulary — rejected (fragmentation, migration cost) |
 | Where the account factor lives | Optional external provider; protocol sees only abstract factor kinds (§5) | First-party required account — rejected; protocol-embedded account — out of scope for this repo |
 
@@ -842,6 +954,7 @@ Implementation PRs must add, at minimum:
 
 - deterministic CBOR/COSE vectors for each new object (canonical-encoding suite, `conformance-manifest.json` suites);
 - negative tests: transcript substitution, scope substitution, expired/single-use nonce replay, threshold bypass, approval-for-another-request, unknown attribute/evidence values (fail closed), attestation claim expiry;
+- attestation trust-anchor tests: claim outside the §7.1 matrix rejected even with a valid verifier signature; claim from an unpinned `verifierId` or retired `verifierKeyId` rejected; anchor rotation overlap window honored and `validUntil` enforced; removing an anchor invalidates outstanding claims at the next gated operation; per-operation `requireFor` enforcement (attribute subsets do not satisfy an entry); empty-`verifiers` policy accepted only with empty `requireFor`;
 - `COVEN-ASSURANCE/1` proof tests: challenge single-use/atomic consumption, proof replay, proof bound to a different transcript, proof against a stale grant or revocation epoch, possession-key signature offered as a step-up proof (must fail), expired proof window, effective assurance computed server-side (claimed level above the enrolled-class ceiling is capped);
 - integration tests with a malicious relay/account shim: no enrollment without valid approvals; account service compromise reduces to a no-op on the authority path;
 - privacy tests: no passkey credential IDs, attestation receipts, hardware IDs, or biometric metadata in any protocol object, audit record, or log line (extends `scripts/check-coven-privacy.py` coverage);
