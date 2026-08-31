@@ -58,7 +58,7 @@
   ],
   "runner": {
     "entry": "runner/conformance.mjs",
-    "usage": "node conformance/automations/runner/conformance.mjs --profile all --target reference-oracle --report reports/last-run.json",
+    "usage": "node conformance/automations/runner/conformance.mjs --profile all --target reference-oracle --report conformance/automations/reports/last-run.json",
     "agentCheckFast": "node conformance/automations/runner/conformance.mjs --profile structural --fuzz 200"
   }
 }

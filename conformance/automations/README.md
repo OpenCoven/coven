@@ -139,8 +139,12 @@ to a stable finding code with subject ids, a redacted observation, and exact
 safe next steps — read-only unless an explicitly guarded operation is
 requested (`--dry-run` review first, `--expected-state` guards for retries).
 No diagnostic ever recommends deleting rows or blindly rerunning ambiguous
-mutating work. The diagnostics vectors under `vectors/diagnostics/` prove
-each finding code end to end.
+mutating work. The diagnostics vectors under `vectors/diagnostics/` prove 7 of
+the 14 finding codes in `schemas/diagnostics.doctor.v1.schema.json` end to end
+(`runs.ambiguous-outcome`, `runs.quarantined`, `runs.repeated-failures`,
+`scheduler.no-leader`, `scheduler.stale-pass`, `delivery.commit-failures`,
+`occurrences.due-backlog`); the remaining seven are contract-defined and land
+with the slice-2 vector backlog.
 
 ## CI interface
 

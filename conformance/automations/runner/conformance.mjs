@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Coven automations conformance runner (coven.automations.conformance v1).
 //
-//   node conformance.mjs --profile all --target reference --report reports/last-run.json
+//   node conformance.mjs --profile all --target reference --report conformance/automations/reports/last-run.json
 //
 // Standalone and dependency-free: loads the versioned manifest, schemas, and
 // vectors, validates every vector against the envelope schema, and executes
