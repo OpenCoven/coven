@@ -9,7 +9,10 @@
   "policy": {
     "aggregate_run": "The CI workflow run for the exact release SHA must exist on main, be completed, and conclude success. Routed jobs legitimately skip by path classification, but any job failure fails the run conclusion, so a green run on the exact SHA proves every job that ran succeeded. A green run for an ancestor SHA or any unrelated workflow is insufficient.",
     "strict": "Runs on every push to main. For the exact release SHA the check must exist, be completed, and conclude success. Missing, skipped, in-flight, cancelled, or otherwise non-success is rejected.",
-    "routed": "Routed by scripts/classify-ci-changes.py. Absent or skipped for the exact release SHA is legitimate path classification; any other non-success conclusion is rejected."
+    "routed": "Routed by scripts/classify-ci-changes.py. Absent or skipped for the exact release SHA is legitimate path classification; any other non-success conclusion is rejected.",
+    "pr_only": "Jobs gated on the pull_request event. They never run for a push-to-main release SHA, so they are never release evidence; the gate refuses any observed job that is not declared strict or routed. They are listed so the manifest stays a complete, auditable map of every CI job.",
+    "pr_gate": "The pull-request merge contract (branch protection), kept separate from the release contract above. Branch protection requires the PR gate aggregate plus the jobs that run unconditionally on pull requests; the release strict/routed sets are enforced by the release gate, not by merge requirements. Release-only jobs (if: github.event_name == 'push') never run on pull requests and MUST NOT be required for merge.",
+    "completeness": "strict_checks + routed_checks + pr_only_checks + pr_gate must name every job in .github/workflows/ci.yml exactly once. Removing or renaming a CI job without updating the manifest fails the contract tests, and the release gate refuses any undeclared job it observes in the selected run."
   },
   "strict_checks": [
     { "name": "Classify changes", "job_id": "changes" },
@@ -31,5 +34,16 @@
     { "name": "AFS mount backend (Linux)", "job_id": "afs-mount-linux" },
     { "name": "Channels package", "job_id": "channels" },
     { "name": "OpenClaw bridge", "job_id": "openclaw-bridge" }
-  ]
+  ],
+  "pr_only_checks": [
+    { "name": "npm onboarding smoke (linux-x64)", "job_id": "npm-onboarding-pr" },
+    { "name": "npm onboarding smoke (windows)", "job_id": "npm-onboarding-pr" }
+  ],
+  "pr_gate": {
+    "aggregate_check": { "name": "PR gate", "job_id": "pr-gate" },
+    "required_checks": [
+      { "name": "Classify changes", "job_id": "changes" },
+      { "name": "Policy guard", "job_id": "policy-guard" }
+    ]
+  }
 }

@@ -198,6 +198,153 @@ test('manifest: rejects entries missing a job_id binding', () => {
   assert.throws(() => loadRequiredChecksManifest(text), /job_id must be a non-empty string/);
 });
 
+test('manifest: loads pr_only checks and the pr_gate merge policy from the real manifest', () => {
+  assert.ok(REAL_MANIFEST.pr_only_checks.length > 0);
+  assert.equal(REAL_MANIFEST.pr_gate.aggregate_check.name, 'PR gate');
+  assert.equal(REAL_MANIFEST.pr_gate.aggregate_check.job_id, 'pr-gate');
+  assert.ok(REAL_MANIFEST.pr_gate.required_checks.length > 0);
+  // Job identity is disjoint across the policy dimensions even when the
+  // display name repeats across event scopes (npm onboarding smoke matrix).
+  const releaseJobIds = new Set(
+    [...REAL_MANIFEST.strict_checks, ...REAL_MANIFEST.routed_checks].map((entry) => entry.job_id)
+  );
+  for (const entry of REAL_MANIFEST.pr_only_checks) {
+    assert.ok(!releaseJobIds.has(entry.job_id), `pr-only job ${entry.job_id} must be separate from release jobs`);
+  }
+  for (const entry of [...REAL_MANIFEST.pr_gate.required_checks, REAL_MANIFEST.pr_gate.aggregate_check]) {
+    assert.ok(!releaseJobIds.has(entry.job_id) || entry.job_id === 'changes' || entry.job_id === 'policy-guard');
+  }
+  // The PR gate aggregate itself is a pull_request-only job.
+  assert.ok(!releaseJobIds.has('pr-gate'));
+});
+
+test('manifest: rejects a job_id that is both a release required check and PR-only', () => {
+  const base = JSON.parse(readFileSync(realManifestPath, 'utf8'));
+  const collide = JSON.stringify({
+    ...base,
+    pr_only_checks: [{ name: 'Policy guard', job_id: 'policy-guard' }]
+  });
+  assert.throws(
+    () => loadRequiredChecksManifest(collide),
+    /cannot be both a release required check and PR-only/
+  );
+});
+
+test('manifest: accepts the same check name in push and pull_request scopes (matrix legs)', () => {
+  // npm onboarding smoke runs the same display names on both events via two
+  // different jobs; evidence is run-scoped, so this is not ambiguity.
+  const mainLeg = REAL_MANIFEST.strict_checks.filter((entry) => entry.job_id === 'npm-onboarding-main');
+  const prLeg = REAL_MANIFEST.pr_only_checks.filter((entry) => entry.job_id === 'npm-onboarding-pr');
+  assert.ok(mainLeg.length > 0 && prLeg.length > 0);
+  assert.ok(prLeg.every((entry) => mainLeg.some((other) => other.name === entry.name)));
+});
+
+// --- Manifest completeness: nothing can silently narrow the required sets ---
+
+function parseCiJobs(ciText) {
+  const lines = ciText.split('\n');
+  const jobsIndex = lines.findIndex((line) => line === 'jobs:');
+  assert.ok(jobsIndex >= 0, 'ci.yml must declare jobs');
+  const jobs = [];
+  let current = null;
+  for (const line of lines.slice(jobsIndex + 1)) {
+    const jobMatch = /^  ([a-zA-Z0-9_-]+):\s*$/.exec(line);
+    if (jobMatch) {
+      current = { job_id: jobMatch[1], text: [] };
+      jobs.push(current);
+      continue;
+    }
+    if (/^[a-zA-Z#]/.test(line) && current) {
+      break;
+    }
+    if (current) {
+      current.text.push(line);
+    }
+  }
+  return jobs.map(({ job_id, text }) => ({ job_id, block: text.join('\n') }));
+}
+
+function expectedCiCheckNames(ciText) {
+  const names = [];
+  for (const { job_id, block } of parseCiJobs(ciText)) {
+    const nameMatch = /^ {4}name: (.+)$/m.exec(block);
+    assert.ok(nameMatch, `job ${job_id} must declare a display name`);
+    const rawName = nameMatch[1].trim();
+    const matrixMatch = /\$\{\{\s*matrix\.npm-target\s*\}\}/.exec(rawName);
+    if (matrixMatch) {
+      let prefix = rawName.split('${{')[0].trim();
+      if (prefix.endsWith('(')) {
+        prefix = prefix.slice(0, -1).trim();
+      }
+      const targets = [...block.matchAll(/npm-target: ([a-z0-9-]+)/g)].map((match) => match[1]);
+      assert.ok(targets.length > 0, `job ${job_id} matrix targets not found`);
+      for (const target of targets) {
+        names.push({ name: `${prefix} (${target})`, job_id });
+      }
+    } else {
+      names.push({ name: rawName, job_id });
+    }
+  }
+  return names;
+}
+
+test('manifest: covers every CI job exactly once — the required sets cannot silently narrow', () => {
+  const ciText = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  const expected = expectedCiCheckNames(ciText);
+  const expectedNamesByJobId = new Map();
+  for (const entry of expected) {
+    expectedNamesByJobId.set(entry.job_id, [...(expectedNamesByJobId.get(entry.job_id) ?? []), entry.name]);
+  }
+  const manifestEntries = [
+    ...REAL_MANIFEST.strict_checks,
+    ...REAL_MANIFEST.routed_checks,
+    ...REAL_MANIFEST.pr_only_checks,
+    REAL_MANIFEST.pr_gate.aggregate_check,
+    ...REAL_MANIFEST.pr_gate.required_checks
+  ].filter(Boolean);
+
+  // (a) Every manifest entry must be bound to a real CI job by its real name.
+  const manifestJobIds = new Set();
+  for (const entry of manifestEntries) {
+    const expectedNames = expectedNamesByJobId.get(entry.job_id);
+    assert.ok(
+      expectedNames?.includes(entry.name),
+      `manifest entry ${JSON.stringify(entry.name)} (${entry.job_id}) does not match ci.yml`
+    );
+    manifestJobIds.add(entry.job_id);
+  }
+  // (b) Every CI job must be claimed by the manifest (strict, routed, pr-only,
+  // or pr-gate) — dropping an entry can no longer silently narrow the sets.
+  for (const jobId of expectedNamesByJobId.keys()) {
+    assert.ok(manifestJobIds.has(jobId), `ci.yml job ${jobId} is missing from the required-checks manifest`);
+  }
+  // (c) Per job, the claimed names must not exceed the real expanded names.
+  for (const jobId of manifestJobIds) {
+    const claimed = new Set(
+      manifestEntries.filter((entry) => entry.job_id === jobId).map((entry) => entry.name)
+    );
+    for (const name of claimed) {
+      assert.ok(
+        expectedNamesByJobId.get(jobId).includes(name),
+        `manifest claims unexpected name ${JSON.stringify(name)} for job ${jobId}`
+      );
+    }
+  }
+});
+
+test('manifest: pr_gate merge checks are disjoint from push-only release jobs', () => {
+  const ciText = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  // Release-only jobs are conditioned on the push event and must never be
+  // required for merge, or pull requests could never satisfy them.
+  for (const entry of [...REAL_MANIFEST.pr_gate.required_checks, REAL_MANIFEST.pr_gate.aggregate_check]) {
+    const jobBlock = parseCiJobs(ciText).find((job) => job.job_id === entry.job_id)?.block ?? '';
+    assert.ok(
+      !/if: \$\{\{.*github\.event_name == 'push'/.test(jobBlock),
+      `pr_gate entry ${entry.name} must not be bound to a push-only job`
+    );
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Exact source acceptance — aggregate run
 // ---------------------------------------------------------------------------

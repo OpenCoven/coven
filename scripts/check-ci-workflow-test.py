@@ -229,6 +229,50 @@ class CheckCiWorkflowTests(unittest.TestCase):
                 else:
                     self.assertIn(f"name: {entry['name']}", block)
 
+    def _ci_job_ids(self) -> list[str]:
+        # Top-level job keys under `jobs:` (two-space indentation), scanning
+        # from the `jobs:` line so `on:` trigger keys are not picked up.
+        lines = CI_TEXT.splitlines()
+        start = next(i for i, line in enumerate(lines) if line.strip() == "jobs:")
+        return re.findall(r"^  ([a-zA-Z0-9_-]+):\s*$", "\n".join(lines[start + 1:]), flags=re.MULTILINE)
+
+    def test_required_checks_manifest_covers_every_ci_job(self) -> None:
+        # Complete expected sets: strict + routed (release gate) + pr-only +
+        # pr-gate (merge gate) must claim every CI job. Removing a manifest
+        # entry can no longer silently narrow what a release depends on, and
+        # an undeclared job refuses the release at the gate.
+        manifest_entries = (
+            MANIFEST["strict_checks"]
+            + MANIFEST["routed_checks"]
+            + MANIFEST.get("pr_only_checks", [])
+            + ([MANIFEST["pr_gate"]["aggregate_check"]] if MANIFEST.get("pr_gate", {}).get("aggregate_check") else [])
+            + MANIFEST.get("pr_gate", {}).get("required_checks", [])
+        )
+        manifest_job_ids = {entry["job_id"] for entry in manifest_entries}
+        ci_job_ids = set(self._ci_job_ids())
+        self.assertTrue(ci_job_ids, "no jobs parsed from ci.yml")
+        self.assertEqual(
+            manifest_job_ids - ci_job_ids,
+            set(),
+            "manifest entries bound to jobs that do not exist in ci.yml",
+        )
+        self.assertEqual(
+            ci_job_ids - manifest_job_ids,
+            set(),
+            "ci.yml jobs missing from the required-checks manifest",
+        )
+        # The PR merge policy must stay separate from the release policy:
+        # push-only jobs (if: github.event_name == 'push') never run on pull
+        # requests, so requiring them for merge would deadlock merges.
+        pr_gate_entries = (
+            ([MANIFEST["pr_gate"]["aggregate_check"]] if MANIFEST.get("pr_gate", {}).get("aggregate_check") else [])
+            + MANIFEST.get("pr_gate", {}).get("required_checks", [])
+        )
+        for entry in pr_gate_entries:
+            with self.subTest(pr_gate_check=entry["name"], job=entry["job_id"]):
+                block = self._job_block(CI_TEXT, entry["job_id"])
+                self.assertNotIn("github.event_name == 'push'", block)
+
     def test_gate_script_consumes_manifest_source_workflow(self) -> None:
         gate_script = (pathlib.Path(__file__).resolve().parents[1] / 'scripts' / 'verify-release-commit-gate.mjs').read_text(encoding='utf-8')
         self.assertIn("manifest.source_workflow", gate_script)

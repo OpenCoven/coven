@@ -116,6 +116,8 @@ export function loadRequiredChecksManifest(manifestText) {
   }
   const strictChecks = parseCheckEntries(parsed.strict_checks, 'strict_checks', { allowEmpty: false });
   const routedChecks = parseCheckEntries(parsed.routed_checks, 'routed_checks', { allowEmpty: true });
+  const prOnlyChecks = parseCheckEntries(parsed.pr_only_checks ?? [], 'pr_only_checks', { allowEmpty: true });
+  const prGate = parsePrGatePolicy(parsed.pr_gate);
   const strictNames = new Set(strictChecks.map((entry) => entry.name));
   for (const entry of routedChecks) {
     if (strictNames.has(entry.name)) {
@@ -124,13 +126,55 @@ export function loadRequiredChecksManifest(manifestText) {
       );
     }
   }
+  // Check names may repeat across event scopes (e.g. the npm onboarding smoke
+  // matrix exists on both pull requests and push), because evidence is always
+  // bound to one selected run. What must stay disjoint is the job identity:
+  // a job cannot be simultaneously a release required check and PR-only.
+  const releaseJobIds = new Set(
+    [...strictChecks, ...routedChecks].map((entry) => entry.job_id)
+  );
+  for (const entry of prOnlyChecks) {
+    if (releaseJobIds.has(entry.job_id)) {
+      throw new Error(
+        `Refusing release commit gate: job ${JSON.stringify(entry.job_id)} cannot be both a release required check and PR-only.`
+      );
+    }
+  }
   return {
     schema: parsed.schema,
     source_workflow: sourceWorkflow,
     policy: typeof parsed.policy === 'object' && parsed.policy !== null ? parsed.policy : {},
     strict_checks: strictChecks,
-    routed_checks: routedChecks
+    routed_checks: routedChecks,
+    pr_only_checks: prOnlyChecks,
+    pr_gate: prGate
   };
+}
+
+// The pull-request merge contract is declared next to the release contract so
+// the two policies cannot drift apart silently: PR-gate entries stay bound to
+// real CI jobs, and they are a different set from the release strict/routed
+// checks (release-only jobs never run on pull requests, so requiring them for
+// merge would deadlock it).
+function parsePrGatePolicy(value) {
+  if (value === undefined || value === null) {
+    return { aggregate_check: null, required_checks: [] };
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Refusing release commit gate: manifest pr_gate must be an object.');
+  }
+  const aggregateCheck = value.aggregate_check
+    ? parseCheckEntries([value.aggregate_check], 'pr_gate.aggregate_check', { allowEmpty: false })[0]
+    : null;
+  const requiredChecks = parseCheckEntries(value.required_checks ?? [], 'pr_gate.required_checks', {
+    allowEmpty: true
+  });
+  if (!aggregateCheck && requiredChecks.length === 0) {
+    throw new Error(
+      'Refusing release commit gate: manifest pr_gate must declare an aggregate_check or required_checks.'
+    );
+  }
+  return { aggregate_check: aggregateCheck, required_checks: requiredChecks };
 }
 
 function parseCheckEntries(value, label, { allowEmpty }) {
