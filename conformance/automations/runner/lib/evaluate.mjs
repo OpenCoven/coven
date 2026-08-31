@@ -6,7 +6,7 @@
 // ids, the event cursor, expected/observed state, and the exact safe
 // reproduction command the report requires.
 
-import { latestDueSlot, parseRrule } from './clock.mjs';
+import { latestDueSlot, latestDueSlotBrute, parseRrule } from './clock.mjs';
 import { applyOperation } from './ops.mjs';
 import { ConformanceModel } from './model.mjs';
 import { doctorFindings } from './doctor.mjs';
@@ -22,7 +22,8 @@ const INVARIANT_EXPECTED = {
   'no-false-success-under-injected-failure': 'a run never reads succeeded under injected failure',
   'terminal-state-monotonicity': 'terminal states never transition again',
   'fence-uniqueness': 'one occurrence per (automation, scheduled slot)',
-  'bounded-ledger-growth': 'events and logs stay bounded by work performed'
+  'bounded-ledger-growth': 'events and logs stay bounded by work performed',
+  'occurrence-planner-agreement': 'the planner and the independent oracle agree on the latest due slot'
 };
 
 function failure(vector, invariant, expected, observed, objectIds, eventCursor) {
@@ -137,16 +138,35 @@ export function checkInvariants(model) {
   }
 
   // no-silent-eligible-occurrence-loss: the latest due slot of every active
-  // routine must be fenced once a successful pass ran at or after it.
+  // routine must be fenced once a successful pass ran at or after it. The
+  // oracle here is latestDueSlotBrute — structurally independent of the
+  // planner's direct computation — so the invariant cannot share a bug with
+  // the code it polices. The planner's answer is also cross-checked against
+  // it; any disagreement is its own violation.
   for (const record of model.definitions.values()) {
     if (record.definition.status !== 'ACTIVE') continue;
-    const latest = latestDueSlot(
+    const brute = latestDueSlotBrute(
       record.definition.rrule,
       record.definition.timezone,
       record.createdAtMs,
       model.now,
       model.hostTimezone
     );
+    const direct = latestDueSlot(
+      record.definition.rrule,
+      record.definition.timezone,
+      record.createdAtMs,
+      model.now,
+      model.hostTimezone
+    );
+    if (brute !== direct) {
+      violations.push({
+        invariant: 'occurrence-planner-agreement',
+        objectIds: [record.definition.id],
+        observed: `planner says ${direct === null ? 'no slot' : new Date(direct).toISOString()} but the independent oracle says ${brute === null ? 'no slot' : new Date(brute).toISOString()}`
+      });
+    }
+    const latest = brute;
     if (latest === null) continue;
     const fenced = [...model.occurrences.values()].some(
       (occurrence) =>

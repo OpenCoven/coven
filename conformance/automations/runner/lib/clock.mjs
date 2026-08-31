@@ -193,22 +193,93 @@ export function nextDue(rruleText, timezone, fromMillis, hostTimezone = 'UTC') {
   return null;
 }
 
-// Latest due slot at or before `nowMs`, walking forward from `cursorMs`
-// (never further back than the routine's creation). Mirrors the planner's
-// 96-step walk behind misfire-latest semantics.
+// Latest due slot in (cursorMs, nowMs], computed directly from the calendar.
+//
+// The previous implementation walked forward one slot at a time (nextDue in
+// a loop) under a 4096-step cap: after a long outage the walk ran out of
+// steps and silently returned a stale slot. There is no walk here and no
+// cap to exhaust: candidate local dates descend from the local date of
+// `now` (eight days reaches every weekday once plus one spare day, which
+// covers DST transition days whose slot may not exist), hours descend, DST
+// gaps do not exist, and DST folds take the earliest pass. The first slot
+// found with cursorMs < instant <= nowMs is the latest one; because scan
+// order is descending in instant, an instant at or below cursorMs proves no
+// qualifying slot exists.
 export function latestDueSlot(rruleText, timezone, cursorMs, nowMs, hostTimezone = 'UTC') {
-  let walk = cursorMs;
+  if (!Number.isFinite(cursorMs) || !Number.isFinite(nowMs) || nowMs <= cursorMs) return null;
+  const parsed = typeof rruleText === 'string' ? parseRrule(rruleText) : rruleText;
+  const tz = resolveTimezone(timezone, hostTimezone);
+  const allowedDays =
+    parsed.frequency === 'DAILY'
+      ? null
+      : new Set(
+          parsed.byDay.map((code) => WEEKDAY_CODES.indexOf(code)).filter((index) => index >= 0)
+        );
+  const nowParts = localDateParts(tz, nowMs);
+  const hoursDescending = [...parsed.byHour].sort((a, b) => b - a);
+  for (let back = 0; back <= 8; back += 1) {
+    const date = new Date(Date.UTC(nowParts.year, nowParts.month - 1, nowParts.day - back));
+    const parts = {
+      year: date.getUTCFullYear(),
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate()
+    };
+    if (allowedDays !== null && !allowedDays.has(weekdayIndexMondayFirst(parts))) continue;
+    for (const hour of hoursDescending) {
+      const wallMillis = Date.UTC(parts.year, parts.month - 1, parts.day, hour, 0, 0);
+      const resolved = resolveWall(tz, wallMillis);
+      if (resolved.status === 'gap') continue; // the slot does not exist
+      const instant = resolved.instant; // fold: earliest pass
+      if (instant > nowMs) continue;
+      if (instant <= cursorMs) return null; // scan order is descending: nothing qualifies
+      return instant;
+    }
+  }
+  return null;
+}
+
+// Independent brute-force oracle for the latest due slot: enumerates every
+// candidate slot day by day over the whole (cursorMs, nowMs] window and
+// returns the maximum. Deliberately O(days) and structurally unlike the
+// direct computation above, so agreement between the two is real evidence:
+// the no-silent-eligible-occurrence-loss invariant checks the planner
+// against THIS implementation, never against itself.
+export function latestDueSlotBrute(rruleText, timezone, cursorMs, nowMs, hostTimezone = 'UTC') {
+  if (!Number.isFinite(cursorMs) || !Number.isFinite(nowMs) || nowMs <= cursorMs) return null;
+  if (nowMs - cursorMs > 200 * 366 * 86400e3) {
+    throw new Error(
+      `latestDueSlotBrute window exceeds 200 years (${Math.round((nowMs - cursorMs) / (365 * 86400e3))}y); refusing to scan`
+    );
+  }
+  const parsed = typeof rruleText === 'string' ? parseRrule(rruleText) : rruleText;
+  const tz = resolveTimezone(timezone, hostTimezone);
+  const allowedDays =
+    parsed.frequency === 'DAILY'
+      ? null
+      : new Set(
+          parsed.byDay.map((code) => WEEKDAY_CODES.indexOf(code)).filter((index) => index >= 0)
+        );
+  const startParts = localDateParts(tz, cursorMs);
+  const endParts = localDateParts(tz, nowMs);
+  const startPseudo = Date.UTC(startParts.year, startParts.month - 1, startParts.day);
+  const endPseudo = Date.UTC(endParts.year, endParts.month - 1, endParts.day);
   let latest = null;
-  // The contract (coven#858 vectors, misfire-latest) requires the walk to
-  // reach the latest due slot no matter how long the gap: a capped walk
-  // silently drops slots after a long outage, which the
-  // no-silent-eligible-occurrence-loss invariant forbids. 4096 steps is
-  // roughly eleven years of daily slots, purely a runaway guard.
-  for (let step = 0; step < 4096; step += 1) {
-    const next = nextDue(rruleText, timezone, walk, hostTimezone);
-    if (next === null || next > nowMs) break;
-    latest = next;
-    walk = next;
+  for (let pseudo = startPseudo; pseudo <= endPseudo; pseudo += 86400e3) {
+    const date = new Date(pseudo);
+    const parts = {
+      year: date.getUTCFullYear(),
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate()
+    };
+    if (allowedDays !== null && !allowedDays.has(weekdayIndexMondayFirst(parts))) continue;
+    for (const hour of parsed.byHour) {
+      const wallMillis = Date.UTC(parts.year, parts.month - 1, parts.day, hour, 0, 0);
+      const resolved = resolveWall(tz, wallMillis);
+      if (resolved.status === 'gap') continue;
+      const instant = resolved.instant;
+      if (instant <= cursorMs || instant > nowMs) continue;
+      if (latest === null || instant > latest) latest = instant;
+    }
   }
   return latest;
 }

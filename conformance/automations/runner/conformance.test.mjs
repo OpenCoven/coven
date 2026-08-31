@@ -27,6 +27,7 @@ import {
 import { validateAgainstSchema, assertValid } from './lib/schema.mjs';
 import {
   latestDueSlot,
+  latestDueSlotBrute,
   nextDue,
   parseIso,
   parseRrule,
@@ -114,6 +115,50 @@ test('rrule parser mirrors the scoped vocabulary', () => {
   assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=-9'), RruleError);
   assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=9,-3'), RruleError);
   assert.throws(() => parseRrule('FREQ=DAILY;BYHOUR=-0'), RruleError);
+});
+
+test('direct computation survives an outage longer than the old 4096-slot walk cap', () => {
+  // 14 years of daily slots: the removed forward walk stopped after 4096
+  // steps (~11 years) and silently reported a stale slot.
+  const cursor = parseIso('2014-03-01T00:00:00.000Z');
+  const now = parseIso('2028-02-29T10:00:00.000Z');
+  assert.ok((now - cursor) / 86400e3 > 4096, 'the gap must exceed the old walk cap');
+  assert.equal(
+    latestDueSlot('FREQ=DAILY;BYHOUR=9', 'utc', cursor, now),
+    parseIso('2028-02-29T09:00:00.000Z')
+  );
+  assert.equal(
+    latestDueSlotBrute('FREQ=DAILY;BYHOUR=9', 'utc', cursor, now),
+    parseIso('2028-02-29T09:00:00.000Z')
+  );
+});
+
+test('direct computation agrees with the independent brute oracle everywhere', () => {
+  const rrules = ['FREQ=DAILY', 'FREQ=DAILY;BYHOUR=0,23', 'FREQ=WEEKLY;BYDAY=MO,FR;BYHOUR=6,18'];
+  const zones = ['UTC', 'America/New_York', 'Asia/Tokyo', 'Australia/Lord_Howe'];
+  // Window boundaries straddle both 2026 DST transitions in New York plus
+  // ordinary days, with now placed before, inside, and after slot hours.
+  const windows = [
+    ['2026-03-07T00:00:00.000Z', '2026-03-08T07:30:00.000Z'],
+    ['2026-03-07T00:00:00.000Z', '2026-03-08T09:00:00.000Z'],
+    ['2026-03-08T06:00:00.000Z', '2026-03-09T12:00:00.000Z'],
+    ['2026-10-31T00:00:00.000Z', '2026-11-01T05:30:00.000Z'],
+    ['2026-10-31T00:00:00.000Z', '2026-11-01T07:30:00.000Z'],
+    ['2026-06-01T04:00:00.000Z', '2026-06-15T09:30:00.000Z']
+  ];
+  for (const rrule of rrules) {
+    for (const zone of zones) {
+      for (const [cursor, now] of windows) {
+        const direct = latestDueSlot(rrule, zone, parseIso(cursor), parseIso(now));
+        const brute = latestDueSlotBrute(rrule, zone, parseIso(cursor), parseIso(now));
+        assert.equal(
+          direct,
+          brute,
+          `${rrule} @ ${zone} (${cursor}..${now}): direct ${direct} vs brute ${brute}`
+        );
+      }
+    }
+  }
 });
 
 test('clock resolves DST gaps, folds, and IANA zones deterministically', () => {
