@@ -40,7 +40,11 @@ daemon startup. Degraded recovery keeps the run unresolved, and therefore its
 event-retention pin and session-deletion fence, until terminal evidence is
 captured in the same settlement transaction. A pre-rename cleanup failure
 retains the recorded spool pointer until unlink and parent-directory sync are
-both confirmed. An external
+both confirmed. If that cleanup later succeeds before the session terminates,
+the pointer remains in a `recovered_degraded` evidence phase until terminal
+capture atomically clears it. Competing ticks that observe the same claimed
+occurrence treat a winner's transition to running as already handled; only a
+still-claimed malformed row is failed. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions

@@ -67,7 +67,13 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     exit/log/truncation evidence is captured transactionally. Session deletion
     is atomically refused while that pin exists. Pre-rename cleanup retains its
     spool pointer until unlink plus parent-directory sync is confirmed; a
-    failed sync remains ambiguous and is retried from the durable pointer.
+    failed sync remains ambiguous and is retried from the durable pointer. A
+    successful retry before terminal capture moves the pointer to
+    `recovered_degraded`; terminal evidence and pointer clearing then commit
+    atomically. Dispatchers re-read stale claimed IDs and treat a concurrent
+    transition to running as already handled. Malformed work is failed only by
+    a `state = 'claimed'` compare-and-set, so a losing dispatcher cannot fail
+    the winner's running occurrence.
 
 ## Contract profile and versioning
 

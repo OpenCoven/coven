@@ -35,6 +35,46 @@ fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4())
 }
 
+#[cfg(test)]
+struct DispatchClaimHook {
+    occurrence_id: Option<String>,
+    automation_id: Option<String>,
+    reached: std::sync::mpsc::SyncSender<String>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static DISPATCH_CLAIM_HOOKS: std::sync::Mutex<Vec<DispatchClaimHook>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn install_dispatch_claim_hook(hook: DispatchClaimHook) {
+    DISPATCH_CLAIM_HOOKS.lock().unwrap().push(hook);
+}
+
+#[cfg(test)]
+fn pause_dispatch_claim_for_test(occurrence_id: &str, automation_id: Option<&str>) {
+    let hook = {
+        let mut installed = DISPATCH_CLAIM_HOOKS.lock().unwrap();
+        installed
+            .iter()
+            .position(|hook| {
+                hook.occurrence_id.as_deref() == Some(occurrence_id)
+                    || hook.automation_id.as_deref().is_some_and(|target| {
+                        automation_id.is_some_and(|automation_id| target == automation_id)
+                    })
+            })
+            .map(|position| installed.remove(position))
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(occurrence_id.to_string()).unwrap();
+        hook.release.recv().unwrap();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_dispatch_claim_for_test(_occurrence_id: &str, _automation_id: Option<&str>) {}
+
 fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
     RunOutcome {
         run_id: String::new(),
@@ -64,10 +104,16 @@ struct PinnedOccurrenceRow {
     deadline_at: Option<String>,
 }
 
+enum ClaimedOccurrenceLoad {
+    Ready(Box<PinnedOccurrence>),
+    AlreadyHandled,
+    Malformed(String),
+}
+
 fn load_pinned_occurrence(
     conn: &Connection,
     occurrence_id: &str,
-) -> Result<PinnedOccurrence, String> {
+) -> Result<ClaimedOccurrenceLoad, String> {
     let row = conn
         .query_row(
             "SELECT automation_id, definition_revision, definition_digest, definition_json,
@@ -86,41 +132,86 @@ fn load_pinned_occurrence(
                 })
             },
         )
+        .optional()
         .map_err(|error| format!("failed to read claimed occurrence: {error}"))?;
-    let revision = row
-        .revision
-        .ok_or_else(|| "claimed occurrence has no pinned revision".to_string())?;
-    let digest = row
-        .digest
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "claimed occurrence has no pinned definition digest".to_string())?;
-    let definition_json = row
-        .definition_json
-        .ok_or_else(|| "claimed occurrence has no pinned definition".to_string())?;
-    let deadline_at = row
-        .deadline_at
-        .ok_or_else(|| "claimed occurrence has no pinned deadline".to_string())?;
-    let definition: RoutineDefinition =
-        serde_json::from_str(&definition_json).map_err(|error| {
-            format!(
-                "pinned routine `{}` is unreadable: {error}",
-                row.automation_id
-            )
-        })?;
-    let timeout_minutes = i64::from(definition.timeout_minutes);
-    Ok(PinnedOccurrence {
-        id: occurrence_id.to_string(),
-        automation_id: row.automation_id,
-        definition,
-        snapshot: DefinitionSnapshot {
-            revision,
-            digest,
-            definition_json,
-            output_target: row.output_target,
-            timeout_minutes,
-        },
-        deadline_at,
-    })
+    let Some(row) = row else {
+        return Ok(ClaimedOccurrenceLoad::AlreadyHandled);
+    };
+    let validated = (|| -> Result<PinnedOccurrence, String> {
+        let revision = row
+            .revision
+            .ok_or_else(|| "claimed occurrence has no pinned revision".to_string())?;
+        let digest = row
+            .digest
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "claimed occurrence has no pinned definition digest".to_string())?;
+        let definition_json = row
+            .definition_json
+            .ok_or_else(|| "claimed occurrence has no pinned definition".to_string())?;
+        let deadline_at = row
+            .deadline_at
+            .ok_or_else(|| "claimed occurrence has no pinned deadline".to_string())?;
+        let definition: RoutineDefinition =
+            serde_json::from_str(&definition_json).map_err(|error| {
+                format!(
+                    "pinned routine `{}` is unreadable: {error}",
+                    row.automation_id
+                )
+            })?;
+        let timeout_minutes = i64::from(definition.timeout_minutes);
+        Ok(PinnedOccurrence {
+            id: occurrence_id.to_string(),
+            automation_id: row.automation_id,
+            definition,
+            snapshot: DefinitionSnapshot {
+                revision,
+                digest,
+                definition_json,
+                output_target: row.output_target,
+                timeout_minutes,
+            },
+            deadline_at,
+        })
+    })();
+    match validated {
+        Ok(pinned) => Ok(ClaimedOccurrenceLoad::Ready(Box::new(pinned))),
+        Err(reason) => Ok(ClaimedOccurrenceLoad::Malformed(reason)),
+    }
+}
+
+fn occurrence_state(conn: &Connection, occurrence_id: &str) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT state FROM automation_occurrences WHERE id = ?1",
+        params![occurrence_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(|error| format!("failed to inspect occurrence {occurrence_id} state: {error}"))
+}
+
+fn fail_claimed_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = ?1 AND state = 'claimed'",
+            params![
+                occurrence_id,
+                reason,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .map_err(|error| format!("failed to reject malformed claimed occurrence: {error}"))?;
+    Ok(changed == 1)
 }
 
 fn automation_launch(
@@ -511,7 +602,19 @@ pub fn run_routine_now(
         }
         return Ok(overlap_outcome(&expected_definition));
     }
-    let pinned = load_pinned_occurrence(conn, &occurrence_id)?;
+    pause_dispatch_claim_for_test(&occurrence_id, Some(&definition.id));
+    let pinned = match load_pinned_occurrence(conn, &occurrence_id)? {
+        ClaimedOccurrenceLoad::Ready(pinned) => pinned,
+        ClaimedOccurrenceLoad::AlreadyHandled => {
+            return Ok(RunOutcome {
+                run_id: String::new(),
+                status: "already_dispatched".to_string(),
+                session_id: None,
+                error: None,
+            });
+        }
+        ClaimedOccurrenceLoad::Malformed(reason) => return Err(reason),
+    };
     dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "manual", now)
 }
 
@@ -578,10 +681,15 @@ pub fn dispatch_claimed_occurrences(
     };
 
     for occurrence_id in claimed {
+        pause_dispatch_claim_for_test(&occurrence_id, None);
         let pinned = match load_pinned_occurrence(conn, &occurrence_id) {
-            Ok(pinned) => pinned,
-            Err(reason) => {
-                if !fail_occurrence_nonterminal(conn, &occurrence_id, &reason, now)? {
+            Ok(ClaimedOccurrenceLoad::Ready(pinned)) => pinned,
+            Ok(ClaimedOccurrenceLoad::AlreadyHandled) => continue,
+            Ok(ClaimedOccurrenceLoad::Malformed(reason)) => {
+                if !fail_claimed_occurrence(conn, &occurrence_id, &reason, now)? {
+                    if occurrence_state(conn, &occurrence_id)?.as_deref() != Some("claimed") {
+                        continue;
+                    }
                     return Err(format!(
                         "{reason}; occurrence {occurrence_id} could not be terminally failed"
                     ));
@@ -589,6 +697,7 @@ pub fn dispatch_claimed_occurrences(
                 report.failed.push(format!("{occurrence_id}: {reason}"));
                 continue;
             }
+            Err(error) => return Err(error),
         };
         let automation_id = pinned.automation_id.clone();
         if adopt_existing_run(conn, &pinned, now)? {
@@ -1202,6 +1311,165 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn daemon_dispatch_skips_stale_claim_after_manual_dispatch_wins() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("store.sqlite");
+        initialize_store(&store_path).unwrap();
+        let conn = crate::store::open_store(&store_path).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("dispatch-race");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('dispatch-race-occ', 'dispatch-race', ?1, 'planned', 0, ?1, ?1)",
+            params![now_iso],
+        )
+        .unwrap();
+        super::super::occurrences::claim_occurrence_by_id(
+            &conn,
+            "dispatch-race-occ",
+            "daemon",
+            30,
+            now,
+        )
+        .unwrap()
+        .expect("claimed occurrence");
+        drop(conn);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        install_dispatch_claim_hook(DispatchClaimHook {
+            occurrence_id: Some("dispatch-race-occ".to_string()),
+            automation_id: None,
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let loser_path = store_path.clone();
+        let loser_home = temp.path().to_path_buf();
+        let loser = std::thread::spawn(move || {
+            let conn = crate::store::open_store(&loser_path).unwrap();
+            dispatch_claimed_occurrences(&conn, &loser_home, &crate::api::NoopSessionRuntime, now)
+        });
+        assert_eq!(reached_rx.recv().unwrap(), "dispatch-race-occ");
+
+        let winner_conn = crate::store::open_store(&store_path).unwrap();
+        let pinned = match load_pinned_occurrence(&winner_conn, "dispatch-race-occ").unwrap() {
+            ClaimedOccurrenceLoad::Ready(pinned) => pinned,
+            _ => panic!("manual winner must observe the claimed occurrence"),
+        };
+        let winner = dispatch_pinned_occurrence(
+            &winner_conn,
+            temp.path(),
+            &crate::api::NoopSessionRuntime,
+            &pinned,
+            "manual",
+            now,
+        )
+        .unwrap();
+        assert_eq!(winner.status, "dispatched");
+        release_tx.send(()).unwrap();
+        let loser = loser.join().unwrap().unwrap();
+
+        assert!(loser.dispatched.is_empty());
+        assert!(loser.ambiguous.is_empty());
+        assert!(loser.failed.is_empty());
+        let state: String = winner_conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'dispatch-race-occ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        let run_count: i64 = winner_conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_runs WHERE occurrence_id = 'dispatch-race-occ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1);
+    }
+
+    #[test]
+    fn manual_dispatch_treats_daemon_winner_as_already_handled() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("store.sqlite");
+        initialize_store(&store_path).unwrap();
+        let conn = crate::store::open_store(&store_path).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("manual-dispatch-race");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        drop(conn);
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        install_dispatch_claim_hook(DispatchClaimHook {
+            occurrence_id: None,
+            automation_id: Some("manual-dispatch-race".to_string()),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let manual_path = store_path.clone();
+        let manual_home = temp.path().to_path_buf();
+        let manual_routine = routine.clone();
+        let now = Utc::now();
+        let manual = std::thread::spawn(move || {
+            let conn = crate::store::open_store(&manual_path).unwrap();
+            run_routine_now(
+                &conn,
+                &manual_home,
+                &crate::api::NoopSessionRuntime,
+                &manual_routine,
+                now,
+            )
+        });
+        let occurrence_id = reached_rx.recv().unwrap();
+
+        let daemon_conn = crate::store::open_store(&store_path).unwrap();
+        let daemon = dispatch_claimed_occurrences(
+            &daemon_conn,
+            temp.path(),
+            &crate::api::NoopSessionRuntime,
+            now,
+        )
+        .unwrap();
+        assert_eq!(daemon.dispatched.len(), 1);
+        release_tx.send(()).unwrap();
+        let manual = manual
+            .join()
+            .unwrap()
+            .expect("manual loser should treat the daemon winner as already handled");
+
+        assert_eq!(manual.status, "already_dispatched");
+        let state: String = daemon_conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = ?1",
+                params![occurrence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        let run_count: i64 = daemon_conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_runs WHERE occurrence_id = ?1",
+                params![occurrence_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_count, 1);
     }
 
     #[test]

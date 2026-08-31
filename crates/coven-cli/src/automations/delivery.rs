@@ -660,6 +660,7 @@ fn sync_removed_spool_parent(spool_path: &Path) -> Result<(), String> {
 struct OrphanedSpool {
     run_id: String,
     occurrence_id: String,
+    run_status: String,
     target: String,
     spool_path: String,
     spool_state: String,
@@ -678,7 +679,7 @@ fn reconcile_orphaned_delivery_spools_for_owner(
     let rows = {
         let mut statement = conn
             .prepare(
-                "SELECT r.id, o.id, r.output_target,
+                "SELECT r.id, o.id, r.status, r.output_target,
                             r.delivery_spool_path, r.delivery_spool_state, r.delivery_spool_owner,
                             o.delivery_spool_path, o.delivery_spool_state, o.delivery_spool_owner
                      FROM automation_runs AS r
@@ -693,13 +694,14 @@ fn reconcile_orphaned_delivery_spools_for_owner(
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(2)?,
                     row.get::<_, Option<String>>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
                     row.get::<_, Option<String>>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
                 ))
             })
             .map_err(|error| format!("failed to read orphan spool reconciliation: {error}"))?;
@@ -711,6 +713,7 @@ fn reconcile_orphaned_delivery_spools_for_owner(
     for (
         run_id,
         occurrence_id,
+        run_status,
         target,
         run_path,
         run_state,
@@ -743,6 +746,7 @@ fn reconcile_orphaned_delivery_spools_for_owner(
             let spool = OrphanedSpool {
                 run_id: run_id.clone(),
                 occurrence_id: occurrence_id.clone(),
+                run_status,
                 target,
                 spool_path,
                 spool_state: run_state,
@@ -758,15 +762,16 @@ fn reconcile_orphaned_delivery_spools_for_owner(
             }
             let spool_path = PathBuf::from(&spool.spool_path);
             remove_recorded_spool(&spool_path, &spool.target)?;
-            clear_spool_ledger(
-                conn,
-                &SpoolLedgerTarget {
-                    run_id: &spool.run_id,
-                    occurrence_id: &spool.occurrence_id,
-                    target: &spool.target,
-                },
-                &spool_path,
-            )?;
+            let ledger = SpoolLedgerTarget {
+                run_id: &spool.run_id,
+                occurrence_id: &spool.occurrence_id,
+                target: &spool.target,
+            };
+            if spool.spool_state == "degraded" && spool.run_status == "running" {
+                mark_spool_cleanup_recovered(conn, &ledger, &spool_path)?;
+            } else {
+                clear_spool_ledger(conn, &ledger, &spool_path)?;
+            }
             Ok(())
         })();
         match recovery {
@@ -781,6 +786,44 @@ fn reconcile_orphaned_delivery_spools_for_owner(
     Ok(report)
 }
 
+fn mark_spool_cleanup_recovered(
+    conn: &Connection,
+    ledger: &SpoolLedgerTarget<'_>,
+    spool_path: &Path,
+) -> Result<(), String> {
+    let spool_path = spool_path.to_string_lossy();
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin recovered spool update: {error}"))?;
+    let run_changed = transaction
+        .execute(
+            "UPDATE automation_runs
+             SET delivery_spool_state = 'recovered_degraded'
+             WHERE id = ?1
+               AND status = 'running'
+               AND delivery_spool_state = 'degraded'
+               AND delivery_spool_path = ?2",
+            params![ledger.run_id, spool_path],
+        )
+        .map_err(|error| format!("failed to mark recovered run spool: {error}"))?;
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET delivery_spool_state = 'recovered_degraded'
+             WHERE id = ?1
+               AND delivery_spool_state = 'degraded'
+               AND delivery_spool_path = ?2",
+            params![ledger.occurrence_id, spool_path],
+        )
+        .map_err(|error| format!("failed to mark recovered occurrence spool: {error}"))?;
+    if run_changed != 1 || occurrence_changed != 1 {
+        return Err("recovered spool update CAS rejected".to_string());
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit recovered spool update: {error}"))
+}
+
 fn mark_spool_recovery_degraded(
     conn: &Connection,
     run_id: &str,
@@ -791,11 +834,12 @@ fn mark_spool_recovery_degraded(
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin degraded spool recovery: {error}"))?;
-    let (run_status, session_id): (String, Option<String>) = transaction
+    let (run_status, session_id, spool_state): (String, Option<String>, String) = transaction
         .query_row(
-            "SELECT status, session_id FROM automation_runs WHERE id = ?1",
+            "SELECT status, session_id, delivery_spool_state
+             FROM automation_runs WHERE id = ?1",
             params![run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|error| format!("failed to inspect degraded run evidence: {error}"))?;
     let terminal_session = match session_id.as_deref() {
@@ -825,7 +869,11 @@ fn mark_spool_recovery_degraded(
                      WHEN instr(delivery_error, ?2) > 0 THEN delivery_error
                      ELSE delivery_error || '; ' || ?2
                  END,
-                 delivery_spool_state = 'degraded'
+                 delivery_spool_state = CASE
+                     WHEN delivery_spool_state = 'recovered_degraded'
+                         THEN 'recovered_degraded'
+                     ELSE 'degraded'
+                 END
              WHERE id = ?1",
             params![run_id, diagnostic],
         )
@@ -847,7 +895,11 @@ fn mark_spool_recovery_degraded(
                      WHEN instr(delivery_error, ?2) > 0 THEN delivery_error
                      ELSE delivery_error || '; ' || ?2
                  END,
-                 delivery_spool_state = 'degraded',
+                 delivery_spool_state = CASE
+                     WHEN delivery_spool_state = 'recovered_degraded'
+                         THEN 'recovered_degraded'
+                     ELSE 'degraded'
+                 END,
                  updated_at = ?3
              WHERE id = ?1",
             params![occurrence_id, diagnostic, now],
@@ -870,6 +922,37 @@ fn mark_spool_recovery_degraded(
                 params![occurrence_id, now],
             )
             .map_err(|error| format!("failed to terminalize degraded occurrence: {error}"))?;
+        if spool_state == "recovered_degraded" {
+            let run_cleared = transaction
+                .execute(
+                    "UPDATE automation_runs
+                     SET delivery_spool_path = NULL,
+                         delivery_spool_state = 'none',
+                         delivery_spool_owner = NULL,
+                         delivery_spool_digest = NULL,
+                         delivery_spool_bytes = NULL
+                     WHERE id = ?1
+                       AND delivery_spool_state = 'recovered_degraded'",
+                    params![run_id],
+                )
+                .map_err(|error| format!("failed to clear recovered run spool: {error}"))?;
+            let occurrence_cleared = transaction
+                .execute(
+                    "UPDATE automation_occurrences
+                     SET delivery_spool_path = NULL,
+                         delivery_spool_state = 'none',
+                         delivery_spool_owner = NULL,
+                         delivery_spool_digest = NULL,
+                         delivery_spool_bytes = NULL
+                     WHERE id = ?1
+                       AND delivery_spool_state = 'recovered_degraded'",
+                    params![occurrence_id],
+                )
+                .map_err(|error| format!("failed to clear recovered occurrence spool: {error}"))?;
+            if run_cleared != 1 || occurrence_cleared != 1 {
+                return Err("recovered spool evidence clear CAS rejected".to_string());
+            }
+        }
         let finished = record_run_finish(
             &transaction,
             run_id,
@@ -2058,7 +2141,12 @@ pub fn settle_finished_runs_with_runtime(
         let deadline = chrono::DateTime::parse_from_rfc3339(&deadline_at)
             .map(|instant| instant.with_timezone(&Utc))
             .map_err(|error| format!("running run {run_id} has invalid deadline: {error}"))?;
-        if delivery_state == "ambiguous" && delivery_spool_state == "degraded" {
+        if delivery_state == "ambiguous"
+            && matches!(
+                delivery_spool_state.as_str(),
+                "degraded" | "recovered_degraded"
+            )
+        {
             let diagnostic = delivery_error.as_deref().unwrap_or(
                 "delivery spool recovery degraded before terminal evidence was available",
             );
@@ -3036,7 +3124,151 @@ mod tests {
     }
 
     #[test]
-    fn pre_rename_cleanup_failure_preserves_sensitive_spool_pointer_until_restart_removes_it() {
+    fn recovered_degraded_cleanup_waits_for_terminal_evidence_then_clears_without_pin() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("store.sqlite");
+        initialize_store(&store_path).unwrap();
+        let conn = crate::store::open_store(&store_path).unwrap();
+        let target = temp.path().join("payload.md");
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "running", None);
+        event(&conn, "session-1", "output", "evidence before terminal");
+        let plan = prepare_tracked_delivery_spool(
+            &conn,
+            SpoolLedgerTarget {
+                run_id: "run-session-1",
+                occurrence_id: "occ-session-1",
+                target: target.to_str().unwrap(),
+            },
+            "session-1",
+        )
+        .unwrap()
+        .unwrap();
+        let spool_path = plan.spool_path.clone();
+        std::mem::forget(plan);
+        set_spool_remove_failure_for_test(true);
+        let first = reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-one").unwrap();
+        assert_eq!(first.degraded.len(), 1);
+        drop(conn);
+
+        let conn = crate::store::open_store(&store_path).unwrap();
+        let second = reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-two").unwrap();
+
+        assert_eq!(second.removed, 1);
+        assert!(!spool_path.exists());
+        let unresolved: (
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT o.state, r.status, r.delivery_state,
+                        o.delivery_spool_state, r.delivery_spool_state,
+                        o.delivery_spool_path, r.delivery_spool_path
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(unresolved.0, "running");
+        assert_eq!(unresolved.1, "running");
+        assert_eq!(unresolved.2, "ambiguous");
+        assert_eq!(unresolved.3, "recovered_degraded");
+        assert_eq!(unresolved.4, "recovered_degraded");
+        assert_eq!(
+            unresolved.5.as_deref(),
+            Some(spool_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            unresolved.6.as_deref(),
+            Some(spool_path.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            crate::store::prune_events_older_than(&conn, "2099-01-01T00:00:00Z").unwrap(),
+            0,
+            "recovered cleanup must retain the evidence pin"
+        );
+
+        crate::store::update_session_status(
+            &conn,
+            "session-1",
+            "completed",
+            Some(0),
+            "2026-08-28T09:05:00Z",
+        )
+        .unwrap();
+        event(&conn, "session-1", "exit", "completed");
+        let settlement = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert_eq!(settlement.settled_failed, 1);
+        let settled: (
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT o.state, r.status, o.delivery_spool_state,
+                        r.delivery_spool_state, o.delivery_spool_path,
+                        r.delivery_spool_path, r.log_json
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 WHERE r.id = 'run-session-1'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(settled.0, "failed");
+        assert_eq!(settled.1, "failed");
+        assert_eq!(settled.2, "none");
+        assert_eq!(settled.3, "none");
+        assert_eq!(settled.4, None);
+        assert_eq!(settled.5, None);
+        let log: Value = serde_json::from_str(&settled.6).unwrap();
+        assert!(log
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["kind"] == "exit"));
+        assert_eq!(
+            crate::store::prune_events_older_than(&conn, "2099-01-01T00:00:00Z").unwrap(),
+            2,
+            "terminal evidence capture must release the retention pin"
+        );
+    }
+
+    #[test]
+    fn pre_rename_cleanup_failure_after_terminal_evidence_clears_on_successful_restart() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target-directory");
         std::fs::create_dir(&target).unwrap();
@@ -3061,6 +3293,13 @@ mod tests {
         assert_eq!(evidence.0, "ambiguous");
         assert_eq!(evidence.1, "degraded");
         let spool_path = PathBuf::from(evidence.2.expect("durable spool pointer"));
+        let captured_log: String = conn
+            .query_row(
+                "SELECT log_json FROM automation_runs WHERE id = 'run-session-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(&spool_path).unwrap(),
             "private payload marker"
@@ -3070,15 +3309,15 @@ mod tests {
             reconcile_orphaned_delivery_spools_for_owner(&conn, "restart-owner").unwrap();
         assert_eq!(recovery.removed, 1);
         assert!(!spool_path.exists());
-        let cleared: (String, Option<String>) = conn
+        let cleared: (String, Option<String>, String) = conn
             .query_row(
-                "SELECT delivery_spool_state, delivery_spool_path
+                "SELECT delivery_spool_state, delivery_spool_path, log_json
                  FROM automation_runs WHERE id = 'run-session-1'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(cleared, ("none".to_string(), None));
+        assert_eq!(cleared, ("none".to_string(), None, captured_log));
     }
 
     #[cfg(unix)]
