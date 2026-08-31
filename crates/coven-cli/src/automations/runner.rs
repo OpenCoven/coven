@@ -315,14 +315,22 @@ pub fn dispatch_claimed_occurrences(
     let mut report = DispatchReport::default();
 
     let claimed: Vec<(String, String)> = {
+        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         let mut statement = conn
             .prepare(
+                // Every valid existing claim — not just ones this pass made —
+                // reaches dispatch here, so control-plane claims and
+                // crash-interrupted claims never stay stuck (coven#816
+                // finding 2). Expired leases are excluded: lease recovery
+                // owns them.
                 "SELECT id, automation_id FROM automation_occurrences
-                 WHERE state = 'claimed' ORDER BY scheduled_for ASC",
+                 WHERE state = 'claimed'
+                   AND (lease_expires_at IS NULL OR lease_expires_at >= ?1)
+                 ORDER BY scheduled_for ASC",
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(params![now_iso], |row| Ok((row.get(0)?, row.get(1)?)))
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let mut out = Vec::new();
         for row in rows {

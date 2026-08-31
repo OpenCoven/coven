@@ -250,7 +250,7 @@ pub fn route_action(
                 action,
                 origin,
                 intent_id,
-                automation_tick_payload(conn, now),
+                automation_tick_payload(coven_home, conn, runtime, now),
             );
             (200, event)
         }
@@ -352,27 +352,31 @@ fn required_definition_field(
 }
 
 fn automation_tick_payload(
+    coven_home: &std::path::Path,
     conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
-    let report = match crate::automations::occurrences::tick(conn, now) {
+    // The action shares the daemon's full tick: plan, recover, claim,
+    // dispatch every valid existing claim, and settle finished runs. A
+    // control-plane claim is dispatched by this same pass — never left
+    // stuck for a later tick (coven#816 finding 2).
+    let report = match crate::automations::full_tick(coven_home, conn, runtime, now) {
         Ok(report) => report,
-        Err(error) => return json!({ "error": format!("{error:#}") }),
-    };
-    let settled = match crate::automations::delivery::settle_finished_runs(conn, now) {
-        Ok(settled) => settled,
         Err(error) => return json!({ "error": error }),
     };
     json!({
-        "planned": report.planned,
-        "alreadyFenced": report.already_fenced,
-        "pausedSkipped": report.paused_skipped,
-        "recovered": report.recovered,
-        "claimed": report.claimed,
-        "settledSucceeded": settled.settled_succeeded,
-        "settledFailed": settled.settled_failed,
-        "failures": settled.failures,
-        "failed": report.failed,
+        "planned": report.tick.planned,
+        "alreadyFenced": report.tick.already_fenced,
+        "pausedSkipped": report.tick.paused_skipped,
+        "recovered": report.tick.recovered,
+        "claimed": report.tick.claimed,
+        "dispatched": report.dispatch.dispatched,
+        "dispatchFailed": report.dispatch.failed,
+        "settledSucceeded": report.settlement.settled_succeeded,
+        "settledFailed": report.settlement.settled_failed,
+        "failures": report.settlement.failures,
+        "failed": report.tick.failed,
     })
 }
 

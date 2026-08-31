@@ -12,10 +12,9 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-/// One automations pass: open the store, run the full tick (plan, recover,
-/// claim), dispatch every claimed occurrence through the shared
-/// session-launch runtime, then reconcile running runs. Failures land in the
-/// daemon recovery log via the caller.
+/// One automations pass: the shared full tick (`automations::full_tick`) —
+/// plan, recover, claim, dispatch every valid existing claim, and settle
+/// finished runs. Failures land in the daemon recovery log via the caller.
 pub fn process_automations_tick(
     coven_home: &Path,
     runtime: &dyn crate::api::SessionRuntime,
@@ -23,21 +22,14 @@ pub fn process_automations_tick(
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
     let now = chrono::Utc::now();
-    let report = super::occurrences::tick(&conn, now)?;
-    if !report.claimed.is_empty() {
-        let _dispatch =
-            super::runner::dispatch_claimed_occurrences(coven_home, &conn, runtime, now)
-                .map_err(anyhow::Error::msg)?;
-    }
-    let settlement =
-        super::delivery::settle_finished_runs(&conn, now).map_err(anyhow::Error::msg)?;
-    for failure in &settlement.failures {
+    let report = super::full_tick(coven_home, &conn, runtime, now).map_err(anyhow::Error::msg)?;
+    for failure in &report.settlement.failures {
         crate::daemon::append_daemon_recovery_log(
             coven_home,
             &format!("automations run failed: {failure}"),
         );
     }
-    Ok(report)
+    Ok(report.tick)
 }
 
 /// Starts the automations scheduler thread on the daemon's 60s cadence.
@@ -162,5 +154,45 @@ mod tests {
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].exit_code, Some(0));
+    }
+
+    #[test]
+    fn tick_dispatches_a_valid_pre_existing_claim() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("daily")).unwrap();
+        // A claim a previous process made and never dispatched (crash gap):
+        // live lease, state claimed, nothing new planned this tick.
+        let now = chrono::Utc::now();
+        let millis = chrono::SecondsFormat::Millis;
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, created_at, updated_at)
+             VALUES ('daily-stuck', 'daily', ?2, 'claimed', 'daemon-a', ?3, 1, ?2, ?2)",
+            rusqlite::params![
+                "daily-stuck",
+                (now - chrono::Duration::hours(1)).to_rfc3339_opts(millis, true),
+                (now + chrono::Duration::hours(1)).to_rfc3339_opts(millis, true),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        process_automations_tick(home, &crate::api::NoopSessionRuntime).unwrap();
+
+        // The pre-existing claim is dispatched by this pass — never left
+        // stuck (coven#816 finding 2).
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'daily-stuck'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
     }
 }
