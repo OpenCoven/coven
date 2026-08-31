@@ -19,10 +19,13 @@ on:
 permissions:
   contents: read
 
-# Never run two release pipelines for the same tag at the same time. We don't cancel an in-flight
-# release because that could leave the registry in a partially-published state.
+# One stable-channel lock for ALL tags: npm publication mutates the shared
+# `latest` dist-tag, so two stable versions must never interleave their
+# package publications. Pending runs for newer tags queue behind an in-flight
+# release without cancelling it (a cancelled release could leave the registry
+# in a partially-published state).
 concurrency:
-  group: release-npm-${{ github.ref }}
+  group: release-npm-stable-channel
   cancel-in-progress: false
 
 env:

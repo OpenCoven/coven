@@ -24,8 +24,12 @@ on:
 permissions:
   contents: read
 
+# One stable-channel lock for ALL tags: the complete npm-to-GitHub release
+# transaction is serialized (the npm pipeline holds its own stable-channel
+# lock first), so GitHub Release publications for different versions can
+# never interleave either. Pending runs queue without cancelling.
 concurrency:
-  group: release-github-${{ github.event.workflow_run.head_branch || inputs.release_tag }}
+  group: release-github-stable-channel
   cancel-in-progress: false
 
 env:

@@ -1706,13 +1706,28 @@ test('release workflow pins all third-party actions to immutable commit SHAs', (
   }
 });
 
-test('release workflow concurrency keeps overlapping releases from interleaving', () => {
+test('release workflow concurrency is one stable-channel lock across all tags', () => {
   const workflowPath = new URL(
     ['..', '.github', 'workflows', 'release-npm.yml'].join('/'),
     import.meta.url
   );
   const workflow = readFileSync(workflowPath, 'utf8');
-  assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-npm/m);
+  // The npm `latest` dist-tag is shared by every stable version, so the lock
+  // must not be per-tag (release-npm-${{ github.ref }} would let two stable
+  // releases interleave their package publications).
+  assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-npm-stable-channel\s*$/m);
+  assert.doesNotMatch(workflow, /group:\s*release-npm-\$\{\{/);
+  assert.match(workflow, /cancel-in-progress:\s*false/);
+});
+
+test('github release workflow is also locked to the stable channel', () => {
+  const workflowPath = new URL(
+    ['..', '.github', 'workflows', 'release-github.yml'].join('/'),
+    import.meta.url
+  );
+  const workflow = readFileSync(workflowPath, 'utf8');
+  assert.match(workflow, /^concurrency:\s*\n\s*group:\s*release-github-stable-channel\s*$/m);
+  assert.doesNotMatch(workflow, /group:\s*release-github-\$\{\{/);
   assert.match(workflow, /cancel-in-progress:\s*false/);
 });
 
