@@ -1,12 +1,14 @@
 //! Routine run dispatch (coven#816).
 //!
-//! A run is a claimed occurrence dispatched through the exact session-launch
-//! path every other launch uses: the definition is re-read, the familiar and
-//! runtime are re-validated per run, a SessionLaunch is built, and the run
-//! goes in flight under a bounded lease. Coven (not a harness home) owns the
-//! record; terminal status, bounded log, and output delivery land through
-//! the delivery reconciliation pass.
+//! A run is a claimed occurrence dispatched through the one durable
+//! session-launch primitive `POST /sessions` uses
+//! (`api::launch_session_durable`): the definition is re-read, the familiar
+//! is admitted through the shared resolver, the maintenance gate is taken,
+//! and the session row is persisted before spawn. Coven (not a harness
+//! home) owns the record; terminal status, bounded log, and output delivery
+//! land through the delivery reconciliation pass.
 
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
@@ -15,7 +17,7 @@ use rusqlite::{params, Connection};
 use super::definition::RoutineDefinition;
 use super::occurrences::{claim_occurrence_by_id, mark_occurrence_running, settle_occurrence};
 use super::runs::{record_run_finish, record_run_session, record_run_start, RunFinish};
-use crate::api::{SessionLaunch, SessionRuntime};
+use crate::api::{DurableLaunch, DurableLaunchError, SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,14 +57,106 @@ fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
     }
 }
 
+/// Resolves a routine's familiar through the same admission resolver
+/// `POST /sessions` uses. An automation launch must never bypass the
+/// familiar check (coven#816 finding 1).
+fn resolve_familiar_for_run(
+    coven_home: &Path,
+    familiar_id: Option<&str>,
+) -> Result<Option<crate::harness::FamiliarContext>, String> {
+    match crate::session_launch::resolve_familiar(coven_home, familiar_id) {
+        Ok(familiar) => Ok(familiar),
+        Err(crate::session_launch::FamiliarError::Unknown { error, .. }) => Err(format!("{error}")),
+        Err(crate::session_launch::FamiliarError::LookupFailed(error)) => {
+            Err(format!("familiar lookup failed: {error:#}"))
+        }
+    }
+}
+
+/// Launches through the shared durable primitive with the automation
+/// caller's fixed identity: no execution binding, no raw caller familiar.
+fn launch_durable(
+    coven_home: &Path,
+    launch: &SessionLaunch,
+    runtime: &dyn SessionRuntime,
+) -> Result<crate::store::SessionRecord, DurableLaunchError> {
+    crate::api::launch_session_durable(
+        coven_home,
+        launch,
+        DurableLaunch {
+            familiar_id: launch.familiar_id.clone(),
+            execution_binding: None,
+            raw_caller_familiar_id: None,
+        },
+        runtime,
+    )
+}
+
+/// A human-readable reason for every durable-launch failure mode.
+fn launch_failure_reason(error: &DurableLaunchError) -> String {
+    match error {
+        DurableLaunchError::MaintenanceGate { code, message, .. } => {
+            format!("maintenance gate rejected the launch ({code}): {message}")
+        }
+        DurableLaunchError::Rejected(_) => {
+            "launch rejected by parent-correlation validation".to_string()
+        }
+        DurableLaunchError::Store(error) => {
+            format!("durable launch persistence failed: {error:#}")
+        }
+        DurableLaunchError::LaunchRejected { message, .. } => message.clone(),
+    }
+}
+
+/// The session id a durable-launch failure already named, when one exists.
+fn launch_error_session_id(error: &DurableLaunchError) -> Option<String> {
+    match error {
+        DurableLaunchError::MaintenanceGate { session_id, .. } => Some(session_id.clone()),
+        DurableLaunchError::LaunchRejected { session_id, .. } => Some(session_id.clone()),
+        _ => None,
+    }
+}
+
+/// Terminally settles a launch failure: the occurrence and the ledger row
+/// both record the failure with its reason. A failed spawn must never leave
+/// claimed work or a running ledger row behind (coven#816 finding 1).
+fn settle_launch_failure(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) {
+    if let Err(error) = settle_occurrence(conn, occurrence_id, "failed", Some(reason), now) {
+        eprintln!("coven automations: failed to settle occurrence {occurrence_id}: {error}");
+    }
+    if let Err(error) = record_run_finish(
+        conn,
+        run_id,
+        RunFinish {
+            status: "failed",
+            exit_code: None,
+            session_id: None,
+            log_json: None,
+            output_commit: None,
+        },
+        now,
+    ) {
+        eprintln!("coven automations: failed to settle run {run_id}: {error:#}");
+    }
+}
+
 /// Runs a routine once, now: fences and claims an immediate occurrence,
-/// records a ledger row, dispatches through the shared session-launch path,
-/// and leaves the run in flight with a bounded lease. Settlement — terminal
-/// status, exit code, bounded log, output delivery — happens through the
-/// reconciliation pass once the session finishes. A missing cwd fails the
-/// run with a recorded reason instead of guessing a project; a live
-/// previous occurrence fails the run (overlap: forbid).
+/// records a ledger row, persists the bounded lease and the durable session
+/// row before spawn, and dispatches through the shared session-launch
+/// primitive. Settlement — terminal status, exit code, bounded log, output
+/// delivery — happens through the reconciliation pass once the session
+/// finishes. A missing cwd or an unadmitted familiar fails the run with a
+/// recorded reason instead of guessing; a live previous occurrence fails
+/// the run (overlap: forbid); every launch failure is terminally settled
+/// in the ledger (coven#816 finding 1).
 pub fn run_routine_now(
+    coven_home: &Path,
     conn: &Connection,
     runtime: &dyn SessionRuntime,
     definition: &RoutineDefinition,
@@ -80,6 +174,17 @@ pub fn run_routine_now(
             session_id: None,
             error: Some("routine has no cwd; add a cwd before running".to_string()),
         });
+    };
+    let familiar = match resolve_familiar_for_run(coven_home, definition.familiar_id.as_deref()) {
+        Ok(familiar) => familiar,
+        Err(reason) => {
+            return Ok(RunOutcome {
+                run_id: String::new(),
+                status: "failed".to_string(),
+                session_id: None,
+                error: Some(reason),
+            });
+        }
     };
 
     let occurrence_id = fresh_id("occ");
@@ -120,43 +225,43 @@ pub fn run_routine_now(
     )
     .map_err(|error| format!("failed to record run start: {error:#}"))?;
 
-    let launch = build_session_launch(definition, cwd)?;
+    let mut launch = build_session_launch(definition, cwd)?;
+    launch.familiar_id = familiar.as_ref().map(|familiar| familiar.id.clone());
 
-    match runtime.launch_session(&launch) {
-        Ok(()) => {
-            // The run is in flight: keep the occurrence under a bounded
-            // lease, attach the session id, and let settlement happen from
-            // the Coven session store. Launch success is never reported as
-            // run success.
-            let lease = run_lease_minutes(definition);
-            let _ = mark_occurrence_running(conn, &occurrence_id, "manual", lease, now);
-            let _ = record_run_session(conn, &run_id, &launch.id);
+    // Persist the bounded lease before spawn: a crash after this point
+    // leaves recoverable work, never a stuck claim (coven#816 finding 1).
+    let lease = run_lease_minutes(definition);
+    if let Err(error) = mark_occurrence_running(conn, &occurrence_id, "manual", lease, now) {
+        let reason = format!("failed to persist the run lease: {error}");
+        settle_launch_failure(conn, &run_id, &occurrence_id, &reason, now);
+        return Ok(RunOutcome {
+            run_id,
+            status: "failed".to_string(),
+            session_id: None,
+            error: Some(reason),
+        });
+    }
+
+    match launch_durable(coven_home, &launch, runtime) {
+        Ok(record) => {
+            // The run is in flight under the persisted lease; settlement
+            // happens from the Coven session store. Launch success is never
+            // reported as run success.
+            let _ = record_run_session(conn, &run_id, &record.id);
             Ok(RunOutcome {
                 run_id,
                 status: "dispatched".to_string(),
-                session_id: Some(launch.id),
+                session_id: Some(record.id),
                 error: None,
             })
         }
         Err(error) => {
-            let reason = format!("{error:#}");
-            let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-            let _ = record_run_finish(
-                conn,
-                &run_id,
-                RunFinish {
-                    status: "failed",
-                    exit_code: None,
-                    session_id: None,
-                    log_json: None,
-                    output_commit: None,
-                },
-                now,
-            );
+            let reason = launch_failure_reason(&error);
+            settle_launch_failure(conn, &run_id, &occurrence_id, &reason, now);
             Ok(RunOutcome {
                 run_id,
                 status: "failed".to_string(),
-                session_id: None,
+                session_id: launch_error_session_id(&error),
                 error: Some(reason),
             })
         }
@@ -192,14 +297,17 @@ pub struct DispatchReport {
     pub failed: Vec<String>,
 }
 
-/// Dispatches every claimed occurrence that the scheduler has fenced: builds
-/// the launch, records the ledger row, and launches through the shared
-/// runtime path. A dispatched run stays in flight under a bounded lease —
-/// the reconciliation pass (`delivery::settle_finished_runs`) settles the
-/// occurrence and the ledger once the session finishes. Claimed occurrences
-/// whose routine has no cwd fail with a recorded reason instead of guessing
-/// a project.
+/// Dispatches every valid claimed occurrence the scheduler has fenced:
+/// admits the familiar, records the ledger row, persists the bounded lease
+/// and the durable session row before spawn, and launches through the
+/// shared session-launch primitive. A dispatched run stays in flight under
+/// its lease — the reconciliation pass (`delivery::settle_finished_runs`)
+/// settles the occurrence and the ledger once the session finishes. Every
+/// launch failure is terminally settled in the ledger (coven#816 finding
+/// 1); claimed occurrences whose routine has no cwd fail with a recorded
+/// reason instead of guessing a project.
 pub fn dispatch_claimed_occurrences(
+    coven_home: &Path,
     conn: &Connection,
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
@@ -243,6 +351,17 @@ pub fn dispatch_claimed_occurrences(
             continue;
         };
 
+        let familiar = match resolve_familiar_for_run(coven_home, definition.familiar_id.as_deref())
+        {
+            Ok(familiar) => familiar,
+            Err(reason) => {
+                let reason = format!("{automation_id}: {reason}");
+                let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
+                report.failed.push(reason);
+                continue;
+            }
+        };
+
         let run_id = fresh_id("run");
         let started = record_run_start(
             conn,
@@ -258,36 +377,37 @@ pub fn dispatch_claimed_occurrences(
             continue;
         }
 
-        match build_session_launch(&definition, cwd).and_then(|launch| {
-            runtime
-                .launch_session(&launch)
-                .map(|()| launch)
-                .map_err(|error| format!("{error:#}"))
-        }) {
-            Ok(launch) => {
-                // The run is in flight: keep the occurrence under a bounded
-                // lease, attach the session id, and let settlement happen
-                // from the Coven session store. Launch success is never
-                // reported as run success (coven#816).
-                let lease = run_lease_minutes(&definition);
-                let _ = mark_occurrence_running(conn, &occurrence_id, "daemon", lease, now);
-                let _ = record_run_session(conn, &run_id, &launch.id);
+        let mut launch = match build_session_launch(&definition, cwd) {
+            Ok(launch) => launch,
+            Err(reason) => {
+                settle_launch_failure(conn, &run_id, &occurrence_id, &reason, now);
+                report.failed.push(format!("{automation_id}: {reason}"));
+                continue;
+            }
+        };
+        launch.familiar_id = familiar.as_ref().map(|familiar| familiar.id.clone());
+
+        // Persist the bounded lease before spawn: a crash after this point
+        // leaves recoverable work, never a stuck claim (coven#816 finding 1).
+        let lease = run_lease_minutes(&definition);
+        if let Err(error) = mark_occurrence_running(conn, &occurrence_id, "daemon", lease, now) {
+            let reason = format!("failed to persist the run lease: {error}");
+            settle_launch_failure(conn, &run_id, &occurrence_id, &reason, now);
+            report.failed.push(format!("{automation_id}: {reason}"));
+            continue;
+        }
+
+        match launch_durable(coven_home, &launch, runtime) {
+            Ok(record) => {
+                // The run is in flight under the persisted lease; settlement
+                // happens from the Coven session store. Launch success is
+                // never reported as run success (coven#816).
+                let _ = record_run_session(conn, &run_id, &record.id);
                 report.dispatched.push(run_id);
             }
-            Err(reason) => {
-                let _ = settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now);
-                let _ = record_run_finish(
-                    conn,
-                    &run_id,
-                    RunFinish {
-                        status: "failed",
-                        exit_code: None,
-                        session_id: None,
-                        log_json: None,
-                        output_commit: None,
-                    },
-                    now,
-                );
+            Err(error) => {
+                let reason = launch_failure_reason(&error);
+                settle_launch_failure(conn, &run_id, &occurrence_id, &reason, now);
                 report.failed.push(format!("{automation_id}: {reason}"));
             }
         }
@@ -358,20 +478,30 @@ mod tests {
         .unwrap()
     }
 
+    /// A temp COVEN_HOME with the real store layout (`coven.sqlite3`) and a
+    /// seeded familiar roster, because dispatch now resolves the familiar
+    /// through the shared admission path.
     fn temp_store() -> (tempfile::TempDir, Connection) {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("store.sqlite");
-        initialize_store(&path).unwrap();
-        let conn = crate::store::open_store(&path).unwrap();
+        let home = temp.path();
+        std::fs::write(
+            home.join("familiars.toml"),
+            "[[familiar]]\nid = \"charm\"\ndisplay_name = \"Charm\"\nrole = \"Code\"\ndescription = \"Does the thing.\"\n",
+        )
+        .unwrap();
+        initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
         (temp, conn)
     }
 
     #[test]
-    fn successful_dispatch_leaves_the_run_in_flight() {
-        let (_temp, conn) = temp_store();
-        insert_definition(&conn, &definition("daily")).unwrap();
+    fn successful_dispatch_leaves_the_run_in_flight_and_a_durable_session_row() {
+        let (_temp, home_conn) = temp_store();
+        let home = _temp.path();
+        insert_definition(&home_conn, &definition("daily")).unwrap();
         let outcome = run_routine_now(
-            &conn,
+            home,
+            &home_conn,
             &crate::api::NoopSessionRuntime,
             &definition("daily"),
             Utc::now(),
@@ -381,9 +511,9 @@ mod tests {
         // settlement pass reports the terminal status from the Coven session
         // store.
         assert_eq!(outcome.status, "dispatched");
-        assert!(outcome.session_id.is_some());
+        let session_id = outcome.session_id.clone().unwrap();
 
-        let state: String = conn
+        let state: String = home_conn
             .query_row(
                 "SELECT state FROM automation_occurrences WHERE automation_id = 'daily'",
                 [],
@@ -392,15 +522,24 @@ mod tests {
             .unwrap();
         assert_eq!(state, "running");
 
-        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        let runs = super::super::runs::list_runs(&home_conn, "daily", 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "running");
         assert_eq!(runs[0].session_id, outcome.session_id);
         assert_eq!(runs[0].familiar_id.as_deref(), Some("charm"));
 
+        // The durable launch primitive persisted the session row before
+        // spawn (coven#816 finding 1).
+        let session = crate::store::get_session(&home_conn, &session_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "running");
+        assert_eq!(session.project_root, "/work/project");
+
         // A live run blocks a second one (overlap: forbid).
         let second = run_routine_now(
-            &conn,
+            home,
+            &home_conn,
             &crate::api::NoopSessionRuntime,
             &definition("daily"),
             Utc::now(),
@@ -409,7 +548,7 @@ mod tests {
         assert_eq!(second.status, "failed");
         let second_error = second.error.clone().unwrap_or_default();
         assert!(second_error.contains("overlap"), "{second_error}");
-        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        let runs = super::super::runs::list_runs(&home_conn, "daily", 10).unwrap();
         assert_eq!(runs.len(), 1, "the rejected run records no ledger row");
     }
 
@@ -423,18 +562,25 @@ mod tests {
     }
 
     #[test]
-    fn failed_launch_records_a_failed_run() {
-        let (_temp, conn) = temp_store();
-        insert_definition(&conn, &definition("daily")).unwrap();
-        let outcome =
-            run_routine_now(&conn, &RejectingRuntime, &definition("daily"), Utc::now()).unwrap();
+    fn failed_launch_records_a_failed_run_and_a_failed_session_row() {
+        let (_temp, home_conn) = temp_store();
+        let home = _temp.path();
+        insert_definition(&home_conn, &definition("daily")).unwrap();
+        let outcome = run_routine_now(
+            home,
+            &home_conn,
+            &RejectingRuntime,
+            &definition("daily"),
+            Utc::now(),
+        )
+        .unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("synthetic"));
 
-        let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
+        let runs = super::super::runs::list_runs(&home_conn, "daily", 10).unwrap();
         assert_eq!(runs[0].status, "failed");
 
-        let state: String = conn
+        let state: String = home_conn
             .query_row(
                 "SELECT state FROM automation_occurrences WHERE automation_id = 'daily'",
                 [],
@@ -442,17 +588,26 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+
+        // The durable row the primitive persisted before spawn is terminally
+        // settled to `failed` — the launch failure is visible everywhere.
+        let session = crate::store::get_session(&home_conn, &outcome.session_id.unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, "failed");
     }
 
     #[test]
     fn missing_cwd_fails_without_launching() {
-        let (_temp, conn) = temp_store();
+        let (_temp, home_conn) = temp_store();
+        let home = _temp.path();
         let mut definition = definition("nocwd");
         definition.cwd = None;
-        insert_definition(&conn, &definition).unwrap();
+        insert_definition(&home_conn, &definition).unwrap();
 
         let outcome = run_routine_now(
-            &conn,
+            home,
+            &home_conn,
             &crate::api::NoopSessionRuntime,
             &definition,
             Utc::now(),
@@ -460,5 +615,30 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.status, "failed");
         assert!(outcome.error.as_deref().unwrap().contains("no cwd"));
+    }
+
+    #[test]
+    fn an_unadmitted_familiar_fails_without_launching() {
+        let (_temp, home_conn) = temp_store();
+        let home = _temp.path();
+        let mut definition = definition("ghost");
+        definition.familiar_id = Some("ghost".to_string());
+        insert_definition(&home_conn, &definition).unwrap();
+
+        let outcome = run_routine_now(
+            home,
+            &home_conn,
+            &crate::api::NoopSessionRuntime,
+            &definition,
+            Utc::now(),
+        )
+        .unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert!(
+            outcome.error.as_deref().unwrap().contains("ghost"),
+            "{outcome:?}"
+        );
+        let runs = super::super::runs::list_runs(&home_conn, "ghost", 10).unwrap();
+        assert_eq!(runs.len(), 0, "admission failures never record ledger rows");
     }
 }

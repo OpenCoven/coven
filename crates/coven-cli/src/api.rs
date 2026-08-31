@@ -575,7 +575,8 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
-            let (status, response) = control_plane::route_action(payload, &conn, runtime);
+            let (status, response) =
+                control_plane::route_action(payload, coven_home, &conn, runtime);
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),
@@ -2106,7 +2107,6 @@ fn launch_session(
     // up, i.e. a child binding — an unbound or root-bound launch must not
     // create any store side effect ahead of the maintenance gate below, per
     // the existing maintenance-before-store-open precedence (§5.1).
-    let mut opened_conn: Option<rusqlite::Connection> = None;
     if let Some(binding) = execution_binding.as_ref() {
         let Some(familiar) = familiar_ctx.as_ref() else {
             return api_error(
@@ -2139,7 +2139,6 @@ fn launch_session(
             {
                 return Ok(response);
             }
-            opened_conn = Some(conn);
             // Test-only failpoint (issue #728 BLOCKER 1, final review): a
             // no-op in every non-test build. Deterministic concurrency tests
             // hook this to run a real concurrent write — e.g. sacrificing
@@ -2152,6 +2151,93 @@ fn launch_session(
             parent_correlation_advisory_check_completed_failpoint();
         }
     }
+    // The shared durable-launch primitive (coven#816): every launch —
+    // interactive `/sessions` and automation runs alike — persists the
+    // session row before spawn, and a runtime rejection terminally settles
+    // that row to `failed`.
+    let durable = DurableLaunch {
+        familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
+        execution_binding,
+        raw_caller_familiar_id: raw_caller_familiar_id.as_str(),
+    };
+    let record = match launch_session_durable(coven_home, &launch, durable, runtime) {
+        Ok(record) => record,
+        Err(DurableLaunchError::MaintenanceGate {
+            status,
+            code,
+            message,
+            session_id,
+            owner,
+        }) => {
+            let mut details = json!({ "sessionId": session_id });
+            if let Some(owner) = owner {
+                details["owner"] = json!(owner);
+            }
+            return api_error(status, code, &message, Some(details));
+        }
+        Err(DurableLaunchError::Rejected(response)) => return Ok(response),
+        Err(DurableLaunchError::Store(error)) => return Err(error),
+        Err(DurableLaunchError::LaunchRejected {
+            session_id,
+            message,
+        }) => {
+            return api_error(
+                500,
+                "launch_failed",
+                &message,
+                Some(json!({ "sessionId": session_id })),
+            );
+        }
+    };
+    json_response(201, &record)
+}
+
+/// The caller-specific durable-launch inputs each entry route resolves
+/// before the shared primitive runs. Automation runs resolve the familiar
+/// the definition pins; `/sessions` additionally resolves execution
+/// bindings and their raw caller identity.
+pub(crate) struct DurableLaunch<'a> {
+    pub familiar_id: Option<String>,
+    pub execution_binding: Option<crate::execution_binding::ExecutionBinding>,
+    pub raw_caller_familiar_id: Option<&'a str>,
+}
+
+/// The durable-launch failure modes. `MaintenanceGate` and `Rejected` mean
+/// nothing durable was written; `LaunchRejected` means the session row
+/// exists and has already been terminally settled to `failed`.
+pub(crate) enum DurableLaunchError {
+    /// The maintenance gate refused the launch before any row was written.
+    MaintenanceGate {
+        status: u16,
+        code: &'static str,
+        message: String,
+        session_id: String,
+        owner: Option<String>,
+    },
+    /// A request-level rejection surfaced after the gate (child/parent
+    /// correlation for bound launches): carries the structured response.
+    Rejected(ApiResponse),
+    /// The store could not be opened or the durable row could not be
+    /// written; nothing durable was created.
+    Store(anyhow::Error),
+    /// The runtime rejected the launch after the durable row existed; the
+    /// row has been terminally settled to `failed` unless a concurrent
+    /// terminal transition (kill/cancel) had already won that row.
+    LaunchRejected { session_id: String, message: String },
+}
+
+/// The one durable session-launch primitive shared by `POST /sessions` and
+/// automation run dispatch (coven#816 finding 1). Persists the session row
+/// before spawn, spawns through the caller's runtime, and terminally
+/// settles the row when the runtime rejects the launch — so every launch
+/// failure is durable and visible, and no launch bypasses the maintenance
+/// gate or familiar admission that `/sessions` applies.
+pub(crate) fn launch_session_durable(
+    coven_home: &Path,
+    launch: &SessionLaunch,
+    durable: DurableLaunch<'_>,
+    runtime: &dyn SessionRuntime,
+) -> Result<crate::store::SessionRecord, DurableLaunchError> {
     let writer = match crate::maintenance_gate::MaintenanceGate::discover_optional(Path::new(
         &launch.project_root,
     ))
@@ -2164,21 +2250,20 @@ fn launch_session(
         Ok(writer) => writer,
         Err(error) => {
             let gate_error = error.downcast_ref::<crate::maintenance_gate::GateError>();
-            let (code, details) = match gate_error {
-                Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => (
-                    "maintenance_locked",
-                    Some(json!({ "owner": owner, "sessionId": launch.id })),
-                ),
-                Some(_) => (
-                    "maintenance_state_invalid",
-                    Some(json!({ "sessionId": launch.id })),
-                ),
-                None => (
-                    "maintenance_gate_unavailable",
-                    Some(json!({ "sessionId": launch.id })),
-                ),
+            let (code, owner) = match gate_error {
+                Some(crate::maintenance_gate::GateError::OwnerHeld(owner)) => {
+                    ("maintenance_locked", Some(owner.owner_id.clone()))
+                }
+                Some(_) => ("maintenance_state_invalid", None),
+                None => ("maintenance_gate_unavailable", None),
             };
-            return api_error(423, code, &error.to_string(), details);
+            return Err(DurableLaunchError::MaintenanceGate {
+                status: 423,
+                code,
+                message: error.to_string(),
+                session_id: launch.id.clone(),
+                owner,
+            });
         }
     };
     let now = current_timestamp();
@@ -2190,21 +2275,15 @@ fn launch_session(
         status: "running".to_string(),
         now,
         conversation_id: launch.conversation_id.clone(),
-        familiar_id: familiar_ctx.as_ref().map(|familiar| familiar.id.clone()),
-        execution_binding,
+        familiar_id: durable.familiar_id,
+        execution_binding: durable.execution_binding,
         labels: Vec::new(),
         visibility: None,
     });
-    // Reuse the connection opened for a child binding's parent lookup, if
-    // any; otherwise open (and thereby initialize) the store only now, after
-    // the maintenance gate has already admitted this launch. Root/unbound
-    // launches take the `None` arm here and below, preserving the existing
-    // maintenance-before-store-open precedence unchanged: no parent to
-    // revalidate means no reason to pay for a transaction.
-    let mut conn = match opened_conn {
-        Some(conn) => conn,
-        None => store::open_store(&store_path(coven_home))?,
-    };
+    // Open (and thereby initialize) the store only now, after the
+    // maintenance gate has already admitted this launch, preserving the
+    // existing maintenance-before-store-open precedence (§5.1).
+    let mut conn = store::open_store(&store_path(coven_home)).map_err(DurableLaunchError::Store)?;
     match record
         .execution_binding
         .as_ref()
@@ -2220,46 +2299,49 @@ fn launch_session(
             // admission a single atomic unit against concurrent writers,
             // with no persistent FK/uniqueness constraint added to the
             // schema.
-            let caller_familiar_id = raw_caller_familiar_id.as_str();
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            if let Err(response) = correlate_child_parent(&tx, parent, caller_familiar_id)? {
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| DurableLaunchError::Store(error.into()))?;
+            let correlated = correlate_child_parent(&tx, parent, durable.raw_caller_familiar_id)
+                .map_err(DurableLaunchError::Store)?;
+            if let Err(response) = correlated {
                 // Dropping `tx` without calling `commit()` rolls it back:
                 // no child row is ever inserted on a revalidation failure.
-                return Ok(response);
+                return Err(DurableLaunchError::Rejected(response));
             }
-            store::insert_session(&tx, &record)?;
-            tx.commit()?;
+            store::insert_session(&tx, &record).map_err(DurableLaunchError::Store)?;
+            tx.commit()
+                .map_err(|error| DurableLaunchError::Store(error.into()))?;
         }
         None => {
-            store::insert_session(&conn, &record)?;
+            store::insert_session(&conn, &record).map_err(DurableLaunchError::Store)?;
         }
     }
     if let Err(error) = match writer {
-        Some(writer) => runtime.launch_session_with_writer(&launch, writer),
-        None => runtime.launch_session(&launch),
+        Some(writer) => runtime.launch_session_with_writer(launch, writer),
+        None => runtime.launch_session(launch),
     } {
         // Don't propagate to the accept loop — that crashes the daemon.
         // Runtime launch failures are user-facing (missing harness CLI,
         // missing auth, child closed stdin during stream-mode init):
-        // mark the session row failed and return a structured response
-        // so the client surfaces the cause and the daemon stays up.
+        // mark the session row failed so the failure is durable and the
+        // caller surfaces the cause.
         // Cancellation can win while a large launch-time stdin prompt is
         // still being delivered. Preserve that terminal decision: only a row
         // that is still owned by the failing launch may transition to failed.
-        let _ = store::update_session_status_if_current(
+        store::update_session_status_if_current(
             &conn,
             &record.id,
             "running",
             "failed",
             None,
             &current_timestamp(),
-        )?;
-        return api_error(
-            500,
-            "launch_failed",
-            &error.to_string(),
-            Some(json!({ "sessionId": record.id })),
-        );
+        )
+        .map_err(DurableLaunchError::Store)?;
+        return Err(DurableLaunchError::LaunchRejected {
+            session_id: record.id,
+            message: error.to_string(),
+        });
     }
     // Record the inter-familiar delegation in cave-coven-calls.json so the
     // Coven Calls graph in coven-cave has data to render. Best-effort: a
@@ -2275,7 +2357,7 @@ fn launch_session(
             eprintln!("[coven-calls] warn: failed to record delegation: {_err}");
         }
     }
-    json_response(201, &record)
+    Ok(record)
 }
 
 fn validate_adopted_launch_structure(payload: &Value) -> Result<()> {
@@ -10748,6 +10830,12 @@ mod tests {
     #[test]
     fn control_action_runs_a_routine_through_the_ledger() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
+        // Run-now dispatch resolves the familiar through the shared
+        // admission path (coven#816 finding 1), so the roster must exist.
+        std::fs::write(
+            temp_dir.path().join("familiars.toml"),
+            "[[familiar]]\nid = \"charm\"\ndisplay_name = \"Charm\"\nrole = \"Code\"\ndescription = \"Does the thing.\"\n",
+        )?;
         let create_body = json!({
             "action": "coven.automations.create",
             "definition": {
@@ -10813,26 +10901,13 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        crate::store::insert_session(
-            &conn,
-            &crate::store::SessionRecord {
-                id: session_id,
-                project_root: "/work/project".to_string(),
-                harness: "coven-code".to_string(),
-                title: "Daily notes".to_string(),
-                status: "completed".to_string(),
-                exit_code: Some(0),
-                archived_at: None,
-                created_at: "2026-08-28T09:00:00Z".to_string(),
-                updated_at: "2026-08-28T09:05:00Z".to_string(),
-                conversation_id: None,
-                familiar_id: Some("charm".to_string()),
-                execution_binding: None,
-                labels: Vec::new(),
-                visibility: "private".to_string(),
-                external: false,
-                transcript_path: None,
-            },
+        // The durable launch primitive persisted the session row before
+        // spawn (coven#816 finding 1); the PTY writer only flips it
+        // terminal.
+        conn.execute(
+            "UPDATE sessions SET status = 'completed', exit_code = 0,
+                    updated_at = '2026-08-28T09:05:00Z' WHERE id = ?1",
+            rusqlite::params![session_id],
         )
         .unwrap();
         drop(conn);

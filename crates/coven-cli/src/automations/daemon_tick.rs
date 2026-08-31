@@ -25,8 +25,9 @@ pub fn process_automations_tick(
     let now = chrono::Utc::now();
     let report = super::occurrences::tick(&conn, now)?;
     if !report.claimed.is_empty() {
-        let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
-            .map_err(anyhow::Error::msg)?;
+        let _dispatch =
+            super::runner::dispatch_claimed_occurrences(coven_home, &conn, runtime, now)
+                .map_err(anyhow::Error::msg)?;
     }
     let settlement =
         super::delivery::settle_finished_runs(&conn, now).map_err(anyhow::Error::msg)?;
@@ -125,28 +126,13 @@ mod tests {
 
         // The session then finishes (the PTY writer flips the sessions row
         // and records the normalized stream); the next tick settles the run
-        // from that store.
+        // from that store. The durable launch primitive already persisted
+        // the session row before spawn — the writer only flips it terminal.
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
-        crate::store::insert_session(
-            &conn,
-            &crate::store::SessionRecord {
-                id: session_id.clone(),
-                project_root: "/work/project".to_string(),
-                harness: "coven-code".to_string(),
-                title: "daily".to_string(),
-                status: "completed".to_string(),
-                exit_code: Some(0),
-                archived_at: None,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-                conversation_id: None,
-                familiar_id: Some("charm".to_string()),
-                execution_binding: None,
-                labels: Vec::new(),
-                visibility: "private".to_string(),
-                external: false,
-                transcript_path: None,
-            },
+        conn.execute(
+            "UPDATE sessions SET status = 'completed', exit_code = 0, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![session_id, chrono::Utc::now().to_rfc3339()],
         )
         .unwrap();
         crate::store::insert_event(

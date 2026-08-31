@@ -132,6 +132,7 @@ pub fn capabilities() -> CapabilityCatalog {
 
 pub fn route_action(
     payload: Value,
+    coven_home: &std::path::Path,
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
 ) -> (u16, ControlActionResponse) {
@@ -294,7 +295,7 @@ pub fn route_action(
                     action,
                     origin,
                     intent_id,
-                    automation_run_payload(conn, runtime, &id, now),
+                    automation_run_payload(conn, coven_home, runtime, &id, now),
                 ),
                 Err(error) => return (400, rejected_action(action, error)),
             };
@@ -411,13 +412,20 @@ fn automation_import_payload(conn: &rusqlite::Connection) -> Value {
 
 fn automation_run_payload(
     conn: &rusqlite::Connection,
+    coven_home: &std::path::Path,
     runtime: &dyn crate::api::SessionRuntime,
     id: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Value {
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
-            match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
+            match crate::automations::runner::run_routine_now(
+                coven_home,
+                conn,
+                runtime,
+                &definition,
+                now,
+            ) {
                 Ok(outcome) => json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
