@@ -36,7 +36,11 @@ committing surviving fragments, and unresolved automation sessions pin their
 events beyond ordinary log retention. Settlement is process-serialized so a
 concurrent tick cannot reinterpret another live spool as crash debris; unsafe
 or undeletable stale artifacts degrade only their own run and never block
-daemon startup. An external
+daemon startup. Degraded recovery keeps the run unresolved, and therefore its
+event-retention pin and session-deletion fence, until terminal evidence is
+captured in the same settlement transaction. A pre-rename cleanup failure
+retains the recorded spool pointer until unlink and parent-directory sync are
+both confirmed. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions

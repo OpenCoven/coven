@@ -63,7 +63,11 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     raw truncation. Settlement is process-serialized, and stale spool cleanup
     degrades only the affected ledger pair when an artifact is unsafe or
     undeletable, preserving the artifact and allowing daemon startup to
-    continue.
+    continue. Degraded recovery retains the running ledger pin until terminal
+    exit/log/truncation evidence is captured transactionally. Session deletion
+    is atomically refused while that pin exists. Pre-rename cleanup retains its
+    spool pointer until unlink plus parent-directory sync is confirmed; a
+    failed sync remains ambiguous and is retried from the durable pointer.
 
 ## Contract profile and versioning
 

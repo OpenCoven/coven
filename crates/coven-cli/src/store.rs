@@ -145,6 +145,18 @@ impl std::fmt::Display for AdoptionRetentionError {
 
 impl std::error::Error for AdoptionRetentionError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutomationRunRetentionError;
+
+impl std::fmt::Display for AutomationRunRetentionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("unresolved automation run retains this session until settlement completes")
+    }
+}
+
+impl std::error::Error for AutomationRunRetentionError {}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
@@ -986,6 +998,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation_runs schema")?;
     crate::automations::store::ensure_snapshot_schema(conn)
         .context("failed to migrate automation snapshot schema")?;
+    ensure_automation_session_retention_trigger(conn)?;
 
     backfill_events_fts_if_needed(conn)?;
 
@@ -1169,7 +1182,24 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, sql: &str) -> Res
         conn.execute(sql, [])
             .with_context(|| format!("failed to add {table}.{column} column"))?;
     }
+
     Ok(())
+}
+
+fn ensure_automation_session_retention_trigger(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS sessions_no_delete_unresolved_automation
+         BEFORE DELETE ON sessions
+         WHEN EXISTS (
+             SELECT 1 FROM automation_runs
+             WHERE automation_runs.session_id = OLD.id
+               AND automation_runs.status = 'running'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'unresolved automation run retains session');
+         END;",
+    )
+    .context("failed to create unresolved automation session retention trigger")
 }
 
 fn ensure_sensitive_artifacts_table(conn: &Connection) -> Result<()> {
@@ -3516,10 +3546,26 @@ pub fn ensure_session_sacrificable(conn: &Connection, session_id: &str) -> Resul
     if session.status == crate::RUNNING_SESSION_STATUS {
         bail!("session `{session_id}` is still running; do not sacrifice live work");
     }
+    if session_has_unresolved_automation_run(conn, session_id)? {
+        return Err(AutomationRunRetentionError.into());
+    }
     if session_has_request_adoption(conn, session_id)? {
         return Err(AdoptionRetentionError.into());
     }
+
     Ok(())
+}
+
+fn session_has_unresolved_automation_run(conn: &Connection, session_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM automation_runs
+             WHERE session_id = ?1 AND status = 'running'
+         )",
+        params![session_id],
+        |row| row.get(0),
+    )
+    .context("failed to inspect unresolved automation session retention")
 }
 
 fn is_foreign_key_constraint(error: &rusqlite::Error) -> bool {
@@ -3532,6 +3578,15 @@ fn is_foreign_key_constraint(error: &rusqlite::Error) -> bool {
             rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY | rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
         )
         && message.as_deref() == Some("FOREIGN KEY constraint failed")
+}
+
+fn is_automation_retention_constraint(error: &rusqlite::Error) -> bool {
+    let rusqlite::Error::SqliteFailure(code, message) = error else {
+        return false;
+    };
+    code.code == ErrorCode::ConstraintViolation
+        && code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER
+        && message.as_deref() == Some("unresolved automation run retains session")
 }
 
 fn sacrifice_session_with_pre_delete_hook<F>(
@@ -3566,6 +3621,9 @@ where
                 && session_has_request_adoption(conn, session_id)? =>
         {
             Err(AdoptionRetentionError.into())
+        }
+        Err(error) if is_automation_retention_constraint(&error) => {
+            Err(AutomationRunRetentionError.into())
         }
         Err(error) => {
             Err(error).with_context(|| format!("failed to sacrifice session {session_id}"))
@@ -6837,6 +6895,61 @@ END;
         let retained = get_session(&delete_conn, "race-session")?.expect("session retained");
         assert_eq!(retained.status, "running");
         assert_eq!(list_events(&delete_conn, "race-session")?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn sacrifice_atomically_refuses_racing_unresolved_automation_then_succeeds_terminally(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("automation-retention.sqlite");
+        let delete_conn = open_store(&path)?;
+        let insert_conn = open_store(&path)?;
+        let mut session = session_record("automation-session", "2026-04-27T06:00:00Z");
+        session.status = "completed".to_string();
+        insert_session(&delete_conn, &session)?;
+        insert_json_event(
+            &delete_conn,
+            "automation-session",
+            "output",
+            &serde_json::json!({"data":"retain until automation settles"}),
+            "2026-04-27T06:01:00Z",
+        )?;
+
+        let error =
+            sacrifice_session_with_pre_delete_hook(&delete_conn, "automation-session", || {
+                insert_conn.execute(
+                    "INSERT INTO automation_occurrences
+                        (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+                     VALUES ('sacrifice-occ', 'sacrifice-automation',
+                             '2026-04-27T06:00:00Z', 'running', 1,
+                             '2026-04-27T06:00:00Z', '2026-04-27T06:00:00Z')",
+                    [],
+                )?;
+                insert_conn.execute(
+                    "INSERT INTO automation_runs
+                        (id, automation_id, occurrence_id, session_id, runtime, status, started_at)
+                     VALUES ('sacrifice-run', 'sacrifice-automation', 'sacrifice-occ',
+                             'automation-session', 'coven-code', 'running',
+                             '2026-04-27T06:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect_err("racing unresolved automation must block sacrifice");
+
+        assert!(error.to_string().contains("unresolved automation"));
+        assert!(get_session(&delete_conn, "automation-session")?.is_some());
+        assert_eq!(list_events(&delete_conn, "automation-session")?.len(), 1);
+
+        insert_conn.execute(
+            "UPDATE automation_runs SET status = 'failed', finished_at = '2026-04-27T06:02:00Z'
+             WHERE id = 'sacrifice-run'",
+            [],
+        )?;
+        sacrifice_session(&delete_conn, "automation-session")?;
+        assert!(get_session(&delete_conn, "automation-session")?.is_none());
+        assert!(list_events(&delete_conn, "automation-session")?.is_empty());
         Ok(())
     }
 
