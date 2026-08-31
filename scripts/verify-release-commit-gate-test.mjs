@@ -9,8 +9,10 @@ import {
   buildGateReceipt,
   loadRequiredChecksManifest,
   parseVerifyArgs,
+  selectAcceptedWorkflowRun,
   verifyCommitRequiredChecks,
-  verifyExactCommitGate
+  verifyExactCommitGate,
+  verifyRunJobEvidence
 } from './verify-release-commit-gate.mjs';
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -72,22 +74,37 @@ function checkPayload(name, overrides = {}) {
   };
 }
 
-function strictAndRoutedCheckRuns({ manifest, routed = {} } = {}) {
-  const runs = manifest.strict_checks.map((entry) => checkPayload(entry.name));
+// The gate's accepted evidence is the job list of the selected run attempt.
+function jobPayload(name, overrides = {}) {
+  return {
+    name,
+    id: 9000 + name.length,
+    run_id: 501,
+    run_url: 'https://github.com/OpenCoven/coven/actions/runs/501',
+    head_sha: COMMIT_SHA,
+    status: 'completed',
+    conclusion: 'success',
+    workflow_name: 'CI',
+    ...overrides
+  };
+}
+
+function selectedRunJobs({ manifest, routed = {}, overrides = {} } = {}) {
+  const jobs = manifest.strict_checks.map((entry) => jobPayload(entry.name, overrides[entry.name]));
   for (const entry of manifest.routed_checks) {
     const observation = routed[entry.name] ?? 'success';
     if (observation === 'absent') {
       continue;
     }
-    runs.push(checkPayload(entry.name, { conclusion: observation }));
+    jobs.push(jobPayload(entry.name, { conclusion: observation, ...(overrides[entry.name] ?? {}) }));
   }
-  return runs;
+  return jobs;
 }
 
-function gateError({ manifest = syntheticManifest(), workflowRuns, checkRuns, commitSha = COMMIT_SHA }) {
+function gateError({ manifest = syntheticManifest(), workflowRuns, runJobs, commitSha = COMMIT_SHA } = {}) {
   let message = null;
   try {
-    verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, checkRuns });
+    verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, runJobs });
   } catch (error) {
     message = error.message;
   }
@@ -95,8 +112,8 @@ function gateError({ manifest = syntheticManifest(), workflowRuns, checkRuns, co
   return message;
 }
 
-function acceptedEvidence({ manifest = syntheticManifest(), workflowRuns, checkRuns, commitSha = COMMIT_SHA } = {}) {
-  return verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, checkRuns });
+function acceptedEvidence({ manifest = syntheticManifest(), workflowRuns, runJobs, commitSha = COMMIT_SHA } = {}) {
+  return verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, runJobs });
 }
 
 // ---------------------------------------------------------------------------
@@ -190,7 +207,7 @@ test('happy path: exact commit with green aggregate, strict successes, and route
   const evidence = acceptedEvidence({
     manifest,
     workflowRuns: [runPayload()],
-    checkRuns: strictAndRoutedCheckRuns({ manifest, routed: { 'Channels package': 'skipped' } })
+    runJobs: selectedRunJobs({ manifest, routed: { 'Channels package': 'skipped' } })
   });
   assert.equal(evidence.run.id, '501');
   assert.equal(evidence.run.conclusion, 'success');
@@ -205,20 +222,20 @@ test('accepts the real manifest when every strict check is green and routed chec
   const evidence = acceptedEvidence({
     manifest: REAL_MANIFEST,
     workflowRuns: [runPayload()],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: REAL_MANIFEST, routed: { 'Rust tests (Linux)': 'skipped', 'Channels package': 'absent' } })
+    runJobs: selectedRunJobs({ manifest: REAL_MANIFEST, routed: { 'Rust tests (Linux)': 'skipped', 'Channels package': 'absent' } })
   });
   assert.equal(evidence.checks.length, REAL_MANIFEST.strict_checks.length + REAL_MANIFEST.routed_checks.length);
 });
 
 test('refuses when no CI run exists for the exact commit (missing)', () => {
-  const message = gateError({ workflowRuns: [], checkRuns: [] });
+  const message = gateError({ workflowRuns: [], runJobs: [] });
   assert.match(message, /no .* run .* exists for the exact commit/);
 });
 
 test('refuses when only a green ancestor commit has a run (exact target differs)', () => {
   const message = gateError({
     workflowRuns: [runPayload({ head_sha: ANCESTOR_SHA })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /green ancestor or unrelated commit is insufficient/);
 });
@@ -226,7 +243,7 @@ test('refuses when only a green ancestor commit has a run (exact target differs)
 test('refuses a candidate run whose payload head SHA differs from the release commit', () => {
   const message = gateError({
     workflowRuns: [runPayload({ head_sha: ANCESTOR_SHA })],
-    checkRuns: [],
+    runJobs: [],
     manifest: syntheticManifest()
   });
   assert.match(message, /green ancestor or unrelated commit is insufficient/);
@@ -235,7 +252,7 @@ test('refuses a candidate run whose payload head SHA differs from the release co
 test('refuses an in-flight run for the exact commit (stale evidence)', () => {
   const message = gateError({
     workflowRuns: [runPayload({ status: 'in_progress', conclusion: null })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /stale or in flight/);
 });
@@ -243,7 +260,7 @@ test('refuses an in-flight run for the exact commit (stale evidence)', () => {
 test('refuses a queued run for the exact commit', () => {
   const message = gateError({
     workflowRuns: [runPayload({ status: 'queued', conclusion: null })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /stale or in flight/);
 });
@@ -254,7 +271,7 @@ test('refuses a green older run when a newer attempt is in flight', () => {
       runPayload({ id: 501, run_number: 12, status: 'completed', conclusion: 'success' }),
       runPayload({ id: 502, run_number: 13, status: 'in_progress', conclusion: null })
     ],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest: syntheticManifest() })
   });
   assert.match(message, /stale or in flight/);
 });
@@ -262,7 +279,7 @@ test('refuses a green older run when a newer attempt is in flight', () => {
 test('refuses a failed aggregate run (exact tag target has a failing CI run)', () => {
   const message = gateError({
     workflowRuns: [runPayload({ conclusion: 'failure' })],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest: syntheticManifest() })
   });
   assert.match(message, /concluded "failure", not "success"/);
 });
@@ -270,7 +287,7 @@ test('refuses a failed aggregate run (exact tag target has a failing CI run)', (
 test('refuses a cancelled aggregate run', () => {
   const message = gateError({
     workflowRuns: [runPayload({ conclusion: 'cancelled' })],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest: syntheticManifest() })
   });
   assert.match(message, /concluded "cancelled"/);
 });
@@ -278,7 +295,7 @@ test('refuses a cancelled aggregate run', () => {
 test('refuses a timed-out aggregate run', () => {
   const message = gateError({
     workflowRuns: [runPayload({ conclusion: 'timed_out' })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /concluded "timed_out"/);
 });
@@ -286,7 +303,7 @@ test('refuses a timed-out aggregate run', () => {
 test('refuses a run for the exact commit on a non-main branch', () => {
   const message = gateError({
     workflowRuns: [runPayload({ head_branch: 'feature-branch' })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /exists for the exact commit/);
 });
@@ -294,18 +311,20 @@ test('refuses a run for the exact commit on a non-main branch', () => {
 test('refuses a pull_request CI run as release evidence', () => {
   const message = gateError({
     workflowRuns: [runPayload({ event: 'pull_request' })],
-    checkRuns: []
+    runJobs: []
   });
   assert.match(message, /exists for the exact commit/);
 });
 
 test('accepts and selects the newest run when several green runs exist for the exact commit', () => {
+  const manifest = syntheticManifest();
   const evidence = acceptedEvidence({
+    manifest,
     workflowRuns: [
       runPayload({ id: 501, run_number: 11 }),
       runPayload({ id: 502, run_number: 12 })
     ],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest }).map((job) => ({ ...job, run_id: 502 }))
   });
   assert.equal(evidence.run.id, '502');
 });
@@ -316,7 +335,7 @@ test('refuses when two completed runs for the exact commit disagree', () => {
       runPayload({ id: 501, run_number: 11, conclusion: 'success' }),
       runPayload({ id: 502, run_number: 12, conclusion: 'failure' })
     ],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest: syntheticManifest() })
   });
   assert.match(message, /concluded "failure"/);
 });
@@ -327,54 +346,54 @@ test('refuses when two completed runs for the exact commit disagree', () => {
 
 test('refuses when a strict required check is missing for the exact commit', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).filter((run) => run.name !== 'engine contract');
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const runJobs = selectedRunJobs({ manifest }).filter((run) => run.name !== 'engine contract');
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /required check "engine contract" \(strict\) is missing/);
 });
 
 test('refuses when a strict required check was skipped for the exact commit (skipped-when-required)', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
+  const runJobs = selectedRunJobs({ manifest }).map((run) =>
     run.name === 'Policy guard' ? { ...run, conclusion: 'skipped' } : run
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /required check "Policy guard" \(strict\) was skipped/);
 });
 
 test('refuses when a strict required check failed for the exact commit', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
+  const runJobs = selectedRunJobs({ manifest }).map((run) =>
     run.name === 'engine contract' ? { ...run, conclusion: 'failure' } : run
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /required check "engine contract" \(strict\)/);
   assert.match(message, /concluded "failure"/);
 });
 
 test('refuses when a strict required check is still running', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
+  const runJobs = selectedRunJobs({ manifest }).map((run) =>
     run.name === 'engine contract' ? { ...run, status: 'in_progress', conclusion: null } : run
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /required check "engine contract" \(strict\)/);
   assert.match(message, /is not completed/);
 });
 
 test('refuses when a strict required check was cancelled', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
+  const runJobs = selectedRunJobs({ manifest }).map((run) =>
     run.name === 'Policy guard' ? { ...run, conclusion: 'cancelled' } : run
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /required check "Policy guard" \(strict\)/);
   assert.match(message, /concluded "cancelled"/);
 });
 
 test('accepts an absent routed check as routed-out and records it in the evidence', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest, routed: { 'Channels package': 'absent', 'Rust tests (Linux)': 'success' } });
-  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const runJobs = selectedRunJobs({ manifest, routed: { 'Channels package': 'absent', 'Rust tests (Linux)': 'success' } });
+  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], runJobs });
   const channels = evidence.checks.find((check) => check.name === 'Channels package');
   assert.equal(channels.status, 'absent');
   assert.equal(channels.conclusion, 'routed-out');
@@ -382,62 +401,115 @@ test('accepts an absent routed check as routed-out and records it in the evidenc
 
 test('accepts a skipped routed check', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest, routed: { 'Rust tests (Linux)': 'skipped' } });
-  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const runJobs = selectedRunJobs({ manifest, routed: { 'Rust tests (Linux)': 'skipped' } });
+  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], runJobs });
   const rust = evidence.checks.find((check) => check.name === 'Rust tests (Linux)');
   assert.equal(rust.conclusion, 'skipped');
 });
 
 test('refuses a failed routed check', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest, routed: { 'Rust tests (Linux)': 'failure' } });
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const runJobs = selectedRunJobs({ manifest, routed: { 'Rust tests (Linux)': 'failure' } });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /routed check "Rust tests \(Linux\)" .* concluded "failure"/);
 });
 
 test('refuses a routed check that is still running', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest, routed: { 'Channels package': 'absent' } }).map((run) =>
+  const runJobs = selectedRunJobs({ manifest, routed: { 'Channels package': 'absent' } }).map((run) =>
     run.name === 'Rust tests (Linux)' ? { ...run, status: 'in_progress', conclusion: null } : run
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
   assert.match(message, /routed check "Rust tests \(Linux\)" .* is not completed/);
 });
 
 // ---------------------------------------------------------------------------
-// Evidence hygiene
+// Evidence hygiene — evidence must come from the selected run/attempt only
 // ---------------------------------------------------------------------------
 
-test('ignores check runs produced by third-party apps (foreign evidence cannot satisfy a required check)', () => {
+test('refuses a same-named job from a different check suite (cross-suite evidence cannot satisfy a required check)', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
-    run.name === 'Policy guard' ? { ...run, app: { slug: 'not-github-actions' } } : run
+  // The job list contains a green "Policy guard" job, but it belongs to another
+  // run (another check suite — e.g. a different workflow or an older attempt).
+  // The selected run has no such job, so the strict check is missing.
+  const runJobs = selectedRunJobs({ manifest }).map((job) =>
+    job.name === 'Policy guard' ? { ...job, run_id: 999 } : job
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
-  assert.match(message, /required check "Policy guard" \(strict\) is missing/);
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
+  assert.match(
+    message,
+    /belongs to run 999, not the selected run 501\. Check evidence from a different check suite/
+  );
 });
 
-test('refuses ambiguous duplicate latest check runs for one name', () => {
+test('verifyRunJobEvidence refuses cross-suite jobs outright, even when the name would match', () => {
   const manifest = syntheticManifest();
-  const base = strictAndRoutedCheckRuns({ manifest });
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns: [...base, checkPayload('Policy guard')] });
-  assert.match(message, /more than one latest check run named "Policy guard"/);
+  const run = runPayload();
+  assert.throws(
+    () =>
+      verifyRunJobEvidence({
+        commitSha: COMMIT_SHA,
+        run,
+        manifest,
+        runJobs: [{ ...jobPayload('Policy guard'), run_id: 999 }]
+      }),
+    /belongs to run 999, not the selected run 501/
+  );
 });
 
-test('refuses a check run reporting a different head SHA', () => {
+test('refuses a job whose workflow name differs from the selected source workflow', () => {
   const manifest = syntheticManifest();
-  const checkRuns = strictAndRoutedCheckRuns({ manifest }).map((run) =>
-    run.name === 'Policy guard' ? { ...run, head_sha: ANCESTOR_SHA } : run
+  const runJobs = selectedRunJobs({ manifest }).map((job) =>
+    job.name === 'Policy guard' ? { ...job, workflow_name: 'Legacy CI' } : job
   );
-  const message = gateError({ manifest, workflowRuns: [runPayload()], checkRuns });
-  assert.match(message, /check run "Policy guard" reports head SHA .* not the exact commit/);
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
+  assert.match(message, /belongs to workflow "Legacy CI", not the source workflow "CI"/);
+});
+
+test('refuses a job in the selected run reporting a different head SHA', () => {
+  const manifest = syntheticManifest();
+  const runJobs = selectedRunJobs({ manifest }).map((job) =>
+    job.name === 'Policy guard' ? { ...job, head_sha: ANCESTOR_SHA } : job
+  );
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
+  assert.match(message, /job "Policy guard" in the selected run reports head SHA .* not the exact commit/);
+});
+
+test('refuses a job that ran in the selected CI run but is not declared in the manifest', () => {
+  const manifest = syntheticManifest();
+  const runJobs = [...selectedRunJobs({ manifest }), jobPayload('Brand new job')];
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
+  assert.match(message, /not declared in scripts\/release-required-checks\.json/);
+});
+
+test('refuses duplicate job names inside the selected run (ambiguous evidence)', () => {
+  const manifest = syntheticManifest();
+  const base = selectedRunJobs({ manifest });
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs: [...base, jobPayload('Policy guard')] });
+  assert.match(message, /more than one job named "Policy guard"/);
+});
+
+test('refuses a selected-run job without a name', () => {
+  const manifest = syntheticManifest();
+  const runJobs = [...selectedRunJobs({ manifest }), jobPayload('')];
+  const message = gateError({ manifest, workflowRuns: [runPayload()], runJobs });
+  assert.match(message, /reported a job without a name/);
+});
+
+test('selectAcceptedWorkflowRun is exported and selects the newest green run', () => {
+  const run = selectAcceptedWorkflowRun({
+    commitSha: COMMIT_SHA,
+    manifest: syntheticManifest(),
+    workflowRuns: [runPayload({ id: 501, run_number: 11 }), runPayload({ id: 502, run_number: 12 })]
+  });
+  assert.equal(run.id, 502);
 });
 
 test('refuses a malformed release commit SHA', () => {
   const message = gateError({
     commitSha: 'not-a-sha',
     workflowRuns: [runPayload()],
-    checkRuns: strictAndRoutedCheckRuns({ manifest: syntheticManifest() })
+    runJobs: selectedRunJobs({ manifest: syntheticManifest() })
   });
   assert.match(message, /must be a 40-hex git SHA/);
 });
@@ -451,7 +523,7 @@ function acceptedReceipt() {
   const evidence = acceptedEvidence({
     manifest,
     workflowRuns: [runPayload()],
-    checkRuns: strictAndRoutedCheckRuns({ manifest })
+    runJobs: selectedRunJobs({ manifest })
   });
   return buildGateReceipt({
     repository: 'OpenCoven/coven',
@@ -504,7 +576,7 @@ test('receipt: is deterministic and contains no timestamps or secret-bearing fie
 
 test('receipt: rejects incoherent version metadata (non-stable tag)', () => {
   const manifest = syntheticManifest();
-  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], checkRuns: strictAndRoutedCheckRuns({ manifest }) });
+  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], runJobs: selectedRunJobs({ manifest }) });
   assert.throws(
     () =>
       buildGateReceipt({
@@ -521,7 +593,7 @@ test('receipt: rejects incoherent version metadata (non-stable tag)', () => {
 
 test('receipt: rejects a malformed tag object SHA', () => {
   const manifest = syntheticManifest();
-  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], checkRuns: strictAndRoutedCheckRuns({ manifest }) });
+  const evidence = acceptedEvidence({ manifest, workflowRuns: [runPayload()], runJobs: selectedRunJobs({ manifest }) });
   assert.throws(
     () =>
       buildGateReceipt({
@@ -548,7 +620,7 @@ test('REST wrapper: accepts a green exact commit and returns evidence plus recei
     if (endpoint.includes('/actions/runs?')) {
       return { total_count: 1, workflow_runs: [runPayload()] };
     }
-    return { total_count: 4, check_runs: strictAndRoutedCheckRuns({ manifest }) };
+    return { total_count: 4, jobs: selectedRunJobs({ manifest }) };
   };
   const { evidence, receipt } = await verifyExactCommitGate({
     repository: 'OpenCoven/coven',
@@ -560,8 +632,11 @@ test('REST wrapper: accepts a green exact commit and returns evidence plus recei
   });
   assert.equal(endpoints.length, 2);
   assert.match(endpoints[0], /\/actions\/runs\?head_sha=/);
-  assert.match(endpoints[1], /\/commits\/.*\/check-runs\?filter=latest/);
+  // Evidence is bound to the selected run and attempt.
+  assert.match(endpoints[1], /\/actions\/runs\/501\/attempts\/1\/jobs\?per_page=100&page=1/);
   assert.equal(evidence.run.conclusion, 'success');
+  assert.equal(evidence.run.id, '501');
+  assert.equal(evidence.run.run_attempt, 1);
   assert.equal(receipt.decision, 'accepted');
 });
 
@@ -581,21 +656,21 @@ test('REST wrapper: fails closed when run results are paginated away (incomplete
   );
 });
 
-test('REST wrapper: paginates check runs until the reported total is collected', async () => {
+test('REST wrapper: fetches job pages for the selected run attempt until the reported total is collected', async () => {
   const manifest = syntheticManifest();
-  const allCheckRuns = strictAndRoutedCheckRuns({ manifest });
-  const pageOne = allCheckRuns.slice(0, 3);
-  const pageTwo = allCheckRuns.slice(3);
-  const requestedPages = [];
+  const allJobs = selectedRunJobs({ manifest });
+  const pageOne = allJobs.slice(0, 3);
+  const pageTwo = allJobs.slice(3);
+  const requestedEndpoints = [];
   const ghApi = async (endpoint) => {
     if (endpoint.includes('/actions/runs?')) {
       return { total_count: 1, workflow_runs: [runPayload()] };
     }
     const page = Number(/[?&]page=(\d+)/.exec(endpoint)?.[1] ?? 1);
-    requestedPages.push(page);
+    requestedEndpoints.push(endpoint);
     return {
       total_count: pageOne.length + pageTwo.length,
-      check_runs: page === 1 ? pageOne : pageTwo
+      jobs: page === 1 ? pageOne : pageTwo
     };
   };
   const { evidence } = await verifyExactCommitGate({
@@ -605,17 +680,19 @@ test('REST wrapper: paginates check runs until the reported total is collected',
     manifestDigest: 'f'.repeat(64),
     ghApi
   });
-  assert.deepEqual(requestedPages, [1, 2]);
+  assert.equal(requestedEndpoints.length, 2);
+  assert.match(requestedEndpoints[0], /\/actions\/runs\/501\/attempts\/1\/jobs\?per_page=100&page=1/);
+  assert.match(requestedEndpoints[1], /\/actions\/runs\/501\/attempts\/1\/jobs\?per_page=100&page=2/);
   assert.ok(evidence.checks.length > 0);
 });
 
-test('REST wrapper: fails closed when check-run pages never reach the reported total', async () => {
+test('REST wrapper: fails closed when job pages never reach the reported total', async () => {
   const manifest = syntheticManifest();
   const ghApi = async (endpoint) => {
     if (endpoint.includes('/actions/runs?')) {
       return { total_count: 1, workflow_runs: [runPayload()] };
     }
-    return { total_count: 5000, check_runs: strictAndRoutedCheckRuns({ manifest }) };
+    return { total_count: 5000, jobs: selectedRunJobs({ manifest }) };
   };
   await assert.rejects(
     () =>
@@ -627,6 +704,57 @@ test('REST wrapper: fails closed when check-run pages never reach the reported t
         ghApi
       }),
     /truncated evidence/
+  );
+});
+
+test('REST wrapper: fails closed when the job list payload has no usable total_count', async () => {
+  const manifest = syntheticManifest();
+  const ghApi = async (endpoint) => {
+    if (endpoint.includes('/actions/runs?')) {
+      return { total_count: 1, workflow_runs: [runPayload()] };
+    }
+    return { jobs: selectedRunJobs({ manifest }) };
+  };
+  await assert.rejects(
+    () =>
+      verifyExactCommitGate({
+        repository: 'OpenCoven/coven',
+        commitSha: COMMIT_SHA,
+        manifest,
+        manifestDigest: 'f'.repeat(64),
+        ghApi
+      }),
+    /no usable total_count/
+  );
+});
+
+test('REST wrapper: cross-suite negative — a same-named green check run from another check suite cannot satisfy the gate', async () => {
+  const manifest = syntheticManifest();
+  // The selected run's own job list lacks "Policy guard"; a green same-named
+  // check run exists on the commit from a different workflow/check suite. The
+  // gate never reads the check-runs listing, so it must refuse.
+  const ghApi = async (endpoint) => {
+    if (endpoint.includes('/actions/runs?')) {
+      return { total_count: 1, workflow_runs: [runPayload()] };
+    }
+    if (endpoint.includes('/attempts/1/jobs')) {
+      return {
+        total_count: 3,
+        jobs: selectedRunJobs({ manifest }).filter((job) => job.name !== 'Policy guard')
+      };
+    }
+    throw new Error(`Unexpected endpoint ${endpoint}`);
+  };
+  await assert.rejects(
+    () =>
+      verifyExactCommitGate({
+        repository: 'OpenCoven/coven',
+        commitSha: COMMIT_SHA,
+        manifest,
+        manifestDigest: 'f'.repeat(64),
+        ghApi
+      }),
+    /required check "Policy guard" \(strict\) is missing/
   );
 });
 

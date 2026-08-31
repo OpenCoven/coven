@@ -12,10 +12,15 @@
 //     an unrelated workflow, or a missing run is rejected);
 //   - the run must be completed with conclusion success (an in-flight, stale,
 //     cancelled, or failed run is rejected);
-//   - every strict required check (runs on every push to main) must report
-//     success for the exact SHA (missing, skipped, or failed is rejected);
-//   - every routed check (legitimately skipped by path classification) must not
-//     have failed (absent or skipped is accepted, anything else is rejected).
+//   - evidence is bound to the *selected* run and attempt: the only accepted
+//     check evidence is the job list of that exact workflow-run attempt
+//     (GET /actions/runs/{id}/attempts/{attempt}/jobs). A same-named check run
+//     from any other check suite — another workflow, a different attempt, or a
+//     third-party integration — can never satisfy a required check because it
+//     is not a job of the selected run;
+//   - every job that ran in the selected run must be a declared required check
+//     (strict or routed) and report an allowed conclusion, so the manifest can
+//     never silently narrow what a release actually depends on.
 //
 // Evidence for the decision is emitted as a deterministic machine-readable
 // receipt (schema coven.release-commit-gate-receipt/v1) so the release record
@@ -33,12 +38,8 @@ import path from 'node:path';
 
 const MANIFEST_SCHEMA = 'coven.release-required-checks/v1';
 const RECEIPT_SCHEMA = 'coven.release-commit-gate-receipt/v1';
-const CHECK_RUN_PAGE_SIZE = 100;
-const MAX_CHECK_RUN_PAGES = 10;
-// The workflow run and the check runs are only trusted as evidence when GitHub
-// produced them. Matching the app slug keeps a same-named check run from some
-// third-party integration from satisfying a required check.
-const GITHUB_ACTIONS_APP_SLUG = 'github-actions';
+const JOB_PAGE_SIZE = 100;
+const MAX_JOB_PAGES = 10;
 const ACCEPTED_RUN_CONCLUSION = 'success';
 const NON_COMPLETED_RUN_STATUSES = new Set([
   'queued',
@@ -157,7 +158,7 @@ function parseCheckEntries(value, label, { allowEmpty }) {
 // Pure verification: refuse anything that is not exact, complete, green evidence
 // ---------------------------------------------------------------------------
 
-export function verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, checkRuns }) {
+export function selectAcceptedWorkflowRun({ commitSha, manifest, workflowRuns }) {
   if (!isSha(commitSha)) {
     throw new Error(`Refusing release commit gate: commit SHA ${JSON.stringify(commitSha ?? null)} must be a 40-hex git SHA.`);
   }
@@ -193,13 +194,71 @@ export function verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, 
       `Refusing release commit gate: CI run ${describeRunId(rejectedRun)} for the exact commit ${commitSha} concluded ${JSON.stringify(rejectedRun?.conclusion ?? null)}, not ${JSON.stringify(ACCEPTED_RUN_CONCLUSION)}.`
     );
   }
-  const acceptedRun = [...candidateRuns].sort((a, b) => compareRuns(a, b)).at(-1);
+  return [...candidateRuns].sort((a, b) => compareRuns(a, b)).at(-1);
+}
 
-  const checkEvidence = collectCheckEvidence({ commitSha, checkRuns });
+// The selected run's own job list is the only accepted evidence. Check runs are
+// intentionally not consulted: the check-runs listing for a commit aggregates
+// every check suite that ever reported against that SHA, so a same-named check
+// run from another workflow (or another app) could satisfy a required check by
+// name alone. Jobs are fetched per run attempt, carry the run id, head SHA, and
+// workflow name, and are therefore bound to the exact evidence source.
+export function verifyRunJobEvidence({ commitSha, run, manifest, runJobs }) {
+  if (!isSha(commitSha)) {
+    throw new Error(`Refusing release commit gate: commit SHA ${JSON.stringify(commitSha ?? null)} must be a 40-hex git SHA.`);
+  }
+  if (!run || typeof run !== 'object' || run.id === undefined || run.id === null) {
+    throw new Error('Refusing release commit gate: an accepted workflow run with an id is required to bind job evidence.');
+  }
+  const { source_workflow: sourceWorkflow } = manifest;
+  const evidence = new Map();
+  for (const job of Array.isArray(runJobs) ? runJobs : []) {
+    const name = typeof job?.name === 'string' ? job.name.trim() : '';
+    if (!name) {
+      throw new Error(
+        `Refusing release commit gate: selected run ${describeRunId(run)} reported a job without a name; refusing to decide on unlabelled evidence.`
+      );
+    }
+    if (String(job?.run_id ?? '') !== String(run.id)) {
+      throw new Error(
+        `Refusing release commit gate: job ${JSON.stringify(name)} belongs to run ${JSON.stringify(job?.run_id ?? null)}, not the selected run ${describeRunId(run)}. Check evidence from a different check suite (another workflow, attempt, or app) cannot satisfy a required check.`
+      );
+    }
+    if (job?.head_sha !== commitSha) {
+      throw new Error(
+        `Refusing release commit gate: job ${JSON.stringify(name)} in the selected run reports head SHA ${JSON.stringify(job?.head_sha ?? null)}, not the exact commit ${commitSha}.`
+      );
+    }
+    if (job?.workflow_name !== sourceWorkflow.name) {
+      throw new Error(
+        `Refusing release commit gate: job ${JSON.stringify(name)} belongs to workflow ${JSON.stringify(job?.workflow_name ?? null)}, not the source workflow ${JSON.stringify(sourceWorkflow.name)} of the selected run.`
+      );
+    }
+    if (evidence.has(name)) {
+      throw new Error(
+        `Refusing release commit gate: ambiguous evidence — more than one job named ${JSON.stringify(name)} in the selected run ${describeRunId(run)} for the exact commit ${commitSha}.`
+      );
+    }
+    evidence.set(name, { status: job.status, conclusion: job.conclusion });
+  }
+
+  // Fail closed on manifest narrowing: every job that ran in the selected CI
+  // run must be a declared required check. A job missing from the manifest is
+  // an unclassified required-check surface and refuses the release.
+  const declaredNames = new Set(
+    [...manifest.strict_checks, ...manifest.routed_checks].map((entry) => entry.name)
+  );
+  for (const name of evidence.keys()) {
+    if (!declaredNames.has(name)) {
+      throw new Error(
+        `Refusing release commit gate: job ${JSON.stringify(name)} ran in the selected CI run for the exact commit ${commitSha} but is not declared in scripts/release-required-checks.json (strict, routed, or PR-only). The manifest must be updated in the same PR that adds, renames, or re-routes a CI job; refusing to decide on unclassified check surface.`
+      );
+    }
+  }
 
   const checks = [];
   for (const entry of manifest.strict_checks) {
-    const observed = checkEvidence.get(entry.name);
+    const observed = evidence.get(entry.name);
     if (!observed) {
       throw new Error(
         `Refusing release commit gate: required check ${JSON.stringify(entry.name)} (strict) is missing for the exact commit ${commitSha}. Required-check names must stay stable; see scripts/release-required-checks.json.`
@@ -224,7 +283,7 @@ export function verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, 
   }
 
   for (const entry of manifest.routed_checks) {
-    const observed = checkEvidence.get(entry.name);
+    const observed = evidence.get(entry.name);
     if (!observed) {
       // Routed jobs are classified out by scripts/classify-ci-changes.py when
       // the commit does not touch their surface; the aggregate run conclusion
@@ -247,20 +306,20 @@ export function verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, 
 
   return {
     run: {
-      id: String(acceptedRun.id),
-      run_number: acceptedRun.run_number,
-      run_attempt: acceptedRun.run_attempt,
-      head_sha: acceptedRun.head_sha,
-      conclusion: acceptedRun.conclusion,
-      url: typeof acceptedRun.html_url === 'string' ? acceptedRun.html_url : null
+      id: String(run.id),
+      run_number: run.run_number,
+      run_attempt: run.run_attempt,
+      head_sha: run.head_sha,
+      conclusion: run.conclusion,
+      url: typeof run.html_url === 'string' ? run.html_url : null
     },
     checks
   };
 }
 
-function describeRunId(run) {
-  const id = run?.id === undefined || run?.id === null ? '(unknown)' : String(run.id);
-  return id;
+export function verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, runJobs }) {
+  const run = selectAcceptedWorkflowRun({ commitSha, manifest, workflowRuns });
+  return verifyRunJobEvidence({ commitSha, run, manifest, runJobs });
 }
 
 function compareRuns(a, b) {
@@ -276,29 +335,9 @@ function compareNumbers(a, b) {
   return left - right;
 }
 
-function collectCheckEvidence({ commitSha, checkRuns }) {
-  const evidence = new Map();
-  for (const run of Array.isArray(checkRuns) ? checkRuns : []) {
-    const name = typeof run?.name === 'string' ? run.name.trim() : '';
-    if (!name) {
-      continue;
-    }
-    if (run?.head_sha !== commitSha) {
-      throw new Error(
-        `Refusing release commit gate: check run ${JSON.stringify(name)} reports head SHA ${JSON.stringify(run?.head_sha ?? null)}, not the exact commit ${commitSha}.`
-      );
-    }
-    if (run?.app?.slug !== GITHUB_ACTIONS_APP_SLUG) {
-      continue;
-    }
-    if (evidence.has(name)) {
-      throw new Error(
-        `Refusing release commit gate: ambiguous evidence — more than one latest check run named ${JSON.stringify(name)} for the exact commit ${commitSha}.`
-      );
-    }
-    evidence.set(name, { status: run.status, conclusion: run.conclusion });
-  }
-  return evidence;
+function describeRunId(run) {
+  const id = run?.id === undefined || run?.id === null ? '(unknown)' : String(run.id);
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -381,7 +420,7 @@ export async function verifyExactCommitGate({
   ghApi = ghApiJson
 }) {
   requireNonEmptyString(repository, 'repository');
-  const runsEndpoint = `/repos/${repository}/actions/runs?head_sha=${encodeURIComponent(commitSha)}&per_page=${CHECK_RUN_PAGE_SIZE}`;
+  const runsEndpoint = `/repos/${repository}/actions/runs?head_sha=${encodeURIComponent(commitSha)}&per_page=${JOB_PAGE_SIZE}`;
   const runsPayload = await ghApi(runsEndpoint);
   const workflowRuns = Array.isArray(runsPayload?.workflow_runs) ? runsPayload.workflow_runs : [];
   if (Number.isSafeInteger(Number(runsPayload?.total_count)) && Number(runsPayload.total_count) > workflowRuns.length) {
@@ -390,34 +429,40 @@ export async function verifyExactCommitGate({
     );
   }
 
-  const checkRuns = [];
+  const run = selectAcceptedWorkflowRun({ commitSha, manifest, workflowRuns });
+
+  // Evidence is fetched for the selected run and attempt only, so no check run
+  // from another check suite can enter the decision.
+  const runJobs = [];
+  let totalJobCount = null;
   let page = 1;
-  let totalCount = null;
   while (true) {
-    const checkRunsEndpoint = `/repos/${repository}/commits/${commitSha}/check-runs?filter=latest&per_page=${CHECK_RUN_PAGE_SIZE}&page=${page}`;
-    const payload = await ghApi(checkRunsEndpoint);
-    if (totalCount === null) {
-      totalCount = Number(payload?.total_count);
-      if (!Number.isSafeInteger(totalCount) || totalCount < 0) {
+    const jobsEndpoint =
+      `/repos/${repository}/actions/runs/${encodeURIComponent(String(run.id))}` +
+      `/attempts/${encodeURIComponent(String(run.run_attempt))}/jobs?per_page=${JOB_PAGE_SIZE}&page=${page}`;
+    const payload = await ghApi(jobsEndpoint);
+    if (totalJobCount === null) {
+      totalJobCount = Number(payload?.total_count);
+      if (!Number.isSafeInteger(totalJobCount) || totalJobCount < 0) {
         throw new Error(
-          `Refusing release commit gate: check runs payload for the exact commit ${commitSha} has no usable total_count; refusing to decide on unverifiable evidence.`
+          `Refusing release commit gate: job list payload for the selected run ${describeRunId(run)} has no usable total_count; refusing to decide on unverifiable evidence.`
         );
       }
     }
-    const batch = Array.isArray(payload?.check_runs) ? payload.check_runs : [];
-    checkRuns.push(...batch);
-    if (checkRuns.length >= totalCount) {
+    const batch = Array.isArray(payload?.jobs) ? payload.jobs : [];
+    runJobs.push(...batch);
+    if (runJobs.length >= totalJobCount) {
       break;
     }
     page += 1;
-    if (page > MAX_CHECK_RUN_PAGES) {
+    if (page > MAX_JOB_PAGES) {
       throw new Error(
-        `Refusing release commit gate: check runs for the exact commit ${commitSha} exceed ${MAX_CHECK_RUN_PAGES * CHECK_RUN_PAGE_SIZE} entries; refusing to decide on truncated evidence.`
+        `Refusing release commit gate: jobs for the selected run ${describeRunId(run)} exceed ${MAX_JOB_PAGES * JOB_PAGE_SIZE} entries; refusing to decide on truncated evidence.`
       );
     }
   }
 
-  const evidence = verifyCommitRequiredChecks({ commitSha, manifest, workflowRuns, checkRuns });
+  const evidence = verifyRunJobEvidence({ commitSha, run, manifest, runJobs });
   const receipt = buildGateReceipt({
     repository,
     commitSha,
