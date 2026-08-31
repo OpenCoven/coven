@@ -1039,3 +1039,9 @@ Implementation PRs must add, at minimum:
 - integration tests with a malicious relay/account shim: no enrollment without valid approvals; account service compromise reduces to a no-op on the authority path;
 - privacy tests: no passkey credential IDs, attestation receipts, hardware IDs, or biometric metadata in any protocol object, audit record, or log line (extends `scripts/check-coven-privacy.py` coverage);
 - revocation/rotation tests: per-device epoch bump invalidates that device's pre-revocation grants; trust-domain epoch bump invalidates **every** grant, step-up authorization key, outstanding assurance challenge, and resumption material issued under the previous epoch, atomically (no partial state after an interrupted rotation), while leaving familiar identity untouched; grants and resumption material issued under the new epoch keep working;
+
+## 14. Security review and maintainer actions
+
+The protocol deltas above — the `COVEN-ASSURANCE/1` introduction proof binding (§4.3), delegated-authority enforcement and scope caps (§4.4), the attestation verifier trust anchor and claim matrix (§7.1–§7.3), the trust-domain issuer epoch with atomic revocation (§6.2), and the recovery AND/OR/quorum semantics (§3.3, §6.1) — require a maintainer security review before any implementation PR in this track (7a–7d) merges.
+
+**Requires maintainer action** (a fork cannot grant this): the security review itself must be obtained on OpenCoven/coven — requested by adding a maintainer (BunsDev) as reviewer on OpenCoven/coven#881 and recorded in that PR. The review should confirm the threat-model deltas of §9: no client-asserted assurance, no enrollment authority without delegation, no self-asserted attestation, no pre-rotation authority survival across identity rotation, and no ambiguous quorum semantics.
