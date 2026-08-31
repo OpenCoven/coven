@@ -219,12 +219,7 @@ fn current_sigint_disposition() -> Result<libc::sigaction> {
     // SIGINT into the caller-provided storage; it changes nothing.
     unsafe {
         let mut previous: libc::sigaction = std::mem::zeroed();
-        if libc::sigaction(
-            libc::SIGINT,
-            std::ptr::null(),
-            &mut previous,
-        ) != 0
-        {
+        if libc::sigaction(libc::SIGINT, std::ptr::null(), &mut previous) != 0 {
             return Err(std::io::Error::last_os_error())
                 .context("failed to query the current SIGINT disposition");
         }
@@ -623,8 +618,8 @@ mod pairing_flow_tests {
     use super::*;
     use std::collections::VecDeque;
     use std::io::{BufRead, Read};
-    use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
 
     /// Stdin stand-in whose reads replay a scripted sequence of byte chunks
     /// and I/O errors, so the confirmation loop can be driven without a tty.
@@ -740,10 +735,8 @@ mod pairing_flow_tests {
 
     #[test]
     fn confirmation_reader_observes_an_interrupt_that_races_the_read() {
-        let mut input = ScriptedInput::new(vec![
-            Err(interrupted_error()),
-            Ok(b"confirm\n".to_vec()),
-        ]);
+        let mut input =
+            ScriptedInput::new(vec![Err(interrupted_error()), Ok(b"confirm\n".to_vec())]);
         let interrupt = AtomicBool::new(false);
         interrupt.store(true, Ordering::Release);
         let line = read_confirmation_line(&mut input, &interrupt).unwrap();

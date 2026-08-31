@@ -956,8 +956,10 @@ pub(crate) fn handle_local_control(
                         None,
                     ) {
                         Ok(()) => {
-                            let _ =
-                                super::audit::remove_pending_pairing_cancelled(&state.coven_home, id);
+                            let _ = super::audit::remove_pending_pairing_cancelled(
+                                &state.coven_home,
+                                id,
+                            );
                         }
                         Err(error) => {
                             eprintln!(
@@ -1633,8 +1635,7 @@ mod tests {
 
         let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
         assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert_eq!(outbox.trim(), "[]");
     }
 
@@ -1672,8 +1673,7 @@ mod tests {
             "cancelled"
         );
         // The record is owed, not lost: the tombstone token is pending.
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert!(outbox.contains(&id));
 
         // A later terminal replay of the pairing delivers the pending record.
@@ -1688,8 +1688,7 @@ mod tests {
         assert_eq!(status.status, 200);
         let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
         assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert_eq!(outbox.trim(), "[]");
 
         // Repeated terminal replays stay idempotent.

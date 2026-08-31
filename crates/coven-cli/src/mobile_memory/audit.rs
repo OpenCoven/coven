@@ -97,8 +97,7 @@ fn read_pending_pairing_cancellations(coven_home: &Path) -> Result<Vec<Uuid>> {
         return Ok(Vec::new());
     }
     validate_private_file(&path)?;
-    let raw = std::fs::read(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?;
+    let raw = std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -231,8 +230,8 @@ mod tests {
         // A token for the same pairing is never duplicated.
         assert!(!record_pending_pairing_cancelled(temp.path(), first).unwrap());
         for index in 2..(MAX_PENDING_AUDIT_EVENTS as u128 + 2) {
-            let added = record_pending_pairing_cancelled(temp.path(), Uuid::from_u128(index))
-                .unwrap();
+            let added =
+                record_pending_pairing_cancelled(temp.path(), Uuid::from_u128(index)).unwrap();
             if index <= MAX_PENDING_AUDIT_EVENTS as u128 {
                 assert!(added, "token {index} should fit the outbox bound");
             } else {
@@ -252,8 +251,7 @@ mod tests {
         assert_eq!(flush_pending_pairing_cancellations(temp.path()), 1);
         let line = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
         assert!(line.contains("pairing_cancelled"));
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert_eq!(outbox.trim(), "[]");
         // A later terminal replay finds nothing pending and must not duplicate
         // the record.
@@ -271,8 +269,7 @@ mod tests {
         remove_pending_pairing_cancelled(temp.path(), Uuid::from_u128(1)).unwrap();
         // Removing an unknown token is a no-op, not an error.
         remove_pending_pairing_cancelled(temp.path(), Uuid::from_u128(99)).unwrap();
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert!(!outbox.contains("00000000-0000-0000-0000-000000000001"));
         assert!(outbox.contains(&kept.to_string()));
     }
@@ -288,8 +285,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/dev/null", temp.path().join("mobile/audit.jsonl")).unwrap();
         assert_eq!(flush_pending_pairing_cancellations(temp.path()), 0);
-        let outbox =
-            std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
+        let outbox = std::fs::read_to_string(temp.path().join("mobile/audit-outbox.json")).unwrap();
         assert!(outbox.contains(&pairing.to_string()));
     }
 }
