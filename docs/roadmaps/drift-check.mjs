@@ -589,9 +589,9 @@ function findSyncNarrativeDrift(mapping, roadmapText) {
       slug: null,
       message:
         `remote sync state is inconsistent across artifacts: ` +
-        `mapping.sync.remote_sync_status is ${statusUnresolved ? "unresolved (deferred/blocked)" : "resolved"} ` +
+        `mapping.sync.beads_provisioning.remote_sync_status is ${statusUnresolved ? "unresolved (deferred/blocked)" : "resolved"} ` +
         `but the roadmap Active blockers narrative is ${narrativeUnresolved ? "unresolved (deferred/blocked)" : "resolved"}. ` +
-        `Update docs/roadmaps/coven-automations-v1.mapping.json and coven-automations-v1.md together.`,
+        `Update docs/roadmaps/coven-automations-v1.mapping.json and docs/roadmaps/coven-automations-v1.md together.`,
     },
   ];
 }
