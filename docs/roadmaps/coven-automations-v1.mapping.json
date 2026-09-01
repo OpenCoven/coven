@@ -3,7 +3,7 @@
   "schema_version": 1,
   "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#859). GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
   "sync": {
-    "last_sync": "2026-09-01T18:40:00Z",
+    "last_sync": "2026-09-01T20:15:00Z",
     "source_branch": "docs/859-automations-v1-mapping",
     "writer": "One canonical writer/process is designated for this setup; see docs/superpowers/plans/2026-08-30-issue-859-coven-automations-v1-tracker-operationalization.md (Decision D1). Persisted tracker changes land only through reviewed PRs.",
     "canonical_bead_store": "OpenCoven/coven-cave embedded Dolt database `cave`; provisioning was executed through OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277). A competing Beads database must not be initialized in OpenCoven/coven (operational correction on OpenCoven/coven#859, 2026-08-30).",
@@ -17,8 +17,8 @@
       "cross_repository_children": "OpenCoven/familiar-contract#17 -> cave-6jswi; OpenCoven/coven-threads#29 -> cave-m9tw3; OpenCoven/sdk#80 -> cave-90hwl; OpenCoven/coven-cave#5217 -> cave-e52qp; OpenCoven/psyche#18 -> cave-yaul2; OpenCoven/coven-docs#76 -> cave-qwnxq; OpenCoven/.github#2 -> cave-xqbs4",
       "graph_shape": "15 canonical beads (14 mapped outcomes plus the OpenCoven/coven-cave#5220 seed bead cave-tmegk) and 30 in-program blocked-first edges, no cycles. cave-hlv.9 and cave-hlv.10 additionally carry a pre-existing parent-epic edge to the closed Cave epic cave-hlv, which is outside the Automations v1 program set.",
       "remote_ref": "refs/dolt/data",
-      "dolt_commit_evidence": "Embedded-Dolt pre/post commit OIDs and the remote refs/dolt/data OID are recorded in Cave PR OpenCoven/coven-cave#5277 and the seed-run execution ledger (kept out of this committed file to satisfy the repository secret guard).",
-      "remote_sync_status": "deferred: local embedded Dolt is durable and canonical; bd dolt push is non-fast-forward (remote ahead from concurrent sessions) and bd dolt pull did not complete non-interactively. Not force-pushed.",
+      "dolt_commit_evidence": "Embedded-Dolt pre/post commit OIDs, the reconciled local/remote Dolt commit, and the durable refs/dolt/data git OID are recorded in Cave PR OpenCoven/coven-cave#5277 and the seed-run execution ledger (exact transient OIDs are kept out of this committed file so this reconciliation contract cannot go stale against a moving remote; the ledger is the exact-evidence surface).",
+      "remote_sync_status": "synchronized: the documented wrapper `pnpm beads:sync` completed pull+push (exit 0, ~24s) on 2026-09-01; local embedded Dolt `main` and `remotes/origin/main` are equal, `dolt diff --summary` is empty, and the shared remote `refs/dolt/data` carries the seeded 15-bead / 30-edge graph. No force-push occurred and no concurrent Dolt commit was discarded; local state was re-verified intact afterward. This is the canonical graph-sync receipt and is distinct from the Cave-side mapping follow-up (see the roadmap Active blockers section), which remains blocked on a schema-v66-capable bd for managed-worktree admission.",
       "dependency_proof": "bd dep list (both directions), bd dep cycles (none), bd ready --json; recorded on Cave PR OpenCoven/coven-cave#5277."
     },
     "drift_check": "node docs/roadmaps/drift-check.mjs (add --beads-export <issues.jsonl> to cross-check an export; --strict to fail on pending provisioning; --selftest to verify detection rules)",
@@ -100,7 +100,9 @@
         "evidence_status": "partial",
         "evidence": [
           "OpenCoven/coven-cave#5277 (merged 2026-09-01; canonical Beads graph seeded)",
-          "https://github.com/OpenCoven/coven/pull/900 (this tracker-mapping reconciliation)"
+          "https://github.com/OpenCoven/coven/pull/900 (initial tracker-mapping reconciliation)",
+          "canonical graph sync durable: `pnpm beads:sync` pull+push exit 0 (~24s) on 2026-09-01; local Dolt `main` == `remotes/origin/main`, empty `dolt diff --summary`, `refs/dolt/data` carries the seeded graph, no force-push (exact OIDs in the seed-run ledger and Cave PR OpenCoven/coven-cave#5277)",
+          "remaining: the Cave-side mapping follow-up PR is blocked on a schema-v66-capable bd for managed-worktree admission, so #859 stays open until it lands"
         ]
       },
       "depends_on": [],

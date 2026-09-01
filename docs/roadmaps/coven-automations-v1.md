@@ -10,7 +10,7 @@ description: "Delivery roadmap for Coven Automations v1: tracker roles, ownershi
 
 # Coven Automations v1 delivery roadmap
 
-_Last synchronized: 2026-09-01T18:40:00Z (see the sync metadata block below)_
+_Last synchronized: 2026-09-01T20:15:00Z (see the sync metadata block below)_
 
 > [!WARNING]
 > **Generated content.** The mapping table in the marked block below is generated from
@@ -47,7 +47,7 @@ through reviewed PRs (see
 
 ## Sync metadata
 
-- **Last synchronization:** 2026-09-01T18:40:00Z (UTC)
+- **Last synchronization:** 2026-09-01T20:15:00Z (UTC)
 - **Source branch:** `docs/859-automations-v1-mapping` (based on upstream `main`)
 - **Machine-readable mapping:** [`coven-automations-v1.mapping.json`](./coven-automations-v1.mapping.json) (schema `coven.automations-v1.tracker-mapping`, version 1)
 - **Drift check:** `node docs/roadmaps/drift-check.mjs` (add `--beads-export <issues.jsonl>` to cross-check an export; `--strict` to fail on pending provisioning; `--selftest` verifies detection rules) — runs locally and in CI without ambient production credentials
@@ -178,14 +178,22 @@ program parent.
 
 ## Active blockers
 
-- **Remote Dolt propagation deferred** — the delivery beads and their `surface:shared`
+- **Remote Dolt propagation (resolved)** — the delivery beads and their `surface:shared`
   ownership are provisioned and dependency-verified in Cave's canonical embedded-Dolt graph
-  (Cave PR OpenCoven/coven-cave#5277;
-  local embedded-Dolt commit (recorded in Cave PR #5277), the durable source of truth). Only the
-  cross-machine `pnpm beads:sync` push to `refs/dolt/data` is deferred: it is non-fast-forward
-  (remote `04cb957…` is ahead from concurrent sessions) and `bd dolt pull` did not complete
-  non-interactively. The remote was not force-pushed. No competing Beads database may be
-  initialized in `OpenCoven/coven`.
+  (Cave PR OpenCoven/coven-cave#5277). Cross-machine propagation is now durable: the documented
+  wrapper `pnpm beads:sync` completed pull+push (exit 0, ~24s) on 2026-09-01, local embedded Dolt
+  `main` and `remotes/origin/main` are equal, `dolt diff --summary` is empty, and the shared remote
+  `refs/dolt/data` carries the seeded 15-bead / 30-edge graph. The remote was not force-pushed, no
+  concurrent Dolt commit was discarded, and local state was re-verified intact afterward. Exact
+  transient OIDs live in the seed-run execution ledger and Cave PR #5277, not in this file. No
+  competing Beads database may be initialized in `OpenCoven/coven`.
+- **Cave-side mapping follow-up (open)** — canonical graph sync above is complete, but the
+  Cave-repo mapping reconciliation PR (which lands the prepared reconcile script into Cave's own
+  roadmap surfaces) has not merged yet. It is gated on obtaining a schema-v66-capable `bd` so
+  Cave's managed worktree lifecycle can admit the follow-up; Homebrew `bd` 1.2.2 knows only up to
+  schema v53. Until that PR merges, Cave bead `cave-tmegk` stays `in_progress` and
+  `OpenCoven/coven-cave#5220` stays open. This is a Cave-side follow-up and does not reopen the
+  canonical graph-sync receipt.
 - **Foundation reconciled (resolved)** —
   [#816](https://github.com/OpenCoven/coven/issues/816) is CLOSED and represented as
   verified-foundation (bead `cave-stsf7`, closed; PR
