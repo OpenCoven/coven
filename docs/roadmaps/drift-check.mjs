@@ -37,6 +37,41 @@ const PRIORITIES = new Set(["P0", "P1", "P2"]);
 const BEAD_PRIORITY_BY_NUMBER = { 0: "P0", 1: "P1", 2: "P2" };
 
 // ---------------------------------------------------------------------------
+// Program membership contract (E011).
+//
+// These are the outcomes that OpenCoven/coven#854 and OpenCoven/coven#859
+// declare as the Automations v1 P0/P1 set. They are pinned here, in the checker,
+// on purpose: a coverage rule that reads its own expectations out of the file it
+// is checking can always be satisfied by deleting a row. Every ref below must
+// appear in the section named here, so the mapping cannot pass -- in default or
+// --strict mode -- by omitting the #859 program-control binding or any of the
+// seven cross-repository children.
+//
+// Adding or retiring a program outcome is a deliberate two-file change: update
+// the mapping and update this contract in the same reviewed PR.
+// ---------------------------------------------------------------------------
+
+const REQUIRED_OUTCOME_REFS = [
+  "OpenCoven/coven#854", // program / release rollup
+  "OpenCoven/coven#859", // program control / tracker operationalization
+  "OpenCoven/coven#816", // foundation
+  "OpenCoven/coven#855", // protocol
+  "OpenCoven/coven#856", // scheduler
+  "OpenCoven/coven#857", // authority
+  "OpenCoven/coven#858", // certification
+];
+
+const REQUIRED_CROSS_REPOSITORY_CHILD_REFS = [
+  "OpenCoven/familiar-contract#17", // familiar embodiment profile
+  "OpenCoven/coven-threads#29", // automation authority profile
+  "OpenCoven/sdk#80", // SDK surface
+  "OpenCoven/coven-cave#5217", // Cave oversight
+  "OpenCoven/psyche#18", // Psyche adapter
+  "OpenCoven/coven-docs#76", // documentation
+  "OpenCoven/.github#2", // organization canaries
+];
+
+// ---------------------------------------------------------------------------
 // Sensitive-payload detection. Patterns are assembled from fragments so that
 // this source file never itself contains a string matching the repo privacy
 // guard or the detector below.
@@ -96,12 +131,50 @@ function outcomeGithubRef(outcome) {
   return `${outcome.github.repo}#${outcome.github.issue}`;
 }
 
+// Every mapped row, whichever section it lives in. Cross-repository children are
+// first-class program members: they carry the same shape, the same one-to-one
+// invariant, and the same evidence semantics as in-repository outcomes.
+function allEntries(mapping) {
+  return [...(mapping.outcomes ?? []), ...(mapping.cross_repository_children ?? [])];
+}
+
 function buildSlugIndex(mapping) {
   const bySlug = new Map();
-  for (const outcome of mapping.outcomes ?? []) {
+  for (const outcome of allEntries(mapping)) {
     bySlug.set(outcome.slug, outcome);
   }
   return bySlug;
+}
+
+function findCoverageErrors(mapping) {
+  const findings = [];
+  const sectionOf = (entries) => new Set((entries ?? []).map(outcomeGithubRef));
+  const outcomeRefs = sectionOf(mapping.outcomes);
+  const childRefs = sectionOf(mapping.cross_repository_children);
+
+  for (const ref of REQUIRED_OUTCOME_REFS) {
+    if (outcomeRefs.has(ref)) continue;
+    const misfiled = childRefs.has(ref) ? " (found under cross_repository_children instead)" : "";
+    findings.push({
+      code: "E011",
+      severity: "error",
+      slug: null,
+      message: `required program outcome ${ref} is missing from mapping.outcomes${misfiled}`,
+    });
+  }
+
+  for (const ref of REQUIRED_CROSS_REPOSITORY_CHILD_REFS) {
+    if (childRefs.has(ref)) continue;
+    const misfiled = outcomeRefs.has(ref) ? " (found under outcomes instead)" : "";
+    findings.push({
+      code: "E011",
+      severity: "error",
+      slug: null,
+      message: `required cross-repository child ${ref} is missing from mapping.cross_repository_children${misfiled}`,
+    });
+  }
+
+  return findings;
 }
 
 function findDependencyErrors(mapping) {
@@ -109,7 +182,7 @@ function findDependencyErrors(mapping) {
   const bySlug = buildSlugIndex(mapping);
   const edges = new Map();
 
-  for (const outcome of mapping.outcomes ?? []) {
+  for (const outcome of allEntries(mapping)) {
     for (const dep of outcome.depends_on ?? []) {
       if (!bySlug.has(dep)) {
         findings.push({
@@ -153,8 +226,10 @@ function findMappingErrors(mapping) {
   const seenRefs = new Map();
   const seenSlugs = new Set();
   const seenLabels = new Set();
+  const seenBeadIds = new Map();
+  const seenCaveLabels = new Set();
 
-  for (const outcome of mapping.outcomes ?? []) {
+  for (const outcome of allEntries(mapping)) {
     const ref = outcomeGithubRef(outcome);
     if (seenRefs.has(ref)) {
       findings.push({
@@ -188,6 +263,33 @@ function findMappingErrors(mapping) {
         });
       }
       seenLabels.add(label);
+    }
+
+    const beadId = outcome.bead?.id;
+    if (beadId) {
+      if (seenBeadIds.has(beadId)) {
+        findings.push({
+          code: "E002",
+          severity: "error",
+          slug: outcome.slug,
+          message: `bead ${beadId} maps to more than one outcome ('${seenBeadIds.get(beadId)}' and '${outcome.slug}')`,
+        });
+      } else {
+        seenBeadIds.set(beadId, outcome.slug);
+      }
+    }
+
+    const caveLabel = outcome.bead?.cave_label;
+    if (caveLabel) {
+      if (seenCaveLabels.has(caveLabel)) {
+        findings.push({
+          code: "E002",
+          severity: "error",
+          slug: outcome.slug,
+          message: `duplicate canonical Cave bead label '${caveLabel}'`,
+        });
+      }
+      seenCaveLabels.add(caveLabel);
     }
 
     const priority = outcome.github?.priority;
@@ -228,13 +330,14 @@ function findMappingErrors(mapping) {
     }
   }
 
+  findings.push(...findCoverageErrors(mapping));
   findings.push(...findDependencyErrors(mapping));
   return findings;
 }
 
 function findPendingProvisioning(mapping) {
   const findings = [];
-  for (const outcome of mapping.outcomes ?? []) {
+  for (const outcome of allEntries(mapping)) {
     if (outcome.bead?.id === null || outcome.bead?.id === undefined) {
       const ref = outcomeGithubRef(outcome);
       const provisioning = outcome.bead?.provisioning ?? "unrecorded";
@@ -250,28 +353,51 @@ function findPendingProvisioning(mapping) {
 }
 
 function renderMappingTable(mapping) {
-  const lines = [
+  const header = [
     "| Outcome | GitHub | Priority | Bead label | Bead ID | Dependencies | Disposition |",
     "| --- | --- | --- | --- | --- | --- | --- |",
   ];
-  const order = { program: 0, "p0-foundation": 1, "p0-workstream": 2 };
-  const outcomes = [...(mapping.outcomes ?? [])].sort(
-    (a, b) => (order[a.role] ?? 9) - (order[b.role] ?? 9) || a.slug.localeCompare(b.slug),
-  );
-  for (const outcome of outcomes) {
+  const order = {
+    program: 0,
+    "program-control": 1,
+    "p0-foundation": 2,
+    "p0-workstream": 3,
+    "p0-cross-repository-child": 4,
+    "p1-cross-repository-child": 5,
+  };
+  const sortEntries = (entries) =>
+    [...entries].sort((a, b) => (order[a.role] ?? 9) - (order[b.role] ?? 9) || a.slug.localeCompare(b.slug));
+  const row = (outcome) => {
     const ref = outcomeGithubRef(outcome);
     const deps = (outcome.depends_on ?? []).join(", ") || "(none)";
+    // Cross-repository children are cited by fully-qualified `owner/repo#number`
+    // reference rather than absolute URL: that is this tracker's citation
+    // convention for cross-repo work, and several of those absolute URLs also
+    // trip the repository secret guard's high-entropy heuristic
+    // (scripts/check-secrets.py). Re-adding a `github.url` to a child therefore
+    // fails the secret scan, not this checker.
+    const cell = outcome.github.url ? `[${ref}](${outcome.github.url})` : `\`${ref}\``;
+    return `| ${outcome.slug} | ${cell} | ${outcome.github.priority} | \`${
+      outcome.bead.label
+    }\` | ${outcome.bead.id ?? "(pending provisioning)"} | ${deps} | ${outcome.bead.disposition} |`;
+  };
+
+  const lines = [...header];
+  for (const outcome of sortEntries(mapping.outcomes ?? [])) lines.push(row(outcome));
+
+  const children = mapping.cross_repository_children ?? [];
+  lines.push("");
+  if (children.length === 0) {
     lines.push(
-      `| ${outcome.slug} | [${ref}](${outcome.github.url}) | ${outcome.github.priority} | \`${outcome.bead.label}\` | ${
-        outcome.bead.id ?? "(pending provisioning)"
-      } | ${deps} | ${outcome.bead.disposition} |`,
+      "_Cross-repository child outcomes: **none mapped**. The program declares one Bead per SDK, Cave, Psyche, docs, organization-canary, Familiar Contract, and Threads outcome, so an empty section is a coverage violation (`E011`), not a statement that none exist._",
     );
-  }
-  if ((mapping.cross_repository_children ?? []).length === 0) {
+  } else {
+    lines.push(
+      `_Cross-repository child outcomes (${children.length}), mapped one-to-one in the same canonical Cave Beads graph. Each carries a live bead id, an acceptance gate, a disposition, and an evidence list that stays empty until exact PR/test/release references exist._`,
+    );
     lines.push("");
-    lines.push(
-      "_Cross-repository child outcomes: none created yet. One Bead per SDK, Cave, Psyche, docs, organization-canary, Familiar Contract, and Threads outcome under the program is mapped here one-to-one as each is created._",
-    );
+    lines.push(...header);
+    for (const child of sortEntries(children)) lines.push(row(child));
   }
   return lines.join("\n");
 }
@@ -369,7 +495,7 @@ function findExportDrift(mapping, exportText) {
   }
 
   const byRef = new Map();
-  for (const outcome of mapping.outcomes ?? []) {
+  for (const outcome of allEntries(mapping)) {
     byRef.set(outcomeGithubRef(outcome), outcome);
   }
 
@@ -520,34 +646,119 @@ function runSelftest() {
   if (pristineErrors.length > 0) {
     failures.push(`selftest: committed state has error-severity findings: ${JSON.stringify(pristineErrors)}`);
   }
-  if (!pristine.some((finding) => finding.code === "W010")) {
-    failures.push("selftest: expected W010 pending-provisioning warnings on the committed mapping");
+  // The committed mapping is now fully provisioned (every outcome carries a live
+  // bead id), so it must be clean under --strict, i.e. no W010 pending-provisioning
+  // warnings. The W010 detection rule itself is still exercised below against a
+  // synthetic pending fixture.
+  if (pristine.some((finding) => finding.code === "W010")) {
+    failures.push(
+      `selftest: committed mapping still has pending-provisioning warnings (W010): ${JSON.stringify(
+        pristine.filter((finding) => finding.code === "W010"),
+      )}`,
+    );
+  }
+  const pendingProvisioning = clone(baseMapping);
+  for (const outcome of [...pendingProvisioning.outcomes, ...pendingProvisioning.cross_repository_children]) {
+    outcome.bead.id = null;
+    outcome.bead.provisioning = "selftest";
+  }
+  if (!analyze(pendingProvisioning, baseRoadmap, undefined).some((finding) => finding.code === "W010")) {
+    failures.push("selftest: expected W010 detection on a synthetic pending-provisioning mapping");
   }
 
+  // A cross-repository child whose bead id is missing must be caught too: the
+  // pending-provisioning rule covers the whole program, not just mapping.outcomes.
+  const pendingChild = clone(baseMapping);
+  pendingChild.cross_repository_children[2].bead.id = null;
+  pendingChild.cross_repository_children[2].bead.provisioning = "selftest";
+  expectFinding(
+    analyze(pendingChild, baseRoadmap, undefined),
+    "W010",
+    "unprovisioned cross-repository child",
+  );
+
+  // Coverage contract (E011): --strict must not be satisfiable by deleting rows.
+  const droppedProgramControl = clone(baseMapping);
+  droppedProgramControl.outcomes = droppedProgramControl.outcomes.filter(
+    (outcome) => outcome.github.issue !== 859,
+  );
+  expectFinding(
+    analyze(droppedProgramControl, baseRoadmap, undefined),
+    "E011",
+    "omitted #859 program-control outcome",
+  );
+
+  const emptyChildren = clone(baseMapping);
+  emptyChildren.cross_repository_children = [];
+  const emptyChildFindings = analyze(emptyChildren, baseRoadmap, undefined);
+  expectFinding(emptyChildFindings, "E011", "emptied cross_repository_children");
+  if (emptyChildFindings.filter((finding) => finding.code === "E011").length !== 7) {
+    failures.push(
+      `selftest: expected one E011 per missing cross-repository child, got ${
+        emptyChildFindings.filter((finding) => finding.code === "E011").length
+      }`,
+    );
+  }
+
+  const droppedOneChild = clone(baseMapping);
+  droppedOneChild.cross_repository_children = droppedOneChild.cross_repository_children.filter(
+    (child) => child.slug !== "sdk",
+  );
+  expectFinding(analyze(droppedOneChild, baseRoadmap, undefined), "E011", "omitted sdk#80 child");
+
+  const misfiledChild = clone(baseMapping);
+  const movedChild = misfiledChild.cross_repository_children.find((child) => child.slug === "documentation");
+  misfiledChild.cross_repository_children = misfiledChild.cross_repository_children.filter(
+    (child) => child.slug !== "documentation",
+  );
+  misfiledChild.outcomes.push(movedChild);
+  expectFinding(analyze(misfiledChild, baseRoadmap, undefined), "E011", "cross-repository child filed as an outcome");
+
+  const duplicateBeadId = clone(baseMapping);
+  duplicateBeadId.cross_repository_children[0].bead.id = duplicateBeadId.outcomes[0].bead.id;
+  expectFinding(analyze(duplicateBeadId, baseRoadmap, undefined), "E002", "one bead mapped to two outcomes");
+
+  const bySlug = (mapping, slug) => {
+    const entry = [...mapping.outcomes, ...mapping.cross_repository_children].find(
+      (candidate) => candidate.slug === slug,
+    );
+    if (!entry) throw new Error(`selftest fixture: no entry with slug '${slug}'`);
+    return entry;
+  };
+
   const duplicateRef = clone(baseMapping);
-  duplicateRef.outcomes[1].github.issue = duplicateRef.outcomes[2].github.issue;
+  bySlug(duplicateRef, "protocol").github.issue = bySlug(duplicateRef, "scheduler").github.issue;
   expectFinding(analyze(duplicateRef, baseRoadmap, undefined), "E001", "duplicate GitHub mapping");
 
   const unknownDep = clone(baseMapping);
-  unknownDep.outcomes[2].depends_on.push("does-not-exist");
+  bySlug(unknownDep, "protocol").depends_on.push("does-not-exist");
   expectFinding(analyze(unknownDep, baseRoadmap, undefined), "E003", "unknown dependency");
 
   const cycle = clone(baseMapping);
-  cycle.outcomes[0].depends_on.push("certification");
-  cycle.outcomes[5].depends_on.push("program");
+  bySlug(cycle, "foundation").depends_on.push("certification");
+  bySlug(cycle, "certification").depends_on.push("foundation");
   expectFinding(analyze(cycle, baseRoadmap, undefined), "E004", "dependency cycle");
 
   const badPriority = clone(baseMapping);
-  badPriority.outcomes[2].github.priority = "P9";
+  bySlug(badPriority, "protocol").github.priority = "P9";
   expectFinding(analyze(badPriority, baseRoadmap, undefined), "E005", "invalid priority");
 
   const noOwner = clone(baseMapping);
-  noOwner.outcomes[2].github.owner = null;
+  bySlug(noOwner, "protocol").github.owner = null;
   expectFinding(analyze(noOwner, baseRoadmap, undefined), "E006", "P0 without owner");
 
   const closedNoEvidence = clone(baseMapping);
-  closedNoEvidence.outcomes[2].github.state = "closed";
+  bySlug(closedNoEvidence, "protocol").github.state = "closed";
   expectFinding(analyze(closedNoEvidence, baseRoadmap, undefined), "E007", "closed without evidence");
+
+  // The same evidence rule must reach cross-repository children.
+  const closedChildNoEvidence = clone(baseMapping);
+  bySlug(closedChildNoEvidence, "sdk").github.state = "closed";
+  expectFinding(
+    analyze(closedChildNoEvidence, baseRoadmap, undefined),
+    "E007",
+    "closed cross-repository child without evidence",
+  );
 
   const tamperedBlock = baseRoadmap.replace(
     /\| program \| \[/,
@@ -623,7 +834,7 @@ function runSelftest() {
   ];
 
   const emptyOutcomeMapping = clone(baseMapping);
-  for (const outcome of emptyOutcomeMapping.outcomes) {
+  for (const outcome of [...emptyOutcomeMapping.outcomes, ...emptyOutcomeMapping.cross_repository_children]) {
     outcome.bead.id = null;
     outcome.bead.provisioning = "selftest";
   }
@@ -656,8 +867,8 @@ function runSelftest() {
   const dupFindings = analyze(emptyOutcomeMapping, baseRoadmap, duplicateBeadExport);
   if (!dupFindings.some((finding) => finding.code === "E101")) {
     // Provisioning is pending, so E101 only fires for outcomes with declared ids.
-    const declared = clone(baseMapping);
-    declared.outcomes[2].bead.id = "automations-v1.1";
+    const declared = clone(emptyOutcomeMapping);
+    bySlug(declared, "protocol").bead.id = "automations-v1.1";
     const declaredFindings = analyze(declared, baseRoadmap, duplicateBeadExport);
     expectFinding(declaredFindings, "E101", "duplicate bead references for one outcome");
   }
@@ -666,7 +877,10 @@ function runSelftest() {
     console.error(failures.join("\n"));
     return false;
   }
-  console.log(`drift-check: selftest passed (${SENSITIVE_PATTERNS.length} sensitive-payload rules, 11 drift fixtures)`);
+  console.log(
+    `drift-check: selftest passed (${SENSITIVE_PATTERNS.length} sensitive-payload rules, 18 drift fixtures, ` +
+      `${REQUIRED_OUTCOME_REFS.length} required outcomes and ${REQUIRED_CROSS_REPOSITORY_CHILD_REFS.length} required cross-repository children pinned)`,
+  );
   return true;
 }
 
