@@ -520,8 +520,24 @@ function runSelftest() {
   if (pristineErrors.length > 0) {
     failures.push(`selftest: committed state has error-severity findings: ${JSON.stringify(pristineErrors)}`);
   }
-  if (!pristine.some((finding) => finding.code === "W010")) {
-    failures.push("selftest: expected W010 pending-provisioning warnings on the committed mapping");
+  // The committed mapping is now fully provisioned (every outcome carries a live
+  // bead id), so it must be clean under --strict, i.e. no W010 pending-provisioning
+  // warnings. The W010 detection rule itself is still exercised below against a
+  // synthetic pending fixture.
+  if (pristine.some((finding) => finding.code === "W010")) {
+    failures.push(
+      `selftest: committed mapping still has pending-provisioning warnings (W010): ${JSON.stringify(
+        pristine.filter((finding) => finding.code === "W010"),
+      )}`,
+    );
+  }
+  const pendingProvisioning = clone(baseMapping);
+  for (const outcome of pendingProvisioning.outcomes) {
+    outcome.bead.id = null;
+    outcome.bead.provisioning = "selftest";
+  }
+  if (!analyze(pendingProvisioning, baseRoadmap, undefined).some((finding) => finding.code === "W010")) {
+    failures.push("selftest: expected W010 detection on a synthetic pending-provisioning mapping");
   }
 
   const duplicateRef = clone(baseMapping);
