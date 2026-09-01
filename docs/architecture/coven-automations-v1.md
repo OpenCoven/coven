@@ -74,6 +74,20 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
     transition to running as already handled. Malformed work is failed only by
     a `state = 'claimed'` compare-and-set, so a losing dispatcher cannot fail
     the winner's running occurrence.
+14. **Manual and latest-misfire fences are transactional.** Manual run-now
+    reads and pins the stored definition, checks overlap, and inserts its
+    directly claimed occurrence with lease/deadline inside one `BEGIN
+    IMMEDIATE`; no planned manual row is externally visible. Scheduled latest
+    misfires transactionally fail older due planned rows as `superseded by
+    latest misfire` and claim only the newest eligible slot after overlap
+    clears.
+15. **Delivery filesystem metadata is part of durability.** Spools are created
+    as Unix `0600` files or with a protected owner-only Windows DACL.
+    Replacement snapshots and reapplies an existing destination's Unix mode or
+    Windows DACL before recording success. Newly created output-directory
+    components and their parents are durability-synced in order. Windows spool
+    cleanup issues a real deletion and records success only after bounded
+    absence verification.
 
 ## Contract profile and versioning
 

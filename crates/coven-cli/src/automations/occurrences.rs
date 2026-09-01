@@ -96,7 +96,8 @@ struct ActiveDefinition {
     digest: String,
 }
 
-/// Claims the earliest due PLANNED occurrence for a routine with a bounded
+/// Collapses due PLANNED occurrences to the latest slot, then claims that
+/// occurrence for a routine with a bounded
 /// lease. Returns the claimed occurrence id, or `None` when nothing is due
 /// — including when the routine already has a live claimed/running
 /// occurrence, which `overlap: forbid` keeps from racing a second run. The
@@ -141,6 +142,27 @@ pub fn claim_due_occurrence_at_revision(
     let snapshot = snapshot_for_claim(&tx, automation_id, expected_revision, expected_digest)?;
     let expires_iso = iso(now + chrono::Duration::minutes(snapshot.timeout_minutes));
     let now_iso = iso(now);
+    tx.execute(
+        "UPDATE automation_occurrences
+         SET state = 'failed',
+             failure_reason = 'superseded by latest misfire',
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?2
+         WHERE automation_id = ?1
+           AND state = 'planned'
+           AND scheduled_for <= ?2
+           AND id != (
+               SELECT id FROM automation_occurrences
+               WHERE automation_id = ?1
+                 AND state = 'planned'
+                 AND scheduled_for <= ?2
+               ORDER BY scheduled_for DESC
+               LIMIT 1
+           )",
+        params![automation_id, now_iso],
+    )
+    .map_err(|error| format!("failed to collapse superseded latest misfires: {error}"))?;
     let changed = tx
         .execute(
             "UPDATE automation_occurrences
@@ -162,7 +184,7 @@ pub fn claim_due_occurrence_at_revision(
                    WHERE automation_id = ?1
                      AND state = 'planned'
                      AND scheduled_for <= ?2
-                   ORDER BY scheduled_for ASC
+                   ORDER BY scheduled_for DESC
                    LIMIT 1
                )
                AND NOT EXISTS (
@@ -234,6 +256,7 @@ pub fn claim_occurrence_by_id(
     )
 }
 
+#[cfg(test)]
 pub fn claim_occurrence_by_id_at_revision(
     conn: &Connection,
     occurrence_id: &str,
@@ -427,8 +450,9 @@ pub fn fail_occurrence_nonterminal(
     Ok(changed > 0)
 }
 
-/// One full tick: plan due slots, recover expired leases, then claim the
-/// earliest due occurrence of every ACTIVE routine that has one.
+/// One full tick: plan due slots, recover expired leases, collapse superseded
+/// planned rows, then claim the latest due occurrence of every ACTIVE routine
+/// that has one.
 pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
     let mut report = TickReport::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -1063,18 +1087,117 @@ mod tests {
         // First claim wins; the second must be refused while it stays live,
         // even though another planned occurrence is due.
         let first = claim_due_occurrence(&conn, "daily", "daemon-a", 60, real_now()).unwrap();
-        assert!(first.is_some());
+        assert_eq!(first.as_deref(), Some(planned.as_str()));
         let second = claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now()).unwrap();
         assert!(
             second.is_none(),
             "overlap=forbid must reject a second claim"
         );
 
-        // Settling the live run unblocks the next claim.
+        // The older planned row was collapsed rather than queued behind the
+        // live latest occurrence.
         let claimed_id = first.unwrap();
         assert!(settle_occurrence(&conn, &claimed_id, "succeeded", None, real_now()).unwrap());
-        let third = claim_occurrence_by_id(&conn, &planned, "daemon-b", 60, real_now()).unwrap();
-        assert!(third.is_some());
+        let older: (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_reason FROM automation_occurrences
+                 WHERE id = 'daily-earlier'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            older,
+            (
+                "failed".to_string(),
+                Some("superseded by latest misfire".to_string())
+            )
+        );
+        assert!(
+            claim_due_occurrence(&conn, "daily", "daemon-b", 60, real_now())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn latest_misfire_collapses_multi_day_plans_during_overlap_then_runs_only_newest() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = '2026-08-25T00:00:00.000Z'
+             WHERE id = 'daily'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, created_at, updated_at)
+             VALUES ('daily-live', 'daily', '2026-08-26T09:00:00.000Z', 'running',
+                     'daemon-a', '2099-01-01T00:00:00.000Z', 1,
+                     '2026-08-26T09:00:00.000Z', '2026-08-26T09:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+        for day in [27, 28, 29] {
+            let now = Utc.with_ymd_and_hms(2026, 8, day, 10, 0, 0).unwrap();
+            let report = tick(&conn, now).unwrap();
+            assert!(
+                report.claimed.is_empty(),
+                "live overlap must block day {day}"
+            );
+        }
+
+        let planned: Vec<String> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT scheduled_for FROM automation_occurrences
+                     WHERE automation_id = 'daily' AND state = 'planned'
+                     ORDER BY scheduled_for",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(planned, ["2026-08-29T09:00:00.000Z"]);
+        let superseded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'daily'
+                   AND state = 'failed'
+                   AND failure_reason = 'superseded by latest misfire'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded, 2);
+
+        let final_now = Utc.with_ymd_and_hms(2026, 8, 29, 10, 0, 0).unwrap();
+        assert!(settle_occurrence(&conn, "daily-live", "succeeded", None, final_now).unwrap());
+        let report = tick(&conn, final_now).unwrap();
+        assert_eq!(report.claimed.len(), 1);
+        let scheduled: String = conn
+            .query_row(
+                "SELECT scheduled_for FROM automation_occurrences WHERE id = ?1",
+                params![report.claimed[0]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled, "2026-08-29T09:00:00.000Z");
+        let remaining_planned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'daily' AND state = 'planned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining_planned, 0);
     }
 
     #[test]

@@ -28,7 +28,12 @@ stream, independent of how event-writer batches split those bytes. Spool
 identity and phase are persisted before creation; a restarted daemon removes
 only the exact recorded `.coven-delivery-*` sibling and never scans or deletes
 unrelated files. Unix commits sync the file and parent directory; Windows
-uses a write-through atomic replacement. At a run deadline Coven records one
+uses a write-through atomic replacement. Spools are owner-only from creation;
+replacement preserves an existing destination's restrictive mode or DACL.
+New output-directory components are created one at a time and each new
+directory plus its parent is durability-synced before a spool is accepted.
+Windows cleanup performs a real delete and bounded absence proof, retaining
+ambiguity only when removal cannot be verified. At a run deadline Coven records one
 termination request and asks the runtime to kill the session, but keeps the
 overlap fence until terminal session evidence arrives; an unproven kill stays
 explicitly ambiguous. Output-loss markers refuse delivery rather than
@@ -44,7 +49,11 @@ both confirmed. If that cleanup later succeeds before the session terminates,
 the pointer remains in a `recovered_degraded` evidence phase until terminal
 capture atomically clears it. Competing ticks that observe the same claimed
 occurrence treat a winner's transition to running as already handled; only a
-still-claimed malformed row is failed. An external
+still-claimed malformed row is failed. Manual run-now creates a directly
+claimed, snapshot-pinned occurrence inside one immediate transaction, so no
+unowned planned row is visible to the scheduler. Scheduled `misfire: latest`
+ticks fail older outstanding planned rows as superseded and retain only the
+newest eligible slot while overlap is live or clearing. An external
 runtime may execute an already-claimed occurrence, but it never owns the
 schedule and never owns the record — runtimes are replaceable workers. The
 `coven.scheduler` capability stays reserved for multi-host routing decisions

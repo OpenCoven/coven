@@ -14,10 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::definition::RoutineDefinition;
-use super::occurrences::{
-    claim_occurrence_by_id_at_revision, fail_occurrence_nonterminal, mark_occurrence_running,
-    settle_occurrence,
-};
+use super::occurrences::{fail_occurrence_nonterminal, mark_occurrence_running, settle_occurrence};
 use super::runs::{record_run_finish, record_run_start_pinned, PinnedRunStart, RunFinish};
 use super::store::DefinitionSnapshot;
 use crate::api::{DurableSessionLaunchError, DurableSessionStore, SessionLaunch, SessionRuntime};
@@ -48,8 +45,24 @@ static DISPATCH_CLAIM_HOOKS: std::sync::Mutex<Vec<DispatchClaimHook>> =
     std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
+struct ManualClaimHook {
+    automation_id: String,
+    reached: std::sync::mpsc::SyncSender<String>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+static MANUAL_CLAIM_HOOKS: std::sync::Mutex<Vec<ManualClaimHook>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
 fn install_dispatch_claim_hook(hook: DispatchClaimHook) {
     DISPATCH_CLAIM_HOOKS.lock().unwrap().push(hook);
+}
+
+#[cfg(test)]
+fn install_manual_claim_hook(hook: ManualClaimHook) {
+    MANUAL_CLAIM_HOOKS.lock().unwrap().push(hook);
 }
 
 #[cfg(test)]
@@ -74,6 +87,24 @@ fn pause_dispatch_claim_for_test(occurrence_id: &str, automation_id: Option<&str
 
 #[cfg(not(test))]
 fn pause_dispatch_claim_for_test(_occurrence_id: &str, _automation_id: Option<&str>) {}
+
+#[cfg(test)]
+fn pause_manual_claim_for_test(automation_id: &str, occurrence_id: &str) {
+    let hook = {
+        let mut installed = MANUAL_CLAIM_HOOKS.lock().unwrap();
+        installed
+            .iter()
+            .position(|hook| hook.automation_id == automation_id)
+            .map(|position| installed.remove(position))
+    };
+    if let Some(hook) = hook {
+        hook.reached.send(occurrence_id.to_string()).unwrap();
+        hook.release.recv().unwrap();
+    }
+}
+
+#[cfg(not(test))]
+fn pause_manual_claim_for_test(_automation_id: &str, _occurrence_id: &str) {}
 
 fn overlap_outcome(definition: &RoutineDefinition) -> RunOutcome {
     RunOutcome {
@@ -108,6 +139,11 @@ enum ClaimedOccurrenceLoad {
     Ready(Box<PinnedOccurrence>),
     AlreadyHandled,
     Malformed(String),
+}
+
+enum ManualClaim {
+    Claimed(Box<PinnedOccurrence>),
+    Overlap(Box<RoutineDefinition>),
 }
 
 fn load_pinned_occurrence(
@@ -212,6 +248,82 @@ fn fail_claimed_occurrence(
         )
         .map_err(|error| format!("failed to reject malformed claimed occurrence: {error}"))?;
     Ok(changed == 1)
+}
+
+fn claim_manual_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+    automation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<ManualClaim, String> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin immediate occurrence claim: {error}"))?;
+    let record = super::store::get_definition(&transaction, automation_id)
+        .map_err(|error| format!("failed to read routine before manual claim: {error:#}"))?
+        .ok_or_else(|| format!("routine `{automation_id}` vanished before manual claim"))?;
+    let definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
+        .map_err(|error| format!("stored routine `{automation_id}` is unreadable: {error}"))?;
+    let snapshot = super::store::definition_snapshot(&record)
+        .map_err(|error| format!("failed to snapshot manual routine: {error:#}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let deadline_at = (now + chrono::Duration::minutes(snapshot.timeout_minutes))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let inserted = transaction
+        .execute(
+            "INSERT OR IGNORE INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, definition_revision, definition_digest, definition_json,
+                 output_target, deadline_at, created_at, updated_at)
+             SELECT ?1, ?2, ?3, 'claimed', 'manual', ?4, 1, ?5, ?6, ?7, ?8, ?4, ?3, ?3
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM automation_occurrences
+                 WHERE automation_id = ?2
+                   AND state IN ('claimed', 'running')
+             )",
+            params![
+                occurrence_id,
+                automation_id,
+                now_iso,
+                deadline_at,
+                snapshot.revision,
+                snapshot.digest,
+                snapshot.definition_json,
+                snapshot.output_target
+            ],
+        )
+        .map_err(|error| format!("failed to create immediate occurrence claim: {error}"))?;
+    if inserted == 0 {
+        let overlap: bool = transaction
+            .query_row(
+                "SELECT EXISTS (
+                     SELECT 1 FROM automation_occurrences
+                     WHERE automation_id = ?1
+                       AND state IN ('claimed', 'running')
+                 )",
+                params![automation_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to verify immediate occurrence overlap: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit refused immediate claim: {error}"))?;
+        if overlap {
+            return Ok(ManualClaim::Overlap(Box::new(definition)));
+        }
+        return Err("immediate occurrence fence collided; retry".to_string());
+    }
+    pause_manual_claim_for_test(automation_id, occurrence_id);
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit immediate occurrence claim: {error}"))?;
+    Ok(ManualClaim::Claimed(Box::new(PinnedOccurrence {
+        id: occurrence_id.to_string(),
+        automation_id: automation_id.to_string(),
+        definition,
+        snapshot,
+        deadline_at,
+    })))
 }
 
 fn automation_launch(
@@ -535,86 +647,12 @@ pub fn run_routine_now(
     definition: &RoutineDefinition,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
-    let expected_record = super::store::get_definition(conn, &definition.id)
-        .map_err(|error| format!("failed to read routine before manual run: {error:#}"))?
-        .ok_or_else(|| format!("routine `{}` vanished before manual run", definition.id))?;
-    let expected_definition: RoutineDefinition =
-        serde_json::from_str(&expected_record.definition_json).map_err(|error| {
-            format!("stored routine `{}` is unreadable: {error}", definition.id)
-        })?;
-    let expected_snapshot = super::store::definition_snapshot(&expected_record)
-        .map_err(|error| format!("failed to snapshot manual routine: {error:#}"))?;
-
     let occurrence_id = fresh_id("occ");
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let inserted = conn
-        .execute(
-            "INSERT OR IGNORE INTO automation_occurrences
-                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'planned', 0, ?3, ?3)",
-            params![occurrence_id, definition.id, now_iso],
-        )
-        .map_err(|error| format!("failed to fence immediate occurrence: {error}"))?;
-    if inserted == 0 {
-        return Err("immediate occurrence fence collided; retry".to_string());
-    }
-
-    let claimed = match claim_occurrence_by_id_at_revision(
-        conn,
-        &occurrence_id,
-        "manual",
-        expected_record.revision,
-        &expected_record.definition_digest,
-        now,
-    ) {
-        Ok(claimed) => claimed,
-        Err(reason) => {
-            let pinned = PinnedOccurrence {
-                id: occurrence_id,
-                automation_id: definition.id.clone(),
-                definition: expected_definition,
-                deadline_at: (now + chrono::Duration::minutes(expected_snapshot.timeout_minutes))
-                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                snapshot: expected_snapshot,
-            };
-            let run_id = fresh_id("run");
-            settle_launch_failure(conn, &pinned, &run_id, None, &reason, now)?;
-            return Ok(RunOutcome {
-                run_id,
-                status: "failed".to_string(),
-                session_id: None,
-                error: Some(reason),
-            });
-        }
+    let pinned = match claim_manual_occurrence(conn, &occurrence_id, &definition.id, now)? {
+        ManualClaim::Claimed(pinned) => pinned,
+        ManualClaim::Overlap(definition) => return Ok(overlap_outcome(&definition)),
     };
-    if claimed.is_none() {
-        // The claim was refused — in practice a live sibling run appeared
-        // first (overlap: forbid). Release our fence so the daemon can never
-        // dispatch it later, then fail visibly.
-        let deleted = conn
-            .execute(
-                "DELETE FROM automation_occurrences WHERE id = ?1 AND state = 'planned'",
-                params![occurrence_id],
-            )
-            .map_err(|error| format!("failed to release refused occurrence: {error}"))?;
-        if deleted != 1 {
-            return Err("refused occurrence changed before it could be released".to_string());
-        }
-        return Ok(overlap_outcome(&expected_definition));
-    }
     pause_dispatch_claim_for_test(&occurrence_id, Some(&definition.id));
-    let pinned = match load_pinned_occurrence(conn, &occurrence_id)? {
-        ClaimedOccurrenceLoad::Ready(pinned) => pinned,
-        ClaimedOccurrenceLoad::AlreadyHandled => {
-            return Ok(RunOutcome {
-                run_id: String::new(),
-                status: "already_dispatched".to_string(),
-                session_id: None,
-                error: None,
-            });
-        }
-        ClaimedOccurrenceLoad::Malformed(reason) => return Err(reason),
-    };
     dispatch_pinned_occurrence(conn, coven_home, runtime, &pinned, "manual", now)
 }
 
@@ -1470,6 +1508,84 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run_count, 1);
+    }
+
+    #[test]
+    fn manual_claim_is_atomic_and_retry_leaves_no_planned_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let store_path = temp.path().join("store.sqlite");
+        initialize_store(&store_path).unwrap();
+        let conn = crate::store::open_store(&store_path).unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut routine = definition("atomic-manual");
+        routine.cwd = Some(project.to_string_lossy().into_owned());
+        routine.familiar_id = None;
+        insert_definition(&conn, &routine).unwrap();
+        drop(conn);
+        let observer = crate::store::open_store(&store_path).unwrap();
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        install_manual_claim_hook(ManualClaimHook {
+            automation_id: routine.id.clone(),
+            reached: reached_tx,
+            release: release_rx,
+        });
+        let manual_path = store_path.clone();
+        let manual_home = temp.path().to_path_buf();
+        let manual_routine = routine.clone();
+        let now = Utc::now();
+        let manual = std::thread::spawn(move || {
+            let conn = crate::store::open_store(&manual_path).unwrap();
+            run_routine_now(
+                &conn,
+                &manual_home,
+                &crate::api::NoopSessionRuntime,
+                &manual_routine,
+                now,
+            )
+        });
+        let occurrence_id = reached_rx.recv().unwrap();
+
+        let visible_state: Option<String> = observer
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = ?1",
+                params![occurrence_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        assert_eq!(
+            visible_state, None,
+            "manual occurrence must not be visible before its claim commits"
+        );
+
+        release_tx.send(()).unwrap();
+        let first = manual.join().unwrap().unwrap();
+        assert_eq!(first.status, "dispatched");
+        let retry = run_routine_now(
+            &observer,
+            temp.path(),
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            now,
+        )
+        .unwrap();
+        assert_eq!(retry.status, "failed");
+        assert!(retry
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("overlap")));
+        let planned: i64 = observer
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'atomic-manual' AND state = 'planned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(planned, 0);
     }
 
     #[test]

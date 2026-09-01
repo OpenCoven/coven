@@ -10,7 +10,6 @@
 
 use std::path::{Path, PathBuf};
 use std::{
-    fs::OpenOptions,
     io::{Read, Write},
     sync::{LazyLock, Mutex, MutexGuard},
 };
@@ -20,7 +19,13 @@ use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+use std::fs::OpenOptions;
+
 use super::runs::{record_run_finish, RunFinish, LOG_ENTRY_MAX_CHARS};
+
+#[cfg(any(windows, test))]
+const WINDOWS_OWNER_ONLY_FILE_DACL_SDDL: &str = "D:P(A;;GA;;;OW)";
 
 /// How many trailing normalized-stream events a bounded log captures. The
 /// budget keeps the newest events; older entries are replaced by a marker.
@@ -174,12 +179,7 @@ fn prepare_delivery_spool(
 fn new_delivery_spool_path(target: &str) -> Result<PathBuf, String> {
     let target_path = Path::new(target);
     let parent = output_parent(target_path);
-    std::fs::create_dir_all(&parent).map_err(|error| {
-        format!(
-            "output commit failed: cannot create {}: {error}",
-            parent.display()
-        )
-    })?;
+    ensure_output_parent_durable(&parent)?;
     let file_name = target_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -196,16 +196,7 @@ fn stream_session_output_to_spool(
     target: &str,
     spool_path: PathBuf,
 ) -> Result<Option<DeliveryPlan>, String> {
-    let mut spool = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&spool_path)
-        .map_err(|error| {
-            format!(
-                "output commit failed: cannot create {}: {error}",
-                spool_path.display()
-            )
-        })?;
+    let mut spool = open_private_delivery_file(&spool_path)?;
     let mut statement = conn
         .prepare(
             "SELECT kind, payload_json FROM events
@@ -592,6 +583,36 @@ fn remove_recorded_spool(spool_path: &Path, target: &str) -> Result<(), String> 
     remove_spool_file_durably(spool_path)
 }
 
+#[cfg(any(windows, test))]
+fn verify_spool_absence_with(
+    spool_path: &Path,
+    mut probe: impl FnMut() -> std::io::Result<bool>,
+    attempts: usize,
+) -> Result<(), String> {
+    let attempts = attempts.max(1);
+    let mut last_error = None;
+    for attempt in 0..attempts {
+        match probe() {
+            Ok(false) => return Ok(()),
+            Ok(true) => last_error = None,
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < attempts {
+            std::thread::yield_now();
+        }
+    }
+    match last_error {
+        Some(error) => Err(format!(
+            "cannot verify delivery spool absence {}: {error}",
+            spool_path.display()
+        )),
+        None => Err(format!(
+            "delivery spool still exists after deletion request: {}",
+            spool_path.display()
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn remove_spool_file_durably(spool_path: &Path) -> Result<(), String> {
     std::fs::remove_file(spool_path).map_err(|error| {
@@ -627,18 +648,39 @@ fn sync_removed_spool_parent(spool_path: &Path) -> Result<(), String> {
 
 #[cfg(windows)]
 fn remove_spool_file_durably(spool_path: &Path) -> Result<(), String> {
-    Err(format!(
-        "durable delivery spool removal is unavailable on Windows for {}",
-        spool_path.display()
-    ))
+    let deletion_error = match std::fs::remove_file(spool_path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error),
+    };
+    match verify_windows_spool_absence(spool_path) {
+        Ok(()) => Ok(()),
+        Err(verification) => match deletion_error {
+            Some(error) => Err(format!(
+                "failed to remove recorded delivery spool {}: {error}; {verification}",
+                spool_path.display()
+            )),
+            None => Err(verification),
+        },
+    }
 }
 
 #[cfg(windows)]
 fn sync_removed_spool_parent(spool_path: &Path) -> Result<(), String> {
-    Err(format!(
-        "durable delivery spool removal is unavailable on Windows for {}",
-        spool_path.display()
-    ))
+    verify_windows_spool_absence(spool_path)
+}
+
+#[cfg(windows)]
+fn verify_windows_spool_absence(spool_path: &Path) -> Result<(), String> {
+    verify_spool_absence_with(
+        spool_path,
+        || match std::fs::symlink_metadata(spool_path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        },
+        4,
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -1006,12 +1048,9 @@ struct DeliveryIoFailure {
 fn deliver_output_detailed(target: &str, payload: &str) -> Result<(), DeliveryIoFailure> {
     let target_path = Path::new(target);
     let parent = output_parent(target_path);
-    std::fs::create_dir_all(&parent).map_err(|error| DeliveryIoFailure {
+    ensure_output_parent_durable(&parent).map_err(|message| DeliveryIoFailure {
         stage: DeliveryIoStage::BeforeRename,
-        message: format!(
-            "output commit failed: cannot create {}: {error}",
-            parent.display()
-        ),
+        message,
     })?;
     let file_name = target_path
         .file_name()
@@ -1033,17 +1072,14 @@ fn deliver_output_detailed(target: &str, payload: &str) -> Result<(), DeliveryIo
 
 #[cfg(test)]
 fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), DeliveryIoFailure> {
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(temp)
-        .map_err(|error| DeliveryIoFailure {
-            stage: DeliveryIoStage::BeforeRename,
-            message: format!(
-                "output commit failed: cannot create {}: {error}",
-                temp.display()
-            ),
-        })?;
+    let security = capture_destination_security(target).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::BeforeRename,
+        message,
+    })?;
+    let mut file = open_private_delivery_file(temp).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::BeforeRename,
+        message,
+    })?;
     file.write_all(payload.as_bytes())
         .map_err(|error| DeliveryIoFailure {
             stage: DeliveryIoStage::BeforeRename,
@@ -1068,6 +1104,10 @@ fn write_atomically(temp: &Path, target: &Path, payload: &str) -> Result<(), Del
             target.display()
         ),
     })?;
+    apply_destination_security(target, security.as_ref()).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::AfterRename,
+        message,
+    })?;
     sync_parent_directory(target).map_err(|message| DeliveryIoFailure {
         stage: DeliveryIoStage::AfterRename,
         message,
@@ -1080,6 +1120,377 @@ fn output_parent(target: &Path) -> PathBuf {
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf()
+}
+
+fn ensure_output_parent_durable(parent: &Path) -> Result<(), String> {
+    let mut missing = Vec::new();
+    let mut cursor = parent.to_path_buf();
+    loop {
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
+            Ok(_) => {
+                return Err(format!(
+                    "output commit failed: output directory component {} is not a real directory",
+                    cursor.display()
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.clone());
+                cursor = cursor
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(format!(
+                    "output commit failed: cannot inspect directory {}: {error}",
+                    cursor.display()
+                ));
+            }
+        }
+    }
+    for directory in missing.iter().rev() {
+        match std::fs::create_dir(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(format!(
+                    "output commit failed: cannot create directory {}: {error}",
+                    directory.display()
+                ));
+            }
+        };
+        let metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+            format!(
+                "output commit failed: cannot inspect created directory {}: {error}",
+                directory.display()
+            )
+        })?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "output commit failed: output directory component {} is not a real directory",
+                directory.display()
+            ));
+        }
+        sync_new_directory_path(directory)?;
+        let parent = directory
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        sync_new_directory_path(parent)?;
+    }
+    Ok(())
+}
+
+fn sync_new_directory_path(path: &Path) -> Result<(), String> {
+    if take_new_directory_sync_failure_for_test() {
+        return Err(format!(
+            "output commit failed: cannot sync new directory {}: synthetic directory sync failure",
+            path.display()
+        ));
+    }
+    sync_new_directory_path_platform(path)
+}
+
+#[cfg(unix)]
+fn sync_new_directory_path_platform(path: &Path) -> Result<(), String> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            format!(
+                "output commit failed: cannot sync new directory {}: {error}",
+                path.display()
+            )
+        })
+}
+
+#[cfg(windows)]
+fn sync_new_directory_path_platform(_path: &Path) -> Result<(), String> {
+    // Windows directory creation is synchronous, and directory handles do not
+    // support FlushFileBuffers. The final file uses a write-through replace.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_new_directory_path_platform(path: &Path) -> Result<(), String> {
+    Err(format!(
+        "output commit failed: cannot sync new directory {} on this platform",
+        path.display()
+    ))
+}
+
+#[cfg(unix)]
+fn open_private_delivery_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true).mode(0o600);
+    let file = options.open(path).map_err(|error| {
+        format!(
+            "output commit failed: cannot create {}: {error}",
+            path.display()
+        )
+    })?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            format!(
+                "output commit failed: cannot secure {}: {error}",
+                path.display()
+            )
+        })?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn open_private_delivery_file(path: &Path) -> Result<std::fs::File, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{FromRawHandle, RawHandle};
+    use std::ptr;
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL},
+    };
+
+    let descriptor = windows_owner_only_file_security_descriptor()?;
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_WRITE,
+            0,
+            &security,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(format!(
+            "output commit failed: cannot create {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle as RawHandle) })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_private_delivery_file(_path: &Path) -> Result<std::fs::File, String> {
+    Err("output commit failed: platform has no private file security primitive".to_string())
+}
+
+#[cfg(test)]
+fn windows_private_delivery_create_strategy() -> &'static str {
+    "createfile-security-attributes"
+}
+
+#[cfg(unix)]
+struct DestinationSecurity {
+    mode: u32,
+}
+
+#[cfg(unix)]
+fn capture_destination_security(target: &Path) -> Result<Option<DestinationSecurity>, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(DestinationSecurity {
+            mode: metadata.permissions().mode() & 0o777,
+        })),
+        Ok(_) => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "output commit failed: cannot inspect destination security {}: {error}",
+            target.display()
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn apply_destination_security(
+    target: &Path,
+    security: Option<&DestinationSecurity>,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(security) = security else {
+        return Ok(());
+    };
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(security.mode)).map_err(
+        |error| {
+            format!(
+                "output commit failed: cannot restore destination security {}: {error}",
+                target.display()
+            )
+        },
+    )
+}
+
+#[cfg(windows)]
+struct DestinationSecurity {
+    descriptor: Vec<u8>,
+}
+
+#[cfg(windows)]
+fn capture_destination_security(target: &Path) -> Result<Option<DestinationSecurity>, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Security::{GetFileSecurityW, DACL_SECURITY_INFORMATION};
+
+    match std::fs::symlink_metadata(target) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "output commit failed: cannot inspect destination security {}: {error}",
+                target.display()
+            ));
+        }
+    }
+    let wide: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut needed = 0;
+    unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        return Err(format!(
+            "output commit failed: cannot size destination security {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut descriptor = vec![0_u8; needed as usize];
+    if unsafe {
+        GetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(format!(
+            "output commit failed: cannot read destination security {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    descriptor.truncate(needed as usize);
+    Ok(Some(DestinationSecurity { descriptor }))
+}
+
+#[cfg(windows)]
+fn apply_destination_security(
+    target: &Path,
+    security: Option<&DestinationSecurity>,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+
+    let Some(security) = security else {
+        return Ok(());
+    };
+    let wide: Vec<u16> = target
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe {
+        SetFileSecurityW(
+            wide.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            security.descriptor.as_ptr().cast_mut().cast(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "output commit failed: cannot restore destination security {}: {}",
+            target.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+struct DestinationSecurity;
+
+#[cfg(not(any(unix, windows)))]
+fn capture_destination_security(_target: &Path) -> Result<Option<DestinationSecurity>, String> {
+    Ok(None)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn apply_destination_security(
+    _target: &Path,
+    _security: Option<&DestinationSecurity>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(windows)]
+struct WindowsSecurityAllocation(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for WindowsSecurityAllocation {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::Foundation::LocalFree(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn windows_owner_only_file_security_descriptor() -> Result<WindowsSecurityAllocation, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr;
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+
+    let descriptor_sddl: Vec<u16> = std::ffi::OsStr::new(WINDOWS_OWNER_ONLY_FILE_DACL_SDDL)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut descriptor = ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(format!(
+            "output commit failed: cannot build owner-only Windows file ACL: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(WindowsSecurityAllocation(descriptor))
 }
 
 #[cfg(not(windows))]
@@ -1180,6 +1591,7 @@ fn sync_parent_directory(_target: &Path) -> Result<(), String> {
 thread_local! {
     static FAIL_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FAIL_SPOOL_REMOVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_NEW_DIRECTORY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(unix)]
     static FAIL_SPOOL_PARENT_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1204,6 +1616,11 @@ fn set_spool_remove_failure_for_test(enabled: bool) {
     FAIL_SPOOL_REMOVE.set(enabled);
 }
 
+#[cfg(test)]
+fn set_new_directory_sync_failure_for_test(enabled: bool) {
+    FAIL_NEW_DIRECTORY_SYNC.set(enabled);
+}
+
 #[cfg(all(test, unix))]
 fn set_spool_parent_sync_failure_for_test(enabled: bool) {
     FAIL_SPOOL_PARENT_SYNC.set(enabled);
@@ -1216,6 +1633,16 @@ fn take_spool_remove_failure_for_test() -> bool {
 
 #[cfg(not(test))]
 fn take_spool_remove_failure_for_test() -> bool {
+    false
+}
+
+#[cfg(test)]
+fn take_new_directory_sync_failure_for_test() -> bool {
+    FAIL_NEW_DIRECTORY_SYNC.replace(false)
+}
+
+#[cfg(not(test))]
+fn take_new_directory_sync_failure_for_test() -> bool {
     false
 }
 
@@ -1894,6 +2321,10 @@ fn settle_reserved_delivery(
 
 fn commit_delivery_spool(plan: &DeliveryPlan) -> Result<(), DeliveryIoFailure> {
     let target = Path::new(&plan.target);
+    let security = capture_destination_security(target).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::BeforeRename,
+        message,
+    })?;
     replace_output_file(&plan.spool_path, target).map_err(|error| DeliveryIoFailure {
         stage: DeliveryIoStage::BeforeRename,
         message: format!(
@@ -1901,6 +2332,10 @@ fn commit_delivery_spool(plan: &DeliveryPlan) -> Result<(), DeliveryIoFailure> {
             plan.spool_path.display(),
             target.display()
         ),
+    })?;
+    apply_destination_security(target, security.as_ref()).map_err(|message| DeliveryIoFailure {
+        stage: DeliveryIoStage::AfterRename,
+        message,
     })?;
     sync_parent_directory(target).map_err(|message| DeliveryIoFailure {
         stage: DeliveryIoStage::AfterRename,
@@ -2531,15 +2966,111 @@ mod tests {
     #[test]
     fn deliver_output_replaces_atomically_without_temp_litter() {
         let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("out").join("payload.md");
+        let target = temp
+            .path()
+            .join("new")
+            .join("nested")
+            .join("out")
+            .join("payload.md");
         deliver_output(target.to_str().unwrap(), "first").unwrap();
         deliver_output(target.to_str().unwrap(), "second version").unwrap();
 
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "second version");
-        let entries: Vec<_> = std::fs::read_dir(temp.path().join("out"))
+        let entries: Vec<_> = std::fs::read_dir(target.parent().unwrap())
             .unwrap()
             .collect();
         assert_eq!(entries.len(), 1, "no temp files may remain");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_spool_is_owner_only_even_with_zero_umask() {
+        const CHILD_TEST: &str = "automations::delivery::tests::delivery_spool_zero_umask_child";
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--ignored")
+            .arg("--exact")
+            .arg(CHILD_TEST)
+            .arg("--nocapture")
+            .env("COVEN_TEST_DELIVERY_UMASK_ROOT", temp.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn delivery_spool_zero_umask_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Some(root) = std::env::var_os("COVEN_TEST_DELIVERY_UMASK_ROOT") else {
+            return;
+        };
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+        let guard = UmaskGuard(unsafe { libc::umask(0) });
+        let (_temp, conn) = temp_store();
+        session_record(&conn, "umask-session", "completed", Some(0));
+        event(&conn, "umask-session", "output", "private");
+        let target = PathBuf::from(root).join("payload.md");
+        let plan = prepare_delivery_spool(&conn, "umask-session", target.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        let mode = std::fs::metadata(&plan.spool_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delivery_preserves_existing_restrictive_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        deliver_output(target.to_str().unwrap(), "replacement").unwrap();
+
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn nested_directory_sync_failure_prevents_delivery() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("new").join("nested").join("payload.md");
+        set_new_directory_sync_failure_for_test(true);
+
+        let error = deliver_output(target.to_str().unwrap(), "private").unwrap_err();
+
+        assert!(error.contains("cannot sync new directory"), "{error}");
+        assert!(!target.exists());
+        assert!(
+            !target
+                .parent()
+                .unwrap()
+                .read_dir()
+                .is_ok_and(|mut entries| entries.next().is_some()),
+            "failed directory durability must not leave a spool"
+        );
     }
 
     #[test]
@@ -3464,6 +3995,61 @@ mod tests {
     }
 
     #[test]
+    fn spool_absence_verifier_retries_and_refuses_unproven_deletion() {
+        let attempts = std::cell::Cell::new(0);
+        verify_spool_absence_with(
+            Path::new("synthetic-spool"),
+            || {
+                attempts.set(attempts.get() + 1);
+                Ok(attempts.get() < 3)
+            },
+            3,
+        )
+        .unwrap();
+        assert_eq!(attempts.get(), 3);
+
+        let present =
+            verify_spool_absence_with(Path::new("synthetic-spool"), || Ok(true), 2).unwrap_err();
+        assert!(present.contains("still exists"), "{present}");
+
+        let inaccessible = verify_spool_absence_with(
+            Path::new("synthetic-spool"),
+            || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "denied",
+                ))
+            },
+            2,
+        )
+        .unwrap_err();
+        assert!(inaccessible.contains("cannot verify"), "{inaccessible}");
+    }
+
+    #[test]
+    fn windows_delivery_file_acl_contract_is_owner_only_and_protected() {
+        assert_eq!(WINDOWS_OWNER_ONLY_FILE_DACL_SDDL, "D:P(A;;GA;;;OW)");
+        assert_eq!(
+            windows_private_delivery_create_strategy(),
+            "createfile-security-attributes"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_spool_delete_removes_file_and_proves_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let spool = temp
+            .path()
+            .join(".coven-delivery-00000000-0000-0000-0000-000000000000-payload");
+        std::fs::write(&spool, "private").unwrap();
+
+        remove_spool_file_durably(&spool).unwrap();
+
+        assert!(!spool.exists());
+    }
+
+    #[test]
     fn settlement_uses_the_output_target_pinned_when_the_run_started() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
@@ -3568,6 +4154,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "succeeded");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settled_delivery_preserves_existing_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("payload.md");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", Some(target.to_str().unwrap()))).unwrap();
+        live_run(&conn, "daily", "session-1");
+        session_record(&conn, "session-1", "completed", Some(0));
+        event(&conn, "session-1", "output", "replacement");
+
+        let report = settle_finished_runs(&conn, Utc::now()).unwrap();
+
+        assert_eq!(report.settled_succeeded, 1);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 
     #[test]
