@@ -49,6 +49,8 @@ class CheckCiWorkflowTests(unittest.TestCase):
             'python3 scripts/classify-ci-changes-test.py',
             'python3 scripts/check-workflows-test.py',
             'python3 scripts/check-ci-workflow-test.py',
+            'python3 scripts/check-docs-ownership-test.py',
+            'python3 scripts/check-docs-ownership.py --range',
             'scripts/check-workflows.sh',
             'node --test scripts/package-github-release-test.mjs',
             'node --test scripts/release-stress-test.mjs',

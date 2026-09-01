@@ -55,9 +55,17 @@ The repository's public-doc directories may contain only two kinds of pages:
 
 - **Source-adjacent exceptions** — a page that must evolve with the code
   (contracts, maintainer source maps, verification procedures). Every retained
-  page states its source-adjacent ownership reason, either in the page itself
-  or in the ownership table in [`README.md`](../README.md) and
-  [`docs/index.md`](index.md).
+  page changed after this policy landed states its ownership reason in
+  frontmatter:
+
+  ```yaml
+  source_adjacent_reason: "Tracks the daemon API implemented in this repository."
+  ```
+
+  The ownership guard intentionally applies to changed pages. Historical
+  public guidance remains migration debt until its canonical target is
+  verified; touching one requires converting it to a pointer or declaring a
+  truthful source-adjacent reason.
 
 Public-doc directories today: `docs/install/`, `docs/platforms/`,
 `docs/start/`, `docs/help/`, `docs/harnesses/`, `docs/models/`,
@@ -134,6 +142,8 @@ Update docs in the same change when you modify:
 For docs-only changes:
 
 ```sh
+python3 scripts/check-docs-ownership-test.py
+python3 scripts/check-docs-ownership.py --range origin/main...HEAD
 python scripts/check-secrets.py
 git diff --check
 ```

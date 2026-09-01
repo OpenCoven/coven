@@ -76,7 +76,21 @@ jobs:
       - run: python scripts/check-secrets-test.py
       - run: python3 scripts/check-api-contract-docs-test.py
       - run: python3 scripts/check-api-contract-docs.py
+      - run: python3 scripts/check-docs-ownership-test.py
       - run: python scripts/check-secrets.py
+      - name: Documentation ownership guard (pull request changes)
+        if: github.event_name == 'pull_request'
+        run: python3 scripts/check-docs-ownership.py --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+      - name: Documentation ownership guard (pushed changes)
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+        run: |
+          if ! git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            BEFORE_SHA="$(git hash-object -t tree -w --stdin </dev/null)"
+          fi
+          python3 scripts/check-docs-ownership.py --range "${BEFORE_SHA}..${AFTER_SHA}"
       - name: Coven privacy guard (pull request changes)
         if: github.event_name == 'pull_request'
         run: python scripts/check-coven-privacy.py --range "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
