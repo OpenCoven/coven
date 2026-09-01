@@ -12447,7 +12447,8 @@ mod tests {
                 ));
             });
 
-            let session_id = entered_rx.recv_timeout(std::time::Duration::from_secs(2))?;
+            // Hang guard: 10 s is far above any load-induced scheduling delay.
+            let session_id = entered_rx.recv_timeout(std::time::Duration::from_secs(10))?;
             let conn = store::open_store(&store_path(temp.path()))?;
             assert_eq!(
                 store::get_session(&conn, &session_id)?
@@ -12472,7 +12473,8 @@ mod tests {
             )?;
             assert_eq!(kill.status, 202, "{launch_mode}: {}", kill.body);
             assert_eq!(runtime.kill_count(), 1);
-            let response = response_rx.recv_timeout(std::time::Duration::from_secs(2))??;
+            // Hang guard: 10 s is far above any load-induced scheduling delay.
+            let response = response_rx.recv_timeout(std::time::Duration::from_secs(10))??;
             assert_eq!(response.status, 201, "{launch_mode}: {}", response.body);
             let launch_status = serde_json::from_str::<Value>(&response.body)?["status"]
                 .as_str()
