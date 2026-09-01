@@ -31,3 +31,4 @@ __pycache__/
 .worktrees/
 /.fastembed_cache
 /.psyche*
+findings/
