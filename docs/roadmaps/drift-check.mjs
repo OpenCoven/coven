@@ -569,10 +569,38 @@ function findExportDrift(mapping, exportText) {
   return findings;
 }
 
+function findSyncNarrativeDrift(mapping, roadmapText) {
+  // Truth-critical invariant: the machine-readable remote sync status
+  // (mapping.sync.beads_provisioning.remote_sync_status) and the roadmap's
+  // Active blockers narrative must agree on whether remote Dolt propagation is
+  // still an open blocker. This exists because a real successful sync once left
+  // one artifact corrected while the other silently claimed propagation was
+  // deferred. It pins no transient OID -- it only enforces cross-artifact
+  // agreement, so either both are updated together or the check fails.
+  if (typeof roadmapText !== "string") return [];
+  const status = String(mapping.sync?.beads_provisioning?.remote_sync_status ?? "");
+  const statusUnresolved = /^\s*(deferred|blocked)\b/i.test(status);
+  const narrativeUnresolved = /remote dolt propagation[^\n]*\b(deferred|blocked)\b/i.test(roadmapText);
+  if (statusUnresolved === narrativeUnresolved) return [];
+  return [
+    {
+      code: "E012",
+      severity: "error",
+      slug: null,
+      message:
+        `remote sync state is inconsistent across artifacts: ` +
+        `mapping.sync.remote_sync_status is ${statusUnresolved ? "unresolved (deferred/blocked)" : "resolved"} ` +
+        `but the roadmap Active blockers narrative is ${narrativeUnresolved ? "unresolved (deferred/blocked)" : "resolved"}. ` +
+        `Update docs/roadmaps/coven-automations-v1.mapping.json and coven-automations-v1.md together.`,
+    },
+  ];
+}
+
 function analyze(mapping, roadmapText, exportText) {
   const findings = [
     ...findMappingErrors(mapping),
     ...findGeneratedBlockDrift(mapping, roadmapText),
+    ...findSyncNarrativeDrift(mapping, roadmapText),
     ...findPendingProvisioning(mapping),
   ];
   if (typeof roadmapText === "string") {
@@ -771,6 +799,23 @@ function runSelftest() {
     "missing generated block",
   );
 
+  // E012: the machine-readable remote sync status and the roadmap narrative must
+  // agree. Both directions of disagreement must be caught.
+  const staleStatus = clone(baseMapping);
+  staleStatus.sync.beads_provisioning.remote_sync_status =
+    "deferred: bd dolt push is non-fast-forward and pull did not complete.";
+  expectFinding(
+    analyze(staleStatus, baseRoadmap, undefined),
+    "E012",
+    "mapping says remote sync deferred while roadmap says resolved",
+  );
+  const staleNarrative = `${baseRoadmap}\n- Remote Dolt propagation blocked (synthetic selftest line)\n`;
+  expectFinding(
+    analyze(baseMapping, staleNarrative, undefined),
+    "E012",
+    "roadmap says remote propagation blocked while mapping says resolved",
+  );
+
   const sensitiveMapping = clone(baseMapping);
   sensitiveMapping.outcomes[0].notes = [
     "operator note: ",
@@ -878,7 +923,7 @@ function runSelftest() {
     return false;
   }
   console.log(
-    `drift-check: selftest passed (${SENSITIVE_PATTERNS.length} sensitive-payload rules, 18 drift fixtures, ` +
+    `drift-check: selftest passed (${SENSITIVE_PATTERNS.length} sensitive-payload rules, 20 drift fixtures, ` +
       `${REQUIRED_OUTCOME_REFS.length} required outcomes and ${REQUIRED_CROSS_REPOSITORY_CHILD_REFS.length} required cross-repository children pinned)`,
   );
   return true;
