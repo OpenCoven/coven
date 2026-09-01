@@ -336,6 +336,17 @@ pub trait SessionRuntime {
         }
         result
     }
+    /// Launches an adopted session whose complete process tree must be
+    /// strictly contained before execution. Automation deadlines use this
+    /// path so a successful kill is also a quiescence proof.
+    fn launch_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.launch_adopted_session(launch, writer, ownership_established)
+    }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
@@ -10746,7 +10757,7 @@ mod tests {
     }
 
     #[test]
-    fn control_action_runs_a_routine_through_the_ledger() -> anyhow::Result<()> {
+    fn control_action_reports_launch_as_running_until_completion_evidence() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let create_body = json!({
             "action": "coven.automations.create",
@@ -10790,7 +10801,7 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(
-            response.body.contains(r#""status":"succeeded""#),
+            response.body.contains(r#""status":"running""#),
             "{}",
             response.body
         );
@@ -10815,7 +10826,7 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""runs":[{""#), "{}", response.body);
         assert!(
-            response.body.contains(r#""status":"succeeded""#),
+            response.body.contains(r#""status":"running""#),
             "{}",
             response.body
         );

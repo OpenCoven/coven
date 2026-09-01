@@ -817,7 +817,7 @@ static CLAUDE_JSON_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 
 impl SessionRuntime for LiveSessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()> {
-        self.launch_session_inner(launch, None, None)
+        self.launch_session_inner(launch, None, None, false)
     }
 
     fn launch_session_with_writer(
@@ -825,7 +825,7 @@ impl SessionRuntime for LiveSessionRuntime {
         launch: &SessionLaunch,
         writer: crate::maintenance_gate::WriterLease,
     ) -> Result<()> {
-        self.launch_session_inner(launch, Some(writer), None)
+        self.launch_session_inner(launch, Some(writer), None, false)
     }
 
     fn launch_adopted_session(
@@ -834,7 +834,16 @@ impl SessionRuntime for LiveSessionRuntime {
         writer: Option<crate::maintenance_gate::WriterLease>,
         ownership_established: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        self.launch_session_inner(launch, writer, Some(ownership_established))
+        self.launch_session_inner(launch, writer, Some(ownership_established), false)
+    }
+
+    fn launch_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        self.launch_session_inner(launch, writer, Some(ownership_established), true)
     }
 
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()> {
@@ -960,6 +969,7 @@ impl LiveSessionRuntime {
         launch: &SessionLaunch,
         writer: Option<crate::maintenance_gate::WriterLease>,
         ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
+        strict_containment: bool,
     ) -> Result<()> {
         anyhow::ensure!(
             !self.shutting_down.load(Ordering::Acquire),
@@ -1002,8 +1012,47 @@ impl LiveSessionRuntime {
                 launch_options,
             )?
         };
+        if strict_containment {
+            let coven_home = self
+                .coven_home
+                .as_deref()
+                .context("strict automation containment requires COVEN_HOME")?;
+            let receipt_path =
+                crate::automations::runner::containment_receipt_path(coven_home, &launch.id);
+            let receipt_dir = receipt_path
+                .parent()
+                .context("automation containment receipt path has no parent")?;
+            std::fs::create_dir_all(receipt_dir).with_context(|| {
+                format!(
+                    "failed creating automation containment receipt directory `{}`",
+                    receipt_dir.display()
+                )
+            })?;
+            match std::fs::remove_file(&receipt_path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed resetting automation containment receipt `{}`",
+                            receipt_path.display()
+                        )
+                    });
+                }
+            }
+            command.set_environment_override(
+                pty_runner::CONTAINMENT_RECEIPT_ENV,
+                Some(receipt_path.to_string_lossy().into_owned()),
+            );
+        }
         Self::apply_writer_participant(&mut command, writer.as_ref())?;
-        self.launch_prepared_session(launch, writer, command, ownership_established)
+        self.launch_prepared_session(
+            launch,
+            writer,
+            command,
+            ownership_established,
+            strict_containment,
+        )
     }
 
     fn launch_prepared_session(
@@ -1012,6 +1061,7 @@ impl LiveSessionRuntime {
         writer: Option<crate::maintenance_gate::WriterLease>,
         command: pty_runner::HarnessCommand,
         mut ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
+        strict_containment: bool,
     ) -> Result<()> {
         let (observer, registration) =
             self.observer_for_session_with_writer(launch.id.clone(), writer);
@@ -1067,7 +1117,7 @@ impl LiveSessionRuntime {
         // bounded. Windows additionally routes every noninteractive harness
         // here because ConPTY can terminate those children immediately.
         if launch.launch_mode == crate::harness::HarnessLaunchMode::NonInteractive
-            && (cfg!(windows) || launch.harness == "codex")
+            && (strict_containment || cfg!(windows) || launch.harness == "codex")
         {
             let (piped, _provisional_killer) = launch_admission.spawn_owned(|publish| {
                 let piped = pty_runner::spawn_piped_with_observer(&command, observer, false)?;
@@ -5235,6 +5285,7 @@ fn serve_forever_with_lifetime_job_installer(
     initialize_daemon_store(coven_home)?;
     write_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
+    recover_stale_created_sessions(coven_home, &started_at)?;
     recover_orphaned_afs_mounts(coven_home);
 
     let runtime = Arc::new(LiveSessionRuntime::try_with_coven_home(
@@ -5242,6 +5293,7 @@ fn serve_forever_with_lifetime_job_installer(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
+    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -7185,6 +7237,7 @@ mod tests {
                 None,
                 command,
                 Some(&mut publish_running),
+                false,
             );
             let _ = launch_tx.send(result);
         });

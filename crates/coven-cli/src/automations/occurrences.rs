@@ -98,6 +98,14 @@ pub fn claim_due_occurrence(
              WHERE automation_id = ?1
                AND state = 'planned'
                AND scheduled_for <= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_occurrences
+                   WHERE automation_id = ?1 AND state IN ('claimed', 'running')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_id = ?1 AND status = 'running'
+               )
                AND id = (
                    SELECT id FROM automation_occurrences
                    WHERE automation_id = ?1
@@ -122,8 +130,45 @@ pub fn claim_due_occurrence(
     Ok(Some(id))
 }
 
-/// Marks occurrences whose lease has expired as failed with a stale reason.
-/// A stale lease must never render as live work (coven#816).
+/// Creates a manually requested occurrence already claimed by its caller.
+/// The single insert prevents a scheduler connection from claiming the row
+/// between manual fencing and ownership publication.
+pub fn insert_claimed_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+    automation_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    if lease_minutes <= 0 || lease_minutes > 24 * 60 {
+        return Err("lease minutes must be 1..=1440".to_string());
+    }
+    let expires = now + chrono::Duration::minutes(lease_minutes);
+    let now_iso = iso(now);
+    let expires_iso = iso(expires);
+    conn.execute(
+        "INSERT OR IGNORE INTO automation_occurrences
+            (id, automation_id, scheduled_for, state, lease_owner,
+             lease_expires_at, attempt, created_at, updated_at)
+         SELECT ?1, ?2, ?5, 'claimed', ?3, ?4, 1, ?5, ?5
+         WHERE NOT EXISTS (
+             SELECT 1 FROM automation_occurrences
+             WHERE automation_id = ?2 AND state IN ('claimed', 'running')
+         )
+           AND NOT EXISTS (
+             SELECT 1 FROM automation_runs
+             WHERE automation_id = ?2 AND status = 'running'
+         )",
+        params![occurrence_id, automation_id, owner, expires_iso, now_iso],
+    )
+    .map(|inserted| inserted == 1)
+    .map_err(|error| format!("failed to insert claimed occurrence `{occurrence_id}`: {error}"))
+}
+
+/// Marks pre-dispatch claims whose lease has expired as failed. Once runtime
+/// ownership is published, only terminal session evidence may settle the
+/// occurrence; an execution lease is not completion evidence.
 pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<usize, String> {
     let now_iso = iso(now);
     let changed = conn
@@ -134,9 +179,14 @@ pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<u
                  lease_owner = NULL,
                  lease_expires_at = NULL,
                  updated_at = ?1
-             WHERE state IN ('claimed', 'running')
+             WHERE state = 'claimed'
                AND lease_expires_at IS NOT NULL
-               AND lease_expires_at < ?1",
+               AND lease_expires_at < ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_runs.occurrence_id = automation_occurrences.id
+                     AND automation_runs.status = 'running'
+               )",
             params![now_iso],
         )
         .map_err(|error| format!("failed to recover expired leases: {error}"))?;
@@ -171,6 +221,24 @@ pub fn settle_occurrence(
             params![occurrence_id, terminal_state, failure_reason, now_iso],
         )
         .map_err(|error| format!("failed to settle occurrence: {error}"))?;
+    Ok(changed > 0)
+}
+
+/// Publishes runtime ownership for a claimed occurrence without settling it.
+/// The lease remains attached until terminal session evidence is reconciled.
+pub fn mark_occurrence_running(
+    conn: &Connection,
+    occurrence_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'running', updated_at = ?2
+             WHERE id = ?1 AND state = 'claimed'",
+            params![occurrence_id, iso(now)],
+        )
+        .map_err(|error| format!("failed to mark occurrence running: {error}"))?;
     Ok(changed > 0)
 }
 
@@ -521,6 +589,33 @@ mod tests {
     }
 
     #[test]
+    fn overlap_forbid_does_not_claim_while_an_occurrence_is_running() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES
+                ('running', 'daily', '2020-01-01T00:00:00.000Z', 'running', 1,
+                 '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z'),
+                ('next', 'daily', '2020-01-01T00:01:00.000Z', 'planned', 0,
+                 '2020-01-01T00:01:00.000Z', '2020-01-01T00:01:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let claimed = claim_due_occurrence(&conn, "daily", "daemon", 60, real_now()).unwrap();
+        assert!(claimed.is_none());
+        let next_state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'next'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(next_state, "planned");
+    }
+
+    #[test]
     fn recovers_expired_leases_to_failed() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
@@ -551,6 +646,31 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn does_not_fail_running_work_when_its_claim_lease_expires() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                 attempt, created_at, updated_at)
+             VALUES ('occ-running', 'daily', '2020-01-01T00:00:00.000Z', 'running',
+                     'daemon-a', '2020-01-01T01:00:00.000Z', 1,
+                     '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(recover_expired_leases(&conn, real_now()).unwrap(), 0);
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'occ-running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
     }
 
     #[test]

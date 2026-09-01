@@ -198,6 +198,18 @@ fn main() {
             // Exit successfully while the descendant remains alive and has
             // already closed every pipe observed by the supervisor.
         }
+        "closed-descendant" => {
+            let pid_file = required_arg("first");
+            let child = Command::new(env::current_exe().expect("current executable"))
+                .arg("output-child")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn closed-pipe descendant");
+            fs::write(pid_file, child.id().to_string()).expect("write descendant pid");
+            thread::sleep(Duration::from_secs(120));
+        }
         "output-child" => loop {
             io::stdout().write_all(b"stdout-tick\n").expect("stdout tick");
             io::stdout().flush().expect("flush stdout tick");

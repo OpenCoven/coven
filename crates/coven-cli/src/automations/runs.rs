@@ -22,6 +22,7 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         log_json TEXT,
         output_commit TEXT,
         started_at TEXT NOT NULL,
+        timeout_at TEXT,
         finished_at TEXT,
         FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
     );
@@ -51,30 +52,40 @@ pub struct RunRecord {
     pub log_json: Option<String>,
     pub output_commit: Option<String>,
     pub started_at: String,
+    pub timeout_at: Option<String>,
     pub finished_at: Option<String>,
 }
 
 #[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
+pub struct RunStart<'a> {
+    pub automation_id: &'a str,
+    pub occurrence_id: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub familiar_id: Option<&'a str>,
+    pub runtime: &'a str,
+    pub timeout_at: DateTime<Utc>,
+}
+
 pub fn record_run_start(
     conn: &Connection,
     run_id: &str,
-    automation_id: &str,
-    occurrence_id: Option<&str>,
-    familiar_id: Option<&str>,
-    runtime: &str,
+    start: RunStart<'_>,
     now: DateTime<Utc>,
 ) -> Result<()> {
     conn.execute(
         "INSERT INTO automation_runs
-            (id, automation_id, occurrence_id, familiar_id, runtime, status, started_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6)",
+            (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
+             status, started_at, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
         params![
             run_id,
-            automation_id,
-            occurrence_id,
-            familiar_id,
-            runtime,
-            iso(now)
+            start.automation_id,
+            start.occurrence_id,
+            start.session_id,
+            start.familiar_id,
+            start.runtime,
+            iso(now),
+            iso(start.timeout_at)
         ],
     )
     .context("failed to record run start")?;
@@ -150,7 +161,7 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     let mut statement = conn
         .prepare(
             "SELECT id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                    status, exit_code, log_json, output_commit, started_at, finished_at
+                    status, exit_code, log_json, output_commit, started_at, timeout_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -171,7 +182,8 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
                 log_json: row.get(8)?,
                 output_commit: row.get(9)?,
                 started_at: row.get(10)?,
-                finished_at: row.get(11)?,
+                timeout_at: row.get(11)?,
+                finished_at: row.get(12)?,
             })
         })
         .context("failed to list runs")?;
@@ -180,7 +192,32 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     for row in rows {
         records.push(row.context("failed to read run row")?);
     }
+
     Ok(records)
+}
+
+pub fn ensure_timeout_column(conn: &Connection) -> Result<()> {
+    let present = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .context("failed to inspect automation_runs columns")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to query automation_runs columns")?;
+        let mut present = false;
+        for column in columns {
+            if column.context("failed to read automation_runs column")? == "timeout_at" {
+                present = true;
+                break;
+            }
+        }
+        present
+    };
+    if !present {
+        conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN timeout_at TEXT")
+            .context("failed to add automation_runs.timeout_at")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -216,10 +253,14 @@ mod tests {
         record_run_start(
             &conn,
             "run-1",
-            "daily",
-            Some("occ-1"),
-            Some("charm"),
-            "coven-code",
+            RunStart {
+                automation_id: "daily",
+                occurrence_id: Some("occ-1"),
+                session_id: None,
+                familiar_id: Some("charm"),
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
             start,
         )
         .unwrap();
@@ -244,13 +285,30 @@ mod tests {
         assert_eq!(runs[0].status, "succeeded");
         assert_eq!(runs[0].session_id.as_deref(), Some("session-1"));
         assert_eq!(runs[0].familiar_id.as_deref(), Some("charm"));
+        assert_eq!(
+            runs[0].timeout_at.as_deref(),
+            Some("2026-08-28T09:30:00.000Z")
+        );
     }
 
     #[test]
     fn finishing_a_non_running_run_is_a_no_op() {
         let (_temp, conn) = temp_store();
         let start = utc(2026, 8, 28, 9, 0);
-        record_run_start(&conn, "run-2", "daily", None, None, "coven-code", start).unwrap();
+        record_run_start(
+            &conn,
+            "run-2",
+            RunStart {
+                automation_id: "daily",
+                occurrence_id: None,
+                session_id: None,
+                familiar_id: None,
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
         record_run_finish(
             &conn,
             "run-2",
@@ -288,7 +346,20 @@ mod tests {
     fn rejects_unknown_terminal_status() {
         let (_temp, conn) = temp_store();
         let start = utc(2026, 8, 28, 9, 0);
-        record_run_start(&conn, "run-3", "daily", None, None, "coven-code", start).unwrap();
+        record_run_start(
+            &conn,
+            "run-3",
+            RunStart {
+                automation_id: "daily",
+                occurrence_id: None,
+                session_id: None,
+                familiar_id: None,
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
         let error = record_run_finish(
             &conn,
             "run-3",

@@ -977,6 +977,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation_occurrences schema")?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
+    crate::automations::runs::ensure_timeout_column(conn)?;
 
     backfill_events_fts_if_needed(conn)?;
 
@@ -2588,7 +2589,7 @@ pub fn update_session_terminal_if_active(
         .execute(
             "UPDATE sessions
              SET status = ?2, exit_code = ?3, updated_at = ?4
-             WHERE id = ?1 AND status IN ('created', 'running')",
+             WHERE id = ?1 AND status IN ('created', 'running', 'orphaned')",
             params![session_id, status, exit_code, updated_at],
         )
         .with_context(|| format!("failed to update session {session_id}"))?;
@@ -2639,9 +2640,9 @@ pub fn mark_running_sessions_orphaned(conn: &Connection, updated_at: &str) -> Re
 /// those two writes (fork exhaustion, missing adapter, crash) leaves a row
 /// no process owns, so only age can prove it dead. Rows created before the
 /// cutoff become `failed`; newer rows stay untouched so a slow-but-live
-/// launch is never clobbered. A launch adoption or historical launch
-/// reservation is durable ownership evidence, so those rows are excluded
-/// regardless of age.
+/// launch is never clobbered. Launch adoptions, historical reservations, and
+/// correlated automation runs are durable ownership evidence, so those rows
+/// are excluded regardless of age.
 pub fn mark_stale_created_sessions_failed(
     conn: &Connection,
     created_before: &str,
@@ -2657,6 +2658,11 @@ pub fn mark_stale_created_sessions_failed(
                  SELECT 1 FROM request_adoptions
                  WHERE request_adoptions.session_id = sessions.id
                   AND request_adoptions.operation = 'launch'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM automation_runs
+                 WHERE automation_runs.session_id = sessions.id
+                   AND automation_runs.status = 'running'
                )",
             params![created_before, updated_at],
         )
