@@ -1,10 +1,7 @@
 //! Daemon-side automations tick (coven#816).
 //!
-//! The daemon runs the planning/recovery/claim tick on a 60-second cadence.
-//! Dispatch of claimed occurrences is intentionally NOT wired into this tick
-//! yet: the tick fences and claims so the ledger reflects reality, and the
-//! dispatch path (part 4's run_routine_now) currently serves manual runs
-//! while occurrence execution lands behind the same SessionLaunch seam.
+//! The daemon reconciles terminal session evidence before planning, recovering,
+//! claiming, and dispatching occurrences on a 60-second cadence.
 
 use std::path::Path;
 use std::time::Duration;
@@ -22,12 +19,35 @@ pub fn process_automations_tick(
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
     let now = chrono::Utc::now();
+    reconcile_automation_runs(coven_home, &conn, runtime, now)?;
     let report = super::occurrences::tick(&conn, now)?;
-    if !report.claimed.is_empty() {
-        let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
-            .map_err(anyhow::Error::msg)?;
-    }
+    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
+        .map_err(anyhow::Error::msg)?;
     Ok(report)
+}
+
+fn reconcile_automation_runs(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    runtime: &dyn crate::api::SessionRuntime,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<()> {
+    super::runner::recover_restart_containment(coven_home, conn, now, false)
+        .map_err(anyhow::Error::msg)?;
+    for failure in
+        super::runner::recover_abandoned_launches(conn, runtime, now).map_err(anyhow::Error::msg)?
+    {
+        crate::daemon::append_daemon_recovery_log(coven_home, &failure);
+    }
+    for failure in
+        super::runner::enforce_run_timeouts(conn, runtime, now).map_err(anyhow::Error::msg)?
+    {
+        crate::daemon::append_daemon_recovery_log(coven_home, &failure);
+    }
+    super::runner::settle_finished_runs(conn, now).map_err(anyhow::Error::msg)?;
+    super::runner::cleanup_terminal_containment_receipts(coven_home, conn)
+        .map_err(anyhow::Error::msg)?;
+    Ok(())
 }
 
 /// Starts the automations scheduler thread on the daemon's 60s cadence.
@@ -35,6 +55,14 @@ pub fn start_automations_scheduler(
     coven_home: &Path,
     runtime: std::sync::Arc<dyn crate::api::SessionRuntime + Send + Sync>,
 ) -> Result<()> {
+    let store_path = crate::api::store_path(coven_home);
+    let conn = crate::store::open_store(&store_path)?;
+    let now = chrono::Utc::now();
+    super::runner::recover_restart_containment(coven_home, &conn, now, true)
+        .map_err(anyhow::Error::msg)?;
+    reconcile_automation_runs(coven_home, &conn, runtime.as_ref(), now)?;
+    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime.as_ref(), now)
+        .map_err(anyhow::Error::msg)?;
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-automations-scheduler".into())
@@ -105,11 +133,53 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // The tick claims and then dispatches through the (noop) runtime, so
-        // the occurrence settles as succeeded and the ledger records the run.
-        assert_eq!(state, "succeeded");
+        // A launch acknowledgement proves only that the runtime accepted the
+        // session. Terminal settlement waits for completion evidence.
+        assert_eq!(state, "running");
         let runs = super::super::runs::list_runs(&conn, "daily", 10).unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, "succeeded");
+        assert_eq!(runs[0].status, "running");
+        assert!(runs[0].session_id.is_some());
+        assert_eq!(runs[0].finished_at, None);
+    }
+
+    #[test]
+    fn tick_dispatches_a_preexisting_daemon_claim_without_new_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let routine = definition("preclaimed");
+        insert_definition(&conn, &routine).unwrap();
+        let now = chrono::Utc::now();
+        assert!(super::super::occurrences::insert_claimed_occurrence(
+            &conn,
+            "preexisting-daemon-claim",
+            &routine.id,
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        drop(conn);
+
+        let report = process_automations_tick(home, &crate::api::NoopSessionRuntime).unwrap();
+        assert!(report.claimed.is_empty());
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'preexisting-daemon-claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "running");
+        assert_eq!(
+            super::super::runs::list_runs(&conn, &routine.id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

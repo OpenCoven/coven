@@ -315,6 +315,14 @@ impl HarnessCommand {
             }
         }
     }
+
+    fn containment_receipt_path(&self) -> Option<PathBuf> {
+        self.env_overrides.iter().rev().find_map(|(name, value)| {
+            (name == CONTAINMENT_RECEIPT_ENV)
+                .then(|| value.as_ref().map(PathBuf::from))
+                .flatten()
+        })
+    }
 }
 
 pub fn build_harness_command(
@@ -1504,8 +1512,28 @@ impl SharedStrictChildProcessTree {
     }
 
     pub(crate) fn terminate_and_wait(&self, timeout: Duration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
         let termination = self.terminate_tree().err();
         let wait_state = wait_for_piped_child_reap(&self.child_wait_state, timeout);
+        #[cfg(unix)]
+        let containment_quiescence = if wait_state == PIPED_CHILD_REAPED {
+            self.wait_for_unix_process_group_quiescence(
+                deadline.saturating_duration_since(Instant::now()),
+            )
+            .err()
+        } else {
+            None
+        };
+        #[cfg(not(unix))]
+        let containment_quiescence: Option<anyhow::Error> = None;
+        if let Some(error) = containment_quiescence {
+            return match termination {
+                Some(termination) => Err(error.context(format!(
+                    "process-tree termination also reported an error: {termination}"
+                ))),
+                None => Err(error),
+            };
+        }
         match (termination, wait_state) {
             (None, PIPED_CHILD_REAPED) => Ok(()),
             (Some(error), PIPED_CHILD_REAPED) => Err(anyhow::Error::new(error).context(
@@ -1530,6 +1558,15 @@ impl SharedStrictChildProcessTree {
                 ),
             },
         }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_unix_process_group_quiescence(&self, timeout: Duration) -> Result<()> {
+        let pid = match self.process_tree.lock() {
+            Ok(process_tree) => process_tree.0.pid,
+            Err(poisoned) => poisoned.into_inner().0.pid,
+        };
+        wait_for_unix_process_group_exit(pid, timeout)
     }
 
     pub(crate) fn wait_for_quiescence(&self, timeout: Duration) -> Result<()> {
@@ -1883,6 +1920,9 @@ fn wait_at_windows_strict_preattach_test_barrier(child_pid: u32) -> io::Result<(
 }
 
 pub(crate) const PROCESS_SUPERVISOR_PROTOCOL: &str = "coven.process-supervisor.v1";
+pub(crate) const CONTAINMENT_RECEIPT_ENV: &str = "COVEN_CONTAINMENT_RECEIPT_PATH";
+pub(crate) const CONTAINMENT_QUIESCENT_RECEIPT: &[u8] = b"coven.containment.quiescent.v1\n";
+pub(crate) const CONTAINMENT_NO_PROCESS_RECEIPT: &[u8] = b"coven.containment.no-process.v1\n";
 const PROCESS_SUPERVISOR_CONTROL_PREFIX: &str = "COVEN_PROCESS_SUPERVISOR_V1 ";
 const PROCESS_SUPERVISOR_MAX_REQUEST_BYTES: usize = 256 * 1024;
 const PROCESS_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1957,6 +1997,7 @@ struct ProcessSupervisorGuardian {
     setup_ack_read: libc::c_int,
     pid: libc::pid_t,
     finished: bool,
+    receipt_path: Option<PathBuf>,
 }
 
 #[cfg(unix)]
@@ -2024,8 +2065,9 @@ unsafe fn guardian_remap_and_close_unrelated_fds(
     owner_read: libc::c_int,
     pid_read: libc::c_int,
     ack_write: libc::c_int,
+    receipt_write: Option<libc::c_int>,
     max_fd: libc::c_int,
-) -> Option<(libc::c_int, libc::c_int, libc::c_int)> {
+) -> Option<(libc::c_int, libc::c_int, libc::c_int, Option<libc::c_int>)> {
     // A guardian is forked from a multithreaded daemon and intentionally does
     // not exec. Without this close sweep it would retain accepted API sockets,
     // store locks, and listeners after the request handler dropped them. First
@@ -2034,21 +2076,32 @@ unsafe fn guardian_remap_and_close_unrelated_fds(
     let owner_temp = unsafe { libc::fcntl(owner_read, libc::F_DUPFD_CLOEXEC, 64) };
     let pid_temp = unsafe { libc::fcntl(pid_read, libc::F_DUPFD_CLOEXEC, 64) };
     let ack_temp = unsafe { libc::fcntl(ack_write, libc::F_DUPFD_CLOEXEC, 64) };
-    if owner_temp < 0 || pid_temp < 0 || ack_temp < 0 {
+    let receipt_temp =
+        receipt_write.map(|fd| unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 64) });
+    if owner_temp < 0 || pid_temp < 0 || ack_temp < 0 || receipt_temp.is_some_and(|fd| fd < 0) {
         return None;
     }
     if unsafe { libc::dup2(owner_temp, 3) } < 0
         || unsafe { libc::dup2(pid_temp, 4) } < 0
         || unsafe { libc::dup2(ack_temp, 5) } < 0
+        || receipt_temp.is_some_and(|fd| unsafe { libc::dup2(fd, 6) } < 0)
     {
         return None;
     }
+    let first_unrelated_fd = if receipt_temp.is_some() { 7 } else { 6 };
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        let closed = unsafe { libc::syscall(libc::SYS_close_range, 6_u32, u32::MAX, 0_u32) } == 0;
+        let closed = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                first_unrelated_fd as u32,
+                u32::MAX,
+                0_u32,
+            )
+        } == 0;
         if !closed {
-            for fd in 6..max_fd {
+            for fd in first_unrelated_fd..max_fd {
                 unsafe { libc::close(fd) };
             }
         }
@@ -2070,19 +2123,79 @@ unsafe fn guardian_remap_and_close_unrelated_fds(
         target_os = "netbsd",
         target_os = "dragonfly"
     )))]
-    for fd in 6..max_fd {
+    for fd in first_unrelated_fd..max_fd {
         unsafe { libc::close(fd) };
     }
     for fd in 0..3 {
         unsafe { libc::close(fd) };
     }
-    Some((3, 4, 5))
+    Some((3, 4, 5, receipt_temp.map(|_| 6)))
+}
+
+#[cfg(unix)]
+unsafe fn guardian_write_receipt(fd: libc::c_int, receipt: &[u8]) {
+    unsafe {
+        libc::ftruncate(fd, 0);
+        libc::lseek(fd, 0, libc::SEEK_SET);
+        if guardian_write_all(fd, receipt) {
+            libc::fsync(fd);
+        }
+        libc::close(fd);
+    }
+}
+
+#[cfg(unix)]
+unsafe fn guardian_wait_for_process_group_exit(pid: libc::pid_t) -> bool {
+    for _ in 0..3_000 {
+        let result = unsafe { libc::kill(-pid, 0) };
+        if result == -1 {
+            let code = io::Error::last_os_error().raw_os_error();
+            if code == Some(libc::ESRCH) || (cfg!(target_os = "macos") && code == Some(libc::EPERM))
+            {
+                return true;
+            }
+        }
+        unsafe { libc::usleep(10_000) };
+    }
+    false
+}
+
+fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?;
+    file.write_all(receipt)?;
+    file.sync_all()
+}
+
+#[cfg(unix)]
+fn wait_for_unix_process_group_exit(pid: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let result = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+        if result == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH)
+                || (cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM))
+            {
+                return Ok(());
+            }
+            return Err(error).context("failed to inspect contained Unix process group");
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "contained Unix process group {pid} remained live after termination"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[cfg(unix)]
 impl ProcessSupervisorGuardian {
-    fn install(command: &mut std::process::Command) -> Result<Self> {
-        use std::os::unix::process::CommandExt;
+    fn install(command: &mut std::process::Command, receipt_path: Option<&Path>) -> Result<Self> {
+        use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
 
         let owner = cloexec_pipe().context("failed creating supervisor owner pipe")?;
         let pid_channel = match cloexec_pipe() {
@@ -2106,6 +2219,37 @@ impl ProcessSupervisorGuardian {
                 return Err(error).context("failed creating supervisor acknowledgement channel");
             }
         };
+        let receipt = match receipt_path
+            .map(|path| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(true)
+                    .write(true)
+                    .mode(0o600)
+                    .open(path)
+                    .with_context(|| {
+                        format!("failed arming containment receipt `{}`", path.display())
+                    })
+            })
+            .transpose()
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                unsafe {
+                    for fd in [
+                        owner[0],
+                        owner[1],
+                        pid_channel[0],
+                        pid_channel[1],
+                        ack_channel[0],
+                        ack_channel[1],
+                    ] {
+                        libc::close(fd);
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         let max_fd = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) }
             .clamp(64, libc::c_int::MAX as libc::c_long) as libc::c_int;
@@ -2124,6 +2268,9 @@ impl ProcessSupervisorGuardian {
                     libc::close(fd);
                 }
             }
+            if let Some(path) = receipt_path {
+                let _ = write_containment_receipt(path, CONTAINMENT_NO_PROCESS_RECEIPT);
+            }
             return Err(error).context("failed starting process-supervisor guardian");
         }
         if guardian_pid == 0 {
@@ -2140,11 +2287,12 @@ impl ProcessSupervisorGuardian {
                 libc::close(owner[1]);
                 libc::close(pid_channel[1]);
                 libc::close(ack_channel[0]);
-                let Some((owner_read, pid_read, ack_write)) =
+                let Some((owner_read, pid_read, ack_write, receipt_write)) =
                     guardian_remap_and_close_unrelated_fds(
                         owner[0],
                         pid_channel[0],
                         ack_channel[1],
+                        receipt.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
                         max_fd,
                     )
                 else {
@@ -2164,6 +2312,9 @@ impl ProcessSupervisorGuardian {
                             // Command implementation may already have reaped
                             // that failed child, so signaling the numeric PGID
                             // here would introduce a stale-id race.
+                            if let Some(fd) = receipt_write {
+                                guardian_write_receipt(fd, CONTAINMENT_NO_PROCESS_RECEIPT);
+                            }
                             break;
                         }
                         if count == 1 && byte == *b"K" {
@@ -2174,6 +2325,11 @@ impl ProcessSupervisorGuardian {
                             // Owner EOF means the supervisor/daemon died
                             // before it could perform orderly cleanup.
                             let _ = libc::kill(-target_pid, libc::SIGKILL);
+                            if let Some(fd) = receipt_write {
+                                if guardian_wait_for_process_group_exit(target_pid) {
+                                    guardian_write_receipt(fd, CONTAINMENT_QUIESCENT_RECEIPT);
+                                }
+                            }
                             break;
                         }
                         if count == -1
@@ -2188,6 +2344,8 @@ impl ProcessSupervisorGuardian {
                             break;
                         }
                     }
+                } else if let Some(fd) = receipt_write {
+                    guardian_write_receipt(fd, CONTAINMENT_NO_PROCESS_RECEIPT);
                 }
                 libc::_exit(0);
             }
@@ -2225,6 +2383,7 @@ impl ProcessSupervisorGuardian {
             setup_ack_read,
             pid: guardian_pid,
             finished: false,
+            receipt_path: receipt_path.map(Path::to_path_buf),
         })
     }
 
@@ -2271,6 +2430,9 @@ impl ProcessSupervisorGuardian {
 
     fn disarm(&mut self) {
         self.finish_with_command(b'D');
+        if let Some(path) = self.receipt_path.as_deref() {
+            let _ = write_containment_receipt(path, CONTAINMENT_NO_PROCESS_RECEIPT);
+        }
     }
 }
 
@@ -2304,7 +2466,7 @@ fn spawn_process_supervisor_target(
     #[cfg(unix)]
     {
         configure_child_process_tree_command(&mut command);
-        let mut guardian = ProcessSupervisorGuardian::install(&mut command)?;
+        let mut guardian = ProcessSupervisorGuardian::install(&mut command, None)?;
         let spawned = spawn_configured_strict_child_process_tree(&mut command);
         guardian.spawn_finished();
         let (child, process_tree) = match spawned {
@@ -4225,6 +4387,7 @@ pub fn spawn_piped_with_observer(
     use std::process::Command as StdCommand;
     use std::sync::{Arc, Mutex as StdMutex};
 
+    let containment_receipt_path = command.containment_receipt_path();
     let mut std_command = StdCommand::new(&command.program);
     std_command.args(&command.args);
     std_command.current_dir(&command.cwd);
@@ -4232,6 +4395,7 @@ pub fn spawn_piped_with_observer(
     std_command.stdout(Stdio::piped());
     std_command.stderr(Stdio::piped());
     command.apply_environment(&mut std_command);
+    std_command.env_remove(CONTAINMENT_RECEIPT_ENV);
     // Reuse strict containment. On Windows the console-subsystem child starts
     // suspended and hidden, enters a KILL_ON_JOB_CLOSE job before its first
     // instruction, and only then resumes. Unix additionally installs an
@@ -4241,7 +4405,10 @@ pub fn spawn_piped_with_observer(
     #[cfg(unix)]
     let (mut child, mut process_tree, mut guardian) = {
         configure_child_process_tree_command(&mut std_command);
-        let mut guardian = ProcessSupervisorGuardian::install(&mut std_command)?;
+        let mut guardian = ProcessSupervisorGuardian::install(
+            &mut std_command,
+            containment_receipt_path.as_deref(),
+        )?;
         let spawned = spawn_configured_strict_child_process_tree(&mut std_command);
         guardian.spawn_finished();
         match spawned {
@@ -4377,10 +4544,13 @@ pub fn spawn_piped_with_observer(
     // The wait thread owns `child`; cancellation uses the independently owned
     // process-group/Job Object handle, so it never needs to lock the `Child`
     // around a blocking wait.
+    #[cfg(unix)]
+    let process_group_pid = process_tree.0.pid;
     let child_wait_state = Arc::new(AtomicU8::new(PIPED_CHILD_WAIT_PENDING));
     let wait_state = Arc::clone(&child_wait_state);
     let exit_callback_complete = Arc::new(AtomicBool::new(false));
     let callback_complete = Arc::clone(&exit_callback_complete);
+    let wait_containment_receipt_path = containment_receipt_path;
     #[cfg(unix)]
     let process_tree = SharedStrictChildProcessTree::new(
         process_tree,
@@ -4456,6 +4626,19 @@ pub fn spawn_piped_with_observer(
                 PIPED_CHILD_WAIT_FAILED,
             ),
         };
+        #[cfg(unix)]
+        let process_group_quiescence_failed = state == PIPED_CHILD_REAPED
+            && wait_for_unix_process_group_exit(process_group_pid, PIPED_PROMPT_REAP_TIMEOUT)
+                .is_err();
+        #[cfg(not(unix))]
+        let process_group_quiescence_failed = false;
+        if state == PIPED_CHILD_REAPED && !process_group_quiescence_failed {
+            if let Some(path) = wait_containment_receipt_path.as_deref() {
+                if write_containment_receipt(path, CONTAINMENT_QUIESCENT_RECEIPT).is_err() {
+                    state = PIPED_CHILD_WAIT_FAILED;
+                }
+            }
+        }
         // A successful cancellation response is a quiescence boundary for
         // consumers such as Cave: do not publish completion until both pipe
         // drains have reached EOF. Otherwise a descendant that inherited
@@ -4464,6 +4647,7 @@ pub fn spawn_piped_with_observer(
             || stderr_drain_failed
             || pre_reap_wait_failed
             || containment_cleanup_failed
+            || process_group_quiescence_failed
         {
             state = PIPED_CHILD_WAIT_FAILED;
         }
@@ -5847,6 +6031,36 @@ mod tests {
             "successful root exit left closed-pipe descendant {descendant_pid} running"
         );
         drop(process_tree);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_termination_waits_for_closed_pipe_descendant_exit() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let pid_file = temp_dir.path().join("strict-closed-pipe-descendant.pid");
+        let mut command = piped_prompt_probe_command(
+            temp_dir.path(),
+            "closed-descendant",
+            &pid_file.to_string_lossy(),
+            None,
+            Vec::new(),
+        )?;
+        let receipt_path = temp_dir.path().join("containment.receipt");
+        command.set_environment_override(
+            CONTAINMENT_RECEIPT_ENV,
+            Some(receipt_path.to_string_lossy().into_owned()),
+        );
+        let session = spawn_piped_with_observer(&command, None, false)?;
+        let descendant_pid = await_piped_descendant_pid(&pid_file)?;
+        let process_tree = session.activate(|_input, process_tree| Ok(process_tree))?;
+
+        process_tree.terminate_and_wait(Duration::from_secs(2))?;
+        assert!(
+            wait_for_piped_process_exit(descendant_pid, Duration::ZERO),
+            "strict termination returned while closed-pipe descendant {descendant_pid} remained"
+        );
+        assert_eq!(std::fs::read(receipt_path)?, CONTAINMENT_QUIESCENT_RECEIPT);
         Ok(())
     }
 
