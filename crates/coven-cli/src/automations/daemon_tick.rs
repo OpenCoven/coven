@@ -19,7 +19,7 @@ pub fn process_automations_tick(
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
     let now = chrono::Utc::now();
-    reconcile_automation_runs(coven_home, &conn, runtime, now)?;
+    reconcile_automation_runs(coven_home, &conn, runtime, now, false)?;
     let report = super::occurrences::tick(&conn, now)?;
     let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
         .map_err(anyhow::Error::msg)?;
@@ -31,8 +31,9 @@ fn reconcile_automation_runs(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
+    startup: bool,
 ) -> Result<()> {
-    super::runner::recover_restart_containment(coven_home, conn, now, false)
+    super::runner::recover_restart_containment(coven_home, conn, now, startup)
         .map_err(anyhow::Error::msg)?;
     for failure in
         super::runner::recover_abandoned_launches(conn, runtime, now).map_err(anyhow::Error::msg)?
@@ -58,9 +59,7 @@ pub fn start_automations_scheduler(
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
     let now = chrono::Utc::now();
-    super::runner::recover_restart_containment(coven_home, &conn, now, true)
-        .map_err(anyhow::Error::msg)?;
-    reconcile_automation_runs(coven_home, &conn, runtime.as_ref(), now)?;
+    reconcile_automation_runs(coven_home, &conn, runtime.as_ref(), now, true)?;
     let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime.as_ref(), now)
         .map_err(anyhow::Error::msg)?;
     let home = coven_home.to_path_buf();

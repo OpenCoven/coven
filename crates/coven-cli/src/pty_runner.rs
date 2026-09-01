@@ -1514,7 +1514,10 @@ impl SharedStrictChildProcessTree {
     pub(crate) fn terminate_and_wait(&self, timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let termination = self.terminate_tree().err();
-        let wait_state = wait_for_piped_child_reap(&self.child_wait_state, timeout);
+        let wait_state = wait_for_piped_child_reap(
+            &self.child_wait_state,
+            deadline.saturating_duration_since(Instant::now()),
+        );
         #[cfg(unix)]
         let containment_quiescence = if wait_state == PIPED_CHILD_REAPED {
             self.wait_for_unix_process_group_quiescence(
