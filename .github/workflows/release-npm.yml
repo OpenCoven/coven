@@ -154,7 +154,10 @@ jobs:
   performance-baseline:
     name: Release performance baseline
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Same I/O-bound fixture seeding as the CI baseline, and this job gates
+    # publish, so it keeps failing loudly - it just gets honest headroom for a
+    # slow shared runner instead of being cancelled at the cap.
+    timeout-minutes: 30
     needs: [verify, verify-tag]
     permissions:
       contents: read
