@@ -253,7 +253,10 @@ jobs:
     needs: changes
     if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Baseline collection is I/O bound (it seeds 10k-session and 10k-event
+    # fixtures), so wall time swings with shared-runner disk speed. A healthy
+    # job finishes in ~9 minutes; a slow runner has been observed at ~2.6x that.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v7
@@ -276,6 +279,13 @@ jobs:
       - name: Validate benchmark runner
         run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - name: Collect non-gating baseline artifact
+        # Non-gating in name and now in behaviour: a wedged or very slow
+        # collection is bounded here so it cannot burn the whole job budget and
+        # cancel the run. `continue-on-error` matches the concurrent-runtime
+        # step below; `Validate benchmark runner` above stays gating, so real
+        # harness breakage is still caught.
+        timeout-minutes: 20
+        continue-on-error: true
         run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
       - name: Collect concurrent runtime baseline artifact
         continue-on-error: true
