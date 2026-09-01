@@ -269,8 +269,12 @@ jobs:
     runs-on: ubuntu-latest
     # Baseline collection is I/O bound (it seeds 10k-session and 10k-event
     # fixtures), so wall time swings with shared-runner disk speed. A healthy
-    # job finishes in ~9 minutes; a slow runner has been observed at ~2.6x that.
-    timeout-minutes: 30
+    # job finishes in ~9 minutes; a slow runner has been observed at ~2.8x that.
+    # This cap must stay comfortably above the collection step's own bound
+    # below, otherwise the job is cancelled before that bound can fire and the
+    # step bound is inert. Everything outside collection measured ~2 minutes on
+    # a slow runner, so 40 leaves ~10 minutes of setup/build/upload headroom.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-node@v7
@@ -297,8 +301,10 @@ jobs:
         # collection is bounded here so it cannot burn the whole job budget and
         # cancel the run. `continue-on-error` matches the concurrent-runtime
         # step below; `Validate benchmark runner` above stays gating, so real
-        # harness breakage is still caught.
-        timeout-minutes: 20
+        # harness breakage is still caught. The last slow runner spent 20m12s
+        # here against a 20-minute bound, so 30 restores real headroom while
+        # staying below the job cap that makes this bound effective at all.
+        timeout-minutes: 30
         continue-on-error: true
         run: node scripts/benchmark-cli.mjs --binary target/debug/coven --iterations 3 --output coven-perf.json
       - name: Collect concurrent runtime baseline artifact
