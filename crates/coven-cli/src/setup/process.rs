@@ -135,11 +135,17 @@ pub fn probe_version(request: &LaunchRequest, timeout: Duration) -> io::Result<O
     }
     Ok(extract_version(
         &String::from_utf8_lossy(&output),
-        request
-            .executable
-            .file_stem()
-            .and_then(std::ffi::OsStr::to_str),
+        version_program_marker(&request.executable),
     ))
+}
+
+fn version_program_marker(executable: &std::path::Path) -> Option<&str> {
+    let file_name = executable.file_name()?.to_str()?;
+    if valid_version(file_name) {
+        Some(file_name)
+    } else {
+        executable.file_stem()?.to_str()
+    }
 }
 
 fn apply_launch_context(command: &mut Command, request: &LaunchRequest) {
@@ -512,6 +518,40 @@ mod windows_job {
 mod version_extraction_tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn version_probe_handles_numeric_canonical_executable_name() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let executable = temp.path().join("2.1.258");
+        symlink("/bin/echo", &executable).expect("link version probe");
+
+        let request = LaunchRequest {
+            executable,
+            args: vec![
+                OsString::from("2.1.258"),
+                OsString::from("(Claude"),
+                OsString::from("Code)"),
+            ],
+            current_dir: None,
+            env_overrides: Vec::new(),
+        };
+
+        assert_eq!(version_program_marker(&request.executable), Some("2.1.258"));
+        assert_eq!(
+            extract_version(
+                "2.1.258 (Claude Code)",
+                version_program_marker(&request.executable)
+            ),
+            Some("2.1.258".to_owned())
+        );
+        assert_eq!(
+            probe_version(&request, Duration::from_secs(2)).expect("probe version"),
+            Some("2.1.258".to_owned())
+        );
+    }
+
     #[test]
     fn copilot_version_output_with_a_trailing_period_is_extracted() {
         // GitHub Copilot CLI ends its version line with a sentence period:
@@ -539,6 +579,14 @@ mod version_extraction_tests {
         assert_eq!(
             extract_version("2.1.220 (Claude Code)", Some("claude")),
             Some("2.1.220".to_string())
+        );
+    }
+
+    #[test]
+    fn ambiguous_unlabeled_versions_are_rejected() {
+        assert_eq!(
+            extract_version("runtime 1.2.3 protocol 4.5.6", Some("claude")),
+            None
         );
     }
 }
