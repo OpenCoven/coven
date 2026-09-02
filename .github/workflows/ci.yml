@@ -330,12 +330,12 @@ jobs:
         # on pull requests, so failing here surfaces the gap on main without
         # blocking anyone's PR.
         run: |
-          set -uo pipefail
+          set -euo pipefail
           status=0
           if [ ! -s coven-perf.json ]; then
             echo "::error::coven-perf.json is missing or empty - the baseline collection step did not complete (timed out, wedged, or failed)"
             status=1
-          elif ! python3 -c 'import json,sys; json.load(open("coven-perf.json"))' 2>/dev/null; then
+          elif ! python3 -c 'import json; json.load(open("coven-perf.json"))' 2>/dev/null; then
             echo "::error::coven-perf.json exists but is not valid JSON - the baseline collection step was interrupted mid-write"
             status=1
           else
