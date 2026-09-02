@@ -10867,6 +10867,30 @@ mod tests {
     }
 
     #[test]
+    fn control_actions_reject_automation_domain_failures() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let body = json!({
+            "action": "coven.automations.run",
+            "id": "missing"
+        })
+        .to_string();
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains("no routine with id"));
+        assert!(!response.body.contains(r#""event":"#));
+        Ok(())
+    }
+
+    #[test]
     fn capabilities_only_advertise_routable_control_actions() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
 

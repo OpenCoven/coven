@@ -9,7 +9,7 @@
     "verification": "A runner recomputes the pinned digests before trusting the vectors; a mismatch means the vector bytes were altered and the file must not be used."
   },
   "caseKinds": {
-    "schema": "Validate `object` against `targetSchema` (draft 2020-12, with sibling schemas from this directory loaded). accept/reject is the whole verdict.",
+    "schema": "Validate `object` against `targetSchema` (draft 2020-12, with sibling schemas from this directory loaded). accept/reject is the structural verdict only; a structurally valid object may still be refused by capabilities.json, including the reserved outputTarget.atomic shape.",
     "stateMachine": "Consult state-machines.json. `attemptedTransition` must be refused because no transition leaves the terminal state `fromState`.",
     "adoption": "Consult command-envelope semantics. The case pins what a conformant command handler commits or refuses, independent of transport.",
     "changefeed": "Consult event-envelope semantics. The case pins duplicate handling, ordering, and deterministic read-model rehydration."

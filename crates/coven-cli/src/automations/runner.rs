@@ -15,7 +15,9 @@ use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use super::definition::RoutineDefinition;
-use super::occurrences::{insert_claimed_occurrence, mark_occurrence_running, settle_occurrence};
+use super::occurrences::{
+    insert_claimed_occurrence, mark_occurrence_running, recover_expired_leases, settle_occurrence,
+};
 use super::runs::{record_run_finish, record_run_start, RunFinish, RunStart};
 use crate::api::{SessionLaunch, SessionRuntime};
 use crate::harness::HarnessLaunchMode;
@@ -168,9 +170,48 @@ fn persist_launch(
     launch: &SessionLaunch,
     now: DateTime<Utc>,
 ) -> Result<(), String> {
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
+    persist_launch_with_clock(
+        conn,
+        run_id,
+        occurrence_id,
+        definition,
+        launch,
+        now,
+        Utc::now,
+    )
+}
+
+fn persist_launch_with_clock(
+    conn: &Connection,
+    run_id: &str,
+    occurrence_id: &str,
+    definition: &RoutineDefinition,
+    launch: &SessionLaunch,
+    not_before: DateTime<Utc>,
+    clock: impl FnOnce() -> DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
+    let now = clock().max(not_before);
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let claim_is_current: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM automation_occurrences
+                WHERE id = ?1
+                  AND state = 'claimed'
+                  AND lease_owner IS NOT NULL
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?2
+            )",
+            rusqlite::params![occurrence_id, now_iso],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to verify durable automation claim: {error}"))?;
+    if !claim_is_current {
+        return Err("occurrence claim expired or changed before durable dispatch".to_string());
+    }
     let overlapping_run: bool = transaction
         .query_row(
             "SELECT EXISTS (
@@ -184,7 +225,6 @@ fn persist_launch(
     if overlapping_run {
         return Err("routine already has a nonterminal run; overlap is forbidden".to_string());
     }
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let session =
         crate::session_launch::new_session_record(crate::session_launch::NewSessionParams {
             id: launch.id.clone(),
@@ -452,7 +492,14 @@ pub fn run_routine_now(
         });
     }
 
-    dispatch_occurrence(conn, runtime, definition, &occurrence_id, cwd, now)
+    dispatch_occurrence(
+        conn,
+        runtime,
+        definition,
+        &occurrence_id,
+        cwd,
+        Utc::now().max(now),
+    )
 }
 
 /// Builds the shared SessionLaunch for a routine run. Every run — manual or
@@ -490,9 +537,11 @@ pub struct DispatchReport {
 pub fn dispatch_claimed_occurrences(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
-    _now: DateTime<Utc>,
+    now: DateTime<Utc>,
 ) -> Result<DispatchReport, String> {
     let mut report = DispatchReport::default();
+    recover_expired_leases(conn, now)?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let claimed: Vec<(String, String)> = {
         let mut statement = conn
@@ -500,6 +549,8 @@ pub fn dispatch_claimed_occurrences(
                 "SELECT o.id, o.automation_id FROM automation_occurrences AS o
                  WHERE o.state = 'claimed'
                    AND o.lease_owner = 'daemon'
+                   AND o.lease_expires_at IS NOT NULL
+                   AND o.lease_expires_at > ?1
                    AND NOT EXISTS (
                        SELECT 1 FROM automation_runs AS r WHERE r.occurrence_id = o.id
                    )
@@ -507,7 +558,9 @@ pub fn dispatch_claimed_occurrences(
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map(rusqlite::params![now_iso], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -517,12 +570,41 @@ pub fn dispatch_claimed_occurrences(
     };
 
     for (occurrence_id, automation_id) in claimed {
-        let now = Utc::now();
-        let Some(definition) = load_definition_for_run(conn, &automation_id)? else {
-            let reason = format!("routine `{automation_id}` vanished during dispatch");
-            settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now)?;
-            report.failed.push(reason);
+        let check_now = Utc::now();
+        recover_expired_leases(conn, check_now)?;
+        let dispatchable: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM automation_occurrences
+                    WHERE id = ?1
+                      AND state = 'claimed'
+                      AND lease_owner = 'daemon'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at > ?2
+                )",
+                rusqlite::params![
+                    occurrence_id,
+                    check_now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to verify occurrence claim: {error}"))?;
+        if !dispatchable {
             continue;
+        }
+        let definition = match load_definition_for_run(conn, &automation_id) {
+            Ok(Some(definition)) => definition,
+            Ok(None) => {
+                let reason = format!("routine `{automation_id}` vanished during dispatch");
+                settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
+                report.failed.push(reason);
+                continue;
+            }
+            Err(reason) => {
+                settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
+                report.failed.push(reason);
+                continue;
+            }
         };
 
         let Some(cwd) = definition
@@ -532,12 +614,20 @@ pub fn dispatch_claimed_occurrences(
             .filter(|cwd| !cwd.is_empty())
         else {
             let reason = format!("{automation_id}: routine has no cwd; add a cwd before running");
-            settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), now)?;
+            settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
             report.failed.push(reason);
             continue;
         };
 
-        match dispatch_occurrence(conn, runtime, &definition, &occurrence_id, cwd, now) {
+        let dispatch_now = Utc::now();
+        match dispatch_occurrence(
+            conn,
+            runtime,
+            &definition,
+            &occurrence_id,
+            cwd,
+            dispatch_now,
+        ) {
             Ok(outcome) if outcome.status == "running" => {
                 report.dispatched.push(outcome.run_id);
             }
@@ -555,7 +645,7 @@ pub fn dispatch_claimed_occurrences(
                     &occurrence_id,
                     "failed",
                     Some("dispatch failed before runtime ownership"),
-                    now,
+                    dispatch_now,
                 )?;
                 report.failed.push(format!("{automation_id}: {reason}"));
             }
@@ -591,7 +681,7 @@ pub fn recover_abandoned_launches(
                    AND s.status = 'created'
                    AND o.state = 'claimed'
                    AND o.lease_expires_at IS NOT NULL
-                   AND o.lease_expires_at < ?1
+                   AND o.lease_expires_at <= ?1
                    AND (r.timeout_at IS NULL OR r.timeout_at > ?1)",
             )
             .map_err(|error| format!("failed to prepare abandoned automation recovery: {error}"))?;
@@ -873,6 +963,9 @@ pub fn load_definition_for_run(
     };
     let definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
         .map_err(|error| format!("stored routine `{id}` is unreadable: {error}"))?;
+    definition
+        .validate()
+        .map_err(|error| format!("stored routine `{id}` is invalid: {error}"))?;
     Ok(Some(definition))
 }
 
@@ -1144,6 +1237,28 @@ mod tests {
         (temp, conn)
     }
 
+    fn persisted_timeout_at(conn: &Connection, automation_id: &str) -> DateTime<Utc> {
+        let timeout_at = super::super::runs::list_runs(conn, automation_id, 1)
+            .unwrap()
+            .remove(0)
+            .timeout_at
+            .expect("running automation has a timeout");
+        DateTime::parse_from_rfc3339(&timeout_at)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn persist_launch_at(
+        conn: &Connection,
+        run_id: &str,
+        occurrence_id: &str,
+        definition: &RoutineDefinition,
+        launch: &SessionLaunch,
+        now: DateTime<Utc>,
+    ) -> Result<(), String> {
+        persist_launch_with_clock(conn, run_id, occurrence_id, definition, launch, now, || now)
+    }
+
     #[test]
     fn accepted_launch_keeps_occurrence_and_run_running() {
         let (_temp, conn) = temp_store();
@@ -1219,6 +1334,205 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "succeeded");
+    }
+
+    #[test]
+    fn expired_daemon_claim_is_failed_before_dispatch() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily");
+        insert_definition(&conn, &routine).unwrap();
+        let claimed_at = Utc::now() - chrono::Duration::hours(2);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "expired-claim",
+            &routine.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let report =
+            dispatch_claimed_occurrences(&conn, &crate::api::NoopSessionRuntime, Utc::now())
+                .unwrap();
+
+        assert!(report.dispatched.is_empty());
+        assert!(report.failed.is_empty());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'expired-claim'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn claim_expired_after_initial_cutoff_is_not_dispatched() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily");
+        insert_definition(&conn, &routine).unwrap();
+        let actual_now = Utc::now();
+        let claimed_at = actual_now - chrono::Duration::minutes(61);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "expired-during-pass",
+            &routine.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let report = dispatch_claimed_occurrences(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            actual_now - chrono::Duration::minutes(2),
+        )
+        .unwrap();
+
+        assert!(report.dispatched.is_empty());
+        assert!(report.failed.is_empty());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'expired-during-pass'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn durable_launch_refuses_a_claim_at_its_exact_deadline() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily");
+        insert_definition(&conn, &routine).unwrap();
+        let claimed_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "deadline-reservation",
+            &routine.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let error = dispatch_occurrence(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            "deadline-reservation",
+            routine.cwd.as_deref().unwrap(),
+            claimed_at + chrono::Duration::minutes(60),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("claim expired or changed"), "{error}");
+        assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn durable_launch_uses_a_post_reservation_timestamp() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily");
+        insert_definition(&conn, &routine).unwrap();
+        let sampled_before_lock = Utc::now() - chrono::Duration::seconds(2);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "stale-sampled-time",
+            &routine.id,
+            "daemon",
+            60,
+            sampled_before_lock,
+        )
+        .unwrap());
+        conn.execute(
+            "UPDATE automation_occurrences
+             SET lease_expires_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                "stale-sampled-time",
+                (Utc::now() - chrono::Duration::seconds(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+
+        let error = dispatch_occurrence(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            "stale-sampled-time",
+            routine.cwd.as_deref().unwrap(),
+            sampled_before_lock,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("claim expired or changed"), "{error}");
+    }
+
+    #[test]
+    fn stored_output_target_definition_is_not_loaded_for_dispatch() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("legacy-output");
+        routine.output_target = Some("result.md".to_string());
+        insert_definition(&conn, &routine).unwrap();
+
+        let error = load_definition_for_run(&conn, &routine.id).unwrap_err();
+
+        assert!(error.contains("outputTarget is not supported"), "{error}");
+    }
+
+    #[test]
+    fn invalid_claimed_definition_does_not_block_valid_dispatch() {
+        let (_temp, conn) = temp_store();
+        let mut invalid = definition("invalid");
+        invalid.output_target = Some("result.md".to_string());
+        let valid = definition("valid");
+        insert_definition(&conn, &invalid).unwrap();
+        insert_definition(&conn, &valid).unwrap();
+        let now = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "invalid-occurrence",
+            &invalid.id,
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "valid-occurrence",
+            &valid.id,
+            "daemon",
+            60,
+            now + chrono::Duration::milliseconds(1),
+        )
+        .unwrap());
+
+        let report =
+            dispatch_claimed_occurrences(&conn, &crate::api::NoopSessionRuntime, now).unwrap();
+
+        assert_eq!(report.dispatched.len(), 1);
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].contains("stored routine `invalid` is invalid"));
+        let invalid_state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'invalid-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(invalid_state, "failed");
     }
 
     #[test]
@@ -1383,8 +1697,7 @@ mod tests {
             launched_at,
         )
         .unwrap();
-        let completed_at =
-            launched_at + chrono::Duration::minutes(1) + chrono::Duration::milliseconds(1);
+        let completed_at = persisted_timeout_at(&conn, "daily") + chrono::Duration::milliseconds(1);
         crate::store::update_session_terminal_if_active(
             &conn,
             outcome.session_id.as_deref().unwrap(),
@@ -1817,7 +2130,7 @@ mod tests {
         .unwrap());
         let mut launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
         launch.id = session_id.to_string();
-        persist_launch(&conn, run_id, occurrence_id, &routine, &launch, launched_at).unwrap();
+        persist_launch_at(&conn, run_id, occurrence_id, &routine, &launch, launched_at).unwrap();
 
         assert_eq!(
             crate::store::mark_stale_created_sessions_failed(
@@ -1870,6 +2183,49 @@ mod tests {
     }
 
     #[test]
+    fn preownership_launch_is_expired_at_its_exact_deadline() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("daily");
+        routine.timeout_minutes = 120;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        let launched_at = now - chrono::Duration::minutes(60);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "deadline-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let mut launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        launch.id = "deadline-session".to_string();
+        persist_launch_at(
+            &conn,
+            "deadline-run",
+            "deadline-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        assert!(
+            recover_abandoned_launches(&conn, &crate::api::NoopSessionRuntime, now)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::store::get_session(&conn, "deadline-session")
+                .unwrap()
+                .unwrap()
+                .status,
+            "killed"
+        );
+    }
+
+    #[test]
     fn timeout_kills_session_before_settling_failure() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
@@ -1883,7 +2239,7 @@ mod tests {
             launched_at,
         )
         .unwrap();
-        let timed_out_at = launched_at + chrono::Duration::minutes(1);
+        let timed_out_at = persisted_timeout_at(&conn, "daily");
 
         let failures =
             enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at).unwrap();
@@ -1920,7 +2276,7 @@ mod tests {
         .unwrap();
         assert!(super::super::store::delete_definition(&conn, "daily").unwrap());
 
-        let timed_out_at = launched_at + chrono::Duration::minutes(1);
+        let timed_out_at = persisted_timeout_at(&conn, "daily");
         assert!(
             enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
                 .unwrap()
@@ -1949,7 +2305,7 @@ mod tests {
             launched_at,
         )
         .unwrap();
-        let timed_out_at = launched_at + chrono::Duration::minutes(1);
+        let timed_out_at = persisted_timeout_at(&conn, "daily");
 
         let failures = enforce_run_timeouts(&conn, &FailedKillRuntime, timed_out_at).unwrap();
         assert_eq!(failures.len(), 1);
