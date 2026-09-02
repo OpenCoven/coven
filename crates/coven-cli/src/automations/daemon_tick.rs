@@ -21,7 +21,7 @@ pub fn process_automations_tick(
     let now = chrono::Utc::now();
     reconcile_automation_runs(coven_home, &conn, runtime, now, false)?;
     let report = super::occurrences::tick(&conn, now)?;
-    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, now)
+    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, chrono::Utc::now())
         .map_err(anyhow::Error::msg)?;
     Ok(report)
 }
@@ -60,8 +60,9 @@ pub fn start_automations_scheduler(
     let conn = crate::store::open_store(&store_path)?;
     let now = chrono::Utc::now();
     reconcile_automation_runs(coven_home, &conn, runtime.as_ref(), now, true)?;
-    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime.as_ref(), now)
-        .map_err(anyhow::Error::msg)?;
+    let _dispatch =
+        super::runner::dispatch_claimed_occurrences(&conn, runtime.as_ref(), chrono::Utc::now())
+            .map_err(anyhow::Error::msg)?;
     let home = coven_home.to_path_buf();
     std::thread::Builder::new()
         .name("coven-automations-scheduler".into())

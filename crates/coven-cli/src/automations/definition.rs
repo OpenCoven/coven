@@ -68,8 +68,8 @@ pub struct RoutineDefinition {
     pub familiar_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Optional atomic output target path (delivery lands there only on a
-    /// completed, verified run).
+    /// Reserved output delivery field. Validation refuses it until delivery
+    /// has a pinned definition revision and crash-recoverable commit protocol.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_target: Option<String>,
     pub prompt: String,
@@ -133,6 +133,11 @@ impl RoutineDefinition {
             if trimmed.is_empty() || trimmed.len() > 64 {
                 return Err("familiarId must be 1..=64 characters".to_string());
             }
+        }
+        if self.output_target.is_some() {
+            return Err(
+                "outputTarget is not supported until atomic delivery is certified".to_string(),
+            );
         }
         Ok(())
     }
@@ -213,5 +218,16 @@ mod tests {
             .insert("timeoutMinutes".to_string(), json!(0));
         let error = RoutineDefinition::from_json(&value).unwrap_err();
         assert!(error.contains("timeoutMinutes"), "{error}");
+    }
+
+    #[test]
+    fn rejects_output_target_until_atomic_delivery_is_certified() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("outputTarget".to_string(), json!("result.md"));
+        let error = RoutineDefinition::from_json(&value).unwrap_err();
+        assert!(error.contains("outputTarget is not supported"), "{error}");
     }
 }

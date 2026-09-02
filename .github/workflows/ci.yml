@@ -331,6 +331,38 @@ jobs:
             coven-chaos.json
             coven-tui-metrics.txt
           if-no-files-found: error
+      - name: Verify baseline collection produced its artifact
+        # `Collect non-gating baseline artifact` is `continue-on-error`, so a
+        # wedged or timed-out collection would otherwise leave this job green
+        # with `coven-perf.json` missing and nobody the wiser. The upload's
+        # `if-no-files-found: error` does not catch that: it only fires when
+        # *zero* paths match, and the chaos/TUI outputs would still be present.
+        #
+        # This runs after the upload on purpose, so whatever partial output
+        # exists is still preserved for diagnosis before the job goes red.
+        # `performance-baseline` is push-only and `pr-gate` sees it as skipped
+        # on pull requests, so failing here surfaces the gap on main without
+        # blocking anyone's PR.
+        run: |
+          set -euo pipefail
+          status=0
+          if [ ! -s coven-perf.json ]; then
+            echo "::error::coven-perf.json is missing or empty - the baseline collection step did not complete (timed out, wedged, or failed)"
+            status=1
+          elif ! python3 -c 'import json; json.load(open("coven-perf.json"))' 2>/dev/null; then
+            echo "::error::coven-perf.json exists but is not valid JSON - the baseline collection step was interrupted mid-write"
+            status=1
+          else
+            echo "coven-perf.json present and parseable"
+          fi
+          # The remaining outputs keep their existing tolerant behaviour; a
+          # warning records the gap without changing what they gate.
+          for optional in coven-chaos.json coven-tui-metrics.txt; do
+            if [ ! -s "$optional" ]; then
+              echo "::warning::${optional} is missing or empty"
+            fi
+          done
+          exit "$status"
 
   channels:
     name: Channels package

@@ -48,12 +48,12 @@ pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
 
     let last_planned_at = max_iso(
         conn,
-        "SELECT MAX(scheduled_for) FROM automation_occurrences WHERE automation_id = ?1 AND state = 'planned'",
+        "SELECT MAX(scheduled_for) FROM automation_occurrences WHERE automation_id = ?1 AND kind = 'scheduled'",
         &[&id],
     )?;
     let last_started_at = max_iso(
         conn,
-        "SELECT MAX(scheduled_for) FROM automation_occurrences WHERE automation_id = ?1 AND state IN ('claimed', 'running')",
+        "SELECT MAX(started_at) FROM automation_runs WHERE automation_id = ?1",
         &[&id],
     )?;
     let last_success_at = max_iso(
@@ -160,6 +160,14 @@ mod tests {
             [],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, finished_at)
+             VALUES ('r2', 'daily', 'o2', 'coven-code', 'failed',
+                     '2026-08-27T09:01:00.000Z', '2026-08-27T09:05:00.000Z')",
+            [],
+        )
+        .unwrap();
 
         let health = routine_health(&conn, "daily", utc(2026, 8, 27, 10, 0)).unwrap();
         assert_eq!(
@@ -169,6 +177,14 @@ mod tests {
         assert_eq!(
             health.last_success_at.as_deref(),
             Some("2026-08-26T09:00:00.000Z")
+        );
+        assert_eq!(
+            health.last_planned_at.as_deref(),
+            Some("2026-08-27T09:00:00.000Z")
+        );
+        assert_eq!(
+            health.last_started_at.as_deref(),
+            Some("2026-08-27T09:01:00.000Z")
         );
         assert_eq!(health.consecutive_failures, 1);
     }

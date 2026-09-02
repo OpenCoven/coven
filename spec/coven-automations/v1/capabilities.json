@@ -23,9 +23,7 @@
       { "variant": "overlap.forbid", "notes": "A run is skipped when the previous occurrence has not settled." },
       { "variant": "timeout.required", "notes": "Every definition carries a bounded per-run timeout, 1..=44640 minutes." }
     ],
-    "deliveryPolicies": [
-      { "variant": "outputTarget.atomic", "notes": "Optional atomic output path; commits only after a completed, verified run." }
-    ],
+    "deliveryPolicies": [],
     "retentionPolicies": [
       { "variant": "retention.standard" }
     ]
@@ -43,6 +41,10 @@
     {
       "variant": "misfire.backfill",
       "reason": "v1 misfire semantics collapse missed slots; backfill would change occurrence-key identity."
+    },
+    {
+      "variant": "outputTarget.atomic",
+      "reason": "The wire shape is reserved, but no current implementation has a pinned-revision, crash-recoverable delivery state machine. Refuse with CAPABILITY_UNSUPPORTED."
     }
   ],
   "negotiationRules": [
