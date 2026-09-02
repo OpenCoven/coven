@@ -28,6 +28,10 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 
 - Unknown schema versions fail closed: `SCHEMA_VERSION_UNSUPPORTED`, never approximation.
 - Unknown trigger/condition/action/policy variants fail closed: `CAPABILITY_UNSUPPORTED` naming the variant.
+- Schema validity is structural, not capability approval. The reserved `outputTarget.atomic`
+  shape remains represented in schemas, types, and golden fixtures, while
+  `capabilities.json` explicitly refuses it until delivery is pinned to a
+  definition revision and crash-recoverable.
 - Unknown fields fail closed (`additionalProperties: false`); optional data travels only in the namespaced `extensions` bag, which is preserved and never interpreted until promoted by a new profile.
 - Digests are SHA-256 over RFC 8785 (JCS) canonical JSON — never over ad-hoc serialization.
 - Contract profile (`coven.automations.v1`) is independent of implementation release versions.

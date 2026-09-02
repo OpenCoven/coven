@@ -79,6 +79,9 @@ pub fn parse_rrule(text: &str) -> Result<ParsedRrule, String> {
         }
         match key.as_str() {
             "FREQ" => {
+                if frequency.is_some() {
+                    return Err("rrule FREQ must not be repeated".to_string());
+                }
                 frequency = Some(match value.to_ascii_uppercase().as_str() {
                     "DAILY" => RruleFrequency::Daily,
                     "WEEKLY" => RruleFrequency::Weekly,
@@ -88,9 +91,15 @@ pub fn parse_rrule(text: &str) -> Result<ParsedRrule, String> {
                 });
             }
             "BYHOUR" => {
+                if by_hour.is_some() {
+                    return Err("rrule BYHOUR must not be repeated".to_string());
+                }
                 by_hour = Some(parse_u8_list(value, "BYHOUR", 23)?);
             }
             "BYDAY" => {
+                if by_day.is_some() {
+                    return Err("rrule BYDAY must not be repeated".to_string());
+                }
                 by_day = Some(parse_by_day(value)?);
             }
             other => {
@@ -105,7 +114,12 @@ pub fn parse_rrule(text: &str) -> Result<ParsedRrule, String> {
         return Err("BYHOUR must contain at least one hour".to_string());
     }
     let by_day = match frequency {
-        RruleFrequency::Daily => Vec::new(),
+        RruleFrequency::Daily => {
+            if by_day.is_some() {
+                return Err("BYDAY is supported only for FREQ=WEEKLY".to_string());
+            }
+            Vec::new()
+        }
         RruleFrequency::Weekly => {
             let days = by_day.unwrap_or_else(|| vec!["MO".to_string()]);
             if days.is_empty() {
@@ -170,6 +184,24 @@ mod tests {
     fn rejects_unknown_weekday() {
         let error = parse_rrule("FREQ=WEEKLY;BYDAY=XX").unwrap_err();
         assert!(error.contains("not a weekday"), "{error}");
+    }
+
+    #[test]
+    fn rejects_byday_for_daily_schedules() {
+        let error = parse_rrule("FREQ=DAILY;BYDAY=MO;BYHOUR=9").unwrap_err();
+        assert!(error.contains("BYDAY is supported only"), "{error}");
+    }
+
+    #[test]
+    fn rejects_duplicate_supported_parts() {
+        for rule in [
+            "FREQ=DAILY;FREQ=WEEKLY;BYDAY=MO",
+            "FREQ=DAILY;BYHOUR=9;BYHOUR=17",
+            "FREQ=WEEKLY;BYDAY=MO;BYDAY=TU;BYHOUR=9",
+        ] {
+            let error = parse_rrule(rule).unwrap_err();
+            assert!(error.contains("must not be repeated"), "{rule}: {error}");
+        }
     }
 
     #[test]

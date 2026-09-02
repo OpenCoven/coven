@@ -118,9 +118,10 @@ export interface AutomationDefinition {
     };
     concurrency: { overlap: "forbid" };
     misfire: { disposition: "latest" };
+    // Reserved wire shape; capabilities.json currently refuses outputTarget.atomic.
     delivery?: {
       outputTarget: string;
-      mode?: "atomic"; // required when outputTarget is present
+      mode: "atomic";
     };
     retention: {
       occurrenceHistory: RetentionClass;
