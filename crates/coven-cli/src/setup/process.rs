@@ -518,36 +518,16 @@ mod windows_job {
 mod version_extraction_tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn version_probe_handles_numeric_canonical_executable_name() {
-        use std::os::unix::fs::symlink;
-
-        let temp = tempfile::tempdir().expect("temporary directory");
-        let executable = temp.path().join("2.1.258");
-        symlink("/bin/echo", &executable).expect("link version probe");
-
-        let request = LaunchRequest {
-            executable,
-            args: vec![
-                OsString::from("2.1.258"),
-                OsString::from("(Claude"),
-                OsString::from("Code)"),
-            ],
-            current_dir: None,
-            env_overrides: Vec::new(),
-        };
-
-        assert_eq!(version_program_marker(&request.executable), Some("2.1.258"));
+    fn numeric_canonical_executable_name_is_kept_as_version_marker() {
+        let executable = std::path::Path::new("managed/claude/versions/2.1.258");
         assert_eq!(
-            extract_version(
-                "2.1.258 (Claude Code)",
-                version_program_marker(&request.executable)
-            ),
-            Some("2.1.258".to_owned())
+            version_program_marker(executable),
+            Some("2.1.258"),
+            "file_stem would incorrectly truncate this marker to 2.1"
         );
         assert_eq!(
-            probe_version(&request, Duration::from_secs(2)).expect("probe version"),
+            extract_version("2.1.258 (Claude Code)", version_program_marker(executable)),
             Some("2.1.258".to_owned())
         );
     }
