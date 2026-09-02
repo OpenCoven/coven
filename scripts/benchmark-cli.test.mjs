@@ -180,6 +180,10 @@ test('parseOptions rejects a missing or non-positive event fixture size', () => 
     () => parseOptions(['--binary=/tmp/coven', '--event-counts=abc']),
     /--event-counts must contain positive integers/
   );
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--event-counts=100abc']),
+    /--event-counts must contain positive integers/
+  );
 });
 
 test('parseOptions accepts none as a core-only session fixture mode', () => {
@@ -197,6 +201,10 @@ test('parseOptions rejects a missing session fixture size', () => {
   assert.throws(
     () => parseOptions(['--binary=/tmp/coven', '--session-counts=']),
     /--session-counts requires a value/
+  );
+  assert.throws(
+    () => parseOptions(['--binary=/tmp/coven', '--session-counts=100abc,1000']),
+    /--session-counts must contain positive integers/
   );
 });
 

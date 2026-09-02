@@ -40,6 +40,16 @@ export function summarizeSamples(samples) {
   return summary;
 }
 
+function parseCountList(raw, option) {
+  const values = raw.split(',').map((token) =>
+    /^\d+$/.test(token) ? Number.parseInt(token, 10) : Number.NaN
+  );
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    throw new Error(`${option} must contain positive integers`);
+  }
+  return values;
+}
+
 export function parseOptions(args) {
   let binary;
   let iterations = 5;
@@ -73,11 +83,7 @@ export function parseOptions(args) {
       if (raw === 'none') {
         sessionCounts = [];
       } else {
-        const values = raw.split(',').map((value) => Number.parseInt(value, 10));
-        if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
-          throw new Error('--session-counts must contain positive integers');
-        }
-        sessionCounts = values;
+        sessionCounts = parseCountList(raw, '--session-counts');
       }
     } else if (arg === '--event-counts' || arg.startsWith('--event-counts=')) {
       const raw = valueFor('--event-counts');
@@ -87,11 +93,7 @@ export function parseOptions(args) {
       if (raw === 'none') {
         eventCounts = [];
       } else {
-        const values = raw.split(',').map((value) => Number.parseInt(value, 10));
-        if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
-          throw new Error('--event-counts must contain positive integers');
-        }
-        eventCounts = values;
+        eventCounts = parseCountList(raw, '--event-counts');
       }
     } else {
       throw new Error(`unknown option: ${arg}`);
