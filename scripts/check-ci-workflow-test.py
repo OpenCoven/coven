@@ -103,8 +103,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         # its own. Asserting the command against the whole file would pass on
         # the push-only copy alone and prove nothing.
         self.assertIn(command, policy_guard)
-        job_header = policy_guard.split('    steps:')[0]
-        self.assertNotIn('if:', job_header)
+        self.assertNotIn("\n    if:", policy_guard)
         pull_request_job = CI_TEXT.split("\n  npm-onboarding-pr:\n", 1)[1].split(
             "\n  npm-onboarding-main:\n", 1
         )[0]
