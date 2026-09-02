@@ -182,11 +182,11 @@
             "outputTarget": {
               "type": "string",
               "maxLength": 1024,
-              "description": "Optional atomic output path. Delivery commits there only on a completed, verified run."
+              "description": "Reserved atomic output path wire shape. The current capability profile refuses outputTarget.atomic until delivery is pinned to a definition revision and crash-recoverable."
             },
             "mode": {
               "enum": ["atomic"],
-              "description": "Required when outputTarget is present. v1 supports atomic writes only."
+              "description": "Required when outputTarget is present. This schema validates the reserved shape; capabilities.json currently refuses the variant."
             }
           }
         },

@@ -47,8 +47,17 @@ fn next_due_parsed(
     timezone: RoutineTimezone,
     from: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    // Walk up to 9 days of candidate dates; the supported subset always
-    // yields a candidate inside this window (DAILY=1 day, WEEKLY<=7 days).
+    next_due_parsed_with(parsed, timezone, from, resolve_local)
+}
+
+fn next_due_parsed_with(
+    parsed: &ParsedRrule,
+    timezone: RoutineTimezone,
+    from: DateTime<Utc>,
+    mut resolve: impl FnMut(RoutineTimezone, NaiveDate, u8) -> Option<DateTime<Utc>>,
+) -> Option<DateTime<Utc>> {
+    // A weekly local-time slot can disappear during a clock transition.
+    // Search through the following week's slot so the maximum gap is 14 days.
     let window_start = match timezone {
         RoutineTimezone::Utc => from.with_timezone(&Utc).date_naive(),
         RoutineTimezone::Local => from.with_timezone(&Local).date_naive(),
@@ -76,7 +85,7 @@ fn next_due_parsed(
         }
     };
 
-    for offset in 0..10i64 {
+    for offset in 0..15i64 {
         let date = window_start + Duration::days(offset);
         let is_allowed_day = match parsed.frequency {
             RruleFrequency::Daily => true,
@@ -87,7 +96,7 @@ fn next_due_parsed(
         }
 
         for hour in &parsed.by_hour {
-            if let Some(instant) = resolve_local(timezone, date, *hour) {
+            if let Some(instant) = resolve(timezone, date, *hour) {
                 if instant > from {
                     return Some(instant);
                 }
@@ -174,5 +183,29 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(next, utc(2026, 8, 29, 9, 0));
+    }
+
+    #[test]
+    fn weekly_search_crosses_a_skipped_local_slot() {
+        let parsed = parse_rrule("FREQ=WEEKLY;BYDAY=SU;BYHOUR=2").unwrap();
+        let skipped_date = NaiveDate::from_ymd_opt(2026, 3, 8).unwrap();
+        let from = utc(2026, 3, 1, 12, 0);
+
+        let next = next_due_parsed_with(
+            &parsed,
+            RoutineTimezone::Local,
+            from,
+            |_timezone, date, hour| {
+                if date == skipped_date {
+                    None
+                } else {
+                    date.and_hms_opt(hour as u32, 0, 0)
+                        .map(|naive| Utc.from_utc_datetime(&naive))
+                }
+            },
+        )
+        .expect("search should continue through the skipped weekly slot");
+
+        assert_eq!(next, utc(2026, 3, 15, 2, 0));
     }
 }

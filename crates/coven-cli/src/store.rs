@@ -975,6 +975,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation_definitions schema")?;
     conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
         .context("failed to initialize automation_occurrences schema")?;
+    crate::automations::occurrences::ensure_occurrence_kind(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
     crate::automations::runs::ensure_timeout_column(conn)?;

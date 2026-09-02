@@ -191,114 +191,103 @@ pub fn route_action(
             )
         }
         "coven.automations.list" => {
-            let event = automation_event(action, origin, intent_id, automation_list_payload(conn));
-            (200, event)
+            automation_result(action, origin, intent_id, automation_list_payload(conn))
         }
         "coven.automations.get" => {
             let id = required_id_field(&payload, action);
-            let event = match id {
+            match id {
                 Ok(id) => {
-                    automation_event(action, origin, intent_id, automation_get_payload(conn, &id))
+                    automation_result(action, origin, intent_id, automation_get_payload(conn, &id))
                 }
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.create" => {
             let definition = required_definition_field(&payload, action);
-            let event = match definition {
-                Ok(definition) => automation_event(
+            match definition {
+                Ok(definition) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_create_payload(conn, &definition),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.update" => {
             let definition = required_definition_field(&payload, action);
-            let event = match definition {
-                Ok(definition) => automation_event(
+            match definition {
+                Ok(definition) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_update_payload(conn, &definition),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.delete" => {
             let id = required_id_field(&payload, action);
-            let event = match id {
-                Ok(id) => automation_event(
+            match id {
+                Ok(id) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_delete_payload(conn, &id),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.tick" => {
             let now = chrono::Utc::now();
-            let event = automation_event(
+            automation_result(
                 action,
                 origin,
                 intent_id,
                 automation_tick_payload(conn, now),
-            );
-            (200, event)
+            )
         }
         "coven.automations.runs" => {
             let id = required_id_field(&payload, action);
             let limit = payload.get("limit").and_then(Value::as_i64).unwrap_or(20);
-            let event = match id {
-                Ok(id) => automation_event(
+            match id {
+                Ok(id) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_runs_payload(conn, &id, limit),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.health" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
-            let event = match id {
-                Ok(id) => automation_event(
+            match id {
+                Ok(id) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_health_payload(conn, &id, now),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         "coven.automations.import" => {
-            let event =
-                automation_event(action, origin, intent_id, automation_import_payload(conn));
-            (200, event)
+            automation_result(action, origin, intent_id, automation_import_payload(conn))
         }
         "coven.automations.run" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
-            let event = match id {
-                Ok(id) => automation_event(
+            match id {
+                Ok(id) => automation_result(
                     action,
                     origin,
                     intent_id,
                     automation_run_payload(conn, runtime, &id, now),
                 ),
-                Err(error) => return (400, rejected_action(action, error)),
-            };
-            (200, event)
+                Err(error) => (400, rejected_action(action, error)),
+            }
         }
         _ => (
             400,
@@ -329,6 +318,18 @@ fn automation_event(
     }
 }
 
+fn automation_result(
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    result: Result<Value, String>,
+) -> (u16, ControlActionResponse) {
+    match result {
+        Ok(payload) => (200, automation_event(action, origin, intent_id, payload)),
+        Err(reason) => (400, rejected_action(action, reason)),
+    }
+}
+
 fn required_id_field(payload: &Value, action: &str) -> Result<String, String> {
     payload
         .get("id")
@@ -353,17 +354,17 @@ fn required_definition_field(
 fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
-) -> Value {
+) -> Result<Value, String> {
     match crate::automations::occurrences::tick(conn, now) {
-        Ok(report) => json!({
+        Ok(report) => Ok(json!({
             "planned": report.planned,
             "alreadyFenced": report.already_fenced,
             "pausedSkipped": report.paused_skipped,
             "recovered": report.recovered,
             "claimed": report.claimed,
             "failed": report.failed,
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
@@ -371,9 +372,9 @@ fn automation_health_payload(
     conn: &rusqlite::Connection,
     id: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Value {
+) -> Result<Value, String> {
     match crate::automations::health::routine_health(conn, id, now) {
-        Ok(health) => json!({
+        Ok(health) => Ok(json!({
             "health": {
                 "automationId": health.automation_id,
                 "nextDueAt": health.next_due_at,
@@ -385,19 +386,19 @@ fn automation_health_payload(
                 "leaseExpiresAt": health.lease_expires_at,
                 "staleReason": health.stale_reason,
             }
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_import_payload(conn: &rusqlite::Connection) -> Value {
+fn automation_import_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
     match crate::automations::import_legacy::import_legacy_codex_automations(conn) {
-        Ok(report) => json!({
+        Ok(report) => Ok(json!({
             "imported": report.imported,
             "skipped": report.skipped,
             "failures": report.failures,
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
@@ -406,25 +407,32 @@ fn automation_run_payload(
     runtime: &dyn crate::api::SessionRuntime,
     id: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Value {
+) -> Result<Value, String> {
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
             match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
-                Ok(outcome) => json!({
+                Ok(outcome) if outcome.status == "running" => Ok(json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
                     "sessionId": outcome.session_id,
                     "error": outcome.error,
-                }),
-                Err(error) => json!({ "error": error }),
+                })),
+                Ok(outcome) => Err(outcome
+                    .error
+                    .unwrap_or_else(|| "routine run did not enter running state".to_string())),
+                Err(error) => Err(error),
             }
         }
-        Ok(None) => json!({ "error": format!("no routine with id `{id}`") }),
-        Err(error) => json!({ "error": error }),
+        Ok(None) => Err(format!("no routine with id `{id}`")),
+        Err(error) => Err(error),
     }
 }
 
-fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) -> Value {
+fn automation_runs_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+    limit: i64,
+) -> Result<Value, String> {
     match crate::automations::runs::list_runs(conn, id, limit) {
         Ok(records) => {
             let runs: Vec<Value> = records
@@ -446,68 +454,72 @@ fn automation_runs_payload(conn: &rusqlite::Connection, id: &str, limit: i64) ->
                     })
                 })
                 .collect();
-            json!({ "runs": runs })
+            Ok(json!({ "runs": runs }))
         }
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_list_payload(conn: &rusqlite::Connection) -> Value {
+fn automation_list_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
     let records = crate::automations::store::list_definitions(conn);
     match records {
         Ok(records) => {
-            let routines: Vec<Value> = records
-                .iter()
-                .filter_map(|record| serde_json::from_str::<Value>(&record.definition_json).ok())
-                .collect();
-            json!({ "routines": routines })
+            let mut routines = Vec::with_capacity(records.len());
+            for record in records {
+                let routine =
+                    serde_json::from_str::<Value>(&record.definition_json).map_err(|error| {
+                        format!("stored routine `{}` is unreadable: {error}", record.id)
+                    })?;
+                routines.push(routine);
+            }
+            Ok(json!({ "routines": routines }))
         }
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Value {
+fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
     match crate::automations::store::get_definition(conn, id) {
         Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
-            Ok(routine) => json!({ "routine": routine }),
-            Err(error) => json!({ "error": format!("stored routine is unreadable: {error}") }),
+            Ok(routine) => Ok(json!({ "routine": routine })),
+            Err(error) => Err(format!("stored routine is unreadable: {error}")),
         },
-        Ok(None) => json!({ "routine": Value::Null }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        Ok(None) => Ok(json!({ "routine": Value::Null })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
 fn automation_create_payload(
     conn: &rusqlite::Connection,
     definition: &crate::automations::RoutineDefinition,
-) -> Value {
+) -> Result<Value, String> {
     match crate::automations::store::insert_definition(conn, definition) {
-        Ok(record) => json!({
+        Ok(record) => Ok(json!({
             "routine": definition.to_json(),
             "createdAt": record.created_at,
-        }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
 fn automation_update_payload(
     conn: &rusqlite::Connection,
     definition: &crate::automations::RoutineDefinition,
-) -> Value {
+) -> Result<Value, String> {
     match crate::automations::store::update_definition(conn, definition) {
-        Ok(Some(record)) => json!({
+        Ok(Some(record)) => Ok(json!({
             "routine": definition.to_json(),
             "updatedAt": record.updated_at,
-        }),
-        Ok(None) => json!({ "error": format!("no routine with id `{}`", definition.id) }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        })),
+        Ok(None) => Err(format!("no routine with id `{}`", definition.id)),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_delete_payload(conn: &rusqlite::Connection, id: &str) -> Value {
+fn automation_delete_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
     match crate::automations::store::delete_definition(conn, id) {
-        Ok(deleted) => json!({ "id": id, "deleted": deleted }),
-        Err(error) => json!({ "error": format!("{error:#}") }),
+        Ok(deleted) => Ok(json!({ "id": id, "deleted": deleted })),
+        Err(error) => Err(format!("{error:#}")),
     }
 }
 
@@ -522,5 +534,261 @@ pub fn rejected_action(
         status: ActionStatus::Rejected,
         reason: Some(reason.into()),
         event: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::{SessionLaunch, SessionRuntime};
+
+    struct OwnershipThenErrorRuntime;
+    struct RejectedRuntime;
+
+    impl SessionRuntime for OwnershipThenErrorRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch uses strict adopted containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            ownership_established()?;
+            anyhow::bail!("synthetic acknowledgement failure")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionRuntime for RejectedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch uses strict adopted containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("synthetic launch rejection")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn live_run_with_diagnostic_remains_an_accepted_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "daily",
+            "name": "Daily",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "daily"}),
+            &conn,
+            &OwnershipThenErrorRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert!(response.accepted);
+        let payload = &response.event.as_ref().unwrap().payload;
+        assert_eq!(payload["status"], "running");
+        assert!(payload["runId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(payload["sessionId"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("acknowledgement failed")));
+    }
+
+    #[test]
+    fn automation_list_rejects_unreadable_stored_definitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions
+                (id, name, status, definition_json, created_at, updated_at)
+             VALUES ('broken', 'Broken', 'ACTIVE', '{', ?1, ?1)",
+            rusqlite::params!["2026-08-30T09:00:00.000Z"],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.list"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert!(!response.ok);
+        assert!(!response.accepted);
+        assert!(response
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("stored routine `broken` is unreadable")));
+    }
+
+    #[test]
+    fn synchronous_manual_run_failure_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "missing-cwd",
+            "name": "Missing cwd",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "missing-cwd"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert!(!response.ok);
+        assert!(!response.accepted);
+        assert!(response
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("routine has no cwd")));
+    }
+
+    #[test]
+    fn overlapping_manual_run_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "overlap",
+            "name": "Overlap",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        assert!(crate::automations::occurrences::insert_claimed_occurrence(
+            &conn,
+            "existing",
+            &definition.id,
+            "manual",
+            60,
+            chrono::Utc::now(),
+        )
+        .unwrap());
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "overlap"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert!(!response.accepted);
+        assert!(response
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("overlap is forbidden")));
+    }
+
+    #[test]
+    fn preownership_launch_rejection_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "rejected",
+            "name": "Rejected",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "rejected"}),
+            &conn,
+            &RejectedRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert!(!response.accepted);
+        assert!(response
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("synthetic launch rejection")));
     }
 }
