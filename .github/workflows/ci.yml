@@ -109,6 +109,14 @@ jobs:
       - run: python3 scripts/check-ci-workflow-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/release-stress-test.mjs
+      # The benchmark harness tests also run inside `performance-baseline`,
+      # but that job is push-only, so until this step existed a pull request
+      # could break `benchmark-cli.mjs` and still show every check green -
+      # the failure only appeared after the merge landed on main. These are
+      # pure Node with no daemon or built binary involved (they pass
+      # `--binary=$(node)` with `--session-counts=none`), so they cost about a
+      # second here rather than gating behind the expensive baseline job.
+      - run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - run: scripts/check-workflows.sh
 
   rust-lint-linux:
