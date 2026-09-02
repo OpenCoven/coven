@@ -156,8 +156,9 @@ jobs:
     runs-on: ubuntu-latest
     # Same I/O-bound fixture seeding as the CI baseline, and this job gates
     # publish, so it keeps failing loudly - it just gets honest headroom for a
-    # slow shared runner instead of being cancelled at the cap.
-    timeout-minutes: 30
+    # slow shared runner instead of being cancelled at the cap. Held level with
+    # the CI baseline job so the two mirror jobs cannot drift apart.
+    timeout-minutes: 40
     needs: [verify, verify-tag]
     permissions:
       contents: read
