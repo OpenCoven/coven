@@ -457,6 +457,11 @@ OpenCoven/familiar-contract#17 are the ready implementation outcomes.
 - Create: `crates/coven-cli/src/automations/contract/commands.rs`
 - Create: `crates/coven-cli/src/automations/contract/events.rs`
 - Create: `crates/coven-cli/src/automations/contract/migration.rs`
+- Create: `scripts/package-automations-protocol.mjs`
+- Create: `scripts/package-automations-protocol.test.mjs`
+- Modify: `.github/workflows/ci.yml`
+- Modify: `.github/workflows/release-github.yml`
+- Modify: `docs/reference/releasing.md`
 - Modify: `crates/coven-cli/src/automations/mod.rs`
 - Modify: `crates/coven-cli/src/automations/store.rs`
 - Modify: `crates/coven-cli/src/automations/occurrences.rs`
@@ -540,28 +545,100 @@ Cover duplicate delivery, reconnect from cursor, out-of-order append refusal, co
 
 Append state mutation and event sequence in one transaction. Expose read/subscribe semantics through the existing daemon transport without trusting clients to author lifecycle state.
 
-- [ ] **Step 10: Run protocol verification**
+- [ ] **Step 10: Produce the deterministic protocol bundle**
+
+Implement `scripts/package-automations-protocol.mjs` so it copies only
+`spec/coven-automations/v1/` contract files into a lexically ordered archive,
+writes a manifest containing the source commit and each file's SHA-256 digest,
+normalizes archive timestamps and ownership, and refuses a dirty or mismatched
+input tree. With `SOURCE_COMMIT="$(git rev-parse HEAD)"`, the output is
+`coven-automations-v1-contract-${SOURCE_COMMIT}.tar.gz`.
+
+Run:
+
+```bash
+export AUTOMATIONS_ARTIFACT_DIR="$HOME/.coven/artifacts/coven-issue-855/contract"
+node --test scripts/package-automations-protocol.test.mjs
+node scripts/package-automations-protocol.mjs \
+  --output "$AUTOMATIONS_ARTIFACT_DIR"
+export COVEN_PROTOCOL_BUNDLE="$(
+  find "$AUTOMATIONS_ARTIFACT_DIR" -maxdepth 1 -type f \
+    -name 'coven-automations-v1-contract-*.tar.gz' -print -quit
+)"
+test -n "$COVEN_PROTOCOL_BUNDLE"
+shasum -a 256 "$COVEN_PROTOCOL_BUNDLE" |
+  tee "$AUTOMATIONS_ARTIFACT_DIR/protocol-bundle.sha256"
+```
+
+Update `.github/workflows/ci.yml` to upload the bundle and manifest as the
+artifact `coven-automations-v1-contract-${{ github.sha }}` on the exact commit.
+Update `.github/workflows/release-github.yml` to rebuild the same deterministic
+bundle from the tagged source and publish it as an additional canonical release
+asset. Keep `SHA256SUMS` scoped to the four native archives and verify the
+protocol bundle against its manifest digest separately. Document the added
+asset and verification command in `docs/reference/releasing.md`.
+
+- [ ] **Step 11: Run protocol verification**
 
 ```bash
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test -p coven-cli automation_protocol --locked
 cargo test --workspace --locked
+node --test scripts/package-automations-protocol.test.mjs
 python3 scripts/check-secrets.py
 git add crates/coven-cli/src/automations \
   crates/coven-cli/src/control_plane.rs \
   crates/coven-cli/src/api.rs \
   crates/coven-cli/src/store.rs \
-  crates/coven-cli/tests/automation_protocol.rs
+  crates/coven-cli/tests/automation_protocol.rs \
+  scripts/package-automations-protocol.mjs \
+  scripts/package-automations-protocol.test.mjs \
+  .github/workflows/ci.yml \
+  .github/workflows/release-github.yml \
+  docs/reference/releasing.md
 python3 scripts/check-coven-privacy.py --staged
 git diff --cached --check
 ```
 
 Expected: all commands exit 0.
 
-- [ ] **Step 11: Prove two external packed-artifact canaries**
+- [ ] **Step 12: Prove two external packed-artifact canaries**
 
-SDK and Cave must validate the packed protocol schemas/vectors by immutable digest, not a source-relative import. Record package/tarball digest and each canary result.
+Download the exact-commit CI artifact rather than copying from the Coven source
+tree:
+
+```bash
+export COVEN_PROTOCOL_RUN_ID="$(
+  gh run list \
+    --repo OpenCoven/coven \
+    --workflow ci.yml \
+    --commit "$(git rev-parse HEAD)" \
+    --status success \
+    --limit 1 \
+    --json databaseId,headSha \
+    --jq '.[0].databaseId'
+)"
+test -n "$COVEN_PROTOCOL_RUN_ID"
+export COVEN_PROTOCOL_SHA256="$(
+  awk 'NR == 1 { print $1 }' \
+    "$AUTOMATIONS_ARTIFACT_DIR/protocol-bundle.sha256"
+)"
+[[ "$COVEN_PROTOCOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+gh run download "$COVEN_PROTOCOL_RUN_ID" \
+  --repo OpenCoven/coven \
+  --name "coven-automations-v1-contract-$(git rev-parse HEAD)" \
+  --dir "$AUTOMATIONS_ARTIFACT_DIR/downloaded"
+printf '%s  %s\n' \
+  "$COVEN_PROTOCOL_SHA256" \
+  "$AUTOMATIONS_ARTIFACT_DIR/downloaded/coven-automations-v1-contract-$(git rev-parse HEAD).tar.gz" |
+  shasum -a 256 -c -
+```
+
+SDK and Cave must each run their contract verifier against that downloaded
+bundle path and expected digest. Record the CI run URL, bundle digest, manifest
+digest, source commit, and both canary results. No canary may import
+`OpenCoven/coven/spec/` or another source-relative path.
 
 **Exit gate:** all #855 acceptance criteria pass; v1 commands are adopted transactionally; domain failures reject truthfully; changefeed replay deterministically rehydrates state; legacy data migrates without deletion.
 
@@ -1030,7 +1107,11 @@ pnpm lint
 pnpm build
 ```
 
-**Exit gate:** Cave renders one live Coven truth and can approve/recover safely without authoring lifecycle state. Keep the #5217 Bead nonterminal through Task 7's release acceptance; the implementation worktree may retire normally after its PR merges.
+**Exit gate:** Cave renders one live Coven truth and can approve/recover safely
+without authoring lifecycle state. Close OpenCoven/coven-cave#5217 and its Bead
+after the implementation PR and pre-release exact-bundle canary pass. Task 7
+owns a separate post-release acceptance receipt and does not reopen this
+implementation outcome.
 
 #### Task 6C: Psyche adapter
 
@@ -1125,13 +1206,15 @@ pnpm check:production
 
 **Owner:** OpenCoven/coven#854 release gate
 
-**Depends on:** Tasks 1-6
+**Depends on:** merged and verified implementation outcomes from Tasks 1-6.
+The post-release Cave acceptance is part of this task and is not a prerequisite
+for starting it.
 
 **Files:**
 - Modify: `CHANGELOG.md`
 - Verify: `.github/workflows/release-npm.yml`
 - Verify: `.github/workflows/release-github.yml`
-- Produce outside git: redacted certification reports and conformance reports
+- Produce outside git: redacted certification reports, conformance reports, and the deterministic protocol bundle
 
 - [ ] **Step 1: Generate the go/no-go manifest**
 
@@ -1178,6 +1261,20 @@ jq -e \
 
 Any missing, duplicate, or stale digest is a no-go.
 
+Load the protocol digest from the accepted Task 2 lane instead of relying on
+shell state from an earlier session:
+
+```bash
+export COVEN_PROTOCOL_SHA256="$(
+  jq -er '
+    .lanes[] |
+    select(.task == "2") |
+    .artifact_digests.protocol_bundle
+  ' "$RELEASE_PACKET_DIR/go-no-go.json"
+)"
+[[ "$COVEN_PROTOCOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+```
+
 - [ ] **Step 2: Run local release gates from a clean checkout**
 
 ```bash
@@ -1187,7 +1284,12 @@ cargo test --workspace --locked
 python3 scripts/check-secrets.py
 node scripts/test-cli-prepublish.mjs
 cargo build -p coven-cli
+node scripts/package-automations-protocol.mjs \
+  --output "$RELEASE_PACKET_DIR/contract"
 ```
+
+Compare the rebuilt contract bundle and manifest digests to Task 2's immutable
+receipt. Any byte difference is a no-go.
 
 - [ ] **Step 3: Produce provider certification reports**
 
@@ -1240,17 +1342,46 @@ jq -e \
   "$RELEASE_PACKET_DIR/go-no-go.json"
 ```
 
-- [ ] **Step 5: Create and push one signed immutable tag**
+- [ ] **Step 5: Preflight SSH signing, create, verify, and push one immutable tag**
 
 ```bash
 git fetch origin main
 test "$(git rev-parse origin/main)" = "$RELEASE_CANDIDATE_SHA"
 test "$(git rev-parse HEAD)" = "$RELEASE_CANDIDATE_SHA"
+
+test "$(git config --get gpg.format)" = "ssh"
+export RELEASE_SIGNING_KEY="$(git config --get user.signingkey)"
+test -n "$RELEASE_SIGNING_KEY"
+test -f "$RELEASE_SIGNING_KEY"
+
+export RELEASE_ALLOWED_SIGNERS="$RELEASE_PACKET_DIR/allowed-signers"
+gh variable get NPM_RELEASE_ALLOWED_SIGNERS \
+  --repo OpenCoven/coven > "$RELEASE_ALLOWED_SIGNERS"
+test -s "$RELEASE_ALLOWED_SIGNERS"
+
+if [[ "$RELEASE_SIGNING_KEY" == *.pub ]]; then
+  cp "$RELEASE_SIGNING_KEY" "$RELEASE_PACKET_DIR/signing-key.pub"
+else
+  ssh-keygen -y -f "$RELEASE_SIGNING_KEY" \
+    > "$RELEASE_PACKET_DIR/signing-key.pub"
+fi
+gh api user/ssh_signing_keys --paginate --jq '.[].key' |
+  grep -F -x "$(cat "$RELEASE_PACKET_DIR/signing-key.pub")"
+
 git tag -s "$RELEASE_TAG" -m "Coven $RELEASE_TAG"
+git -c gpg.ssh.allowedSignersFile="$RELEASE_ALLOWED_SIGNERS" \
+  verify-tag "$RELEASE_TAG"
+test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$RELEASE_CANDIDATE_SHA"
 git push origin "$RELEASE_TAG"
 ```
 
-Never move or reuse the tag. If `origin/main` advanced after certification, the equality check must fail; rebuild the candidate packet and repeat certification rather than tagging a different commit.
+The local verification must name a signer from the repository's
+`NPM_RELEASE_ALLOWED_SIGNERS`, and the signing public key must already be
+registered as an SSH signing key on the authenticated GitHub maintainer
+account. Never move or reuse the tag. If any preflight fails, delete only the
+unpublished local tag if it was created and stop. If `origin/main` advanced
+after certification, the equality check must fail; rebuild the candidate packet
+and repeat certification rather than tagging a different commit.
 
 - [ ] **Step 6: Verify npm and GitHub release receipts**
 
@@ -1271,9 +1402,13 @@ gh release download "$RELEASE_TAG" \
   --repo OpenCoven/coven \
   --dir "$RELEASE_ARTIFACT_DIR/release-check"
 cd "$RELEASE_ARTIFACT_DIR/release-check" && shasum -a 256 -c SHA256SUMS
+test -f "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz"
+test "$(shasum -a 256 "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz" | awk '{print $1}')" = "$COVEN_PROTOCOL_SHA256"
 ```
 
-Expected: all five npm packages resolve to the approved version, GitHub release targets the signed tag, and all four archives report `OK`.
+Expected: all five npm packages resolve to the approved version, GitHub release
+targets the signed tag, all native archives report `OK`, and the published
+protocol bundle exactly matches the Task 2 digest.
 
 - [ ] **Step 7: Verify a fresh registry install**
 
@@ -1299,31 +1434,18 @@ Expected: the wrapper and exactly one platform-native package match `RELEASE_VER
 
 - [ ] **Step 8: Release Cave against the exact Coven artifact**
 
-After Task 6B's PR merge is present on `origin/main`, create a second managed #5217 worktree at that exact main revision and run the real-daemon Playwright journey:
+After Task 6B's PR merge is present on `origin/main`, create a clean detached
+verification worktree at that exact revision and run the real-daemon Playwright
+journey. This worktree is read-only release evidence, not a second #5217
+implementation claim:
 
 ```bash
 cd "$COVEN_CAVE_REPO"
 git fetch origin main
-export CAVE_AUTOMATIONS_BEAD_ID="$(
-  jq -er '
-    [.outcomes[] |
-      select(.github == "OpenCoven/coven-cave#5217") |
-      .beadId] |
-    if length == 1 and .[0] != null
-    then .[0]
-    else error("expected one provisioned #5217 Bead")
-    end
-  ' docs/roadmaps/coven-automations-v1.mapping.json
-)"
-pnpm beads:worktrees:create \
-  --bead "$CAVE_AUTOMATIONS_BEAD_ID" \
-  --branch "chore/5217-automations-v1-release-acceptance" \
-  --owner "Cody" \
-  --purpose "Verify Cave against the released Coven Automations v1 artifact" \
-  --start-point origin/main
-export CAVE_AUTOMATIONS_WORKTREE="$COVEN_CAVE_REPO/.worktrees/5217-automations-v1-release-acceptance"
+export CAVE_AUTOMATIONS_WORKTREE="$HOME/.coven/worktrees/coven-cave-automations-v1-release-acceptance"
+test ! -e "$CAVE_AUTOMATIONS_WORKTREE"
+git worktree add --detach "$CAVE_AUTOMATIONS_WORKTREE" origin/main
 cd "$CAVE_AUTOMATIONS_WORKTREE"
-coven claim acquire issue-5217
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 test -z "$(git status --porcelain)"
 COVEN_BIN="$RELEASED_COVEN_BIN" \
@@ -1331,7 +1453,11 @@ COVEN_EXPECTED_VERSION="$RELEASE_VERSION" \
 pnpm exec playwright test tests/automations-v1-release.spec.ts
 ```
 
-Expected: the test creates a paused definition, activates it, observes one scheduled and one manual run through adopted commands, verifies receipts, then removes the disposable definition without external mutation. Record the Cave `origin/main` SHA and Playwright result, release `issue-5217`, and retire the acceptance worktree through `pnpm beads:worktrees:apply`.
+Expected: the test creates a paused definition, activates it, observes one
+scheduled and one manual run through adopted commands, verifies receipts, then
+removes the disposable definition without external mutation. Record the Cave
+`origin/main` SHA and Playwright result in #854's release packet, then remove
+the detached verification worktree.
 
 **Exit gate:** immutable signed tag, npm provenance, GitHub release/checksums, fresh install, certification packet, and Cave end-to-end receipt all identify the same Coven commit.
 
@@ -1380,7 +1506,7 @@ node docs/roadmaps/drift-check.mjs --selftest
 | Task 4 dispatch binding | Tasks 2, 3B, 3C merge | Any string-only or allow-on-error fallback remains |
 | Task 5 certification | Tasks 2, 3A, 4 merge | Runner tests its own model instead of the production artifact |
 | Task 6 consumers | Read-only preparation after Task 2; mutations after Task 5 | Consumer authors lifecycle truth or uses mutable/source-relative artifacts |
-| Task 7 release | Tasks 1-6 verified | Any digest/profile/platform/provider receipt is missing or stale |
+| Task 7 release | Tasks 1-6 implementation outcomes merged and pre-release canaries verified | Any digest/profile/platform/provider receipt is missing or stale |
 | Task 8 closure | Task 7 verified | Release and tracker evidence do not resolve to the same revisions |
 
 ## Definition of done

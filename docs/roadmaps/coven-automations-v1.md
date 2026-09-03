@@ -80,7 +80,7 @@ The table below is the canonical Bead ↔ GitHub mapping (also available as JSON
 | Outcome | GitHub | Priority | Bead label | Bead ID | Dependencies | Disposition |
 | --- | --- | --- | --- | --- | --- | --- |
 | program | [OpenCoven/coven#854](https://github.com/OpenCoven/coven/issues/854) | P0 | `automations-v1/program` | cave-hlv.9 | program-control, foundation, protocol, scheduler, familiar-embodiment, automation-authority, authority, certification, sdk, cave-oversight, psyche-adapter, documentation, organization-canaries | active:release-gate-ownership |
-| program-control | [OpenCoven/coven#859](https://github.com/OpenCoven/coven/issues/859) | P0 | `automations-v1/program-control` | cave-hlv.10 | (none) | active:tracker-control |
+| program-control | [OpenCoven/coven#859](https://github.com/OpenCoven/coven/issues/859) | P0 | `automations-v1/program-control` | cave-hlv.10 | (none) | closed:tracker-operationalized |
 | foundation | [OpenCoven/coven#816](https://github.com/OpenCoven/coven/issues/816) | P0 | `automations-v1/foundation` | cave-stsf7 | (none) | closed:verified-foundation |
 | authority | [OpenCoven/coven#857](https://github.com/OpenCoven/coven/issues/857) | P0 | `automations-v1/authority` | cave-dbkng | protocol, familiar-embodiment, automation-authority | blocked:pending-protocol-and-identity-authority-profiles (bead cave-dbkng) |
 | certification | [OpenCoven/coven#858](https://github.com/OpenCoven/coven/issues/858) | P0 | `automations-v1/certification` | cave-x28j6 | protocol, scheduler, authority | blocked:pending-protocol-scheduler-trust (bead cave-x28j6) |
@@ -95,7 +95,7 @@ _Cross-repository child outcomes (7), mapped one-to-one in the same canonical Ca
 | familiar-embodiment | `OpenCoven/familiar-contract#17` | P0 | `automations-v1/familiar-embodiment` | cave-6jswi | foundation | ready:foundation-verified (bead cave-6jswi unblocked in the Cave graph) |
 | cave-oversight | `OpenCoven/coven-cave#5217` | P1 | `automations-v1/cave-oversight` | cave-e52qp | certification | blocked:pending-certification (bead cave-e52qp) |
 | documentation | `OpenCoven/coven-docs#76` | P1 | `automations-v1/documentation` | cave-qwnxq | certification | blocked:pending-certification (bead cave-qwnxq) |
-| organization-canaries | `OpenCoven/.github#2` | P1 | `automations-v1/organization-canaries` | cave-xqbs4 | program-control, certification | blocked:pending-program-control-and-certification (bead cave-xqbs4) |
+| organization-canaries | `OpenCoven/.github#2` | P1 | `automations-v1/organization-canaries` | cave-xqbs4 | program-control, certification | blocked:pending-certification (program control closed; bead cave-xqbs4) |
 | psyche-adapter | `OpenCoven/psyche#18` | P1 | `automations-v1/psyche-adapter` | cave-yaul2 | certification | blocked:pending-certification (bead cave-yaul2) |
 | sdk | `OpenCoven/sdk#80` | P1 | `automations-v1/sdk` | cave-90hwl | certification | blocked:pending-certification (bead cave-90hwl) |
 <!-- END GENERATED:MAPPING-TABLE -->

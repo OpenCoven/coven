@@ -38,7 +38,7 @@
         "issue": 854,
         "url": "https://github.com/OpenCoven/coven/issues/854",
         "title": "Program: Coven Automations v1 — reliable, identity-bound familiar routines",
-        "state": "closed",
+        "state": "open",
         "priority": "P0",
         "owner": "BunsDev"
       },
@@ -83,7 +83,7 @@
         "issue": 859,
         "url": "https://github.com/OpenCoven/coven/issues/859",
         "title": "P0 control: Operationalize Coven Automations v1 through Cave's canonical Beads graph and GitHub mirrors",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
