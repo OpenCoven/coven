@@ -10656,7 +10656,8 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let create_body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:daily-notes:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10684,8 +10685,58 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""routine":"#));
         assert!(response.body.contains(r#""id":"daily-notes""#));
+        assert!(response.body.contains(r#""outcome":"committed""#));
 
-        let list_body = json!({ "action": "coven.automations.list" }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""outcome":"replayed""#));
+        assert!(response.body.contains(r#""firstCommittedAt":"#));
+        let replay_body: Value = serde_json::from_str(&response.body)?;
+        assert!(replay_body.get("event").is_none());
+
+        let conflicting_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:daily-notes:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Must not replace",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "familiarId": "charm",
+                "prompt": "Write the daily reflection."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&conflicting_create),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        assert!(response
+            .body
+            .contains(r#""committedCommand":"definition.create.v1""#));
+        assert!(response.body.contains(r#""committedRevision":1"#));
+
+        let list_body = json!({ "action": "coven.automations.definition.list.v1" }).to_string();
         let response = handle_request_with_body(
             "POST",
             "/api/v1/actions",
@@ -10695,9 +10746,12 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""routines":[{"#));
+        assert!(response
+            .body
+            .contains(r#""revisionById":{"daily-notes":1}"#));
 
         let get_body = json!({
-            "action": "coven.automations.get",
+            "action": "coven.automations.definition.get.v1",
             "id": "daily-notes"
         })
         .to_string();
@@ -10710,9 +10764,12 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""name":"Daily notes""#));
+        assert!(response.body.contains(r#""revision":1"#));
 
         let update_body = json!({
-            "action": "coven.automations.update",
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:daily-notes:0002",
+            "expectedRevision": 1,
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10740,7 +10797,9 @@ mod tests {
         assert!(response.body.contains(r#""status":"ACTIVE""#));
 
         let delete_body = json!({
-            "action": "coven.automations.delete",
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:delete:daily-notes:0003",
+            "expectedRevision": 2,
             "id": "daily-notes"
         })
         .to_string();
@@ -10753,6 +10812,392 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""deleted":true"#));
+
+        let get_tombstone_body = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&get_tombstone_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""revision":3"#));
+        assert!(response.body.contains(r#""tombstonedAt":"#));
+        assert!(response.body.contains(r#""id":"daily-notes""#));
+
+        let list_tombstones_body = json!({
+            "action": "coven.automations.definition.list.v1",
+            "includeTombstoned": true
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&list_tombstones_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response
+            .body
+            .contains(r#""revisionById":{"daily-notes":3}"#));
+        assert!(response
+            .body
+            .contains(r#""tombstonedAtById":{"daily-notes":"#));
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_control_actions_remain_request_and_response_compatible() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-compatible",
+                "name": "Legacy",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Preserve the old request shape.",
+                "legacyExtension": { "ignored": true }
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert!(body.get("event").is_some());
+        assert!(body.get("result").is_none());
+        assert!(body["event"]["payload"].get("createdAt").is_some());
+        assert!(body["event"]["payload"].get("revision").is_none());
+        assert!(body["event"]["payload"]["routine"]
+            .get("legacyExtension")
+            .is_none());
+
+        let update = json!({
+            "action": "coven.automations.update",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-compatible",
+                "name": "Legacy revised",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 60,
+                "runtime": "coven-code",
+                "prompt": "Preserve the old update shape."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&update),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"]["routine"]["name"],
+            "Legacy revised"
+        );
+        assert!(body["event"]["payload"].get("updatedAt").is_some());
+        assert!(body["event"]["payload"].get("revision").is_none());
+
+        let delete = json!({
+            "action": "coven.automations.delete",
+            "id": "legacy-compatible"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"],
+            json!({ "id": "legacy-compatible", "deleted": true })
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"],
+            json!({ "id": "legacy-compatible", "deleted": false })
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"]["routine"]["id"],
+            "legacy-compatible"
+        );
+        assert!(body["event"]["payload"].get("createdAt").is_some());
+
+        let get = json!({
+            "action": "coven.automations.get",
+            "id": "legacy-compatible"
+        })
+        .to_string();
+        let response =
+            handle_request_with_body("POST", "/api/v1/actions", temp_dir.path(), None, Some(&get))?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""id":"legacy-compatible""#));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_delete_cannot_erase_a_versioned_tombstone() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:retained-tombstone:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "retained-tombstone",
+                "name": "Retained",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Retain the tombstone."
+            }
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&create),
+            )?
+            .status,
+            200
+        );
+
+        let legacy_update = json!({
+            "action": "coven.automations.update",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "retained-tombstone",
+                "name": "Legacy overwrite",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not overwrite v1 authority."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_update),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response
+            .body
+            .contains("managed by the versioned authority API"));
+
+        let legacy_delete = json!({
+            "action": "coven.automations.delete",
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["deleted"], false);
+
+        let tombstone = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:retained-tombstone:0002",
+            "expectedRevision": 1,
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&tombstone),
+            )?
+            .status,
+            200
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["deleted"], false);
+
+        let get = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        let response =
+            handle_request_with_body("POST", "/api/v1/actions", temp_dir.path(), None, Some(&get))?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["revision"], 2);
+        assert!(body["event"]["payload"]["tombstonedAt"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_recreate_advances_revision_and_rejects_stale_v1_cas() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let legacy_definition = |name: &str| {
+            json!({
+                "action": "coven.automations.create",
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": "legacy-aba",
+                    "name": name,
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Preserve identity generations."
+                }
+            })
+            .to_string()
+        };
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&legacy_definition("First generation")),
+            )?
+            .status,
+            200
+        );
+
+        let delete = json!({
+            "action": "coven.automations.delete",
+            "id": "legacy-aba"
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&delete),
+            )?
+            .status,
+            200
+        );
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&legacy_definition("Second generation")),
+            )?
+            .status,
+            200
+        );
+
+        let stale_revise = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:legacy-aba:stale",
+            "expectedRevision": 1,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-aba",
+                "name": "Stale overwrite",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not overwrite the recreated identity."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&stale_revise),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""code":"REVISION_CONFLICT""#));
+        assert!(response.body.contains(r#""currentRevision":3"#));
+        assert!(!response.body.contains("Stale overwrite"));
         Ok(())
     }
 
@@ -10760,7 +11205,8 @@ mod tests {
     fn control_action_reports_launch_as_running_until_completion_evidence() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let create_body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:running-daily-notes:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10834,10 +11280,90 @@ mod tests {
     }
 
     #[test]
+    fn control_action_rejects_stale_automation_revision_without_mutation() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:revision-guard:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revision-guard",
+                "name": "Original",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Keep the original."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let stale_update = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:revision-guard:stale",
+            "expectedRevision": 9,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revision-guard",
+                "name": "Must not land",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Do not persist."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&stale_update),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains(r#""code":"REVISION_CONFLICT""#));
+        assert!(response.body.contains(r#""currentRevision":1"#));
+
+        let get_body = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "revision-guard"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&get_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""name":"Original""#));
+        assert!(!response.body.contains("Must not land"));
+        Ok(())
+    }
+
+    #[test]
     fn control_actions_reject_invalid_routine_definitions() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:bad-schedule:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "bad schedule!",
@@ -10862,7 +11388,128 @@ mod tests {
         )?;
         assert_eq!(response.status, 400);
         assert!(response.body.contains(r#""accepted":false"#));
-        assert!(response.body.contains("coven.automations.create"));
+        assert!(response
+            .body
+            .contains("coven.automations.definition.create.v1"));
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+        assert!(!response.body.contains(r#""accepted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_durably_reject_unsafe_integer_definitions() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsafe-integer:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsafe-integer",
+                "name": "Unsafe integer",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 9_007_199_254_740_992_u64,
+                "runtime": "coven-code",
+                "prompt": "Never runs."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+
+        let corrected = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsafe-integer:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsafe-integer",
+                "name": "Corrected",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Still must use a new key."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&corrected),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_versioned_commands_reserve_their_adoption_keys() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let adoption_key = "adopt:create:malformed-shape:0001";
+        let malformed = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": adoption_key,
+            "definition": []
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&malformed),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+
+        let corrected = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": adoption_key,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "malformed-shape",
+                "name": "Corrected",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must use a new adoption key."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&corrected),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        assert!(response.body.contains(r#""committedOutcome":"rejected""#));
         Ok(())
     }
 

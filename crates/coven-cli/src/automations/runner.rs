@@ -2109,6 +2109,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_definition_cannot_create_a_manual_occurrence_after_tombstone() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("tombstoned");
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET revision = 2,
+                 tombstoned_at = '2026-09-03T09:00:00.000Z',
+                 updated_at = '2026-09-03T09:00:00.000Z'
+             WHERE id = 'tombstoned'",
+            [],
+        )
+        .unwrap();
+
+        let outcome =
+            run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, Utc::now()).unwrap();
+
+        assert_eq!(outcome.status, "failed");
+        let occurrence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'tombstoned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_count, 0);
+    }
+
+    #[test]
     fn expired_preownership_launch_recovers_run_and_occurrence_together() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
@@ -2274,7 +2304,7 @@ mod tests {
             launched_at,
         )
         .unwrap();
-        assert!(super::super::store::delete_definition(&conn, "daily").unwrap());
+        assert!(super::super::store::remove_definition_for_test(&conn, "daily").unwrap());
 
         let timed_out_at = persisted_timeout_at(&conn, "daily");
         assert!(
