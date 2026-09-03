@@ -3,22 +3,22 @@
   "schema_version": 1,
   "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#859). GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
   "sync": {
-    "last_sync": "2026-09-01T20:15:00Z",
-    "source_branch": "docs/859-automations-v1-mapping",
+    "last_sync": "2026-09-03T06:09:12Z",
+    "source_branch": "docs/coven-automations-critical-path",
     "writer": "One canonical writer/process is designated for this setup; see docs/superpowers/plans/2026-08-30-issue-859-coven-automations-v1-tracker-operationalization.md (Decision D1). Persisted tracker changes land only through reviewed PRs.",
     "canonical_bead_store": "OpenCoven/coven-cave embedded Dolt database `cave`; provisioning was executed through OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277). A competing Beads database must not be initialized in OpenCoven/coven (operational correction on OpenCoven/coven#859, 2026-08-30).",
     "public_bead_export": "OpenCoven/coven-cave `.beads/issues.jsonl` is a public-scrubbed review export, never canonical state and never a hand-edited sync mechanism.",
-    "beads_tool_reference": "Beads 1.2.2 (Homebrew), bead schema_version 1 (live), as verified during the OpenCoven/coven-cave#5220 seed run.",
+    "beads_tool_reference": "Beads 1.3.0-rc.1 (schema v66 capable), bead schema_version 1 (live). The 2026-09-03 reconciliation used the checksum-verified darwin-arm64 release because Homebrew Beads 1.2.2 only supports the older v53 schema.",
     "beads_provisioning": {
       "seed_task": "OpenCoven/coven-cave#5220",
       "seed_bead": "cave-tmegk",
-      "program_control": "OpenCoven/coven#859 -> Cave bead cave-hlv.10 (tracker operationalization; owns reconciliation, drift control, and evidence semantics only)",
+      "program_control": "OpenCoven/coven#859 -> Cave bead cave-hlv.10 (closed 2026-09-03 after tracker operationalization, reconciliation, drift control, and evidence semantics were verified)",
       "release_rollup": "OpenCoven/coven#854 -> Cave bead cave-hlv.9 (release go/no-go rollup; blocked-first by the other 13 in-program outcomes)",
       "cross_repository_children": "OpenCoven/familiar-contract#17 -> cave-6jswi; OpenCoven/coven-threads#29 -> cave-m9tw3; OpenCoven/sdk#80 -> cave-90hwl; OpenCoven/coven-cave#5217 -> cave-e52qp; OpenCoven/psyche#18 -> cave-yaul2; OpenCoven/coven-docs#76 -> cave-qwnxq; OpenCoven/.github#2 -> cave-xqbs4",
       "graph_shape": "15 canonical beads (14 mapped outcomes plus the OpenCoven/coven-cave#5220 seed bead cave-tmegk) and 30 in-program blocked-first edges, no cycles. cave-hlv.9 and cave-hlv.10 additionally carry a pre-existing parent-epic edge to the closed Cave epic cave-hlv, which is outside the Automations v1 program set.",
       "remote_ref": "refs/dolt/data",
       "dolt_commit_evidence": "Embedded-Dolt pre/post commit OIDs, the reconciled local/remote Dolt commit, and the durable refs/dolt/data git OID are recorded in Cave PR OpenCoven/coven-cave#5277 and the seed-run execution ledger (exact transient OIDs are kept out of this committed file so this reconciliation contract cannot go stale against a moving remote; the ledger is the exact-evidence surface).",
-      "remote_sync_status": "synchronized: the documented wrapper `pnpm beads:sync` completed pull+push (exit 0, ~24s) on 2026-09-01; local embedded Dolt `main` and `remotes/origin/main` are equal, `dolt diff --summary` is empty, and the shared remote `refs/dolt/data` carries the seeded 15-bead / 30-edge graph. No force-push occurred and no concurrent Dolt commit was discarded; local state was re-verified intact afterward. This is the canonical graph-sync receipt and is distinct from the Cave-side mapping follow-up (see the roadmap Active blockers section), which remains blocked on a schema-v66-capable bd for managed-worktree admission.",
+      "remote_sync_status": "synchronized and terminal: Cave PR OpenCoven/coven-cave#5278 reconciled the terminal mapping after the initial seed in OpenCoven/coven-cave#5277, OpenCoven/coven-cave#5220 is closed, and a fresh `pnpm beads:sync` pull+push completed successfully on 2026-09-03 after closing program-control bead cave-hlv.10. The shared remote carries the reviewed 15-bead / 30-edge graph; no force-push or schema-skew bypass was used.",
       "dependency_proof": "bd dep list (both directions), bd dep cycles (none), bd ready --json; recorded on Cave PR OpenCoven/coven-cave#5277."
     },
     "drift_check": "node docs/roadmaps/drift-check.mjs (add --beads-export <issues.jsonl> to cross-check an export; --strict to fail on pending provisioning; --selftest to verify detection rules)",
@@ -38,7 +38,7 @@
         "issue": 854,
         "url": "https://github.com/OpenCoven/coven/issues/854",
         "title": "Program: Coven Automations v1 — reliable, identity-bound familiar routines",
-        "state": "open",
+        "state": "closed",
         "priority": "P0",
         "owner": "BunsDev"
       },
@@ -95,21 +95,24 @@
         "cave_outcome_key": "program-control",
         "cave_label": "automations-v1:program-control",
         "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "active:tracker-control",
+        "disposition": "closed:tracker-operationalized",
         "gate": "Tracker operationalization is complete when: every #854 P0/P1 outcome maps one-to-one to a live Cave bead; dependency direction is proven in both directions with bd dep list and bd ready; this mapping and the generated roadmap block reconcile with the live graph under node docs/roadmaps/drift-check.mjs --strict; and the canonical Cave Dolt state is durable on the shared remote ref refs/dolt/data.",
-        "evidence_status": "partial",
+        "evidence_status": "verified",
         "evidence": [
           "OpenCoven/coven-cave#5277 (merged 2026-09-01; canonical Beads graph seeded)",
+          "OpenCoven/coven-cave#5278 (merged 2026-09-01; terminal Cave mapping reconciliation)",
           "https://github.com/OpenCoven/coven/pull/900 (initial tracker-mapping reconciliation)",
-          "canonical graph sync durable: `pnpm beads:sync` pull+push exit 0 (~24s) on 2026-09-01; local Dolt `main` == `remotes/origin/main`, empty `dolt diff --summary`, `refs/dolt/data` carries the seeded graph, no force-push (exact OIDs in the seed-run ledger and Cave PR OpenCoven/coven-cave#5277)",
-          "remaining: the Cave-side mapping follow-up PR is blocked on a schema-v66-capable bd for managed-worktree admission, so #859 stays open until it lands"
+          "https://github.com/OpenCoven/coven/pull/901 (durable-sync narrative and drift invariant reconciliation)",
+          "OpenCoven/coven-cave#5220 closed 2026-09-01 with the seed and terminal mapping receipts",
+          "Cave bead cave-hlv.10 closed 2026-09-03; `pnpm beads:sync` pull+push exited 0 using checksum-verified Beads 1.3.0-rc.1",
+          "OpenCoven/coven#859 closed 2026-09-03 after `node docs/roadmaps/drift-check.mjs --strict` and `--selftest` passed"
         ]
       },
       "depends_on": [],
       "depends_on_external": [
         "Cave bead cave-hlv (closed 'Operationalize Beads for familiar issue tracking' epic) — pre-existing parent-epic edge in the Cave graph, outside the Automations v1 program set and not a v1 release blocker"
       ],
-      "notes": "#859 is program control / tracker operationalization, bound one-to-one to Cave bead cave-hlv.10. It is a control outcome, not an implementation catch-all: it owns reconciliation, drift control, and evidence semantics only. In the live Cave graph cave-hlv.10 blocks cave-hlv.9 (release rollup) and cave-xqbs4 (organization canaries)."
+      "notes": "#859 completed tracker operationalization and remains a closed dependency of the release rollup and organization canaries. Its closure does not certify Automations v1; #854 stays open until every implementation, consumer, certification, and release gate resolves."
     },
     {
       "slug": "foundation",
@@ -451,14 +454,14 @@
         "cave_outcome_key": "organization-canaries",
         "cave_label": "automations-v1:organization-canaries",
         "provisioning": "provisioned:OpenCoven/coven-cave#5220 (Cave PR OpenCoven/coven-cave#5277)",
-        "disposition": "blocked:pending-program-control-and-certification (bead cave-xqbs4)",
+        "disposition": "blocked:pending-certification (program control closed; bead cave-xqbs4)",
         "gate": "Reusable organization-level conformance, contract-drift, and roadmap checks run on consumer repositories without ambient production credentials and fail closed on drift.",
         "evidence_status": "none",
         "evidence": []
       },
       "depends_on": ["program-control", "certification"],
       "depends_on_external": [],
-      "notes": "Live Cave bead cave-xqbs4 is blocked-first by cave-hlv.10 (program control) and cave-x28j6 (certification), and blocks cave-hlv.9."
+      "notes": "Live Cave bead cave-xqbs4 still depends on closed cave-hlv.10 for historical graph integrity and remains blocked only by open certification bead cave-x28j6; it blocks cave-hlv.9."
     }
   ],
   "cross_repository_children_policy": "One Bead per SDK, Cave, Psyche, docs, organization-canary, Familiar Contract, and Threads outcome created under OpenCoven/coven#854. All seven are provisioned and mapped one-to-one above, and each row carries the same evidence semantics as an in-repository outcome: a live bead id, an acceptance gate, a disposition, an evidence_status, and an evidence list that stays empty until exact PR/test/release references exist. They are mirrored in the canonical Cave mapping (docs/roadmaps/coven-automations-v1.mapping.json in OpenCoven/coven-cave; Cave PR OpenCoven/coven-cave#5277), where familiar-embodiment and automation-authority use the same keys and sdk/cave-oversight/psyche-adapter/documentation/organization-canaries depend on the Cave key `conformance` (this file's `certification` slug). node docs/roadmaps/drift-check.mjs enforces the membership contract: omitting any of these seven, or the #859 program-control outcome, is an E011 error in both default and strict mode.",

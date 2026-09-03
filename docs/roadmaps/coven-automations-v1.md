@@ -10,7 +10,7 @@ description: "Delivery roadmap for Coven Automations v1: tracker roles, ownershi
 
 # Coven Automations v1 delivery roadmap
 
-_Last synchronized: 2026-09-01T20:15:00Z (see the sync metadata block below)_
+_Last synchronized: 2026-09-03T06:09:12Z (see the sync metadata block below)_
 
 > [!WARNING]
 > **Generated content.** The mapping table in the marked block below is generated from
@@ -25,10 +25,10 @@ _Last synchronized: 2026-09-01T20:15:00Z (see the sync metadata block below)_
 ([OpenCoven/coven#854](https://github.com/OpenCoven/coven/issues/854)) — the release
 rollup outcome, bound one-to-one to Cave bead `cave-hlv.9`.
 Tracker operationalization control:
-[OpenCoven/coven#859](https://github.com/OpenCoven/coven/issues/859) — a distinct
-program-control outcome, bound one-to-one to Cave bead `cave-hlv.10`. #854 owns release
-gates and cross-repository rollup; #859 owns tracker reconciliation, drift control, and
-evidence semantics. Neither may be used as a catch-all implementation task.
+[OpenCoven/coven#859](https://github.com/OpenCoven/coven/issues/859) — the completed
+program-control outcome, bound one-to-one to closed Cave bead `cave-hlv.10`. #854 owns
+release gates and cross-repository rollup; #859 established tracker reconciliation, drift
+control, and evidence semantics. Neither is an implementation catch-all.
 Parent of the initial P0 graph (#816, #855, #856, #857, #858) plus seven cross-repository
 children (Familiar Contract, Threads, SDK, Cave, Psyche, docs, organization canaries).
 
@@ -47,13 +47,15 @@ through reviewed PRs (see
 
 ## Sync metadata
 
-- **Last synchronization:** 2026-09-01T20:15:00Z (UTC)
-- **Source branch:** `docs/859-automations-v1-mapping` (based on upstream `main`)
+- **Last synchronization:** 2026-09-03T06:09:12Z (UTC)
+- **Source branch:** `docs/coven-automations-critical-path` (based on upstream `main`)
 - **Machine-readable mapping:** [`coven-automations-v1.mapping.json`](./coven-automations-v1.mapping.json) (schema `coven.automations-v1.tracker-mapping`, version 1)
 - **Drift check:** `node docs/roadmaps/drift-check.mjs` (add `--beads-export <issues.jsonl>` to cross-check an export; `--strict` to fail on pending provisioning; `--selftest` verifies detection rules) — runs locally and in CI without ambient production credentials
-- **Beads tool reference:** Beads 1.2.2 (Homebrew), live bead `schema_version` 1, verified during the
-  [OpenCoven/coven-cave#5220](https://github.com/OpenCoven/coven-cave/issues/5220) seed run
-  (Cave PR OpenCoven/coven-cave#5277); pre/post
+- **Beads tool reference:** checksum-verified Beads 1.3.0-rc.1, required for the live
+  schema-v66 Cave store; Homebrew Beads 1.2.2 is schema-v53-only and was not used for
+  writes. The graph was seeded through
+  [OpenCoven/coven-cave#5220](https://github.com/OpenCoven/coven-cave/issues/5220)
+  (Cave PRs OpenCoven/coven-cave#5277 and OpenCoven/coven-cave#5278); pre/post
   embedded-Dolt commit OIDs are recorded in that Cave PR and the seed-run evidence (kept out of this
   file per the repository secret guard)
 - **Writer:** exactly one canonical writer/process for this setup (Decision D1 in the
@@ -187,13 +189,11 @@ program parent.
   concurrent Dolt commit was discarded, and local state was re-verified intact afterward. Exact
   transient OIDs live in the seed-run execution ledger and Cave PR #5277, not in this file. No
   competing Beads database may be initialized in `OpenCoven/coven`.
-- **Cave-side mapping follow-up (open)** — canonical graph sync above is complete, but the
-  Cave-repo mapping reconciliation PR (which lands the prepared reconcile script into Cave's own
-  roadmap surfaces) has not merged yet. It is gated on obtaining a schema-v66-capable `bd` so
-  Cave's managed worktree lifecycle can admit the follow-up; Homebrew `bd` 1.2.2 knows only up to
-  schema v53. Until that PR merges, Cave bead `cave-tmegk` stays `in_progress` and
-  `OpenCoven/coven-cave#5220` stays open. This is a Cave-side follow-up and does not reopen the
-  canonical graph-sync receipt.
+- **Tracker operationalization (resolved)** — Cave PR OpenCoven/coven-cave#5278
+  reconciled the terminal Cave mapping, OpenCoven/coven-cave#5220 and seed bead
+  `cave-tmegk` are closed, Coven PRs #900 and #901 carry the public mapping and drift
+  controls, and program-control #859 / bead `cave-hlv.10` closed on 2026-09-03 after a
+  fresh schema-v66 read and durable `pnpm beads:sync`.
 - **Foundation reconciled (resolved)** —
   [#816](https://github.com/OpenCoven/coven/issues/816) is CLOSED and represented as
   verified-foundation (bead `cave-stsf7`, closed; PR
