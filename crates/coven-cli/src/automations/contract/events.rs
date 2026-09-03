@@ -9,7 +9,8 @@ use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
 
-use super::types::{EventEnvelope, StreamKind};
+pub use super::types::EventRef;
+use super::types::{EventEnvelope, EventRefStream, SafeInteger, StreamKind};
 
 #[cfg(test)]
 use super::types::{EventKind, EventPayload};
@@ -76,13 +77,6 @@ pub const AUTOMATION_EVENTS_SCHEMA_SQL: &str = "
         SELECT RAISE(ABORT, 'automation events are append-only');
     END;
 ";
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventRef {
-    pub stream: String,
-    pub sequence: u64,
-}
 
 pub struct DefinitionEventInput<'a> {
     pub command: &'a str,
@@ -337,8 +331,10 @@ pub fn append_event(
             ],
         )?;
         Ok(EventRef {
-            stream: format!("{kind}/{stream_id}"),
-            sequence: actual_sequence,
+            stream: EventRefStream::new(format!("{kind}/{stream_id}"))
+                .map_err(|error| EventStoreError::Contract(anyhow::Error::new(error)))?,
+            sequence: SafeInteger::new(actual_sequence)
+                .map_err(|error| EventStoreError::Contract(anyhow::Error::new(error)))?,
         })
     })();
 

@@ -1270,7 +1270,7 @@ mod tests {
             "adopt:create:evented:0001"
         );
         assert_eq!(first.event_ref, replay.event_ref);
-        assert_eq!(first.event_ref.unwrap().sequence, 0);
+        assert_eq!(first.event_ref.unwrap().sequence.get(), 0);
     }
 
     #[test]
