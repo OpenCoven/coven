@@ -985,6 +985,10 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation_runs schema")?;
     crate::automations::runs::ensure_timeout_column(conn)?;
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
+    conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
+        .context("failed to initialize automation events schema")?;
+    crate::automations::contract::events::backfill_definition_event_baselines(conn)
+        .context("failed to backfill automation definition event baselines")?;
 
     backfill_events_fts_if_needed(conn)?;
 

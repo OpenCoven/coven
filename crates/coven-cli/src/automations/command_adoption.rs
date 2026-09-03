@@ -83,13 +83,21 @@ pub struct DefinitionCommandResponse {
     pub result: Option<Value>,
     pub error: Option<ErrorEnvelope>,
     pub replay_first_committed_at: Option<String>,
+    pub event_ref: Option<super::contract::events::EventRef>,
+    mutation_committed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum StoredResponse {
-    Committed { result: Value },
-    Rejected { error: ErrorEnvelope },
+    Committed {
+        result: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_ref: Option<super::contract::events::EventRef>,
+    },
+    Rejected {
+        error: ErrorEnvelope,
+    },
 }
 
 struct StoredAdoption {
@@ -145,10 +153,38 @@ pub fn execute_definition_command(
     }
 
     let (command_name, automation_id) = command_identity(&command);
-    let response = apply_command(&transaction, command, adopted_at)?;
+    let mut response = apply_command(&transaction, command, adopted_at)?;
+    if response.mutation_committed {
+        if let (Some(automation_id), Some(revision)) = (automation_id.as_deref(), response.revision)
+        {
+            let record =
+                super::store::get_definition_with_tombstone(&transaction, automation_id, true)?
+                    .with_context(|| {
+                        format!("committed automation definition `{automation_id}` is missing")
+                    })?;
+            let lifecycle_state = if record.tombstoned_at.is_some() {
+                "tombstoned"
+            } else {
+                record.lifecycle_state.as_str()
+            };
+            response.event_ref = Some(super::contract::events::append_definition_event(
+                &transaction,
+                super::contract::events::DefinitionEventInput {
+                    command: command_name,
+                    automation_id,
+                    revision,
+                    definition_digest: record.definition_digest.as_deref(),
+                    lifecycle_state,
+                    adoption_key: adoption_key.as_str(),
+                    observed_at: adopted_at,
+                },
+            )?);
+        }
+    }
     let stored = match (&response.result, &response.error) {
         (Some(result), None) => StoredResponse::Committed {
             result: result.clone(),
+            event_ref: response.event_ref.clone(),
         },
         (None, Some(error)) => StoredResponse::Rejected {
             error: error.clone(),
@@ -382,12 +418,14 @@ fn load_adoption(conn: &Connection, adoption_key: &str) -> Result<Option<StoredA
 
 fn replay_response(stored: StoredAdoption) -> DefinitionCommandResponse {
     match stored.response {
-        StoredResponse::Committed { result } => DefinitionCommandResponse {
+        StoredResponse::Committed { result, event_ref } => DefinitionCommandResponse {
             outcome: DefinitionCommandOutcome::Replayed,
             revision: stored.revision,
             result: Some(result),
             error: None,
             replay_first_committed_at: Some(stored.adopted_at),
+            event_ref,
+            mutation_committed: false,
         },
         StoredResponse::Rejected { error } => DefinitionCommandResponse {
             outcome: DefinitionCommandOutcome::Rejected,
@@ -395,6 +433,8 @@ fn replay_response(stored: StoredAdoption) -> DefinitionCommandResponse {
             result: None,
             error: Some(error),
             replay_first_committed_at: None,
+            event_ref: None,
+            mutation_committed: false,
         },
     }
 }
@@ -445,6 +485,8 @@ fn replay_mismatch_response(
         result: None,
         error: Some(error),
         replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: false,
     }
 }
 
@@ -921,6 +963,8 @@ fn committed(revision: u64, result: Value) -> DefinitionCommandResponse {
         result: Some(result),
         error: None,
         replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: true,
     }
 }
 
@@ -938,6 +982,8 @@ fn committed_delete(
         })),
         error: None,
         replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: deleted,
     }
 }
 
@@ -959,6 +1005,8 @@ fn rejected(
         result: None,
         error: Some(error),
         replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: false,
     }
 }
 
@@ -1168,6 +1216,225 @@ mod tests {
         );
         assert_eq!(list_definitions(&conn).unwrap().len(), 1);
         assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[test]
+    fn committed_definition_command_appends_one_typed_event_and_replay_appends_none() {
+        let (_temp, conn) = temp_store();
+        let command = DefinitionCommand::Create {
+            definition: definition("evented", "Evented"),
+        };
+
+        let first = execute_definition_command(
+            &conn,
+            "adopt:create:evented:0001",
+            command.clone(),
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:create:evented:0001",
+            command,
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+
+        let events: Vec<(i64, String)> = conn
+            .prepare(
+                "SELECT sequence, event_json
+                 FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = 'evented'
+                 ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, 0);
+        let event: crate::automations::contract::types::EventEnvelope =
+            serde_json::from_str(&events[0].1).unwrap();
+        let value = serde_json::to_value(event).unwrap();
+        assert_eq!(value["schemaVersion"], "coven.automations.v1");
+        assert_eq!(
+            value["stream"],
+            json!({"kind": "automation", "id": "evented"})
+        );
+        assert_eq!(value["automationId"], "evented");
+        assert_eq!(value["kind"], "definition.created");
+        assert_eq!(value["payload"]["revision"], 1);
+        assert_eq!(
+            value["causation"]["adoptionKey"],
+            "adopt:create:evented:0001"
+        );
+        assert_eq!(first.event_ref, replay.event_ref);
+        assert_eq!(first.event_ref.unwrap().sequence.get(), 0);
+    }
+
+    #[test]
+    fn definition_lifecycle_events_are_gapless_and_rejections_append_nothing() {
+        let (_temp, conn) = temp_store();
+        execute_definition_command(
+            &conn,
+            "adopt:create:lifecycle:0001",
+            DefinitionCommand::Create {
+                definition: definition("lifecycle", "Lifecycle"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        let mut revised = definition("lifecycle", "Lifecycle revised");
+        revised["status"] = json!("ACTIVE");
+        execute_definition_command(
+            &conn,
+            "adopt:revise:lifecycle:0002",
+            DefinitionCommand::Revise {
+                definition: revised.clone(),
+                expected_revision: Some(1),
+            },
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        let rejected = execute_definition_command(
+            &conn,
+            "adopt:revise:lifecycle:stale",
+            DefinitionCommand::Revise {
+                definition: revised,
+                expected_revision: Some(1),
+            },
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(rejected.outcome, DefinitionCommandOutcome::Rejected);
+        execute_definition_command(
+            &conn,
+            "adopt:tombstone:lifecycle:0003",
+            DefinitionCommand::Delete {
+                automation_id: "lifecycle".to_owned(),
+                expected_revision: Some(2),
+            },
+            "2026-09-03T09:03:00.000Z",
+        )
+        .unwrap();
+
+        let events: Vec<Value> = conn
+            .prepare(
+                "SELECT event_json
+                 FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = 'lifecycle'
+                 ORDER BY sequence",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .map(|row| serde_json::from_str(&row.unwrap()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["kind"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "definition.created",
+                "definition.revised",
+                "definition.tombstoned"
+            ]
+        );
+        assert_eq!(events[0]["payload"]["revision"], 1);
+        assert_eq!(events[1]["payload"]["revision"], 2);
+        assert_eq!(events[1]["payload"]["lifecycleState"], "active");
+        assert_eq!(events[2]["payload"]["revision"], 3);
+        assert_eq!(events[2]["payload"]["lifecycleState"], "tombstoned");
+    }
+
+    #[test]
+    fn event_append_failure_rolls_back_definition_and_adoption() {
+        let (_temp, conn) = temp_store();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_automation_event
+             BEFORE INSERT ON automation_events
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic event failure');
+             END;",
+        )
+        .unwrap();
+
+        let error = execute_definition_command(
+            &conn,
+            "adopt:create:atomic-event:0001",
+            DefinitionCommand::Create {
+                definition: definition("atomic-event", "Atomic event"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("synthetic event failure"));
+        assert!(get_definition(&conn, "atomic-event").unwrap().is_none());
+        assert_eq!(adoption_count(&conn), 0);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM automation_events", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_event_stream_heads",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn committed_legacy_no_op_delete_does_not_fabricate_a_tombstone_event() {
+        let (_temp, conn) = temp_store();
+        execute_definition_command(
+            &conn,
+            "adopt:create:no-op-delete:0001",
+            DefinitionCommand::Create {
+                definition: definition("no-op-delete", "No-op delete"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        let response = execute_definition_command(
+            &conn,
+            "legacy:delete:no-op-delete:0001",
+            DefinitionCommand::LegacyDelete {
+                automation_id: "no-op-delete".to_owned(),
+            },
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.outcome, DefinitionCommandOutcome::Committed);
+        assert_eq!(response.result.unwrap()["deleted"], false);
+        assert!(response.event_ref.is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = 'no-op-delete'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]
