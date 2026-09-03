@@ -30,8 +30,8 @@ const releaseScriptText = readFileSync(path.join(repoRoot, 'scripts', 'package-g
 const fixtureRoot = path.join(repoRoot, 'scripts', 'fixtures', 'package-github-release', 'source-artifacts');
 const scratchRoot = path.join(repoRoot, 'npm', 'dist', '.package-github-release-tests');
 const SOURCE_DATE_EPOCH = 1_786_939_861;
-const RELEASE_TAG = 'v0.4.1';
-const NPM_VERSION = '0.4.1';
+const RELEASE_TAG = 'v0.4.4';
+const NPM_VERSION = '0.4.4';
 const HEAD_SHA = '0000000000000000000000000000000000000000';
 const SOURCE_RUN_ID = '31993572717';
 const SOURCE_RUN_ATTEMPT = 1;
@@ -46,12 +46,23 @@ const RELEASE_PACKAGES = [
   '@opencoven/cli-macos'
 ];
 const EXPECTED_ARCHIVES = [
-  'coven-v0.4.1-linux-x64.tar.gz',
-  'coven-v0.4.1-macos-aarch64.tar.gz',
-  'coven-v0.4.1-macos-x64.tar.gz',
-  'coven-v0.4.1-windows-x64.zip'
+  'coven-v0.4.4-linux-x64.tar.gz',
+  'coven-v0.4.4-macos-aarch64.tar.gz',
+  'coven-v0.4.4-macos-x64.tar.gz',
+  'coven-v0.4.4-windows-x64.zip'
 ].sort();
-const EXPECTED_ASSET_NAMES = [...EXPECTED_ARCHIVES, 'SHA256SUMS'].sort();
+const PROTOCOL_BUNDLE_NAME = `coven-automations-v1-contract-${HEAD_SHA}.tar.gz`;
+const EXPECTED_ASSET_NAMES = [...EXPECTED_ARCHIVES, PROTOCOL_BUNDLE_NAME, 'SHA256SUMS'].sort();
+
+function packageCanonicalRelease(options) {
+  const protocolBundlePath = path.join(path.dirname(options.outputDir), PROTOCOL_BUNDLE_NAME);
+  writeFileSync(protocolBundlePath, 'deterministic protocol bundle\n');
+  return packageGitHubRelease({
+    ...options,
+    sourceCommit: HEAD_SHA,
+    protocolBundlePath
+  });
+}
 
 function releasePackageVersionMap(version = NPM_VERSION) {
   return Object.fromEntries(RELEASE_PACKAGES.map((packageName) => [packageName, version]));
@@ -539,6 +550,14 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   assert.match(workflowText, /node scripts\/package-github-release\.mjs package/);
   assert.match(
     workflowText,
+    /package-automations-protocol\.mjs[\s\S]*--protocol-bundle "\$PROTOCOL_BUNDLE"/
+  );
+  assert.match(
+    workflowText,
+    /if \[\[ -f github-release-protocol-source\/scripts\/package-automations-protocol\.mjs \]\]/
+  );
+  assert.match(
+    workflowText,
     /node scripts\/package-github-release\.mjs sync-release[\s\S]*--expected-tag-object-sha "\$TAG_OBJECT_SHA"[\s\S]*--expected-head-sha "\$HEAD_SHA"/
   );
   assert.match(workflowText, new RegExp(`actions/checkout@${CHECKOUT_ACTION_SHA}`));
@@ -563,16 +582,38 @@ test('release-github workflow uses least privilege, default-branch code, and nev
   assert.doesNotMatch(workflowText, /npm publish|publish-npm\.mjs --publish/);
   assert.match(ciWorkflowText, new RegExp(`actions/setup-node@${SETUP_NODE_ACTION_SHA}`));
   assert.match(ciWorkflowText, /node --test scripts\/package-github-release-test\.mjs/);
+  assert.match(ciWorkflowText, /automations-protocol-bundle:/);
+  assert.match(
+    ciWorkflowText,
+    /package-automations-protocol\.mjs[\s\S]*name: coven-automations-v1-contract-\$\{\{ github\.sha \}\}/
+  );
 });
 
 test('canonical release asset names and package definitions match the public contract', () => {
-  assert.deepEqual(canonicalReleaseAssetNames(RELEASE_TAG).sort(), EXPECTED_ASSET_NAMES);
+  assert.deepEqual(
+    canonicalReleaseAssetNames(RELEASE_TAG, HEAD_SHA).sort(),
+    EXPECTED_ASSET_NAMES
+  );
   assert.deepEqual(Object.keys(PACKAGE_DEFINITIONS).sort(), [
     'linux-x64',
     'macos',
     'macos-x64',
     'windows'
   ]);
+  assert.deepEqual(
+    canonicalReleaseAssetNames('v0.4.3', HEAD_SHA).sort(),
+    [
+      'coven-v0.4.3-linux-x64.tar.gz',
+      'coven-v0.4.3-macos-aarch64.tar.gz',
+      'coven-v0.4.3-macos-x64.tar.gz',
+      'coven-v0.4.3-windows-x64.zip',
+      'SHA256SUMS'
+    ].sort()
+  );
+  assert.ok(
+    canonicalReleaseAssetNames('v0.5.0', HEAD_SHA).includes(PROTOCOL_BUNDLE_NAME),
+    'later minor releases must retain the canonical protocol asset'
+  );
 });
 
 test('verifySourceRun accepts a successful release-npm run and derives the immutable version', () => {
@@ -666,7 +707,7 @@ test('verifyAnnotatedTag rejects lightweight, unsigned, or retargeted tags', () 
         releaseTag: RELEASE_TAG,
         expectedHeadSha: HEAD_SHA
       }),
-    /must name tag v0\.4\.1/
+    /must name tag v0\.4\.4/
   );
   assert.throws(
     () =>
@@ -1043,7 +1084,7 @@ test('verifyNpmRegistrySignatures rejects wrong-version package-lock entries bef
             }
           }
         }),
-      new RegExp(`${wrongPackage}.*0\\.4\\.1`)
+      new RegExp(`${wrongPackage}.*0\\.4\\.4`)
     );
     assert.deepEqual(calls, [
       {
@@ -1226,7 +1267,7 @@ test('verifyPackageProvenance rejects malformed or mismatched attestation payloa
         subjectDigest: goodDigest,
         workflowRef: 'refs/tags/v0.4.2'
       }),
-      error: /refs\/tags\/v0\.4\.1/
+      error: /refs\/tags\/v0\.4\.4/
     },
     {
       name: 'git commit mismatch',
@@ -1335,7 +1376,7 @@ test('packageGitHubRelease emits deterministic canonical assets with normalized 
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
 
-    const produced = packageGitHubRelease({
+    const produced = packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1349,19 +1390,19 @@ test('packageGitHubRelease emits deterministic canonical assets with normalized 
     assert.doesNotThrow(() => assertChecksumManifest(checksums, EXPECTED_ARCHIVES));
 
     const macosArm = parseTarGzEntries(
-      readFileSync(path.join(outputDir, 'coven-v0.4.1-macos-aarch64.tar.gz'))
+      readFileSync(path.join(outputDir, 'coven-v0.4.4-macos-aarch64.tar.gz'))
     );
     assert.equal(macosArm.gzipMtime, SOURCE_DATE_EPOCH);
     assertRootOnlyTarEntries(macosArm.entries, ['coven', 'coven-afs-serve']);
 
     const linux = parseTarGzEntries(
-      readFileSync(path.join(outputDir, 'coven-v0.4.1-linux-x64.tar.gz'))
+      readFileSync(path.join(outputDir, 'coven-v0.4.4-linux-x64.tar.gz'))
     );
     assert.equal(linux.gzipMtime, SOURCE_DATE_EPOCH);
     assertRootOnlyTarEntries(linux.entries, ['coven']);
 
     const windows = parseZipEntries(
-      readFileSync(path.join(outputDir, 'coven-v0.4.1-windows-x64.zip'))
+      readFileSync(path.join(outputDir, 'coven-v0.4.4-windows-x64.zip'))
     );
     const zipTimestamp = expectedZipTimestamp(SOURCE_DATE_EPOCH);
     assert.deepEqual(windows.map((entry) => entry.name), ['coven.exe']);
@@ -1378,7 +1419,7 @@ test('packageGitHubRelease is byte-identical across repeated runs with identical
       const artifactsDir = path.join(scratchDir, `${name}-artifacts`);
       const outputDir = path.join(scratchDir, `${name}-out`);
       cpSync(fixtureRoot, artifactsDir, { recursive: true });
-      packageGitHubRelease({
+      packageCanonicalRelease({
         releaseTag: RELEASE_TAG,
         artifactsDir,
         outputDir,
@@ -1416,7 +1457,7 @@ test('packageGitHubRelease rejects missing or extra source artifact files', () =
     rmSync(path.join(missingArtifactsDir, 'coven-macos', 'coven-afs-serve'));
     assert.throws(
       () =>
-        packageGitHubRelease({
+        packageCanonicalRelease({
           releaseTag: RELEASE_TAG,
           artifactsDir: missingArtifactsDir,
           outputDir: path.join(scratchDir, 'missing-out'),
@@ -1430,13 +1471,65 @@ test('packageGitHubRelease rejects missing or extra source artifact files', () =
     writeFileSync(path.join(extraArtifactsDir, 'coven-linux-x64', 'extra.txt'), 'unexpected\n');
     assert.throws(
       () =>
-        packageGitHubRelease({
+        packageCanonicalRelease({
           releaseTag: RELEASE_TAG,
           artifactsDir: extraArtifactsDir,
           outputDir: path.join(scratchDir, 'extra-out'),
           sourceDateEpoch: SOURCE_DATE_EPOCH
         }),
       /unexpected files/
+    );
+  });
+});
+
+test('packageGitHubRelease refuses missing or misnamed Automations protocol bundles', () => {
+  withScratchDir('invalid-protocol-bundle', (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    assert.throws(
+      () =>
+        packageGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          artifactsDir,
+          outputDir: path.join(scratchDir, 'missing-out'),
+          sourceDateEpoch: SOURCE_DATE_EPOCH,
+          sourceCommit: HEAD_SHA,
+          protocolBundlePath: path.join(scratchDir, PROTOCOL_BUNDLE_NAME)
+        }),
+      /protocol bundle must be a regular file/i
+    );
+
+    const wrongName = path.join(scratchDir, 'wrong-name.tar.gz');
+    writeFileSync(wrongName, 'protocol bundle\n');
+    assert.throws(
+      () =>
+        packageGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          artifactsDir,
+          outputDir: path.join(scratchDir, 'misnamed-out'),
+          sourceDateEpoch: SOURCE_DATE_EPOCH,
+          sourceCommit: HEAD_SHA,
+          protocolBundlePath: wrongName
+        }),
+      new RegExp(`protocol bundle must be a regular file named ${PROTOCOL_BUNDLE_NAME}`)
+    );
+  });
+});
+
+test('packageGitHubRelease preserves pre-v0.4.4 recovery without a protocol bundle', () => {
+  withScratchDir('legacy-release-package', (scratchDir) => {
+    const artifactsDir = path.join(scratchDir, 'artifacts');
+    const outputDir = path.join(scratchDir, 'out');
+    cpSync(fixtureRoot, artifactsDir, { recursive: true });
+    const produced = packageGitHubRelease({
+      releaseTag: 'v0.4.3',
+      artifactsDir,
+      outputDir,
+      sourceDateEpoch: SOURCE_DATE_EPOCH
+    });
+    assert.deepEqual(
+      produced.assetNames.sort(),
+      canonicalReleaseAssetNames('v0.4.3', HEAD_SHA).sort()
     );
   });
 });
@@ -1534,7 +1627,7 @@ test('syncGitHubRelease revalidates the verified remote tag before creating a mi
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1563,7 +1656,7 @@ test('syncGitHubRelease revalidates the verified remote tag before creating a mi
       }
     ]);
     assert.deepEqual(client.state.created, [
-      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.1', notesFromTag: true, verifyTag: true }
+      { releaseTag: RELEASE_TAG, title: 'Coven v0.4.4', notesFromTag: true, verifyTag: true }
     ]);
     assert.deepEqual(result.uploaded.sort(), EXPECTED_ASSET_NAMES);
     assert.deepEqual(result.skipped, []);
@@ -1575,7 +1668,7 @@ test('syncGitHubRelease refuses release creation when the verified remote tag wa
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1585,7 +1678,7 @@ test('syncGitHubRelease refuses release creation when the verified remote tag wa
     const cases = [
       {
         name: 'deleted',
-        error: /no longer resolves to refs\/tags\/v0\.4\.1/i,
+        error: /no longer resolves to refs\/tags\/v0\.4\.4/i,
         revalidateTagState() {
           throw new Error(
             `Refusing GitHub release: ${RELEASE_TAG} no longer resolves to refs/tags/${RELEASE_TAG}.`
@@ -1636,7 +1729,7 @@ test('syncGitHubRelease skips a fully matching rerun, including >1 MiB assets, w
       Buffer.concat([readFileSync(windowsBinaryPath), Buffer.alloc(1_250_000, 0x61)])
     );
 
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1680,7 +1773,7 @@ test('syncGitHubRelease refuses a fully matching rerun when the verified remote 
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1724,7 +1817,7 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1759,6 +1852,8 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
         syncGitHubRelease({
           releaseTag: RELEASE_TAG,
           outputDir,
+          expectedTagObjectSha: baseTagRef().object.sha,
+          expectedHeadSha: HEAD_SHA,
           releaseClient: mismatchedClient
         }),
       /observed hash .* expected hash .* delete only the mismatched GitHub asset/i
@@ -1775,6 +1870,8 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
         syncGitHubRelease({
           releaseTag: RELEASE_TAG,
           outputDir,
+          expectedTagObjectSha: baseTagRef().object.sha,
+          expectedHeadSha: HEAD_SHA,
           releaseClient: extraClient
         }),
       /unexpected release assets/
@@ -1793,6 +1890,8 @@ test('syncGitHubRelease skips matching assets, uploads only missing ones, and fa
         syncGitHubRelease({
           releaseTag: RELEASE_TAG,
           outputDir,
+          expectedTagObjectSha: baseTagRef().object.sha,
+          expectedHeadSha: HEAD_SHA,
           releaseClient: duplicateClient
         }),
       /duplicate release assets/
@@ -1805,7 +1904,7 @@ test('syncGitHubRelease revalidates the verified remote tag before uploading mis
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1845,7 +1944,7 @@ test('syncGitHubRelease refuses to upload missing assets to an existing release 
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1855,7 +1954,7 @@ test('syncGitHubRelease refuses to upload missing assets to an existing release 
     const cases = [
       {
         name: 'deleted',
-        error: /no longer resolves to refs\/tags\/v0\.4\.1/i,
+        error: /no longer resolves to refs\/tags\/v0\.4\.4/i,
         revalidateTagState() {
           throw new Error(
             `Refusing GitHub release: ${RELEASE_TAG} no longer resolves to refs/tags/${RELEASE_TAG}.`
@@ -1905,7 +2004,7 @@ test('syncGitHubRelease rejects existing release metadata mismatches before acce
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
@@ -1931,7 +2030,7 @@ test('syncGitHubRelease rejects existing release metadata mismatches before acce
           title: 'Wrong title',
           assets: allAssets
         }),
-        error: /title .*Coven v0\.4\.1/i
+        error: /title .*Coven v0\.4\.4/i
       },
       {
         name: 'draft release',
@@ -1961,6 +2060,8 @@ test('syncGitHubRelease rejects existing release metadata mismatches before acce
           syncGitHubRelease({
             releaseTag: RELEASE_TAG,
             outputDir,
+            expectedTagObjectSha: baseTagRef().object.sha,
+            expectedHeadSha: HEAD_SHA,
             releaseClient: client
           }),
         error,
@@ -1977,13 +2078,13 @@ test('syncGitHubRelease preflights later mismatches before uploading earlier mis
     const artifactsDir = path.join(scratchDir, 'artifacts');
     const outputDir = path.join(scratchDir, 'out');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
-    packageGitHubRelease({
+    packageCanonicalRelease({
       releaseTag: RELEASE_TAG,
       artifactsDir,
       outputDir,
       sourceDateEpoch: SOURCE_DATE_EPOCH
     });
-    const windowsAssetName = 'coven-v0.4.1-windows-x64.zip';
+    const windowsAssetName = 'coven-v0.4.4-windows-x64.zip';
     const client = fakeReleaseClient({
       existingRelease: baseExistingRelease({
         assets: [{ id: 1, name: windowsAssetName }]
@@ -1998,6 +2099,8 @@ test('syncGitHubRelease preflights later mismatches before uploading earlier mis
         syncGitHubRelease({
           releaseTag: RELEASE_TAG,
           outputDir,
+          expectedTagObjectSha: baseTagRef().object.sha,
+          expectedHeadSha: HEAD_SHA,
           releaseClient: client
         }),
       /asset .*windows.* mismatch/i

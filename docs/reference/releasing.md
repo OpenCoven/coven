@@ -150,6 +150,7 @@ That single push is the entire release. The workflow takes over from there.
 3. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
 4. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
 5. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
+6. **Automations protocol bundle** — starting with `v0.4.4`, rebuilds `spec/coven-automations/v1/` from the exact tagged commit into a deterministic source-bound bundle. The embedded manifest records every contract file digest and a commit-independent `contractContentSha256`. GitHub-only recovery of older tags preserves their original four-archive-plus-checksum asset contract.
 
 ### Postflight
 
@@ -171,9 +172,14 @@ The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using t
 - `coven-vX.Y.Z-macos-x64.tar.gz`
 - `coven-vX.Y.Z-linux-x64.tar.gz`
 - `coven-vX.Y.Z-windows-x64.zip`
+- `coven-automations-v1-contract-<tagged-commit>.tar.gz`
 - `SHA256SUMS`
 
-`SHA256SUMS` contains exactly four lexically ordered entries naming only those four archive filenames. The GitHub Release is the public binary/checksum surface; npm provenance remains the package-integrity surface.
+`SHA256SUMS` contains exactly four lexically ordered entries naming only the
+four native archive filenames. The Automations protocol bundle is verified
+separately through its embedded `manifest.json`; it must never be added to
+`SHA256SUMS`. The GitHub Release is the public binary/checksum surface; npm
+provenance remains the package-integrity surface.
 
 Download the published assets and verify the checksums actually match, rather
 than trusting that the file exists:
@@ -198,6 +204,33 @@ Get-Content SHA256SUMS | ForEach-Object {
 
 All four archives must report `OK`. This is the one checksum surface, so a
 single mismatch fails the release regardless of what npm reports.
+
+Verify the protocol asset is bound to the same commit as the immutable tag and
+that every archived file, recorded size/digest, and the aggregate content
+digest match. Use the protocol bundle SHA-256 recorded in the release workflow
+log and release evidence packet; do not derive the expected value from the
+download being verified:
+
+```sh
+TAG_COMMIT="$(git rev-list -n 1 vX.Y.Z)"
+PROTOCOL_BUNDLE="coven-automations-v1-contract-${TAG_COMMIT}.tar.gz"
+EXPECTED_PROTOCOL_SHA256="<64-character SHA-256 from the release evidence>"
+gh release download vX.Y.Z \
+  --repo OpenCoven/coven \
+  --pattern "$PROTOCOL_BUNDLE" \
+  --dir release-check
+node scripts/package-automations-protocol.mjs verify \
+  --bundle "release-check/$PROTOCOL_BUNDLE" \
+  --source-commit "$TAG_COMMIT" \
+  --sha256 "$EXPECTED_PROTOCOL_SHA256"
+```
+
+The verifier refuses malformed or non-normalized archives, unsafe or duplicate
+paths, missing or extra contract files, source-commit drift, and any bundle,
+file, size, or aggregate content-digest mismatch. The SDK and Cave release
+canaries must consume this downloaded archive and its recorded SHA-256. Reading
+`spec/coven-automations/v1/` from a source checkout does not certify the
+released artifact.
 
 ### Verify a fresh consumer install
 
