@@ -3369,9 +3369,6 @@ type CleanupArtifactReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>
 type VerifiedCleanupCaptureReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
 
 #[cfg(test)]
-type DirectPostCommitSabotage = std::sync::Mutex<BTreeMap<PathBuf, PathBuf>>;
-
-#[cfg(test)]
 type EarlyStagingMoveHook = std::sync::Mutex<BTreeSet<PathBuf>>;
 
 #[cfg(test)]
@@ -3418,12 +3415,6 @@ fn cleanup_artifact_replacement_hook() -> &'static CleanupArtifactReplacementHoo
 fn verified_cleanup_capture_replacement_hook() -> &'static VerifiedCleanupCaptureReplacementHook {
     static HOOK: std::sync::OnceLock<VerifiedCleanupCaptureReplacementHook> =
         std::sync::OnceLock::new();
-    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
-}
-
-#[cfg(test)]
-fn direct_post_commit_sabotage() -> &'static DirectPostCommitSabotage {
-    static HOOK: std::sync::OnceLock<DirectPostCommitSabotage> = std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
@@ -3481,14 +3472,6 @@ fn set_verified_cleanup_capture_replacement(parent: PathBuf, replacement: Vec<u8
         .lock()
         .expect("verified cleanup capture replacement hook lock poisoned")
         .insert(parent, replacement);
-}
-
-#[cfg(test)]
-pub(crate) fn set_direct_post_commit_store_sabotage(path: PathBuf, store: PathBuf) {
-    direct_post_commit_sabotage()
-        .lock()
-        .expect("direct post-commit sabotage lock poisoned")
-        .insert(path, store);
 }
 
 #[cfg(test)]
@@ -3561,18 +3544,6 @@ fn set_conditional_atomic_replacement(trigger: PathBuf, target: PathBuf, replace
 
 #[cfg(test)]
 fn maybe_fail_direct_cleanup(path: &Path) -> Result<()> {
-    if let Some(store) = direct_post_commit_sabotage()
-        .lock()
-        .expect("direct post-commit sabotage lock poisoned")
-        .remove(path)
-    {
-        match std::fs::remove_file(&store) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("removing audit store for test sabotage"),
-        }
-        std::fs::create_dir(&store).context("replacing audit store with a directory")?;
-    }
     if direct_cleanup_hook()
         .lock()
         .expect("direct cleanup hook lock poisoned")

@@ -184,6 +184,9 @@ type ProposalWriteLockProbeMap =
     Mutex<std::collections::HashMap<(PathBuf, String), std::sync::mpsc::Sender<bool>>>;
 
 #[cfg(test)]
+type DirectAuditStoreFailureSet = Mutex<std::collections::HashSet<PathBuf>>;
+
+#[cfg(test)]
 fn direct_apply_lock_probes() -> &'static DirectApplyLockProbeMap {
     static PROBES: OnceLock<DirectApplyLockProbeMap> = OnceLock::new();
     PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
@@ -193,6 +196,37 @@ fn direct_apply_lock_probes() -> &'static DirectApplyLockProbeMap {
 fn proposal_write_lock_probes() -> &'static ProposalWriteLockProbeMap {
     static PROBES: OnceLock<ProposalWriteLockProbeMap> = OnceLock::new();
     PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn direct_audit_store_failures() -> &'static DirectAuditStoreFailureSet {
+    static FAILURES: OnceLock<DirectAuditStoreFailureSet> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+fn set_direct_audit_store_failure(store_path: PathBuf) {
+    direct_audit_store_failures()
+        .lock()
+        .expect("direct audit store failures lock poisoned")
+        .insert(store_path);
+}
+
+#[cfg(test)]
+fn maybe_fail_direct_audit_store_verification(store_path: &Path) -> Result<()> {
+    if direct_audit_store_failures()
+        .lock()
+        .expect("direct audit store failures lock poisoned")
+        .remove(store_path)
+    {
+        anyhow::bail!("injected direct audit store verification failure");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_direct_audit_store_verification(_store_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6126,7 +6160,9 @@ fn apply_familiar_edits(
     // changes so clients can distinguish "write applied, audit failed" from a
     // full failure and avoid blind retries that would produce duplicate writes.
     {
-        if let Err(error) = audit_reservation.verify_store_path(&store_path) {
+        if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
+            .and_then(|()| audit_reservation.verify_store_path(&store_path))
+        {
             audit_reservation.preserve()?;
             return direct_audit_persist_failed_response(&changes, &error);
         }
@@ -24706,14 +24742,15 @@ forbidden = ["(?i)ignore previous"]
     }
 
     #[test]
-    fn post_familiar_edits_reports_applied_changes_when_audit_store_reopen_fails() -> Result<()> {
+    fn post_familiar_edits_reports_applied_changes_when_audit_store_verification_fails(
+    ) -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let workspace = seed_warded_familiar(home)?;
         std::fs::create_dir_all(workspace.join("notes"))?;
         let target = workspace.canonicalize()?.join("notes/today.md");
         std::fs::write(&target, "before")?;
-        ward::set_direct_post_commit_store_sabotage(target.clone(), home.join("coven.sqlite3"));
+        set_direct_audit_store_failure(home.join("coven.sqlite3"));
 
         let response = post_edits(
             home,

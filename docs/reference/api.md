@@ -5,6 +5,7 @@ read_when:
   - Building a client against `/api/v1`
 title: "Coven API reference"
 description: "Endpoint reference for every route the Coven daemon serves under /api/v1: contract discovery, sessions and events, observability reads, familiars, skills, store, cast, travel, scheduler, and the hub control plane."
+source_adjacent_reason: "Tracks the daemon API and security contracts implemented in this repository."
 ---
 
 

@@ -7,6 +7,7 @@ read_when:
   - Auditing applied Ward writes
 title: "coven ward"
 description: "Reference for coven ward: inspect, approve, or reject pending Ward proposals, read the append-only ward_audit ledger, and migrate v0.1 ward.toml files to the Phase-2 WardConfig dialect."
+source_adjacent_reason: "Tracks the Ward CLI and security contracts implemented in this repository."
 ---
 
 `coven ward` groups the Ward's principal-facing lifecycle verbs. Held writes
