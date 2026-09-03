@@ -3,9 +3,26 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
+  buildLocalInstallArgs,
   DEFAULT_COMMAND_TIMEOUT_MS,
   synthesizeDryRunVersion
 } from './test-cli-prepublish.mjs';
+
+test('local tarball install is offline and disables registry extras', () => {
+  assert.deepEqual(
+    buildLocalInstallArgs('/tmp/native.tgz', '/tmp/wrapper.tgz'),
+    [
+      'install',
+      '--offline',
+      '--no-package-lock',
+      '--omit=optional',
+      '--no-audit',
+      '--no-fund',
+      '/tmp/native.tgz',
+      '/tmp/wrapper.tgz'
+    ]
+  );
+});
 
 test('synthesizeDryRunVersion honors COVEN_NPM_DRY_RUN_VERSION without calling npm view', () => {
   let called = false;
