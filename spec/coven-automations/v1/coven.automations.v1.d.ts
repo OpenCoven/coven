@@ -526,6 +526,14 @@ export interface ErrorEnvelope {
   currentRevision?: number;
 }
 
+export interface EventRef {
+  stream: string;
+  sequence: number;
+}
+
+export type CommandResultByCommand<C extends CommandName> =
+  C extends "events.read.v1" | "events.subscribe.v1" ? EventPage : Record<string, unknown>;
+
 export interface CommandResponse<C extends CommandName = CommandName> {
   schemaVersion: SchemaVersion;
   command: C;
@@ -533,10 +541,10 @@ export interface CommandResponse<C extends CommandName = CommandName> {
   outcome: "committed" | "replayed" | "rejected";
   replay?: { firstCommittedAt: Timestamp };
   revision?: number;
-  result?: Record<string, unknown>;
+  result?: CommandResultByCommand<C>;
   error?: ErrorEnvelope;
   receiptRef?: string;
-  eventRef?: { stream: string; sequence: number };
+  eventRef?: EventRef;
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +566,17 @@ export type EventKind =
   | "attempt.transitioned"
   | "receipt.recorded"
   | "feed.snapshot";
+
+export interface EventPage {
+  stream: StreamRef;
+  /** Concrete exclusive cursor used for this page; null means the stream beginning. */
+  after: number | null;
+  events: EventEnvelope[];
+  /** Last delivered sequence, or the concrete exclusive cursor when the page is empty. */
+  nextAfter: number | null;
+  checkpoint: string;
+  checkpointExpiresAt: Timestamp;
+}
 
 export interface DefinitionLifecycleEventPayload {
   revision: number;

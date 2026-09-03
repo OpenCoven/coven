@@ -2,7 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -26,6 +26,7 @@ const ZIP_STORE_METHOD = 0;
 const TRUSTED_PUBLISHER_NAME = 'GitHub Actions';
 const TRUSTED_PUBLISHER_EMAIL = 'npm-oidc-no-reply@github.com';
 const TRUSTED_PUBLISHER_ID = 'github';
+const AUTOMATIONS_PROTOCOL_FIRST_RELEASE = [0, 4, 4];
 const RELEASE_PACKAGES = [
   '@opencoven/cli',
   '@opencoven/cli-linux-x64',
@@ -146,7 +147,9 @@ async function main() {
         releaseTag: requiredOption(options, 'release-tag'),
         artifactsDir: requiredOption(options, 'artifacts-dir'),
         outputDir: requiredOption(options, 'output-dir'),
-        sourceDateEpoch: requiredOption(options, 'source-date-epoch')
+        sourceDateEpoch: requiredOption(options, 'source-date-epoch'),
+        sourceCommit: options.get('source-commit'),
+        protocolBundlePath: options.get('protocol-bundle')
       });
       return;
     }
@@ -193,10 +196,35 @@ function requiredOption(options, key) {
   return value;
 }
 
-export function canonicalReleaseAssetNames(releaseTag) {
+export function automationsProtocolBundleName(sourceCommit) {
+  const normalized = String(sourceCommit).trim();
+  if (!/^[0-9a-f]{40}$/.test(normalized)) {
+    throw new Error(`Automations protocol source commit must be a lowercase 40-character Git SHA: ${normalized}`);
+  }
+  return `coven-automations-v1-contract-${normalized}.tar.gz`;
+}
+
+function releaseIncludesAutomationsProtocol(releaseTag) {
+  const { npmVersion } = parseReleaseTag(releaseTag);
+  const version = npmVersion.split('.').map(Number);
+  for (let index = 0; index < AUTOMATIONS_PROTOCOL_FIRST_RELEASE.length; index += 1) {
+    if (version[index] > AUTOMATIONS_PROTOCOL_FIRST_RELEASE[index]) {
+      return true;
+    }
+    if (version[index] < AUTOMATIONS_PROTOCOL_FIRST_RELEASE[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function canonicalReleaseAssetNames(releaseTag, sourceCommit) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   return [
     ...Object.values(PACKAGE_DEFINITIONS).map((definition) => definition.assetName(npmVersion)),
+    ...(releaseIncludesAutomationsProtocol(releaseTag)
+      ? [automationsProtocolBundleName(sourceCommit)]
+      : []),
     CHECKSUMS_NAME
   ];
 }
@@ -887,7 +915,14 @@ function assertReleasePackagesResolvedInLockfile({ auditDir, npmVersion }) {
   return entries;
 }
 
-export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sourceDateEpoch }) {
+export function packageGitHubRelease({
+  releaseTag,
+  artifactsDir,
+  outputDir,
+  sourceDateEpoch,
+  sourceCommit,
+  protocolBundlePath
+}) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   const normalizedArtifactsDir = path.resolve(String(artifactsDir));
   const normalizedOutputDir = path.resolve(String(outputDir));
@@ -912,9 +947,37 @@ export function packageGitHubRelease({ releaseTag, artifactsDir, outputDir, sour
     checksumRecords.map((record) => record.assetName)
   );
   writeFileSync(path.join(normalizedOutputDir, CHECKSUMS_NAME), checksumText);
+  const protocolAssetNames = [];
+  if (releaseIncludesAutomationsProtocol(releaseTag)) {
+    if (!sourceCommit || !protocolBundlePath) {
+      throw new Error(
+        'GitHub releases v0.4.4 and later require sourceCommit and protocolBundlePath for the Automations protocol asset.'
+      );
+    }
+    const protocolBundleName = automationsProtocolBundleName(sourceCommit);
+    const normalizedProtocolBundlePath = path.resolve(String(protocolBundlePath));
+    if (
+      path.basename(normalizedProtocolBundlePath) !== protocolBundleName ||
+      !existsSync(normalizedProtocolBundlePath) ||
+      !statSync(normalizedProtocolBundlePath).isFile()
+    ) {
+      throw new Error(
+        `Refusing GitHub release: protocol bundle must be a regular file named ${protocolBundleName}.`
+      );
+    }
+    copyFileSync(
+      normalizedProtocolBundlePath,
+      path.join(normalizedOutputDir, protocolBundleName)
+    );
+    protocolAssetNames.push(protocolBundleName);
+  }
 
   return {
-    assetNames: [...checksumRecords.map((record) => record.assetName), CHECKSUMS_NAME].sort(),
+    assetNames: [
+      ...checksumRecords.map((record) => record.assetName),
+      ...protocolAssetNames,
+      CHECKSUMS_NAME
+    ].sort(),
     checksums: checksumRecords
   };
 }
@@ -1160,7 +1223,7 @@ export async function syncGitHubRelease({
   expectedHeadSha,
   releaseClient = createGhReleaseClient()
 }) {
-  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag).sort();
+  const expectedAssetNames = canonicalReleaseAssetNames(releaseTag, expectedHeadSha).sort();
   const normalizedOutputDir = path.resolve(String(outputDir));
   const presentAssetNames = readdirSync(normalizedOutputDir).sort();
   if (presentAssetNames.join('\n') !== expectedAssetNames.join('\n')) {

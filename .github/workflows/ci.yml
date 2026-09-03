@@ -108,8 +108,48 @@ jobs:
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
       - run: node --test scripts/package-github-release-test.mjs
+      - run: node --test scripts/package-automations-protocol.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       - run: scripts/check-workflows.sh
+
+  automations-protocol-bundle:
+    name: Automations v1 protocol bundle
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - name: Package exact-commit Automations protocol
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          AUTOMATIONS_ARTIFACT_DIR: ${{ runner.temp }}/coven-automations-v1-contract
+        run: |
+          set -euo pipefail
+          node --test scripts/package-automations-protocol.test.mjs
+          node scripts/package-automations-protocol.mjs \
+            --output "$AUTOMATIONS_ARTIFACT_DIR"
+          PROTOCOL_BUNDLE="$AUTOMATIONS_ARTIFACT_DIR/coven-automations-v1-contract-${SOURCE_COMMIT}.tar.gz"
+          PROTOCOL_SHA256="$(sha256sum "$PROTOCOL_BUNDLE" | awk '{print $1}')"
+          node scripts/package-automations-protocol.mjs verify \
+            --bundle "$PROTOCOL_BUNDLE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --sha256 "$PROTOCOL_SHA256"
+          jq -e --arg sourceCommit "$SOURCE_COMMIT" \
+            '.sourceCommit == $sourceCommit and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
+            "$AUTOMATIONS_ARTIFACT_DIR/manifest.json"
+      - name: Upload exact-commit Automations protocol
+        uses: actions/upload-artifact@v7
+        with:
+          name: coven-automations-v1-contract-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/coven-automations-v1-contract/coven-automations-v1-contract-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/coven-automations-v1-contract/manifest.json
+          if-no-files-found: error
 
   rust-lint-linux:
     name: Rust lint (Linux)
@@ -548,6 +588,7 @@ jobs:
     needs:
       - changes
       - policy-guard
+      - automations-protocol-bundle
       - rust-lint-linux
       - rust-test-linux
       - rust-test-windows
@@ -576,7 +617,7 @@ jobs:
               for name, data in jobs.items()
               if data["result"] not in {"success", "skipped"}
           }
-          for required in ("changes", "policy-guard"):
+          for required in ("changes", "policy-guard", "automations-protocol-bundle"):
               if jobs[required]["result"] != "success":
                   bad[required] = jobs[required]["result"]
           if bad:

@@ -40,3 +40,18 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 ## Conformance
 
 Required test suites and canary requirements (Coven, SDK, Cave — each against packed/released artifacts, not source-relative imports) are listed in `conformance-manifest.json`. Golden vectors are self-contained: any draft 2020-12 validator plus the digest recipe in `test-vectors.json` suffices to run them outside the Coven crate.
+
+## Immutable bundle
+
+CI packages this directory as
+`coven-automations-v1-contract-<source-commit>.tar.gz`. The archive contains
+these contract files under `coven-automations-v1/` plus `manifest.json`.
+The manifest binds the bundle to the exact source commit, records the SHA-256
+and byte size of every contract file, and publishes `contractContentSha256`
+over the lexically ordered `relative-path\0sha256\n` pairs. That content digest
+excludes the source commit and archive metadata, so consumers can distinguish
+unchanged contract bytes from a newly source-bound release bundle.
+
+SDK, Cave, and other canaries must download the exact-commit CI or release
+artifact and verify its digest and manifest. Importing this source directory
+directly is not a conformance result.
