@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::types::AdoptionKey;
+use super::types::{AdoptionKey, PositiveInteger};
 
 /// Every error code frozen by `error-envelope.schema.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ impl ErrorCode {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorEnvelope {
-    pub code: ErrorCode,
+    code: ErrorCode,
     http_status: u16,
     pub message: String,
     pub retryable: bool,
@@ -115,7 +115,7 @@ pub struct ErrorEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adoption: Option<ErrorAdoption>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_revision: Option<u64>,
+    pub current_revision: Option<PositiveInteger>,
 }
 
 impl ErrorEnvelope {
@@ -130,6 +130,11 @@ impl ErrorEnvelope {
             adoption: None,
             current_revision: None,
         }
+    }
+
+    #[must_use]
+    pub const fn code(&self) -> ErrorCode {
+        self.code
     }
 
     #[must_use]
@@ -150,7 +155,7 @@ impl ErrorEnvelope {
     }
 
     #[must_use]
-    pub fn with_current_revision(mut self, current_revision: u64) -> Self {
+    pub fn with_current_revision(mut self, current_revision: PositiveInteger) -> Self {
         self.current_revision = Some(current_revision);
         self
     }
@@ -170,7 +175,7 @@ impl<'de> Deserialize<'de> for ErrorEnvelope {
             retryable: bool,
             details: Option<BTreeMap<String, Value>>,
             adoption: Option<ErrorAdoption>,
-            current_revision: Option<u64>,
+            current_revision: Option<PositiveInteger>,
         }
 
         let raw = Raw::deserialize(deserializer)?;

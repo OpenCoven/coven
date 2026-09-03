@@ -3,21 +3,415 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::ser::{SerializeStruct, Serializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use super::error::ErrorEnvelope;
 
-pub type Timestamp = String;
-pub type AutomationId = String;
-pub type OccurrenceId = String;
-pub type RunId = String;
-pub type AttemptId = String;
-pub type ReceiptId = String;
-pub type AdoptionKey = String;
-pub type CorrelationId = String;
-pub type ExtensionBag = BTreeMap<String, Value>;
 pub type JsonObject = BTreeMap<String, Value>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StringConstraintError(&'static str);
+
+impl fmt::Display for StringConstraintError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for StringConstraintError {}
+
+macro_rules! validated_string {
+    ($name:ident, $validator:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: String) -> Result<Self, StringConstraintError> {
+                if $validator(&value) {
+                    Ok(Self(value))
+                } else {
+                    Err(StringConstraintError(stringify!($name)))
+                }
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_str(&self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+fn matches_identifier(value: &str, maximum: usize) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= maximum
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn matches_adoption_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 8
+        && bytes.len() <= 200
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn matches_correlation_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 200
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+}
+
+fn matches_principal_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'@' | b'-')
+        })
+}
+
+fn matches_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let separators = match bytes.len() {
+        20 if matches!(
+            bytes,
+            [
+                _,
+                _,
+                _,
+                _,
+                b'-',
+                _,
+                _,
+                b'-',
+                _,
+                _,
+                b'T',
+                _,
+                _,
+                b':',
+                _,
+                _,
+                b':',
+                _,
+                _,
+                b'Z'
+            ]
+        ) =>
+        {
+            [4, 7, 10, 13, 16, 19].as_slice()
+        }
+        24 if matches!(
+            bytes,
+            [
+                _,
+                _,
+                _,
+                _,
+                b'-',
+                _,
+                _,
+                b'-',
+                _,
+                _,
+                b'T',
+                _,
+                _,
+                b':',
+                _,
+                _,
+                b':',
+                _,
+                _,
+                b'.',
+                _,
+                _,
+                _,
+                b'Z'
+            ]
+        ) =>
+        {
+            [4, 7, 10, 13, 16, 19, 23].as_slice()
+        }
+        _ => return false,
+    };
+    bytes
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !separators.contains(index))
+        .all(|(_, byte)| byte.is_ascii_digit())
+}
+
+fn matches_automation_id(value: &str) -> bool {
+    matches_identifier(value, 96)
+}
+
+fn matches_entity_id(value: &str) -> bool {
+    matches_identifier(value, 160)
+}
+
+fn matches_familiar_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 64
+}
+
+fn matches_runtime_id(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 64
+}
+
+fn matches_approval_policy_ref(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 200
+}
+
+fn matches_capability(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= 96
+}
+
+fn matches_approval_record_ref(value: &str) -> bool {
+    value.chars().count() <= 200
+}
+
+fn matches_runtime_model(value: &str) -> bool {
+    value.chars().count() <= 128
+}
+
+fn matches_sha256_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+validated_string!(Timestamp, matches_timestamp);
+validated_string!(AutomationId, matches_automation_id);
+validated_string!(OccurrenceId, matches_entity_id);
+validated_string!(RunId, matches_entity_id);
+validated_string!(AttemptId, matches_entity_id);
+validated_string!(ReceiptId, matches_entity_id);
+validated_string!(AdoptionKey, matches_adoption_key);
+validated_string!(CorrelationId, matches_correlation_id);
+validated_string!(PrincipalId, matches_principal_id);
+validated_string!(FamiliarId, matches_familiar_id);
+validated_string!(RuntimeId, matches_runtime_id);
+validated_string!(ApprovalPolicyRef, matches_approval_policy_ref);
+validated_string!(Capability, matches_capability);
+validated_string!(Sha256Digest, matches_sha256_digest);
+validated_string!(ApprovalRecordRef, matches_approval_record_ref);
+validated_string!(RuntimeModel, matches_runtime_model);
+
+macro_rules! validated_integer {
+    ($name:ident, $minimum:expr, $maximum:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+        pub struct $name(u64);
+
+        impl $name {
+            pub fn new(value: u64) -> Result<Self, StringConstraintError> {
+                if ($minimum..=$maximum).contains(&value) {
+                    Ok(Self(value))
+                } else {
+                    Err(StringConstraintError(stringify!($name)))
+                }
+            }
+
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+
+        impl Serialize for $name {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                serializer.serialize_u64(self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                Self::new(u64::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+validated_integer!(PositiveInteger, 1, u64::MAX);
+validated_integer!(TimeoutMinutes, 1, 44_640);
+validated_integer!(MaximumAttempts, 1, 10);
+validated_integer!(BackoffSeconds, 1, 86_400);
+validated_integer!(LeaseMinutes, 1, 1_440);
+validated_integer!(RunAttemptCount, 1, 100);
+validated_integer!(CommandListLimit, 1, 100);
+validated_integer!(EventReadLimit, 1, 1_000);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionBag(BTreeMap<String, Value>);
+
+impl ExtensionBag {
+    pub fn new(values: BTreeMap<String, Value>) -> Result<Self, StringConstraintError> {
+        if values.keys().all(|key| matches_extension_key(key)) {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError("ExtensionBag"))
+        }
+    }
+}
+
+impl Serialize for ExtensionBag {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionBag {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(BTreeMap::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn matches_extension_key(key: &str) -> bool {
+    if let Some(suffix) = key.strip_prefix("x-") {
+        return !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    }
+    let mut parts = key.rsplitn(3, '.');
+    let Some(last) = parts.next() else {
+        return false;
+    };
+    let Some(middle) = parts.next() else {
+        return false;
+    };
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    !first.is_empty()
+        && !middle.is_empty()
+        && !last.is_empty()
+        && first
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+        && middle
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && last
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeCapabilities(Vec<Capability>);
+
+impl RuntimeCapabilities {
+    fn new(values: Vec<Capability>) -> Result<Self, StringConstraintError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if values.iter().all(|value| seen.insert(value.as_str())) {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError("RuntimeCapabilities must be unique"))
+        }
+    }
+}
+
+impl Serialize for RuntimeCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RuntimeCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExercisedCapabilities(Vec<Capability>);
+
+impl ExercisedCapabilities {
+    fn new(values: Vec<Capability>) -> Result<Self, StringConstraintError> {
+        if values.len() > 128 {
+            return Err(StringConstraintError(
+                "ExercisedCapabilities must contain at most 128 entries",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if values.iter().all(|value| seen.insert(value.as_str())) {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError(
+                "ExercisedCapabilities must be unique",
+            ))
+        }
+    }
+}
+
+impl Serialize for ExercisedCapabilities {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExercisedCapabilities {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SchemaVersion {
@@ -86,7 +480,7 @@ impl<'de> Deserialize<'de> for EmptyConditions {
 pub struct DigestValue {
     pub algorithm: DigestAlgorithm,
     pub canonicalization: Canonicalization,
-    pub value: String,
+    pub value: Sha256Digest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -104,7 +498,7 @@ pub enum Canonicalization {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrincipalRef {
-    pub principal_id: String,
+    pub principal_id: PrincipalId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
 }
@@ -112,24 +506,24 @@ pub struct PrincipalRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct FamiliarRef {
-    pub familiar_id: String,
+    pub familiar_id: FamiliarId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RuntimeDescriptor {
-    pub runtime_id: String,
-    pub capabilities: Vec<String>,
+    pub runtime_id: RuntimeId,
+    pub capabilities: RuntimeCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub model: Option<RuntimeModel>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalRef {
-    pub approval_policy_ref: String,
+    pub approval_policy_ref: ApprovalPolicyRef,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub approval_record_ref: Option<String>,
+    pub approval_record_ref: Option<ApprovalRecordRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,14 +593,14 @@ pub enum DefinitionLifecycleState {
     Invalid,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationDefinition {
     pub schema_version: SchemaVersion,
     pub automation_id: AutomationId,
-    pub revision: u64,
+    pub revision: PositiveInteger,
     pub integrity: DigestValue,
-    pub lifecycle_state: DefinitionLifecycleState,
+    lifecycle_state: DefinitionLifecycleState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletion: Option<DefinitionDeletion>,
     pub display: DefinitionDisplay,
@@ -214,16 +608,118 @@ pub struct AutomationDefinition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditions: Option<EmptyConditions>,
     pub action: FamiliarInvocationAction,
-    pub binding: DefinitionBinding,
+    binding: DefinitionBinding,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime_requirements: Option<RuntimeDescriptor>,
-    pub policies: DefinitionPolicies,
+    runtime_requirements: Option<RuntimeDescriptor>,
+    policies: DefinitionPolicies,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<Provenance>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activation: Option<ActivationWindow>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionBag>,
+}
+
+impl AutomationDefinition {
+    #[must_use]
+    pub const fn lifecycle_state(&self) -> DefinitionLifecycleState {
+        self.lifecycle_state
+    }
+
+    #[must_use]
+    pub fn binding(&self) -> &DefinitionBinding {
+        &self.binding
+    }
+
+    #[must_use]
+    pub fn runtime_requirements(&self) -> Option<&RuntimeDescriptor> {
+        self.runtime_requirements.as_ref()
+    }
+
+    #[must_use]
+    pub fn policies(&self) -> &DefinitionPolicies {
+        &self.policies
+    }
+
+    fn validate(&self) -> Result<(), StringConstraintError> {
+        if matches!(
+            self.lifecycle_state,
+            DefinitionLifecycleState::Active
+                | DefinitionLifecycleState::Paused
+                | DefinitionLifecycleState::Disabled
+        ) && (self.runtime_requirements.is_none() || self.binding.familiar_id.is_none())
+        {
+            return Err(StringConstraintError(
+                "active, paused, and disabled definitions require runtimeRequirements and binding.familiarId",
+            ));
+        }
+        if self.policies.retry.backoff_policy == BackoffPolicy::Fixed
+            && self.policies.retry.backoff_seconds.is_none()
+        {
+            return Err(StringConstraintError(
+                "fixed retry backoff requires backoffSeconds",
+            ));
+        }
+        if self
+            .policies
+            .delivery
+            .as_ref()
+            .is_some_and(|delivery| delivery.output_target.is_some() && delivery.mode.is_none())
+        {
+            return Err(StringConstraintError("delivery outputTarget requires mode"));
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomationDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            automation_id: AutomationId,
+            revision: PositiveInteger,
+            integrity: DigestValue,
+            lifecycle_state: DefinitionLifecycleState,
+            deletion: Option<DefinitionDeletion>,
+            display: DefinitionDisplay,
+            trigger: ScheduleTrigger,
+            conditions: Option<EmptyConditions>,
+            action: FamiliarInvocationAction,
+            binding: DefinitionBinding,
+            runtime_requirements: Option<RuntimeDescriptor>,
+            policies: DefinitionPolicies,
+            provenance: Option<Provenance>,
+            activation: Option<ActivationWindow>,
+            extensions: Option<ExtensionBag>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let definition = Self {
+            schema_version: raw.schema_version,
+            automation_id: raw.automation_id,
+            revision: raw.revision,
+            integrity: raw.integrity,
+            lifecycle_state: raw.lifecycle_state,
+            deletion: raw.deletion,
+            display: raw.display,
+            trigger: raw.trigger,
+            conditions: raw.conditions,
+            action: raw.action,
+            binding: raw.binding,
+            runtime_requirements: raw.runtime_requirements,
+            policies: raw.policies,
+            provenance: raw.provenance,
+            activation: raw.activation,
+            extensions: raw.extensions,
+        };
+        definition.validate().map_err(serde::de::Error::custom)?;
+        Ok(definition)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,7 +817,7 @@ pub enum FamiliarInvocationVariant {
 pub struct DefinitionBinding {
     pub familiar_binding_policy: FamiliarBindingPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub familiar_id: Option<String>,
+    pub familiar_id: Option<FamiliarId>,
     pub authority: ApprovalRef,
 }
 
@@ -346,16 +842,16 @@ pub struct DefinitionPolicies {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimeoutPolicy {
-    pub per_run_minutes: u64,
+    pub per_run_minutes: TimeoutMinutes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetryPolicy {
-    pub max_attempts: u64,
+    pub max_attempts: MaximumAttempts,
     pub backoff_policy: BackoffPolicy,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backoff_seconds: Option<u64>,
+    pub backoff_seconds: Option<BackoffSeconds>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retryable_classes: Option<Vec<RetryableClass>>,
 }
@@ -403,8 +899,10 @@ pub enum MisfirePolicyDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryPolicy {
-    pub output_target: String,
-    pub mode: DeliveryMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<DeliveryMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,7 +955,7 @@ pub struct AutomationOccurrence {
     pub schema_version: SchemaVersion,
     pub occurrence_id: OccurrenceId,
     pub automation_id: AutomationId,
-    pub automation_revision: u64,
+    pub automation_revision: PositiveInteger,
     pub trigger_identity: TriggerIdentity,
     pub occurrence_key: String,
     pub scheduled_for: Timestamp,
@@ -507,7 +1005,7 @@ pub enum TriggerIdentityKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OccurrenceFence {
-    pub generation: u64,
+    pub generation: PositiveInteger,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -518,7 +1016,7 @@ pub struct OccurrenceFence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaimMetadata {
     pub claimed_at: Timestamp,
-    pub lease_minutes: u64,
+    pub lease_minutes: LeaseMinutes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,12 +1084,12 @@ pub struct AutomationRun {
     pub run_id: RunId,
     pub occurrence_id: OccurrenceId,
     pub automation_id: AutomationId,
-    pub automation_revision: u64,
+    pub automation_revision: PositiveInteger,
     pub binding: RunBinding,
     pub state: RunState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_reason: Option<String>,
-    pub attempt_count: u64,
+    pub attempt_count: RunAttemptCount,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_attempt_id: Option<AttemptId>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -707,7 +1205,7 @@ pub struct AutomationAttempt {
     pub attempt_id: AttemptId,
     pub run_id: RunId,
     pub occurrence_id: OccurrenceId,
-    pub attempt_number: u64,
+    pub attempt_number: PositiveInteger,
     pub adoption_key: AdoptionKey,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prior_disposition: Option<PriorDisposition>,
@@ -734,7 +1232,7 @@ pub struct AutomationAttempt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PriorDisposition {
-    pub attempt_number: u64,
+    pub attempt_number: PositiveInteger,
     pub outcome: PriorAttemptOutcome,
 }
 
@@ -750,8 +1248,8 @@ pub enum PriorAttemptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DispatchFence {
-    pub occurrence_fence_generation: u64,
-    pub dispatch_generation: u64,
+    pub occurrence_fence_generation: PositiveInteger,
+    pub dispatch_generation: PositiveInteger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -817,23 +1315,27 @@ pub struct AutomationReceipt {
     pub schema_version: SchemaVersion,
     pub receipt_id: ReceiptId,
     pub automation_id: AutomationId,
-    pub automation_revision: u64,
-    pub definition_digest: DigestValue,
+    pub automation_revision: PositiveInteger,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub definition_digest: Option<DigestValue>,
     pub occurrence_id: OccurrenceId,
-    pub occurrence_fence_generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_fence_generation: Option<PositiveInteger>,
     pub run_id: RunId,
     pub attempt_id: AttemptId,
-    pub attempt_number: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attempt_number: Option<PositiveInteger>,
     pub identity: FamiliarRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority: Option<ReceiptAuthority>,
-    pub runtime: RuntimeDescriptor,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeDescriptor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_digest: Option<DigestValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_digest: Option<DigestValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub exercised_capabilities: Option<Vec<String>>,
+    pub exercised_capabilities: Option<ExercisedCapabilities>,
     pub side_effect_class: SideEffectClass,
     pub outcome: ReceiptOutcome,
     pub produced_at: Timestamp,
@@ -886,7 +1388,7 @@ pub enum ReceiptRecoveryDisposition {
 pub struct ReceiptIntegrity {
     pub algorithm: DigestAlgorithm,
     pub canonicalization: Canonicalization,
-    pub value: String,
+    pub value: Sha256Digest,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authentication: Option<ReceiptAuthentication>,
 }
@@ -950,18 +1452,386 @@ pub enum CommandName {
     LegacyImport,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandRequest {
+    schema_version: SchemaVersion,
+    adoption_key: AdoptionKey,
+    expected_revision: Option<PositiveInteger>,
+    origin: CommandOrigin,
+    intent: CommandIntent,
+    payload: CommandPayload,
+}
+
+impl CommandRequest {
+    pub fn new(
+        schema_version: SchemaVersion,
+        adoption_key: AdoptionKey,
+        expected_revision: Option<PositiveInteger>,
+        origin: CommandOrigin,
+        intent: CommandIntent,
+        payload: CommandPayload,
+    ) -> Result<Self, StringConstraintError> {
+        let revision_is_required = payload.requires_expected_revision();
+        if revision_is_required != expected_revision.is_some() {
+            return Err(StringConstraintError(
+                "expectedRevision is required only for definition revise/activate/pause/disable/tombstone commands",
+            ));
+        }
+        Ok(Self {
+            schema_version,
+            adoption_key,
+            expected_revision,
+            origin,
+            intent,
+            payload,
+        })
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> CommandName {
+        self.payload.command()
+    }
+
+    #[must_use]
+    pub const fn expected_revision(&self) -> Option<PositiveInteger> {
+        self.expected_revision
+    }
+
+    #[must_use]
+    pub fn payload(&self) -> &CommandPayload {
+        &self.payload
+    }
+}
+
+impl Serialize for CommandRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let field_count = if self.expected_revision.is_some() {
+            7
+        } else {
+            6
+        };
+        let mut state = serializer.serialize_struct("CommandRequest", field_count)?;
+        state.serialize_field("schemaVersion", &self.schema_version)?;
+        state.serialize_field("command", &self.command())?;
+        state.serialize_field("adoptionKey", &self.adoption_key)?;
+        if let Some(expected_revision) = self.expected_revision {
+            state.serialize_field("expectedRevision", &expected_revision)?;
+        }
+        state.serialize_field("origin", &self.origin)?;
+        state.serialize_field("intent", &self.intent)?;
+        state.serialize_field("payload", &self.payload)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            command: CommandName,
+            adoption_key: AdoptionKey,
+            expected_revision: Option<PositiveInteger>,
+            origin: CommandOrigin,
+            intent: CommandIntent,
+            payload: Value,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let payload = CommandPayload::from_value(raw.command, raw.payload)
+            .map_err(serde::de::Error::custom)?;
+        Self::new(
+            raw.schema_version,
+            raw.adoption_key,
+            raw.expected_revision,
+            raw.origin,
+            raw.intent,
+            payload,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CommandPayload {
+    DefinitionCreate(DefinitionMutationPayload),
+    DefinitionRevise(DefinitionMutationPayload),
+    DefinitionActivate(DefinitionTargetPayload),
+    DefinitionPause(DefinitionTargetPayload),
+    DefinitionDisable(DefinitionTargetPayload),
+    DefinitionTombstone(DefinitionTargetPayload),
+    OccurrenceRunNow(RunNowPayload),
+    OccurrenceCancel(OccurrenceCancelPayload),
+    RunCancel(RunCancelPayload),
+    AttemptCancel(AttemptCancelPayload),
+    AttemptRetry(AttemptRetryPayload),
+    OccurrenceRecover(OccurrenceRecoverPayload),
+    DefinitionList(DefinitionListPayload),
+    DefinitionGet(DefinitionGetPayload),
+    RunHistory(RunHistoryPayload),
+    DefinitionHealth(DefinitionHealthPayload),
+    EventsRead(EventsReadPayload),
+    EventsSubscribe(EventsSubscribePayload),
+    LegacyImport(LegacyImportPayload),
+}
+
+impl CommandPayload {
+    fn from_value(command: CommandName, value: Value) -> Result<Self, serde_json::Error> {
+        match command {
+            CommandName::DefinitionCreate => {
+                Ok(Self::DefinitionCreate(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionRevise => {
+                Ok(Self::DefinitionRevise(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionActivate => {
+                Ok(Self::DefinitionActivate(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionPause => {
+                Ok(Self::DefinitionPause(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionDisable => {
+                Ok(Self::DefinitionDisable(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionTombstone => {
+                Ok(Self::DefinitionTombstone(serde_json::from_value(value)?))
+            }
+            CommandName::OccurrenceRunNow => {
+                Ok(Self::OccurrenceRunNow(serde_json::from_value(value)?))
+            }
+            CommandName::OccurrenceCancel => {
+                Ok(Self::OccurrenceCancel(serde_json::from_value(value)?))
+            }
+            CommandName::RunCancel => Ok(Self::RunCancel(serde_json::from_value(value)?)),
+            CommandName::AttemptCancel => Ok(Self::AttemptCancel(serde_json::from_value(value)?)),
+            CommandName::AttemptRetry => Ok(Self::AttemptRetry(serde_json::from_value(value)?)),
+            CommandName::OccurrenceRecover => {
+                Ok(Self::OccurrenceRecover(serde_json::from_value(value)?))
+            }
+            CommandName::DefinitionList => Ok(Self::DefinitionList(serde_json::from_value(value)?)),
+            CommandName::DefinitionGet => Ok(Self::DefinitionGet(serde_json::from_value(value)?)),
+            CommandName::RunHistory => Ok(Self::RunHistory(serde_json::from_value(value)?)),
+            CommandName::DefinitionHealth => {
+                Ok(Self::DefinitionHealth(serde_json::from_value(value)?))
+            }
+            CommandName::EventsRead => Ok(Self::EventsRead(serde_json::from_value(value)?)),
+            CommandName::EventsSubscribe => {
+                Ok(Self::EventsSubscribe(serde_json::from_value(value)?))
+            }
+            CommandName::LegacyImport => Ok(Self::LegacyImport(serde_json::from_value(value)?)),
+        }
+    }
+
+    #[must_use]
+    pub const fn command(&self) -> CommandName {
+        match self {
+            Self::DefinitionCreate(_) => CommandName::DefinitionCreate,
+            Self::DefinitionRevise(_) => CommandName::DefinitionRevise,
+            Self::DefinitionActivate(_) => CommandName::DefinitionActivate,
+            Self::DefinitionPause(_) => CommandName::DefinitionPause,
+            Self::DefinitionDisable(_) => CommandName::DefinitionDisable,
+            Self::DefinitionTombstone(_) => CommandName::DefinitionTombstone,
+            Self::OccurrenceRunNow(_) => CommandName::OccurrenceRunNow,
+            Self::OccurrenceCancel(_) => CommandName::OccurrenceCancel,
+            Self::RunCancel(_) => CommandName::RunCancel,
+            Self::AttemptCancel(_) => CommandName::AttemptCancel,
+            Self::AttemptRetry(_) => CommandName::AttemptRetry,
+            Self::OccurrenceRecover(_) => CommandName::OccurrenceRecover,
+            Self::DefinitionList(_) => CommandName::DefinitionList,
+            Self::DefinitionGet(_) => CommandName::DefinitionGet,
+            Self::RunHistory(_) => CommandName::RunHistory,
+            Self::DefinitionHealth(_) => CommandName::DefinitionHealth,
+            Self::EventsRead(_) => CommandName::EventsRead,
+            Self::EventsSubscribe(_) => CommandName::EventsSubscribe,
+            Self::LegacyImport(_) => CommandName::LegacyImport,
+        }
+    }
+
+    const fn requires_expected_revision(&self) -> bool {
+        matches!(
+            self,
+            Self::DefinitionRevise(_)
+                | Self::DefinitionActivate(_)
+                | Self::DefinitionPause(_)
+                | Self::DefinitionDisable(_)
+                | Self::DefinitionTombstone(_)
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandRequest {
-    pub schema_version: SchemaVersion,
-    pub command: CommandName,
-    pub adoption_key: AdoptionKey,
+pub struct DefinitionMutationPayload {
+    pub definition: AutomationDefinition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefinitionTargetPayload {
+    pub automation_id: AutomationId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub expected_revision: Option<u64>,
-    pub origin: CommandOrigin,
-    pub intent: CommandIntent,
-    /// Per-command payloads are a schema-defined object bag.
-    pub payload: JsonObject,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunNowPayload {
+    pub automation_id: AutomationId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bypass_eligibility: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OccurrenceCancelPayload {
+    pub occurrence_id: OccurrenceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunCancelPayload {
+    pub run_id: RunId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttemptCancelPayload {
+    pub attempt_id: AttemptId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttemptRetryPayload {
+    pub run_id: RunId,
+    pub prior_attempt_number: PositiveInteger,
+    pub prior_disposition: RetryPriorDisposition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryPriorDisposition {
+    Failed,
+    TimedOut,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OccurrenceRecoverPayload {
+    pub occurrence_id: OccurrenceId,
+    pub evidence_determination: EvidenceDetermination,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub statement: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceDetermination {
+    FailedDeterministic,
+    RetryWithNewAttempt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefinitionListPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_state: Option<ListLifecycleState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<CommandListLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListLifecycleState {
+    Draft,
+    Paused,
+    Active,
+    Disabled,
+    Invalid,
+    Tombstoned,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefinitionGetPayload {
+    pub automation_id: AutomationId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<PositiveInteger>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunHistoryPayload {
+    pub automation_id: AutomationId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub occurrence_id: Option<OccurrenceId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<CommandListLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DefinitionHealthPayload {
+    pub automation_id: AutomationId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventsReadPayload {
+    pub stream: StreamRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<EventReadLimit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<Timestamp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EventsSubscribePayload {
+    pub stream: StreamRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LegacyImportPayload {
+    pub source: LegacyImportSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LegacyImportSource {
+    #[serde(rename = "codex-automation-toml")]
+    CodexAutomationToml,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1017,7 +1887,7 @@ pub struct CommandResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replay: Option<ReplayMetadata>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<u64>,
+    pub revision: Option<PositiveInteger>,
     /// Committed result bodies are explicitly open in the schema.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<JsonObject>,
@@ -1142,7 +2012,7 @@ pub enum EventPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionLifecyclePayload {
-    pub revision: u64,
+    pub revision: PositiveInteger,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_digest: Option<DigestValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1170,9 +2040,9 @@ pub struct TransitionPayload {
     pub to: String,
     pub reason: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub fence_generation: Option<u64>,
+    pub fence_generation: Option<PositiveInteger>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub attempt_number: Option<u64>,
+    pub attempt_number: Option<PositiveInteger>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_adoption_key: Option<AdoptionKey>,
 }

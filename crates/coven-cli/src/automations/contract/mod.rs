@@ -72,6 +72,7 @@ mod tests {
     #[test]
     fn checked_in_schema_artifacts_and_representative_vectors_load() {
         for artifact in [
+            "common.schema.json",
             "automation-definition.schema.json",
             "automation-occurrence.schema.json",
             "automation-run.schema.json",
@@ -83,6 +84,9 @@ mod tests {
         ] {
             let path = format!("../../../../../spec/coven-automations/v1/{artifact}");
             let schema: Value = match artifact {
+                "common.schema.json" => serde_json::from_str(include_str!(
+                    "../../../../../spec/coven-automations/v1/common.schema.json"
+                )),
                 "automation-definition.schema.json" => serde_json::from_str(include_str!(
                     "../../../../../spec/coven-automations/v1/automation-definition.schema.json"
                 )),
@@ -265,5 +269,106 @@ mod tests {
             "retryable": false,
             "details": {"automationId": "missing"}
         }));
+    }
+
+    #[test]
+    fn command_payloads_and_expected_revisions_are_command_correlated() {
+        let mut wrong_payload = fixture("command.create.golden");
+        wrong_payload["command"] = json!("run.cancel.v1");
+        assert!(serde_json::from_value::<CommandRequest>(wrong_payload).is_err());
+
+        let mut missing_revision = fixture("command.create.golden");
+        missing_revision["command"] = json!("definition.revise.v1");
+        assert!(serde_json::from_value::<CommandRequest>(missing_revision).is_err());
+
+        let mut forbidden_revision = fixture("command.create.golden");
+        forbidden_revision["expectedRevision"] = json!(1);
+        assert!(serde_json::from_value::<CommandRequest>(forbidden_revision).is_err());
+
+        let mut zero_revision = fixture("command.create.golden");
+        zero_revision["command"] = json!("definition.revise.v1");
+        zero_revision["expectedRevision"] = json!(0);
+        assert!(serde_json::from_value::<CommandRequest>(zero_revision).is_err());
+
+        let mut unknown_payload_field = fixture("command.create.golden");
+        unknown_payload_field["payload"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<CommandRequest>(unknown_payload_field).is_err());
+    }
+
+    #[test]
+    fn receipt_optional_fields_remain_optional() {
+        let mut receipt = fixture("receipt.golden");
+        for field in [
+            "definitionDigest",
+            "occurrenceFenceGeneration",
+            "attemptNumber",
+            "runtime",
+        ] {
+            receipt
+                .as_object_mut()
+                .expect("receipt fixture is an object")
+                .remove(field);
+        }
+        assert_round_trip::<AutomationReceipt>(receipt);
+    }
+
+    #[test]
+    fn common_constraints_and_definition_conditionals_fail_closed() {
+        let mut invalid_id = fixture("definition.golden");
+        invalid_id["automationId"] = json!("-daily-notes");
+        assert!(serde_json::from_value::<AutomationDefinition>(invalid_id).is_err());
+
+        let mut invalid_timestamp = fixture("occurrence.golden");
+        invalid_timestamp["scheduledFor"] = json!("2026-08-30T09:00:00+00:00");
+        assert!(serde_json::from_value::<AutomationOccurrence>(invalid_timestamp).is_err());
+
+        let mut invalid_extension = fixture("definition.golden");
+        invalid_extension["extensions"] = json!({"not-namespaced": true});
+        assert!(serde_json::from_value::<AutomationDefinition>(invalid_extension).is_err());
+
+        let mut duplicate_capability = fixture("definition.golden");
+        duplicate_capability["runtimeRequirements"]["capabilities"] =
+            json!(["sessions.launch", "sessions.launch"]);
+        assert!(serde_json::from_value::<AutomationDefinition>(duplicate_capability).is_err());
+
+        let mut oversized_capability = fixture("definition.golden");
+        oversized_capability["runtimeRequirements"]["capabilities"] =
+            json!([format!("x{}", "a".repeat(96))]);
+        assert!(serde_json::from_value::<AutomationDefinition>(oversized_capability).is_err());
+
+        let mut missing_runtime = fixture("definition.golden");
+        missing_runtime
+            .as_object_mut()
+            .expect("definition fixture is an object")
+            .remove("runtimeRequirements");
+        assert!(serde_json::from_value::<AutomationDefinition>(missing_runtime).is_err());
+
+        let mut missing_familiar = fixture("definition.golden");
+        missing_familiar["binding"]
+            .as_object_mut()
+            .expect("binding fixture is an object")
+            .remove("familiarId");
+        assert!(serde_json::from_value::<AutomationDefinition>(missing_familiar).is_err());
+
+        let mut fixed_backoff_without_seconds = fixture("definition.golden");
+        fixed_backoff_without_seconds["policies"]["retry"]["backoffPolicy"] = json!("fixed");
+        fixed_backoff_without_seconds["policies"]["retry"]
+            .as_object_mut()
+            .expect("retry fixture is an object")
+            .remove("backoffSeconds");
+        assert!(
+            serde_json::from_value::<AutomationDefinition>(fixed_backoff_without_seconds).is_err()
+        );
+
+        let mut invalid_digest = fixture("definition.golden");
+        invalid_digest["integrity"]["value"] = json!("not-a-sha256");
+        assert!(serde_json::from_value::<AutomationDefinition>(invalid_digest).is_err());
+
+        let mut duplicate_exercised_capability = fixture("receipt.golden");
+        duplicate_exercised_capability["exercisedCapabilities"] =
+            json!(["sessions.launch", "sessions.launch"]);
+        assert!(
+            serde_json::from_value::<AutomationReceipt>(duplicate_exercised_capability).is_err()
+        );
     }
 }
