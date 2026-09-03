@@ -735,6 +735,42 @@ mod tests {
     }
 
     #[test]
+    fn event_kind_and_payload_must_agree() {
+        let mut receipt_kind_with_transition_payload = event_fixture();
+        receipt_kind_with_transition_payload["kind"] = json!("receipt.recorded");
+        assert!(
+            serde_json::from_value::<EventEnvelope>(receipt_kind_with_transition_payload).is_err()
+        );
+
+        let mut run_kind_with_occurrence_entity = event_fixture();
+        run_kind_with_occurrence_entity["kind"] = json!("run.transitioned");
+        assert!(serde_json::from_value::<EventEnvelope>(run_kind_with_occurrence_entity).is_err());
+
+        let mut run_transition = event_fixture();
+        run_transition["kind"] = json!("run.transitioned");
+        run_transition["payload"]["entity"] = json!("run");
+        assert_round_trip::<EventEnvelope>(run_transition);
+    }
+
+    #[test]
+    fn error_status_mismatch_names_the_unquoted_code() {
+        let mismatch = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 500,
+            "message": "No such automation.",
+            "retryable": false
+        });
+        let error = serde_json::from_value::<ErrorEnvelope>(mismatch)
+            .expect_err("mismatched status must be rejected")
+            .to_string();
+        assert!(
+            error.contains("NOT_FOUND requires HTTP status 404"),
+            "{error}"
+        );
+        assert!(!error.contains("\"NOT_FOUND\""), "{error}");
+    }
+
+    #[test]
     fn schema_counters_reject_values_outside_the_jcs_safe_domain() {
         let unsafe_integer = MAX_SAFE_INTEGER + 1;
 

@@ -197,9 +197,10 @@ impl<'de> Deserialize<'de> for ErrorEnvelope {
 
         let raw = Raw::deserialize(deserializer)?;
         if raw.http_status != raw.code.http_status() {
+            let code = serde_json::to_string(&raw.code).unwrap_or_else(|_| "error code".to_owned());
             return Err(serde::de::Error::custom(format!(
                 "{} requires HTTP status {}",
-                serde_json::to_string(&raw.code).unwrap_or_else(|_| "error code".to_owned()),
+                code.trim_matches('"'),
                 raw.code.http_status()
             )));
         }

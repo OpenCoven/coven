@@ -3140,6 +3140,41 @@ pub struct EventEnvelope {
 }
 
 impl EventEnvelope {
+    fn validate(&self) -> Result<(), StringConstraintError> {
+        let payload_matches_kind = match (&self.kind, &self.payload) {
+            (
+                EventKind::DefinitionCreated
+                | EventKind::DefinitionRevised
+                | EventKind::DefinitionActivated
+                | EventKind::DefinitionPaused
+                | EventKind::DefinitionDisabled
+                | EventKind::DefinitionInvalidated
+                | EventKind::DefinitionTombstoned
+                | EventKind::DefinitionImported,
+                EventPayload::DefinitionLifecycle(_),
+            )
+            | (EventKind::OccurrenceMisfireRecorded, EventPayload::Misfire(_))
+            | (EventKind::ReceiptRecorded, EventPayload::Receipt(_))
+            | (EventKind::FeedSnapshot, EventPayload::Snapshot(_)) => true,
+            (EventKind::OccurrenceTransitioned, EventPayload::Transition(payload)) => {
+                payload.entity == TransitionEntity::Occurrence
+            }
+            (EventKind::RunTransitioned, EventPayload::Transition(payload)) => {
+                payload.entity == TransitionEntity::Run
+            }
+            (EventKind::AttemptTransitioned, EventPayload::Transition(payload)) => {
+                payload.entity == TransitionEntity::Attempt
+            }
+            _ => false,
+        };
+        if !payload_matches_kind {
+            return Err(StringConstraintError(
+                "event kind must match its payload variant and transition entity",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn verify_integrity(&self) -> anyhow::Result<()> {
         let Some(integrity) = &self.integrity else {
             return Ok(());
@@ -3207,6 +3242,7 @@ impl<'de> Deserialize<'de> for EventEnvelope {
             privacy: raw.privacy,
             integrity: raw.integrity,
         };
+        event.validate().map_err(serde::de::Error::custom)?;
         event.verify_integrity().map_err(serde::de::Error::custom)?;
         Ok(event)
     }
