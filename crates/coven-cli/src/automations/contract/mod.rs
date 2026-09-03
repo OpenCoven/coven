@@ -29,12 +29,12 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::canonical_json::{
-        canonicalize, canonicalize_without_integrity, sha256_digest, sha256_hex,
+        canonicalize, canonicalize_without_integrity, sha256_digest, sha256_hex, MAX_SAFE_INTEGER,
     };
     use super::error::{ErrorCode, ErrorEnvelope};
     use super::types::{
         AutomationAttempt, AutomationDefinition, AutomationOccurrence, AutomationReceipt,
-        AutomationRun, CommandRequest, CommandResponse, EventEnvelope,
+        AutomationRun, CommandRequest, CommandResponse, EventEnvelope, PositiveInteger,
     };
 
     const VECTORS: &str =
@@ -247,6 +247,18 @@ mod tests {
     }
 
     #[test]
+    fn jcs_rejects_integers_outside_the_safe_ieee_754_domain() {
+        assert!(canonicalize(&MAX_SAFE_INTEGER).is_ok());
+        assert!(PositiveInteger::new(MAX_SAFE_INTEGER).is_ok());
+
+        let unsafe_integer = MAX_SAFE_INTEGER + 1;
+        assert!(PositiveInteger::new(unsafe_integer).is_err());
+        assert!(canonicalize(&unsafe_integer).is_err());
+        assert!(canonicalize(&u64::MAX).is_err());
+        assert!(sha256_digest(&unsafe_integer).is_err());
+    }
+
+    #[test]
     fn command_response_round_trips_a_typed_error() {
         let response = json!({
             "schemaVersion": "coven.automations.v1",
@@ -370,5 +382,109 @@ mod tests {
         assert!(
             serde_json::from_value::<AutomationReceipt>(duplicate_exercised_capability).is_err()
         );
+    }
+
+    #[test]
+    fn definition_display_and_event_envelope_bounds_fail_closed() {
+        let mut empty_name = fixture("definition.golden");
+        empty_name["display"]["name"] = json!("");
+        assert!(serde_json::from_value::<AutomationDefinition>(empty_name).is_err());
+
+        let mut oversized_description = fixture("definition.golden");
+        oversized_description["display"]["description"] = json!("a".repeat(2_001));
+        assert!(serde_json::from_value::<AutomationDefinition>(oversized_description).is_err());
+
+        let mut duplicate_tags = fixture("definition.golden");
+        duplicate_tags["display"]["tags"] = json!(["notes", "notes"]);
+        assert!(serde_json::from_value::<AutomationDefinition>(duplicate_tags).is_err());
+
+        let mut oversized_tag = fixture("definition.golden");
+        oversized_tag["display"]["tags"] = json!([format!("x{}", "a".repeat(64))]);
+        assert!(serde_json::from_value::<AutomationDefinition>(oversized_tag).is_err());
+
+        let mut oversized_tags = fixture("definition.golden");
+        oversized_tags["display"]["tags"] = json!(vec!["tag"; 65]);
+        assert!(serde_json::from_value::<AutomationDefinition>(oversized_tags).is_err());
+
+        let mut short_event_id = event_fixture();
+        short_event_id["eventId"] = json!("short");
+        assert!(serde_json::from_value::<EventEnvelope>(short_event_id).is_err());
+
+        let mut invalid_event_id = event_fixture();
+        invalid_event_id["eventId"] = json!("event-id-with-hyphen-00001");
+        assert!(serde_json::from_value::<EventEnvelope>(invalid_event_id).is_err());
+
+        let mut oversized_stream_id = event_fixture();
+        oversized_stream_id["stream"]["id"] = json!("a".repeat(321));
+        assert!(serde_json::from_value::<EventEnvelope>(oversized_stream_id).is_err());
+
+        let mut empty_summary = event_fixture();
+        empty_summary["summary"] = json!("");
+        assert!(serde_json::from_value::<EventEnvelope>(empty_summary).is_err());
+    }
+
+    #[test]
+    fn run_and_command_response_outcome_conditionals_fail_closed() {
+        let mut no_finished_at = fixture("run.golden");
+        no_finished_at
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("finishedAt");
+        assert!(serde_json::from_value::<AutomationRun>(no_finished_at).is_err());
+
+        let mut no_terminal_disposition = fixture("run.golden");
+        no_terminal_disposition
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("terminalDisposition");
+        assert!(serde_json::from_value::<AutomationRun>(no_terminal_disposition).is_err());
+
+        let mut running = fixture("run.golden");
+        running["state"] = json!("running");
+        running
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("finishedAt");
+        running
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("terminalDisposition");
+        assert_round_trip::<AutomationRun>(running);
+
+        let base = json!({
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.get.v1",
+            "adoptionKey": "adopt:get-0001"
+        });
+        let mut committed_without_result = base.clone();
+        committed_without_result["outcome"] = json!("committed");
+        assert!(serde_json::from_value::<CommandResponse>(committed_without_result).is_err());
+
+        let mut committed_with_error = base.clone();
+        committed_with_error["outcome"] = json!("committed");
+        committed_with_error["result"] = json!({});
+        committed_with_error["error"] = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "No such automation.",
+            "retryable": false
+        });
+        assert!(serde_json::from_value::<CommandResponse>(committed_with_error).is_err());
+
+        let mut replayed_without_replay = base.clone();
+        replayed_without_replay["outcome"] = json!("replayed");
+        replayed_without_replay["result"] = json!({});
+        assert!(serde_json::from_value::<CommandResponse>(replayed_without_replay).is_err());
+
+        let mut rejected_with_result = base;
+        rejected_with_result["outcome"] = json!("rejected");
+        rejected_with_result["result"] = json!({});
+        rejected_with_result["error"] = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "No such automation.",
+            "retryable": false
+        });
+        assert!(serde_json::from_value::<CommandResponse>(rejected_with_result).is_err());
     }
 }

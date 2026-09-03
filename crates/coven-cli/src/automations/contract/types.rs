@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::ser::{SerializeStruct, Serializer};
+use serde::ser::{SerializeMap, SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -214,6 +214,54 @@ fn matches_sha256_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
+fn matches_event_id(value: &str) -> bool {
+    (20..=64).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn matches_event_stream_id(value: &str) -> bool {
+    value.chars().count() <= 320
+}
+
+fn matches_command_stream_id(value: &str) -> bool {
+    (1..=320).contains(&value.chars().count())
+}
+
+fn matches_event_summary(value: &str) -> bool {
+    (1..=300).contains(&value.chars().count())
+}
+
+fn matches_display_name(value: &str) -> bool {
+    (1..=160).contains(&value.chars().count())
+}
+
+fn matches_display_description(value: &str) -> bool {
+    value.chars().count() <= 2_000
+}
+
+fn matches_display_tag(value: &str) -> bool {
+    (1..=64).contains(&value.chars().count())
+}
+
+fn matches_cause_event_id(value: &str) -> bool {
+    value.chars().count() <= 64
+}
+
+fn matches_component_name(value: &str) -> bool {
+    (1..=96).contains(&value.chars().count())
+}
+
+fn matches_instance_id(value: &str) -> bool {
+    (1..=128).contains(&value.chars().count())
+}
+
+fn matches_implementation_version(value: &str) -> bool {
+    value.chars().count() <= 64
+}
+
+fn matches_event_ref_stream(value: &str) -> bool {
+    (1..=400).contains(&value.chars().count())
+}
+
 validated_string!(Timestamp, matches_timestamp);
 validated_string!(AutomationId, matches_automation_id);
 validated_string!(OccurrenceId, matches_entity_id);
@@ -230,6 +278,18 @@ validated_string!(Capability, matches_capability);
 validated_string!(Sha256Digest, matches_sha256_digest);
 validated_string!(ApprovalRecordRef, matches_approval_record_ref);
 validated_string!(RuntimeModel, matches_runtime_model);
+validated_string!(EventId, matches_event_id);
+validated_string!(EventStreamId, matches_event_stream_id);
+validated_string!(CommandStreamId, matches_command_stream_id);
+validated_string!(EventSummary, matches_event_summary);
+validated_string!(DisplayName, matches_display_name);
+validated_string!(DisplayDescription, matches_display_description);
+validated_string!(DisplayTag, matches_display_tag);
+validated_string!(CauseEventId, matches_cause_event_id);
+validated_string!(ComponentName, matches_component_name);
+validated_string!(InstanceId, matches_instance_id);
+validated_string!(ImplementationVersion, matches_implementation_version);
+validated_string!(EventRefStream, matches_event_ref_stream);
 
 macro_rules! validated_integer {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -271,7 +331,7 @@ macro_rules! validated_integer {
     };
 }
 
-validated_integer!(PositiveInteger, 1, u64::MAX);
+validated_integer!(PositiveInteger, 1, 9_007_199_254_740_991);
 validated_integer!(TimeoutMinutes, 1, 44_640);
 validated_integer!(MaximumAttempts, 1, 10);
 validated_integer!(BackoffSeconds, 1, 86_400);
@@ -392,6 +452,43 @@ impl ExercisedCapabilities {
                 "ExercisedCapabilities must be unique",
             ))
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisplayTags(Vec<DisplayTag>);
+
+impl DisplayTags {
+    fn new(values: Vec<DisplayTag>) -> Result<Self, StringConstraintError> {
+        if values.len() > 64 {
+            return Err(StringConstraintError(
+                "DisplayTags must contain at most 64 entries",
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if values.iter().all(|value| seen.insert(value.as_str())) {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError("DisplayTags must be unique"))
+        }
+    }
+}
+
+impl Serialize for DisplayTags {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DisplayTags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
     }
 }
 
@@ -554,10 +651,10 @@ pub enum RetentionClassification {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProducerIdentity {
-    pub component: String,
-    pub instance_id: String,
+    pub component: ComponentName,
+    pub instance_id: InstanceId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub implementation_version: Option<String>,
+    pub implementation_version: Option<ImplementationVersion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,11 +858,11 @@ impl<'de> Deserialize<'de> for True {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionDisplay {
-    pub name: String,
+    pub name: DisplayName,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
+    pub description: Option<DisplayDescription>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<String>>,
+    pub tags: Option<DisplayTags>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1077,7 +1174,7 @@ pub enum RunState {
 
 pub type RunOutcome = RunState;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationRun {
     pub schema_version: SchemaVersion,
@@ -1086,14 +1183,14 @@ pub struct AutomationRun {
     pub automation_id: AutomationId,
     pub automation_revision: PositiveInteger,
     pub binding: RunBinding,
-    pub state: RunState,
+    state: RunState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state_reason: Option<String>,
     pub attempt_count: RunAttemptCount,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_attempt_id: Option<AttemptId>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_disposition: Option<TerminalDisposition>,
+    terminal_disposition: Option<TerminalDisposition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<RunDelivery>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1102,9 +1199,95 @@ pub struct AutomationRun {
     pub receipt_ref: Option<ReceiptId>,
     pub started_at: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<Timestamp>,
+    finished_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionBag>,
+}
+
+impl AutomationRun {
+    #[must_use]
+    pub const fn state(&self) -> RunState {
+        self.state
+    }
+
+    #[must_use]
+    pub fn terminal_disposition(&self) -> Option<&TerminalDisposition> {
+        self.terminal_disposition.as_ref()
+    }
+
+    #[must_use]
+    pub fn finished_at(&self) -> Option<&Timestamp> {
+        self.finished_at.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), StringConstraintError> {
+        if matches!(
+            self.state,
+            RunState::Succeeded
+                | RunState::Failed
+                | RunState::Cancelled
+                | RunState::TimedOut
+                | RunState::Ambiguous
+        ) && (self.finished_at.is_none() || self.terminal_disposition.is_none())
+        {
+            return Err(StringConstraintError(
+                "terminal runs require finishedAt and terminalDisposition",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomationRun {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            run_id: RunId,
+            occurrence_id: OccurrenceId,
+            automation_id: AutomationId,
+            automation_revision: PositiveInteger,
+            binding: RunBinding,
+            state: RunState,
+            state_reason: Option<String>,
+            attempt_count: RunAttemptCount,
+            current_attempt_id: Option<AttemptId>,
+            terminal_disposition: Option<TerminalDisposition>,
+            delivery: Option<RunDelivery>,
+            result_digest: Option<DigestValue>,
+            receipt_ref: Option<ReceiptId>,
+            started_at: Timestamp,
+            finished_at: Option<Timestamp>,
+            extensions: Option<ExtensionBag>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let run = Self {
+            schema_version: raw.schema_version,
+            run_id: raw.run_id,
+            occurrence_id: raw.occurrence_id,
+            automation_id: raw.automation_id,
+            automation_revision: raw.automation_revision,
+            binding: raw.binding,
+            state: raw.state,
+            state_reason: raw.state_reason,
+            attempt_count: raw.attempt_count,
+            current_attempt_id: raw.current_attempt_id,
+            terminal_disposition: raw.terminal_disposition,
+            delivery: raw.delivery,
+            result_digest: raw.result_digest,
+            receipt_ref: raw.receipt_ref,
+            started_at: raw.started_at,
+            finished_at: raw.finished_at,
+            extensions: raw.extensions,
+        };
+        run.validate().map_err(serde::de::Error::custom)?;
+        Ok(run)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1801,7 +1984,7 @@ pub struct DefinitionHealthPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventsReadPayload {
-    pub stream: StreamRef,
+    pub stream: CommandStreamRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1813,7 +1996,7 @@ pub struct EventsReadPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventsSubscribePayload {
-    pub stream: StreamRef,
+    pub stream: CommandStreamRef,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1877,26 +2060,214 @@ pub enum CommandOutcome {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CommandResponse {
-    pub schema_version: SchemaVersion,
-    pub command: CommandName,
-    pub adoption_key: AdoptionKey,
-    pub outcome: CommandOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub replay: Option<ReplayMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub revision: Option<PositiveInteger>,
-    /// Committed result bodies are explicitly open in the schema.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<JsonObject>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<ErrorEnvelope>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receipt_ref: Option<ReceiptId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_ref: Option<EventRef>,
+    schema_version: SchemaVersion,
+    command: CommandName,
+    adoption_key: AdoptionKey,
+    body: CommandResponseBody,
+}
+
+impl CommandResponse {
+    #[must_use]
+    pub fn new(
+        schema_version: SchemaVersion,
+        command: CommandName,
+        adoption_key: AdoptionKey,
+        body: CommandResponseBody,
+    ) -> Self {
+        Self {
+            schema_version,
+            command,
+            adoption_key,
+            body,
+        }
+    }
+
+    #[must_use]
+    pub const fn outcome(&self) -> CommandOutcome {
+        self.body.outcome()
+    }
+
+    #[must_use]
+    pub fn body(&self) -> &CommandResponseBody {
+        &self.body
+    }
+}
+
+impl Serialize for CommandResponse {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("schemaVersion", &self.schema_version)?;
+        map.serialize_entry("command", &self.command)?;
+        map.serialize_entry("adoptionKey", &self.adoption_key)?;
+        map.serialize_entry("outcome", &self.outcome())?;
+        match &self.body {
+            CommandResponseBody::Committed {
+                revision,
+                result,
+                receipt_ref,
+                event_ref,
+            } => {
+                if let Some(revision) = revision {
+                    map.serialize_entry("revision", revision)?;
+                }
+                map.serialize_entry("result", result)?;
+                if let Some(receipt_ref) = receipt_ref {
+                    map.serialize_entry("receiptRef", receipt_ref)?;
+                }
+                if let Some(event_ref) = event_ref {
+                    map.serialize_entry("eventRef", event_ref)?;
+                }
+            }
+            CommandResponseBody::Replayed {
+                replay,
+                revision,
+                result,
+                receipt_ref,
+                event_ref,
+            } => {
+                map.serialize_entry("replay", replay)?;
+                if let Some(revision) = revision {
+                    map.serialize_entry("revision", revision)?;
+                }
+                map.serialize_entry("result", result)?;
+                if let Some(receipt_ref) = receipt_ref {
+                    map.serialize_entry("receiptRef", receipt_ref)?;
+                }
+                if let Some(event_ref) = event_ref {
+                    map.serialize_entry("eventRef", event_ref)?;
+                }
+            }
+            CommandResponseBody::Rejected {
+                revision,
+                error,
+                receipt_ref,
+                event_ref,
+            } => {
+                if let Some(revision) = revision {
+                    map.serialize_entry("revision", revision)?;
+                }
+                map.serialize_entry("error", error)?;
+                if let Some(receipt_ref) = receipt_ref {
+                    map.serialize_entry("receiptRef", receipt_ref)?;
+                }
+                if let Some(event_ref) = event_ref {
+                    map.serialize_entry("eventRef", event_ref)?;
+                }
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandResponse {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            command: CommandName,
+            adoption_key: AdoptionKey,
+            outcome: CommandOutcome,
+            replay: Option<ReplayMetadata>,
+            revision: Option<PositiveInteger>,
+            result: Option<JsonObject>,
+            error: Option<ErrorEnvelope>,
+            receipt_ref: Option<ReceiptId>,
+            event_ref: Option<EventRef>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let body = match raw.outcome {
+            CommandOutcome::Committed => match (raw.replay, raw.result, raw.error) {
+                (None, Some(result), None) => CommandResponseBody::Committed {
+                    revision: raw.revision,
+                    result,
+                    receipt_ref: raw.receipt_ref,
+                    event_ref: raw.event_ref,
+                },
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "committed responses require result and forbid error and replay",
+                    ));
+                }
+            },
+            CommandOutcome::Replayed => match (raw.replay, raw.result, raw.error) {
+                (Some(replay), Some(result), None) => CommandResponseBody::Replayed {
+                    replay,
+                    revision: raw.revision,
+                    result,
+                    receipt_ref: raw.receipt_ref,
+                    event_ref: raw.event_ref,
+                },
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "replayed responses require replay and result and forbid error",
+                    ));
+                }
+            },
+            CommandOutcome::Rejected => match (raw.replay, raw.result, raw.error) {
+                (None, None, Some(error)) => CommandResponseBody::Rejected {
+                    revision: raw.revision,
+                    error,
+                    receipt_ref: raw.receipt_ref,
+                    event_ref: raw.event_ref,
+                },
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        "rejected responses require error and forbid result and replay",
+                    ));
+                }
+            },
+        };
+        Ok(Self::new(
+            raw.schema_version,
+            raw.command,
+            raw.adoption_key,
+            body,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CommandResponseBody {
+    Committed {
+        revision: Option<PositiveInteger>,
+        result: JsonObject,
+        receipt_ref: Option<ReceiptId>,
+        event_ref: Option<EventRef>,
+    },
+    Replayed {
+        replay: ReplayMetadata,
+        revision: Option<PositiveInteger>,
+        result: JsonObject,
+        receipt_ref: Option<ReceiptId>,
+        event_ref: Option<EventRef>,
+    },
+    Rejected {
+        revision: Option<PositiveInteger>,
+        error: ErrorEnvelope,
+        receipt_ref: Option<ReceiptId>,
+        event_ref: Option<EventRef>,
+    },
+}
+
+impl CommandResponseBody {
+    #[must_use]
+    pub const fn outcome(&self) -> CommandOutcome {
+        match self {
+            Self::Committed { .. } => CommandOutcome::Committed,
+            Self::Replayed { .. } => CommandOutcome::Replayed,
+            Self::Rejected { .. } => CommandOutcome::Rejected,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1908,7 +2279,7 @@ pub struct ReplayMetadata {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventRef {
-    pub stream: String,
+    pub stream: EventRefStream,
     pub sequence: u64,
 }
 
@@ -1948,7 +2319,7 @@ pub enum EventKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventEnvelope {
     pub schema_version: SchemaVersion,
-    pub event_id: String,
+    pub event_id: EventId,
     pub stream: StreamRef,
     pub sequence: u64,
     pub recorded_at: Timestamp,
@@ -1965,7 +2336,7 @@ pub struct EventEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<AttemptId>,
     pub kind: EventKind,
-    pub summary: String,
+    pub summary: EventSummary,
     pub payload: EventPayload,
     pub privacy: EventPrivacy,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1976,7 +2347,14 @@ pub struct EventEnvelope {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StreamRef {
     pub kind: StreamKind,
-    pub id: String,
+    pub id: EventStreamId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandStreamRef {
+    pub kind: StreamKind,
+    pub id: CommandStreamId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1994,7 +2372,7 @@ pub struct EventCausation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adoption_key: Option<AdoptionKey>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cause_event_id: Option<String>,
+    pub cause_event_id: Option<CauseEventId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub correlation_id: Option<CorrelationId>,
 }
