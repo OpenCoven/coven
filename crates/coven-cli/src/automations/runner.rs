@@ -1713,25 +1713,28 @@ mod tests {
     #[test]
     fn startup_cutoff_excludes_new_daemon_launch_without_receipt() {
         let (temp, conn) = temp_store();
-        let routine = definition("new-daemon-launch");
+        let mut routine = definition("new-daemon-launch");
+        routine.status = RoutineStatus::Active;
         insert_definition(&conn, &routine).unwrap();
         let startup_cutoff = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap()
             + chrono::Duration::microseconds(400);
         let launched_at = startup_cutoff + chrono::Duration::microseconds(100);
-        assert!(insert_claimed_occurrence(
-            &conn,
-            "new-daemon-occurrence",
-            &routine.id,
-            "daemon",
-            60,
-            launched_at,
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (launched_at - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
         )
-        .unwrap());
+        .unwrap();
+        let report = super::super::occurrences::tick(&conn, launched_at).unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
         let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
         persist_launch_at(
             &conn,
             "new-daemon-run",
-            "new-daemon-occurrence",
+            occurrence_id,
             &routine,
             &launch,
             launched_at,
