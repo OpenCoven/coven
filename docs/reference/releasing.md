@@ -1,6 +1,7 @@
 ---
 summary: "Release flow for @opencoven/cli and platform packages."
 description: "Operator runbook for releasing Coven to npm and GitHub Releases: OIDC setup, signed-tag publication, deterministic assets, provenance checks, and recovery."
+source_adjacent_reason: "Tracks release automation and artifact verification implemented in this repository."
 read_when:
   - Cutting a release
 title: "Releasing Coven to npm and GitHub Releases"
