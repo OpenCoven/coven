@@ -300,6 +300,82 @@ fn matches_artifact_reference(value: &str) -> bool {
     (1..=512).contains(&value.chars().count())
 }
 
+fn has_character_length(value: &str, minimum: usize, maximum: usize) -> bool {
+    (minimum..=maximum).contains(&value.chars().count())
+}
+
+fn matches_principal_display_name(value: &str) -> bool {
+    has_character_length(value, 0, 160)
+}
+
+fn matches_imported_from(value: &str) -> bool {
+    has_character_length(value, 0, 200)
+}
+
+fn matches_claimed_by(value: &str) -> bool {
+    has_character_length(value, 0, 128)
+}
+
+fn matches_authentication_class(value: &str) -> bool {
+    has_character_length(value, 0, 64)
+}
+
+fn matches_detail(value: &str) -> bool {
+    has_character_length(value, 0, 2_000)
+}
+
+fn matches_worker_id(value: &str) -> bool {
+    has_character_length(value, 1, 128)
+}
+
+fn matches_session_id(value: &str) -> bool {
+    has_character_length(value, 1, 128)
+}
+
+fn matches_note(value: &str) -> bool {
+    has_character_length(value, 0, 500)
+}
+
+fn matches_failure_class(value: &str) -> bool {
+    has_character_length(value, 0, 96)
+}
+
+fn matches_partial_failure_step(value: &str) -> bool {
+    has_character_length(value, 1, 128)
+}
+
+fn matches_partial_failure_reason(value: &str) -> bool {
+    has_character_length(value, 1, 1_000)
+}
+
+fn matches_privacy_notes(value: &str) -> bool {
+    has_character_length(value, 0, 500)
+}
+
+fn matches_operator_statement(value: &str) -> bool {
+    has_character_length(value, 1, 1_000)
+}
+
+fn matches_cursor(value: &str) -> bool {
+    has_character_length(value, 0, 256)
+}
+
+fn matches_checkpoint(value: &str) -> bool {
+    has_character_length(value, 0, 512)
+}
+
+fn matches_transition_state(value: &str) -> bool {
+    has_character_length(value, 1, 32)
+}
+
+fn matches_transition_reason(value: &str) -> bool {
+    has_character_length(value, 1, 500)
+}
+
+fn matches_error_message(value: &str) -> bool {
+    has_character_length(value, 1, 1_000)
+}
+
 validated_string!(Timestamp, matches_timestamp);
 validated_string!(AutomationId, matches_automation_id);
 validated_string!(OccurrenceId, matches_entity_id);
@@ -336,6 +412,24 @@ validated_string!(OccurrenceKey, matches_occurrence_key);
 validated_string!(StateReason, matches_state_reason);
 validated_string!(CommandReason, matches_reason);
 validated_string!(ArtifactReference, matches_artifact_reference);
+validated_string!(PrincipalDisplayName, matches_principal_display_name);
+validated_string!(ImportedFrom, matches_imported_from);
+validated_string!(ClaimedBy, matches_claimed_by);
+validated_string!(AuthenticationClass, matches_authentication_class);
+validated_string!(Detail, matches_detail);
+validated_string!(WorkerId, matches_worker_id);
+validated_string!(SessionId, matches_session_id);
+validated_string!(CommandNote, matches_note);
+validated_string!(FailureClass, matches_failure_class);
+validated_string!(PartialFailureStep, matches_partial_failure_step);
+validated_string!(PartialFailureReason, matches_partial_failure_reason);
+validated_string!(PrivacyNotes, matches_privacy_notes);
+validated_string!(OperatorStatement, matches_operator_statement);
+validated_string!(Cursor, matches_cursor);
+validated_string!(Checkpoint, matches_checkpoint);
+validated_string!(TransitionState, matches_transition_state);
+validated_string!(TransitionReason, matches_transition_reason);
+validated_string!(ErrorMessage, matches_error_message);
 
 macro_rules! validated_integer {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -437,9 +531,9 @@ fn matches_extension_key(key: &str) -> bool {
     !first.is_empty()
         && !middle.is_empty()
         && !last.is_empty()
-        && first
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+        && first.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
         && middle
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
@@ -530,6 +624,69 @@ impl Serialize for DisplayTags {
 }
 
 impl<'de> Deserialize<'de> for DisplayTags {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedVec<T, const MAX: usize>(Vec<T>);
+
+impl<T, const MAX: usize> BoundedVec<T, MAX> {
+    pub fn new(values: Vec<T>) -> Result<Self, StringConstraintError> {
+        if values.len() <= MAX {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError("collection exceeds schema maximum"))
+        }
+    }
+}
+
+impl<T: Serialize, const MAX: usize> Serialize for BoundedVec<T, MAX> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for BoundedVec<T, MAX> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(Vec::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UniqueVec<T>(Vec<T>);
+
+impl<T: Ord> UniqueVec<T> {
+    pub fn new(values: Vec<T>) -> Result<Self, StringConstraintError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if values.iter().all(|value| seen.insert(value)) {
+            Ok(Self(values))
+        } else {
+            Err(StringConstraintError("collection entries must be unique"))
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for UniqueVec<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de> + Ord> Deserialize<'de> for UniqueVec<T> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -643,7 +800,7 @@ pub enum Canonicalization {
 pub struct PrincipalRef {
     pub principal_id: PrincipalId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_name: Option<String>,
+    pub display_name: Option<PrincipalDisplayName>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -714,7 +871,7 @@ pub struct Provenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub imported_from: Option<String>,
+    pub imported_from: Option<ImportedFrom>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -996,10 +1153,10 @@ pub struct RetryPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff_seconds: Option<BackoffSeconds>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub retryable_classes: Option<Vec<RetryableClass>>,
+    pub retryable_classes: Option<UniqueVec<RetryableClass>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BackoffPolicy {
     None,
@@ -1007,7 +1164,7 @@ pub enum BackoffPolicy {
     Exponential,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RetryableClass {
     TransientDispatch,
@@ -1150,7 +1307,7 @@ pub enum TriggerIdentityKind {
 pub struct OccurrenceFence {
     pub generation: PositiveInteger,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub claimed_by: Option<String>,
+    pub claimed_by: Option<ClaimedBy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lease_expires_at: Option<Timestamp>,
 }
@@ -1356,7 +1513,7 @@ pub struct AuthorityBinding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval: Option<ApprovalRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub authentication_class: Option<String>,
+    pub authentication_class: Option<AuthenticationClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1366,7 +1523,7 @@ pub struct TerminalDisposition {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_class: Option<TerminalFailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    pub detail: Option<Detail>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1397,7 +1554,7 @@ pub struct RunDelivery {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<WorkingDirectory>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub artifact_refs: Option<Vec<ArtifactRef>>,
+    pub artifact_refs: Option<BoundedVec<ArtifactRef, 64>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1449,7 +1606,7 @@ pub struct AutomationAttempt {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry_classification: Option<RetryClassification>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub lease_observations: Option<Vec<LeaseObservation>>,
+    pub lease_observations: Option<BoundedVec<LeaseObservation, 1024>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_cursors: Option<OutputCursors>,
     pub state: AttemptState,
@@ -1480,6 +1637,11 @@ impl AutomationAttempt {
                 "attempts after the first require priorDisposition",
             ));
         }
+        if self.attempt_number.get() == 1 && self.prior_disposition.is_some() {
+            return Err(StringConstraintError(
+                "the first attempt must not contain priorDisposition",
+            ));
+        }
         Ok(())
     }
 }
@@ -1502,7 +1664,7 @@ impl<'de> Deserialize<'de> for AutomationAttempt {
             dispatch_fence: DispatchFence,
             worker_correlation: Option<WorkerCorrelation>,
             retry_classification: Option<RetryClassification>,
-            lease_observations: Option<Vec<LeaseObservation>>,
+            lease_observations: Option<BoundedVec<LeaseObservation, 1024>>,
             output_cursors: Option<OutputCursors>,
             state: AttemptState,
             state_reason: Option<StateReason>,
@@ -1562,9 +1724,9 @@ pub struct DispatchFence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerCorrelation {
-    pub worker_id: String,
+    pub worker_id: WorkerId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionId>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub adopted_at: Option<Timestamp>,
 }
@@ -1575,6 +1737,7 @@ pub struct RetryClassification {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classification: Option<RetryClassificationKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// This snapshot has no schema uniqueness or cardinality constraint.
     pub eligible_classes: Option<Vec<RetryableClass>>,
 }
 
@@ -1593,7 +1756,7 @@ pub struct LeaseObservation {
     pub observed_at: Timestamp,
     pub heartbeat_ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
+    pub note: Option<CommandNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1664,11 +1827,11 @@ pub struct ReceiptAuthority {
 pub struct ReceiptOutcome {
     pub disposition: TerminalOutcome,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub failure_class: Option<String>,
+    pub failure_class: Option<FailureClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+    pub detail: Option<Detail>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partial_failures: Option<Vec<PartialFailure>>,
+    pub partial_failures: Option<BoundedVec<PartialFailure, 128>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_disposition: Option<ReceiptRecoveryDisposition>,
 }
@@ -1676,8 +1839,8 @@ pub struct ReceiptOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PartialFailure {
-    pub step: String,
-    pub reason: String,
+    pub step: PartialFailureStep,
+    pub reason: PartialFailureReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovered: Option<bool>,
 }
@@ -1714,7 +1877,7 @@ pub struct ReceiptPrivacy {
     pub classification: PrivacyClassification,
     pub retention: RetentionClass,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub notes: Option<String>,
+    pub notes: Option<PrivacyNotes>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1993,7 +2156,7 @@ pub struct DefinitionTargetPayload {
 pub struct RunNowPayload {
     pub automation_id: AutomationId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
+    pub note: Option<CommandNote>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bypass_eligibility: Option<bool>,
 }
@@ -2029,7 +2192,7 @@ pub struct AttemptRetryPayload {
     pub prior_attempt_number: PositiveInteger,
     pub prior_disposition: RetryPriorDisposition,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<String>,
+    pub note: Option<CommandNote>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2046,7 +2209,7 @@ pub struct OccurrenceRecoverPayload {
     pub occurrence_id: OccurrenceId,
     pub evidence_determination: EvidenceDetermination,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub statement: Option<String>,
+    pub statement: Option<OperatorStatement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2064,7 +2227,7 @@ pub struct DefinitionListPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<CommandListLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub cursor: Option<Cursor>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2096,7 +2259,7 @@ pub struct RunHistoryPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<CommandListLimit>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cursor: Option<String>,
+    pub cursor: Option<Cursor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2124,7 +2287,7 @@ pub struct EventsSubscribePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub checkpoint: Option<String>,
+    pub checkpoint: Option<Checkpoint>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2147,7 +2310,7 @@ pub struct CommandOrigin {
     pub principal: PrincipalRef,
     pub channel: CommandChannel,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub authentication_class: Option<String>,
+    pub authentication_class: Option<AuthenticationClass>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2173,7 +2336,7 @@ pub enum CommandChannel {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CommandIntent {
-    pub statement: String,
+    pub statement: OperatorStatement,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2520,7 +2683,7 @@ pub struct DefinitionLifecyclePayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_state: Option<EventLifecycleState>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub imported_from: Option<String>,
+    pub imported_from: Option<ImportedFrom>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2538,9 +2701,9 @@ pub enum EventLifecycleState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TransitionPayload {
     pub entity: TransitionEntity,
-    pub from: String,
-    pub to: String,
-    pub reason: String,
+    pub from: TransitionState,
+    pub to: TransitionState,
+    pub reason: TransitionReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fence_generation: Option<PositiveInteger>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2561,7 +2724,7 @@ pub enum TransitionEntity {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MisfirePayload {
     pub disposition: MisfireDisposition,
-    pub collapsed_slots: Vec<Timestamp>,
+    pub collapsed_slots: BoundedVec<Timestamp, 4096>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

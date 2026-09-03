@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::types::{AdoptionKey, PositiveInteger};
+use super::types::{AdoptionKey, ErrorMessage, PositiveInteger, StringConstraintError};
 
 /// Every error code frozen by `error-envelope.schema.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ impl ErrorCode {
 pub struct ErrorEnvelope {
     code: ErrorCode,
     http_status: u16,
-    pub message: String,
+    pub message: ErrorMessage,
     pub retryable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<BTreeMap<String, Value>>,
@@ -120,16 +120,28 @@ pub struct ErrorEnvelope {
 
 impl ErrorEnvelope {
     #[must_use]
-    pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+    pub fn new(code: ErrorCode, message: ErrorMessage, retryable: bool) -> Self {
         Self {
             code,
             http_status: code.http_status(),
-            message: message.into(),
+            message,
             retryable,
             details: None,
             adoption: None,
             current_revision: None,
         }
+    }
+
+    pub fn try_new(
+        code: ErrorCode,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Result<Self, StringConstraintError> {
+        Ok(Self::new(
+            code,
+            ErrorMessage::new(message.into())?,
+            retryable,
+        ))
     }
 
     #[must_use]
@@ -171,7 +183,7 @@ impl<'de> Deserialize<'de> for ErrorEnvelope {
         struct Raw {
             code: ErrorCode,
             http_status: u16,
-            message: String,
+            message: ErrorMessage,
             retryable: bool,
             details: Option<BTreeMap<String, Value>>,
             adoption: Option<ErrorAdoption>,

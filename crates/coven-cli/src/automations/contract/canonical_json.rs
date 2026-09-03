@@ -21,8 +21,8 @@ where
     serde_jcs::to_vec(value).context("JCS canonicalization failed")
 }
 
-/// Serialize after removing every `integrity` member, as prescribed by the
-/// published Automations v1 digest recipe.
+/// Serialize after removing only the covered object's top-level `integrity`
+/// member, as prescribed by the published Automations v1 digest recipe.
 pub fn canonicalize_without_integrity(value: &Value) -> anyhow::Result<Vec<u8>> {
     let mut covered = value.clone();
     if let Value::Object(object) = &mut covered {

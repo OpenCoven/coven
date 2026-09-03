@@ -206,7 +206,8 @@ mod tests {
         assert_eq!(ErrorCode::ALL.len(), expected.len());
 
         for (code, status) in expected {
-            let envelope = ErrorEnvelope::new(code, "safe message", false);
+            let envelope = ErrorEnvelope::try_new(code, "safe message", false)
+                .expect("safe message is within the schema bound");
             assert_eq!(code.http_status(), status);
             assert_eq!(envelope.http_status(), status);
 
@@ -356,6 +357,10 @@ mod tests {
         invalid_extension["extensions"] = json!({"not-namespaced": true});
         assert!(serde_json::from_value::<AutomationDefinition>(invalid_extension).is_err());
 
+        let mut reverse_dns_extension = fixture("definition.golden");
+        reverse_dns_extension["extensions"] = json!({"com-acme.tools.feature": true});
+        assert_round_trip::<AutomationDefinition>(reverse_dns_extension);
+
         let mut duplicate_capability = fixture("definition.golden");
         duplicate_capability["runtimeRequirements"]["capabilities"] =
             json!(["sessions.launch", "sessions.launch"]);
@@ -389,6 +394,11 @@ mod tests {
         assert!(
             serde_json::from_value::<AutomationDefinition>(fixed_backoff_without_seconds).is_err()
         );
+
+        let mut duplicate_retryable_class = fixture("definition.golden");
+        duplicate_retryable_class["policies"]["retry"]["retryableClasses"] =
+            json!(["transient_dispatch", "transient_dispatch"]);
+        assert!(serde_json::from_value::<AutomationDefinition>(duplicate_retryable_class).is_err());
 
         let mut invalid_digest = fixture("definition.golden");
         invalid_digest["integrity"]["value"] = json!("not-a-sha256");
@@ -520,6 +530,14 @@ mod tests {
             serde_json::from_value::<AutomationAttempt>(retry_without_prior_disposition).is_err()
         );
 
+        let mut first_attempt_with_prior_disposition = fixture("attempt.golden");
+        first_attempt_with_prior_disposition["priorDisposition"] =
+            json!({"attemptNumber": 1, "outcome": "failed"});
+        assert!(
+            serde_json::from_value::<AutomationAttempt>(first_attempt_with_prior_disposition)
+                .is_err()
+        );
+
         let base = json!({
             "schemaVersion": "coven.automations.v1",
             "command": "definition.get.v1",
@@ -555,5 +573,21 @@ mod tests {
             "retryable": false
         });
         assert!(serde_json::from_value::<CommandResponse>(rejected_with_result).is_err());
+
+        let empty_error_message = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "",
+            "retryable": false
+        });
+        assert!(serde_json::from_value::<ErrorEnvelope>(empty_error_message).is_err());
+
+        let oversized_error_message = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "a".repeat(1_001),
+            "retryable": false
+        });
+        assert!(serde_json::from_value::<ErrorEnvelope>(oversized_error_message).is_err());
     }
 }
