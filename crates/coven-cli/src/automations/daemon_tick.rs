@@ -218,7 +218,7 @@ fn process_automations_tick(
         runtime,
         &SystemAutomationClock::default(),
         &AutomationWakeSignal::default(),
-        false,
+        None,
     )
 }
 
@@ -227,12 +227,12 @@ fn process_automations_pass(
     runtime: &dyn crate::api::SessionRuntime,
     clock: &dyn AutomationClock,
     wake: &AutomationWakeSignal,
-    startup: bool,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<super::occurrences::TickReport> {
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
     let now = clock.now_utc();
-    reconcile_automation_runs(coven_home, &conn, runtime, now, startup)?;
+    reconcile_automation_runs(coven_home, &conn, runtime, now, startup_cutoff)?;
     let report = super::occurrences::tick(&conn, now)?;
     let _dispatch = super::runner::dispatch_claimed_occurrences_with_clock_and_cancel(
         &conn,
@@ -250,9 +250,9 @@ fn reconcile_automation_runs(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
-    startup: bool,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    super::runner::recover_restart_containment(coven_home, conn, now, startup)
+    super::runner::recover_restart_containment(coven_home, conn, now, startup_cutoff)
         .map_err(anyhow::Error::msg)?;
     for failure in
         super::runner::recover_abandoned_launches(conn, runtime, now).map_err(anyhow::Error::msg)?
@@ -321,7 +321,8 @@ fn run_automations_scheduler(
     wake: &AutomationWakeSignal,
 ) -> Result<()> {
     let observed_generation = wake.generation();
-    process_automations_pass(coven_home, runtime, clock, wake, true)?;
+    let startup_cutoff = clock.now_utc();
+    process_automations_pass(coven_home, runtime, clock, wake, Some(startup_cutoff))?;
     run_automations_scheduler_after_startup(coven_home, runtime, clock, wake, observed_generation);
     Ok(())
 }
@@ -341,7 +342,7 @@ fn run_automations_scheduler_after_startup(
                 observed_generation = wake.generation();
             }
         }
-        if let Err(error) = process_automations_pass(coven_home, runtime, clock, wake, false) {
+        if let Err(error) = process_automations_pass(coven_home, runtime, clock, wake, None) {
             crate::daemon::append_daemon_recovery_log(
                 coven_home,
                 &format!("automations tick failed: {error:#}"),
@@ -383,7 +384,7 @@ pub fn start_automations_scheduler(
                 runtime.as_ref(),
                 clock.as_ref(),
                 thread_wake.as_ref(),
-                true,
+                Some(recovery_now),
             ) {
                 crate::daemon::append_daemon_recovery_log(
                     &home,
@@ -718,6 +719,77 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "running");
+    }
+
+    #[test]
+    fn startup_settles_terminal_run_before_planning_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let routine = definition("startup-order");
+        insert_definition(&conn, &routine).unwrap();
+        let previous_started = Utc::now();
+        let created_at = (previous_started - chrono::Duration::days(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        set_created_at(&conn, "startup-order", &created_at);
+        let previous = super::super::runner::run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            previous_started,
+        )
+        .unwrap();
+        let previous_finished = previous_started + chrono::Duration::seconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            previous.session_id.as_deref().unwrap(),
+            "completed",
+            Some(0),
+            &previous_finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        drop(conn);
+
+        let clock = FixedSystemClock {
+            now: previous_started + chrono::Duration::days(1),
+            system: SystemAutomationClock::default(),
+        };
+        let wake = AutomationWakeSignal::default();
+        process_automations_pass(
+            home,
+            &crate::api::NoopSessionRuntime,
+            &clock,
+            &wake,
+            Some(clock.now),
+        )
+        .unwrap();
+        process_automations_pass(
+            home,
+            &crate::api::NoopSessionRuntime,
+            &clock,
+            &wake,
+            Some(clock.now),
+        )
+        .unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let runs = super::super::runs::list_runs(&conn, &routine.id, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter().filter(|run| run.status == "succeeded").count(),
+            1
+        );
+        assert_eq!(runs.iter().filter(|run| run.status == "running").count(), 1);
+        let scheduled_occurrences: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = ?1 AND kind = 'scheduled'",
+                [&routine.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled_occurrences, 1);
     }
 
     #[test]
