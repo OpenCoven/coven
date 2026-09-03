@@ -159,7 +159,7 @@ git fetch origin main
 git worktree add -b dogfood/automations-v1-source \
   "$HOME/.coven/worktrees/coven-automations-v1-source" origin/main
 cd "$HOME/.coven/worktrees/coven-automations-v1-source"
-coven claim acquire automations-v1-dogfood
+coven claim acquire issue-854
 cargo build -p coven-cli --locked
 cargo test -p coven-cli automations:: --locked
 ```
@@ -1045,11 +1045,11 @@ Expected: all commands exit 0 and reports contain separate profile results.
 - [ ] Run:
 
 ```bash
-corepack pnpm@10.34.0 typecheck
-corepack pnpm@10.34.0 test
-corepack pnpm@10.34.0 verify:contracts
-corepack pnpm@10.34.0 verify:package
-corepack pnpm@10.34.0 pack:public
+corepack pnpm@10.11.1 typecheck
+corepack pnpm@10.11.1 test
+corepack pnpm@10.11.1 verify:contracts
+corepack pnpm@10.11.1 verify:package
+corepack pnpm@10.11.1 pack:public
 ```
 
 **Exit gate:** a packed consumer verifies receipts and resumes a changefeed without direct SQLite, Codex, Cave, or runtime access.

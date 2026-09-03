@@ -1,7 +1,7 @@
 {
   "schema": "coven.automations-v1.tracker-mapping",
   "schema_version": 1,
-  "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#859). GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
+  "description": "Machine-readable Bead <-> GitHub outcome mapping for the Coven Automations v1 program (OpenCoven/coven#854), operationalized by OpenCoven/coven#859. GitHub owns public outcomes, acceptance gates, and durable evidence links. Beads (in the OpenCoven/coven-cave embedded Dolt database `cave`) owns the implementation dependency graph, execution ownership, and mirror inputs. This file is the reconciliation contract between the two; it is hand-reviewed, not hand-synced.",
   "sync": {
     "last_sync": "2026-09-03T06:09:12Z",
     "source_branch": "docs/coven-automations-critical-path",
