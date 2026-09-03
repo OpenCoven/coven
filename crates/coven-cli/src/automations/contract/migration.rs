@@ -47,7 +47,9 @@ pub fn migrate_legacy_contract_metadata(conn: &Connection) -> Result<()> {
         conn,
         "automation_definitions",
         "lifecycle_state",
-        "ALTER TABLE automation_definitions ADD COLUMN lifecycle_state TEXT",
+        "ALTER TABLE automation_definitions
+         ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'draft'
+         CHECK (lifecycle_state IN ('draft', 'paused', 'active', 'disabled', 'invalid'))",
     )?;
     ensure_column(
         conn,

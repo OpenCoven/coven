@@ -484,6 +484,31 @@ mod tests {
         assert_eq!(definition.1, 1);
         assert_eq!(definition.2, expected_digest);
         assert_eq!(definition.3, "active");
+        let lifecycle_column: (i64, Option<String>) = conn
+            .prepare("PRAGMA table_info(automation_definitions)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .find_map(|row| {
+                let (name, not_null, default_value) = row.unwrap();
+                (name == "lifecycle_state").then_some((not_null, default_value))
+            })
+            .unwrap();
+        assert_eq!(lifecycle_column, (1, Some("'draft'".to_string())));
+        assert!(conn
+            .execute(
+                "UPDATE automation_definitions
+                 SET lifecycle_state = 'unknown'
+                 WHERE id = 'legacy'",
+                [],
+            )
+            .is_err());
 
         let occurrence: (i64, String, String) = conn
             .query_row(
