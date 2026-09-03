@@ -16,6 +16,9 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
         name TEXT NOT NULL,
         status TEXT NOT NULL,
         definition_json TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+        tombstoned_at TEXT,
+        authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version IN (0, 1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );
@@ -30,8 +33,57 @@ pub struct RoutineRecord {
     pub name: String,
     pub status: String,
     pub definition_json: String,
+    pub revision: u64,
+    pub tombstoned_at: Option<String>,
+    pub authority_version: u8,
     pub created_at: String,
     pub updated_at: String,
+}
+
+fn revision_from_row(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let revision = row.get::<_, i64>(index)?;
+    u64::try_from(revision).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+pub(crate) fn ensure_definition_command_columns(conn: &Connection) -> Result<()> {
+    let columns = conn
+        .prepare("PRAGMA table_info(automation_definitions)")
+        .context("failed to inspect automation_definitions schema")?
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to enumerate automation_definitions columns")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_definitions columns")?;
+    if !columns.iter().any(|column| column == "revision") {
+        conn.execute(
+            "ALTER TABLE automation_definitions
+             ADD COLUMN revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1)",
+            [],
+        )
+        .context("failed to add automation definition revision column")?;
+    }
+    if !columns.iter().any(|column| column == "tombstoned_at") {
+        conn.execute(
+            "ALTER TABLE automation_definitions ADD COLUMN tombstoned_at TEXT",
+            [],
+        )
+        .context("failed to add automation definition tombstone column")?;
+    }
+    if !columns.iter().any(|column| column == "authority_version") {
+        conn.execute(
+            "ALTER TABLE automation_definitions
+             ADD COLUMN authority_version INTEGER NOT NULL DEFAULT 0
+             CHECK (authority_version IN (0, 1))",
+            [],
+        )
+        .context("failed to add automation definition authority version column")?;
+    }
+    Ok(())
 }
 
 fn now_iso() -> String {
@@ -39,24 +91,30 @@ fn now_iso() -> String {
 }
 
 pub fn list_definitions(conn: &Connection) -> Result<Vec<RoutineRecord>> {
+    list_definitions_with_tombstones(conn, false)
+}
+
+pub fn list_definitions_with_tombstones(
+    conn: &Connection,
+    include_tombstoned: bool,
+) -> Result<Vec<RoutineRecord>> {
+    let query = if include_tombstoned {
+        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
+                created_at, updated_at
+         FROM automation_definitions
+         ORDER BY name ASC, id ASC"
+    } else {
+        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
+                created_at, updated_at
+         FROM automation_definitions
+         WHERE tombstoned_at IS NULL
+         ORDER BY name ASC, id ASC"
+    };
     let mut statement = conn
-        .prepare(
-            "SELECT id, name, status, definition_json, created_at, updated_at
-             FROM automation_definitions
-             ORDER BY name ASC, id ASC",
-        )
+        .prepare(query)
         .context("failed to prepare routine list query")?;
     let rows = statement
-        .query_map([], |row| {
-            Ok(RoutineRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                definition_json: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })
+        .query_map([], routine_record_from_row)
         .context("failed to list routine definitions")?;
 
     let mut records = Vec::new();
@@ -67,30 +125,50 @@ pub fn list_definitions(conn: &Connection) -> Result<Vec<RoutineRecord>> {
 }
 
 pub fn get_definition(conn: &Connection, id: &str) -> Result<Option<RoutineRecord>> {
+    get_definition_with_tombstone(conn, id, false)
+}
+
+pub fn get_definition_with_tombstone(
+    conn: &Connection,
+    id: &str,
+    include_tombstoned: bool,
+) -> Result<Option<RoutineRecord>> {
+    let query = if include_tombstoned {
+        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
+                created_at, updated_at
+         FROM automation_definitions
+         WHERE id = ?1"
+    } else {
+        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
+                created_at, updated_at
+         FROM automation_definitions
+         WHERE id = ?1 AND tombstoned_at IS NULL"
+    };
     let mut statement = conn
-        .prepare(
-            "SELECT id, name, status, definition_json, created_at, updated_at
-             FROM automation_definitions
-             WHERE id = ?1",
-        )
+        .prepare(query)
         .context("failed to prepare routine get query")?;
     let mut rows = statement
-        .query_map(params![id], |row| {
-            Ok(RoutineRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                status: row.get(2)?,
-                definition_json: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-            })
-        })
+        .query_map(params![id], routine_record_from_row)
         .context("failed to get routine definition")?;
 
     match rows.next() {
         Some(row) => Ok(Some(row.context("failed to read routine row")?)),
         None => Ok(None),
     }
+}
+
+fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineRecord> {
+    Ok(RoutineRecord {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        status: row.get(2)?,
+        definition_json: row.get(3)?,
+        revision: revision_from_row(row, 4)?,
+        tombstoned_at: row.get(5)?,
+        authority_version: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+    })
 }
 
 pub fn insert_definition(
@@ -102,8 +180,9 @@ pub fn insert_definition(
         serde_json::to_string(definition).context("failed to serialize routine definition")?;
     conn.execute(
         "INSERT INTO automation_definitions
-            (id, name, status, definition_json, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            (id, name, status, definition_json, revision, tombstoned_at, authority_version,
+             created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 1, NULL, 0, ?5, ?5)",
         params![
             definition.id,
             definition.name,
@@ -118,11 +197,15 @@ pub fn insert_definition(
         name: definition.name.clone(),
         status: status_text(definition.status).to_string(),
         definition_json,
+        revision: 1,
+        tombstoned_at: None,
+        authority_version: 0,
         created_at: now.clone(),
         updated_at: now,
     })
 }
 
+#[allow(dead_code)]
 pub fn update_definition(
     conn: &Connection,
     definition: &RoutineDefinition,
@@ -136,8 +219,9 @@ pub fn update_definition(
              SET name = ?2,
                  status = ?3,
                  definition_json = ?4,
+                 revision = revision + 1,
                  updated_at = ?5
-             WHERE id = ?1",
+             WHERE id = ?1 AND tombstoned_at IS NULL AND authority_version = 0",
             params![
                 definition.id,
                 definition.name,
@@ -155,7 +239,8 @@ pub fn update_definition(
     Ok(Some(record))
 }
 
-pub fn delete_definition(conn: &Connection, id: &str) -> Result<bool> {
+#[cfg(test)]
+pub(crate) fn remove_definition_for_test(conn: &Connection, id: &str) -> Result<bool> {
     let changed = conn
         .execute(
             "DELETE FROM automation_definitions WHERE id = ?1",
@@ -221,7 +306,7 @@ mod tests {
         let updated = update_definition(&conn, &active).unwrap().unwrap();
         assert_eq!(updated.status, "ACTIVE");
 
-        assert!(delete_definition(&conn, "round-trip").unwrap());
+        assert!(remove_definition_for_test(&conn, "round-trip").unwrap());
         assert!(get_definition(&conn, "round-trip").unwrap().is_none());
     }
 
@@ -233,8 +318,56 @@ mod tests {
     }
 
     #[test]
-    fn delete_of_missing_id_reports_false() {
+    fn test_only_remove_of_missing_id_reports_false() {
         let (_temp, conn) = temp_store();
-        assert!(!delete_definition(&conn, "missing").unwrap());
+        assert!(!remove_definition_for_test(&conn, "missing").unwrap());
+    }
+
+    #[test]
+    fn initialization_adds_command_metadata_to_legacy_definitions() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        let legacy = definition("legacy");
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, created_at, updated_at
+             ) VALUES (?1, ?2, 'PAUSED', ?3, ?4, ?4)",
+            params![
+                legacy.id,
+                legacy.name,
+                serde_json::to_string(&legacy).unwrap(),
+                "2026-09-01T00:00:00.000Z",
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let migrated = get_definition(&conn, "legacy").unwrap().unwrap();
+        assert_eq!(migrated.revision, 1);
+        let (tombstoned_at, authority_version): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT tombstoned_at, authority_version
+                 FROM automation_definitions
+                 WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(tombstoned_at.is_none());
+        assert_eq!(authority_version, 0);
     }
 }
