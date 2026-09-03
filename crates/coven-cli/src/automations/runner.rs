@@ -193,6 +193,7 @@ fn persist_launch_with_clock(
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
+    ensure_dispatch_definition_pin(&transaction, occurrence_id, definition)?;
     let now = clock().max(not_before);
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let claim_is_current: bool = transaction
@@ -457,6 +458,64 @@ fn dispatch_occurrence(
     }
 }
 
+fn ensure_dispatch_definition_pin(
+    conn: &Connection,
+    occurrence_id: &str,
+    definition: &RoutineDefinition,
+) -> Result<(), String> {
+    let (automation_id, automation_revision, occurrence_digest): (String, i64, Option<String>) =
+        conn.query_row(
+            "SELECT automation_id, automation_revision, definition_digest
+             FROM automation_occurrences
+             WHERE id = ?1",
+            [occurrence_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("failed to read occurrence definition pin: {error}"))?;
+    if automation_id != definition.id {
+        return Err(format!(
+            "occurrence `{occurrence_id}` belongs to `{automation_id}`, not `{}`",
+            definition.id
+        ));
+    }
+    let Some(occurrence_digest) = occurrence_digest else {
+        return Err(format!(
+            "occurrence `{occurrence_id}` has unverifiable legacy definition history"
+        ));
+    };
+    let Some(current) =
+        super::store::get_definition(conn, &automation_id).map_err(|error| format!("{error:#}"))?
+    else {
+        return Err(format!(
+            "routine `{automation_id}` vanished after occurrence fencing"
+        ));
+    };
+    let current_revision =
+        i64::try_from(current.revision).map_err(|_| "definition revision exceeds SQLite range")?;
+    if current_revision != automation_revision
+        || current.definition_digest.as_deref() != Some(occurrence_digest.as_str())
+    {
+        return Err(format!(
+            "definition revision changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
+        .map_err(|error| format!("failed to digest stored routine `{automation_id}`: {error:#}"))?;
+    if persisted_digest != occurrence_digest {
+        return Err(format!(
+            "stored definition digest changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
+        .map_err(|error| format!("stored routine `{automation_id}` is unreadable: {error}"))?;
+    if persisted_definition != *definition {
+        return Err(format!(
+            "definition body changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    Ok(())
+}
+
 /// Runs a routine once, now: fences and claims an immediate occurrence,
 /// durably links its session, and dispatches through the shared session-launch
 /// path. A launch acknowledgement leaves the run in flight; a later
@@ -492,14 +551,18 @@ pub fn run_routine_now(
         });
     }
 
-    dispatch_occurrence(
-        conn,
-        runtime,
-        definition,
-        &occurrence_id,
-        cwd,
-        Utc::now().max(now),
-    )
+    let dispatch_now = Utc::now().max(now);
+    match dispatch_occurrence(conn, runtime, definition, &occurrence_id, cwd, dispatch_now) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if !settle_occurrence(conn, &occurrence_id, "failed", Some(&error), dispatch_now)? {
+                return Err(format!(
+                    "{error}; manual occurrence changed before rejection settlement"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Builds the shared SessionLaunch for a routine run. Every run — manual or
@@ -1369,6 +1432,137 @@ mod tests {
         assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn dispatch_refuses_an_occurrence_after_its_definition_revision_changes() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("revision-race");
+        insert_definition(&conn, &routine).unwrap();
+        let claimed_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "revision-one-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let mut revised = routine.clone();
+        revised.prompt = "A different action.".to_string();
+        let definition_json = serde_json::to_string(&revised).unwrap();
+        let definition_digest =
+            crate::automations::contract::migration::definition_digest(&definition_json).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET definition_json = ?2, definition_digest = ?3, revision = 2
+             WHERE id = ?1",
+            rusqlite::params![routine.id, definition_json, definition_digest],
+        )
+        .unwrap();
+
+        let report = dispatch_claimed_occurrences(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            claimed_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert!(report.dispatched.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].contains("definition revision changed after occurrence fencing"));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'revision-one-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn dispatch_accepts_legacy_optional_fields_that_normalize_on_serialize() {
+        let (_temp, conn) = temp_store();
+        let definition_json = r#"{"schemaVersion":1,"id":"legacy-normalized","name":"Legacy normalized","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"coven-code","familiarId":null,"cwd":"/tmp/project","outputTarget":null,"prompt":"Do the thing.","model":null,"tags":[]}"#;
+        let digest =
+            crate::automations::contract::migration::definition_digest(definition_json).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
+             ) VALUES (
+                'legacy-normalized', 'Legacy normalized', 'ACTIVE', ?1, 1, ?2, 'active',
+                NULL, 0, ?3, ?3
+             )",
+            rusqlite::params![
+                definition_json,
+                digest,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let definition: RoutineDefinition = serde_json::from_str(definition_json).unwrap();
+        let claimed_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "legacy-normalized-occurrence",
+            &definition.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let report = dispatch_claimed_occurrences(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            claimed_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.dispatched.len(), 1);
+        assert!(report.failed.is_empty());
+    }
+
+    #[test]
+    fn manual_dispatch_drift_settles_its_claim_before_returning() {
+        let (_temp, conn) = temp_store();
+        let stale = definition("manual-revision-race");
+        insert_definition(&conn, &stale).unwrap();
+        let mut revised = stale.clone();
+        revised.prompt = "Revision two.".to_string();
+        super::super::store::update_definition(&conn, &revised)
+            .unwrap()
+            .unwrap();
+
+        let error = run_routine_now(&conn, &crate::api::NoopSessionRuntime, &stale, Utc::now())
+            .unwrap_err();
+
+        assert!(error.contains("definition body changed after occurrence fencing"));
+        let claim_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'manual-revision-race' AND state = 'claimed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_count, 0);
+        let failed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'manual-revision-race' AND state = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_count, 1);
     }
 
     #[test]

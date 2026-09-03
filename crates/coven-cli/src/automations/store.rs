@@ -17,6 +17,9 @@ pub const AUTOMATION_DEFINITIONS_SCHEMA_SQL: &str = "
         status TEXT NOT NULL,
         definition_json TEXT NOT NULL,
         revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+        definition_digest TEXT,
+        lifecycle_state TEXT NOT NULL DEFAULT 'draft'
+            CHECK (lifecycle_state IN ('draft', 'paused', 'active', 'disabled', 'invalid')),
         tombstoned_at TEXT,
         authority_version INTEGER NOT NULL DEFAULT 0 CHECK (authority_version IN (0, 1)),
         created_at TEXT NOT NULL,
@@ -34,6 +37,8 @@ pub struct RoutineRecord {
     pub status: String,
     pub definition_json: String,
     pub revision: u64,
+    pub definition_digest: Option<String>,
+    pub lifecycle_state: String,
     pub tombstoned_at: Option<String>,
     pub authority_version: u8,
     pub created_at: String,
@@ -99,13 +104,13 @@ pub fn list_definitions_with_tombstones(
     include_tombstoned: bool,
 ) -> Result<Vec<RoutineRecord>> {
     let query = if include_tombstoned {
-        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
-                created_at, updated_at
+        "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
          FROM automation_definitions
          ORDER BY name ASC, id ASC"
     } else {
-        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
-                created_at, updated_at
+        "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
          FROM automation_definitions
          WHERE tombstoned_at IS NULL
          ORDER BY name ASC, id ASC"
@@ -134,13 +139,13 @@ pub fn get_definition_with_tombstone(
     include_tombstoned: bool,
 ) -> Result<Option<RoutineRecord>> {
     let query = if include_tombstoned {
-        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
-                created_at, updated_at
+        "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
          FROM automation_definitions
          WHERE id = ?1"
     } else {
-        "SELECT id, name, status, definition_json, revision, tombstoned_at, authority_version,
-                created_at, updated_at
+        "SELECT id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
          FROM automation_definitions
          WHERE id = ?1 AND tombstoned_at IS NULL"
     };
@@ -164,10 +169,12 @@ fn routine_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RoutineR
         status: row.get(2)?,
         definition_json: row.get(3)?,
         revision: revision_from_row(row, 4)?,
-        tombstoned_at: row.get(5)?,
-        authority_version: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        definition_digest: row.get(5)?,
+        lifecycle_state: row.get(6)?,
+        tombstoned_at: row.get(7)?,
+        authority_version: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -178,16 +185,21 @@ pub fn insert_definition(
     let now = now_iso();
     let definition_json =
         serde_json::to_string(definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     conn.execute(
         "INSERT INTO automation_definitions
-            (id, name, status, definition_json, revision, tombstoned_at, authority_version,
-             created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 1, NULL, 0, ?5, ?5)",
+            (id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+             tombstoned_at, authority_version, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 0, ?7, ?7)",
         params![
             definition.id,
             definition.name,
             status_text(definition.status),
             definition_json,
+            definition_digest,
+            lifecycle_state,
             now,
         ],
     )
@@ -198,6 +210,8 @@ pub fn insert_definition(
         status: status_text(definition.status).to_string(),
         definition_json,
         revision: 1,
+        definition_digest: Some(definition_digest),
+        lifecycle_state: lifecycle_state.to_string(),
         tombstoned_at: None,
         authority_version: 0,
         created_at: now.clone(),
@@ -213,20 +227,27 @@ pub fn update_definition(
     let updated_at = now_iso();
     let definition_json =
         serde_json::to_string(definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     let changed = conn
         .execute(
             "UPDATE automation_definitions
              SET name = ?2,
                  status = ?3,
                  definition_json = ?4,
+                 definition_digest = ?5,
+                 lifecycle_state = ?6,
                  revision = revision + 1,
-                 updated_at = ?5
+                 updated_at = ?7
              WHERE id = ?1 AND tombstoned_at IS NULL AND authority_version = 0",
             params![
                 definition.id,
                 definition.name,
                 status_text(definition.status),
                 definition_json,
+                definition_digest,
+                lifecycle_state,
                 updated_at,
             ],
         )
@@ -369,5 +390,377 @@ mod tests {
             .unwrap();
         assert!(tombstoned_at.is_none());
         assert_eq!(authority_version, 0);
+    }
+
+    #[test]
+    fn initialization_migrates_legacy_automation_history_without_rewriting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy-contract.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE automation_occurrences (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'scheduled',
+                state TEXT NOT NULL DEFAULT 'planned',
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(automation_id, scheduled_for)
+             );
+             CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                occurrence_id TEXT,
+                session_id TEXT,
+                familiar_id TEXT,
+                runtime TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                log_json TEXT,
+                output_commit TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE SET NULL
+             );",
+        )
+        .unwrap();
+        let legacy_definition = r#"{ "schemaVersion": 1, "id": "legacy", "name": "Legacy", "status": "ACTIVE", "rrule": "FREQ=DAILY;BYHOUR=9", "timezone": "local", "misfire": "latest", "overlap": "forbid", "timeoutMinutes": 30, "runtime": "coven-code", "prompt": "Preserve these exact bytes." }"#;
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, created_at, updated_at
+             ) VALUES ('legacy', 'Legacy', 'ACTIVE', ?1, ?2, ?2)",
+            params![legacy_definition, "2026-09-01T00:00:00.000Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, scheduled_for, kind, state, attempt, created_at, updated_at
+             ) VALUES ('occ-legacy', 'legacy', ?1, 'scheduled', 'succeeded', 1, ?1, ?2)",
+            params!["2026-09-01T09:00:00.000Z", "2026-09-01T09:05:00.000Z"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs (
+                id, automation_id, occurrence_id, session_id, familiar_id, runtime, status,
+                exit_code, log_json, output_commit, started_at, finished_at
+             ) VALUES (
+                'run-legacy', 'legacy', 'occ-legacy', 'session-legacy', 'cody',
+                'coven-code', 'succeeded', 0, '[\"done\"]', 'committed', ?1, ?2
+             )",
+            params!["2026-09-01T09:00:01.000Z", "2026-09-01T09:05:00.000Z"],
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let legacy_json: serde_json::Value = serde_json::from_str(legacy_definition).unwrap();
+        let expected_digest =
+            crate::automations::contract::canonical_json::sha256_digest(&legacy_json).unwrap();
+        let definition: (String, i64, String, String) = conn
+            .query_row(
+                "SELECT definition_json, revision, definition_digest, lifecycle_state
+                 FROM automation_definitions
+                 WHERE id = 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(definition.0, legacy_definition);
+        assert_eq!(definition.1, 1);
+        assert_eq!(definition.2, expected_digest);
+        assert_eq!(definition.3, "active");
+        let lifecycle_column: (i64, Option<String>) = conn
+            .prepare("PRAGMA table_info(automation_definitions)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            })
+            .unwrap()
+            .find_map(|row| {
+                let (name, not_null, default_value) = row.unwrap();
+                (name == "lifecycle_state").then_some((not_null, default_value))
+            })
+            .unwrap();
+        assert_eq!(lifecycle_column, (1, Some("'draft'".to_string())));
+        assert!(conn
+            .execute(
+                "UPDATE automation_definitions
+                 SET lifecycle_state = 'unknown'
+                 WHERE id = 'legacy'",
+                [],
+            )
+            .is_err());
+
+        let occurrence: (i64, String, String) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest, state
+                 FROM automation_occurrences
+                 WHERE id = 'occ-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            occurrence,
+            (1, expected_digest.clone(), "succeeded".to_string())
+        );
+
+        let run: (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest, receipt_id
+                 FROM automation_runs
+                 WHERE id = 'run-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run, (1, expected_digest, None));
+
+        for table in [
+            "automation_definitions",
+            "automation_occurrences",
+            "automation_runs",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "{table} row count changed");
+        }
+        conn.execute_batch(
+            "CREATE TABLE automation_migration_writes (
+                table_name TEXT NOT NULL,
+                operation TEXT NOT NULL
+             );
+             CREATE TRIGGER track_definition_update
+             AFTER UPDATE ON automation_definitions
+             BEGIN
+                INSERT INTO automation_migration_writes VALUES ('automation_definitions', 'update');
+             END;
+             CREATE TRIGGER track_occurrence_update
+             AFTER UPDATE ON automation_occurrences
+             BEGIN
+                INSERT INTO automation_migration_writes VALUES ('automation_occurrences', 'update');
+             END;
+             CREATE TRIGGER track_run_update
+             AFTER UPDATE ON automation_runs
+             BEGIN
+                INSERT INTO automation_migration_writes VALUES ('automation_runs', 'update');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let migrated_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_contract_migrations
+                 WHERE profile = 'coven.automations.v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_rows, 1);
+        let write_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_migration_writes",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(write_count, 0);
+    }
+
+    #[test]
+    fn migration_does_not_attribute_old_history_to_a_recreated_definition() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("recreated.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE automation_occurrences (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'scheduled',
+                state TEXT NOT NULL DEFAULT 'planned',
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(automation_id, scheduled_for)
+             );
+             CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                occurrence_id TEXT,
+                session_id TEXT,
+                familiar_id TEXT,
+                runtime TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                log_json TEXT,
+                output_commit TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+             );
+             INSERT INTO automation_definitions VALUES (
+                'recreated', 'Recreated', 'PAUSED',
+                '{\"schemaVersion\":1,\"id\":\"recreated\",\"name\":\"Recreated\",\"status\":\"PAUSED\",\"rrule\":\"FREQ=DAILY;BYHOUR=9\",\"timezone\":\"local\",\"misfire\":\"latest\",\"overlap\":\"forbid\",\"timeoutMinutes\":30,\"runtime\":\"coven-code\",\"prompt\":\"new body\"}',
+                '2026-09-02T00:00:00.000Z', '2026-09-02T00:00:00.000Z'
+             );
+             INSERT INTO automation_occurrences VALUES (
+                'old-occurrence', 'recreated', '2026-09-01T09:00:00.000Z', 'scheduled',
+                'skipped', NULL, NULL, 0, 'superseded by latest misfire policy',
+                '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             );
+             INSERT INTO automation_runs VALUES (
+                'old-run', 'recreated', 'old-occurrence', NULL, NULL, 'coven-code',
+                'failed', 1, NULL, NULL, '2026-09-01T09:00:01.000Z',
+                '2026-09-01T09:01:00.000Z'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let occurrence: (i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest, state
+                 FROM automation_occurrences
+                 WHERE id = 'old-occurrence'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence, (1, None, "superseded".to_string()));
+        let run: (i64, Option<String>) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest
+                 FROM automation_runs
+                 WHERE id = 'old-run'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(run, (1, None));
+        let unresolved: (i64, i64) = conn
+            .query_row(
+                "SELECT unverifiable_occurrences, unverifiable_runs
+                 FROM automation_contract_migrations
+                 WHERE profile = 'coven.automations.v1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unresolved, (1, 1));
+    }
+
+    #[test]
+    fn migration_retains_malformed_legacy_definitions_as_unverifiable() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_definitions (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                definition_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+             );
+             CREATE TABLE automation_occurrences (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                scheduled_for TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'scheduled',
+                state TEXT NOT NULL DEFAULT 'planned',
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                attempt INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(automation_id, scheduled_for)
+             );
+             CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL,
+                occurrence_id TEXT,
+                session_id TEXT,
+                familiar_id TEXT,
+                runtime TEXT,
+                status TEXT NOT NULL,
+                exit_code INTEGER,
+                log_json TEXT,
+                output_commit TEXT,
+                started_at TEXT NOT NULL,
+                finished_at TEXT
+             );
+             INSERT INTO automation_definitions VALUES (
+                'malformed', 'Malformed', 'ACTIVE', '{not-json',
+                '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z'
+             );",
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let migrated: (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT definition_json, definition_digest, lifecycle_state
+                 FROM automation_definitions
+                 WHERE id = 'malformed'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            migrated,
+            ("{not-json".to_string(), None, "invalid".to_string())
+        );
+        let unverifiable: i64 = conn
+            .query_row(
+                "SELECT unverifiable_definitions
+                 FROM automation_contract_migrations
+                 WHERE profile = 'coven.automations.v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unverifiable, 1);
     }
 }
