@@ -336,6 +336,10 @@ fn matches_note(value: &str) -> bool {
     has_character_length(value, 0, 500)
 }
 
+fn matches_lease_note(value: &str) -> bool {
+    has_character_length(value, 0, 200)
+}
+
 fn matches_failure_class(value: &str) -> bool {
     has_character_length(value, 0, 96)
 }
@@ -420,6 +424,7 @@ validated_string!(Detail, matches_detail);
 validated_string!(WorkerId, matches_worker_id);
 validated_string!(SessionId, matches_session_id);
 validated_string!(CommandNote, matches_note);
+validated_string!(LeaseNote, matches_lease_note);
 validated_string!(FailureClass, matches_failure_class);
 validated_string!(PartialFailureStep, matches_partial_failure_step);
 validated_string!(PartialFailureReason, matches_partial_failure_reason);
@@ -512,34 +517,35 @@ impl<'de> Deserialize<'de> for ExtensionBag {
 }
 
 fn matches_extension_key(key: &str) -> bool {
-    if let Some(suffix) = key.strip_prefix("x-") {
-        return !suffix.is_empty()
+    let vendor_local = key.strip_prefix("x-").is_some_and(|suffix| {
+        !suffix.is_empty()
             && suffix
                 .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    }
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    });
     let mut parts = key.rsplitn(3, '.');
     let Some(last) = parts.next() else {
-        return false;
+        return vendor_local;
     };
     let Some(middle) = parts.next() else {
-        return false;
+        return vendor_local;
     };
     let Some(first) = parts.next() else {
-        return false;
+        return vendor_local;
     };
-    !first.is_empty()
-        && !middle.is_empty()
-        && !last.is_empty()
-        && first.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
-        })
-        && middle
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && last
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    vendor_local
+        || (!first.is_empty()
+            && !middle.is_empty()
+            && !last.is_empty()
+            && first.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+            && middle
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && last
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1756,7 +1762,7 @@ pub struct LeaseObservation {
     pub observed_at: Timestamp,
     pub heartbeat_ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub note: Option<CommandNote>,
+    pub note: Option<LeaseNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

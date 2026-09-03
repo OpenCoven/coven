@@ -361,6 +361,16 @@ mod tests {
         reverse_dns_extension["extensions"] = json!({"com-acme.tools.feature": true});
         assert_round_trip::<AutomationDefinition>(reverse_dns_extension);
 
+        let mut reverse_dns_x_prefix_extension = fixture("definition.golden");
+        reverse_dns_x_prefix_extension["extensions"] = json!({"x-acme.tools.feature": true});
+        assert_round_trip::<AutomationDefinition>(reverse_dns_x_prefix_extension);
+
+        let mut malformed_x_prefix_extension = fixture("definition.golden");
+        malformed_x_prefix_extension["extensions"] = json!({"x-acme.tools": true});
+        assert!(
+            serde_json::from_value::<AutomationDefinition>(malformed_x_prefix_extension).is_err()
+        );
+
         let mut duplicate_capability = fixture("definition.golden");
         duplicate_capability["runtimeRequirements"]["capabilities"] =
             json!(["sessions.launch", "sessions.launch"]);
@@ -410,6 +420,22 @@ mod tests {
         assert!(
             serde_json::from_value::<AutomationReceipt>(duplicate_exercised_capability).is_err()
         );
+
+        let mut lease_note_at_limit = fixture("attempt.golden");
+        lease_note_at_limit["leaseObservations"] = json!([{
+            "observedAt": "2026-08-30T09:00:00.000Z",
+            "heartbeatOk": true,
+            "note": "a".repeat(200)
+        }]);
+        assert_round_trip::<AutomationAttempt>(lease_note_at_limit);
+
+        let mut oversized_lease_note = fixture("attempt.golden");
+        oversized_lease_note["leaseObservations"] = json!([{
+            "observedAt": "2026-08-30T09:00:00.000Z",
+            "heartbeatOk": true,
+            "note": "a".repeat(201)
+        }]);
+        assert!(serde_json::from_value::<AutomationAttempt>(oversized_lease_note).is_err());
     }
 
     #[test]
