@@ -29,24 +29,44 @@ pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> P
         .join(format!("{session_id}.receipt"))
 }
 
+fn receipt_proves_containment(
+    receipt: Option<&[u8]>,
+    previous_daemon_launch: bool,
+    windows_job_guarantee: bool,
+) -> bool {
+    if windows_job_guarantee && previous_daemon_launch {
+        return true;
+    }
+    match receipt {
+        Some(receipt) => {
+            receipt == crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT
+                || receipt == crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT
+        }
+        None => previous_daemon_launch,
+    }
+}
+
 pub(crate) fn recover_restart_containment(
     coven_home: &Path,
     conn: &Connection,
     now: DateTime<Utc>,
-    startup: bool,
+    startup_cutoff: Option<DateTime<Utc>>,
 ) -> Result<usize, String> {
-    let candidates: Vec<String> = {
+    let candidates: Vec<(String, String, String, Option<String>)> = {
         let mut statement = conn
             .prepare(
-                "SELECT r.session_id
+                "SELECT r.session_id, s.created_at, o.kind, o.lease_owner
                  FROM automation_runs AS r
                  JOIN sessions AS s ON s.id = r.session_id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
                  WHERE r.status = 'running'
                    AND s.status IN ('created', 'orphaned')",
             )
             .map_err(|error| format!("failed to prepare containment recovery query: {error}"))?;
         let candidates = statement
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .map_err(|error| format!("failed to query containment recovery candidates: {error}"))?
             .collect::<Result<_, _>>()
             .map_err(|error| format!("failed to read containment recovery candidate: {error}"))?;
@@ -54,25 +74,32 @@ pub(crate) fn recover_restart_containment(
     };
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut recovered = 0;
-    for session_id in candidates {
+    for (session_id, created_at, occurrence_kind, lease_owner) in candidates {
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|error| {
+                format!(
+                    "automation session `{session_id}` has invalid created_at during containment recovery: {error}"
+                )
+            })?
+            .with_timezone(&Utc);
+        let previous_daemon_launch = startup_cutoff.is_some_and(|cutoff| {
+            occurrence_kind == "scheduled"
+                && lease_owner.as_deref() == Some("daemon")
+                && created_at.timestamp_millis() < cutoff.timestamp_millis()
+        });
         let path = containment_receipt_path(coven_home, &session_id);
-        let disposition_proven = if cfg!(windows) {
-            startup
-        } else {
-            match std::fs::read(&path) {
-                Ok(receipt) => {
-                    receipt == crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT
-                        || receipt == crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => startup,
-                Err(error) => {
-                    return Err(format!(
-                        "failed to read containment receipt `{}`: {error}",
-                        path.display()
-                    ));
-                }
+        let receipt = match std::fs::read(&path) {
+            Ok(receipt) => Some(receipt),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read containment receipt `{}`: {error}",
+                    path.display()
+                ));
             }
         };
+        let disposition_proven =
+            receipt_proves_containment(receipt.as_deref(), previous_daemon_launch, cfg!(windows));
         if !disposition_proven {
             continue;
         }
@@ -1251,9 +1278,10 @@ pub fn load_definition_for_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automations::definition::RoutineDefinition;
+    use crate::automations::definition::{RoutineDefinition, RoutineStatus};
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
+    use chrono::TimeZone;
     use serde_json::json;
 
     struct RejectingRuntime;
@@ -1636,6 +1664,193 @@ mod tests {
         assert_eq!(state, "planned");
         assert_eq!(lease_owner, None);
         assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn startup_missing_receipt_does_not_contain_manual_launch() {
+        let (temp, conn) = temp_store();
+        let routine = definition("manual-startup-race");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-startup-occurrence",
+            &routine.id,
+            "manual",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "manual-startup-run",
+            "manual-startup-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_excludes_new_daemon_launch_without_receipt() {
+        let (temp, conn) = temp_store();
+        let routine = definition("new-daemon-launch");
+        insert_definition(&conn, &routine).unwrap();
+        let startup_cutoff = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap()
+            + chrono::Duration::microseconds(400);
+        let launched_at = startup_cutoff + chrono::Duration::microseconds(100);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "new-daemon-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "new-daemon-run",
+            "new-daemon-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(1),
+            Some(startup_cutoff),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_does_not_contain_manual_kind_with_daemon_owner() {
+        let (temp, conn) = temp_store();
+        let routine = definition("manual-daemon-owner");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-daemon-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "manual-daemon-run",
+            "manual-daemon-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_contains_previous_scheduled_daemon_launch_without_receipt() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("previous-scheduled-launch");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 10, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (launched_at - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let report = super::super::occurrences::tick(&conn, launched_at).unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "previous-scheduled-run",
+            occurrence_id,
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "killed"
+        );
+    }
+
+    #[test]
+    fn windows_previous_daemon_job_proves_containment_with_partial_receipt() {
+        assert!(receipt_proves_containment(Some(b"partial"), true, true));
+        assert!(!receipt_proves_containment(Some(b"partial"), true, false));
     }
 
     #[test]
@@ -2108,7 +2323,7 @@ mod tests {
             temp.path(),
             &conn,
             launched_at + chrono::Duration::seconds(1),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(recovered, 1);
@@ -2145,7 +2360,8 @@ mod tests {
         std::fs::write(receipt, b"").unwrap();
 
         assert_eq!(
-            recover_restart_containment(temp.path(), &conn, launched_at, true).unwrap(),
+            recover_restart_containment(temp.path(), &conn, launched_at, Some(launched_at))
+                .unwrap(),
             0
         );
         assert_eq!(
