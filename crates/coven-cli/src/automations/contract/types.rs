@@ -7,9 +7,18 @@ use serde::ser::{SerializeMap, SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use super::canonical_json::{canonicalize_without_integrity, sha256_hex};
 use super::error::ErrorEnvelope;
 
 pub type JsonObject = BTreeMap<String, Value>;
+
+pub(super) fn deserialize_non_null_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringConstraintError(&'static str);
@@ -477,6 +486,7 @@ macro_rules! validated_integer {
 }
 
 validated_integer!(PositiveInteger, 1, 9_007_199_254_740_991);
+validated_integer!(SafeInteger, 0, 9_007_199_254_740_991);
 validated_integer!(TimeoutMinutes, 1, 44_640);
 validated_integer!(MaximumAttempts, 1, 10);
 validated_integer!(BackoffSeconds, 1, 86_400);
@@ -805,7 +815,11 @@ pub enum Canonicalization {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrincipalRef {
     pub principal_id: PrincipalId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub display_name: Option<PrincipalDisplayName>,
 }
 
@@ -820,7 +834,11 @@ pub struct FamiliarRef {
 pub struct RuntimeDescriptor {
     pub runtime_id: RuntimeId,
     pub capabilities: RuntimeCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub model: Option<RuntimeModel>,
 }
 
@@ -828,7 +846,11 @@ pub struct RuntimeDescriptor {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApprovalRef {
     pub approval_policy_ref: ApprovalPolicyRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub approval_record_ref: Option<ApprovalRecordRef>,
 }
 
@@ -845,7 +867,11 @@ pub enum PrivacyClassification {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetentionClass {
     pub classification: RetentionClassification,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub delete_after: Option<Timestamp>,
 }
 
@@ -862,7 +888,11 @@ pub enum RetentionClassification {
 pub struct ProducerIdentity {
     pub component: ComponentName,
     pub instance_id: InstanceId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub implementation_version: Option<ImplementationVersion>,
 }
 
@@ -870,22 +900,46 @@ pub struct ProducerIdentity {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Provenance {
     pub created_by: PrincipalRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub created_at: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_by: Option<PrincipalRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub updated_at: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub imported_from: Option<ImportedFrom>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ActivationWindow {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub effective_from: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub effective_until: Option<Timestamp>,
 }
 
@@ -927,6 +981,15 @@ pub struct AutomationDefinition {
 }
 
 impl AutomationDefinition {
+    pub fn verify_integrity(&self) -> anyhow::Result<()> {
+        let value = serde_json::to_value(self)?;
+        let actual = sha256_hex(&canonicalize_without_integrity(&value)?);
+        anyhow::ensure!(
+            actual == self.integrity.value.as_str(),
+            "definition integrity digest does not match its body"
+        );
+        Ok(())
+    }
     #[must_use]
     pub const fn lifecycle_state(&self) -> DefinitionLifecycleState {
         self.lifecycle_state
@@ -991,16 +1054,22 @@ impl<'de> Deserialize<'de> for AutomationDefinition {
             revision: PositiveInteger,
             integrity: DigestValue,
             lifecycle_state: DefinitionLifecycleState,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             deletion: Option<DefinitionDeletion>,
             display: DefinitionDisplay,
             trigger: ScheduleTrigger,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             conditions: Option<EmptyConditions>,
             action: FamiliarInvocationAction,
             binding: DefinitionBinding,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             runtime_requirements: Option<RuntimeDescriptor>,
             policies: DefinitionPolicies,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             provenance: Option<Provenance>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             activation: Option<ActivationWindow>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             extensions: Option<ExtensionBag>,
         }
 
@@ -1024,6 +1093,9 @@ impl<'de> Deserialize<'de> for AutomationDefinition {
             extensions: raw.extensions,
         };
         definition.validate().map_err(serde::de::Error::custom)?;
+        definition
+            .verify_integrity()
+            .map_err(serde::de::Error::custom)?;
         Ok(definition)
     }
 }
@@ -1033,9 +1105,17 @@ impl<'de> Deserialize<'de> for AutomationDefinition {
 pub struct DefinitionDeletion {
     pub tombstoned: True,
     pub requested_at: Timestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub requested_by: Option<PrincipalRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<CommandReason>,
 }
 
@@ -1068,9 +1148,17 @@ impl<'de> Deserialize<'de> for True {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionDisplay {
     pub name: DisplayName,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub description: Option<DisplayDescription>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tags: Option<DisplayTags>,
 }
 
@@ -1108,7 +1196,11 @@ pub struct FamiliarInvocationAction {
     pub variant: FamiliarInvocationVariant,
     pub version: VersionOne,
     pub prompt: InvocationPrompt,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cwd: Option<WorkingDirectory>,
 }
 
@@ -1122,7 +1214,11 @@ pub enum FamiliarInvocationVariant {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionBinding {
     pub familiar_binding_policy: FamiliarBindingPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub familiar_id: Option<FamiliarId>,
     pub authority: ApprovalRef,
 }
@@ -1140,7 +1236,11 @@ pub struct DefinitionPolicies {
     pub retry: RetryPolicy,
     pub concurrency: ConcurrencyPolicy,
     pub misfire: MisfirePolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub delivery: Option<DeliveryPolicy>,
     pub retention: RetentionPolicy,
 }
@@ -1156,9 +1256,17 @@ pub struct TimeoutPolicy {
 pub struct RetryPolicy {
     pub max_attempts: MaximumAttempts,
     pub backoff_policy: BackoffPolicy,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub backoff_seconds: Option<BackoffSeconds>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub retryable_classes: Option<UniqueVec<RetryableClass>>,
 }
 
@@ -1205,9 +1313,17 @@ pub enum MisfirePolicyDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryPolicy {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_target: Option<WorkingDirectory>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub mode: Option<DeliveryMode>,
 }
 
@@ -1221,9 +1337,17 @@ pub enum DeliveryMode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetentionPolicy {
     pub occurrence_history: RetentionClass,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub run_logs: Option<RetentionClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub receipts: Option<RetentionClass>,
 }
 
@@ -1265,28 +1389,64 @@ pub struct AutomationOccurrence {
     pub trigger_identity: TriggerIdentity,
     pub occurrence_key: OccurrenceKey,
     pub scheduled_for: Timestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub observed_at: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub eligible_at: Option<Timestamp>,
     pub state: OccurrenceState,
     pub state_reason: StateReason,
     pub fence: OccurrenceFence,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub misfire_disposition: Option<MisfireDisposition>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub claim_metadata: Option<ClaimMetadata>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub active_run_ref: Option<RunId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cancellation: Option<Cancellation>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub recovery: Option<Recovery>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub event_window: Option<EventWindow>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub extensions: Option<ExtensionBag>,
 }
 
@@ -1294,9 +1454,17 @@ pub struct AutomationOccurrence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TriggerIdentity {
     pub kind: TriggerIdentityKind,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub rrule_ref: Option<RruleReference>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub requested_by: Option<PrincipalRef>,
 }
 
@@ -1312,9 +1480,17 @@ pub enum TriggerIdentityKind {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OccurrenceFence {
     pub generation: PositiveInteger,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub claimed_by: Option<ClaimedBy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lease_expires_at: Option<Timestamp>,
 }
 
@@ -1329,11 +1505,23 @@ pub struct ClaimMetadata {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Cancellation {
     pub requested_at: Timestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub requested_by: Option<PrincipalRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub acknowledged_at: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reconciled_at: Option<Timestamp>,
 }
 
@@ -1341,9 +1529,17 @@ pub struct Cancellation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Recovery {
     pub entered_at: Timestamp,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub evidence: Option<RecoveryEvidence>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub resolved_disposition: Option<RecoveryDisposition>,
 }
 
@@ -1365,8 +1561,8 @@ pub enum RecoveryDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventWindow {
-    pub first_sequence: u64,
-    pub last_sequence: u64,
+    pub first_sequence: SafeInteger,
+    pub last_sequence: SafeInteger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1443,6 +1639,21 @@ impl AutomationRun {
                 "terminal runs require finishedAt and terminalDisposition",
             ));
         }
+        if let Some(disposition) = &self.terminal_disposition {
+            let matches_state = matches!(
+                (self.state, disposition.outcome),
+                (RunState::Succeeded, TerminalOutcome::Succeeded)
+                    | (RunState::Failed, TerminalOutcome::Failed)
+                    | (RunState::Cancelled, TerminalOutcome::Cancelled)
+                    | (RunState::TimedOut, TerminalOutcome::TimedOut)
+                    | (RunState::Ambiguous, TerminalOutcome::Ambiguous)
+            );
+            if terminal && !matches_state {
+                return Err(StringConstraintError(
+                    "terminalDisposition outcome must match the run state",
+                ));
+            }
+        }
         if !terminal && (self.finished_at.is_some() || self.terminal_disposition.is_some()) {
             return Err(StringConstraintError(
                 "nonterminal runs must not contain finishedAt or terminalDisposition",
@@ -1467,15 +1678,23 @@ impl<'de> Deserialize<'de> for AutomationRun {
             automation_revision: PositiveInteger,
             binding: RunBinding,
             state: RunState,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             state_reason: Option<StateReason>,
             attempt_count: RunAttemptCount,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             current_attempt_id: Option<AttemptId>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             terminal_disposition: Option<TerminalDisposition>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             delivery: Option<RunDelivery>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             result_digest: Option<DigestValue>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             receipt_ref: Option<ReceiptId>,
             started_at: Timestamp,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             finished_at: Option<Timestamp>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             extensions: Option<ExtensionBag>,
         }
 
@@ -1516,9 +1735,17 @@ pub struct RunBinding {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AuthorityBinding {
     pub principal: PrincipalRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub approval: Option<ApprovalRef>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub authentication_class: Option<AuthenticationClass>,
 }
 
@@ -1526,9 +1753,17 @@ pub struct AuthorityBinding {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TerminalDisposition {
     pub outcome: TerminalOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub failure_class: Option<TerminalFailureClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<Detail>,
 }
 
@@ -1557,9 +1792,17 @@ pub enum TerminalFailureClass {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunDelivery {
     pub status: RunDeliveryStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub target: Option<WorkingDirectory>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub artifact_refs: Option<BoundedVec<ArtifactRef, 64>>,
 }
 
@@ -1577,7 +1820,11 @@ pub enum RunDeliveryStatus {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactRef {
     pub r#ref: ArtifactReference,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub digest: Option<DigestValue>,
 }
 
@@ -1666,16 +1913,25 @@ impl<'de> Deserialize<'de> for AutomationAttempt {
             occurrence_id: OccurrenceId,
             attempt_number: PositiveInteger,
             adoption_key: AdoptionKey,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             prior_disposition: Option<PriorDisposition>,
             dispatch_fence: DispatchFence,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             worker_correlation: Option<WorkerCorrelation>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             retry_classification: Option<RetryClassification>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             lease_observations: Option<BoundedVec<LeaseObservation, 1024>>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             output_cursors: Option<OutputCursors>,
             state: AttemptState,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             state_reason: Option<StateReason>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             opened_at: Option<Timestamp>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             settled_at: Option<Timestamp>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             extensions: Option<ExtensionBag>,
         }
 
@@ -1731,18 +1987,34 @@ pub struct DispatchFence {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkerCorrelation {
     pub worker_id: WorkerId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub session_id: Option<SessionId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub adopted_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RetryClassification {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub classification: Option<RetryClassificationKind>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     /// This snapshot has no schema uniqueness or cardinality constraint.
     pub eligible_classes: Option<Vec<RetryableClass>>,
 }
@@ -1761,17 +2033,29 @@ pub enum RetryClassificationKind {
 pub struct LeaseObservation {
     pub observed_at: Timestamp,
     pub heartbeat_ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub note: Option<LeaseNote>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputCursors {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_cursor: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_cursor: Option<u64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub event_cursor: Option<SafeInteger>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_cursor: Option<SafeInteger>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1785,7 +2069,7 @@ pub enum SideEffectClass {
     IrreversibleExternalMutation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationReceipt {
     pub schema_version: SchemaVersion,
@@ -1820,11 +2104,99 @@ pub struct AutomationReceipt {
     pub privacy: ReceiptPrivacy,
 }
 
+impl AutomationReceipt {
+    pub fn verify_integrity(&self) -> anyhow::Result<()> {
+        let value = serde_json::to_value(self)?;
+        let actual = sha256_hex(&canonicalize_without_integrity(&value)?);
+        anyhow::ensure!(
+            actual == self.integrity.value.as_str(),
+            "receipt integrity digest does not match its body"
+        );
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomationReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            receipt_id: ReceiptId,
+            automation_id: AutomationId,
+            automation_revision: PositiveInteger,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            definition_digest: Option<DigestValue>,
+            occurrence_id: OccurrenceId,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            occurrence_fence_generation: Option<PositiveInteger>,
+            run_id: RunId,
+            attempt_id: AttemptId,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            attempt_number: Option<PositiveInteger>,
+            identity: FamiliarRef,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            authority: Option<ReceiptAuthority>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            runtime: Option<RuntimeDescriptor>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            delivery_digest: Option<DigestValue>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            result_digest: Option<DigestValue>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            exercised_capabilities: Option<ExercisedCapabilities>,
+            side_effect_class: SideEffectClass,
+            outcome: ReceiptOutcome,
+            produced_at: Timestamp,
+            producer: ProducerIdentity,
+            integrity: ReceiptIntegrity,
+            privacy: ReceiptPrivacy,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let receipt = Self {
+            schema_version: raw.schema_version,
+            receipt_id: raw.receipt_id,
+            automation_id: raw.automation_id,
+            automation_revision: raw.automation_revision,
+            definition_digest: raw.definition_digest,
+            occurrence_id: raw.occurrence_id,
+            occurrence_fence_generation: raw.occurrence_fence_generation,
+            run_id: raw.run_id,
+            attempt_id: raw.attempt_id,
+            attempt_number: raw.attempt_number,
+            identity: raw.identity,
+            authority: raw.authority,
+            runtime: raw.runtime,
+            delivery_digest: raw.delivery_digest,
+            result_digest: raw.result_digest,
+            exercised_capabilities: raw.exercised_capabilities,
+            side_effect_class: raw.side_effect_class,
+            outcome: raw.outcome,
+            produced_at: raw.produced_at,
+            producer: raw.producer,
+            integrity: raw.integrity,
+            privacy: raw.privacy,
+        };
+        receipt
+            .verify_integrity()
+            .map_err(serde::de::Error::custom)?;
+        Ok(receipt)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptAuthority {
     pub principal: PrincipalRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub approval: Option<ApprovalRef>,
 }
 
@@ -1832,13 +2204,29 @@ pub struct ReceiptAuthority {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptOutcome {
     pub disposition: TerminalOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub failure_class: Option<FailureClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub detail: Option<Detail>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub partial_failures: Option<BoundedVec<PartialFailure, 128>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub recovery_disposition: Option<ReceiptRecoveryDisposition>,
 }
 
@@ -1847,7 +2235,11 @@ pub struct ReceiptOutcome {
 pub struct PartialFailure {
     pub step: PartialFailureStep,
     pub reason: PartialFailureReason,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub recovered: Option<bool>,
 }
 
@@ -1865,7 +2257,11 @@ pub struct ReceiptIntegrity {
     pub algorithm: DigestAlgorithm,
     pub canonicalization: Canonicalization,
     pub value: Sha256Digest,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub authentication: Option<ReceiptAuthentication>,
 }
 
@@ -1882,7 +2278,11 @@ pub enum ReceiptAuthentication {
 pub struct ReceiptPrivacy {
     pub classification: PrivacyClassification,
     pub retention: RetentionClass,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub notes: Option<PrivacyNotes>,
 }
 
@@ -2014,6 +2414,7 @@ impl<'de> Deserialize<'de> for CommandRequest {
             schema_version: SchemaVersion,
             command: CommandName,
             adoption_key: AdoptionKey,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             expected_revision: Option<PositiveInteger>,
             origin: CommandOrigin,
             intent: CommandIntent,
@@ -2153,7 +2554,11 @@ pub struct DefinitionMutationPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionTargetPayload {
     pub automation_id: AutomationId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<CommandReason>,
 }
 
@@ -2161,9 +2566,17 @@ pub struct DefinitionTargetPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunNowPayload {
     pub automation_id: AutomationId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub note: Option<CommandNote>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub bypass_eligibility: Option<bool>,
 }
 
@@ -2171,7 +2584,11 @@ pub struct RunNowPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OccurrenceCancelPayload {
     pub occurrence_id: OccurrenceId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<CommandReason>,
 }
 
@@ -2179,7 +2596,11 @@ pub struct OccurrenceCancelPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunCancelPayload {
     pub run_id: RunId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<CommandReason>,
 }
 
@@ -2187,7 +2608,11 @@ pub struct RunCancelPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AttemptCancelPayload {
     pub attempt_id: AttemptId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<CommandReason>,
 }
 
@@ -2197,7 +2622,11 @@ pub struct AttemptRetryPayload {
     pub run_id: RunId,
     pub prior_attempt_number: PositiveInteger,
     pub prior_disposition: RetryPriorDisposition,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub note: Option<CommandNote>,
 }
 
@@ -2214,7 +2643,11 @@ pub enum RetryPriorDisposition {
 pub struct OccurrenceRecoverPayload {
     pub occurrence_id: OccurrenceId,
     pub evidence_determination: EvidenceDetermination,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub statement: Option<OperatorStatement>,
 }
 
@@ -2228,11 +2661,23 @@ pub enum EvidenceDetermination {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionListPayload {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lifecycle_state: Option<ListLifecycleState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<CommandListLimit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<Cursor>,
 }
 
@@ -2252,7 +2697,11 @@ pub enum ListLifecycleState {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionGetPayload {
     pub automation_id: AutomationId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub revision: Option<PositiveInteger>,
 }
 
@@ -2260,11 +2709,23 @@ pub struct DefinitionGetPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunHistoryPayload {
     pub automation_id: AutomationId,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub occurrence_id: Option<OccurrenceId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<CommandListLimit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cursor: Option<Cursor>,
 }
 
@@ -2278,11 +2739,23 @@ pub struct DefinitionHealthPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventsReadPayload {
     pub stream: CommandStreamRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after: Option<SafeInteger>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub limit: Option<EventReadLimit>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub from: Option<Timestamp>,
 }
 
@@ -2290,9 +2763,17 @@ pub struct EventsReadPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventsSubscribePayload {
     pub stream: CommandStreamRef,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub after: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub after: Option<SafeInteger>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub checkpoint: Option<Checkpoint>,
 }
 
@@ -2300,7 +2781,11 @@ pub struct EventsSubscribePayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LegacyImportPayload {
     pub source: LegacyImportSource,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub dry_run: Option<bool>,
 }
 
@@ -2315,11 +2800,23 @@ pub enum LegacyImportSource {
 pub struct CommandOrigin {
     pub principal: PrincipalRef,
     pub channel: CommandChannel,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub authentication_class: Option<AuthenticationClass>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub requested_at: Option<Timestamp>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub correlation_id: Option<CorrelationId>,
 }
 
@@ -2469,11 +2966,17 @@ impl<'de> Deserialize<'de> for CommandResponse {
             command: CommandName,
             adoption_key: AdoptionKey,
             outcome: CommandOutcome,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             replay: Option<ReplayMetadata>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             revision: Option<PositiveInteger>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             result: Option<JsonObject>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             error: Option<ErrorEnvelope>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             receipt_ref: Option<ReceiptId>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             event_ref: Option<EventRef>,
         }
 
@@ -2573,7 +3076,7 @@ pub struct ReplayMetadata {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventRef {
     pub stream: EventRefStream,
-    pub sequence: u64,
+    pub sequence: SafeInteger,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2608,13 +3111,13 @@ pub enum EventKind {
     FeedSnapshot,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventEnvelope {
     pub schema_version: SchemaVersion,
     pub event_id: EventId,
     pub stream: StreamRef,
-    pub sequence: u64,
+    pub sequence: SafeInteger,
     pub recorded_at: Timestamp,
     pub observed_at: Timestamp,
     pub producer: ProducerIdentity,
@@ -2634,6 +3137,79 @@ pub struct EventEnvelope {
     pub privacy: EventPrivacy,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub integrity: Option<DigestValue>,
+}
+
+impl EventEnvelope {
+    pub fn verify_integrity(&self) -> anyhow::Result<()> {
+        let Some(integrity) = &self.integrity else {
+            return Ok(());
+        };
+        let value = serde_json::to_value(self)?;
+        let actual = sha256_hex(&canonicalize_without_integrity(&value)?);
+        anyhow::ensure!(
+            actual == integrity.value.as_str(),
+            "event integrity digest does not match its body"
+        );
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for EventEnvelope {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            event_id: EventId,
+            stream: StreamRef,
+            sequence: SafeInteger,
+            recorded_at: Timestamp,
+            observed_at: Timestamp,
+            producer: ProducerIdentity,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            causation: Option<EventCausation>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            automation_id: Option<AutomationId>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            occurrence_id: Option<OccurrenceId>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            run_id: Option<RunId>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            attempt_id: Option<AttemptId>,
+            kind: EventKind,
+            summary: EventSummary,
+            payload: EventPayload,
+            privacy: EventPrivacy,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
+            integrity: Option<DigestValue>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let event = Self {
+            schema_version: raw.schema_version,
+            event_id: raw.event_id,
+            stream: raw.stream,
+            sequence: raw.sequence,
+            recorded_at: raw.recorded_at,
+            observed_at: raw.observed_at,
+            producer: raw.producer,
+            causation: raw.causation,
+            automation_id: raw.automation_id,
+            occurrence_id: raw.occurrence_id,
+            run_id: raw.run_id,
+            attempt_id: raw.attempt_id,
+            kind: raw.kind,
+            summary: raw.summary,
+            payload: raw.payload,
+            privacy: raw.privacy,
+            integrity: raw.integrity,
+        };
+        event.verify_integrity().map_err(serde::de::Error::custom)?;
+        Ok(event)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2662,11 +3238,23 @@ pub enum StreamKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventCausation {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub adoption_key: Option<AdoptionKey>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub cause_event_id: Option<CauseEventId>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub correlation_id: Option<CorrelationId>,
 }
 
@@ -2684,11 +3272,23 @@ pub enum EventPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DefinitionLifecyclePayload {
     pub revision: PositiveInteger,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub definition_digest: Option<DigestValue>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lifecycle_state: Option<EventLifecycleState>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub imported_from: Option<ImportedFrom>,
 }
 
@@ -2710,11 +3310,23 @@ pub struct TransitionPayload {
     pub from: TransitionState,
     pub to: TransitionState,
     pub reason: TransitionReason,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub fence_generation: Option<PositiveInteger>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub attempt_number: Option<PositiveInteger>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub command_adoption_key: Option<AdoptionKey>,
 }
 
@@ -2738,17 +3350,25 @@ pub struct MisfirePayload {
 pub struct ReceiptPayload {
     pub receipt_ref: ReceiptId,
     pub outcome: TerminalOutcome,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub side_effect_class: Option<SideEffectClass>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotPayload {
-    pub through_sequence: u64,
+    pub through_sequence: SafeInteger,
     /// Compacted state is explicitly an open, schema-defined JSON object.
     pub state: JsonObject,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reason: Option<SnapshotReason>,
 }
 

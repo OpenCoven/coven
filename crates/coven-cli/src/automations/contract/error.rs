@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::types::{AdoptionKey, ErrorMessage, PositiveInteger, StringConstraintError};
+use super::types::{
+    deserialize_non_null_option, AdoptionKey, ErrorMessage, PositiveInteger, StringConstraintError,
+};
 
 /// Every error code frozen by `error-envelope.schema.json`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,8 +187,11 @@ impl<'de> Deserialize<'de> for ErrorEnvelope {
             http_status: u16,
             message: ErrorMessage,
             retryable: bool,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             details: Option<BTreeMap<String, Value>>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             adoption: Option<ErrorAdoption>,
+            #[serde(default, deserialize_with = "deserialize_non_null_option")]
             current_revision: Option<PositiveInteger>,
         }
 
@@ -214,7 +219,11 @@ impl<'de> Deserialize<'de> for ErrorEnvelope {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ErrorAdoption {
     pub key: AdoptionKey,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub conflict_outcome: Option<AdoptionConflictOutcome>,
 }
 

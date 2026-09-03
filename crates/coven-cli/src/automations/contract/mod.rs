@@ -58,6 +58,33 @@ mod tests {
             .clone()
     }
 
+    fn with_definition_integrity(mut value: Value) -> Value {
+        let digest = sha256_hex(
+            &canonicalize_without_integrity(&value).expect("canonicalize definition body"),
+        );
+        value["integrity"]["value"] = json!(digest);
+        value
+    }
+
+    fn with_receipt_integrity(mut value: Value) -> Value {
+        let digest =
+            sha256_hex(&canonicalize_without_integrity(&value).expect("canonicalize receipt body"));
+        value["integrity"]["value"] = json!(digest);
+        value
+    }
+
+    fn with_event_integrity(mut value: Value) -> Value {
+        value["integrity"] = json!({
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "0".repeat(64)
+        });
+        let digest =
+            sha256_hex(&canonicalize_without_integrity(&value).expect("canonicalize event body"));
+        value["integrity"]["value"] = json!(digest);
+        value
+    }
+
     fn assert_round_trip<T>(value: Value)
     where
         T: DeserializeOwned + Serialize,
@@ -340,7 +367,7 @@ mod tests {
                 .expect("receipt fixture is an object")
                 .remove(field);
         }
-        assert_round_trip::<AutomationReceipt>(receipt);
+        assert_round_trip::<AutomationReceipt>(with_receipt_integrity(receipt));
     }
 
     #[test]
@@ -359,11 +386,13 @@ mod tests {
 
         let mut reverse_dns_extension = fixture("definition.golden");
         reverse_dns_extension["extensions"] = json!({"com-acme.tools.feature": true});
-        assert_round_trip::<AutomationDefinition>(reverse_dns_extension);
+        assert_round_trip::<AutomationDefinition>(with_definition_integrity(reverse_dns_extension));
 
         let mut reverse_dns_x_prefix_extension = fixture("definition.golden");
         reverse_dns_x_prefix_extension["extensions"] = json!({"x-acme.tools.feature": true});
-        assert_round_trip::<AutomationDefinition>(reverse_dns_x_prefix_extension);
+        assert_round_trip::<AutomationDefinition>(with_definition_integrity(
+            reverse_dns_x_prefix_extension,
+        ));
 
         let mut malformed_x_prefix_extension = fixture("definition.golden");
         malformed_x_prefix_extension["extensions"] = json!({"x-acme.tools": true});
@@ -520,6 +549,10 @@ mod tests {
             .remove("terminalDisposition");
         assert!(serde_json::from_value::<AutomationRun>(no_terminal_disposition).is_err());
 
+        let mut mismatched_terminal_outcome = fixture("run.golden");
+        mismatched_terminal_outcome["terminalDisposition"]["outcome"] = json!("failed");
+        assert!(serde_json::from_value::<AutomationRun>(mismatched_terminal_outcome).is_err());
+
         let mut running = fixture("run.golden");
         running["state"] = json!("running");
         running
@@ -615,5 +648,164 @@ mod tests {
             "retryable": false
         });
         assert!(serde_json::from_value::<ErrorEnvelope>(oversized_error_message).is_err());
+    }
+
+    #[test]
+    fn schema_optional_fields_reject_explicit_null() {
+        let mut definition = fixture("definition.golden");
+        definition["display"]["description"] = Value::Null;
+        assert!(
+            serde_json::from_value::<AutomationDefinition>(with_definition_integrity(definition))
+                .is_err()
+        );
+
+        let mut occurrence = fixture("occurrence.golden");
+        occurrence["observedAt"] = Value::Null;
+        assert!(serde_json::from_value::<AutomationOccurrence>(occurrence).is_err());
+
+        let mut run = fixture("run.golden");
+        run["stateReason"] = Value::Null;
+        assert!(serde_json::from_value::<AutomationRun>(run).is_err());
+
+        let mut attempt = fixture("attempt.golden");
+        attempt["workerCorrelation"] = Value::Null;
+        assert!(serde_json::from_value::<AutomationAttempt>(attempt).is_err());
+
+        let mut receipt = fixture("receipt.golden");
+        receipt["authority"] = Value::Null;
+        assert!(
+            serde_json::from_value::<AutomationReceipt>(with_receipt_integrity(receipt)).is_err()
+        );
+
+        let mut command = fixture("command.create.golden");
+        command["origin"]["authenticationClass"] = Value::Null;
+        assert!(serde_json::from_value::<CommandRequest>(command).is_err());
+
+        let response = json!({
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.get.v1",
+            "adoptionKey": "adopt:get-0001",
+            "outcome": "committed",
+            "revision": null,
+            "result": {}
+        });
+        assert!(serde_json::from_value::<CommandResponse>(response).is_err());
+
+        let mut event = event_fixture();
+        event["causation"] = Value::Null;
+        assert!(serde_json::from_value::<EventEnvelope>(event).is_err());
+
+        let error = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "No such automation.",
+            "retryable": false,
+            "details": null
+        });
+        assert!(serde_json::from_value::<ErrorEnvelope>(error).is_err());
+
+        let nested_error = json!({
+            "code": "NOT_FOUND",
+            "httpStatus": 404,
+            "message": "No such automation.",
+            "retryable": false,
+            "adoption": {
+                "key": "adopt:get-0001",
+                "conflictOutcome": null
+            }
+        });
+        assert!(serde_json::from_value::<ErrorEnvelope>(nested_error).is_err());
+    }
+
+    #[test]
+    fn integrity_bearing_objects_reject_tampered_bodies() {
+        let mut definition = fixture("definition.golden");
+        definition["display"]["name"] = json!("Tampered definition");
+        assert!(serde_json::from_value::<AutomationDefinition>(definition).is_err());
+
+        let mut receipt = fixture("receipt.golden");
+        receipt["outcome"]["detail"] = json!("tampered receipt");
+        assert!(serde_json::from_value::<AutomationReceipt>(receipt).is_err());
+
+        let event = with_event_integrity(event_fixture());
+        assert_round_trip::<EventEnvelope>(event.clone());
+        let mut tampered_event = event;
+        tampered_event["summary"] = json!("tampered event");
+        assert!(serde_json::from_value::<EventEnvelope>(tampered_event).is_err());
+    }
+
+    #[test]
+    fn schema_counters_reject_values_outside_the_jcs_safe_domain() {
+        let unsafe_integer = MAX_SAFE_INTEGER + 1;
+
+        let mut occurrence_first = fixture("occurrence.golden");
+        occurrence_first["eventWindow"]["firstSequence"] = json!(unsafe_integer);
+        assert!(serde_json::from_value::<AutomationOccurrence>(occurrence_first).is_err());
+
+        let mut occurrence_last = fixture("occurrence.golden");
+        occurrence_last["eventWindow"]["lastSequence"] = json!(unsafe_integer);
+        assert!(serde_json::from_value::<AutomationOccurrence>(occurrence_last).is_err());
+
+        let mut attempt_event = fixture("attempt.golden");
+        attempt_event["outputCursors"]["eventCursor"] = json!(unsafe_integer);
+        assert!(serde_json::from_value::<AutomationAttempt>(attempt_event).is_err());
+
+        let mut attempt_log = fixture("attempt.golden");
+        attempt_log["outputCursors"]["logCursor"] = json!(unsafe_integer);
+        assert!(serde_json::from_value::<AutomationAttempt>(attempt_log).is_err());
+
+        let events_read = json!({
+            "schemaVersion": "coven.automations.v1",
+            "command": "events.read.v1",
+            "adoptionKey": "adopt:events-read-0001",
+            "origin": {
+                "principal": {"principalId": "principal:tim"},
+                "channel": "cli"
+            },
+            "intent": {"statement": "Read the event stream."},
+            "payload": {
+                "stream": {"kind": "feed", "id": "all"},
+                "after": unsafe_integer
+            }
+        });
+        assert!(serde_json::from_value::<CommandRequest>(events_read).is_err());
+
+        let events_subscribe = json!({
+            "schemaVersion": "coven.automations.v1",
+            "command": "events.subscribe.v1",
+            "adoptionKey": "adopt:events-subscribe-0001",
+            "origin": {
+                "principal": {"principalId": "principal:tim"},
+                "channel": "cli"
+            },
+            "intent": {"statement": "Subscribe to the event stream."},
+            "payload": {
+                "stream": {"kind": "feed", "id": "all"},
+                "after": unsafe_integer
+            }
+        });
+        assert!(serde_json::from_value::<CommandRequest>(events_subscribe).is_err());
+
+        let response = json!({
+            "schemaVersion": "coven.automations.v1",
+            "command": "definition.get.v1",
+            "adoptionKey": "adopt:get-0001",
+            "outcome": "committed",
+            "result": {},
+            "eventRef": {"stream": "feed", "sequence": unsafe_integer}
+        });
+        assert!(serde_json::from_value::<CommandResponse>(response).is_err());
+
+        let mut event = event_fixture();
+        event["sequence"] = json!(unsafe_integer);
+        assert!(serde_json::from_value::<EventEnvelope>(event).is_err());
+
+        let mut snapshot = event_fixture();
+        snapshot["kind"] = json!("feed.snapshot");
+        snapshot["payload"] = json!({
+            "throughSequence": unsafe_integer,
+            "state": {}
+        });
+        assert!(serde_json::from_value::<EventEnvelope>(snapshot).is_err());
     }
 }
