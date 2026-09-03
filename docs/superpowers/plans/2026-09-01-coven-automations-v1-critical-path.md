@@ -549,9 +549,13 @@ Append state mutation and event sequence in one transaction. Expose read/subscri
 
 Implement `scripts/package-automations-protocol.mjs` so it copies only
 `spec/coven-automations/v1/` contract files into a lexically ordered archive,
-writes a manifest containing the source commit and each file's SHA-256 digest,
-normalizes archive timestamps and ownership, and refuses a dirty or mismatched
-input tree. With `SOURCE_COMMIT="$(git rev-parse HEAD)"`, the output is
+writes a manifest containing the source commit, each file's SHA-256 digest, and
+a `contractContentSha256` computed only from the ordered relative-path/digest
+pairs, normalizes archive timestamps and ownership, and refuses a dirty or
+mismatched input tree. The content digest deliberately excludes source commit,
+archive metadata, and manifest metadata so later release candidates can prove
+the contract bytes are unchanged even though their source-bound bundle digests
+differ. With `SOURCE_COMMIT="$(git rev-parse HEAD)"`, the output is
 `coven-automations-v1-contract-${SOURCE_COMMIT}.tar.gz`.
 
 Run:
@@ -568,6 +572,9 @@ export COVEN_PROTOCOL_BUNDLE="$(
 test -n "$COVEN_PROTOCOL_BUNDLE"
 shasum -a 256 "$COVEN_PROTOCOL_BUNDLE" |
   tee "$AUTOMATIONS_ARTIFACT_DIR/protocol-bundle.sha256"
+jq -er '.contractContentSha256' \
+  "$AUTOMATIONS_ARTIFACT_DIR/manifest.json" |
+  tee "$AUTOMATIONS_ARTIFACT_DIR/protocol-content.sha256"
 ```
 
 Update `.github/workflows/ci.yml` to upload the bundle and manifest as the
@@ -637,7 +644,7 @@ printf '%s  %s\n' \
 
 SDK and Cave must each run their contract verifier against that downloaded
 bundle path and expected digest. Record the CI run URL, bundle digest, manifest
-digest, source commit, and both canary results. No canary may import
+digest, contract-content digest, source commit, and both canary results. No canary may import
 `OpenCoven/coven/spec/` or another source-relative path.
 
 **Exit gate:** all #855 acceptance criteria pass; v1 commands are adopted transactionally; domain failures reject truthfully; changefeed replay deterministically rehydrates state; legacy data migrates without deletion.
@@ -1265,14 +1272,14 @@ Load the protocol digest from the accepted Task 2 lane instead of relying on
 shell state from an earlier session:
 
 ```bash
-export COVEN_PROTOCOL_SHA256="$(
+export COVEN_PROTOCOL_CONTENT_SHA256="$(
   jq -er '
     .lanes[] |
     select(.task == "2") |
-    .artifact_digests.protocol_bundle
+    .artifact_digests.contract_content
   ' "$RELEASE_PACKET_DIR/go-no-go.json"
 )"
-[[ "$COVEN_PROTOCOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$COVEN_PROTOCOL_CONTENT_SHA256" =~ ^[0-9a-f]{64}$ ]]
 ```
 
 - [ ] **Step 2: Run local release gates from a clean checkout**
@@ -1288,8 +1295,37 @@ node scripts/package-automations-protocol.mjs \
   --output "$RELEASE_PACKET_DIR/contract"
 ```
 
-Compare the rebuilt contract bundle and manifest digests to Task 2's immutable
-receipt. Any byte difference is a no-go.
+The release candidate has a new source-bound bundle and manifest digest. Compare
+only its content digest to Task 2, then record the candidate-specific archive
+and manifest digests:
+
+```bash
+export COVEN_RELEASE_PROTOCOL_CONTENT_SHA256="$(
+  jq -er '.contractContentSha256' \
+    "$RELEASE_PACKET_DIR/contract/manifest.json"
+)"
+test "$COVEN_RELEASE_PROTOCOL_CONTENT_SHA256" = \
+  "$COVEN_PROTOCOL_CONTENT_SHA256"
+export COVEN_RELEASE_PROTOCOL_BUNDLE="$(
+  find "$RELEASE_PACKET_DIR/contract" -maxdepth 1 -type f \
+    -name "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz" \
+    -print -quit
+)"
+test -n "$COVEN_RELEASE_PROTOCOL_BUNDLE"
+export COVEN_RELEASE_PROTOCOL_SHA256="$(
+  shasum -a 256 "$COVEN_RELEASE_PROTOCOL_BUNDLE" | awk '{ print $1 }'
+)"
+export COVEN_RELEASE_PROTOCOL_MANIFEST_SHA256="$(
+  shasum -a 256 "$RELEASE_PACKET_DIR/contract/manifest.json" |
+    awk '{ print $1 }'
+)"
+[[ "$COVEN_RELEASE_PROTOCOL_SHA256" =~ ^[0-9a-f]{64}$ ]]
+[[ "$COVEN_RELEASE_PROTOCOL_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+```
+
+Re-run the SDK and Cave packed-artifact canaries against this exact candidate
+bundle and record both results in the release packet. Any content-digest change
+or candidate canary failure is a no-go.
 
 - [ ] **Step 3: Produce provider certification reports**
 
@@ -1345,6 +1381,8 @@ jq -e \
 - [ ] **Step 5: Preflight SSH signing, create, verify, and push one immutable tag**
 
 ```bash
+set -euo pipefail
+
 git fetch origin main
 test "$(git rev-parse origin/main)" = "$RELEASE_CANDIDATE_SHA"
 test "$(git rev-parse HEAD)" = "$RELEASE_CANDIDATE_SHA"
@@ -1367,6 +1405,16 @@ else
 fi
 gh api user/ssh_signing_keys --paginate --jq '.[].key' |
   grep -F -x "$(cat "$RELEASE_PACKET_DIR/signing-key.pub")"
+
+if git rev-parse --verify --quiet "refs/tags/$RELEASE_TAG"; then
+  echo "local tag already exists: $RELEASE_TAG" >&2
+  exit 1
+fi
+if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" \
+  >/dev/null 2>&1; then
+  echo "remote tag already exists: $RELEASE_TAG" >&2
+  exit 1
+fi
 
 git tag -s "$RELEASE_TAG" -m "Coven $RELEASE_TAG"
 git -c gpg.ssh.allowedSignersFile="$RELEASE_ALLOWED_SIGNERS" \
@@ -1403,7 +1451,7 @@ gh release download "$RELEASE_TAG" \
   --dir "$RELEASE_ARTIFACT_DIR/release-check"
 cd "$RELEASE_ARTIFACT_DIR/release-check" && shasum -a 256 -c SHA256SUMS
 test -f "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz"
-test "$(shasum -a 256 "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz" | awk '{print $1}')" = "$COVEN_PROTOCOL_SHA256"
+test "$(shasum -a 256 "coven-automations-v1-contract-${RELEASE_CANDIDATE_SHA}.tar.gz" | awk '{print $1}')" = "$COVEN_RELEASE_PROTOCOL_SHA256"
 ```
 
 Expected: all five npm packages resolve to the approved version, GitHub release
