@@ -120,6 +120,8 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
                     "coven.automations.definition.tombstone.v1",
+                    "coven.automations.events.read.v1",
+                    "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
                     "coven.automations.run",
@@ -413,6 +415,75 @@ pub fn route_action(
                 Err(error) => validation_rejection(action, error),
             }
         }
+        "coven.automations.events.read.v1" => {
+            let stream = required_event_stream(&payload, action);
+            let after = optional_event_after(&payload, action);
+            let from = optional_event_from(&payload, action);
+            let limit = optional_event_limit(&payload, action);
+            match (stream, after, from, limit) {
+                (Ok((kind, id)), Ok(after), Ok(from), Ok(limit)) => automation_event_store_result(
+                    action,
+                    origin,
+                    intent_id,
+                    crate::automations::contract::events::read_events(
+                        conn,
+                        &kind,
+                        &id,
+                        after,
+                        from.as_deref(),
+                        limit,
+                        &now_iso(),
+                    ),
+                ),
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.events.subscribe.v1" => {
+            let stream = required_event_stream(&payload, action);
+            let after = optional_event_after(&payload, action);
+            let checkpoint = optional_event_checkpoint(&payload, action);
+            let limit = forbidden_event_limit(&payload, action);
+            match (stream, after, checkpoint, limit) {
+                (Ok((kind, id)), Ok(after), Ok(checkpoint), Ok(())) => {
+                    let result = if let Some(checkpoint) = checkpoint {
+                        if after.is_some() {
+                            Err(
+                                crate::automations::contract::events::EventStoreError::InvalidRead(
+                                    format!("{action} accepts `after` or `checkpoint`, not both"),
+                                ),
+                            )
+                        } else {
+                            crate::automations::contract::events::resume_events(
+                                conn,
+                                &checkpoint,
+                                &kind,
+                                &id,
+                                100,
+                                &now_iso(),
+                            )
+                        }
+                    } else {
+                        crate::automations::contract::events::read_events(
+                            conn,
+                            &kind,
+                            &id,
+                            after,
+                            None,
+                            100,
+                            &now_iso(),
+                        )
+                    };
+                    automation_event_store_result(action, origin, intent_id, result)
+                }
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => validation_rejection(action, error),
+            }
+        }
         "coven.automations.tick" => {
             let now = chrono::Utc::now();
             automation_result(
@@ -575,6 +646,10 @@ fn automation_command_result(
                 "revision": response.revision,
                 "result": response.result,
             });
+            if let Some(event_ref) = response.event_ref {
+                payload["eventRef"] =
+                    serde_json::to_value(event_ref).expect("automation event reference serializes");
+            }
             if let Some(first_committed_at) = response.replay_first_committed_at {
                 payload["replay"] = json!({
                     "firstCommittedAt": first_committed_at,
@@ -611,6 +686,58 @@ fn automation_command_result(
                 .error
                 .expect("rejected automation command carries typed error"),
         ),
+    }
+}
+
+fn automation_event_store_result(
+    action: &str,
+    _origin: Option<String>,
+    _intent_id: Option<String>,
+    result: Result<
+        crate::automations::contract::events::EventPage,
+        crate::automations::contract::events::EventStoreError,
+    >,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    match result {
+        Ok(page) => match serde_json::to_value(page) {
+            Ok(page) => (
+                200,
+                ControlActionResponse {
+                    ok: true,
+                    accepted: true,
+                    action: action.to_owned(),
+                    status: ActionStatus::Completed,
+                    reason: None,
+                    error: None,
+                    result: Some(page),
+                    event: None,
+                },
+            ),
+            Err(error) => typed_rejection(
+                action,
+                automation_error(ErrorCode::Internal, format!("{error:#}")),
+            ),
+        },
+        Err(error) => {
+            let code = match error.code() {
+                "CURSOR_EXPIRED" => ErrorCode::CursorExpired,
+                "STREAM_OUT_OF_ORDER" => ErrorCode::StreamOutOfOrder,
+                "CHECKPOINT_NOT_FOUND" => ErrorCode::NotFound,
+                "VALIDATION_FAILED" => ErrorCode::ValidationFailed,
+                "DUPLICATE_EVENT_ID" | "INTERNAL" => ErrorCode::Internal,
+                _ => ErrorCode::Internal,
+            };
+            let mut envelope = automation_error(code, error.to_string());
+            if let Some(expired_at) = error.expired_at() {
+                envelope.details = Some(
+                    [("expiredAt".to_owned(), json!(expired_at))]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            typed_rejection(action, envelope)
+        }
     }
 }
 
@@ -711,6 +838,80 @@ fn required_expected_revision(payload: &Value, action: &str) -> Result<u64, Stri
 fn forbidden_expected_revision(payload: &Value, action: &str) -> Result<(), String> {
     if payload.get("expectedRevision").is_some() {
         Err(format!("{action} forbids field `expectedRevision`"))
+    } else {
+        Ok(())
+    }
+}
+
+fn required_event_stream(payload: &Value, action: &str) -> Result<(String, String), String> {
+    let stream = payload
+        .get("stream")
+        .cloned()
+        .ok_or_else(|| format!("{action} requires object field `stream`"))?;
+    let stream: crate::automations::contract::types::CommandStreamRef =
+        serde_json::from_value(stream)
+            .map_err(|error| format!("{action} has invalid stream: {error}"))?;
+    let kind = match stream.kind {
+        crate::automations::contract::types::StreamKind::Automation => "automation",
+        crate::automations::contract::types::StreamKind::Occurrence => "occurrence",
+        crate::automations::contract::types::StreamKind::Run => "run",
+        crate::automations::contract::types::StreamKind::Feed => "feed",
+    };
+    Ok((kind.to_owned(), stream.id.as_str().to_owned()))
+}
+
+fn optional_event_after(payload: &Value, action: &str) -> Result<Option<u64>, String> {
+    match payload.get("after") {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value <= 9_007_199_254_740_991)
+            .map(Some)
+            .ok_or_else(|| format!("{action} field `after` must be a non-negative safe integer")),
+    }
+}
+
+fn optional_event_from(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("from") {
+        None => Ok(None),
+        Some(value) => {
+            serde_json::from_value::<crate::automations::contract::types::Timestamp>(value.clone())
+                .map_err(|error| format!("{action} has invalid `from` timestamp: {error}"))
+                .and_then(|timestamp| {
+                    chrono::DateTime::parse_from_rfc3339(timestamp.as_str())
+                        .map(|_| Some(timestamp.as_str().to_owned()))
+                        .map_err(|error| format!("{action} has invalid `from` timestamp: {error}"))
+                })
+        }
+    }
+}
+
+fn optional_event_checkpoint(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("checkpoint") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 512 => {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(format!(
+            "{action} field `checkpoint` must be a non-empty string of at most 512 bytes"
+        )),
+    }
+}
+
+fn optional_event_limit(payload: &Value, action: &str) -> Result<usize, String> {
+    match payload.get("limit") {
+        None => Ok(100),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=1_000).contains(value))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{action} field `limit` must be an integer from 1 to 1000")),
+    }
+}
+
+fn forbidden_event_limit(payload: &Value, action: &str) -> Result<(), String> {
+    if payload.get("limit").is_some() {
+        Err(format!("{action} forbids field `limit`"))
     } else {
         Ok(())
     }
@@ -1188,5 +1389,189 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("synthetic launch rejection")));
+    }
+
+    #[test]
+    fn automation_events_read_and_subscribe_resume_after_exclusive_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = json!({
+            "schemaVersion": 1,
+            "id": "event-control",
+            "name": "Event control",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Do the thing."
+        });
+        let (create_status, _) = route_action(
+            json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": "adopt:create:event-control:0001",
+                "definition": definition,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(create_status, 200);
+
+        let (read_status, read_response) = route_action(
+            json!({
+                "action": "coven.automations.events.read.v1",
+                "stream": {"kind": "automation", "id": "event-control"},
+                "limit": 1,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(read_status, 200);
+        let read = read_response.result.unwrap();
+        assert_eq!(read["events"].as_array().unwrap().len(), 1);
+        assert_eq!(read["events"][0]["sequence"], 0);
+        let checkpoint = read["checkpoint"].as_str().unwrap();
+
+        let (subscribe_status, subscribe_response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "event-control"},
+                "checkpoint": checkpoint,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(subscribe_status, 200);
+        assert!(subscribe_response.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn automation_events_subscribe_surfaces_typed_expired_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        conn.execute(
+            "INSERT INTO automation_event_checkpoints (
+                checkpoint, stream_kind, stream_id, after_sequence, issued_at, expires_at
+             ) VALUES (
+                'ecpexpired00000000000000000001',
+                'automation',
+                'expired',
+                -1,
+                '2020-01-01T00:00:00.000Z',
+                '2020-01-02T00:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "expired"},
+                "checkpoint": "ecpexpired00000000000000000001",
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 410);
+        assert_eq!(response.error.unwrap()["code"], "CURSOR_EXPIRED");
+    }
+
+    #[test]
+    fn automation_events_subscribe_rejects_non_contract_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "limited"},
+                "limit": 10,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+    }
+
+    #[test]
+    fn cross_stream_checkpoint_rejection_does_not_create_a_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let first = crate::automations::contract::events::read_events(
+            &conn,
+            "automation",
+            "source",
+            None,
+            None,
+            100,
+            &now_iso(),
+        )
+        .unwrap();
+        let before = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_event_checkpoints",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "different"},
+                "checkpoint": first.checkpoint,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+        let after = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_event_checkpoints",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn automation_events_read_rejects_calendar_invalid_from_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.read.v1",
+                "stream": {"kind": "automation", "id": "invalid-time"},
+                "from": "2026-99-99T99:99:99.000Z",
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
     }
 }
