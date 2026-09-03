@@ -5028,6 +5028,7 @@ fn http_reason_phrase(status: u16) -> &'static str {
         422 => "Unprocessable Content",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "OK",
     }
 }
@@ -8306,6 +8307,11 @@ mod tests {
     }
 
     #[test]
+    fn http_reason_phrase_names_audit_capacity_failures() {
+        assert_eq!(http_reason_phrase(507), "Insufficient Storage");
+    }
+
+    #[test]
     fn http_reason_phrase_names_memory_detail_failures() {
         let phrases = [
             (413, http_reason_phrase(413)),
@@ -8605,6 +8611,128 @@ mod tests {
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proposal_decision_http_route_preserves_transport_authority() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        for decision in ["approve", "reject"] {
+            let proposal_id = uuid::Uuid::new_v4();
+            let request = format!(
+                "POST /api/v1/threads/proposals/{proposal_id}/{decision} HTTP/1.1\r\n\
+                 Host: localhost\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+
+            let tcp_home = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(tcp_home.path()).expect("ensure home");
+            let mut tcp_stream = Cursor::new(request.as_bytes().to_vec());
+            let mut tcp_output = Vec::new();
+            handle_http_stream(
+                &mut tcp_stream,
+                &mut tcp_output,
+                tcp_home.path(),
+                None,
+                &NoopSessionRuntime,
+                None,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            )
+            .expect("handle TCP request");
+            let tcp_response = String::from_utf8(tcp_output).expect("utf8");
+            assert!(
+                tcp_response.starts_with("HTTP/1.1 403 Forbidden"),
+                "{decision}: {tcp_response}"
+            );
+            assert!(
+                tcp_response.contains(r#""code":"transport_forbidden""#),
+                "{decision}: {tcp_response}"
+            );
+            assert!(!tcp_home.path().join("coven.sqlite3").exists());
+
+            let ipc_home = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(ipc_home.path()).expect("ensure home");
+            let mut ipc_stream = Cursor::new(request.as_bytes().to_vec());
+            let mut ipc_output = Vec::new();
+            handle_http_stream(
+                &mut ipc_stream,
+                &mut ipc_output,
+                ipc_home.path(),
+                None,
+                &NoopSessionRuntime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle owner-local request");
+            let ipc_response = String::from_utf8(ipc_output).expect("utf8");
+            assert!(
+                ipc_response.starts_with("HTTP/1.1 404 Not Found"),
+                "{decision}: {ipc_response}"
+            );
+            assert!(
+                ipc_response.contains(r#""why":"proposal-not-found""#),
+                "{decision}: {ipc_response}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proposal_decision_http_route_preserves_typed_no_write_outcome() -> anyhow::Result<()> {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        let temp = tempfile::tempdir()?;
+        ensure_private_coven_home(temp.path())?;
+        let workspace = crate::api::tests::seed_warded_familiar(temp.path())?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "before")?;
+        let staged = crate::api::tests::post_edits(
+            temp.path(),
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+        )?;
+        let staged: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged["proposalId"]
+            .as_str()
+            .context("proposal id")?
+            .to_string();
+        crate::ward::set_conditional_write_hook(
+            workspace.canonicalize()?.join("reviewed/skill.md"),
+            b"concurrent".to_vec(),
+        );
+        let request = format!(
+            "POST /api/v1/threads/proposals/{proposal_id}/approve HTTP/1.1\r\n\
+             Host: local\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        let mut stream = Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            None,
+            HostGuard::Disabled,
+        )?;
+
+        let response = String::from_utf8(output)?;
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{response}"
+        );
+        assert!(
+            response.contains(r#""code":"ward_apply_failed""#),
+            "{response}"
+        );
+        assert!(response.contains(r#""writeApplied":false"#), "{response}");
+        assert!(
+            !response.contains(r#""code":"internal_error""#),
+            "{response}"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

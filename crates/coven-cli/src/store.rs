@@ -30,6 +30,13 @@ const MAINTENANCE_MAX_BATCHES_PER_TICK: i64 = 10;
 const MAINTENANCE_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAINTENANCE_MIN_FREE_DISK_BYTES: u64 = 256 * 1024 * 1024;
 const MAINTENANCE_WARN_FREE_DISK_BYTES: u64 = 1024 * 1024 * 1024;
+pub const DEFAULT_WARD_AUDIT_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
+pub const WARD_AUDIT_WAL_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+const WARD_AUDIT_WAL_AUTOCHECKPOINT_BYTES: u64 = 4 * 1024 * 1024;
+const WARD_AUDIT_JOURNAL_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
+const WARD_AUDIT_ROW_OVERHEAD_PAGES: u64 = 4;
+const WARD_AUDIT_CAPACITY_TRIGGER: &str = "coven_ward_audit_capacity_insert";
+const WARD_AUDIT_CAPACITY_SQLITE_MESSAGE: &str = "ward audit capacity exceeded";
 const BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_EXPIRY_SQL: &str = "DELETE FROM sensitive_artifacts
      WHERE rowid IN (
         SELECT rowid FROM sensitive_artifacts
@@ -766,6 +773,21 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
             value TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS coven_ward_audit_capacity (
+            singleton          INTEGER PRIMARY KEY CHECK (singleton = 1),
+            limit_bytes        INTEGER NOT NULL CHECK (limit_bytes > 0),
+            used_bytes         INTEGER NOT NULL CHECK (used_bytes >= 0),
+            row_overhead_bytes INTEGER NOT NULL CHECK (row_overhead_bytes > 0),
+            wal_limit_bytes    INTEGER NOT NULL CHECK (wal_limit_bytes > 0)
+        );
+
+        CREATE TABLE IF NOT EXISTS coven_ward_audit_reservations (
+            token          TEXT PRIMARY KEY NOT NULL,
+            purpose        TEXT NOT NULL,
+            reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+            created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        );
+
         CREATE TABLE IF NOT EXISTS travel_profiles (
             id TEXT PRIMARY KEY NOT NULL,
             familiar_id TEXT NOT NULL,
@@ -957,6 +979,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     // own transaction.
     conn.execute_batch(crate::threads_gate::WARD_MANIFEST_SCHEMA_SQL)
         .context("failed to initialize ward_manifest schema")?;
+    ensure_ward_audit_capacity_wal_limit_column(conn)?;
+    initialize_ward_audit_capacity(conn)?;
     ensure_exit_code_column(conn)?;
     ensure_archived_at_column(conn)?;
     ensure_conversation_id_column(conn)?;
@@ -1003,6 +1027,7 @@ fn configure_initializing_connection(conn: &Connection) -> Result<()> {
     )
     .context("failed to configure writable Coven store connection")?;
     enable_wal_with_retry(conn)?;
+    configure_ward_audit_wal(conn)?;
     Ok(())
 }
 
@@ -1041,7 +1066,590 @@ fn configure_runtime_writable_connection(conn: &Connection) -> Result<()> {
          PRAGMA recursive_triggers = ON;",
     )
     .context("failed to configure writable Coven store connection")?;
+    configure_ward_audit_wal(conn)?;
+    let ward_audit_exists = sqlite_object_exists(conn, "table", "ward_audit")?;
+    let capacity_exists = sqlite_object_exists(conn, "table", "coven_ward_audit_capacity")?;
+    let reservations_exist = sqlite_object_exists(conn, "table", "coven_ward_audit_reservations")?;
+    match (ward_audit_exists, capacity_exists, reservations_exist) {
+        (true, true, true) => install_ward_audit_capacity_trigger(conn)?,
+        (false, false, false) => {}
+        _ => anyhow::bail!("Ward audit capacity schema is incomplete"),
+    }
     Ok(())
+}
+
+fn configure_ward_audit_wal(conn: &Connection) -> Result<()> {
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .context("failed to read SQLite page size for Ward audit policy")?;
+    anyhow::ensure!(page_size > 0, "SQLite reported a zero page size");
+    let page_size = u64::try_from(page_size).context("SQLite page size is negative")?;
+    let autocheckpoint_pages =
+        WARD_AUDIT_WAL_AUTOCHECKPOINT_BYTES.saturating_add(page_size - 1) / page_size;
+    let autocheckpoint_pages = i64::try_from(autocheckpoint_pages)
+        .context("Ward audit WAL autocheckpoint exceeds SQLite range")?;
+    conn.pragma_update(None, "wal_autocheckpoint", autocheckpoint_pages)
+        .context("failed to configure Ward audit WAL autocheckpoint")?;
+    let journal_retain = i64::try_from(WARD_AUDIT_JOURNAL_RETAIN_BYTES)
+        .context("Ward audit journal retention exceeds SQLite range")?;
+    conn.pragma_update(None, "journal_size_limit", journal_retain)
+        .context("failed to configure Ward audit WAL retention")?;
+    Ok(())
+}
+
+fn ward_audit_row_charge_sql(prefix: &str) -> String {
+    let column = |name: &str| format!("COALESCE(length(CAST({prefix}.{name} AS BLOB)), 0)");
+    format!(
+        "(SELECT row_overhead_bytes FROM coven_ward_audit_capacity WHERE singleton = 1)
+         + ({event_type} * 2)
+         + {proposal_id}
+         + ({familiar_id} * 2)
+         + {ward_version}
+         + {ward_hash}
+         + {tier}
+         + {decision}
+         + {approver}
+         + {diff_hash}
+         + {detail}
+         + {files_touched}
+         + {channel}
+         + {thread_id}
+         + {submitted_at}
+         + {decided_at}
+         + ({recorded_at} * 3)",
+        event_type = column("event_type"),
+        proposal_id = column("proposal_id"),
+        familiar_id = column("familiar_id"),
+        ward_version = column("ward_version"),
+        ward_hash = column("ward_hash"),
+        tier = column("tier"),
+        decision = column("decision"),
+        approver = column("approver"),
+        diff_hash = column("diff_hash"),
+        detail = column("detail"),
+        files_touched = column("files_touched"),
+        channel = column("channel"),
+        thread_id = column("thread_id"),
+        submitted_at = column("submitted_at"),
+        decided_at = column("decided_at"),
+        recorded_at = column("recorded_at"),
+    )
+}
+
+fn initialize_ward_audit_capacity(conn: &Connection) -> Result<()> {
+    let page_size: i64 = conn
+        .query_row("PRAGMA page_size", [], |row| row.get(0))
+        .context("failed to read SQLite page size for Ward audit capacity")?;
+    anyhow::ensure!(page_size > 0, "SQLite reported a zero page size");
+    let page_size = u64::try_from(page_size).context("SQLite page size is negative")?;
+    let row_overhead = page_size
+        .checked_mul(WARD_AUDIT_ROW_OVERHEAD_PAGES)
+        .context("Ward audit row overhead overflowed")?;
+    let default_limit = i64::try_from(DEFAULT_WARD_AUDIT_CAPACITY_BYTES)
+        .context("default Ward audit capacity exceeds SQLite integer range")?;
+    let default_wal_limit = i64::try_from(WARD_AUDIT_WAL_LIMIT_BYTES)
+        .context("default Ward audit WAL limit exceeds SQLite integer range")?;
+    let row_overhead =
+        i64::try_from(row_overhead).context("Ward audit row overhead exceeds SQLite range")?;
+    conn.execute(
+        "INSERT OR IGNORE INTO coven_ward_audit_capacity (
+            singleton, limit_bytes, used_bytes, row_overhead_bytes, wal_limit_bytes
+         ) VALUES (1, ?1, 0, ?2, ?3)",
+        params![default_limit, row_overhead, default_wal_limit],
+    )
+    .context("failed to initialize Ward audit capacity policy")?;
+    conn.execute(
+        "UPDATE coven_ward_audit_capacity
+         SET row_overhead_bytes = ?1
+         WHERE singleton = 1",
+        [row_overhead],
+    )
+    .context("failed to update Ward audit row overhead")?;
+    let charge = ward_audit_row_charge_sql("audit");
+    conn.execute(
+        &format!(
+            "UPDATE coven_ward_audit_capacity
+             SET used_bytes = (
+                SELECT COALESCE(SUM({charge}), 0)
+                FROM ward_audit AS audit
+             )
+             WHERE singleton = 1"
+        ),
+        [],
+    )
+    .context("failed to reconcile durable Ward audit capacity usage")?;
+    Ok(())
+}
+
+fn ensure_ward_audit_capacity_wal_limit_column(conn: &Connection) -> Result<()> {
+    let has_column: bool = conn
+        .prepare("PRAGMA table_info(coven_ward_audit_capacity)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .any(|column| column == "wal_limit_bytes");
+    if !has_column {
+        conn.execute_batch(
+            "ALTER TABLE coven_ward_audit_capacity
+             ADD COLUMN wal_limit_bytes INTEGER NOT NULL DEFAULT 134217728
+             CHECK (wal_limit_bytes > 0);",
+        )
+        .context("failed to add Ward audit WAL capacity limit")?;
+    }
+    Ok(())
+}
+
+fn install_ward_audit_capacity_trigger(conn: &Connection) -> Result<()> {
+    let charge = ward_audit_row_charge_sql("NEW");
+    conn.execute_batch(&format!(
+        "CREATE TEMP TABLE IF NOT EXISTS coven_active_ward_audit_reservation (
+             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+             token     TEXT NOT NULL
+         );
+         DROP TRIGGER IF EXISTS temp.{WARD_AUDIT_CAPACITY_TRIGGER};
+         CREATE TEMP TRIGGER {WARD_AUDIT_CAPACITY_TRIGGER}
+         BEFORE INSERT ON main.ward_audit
+         BEGIN
+             SELECT CASE
+                 WHEN NOT EXISTS (
+                     SELECT 1
+                     FROM coven_ward_audit_capacity
+                     WHERE singleton = 1
+                 )
+                 THEN RAISE(ABORT, 'Ward audit capacity policy is unavailable')
+             END;
+             SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM coven_active_ward_audit_reservation
+                 )
+                  AND NOT EXISTS (
+                     SELECT 1
+                     FROM coven_ward_audit_reservations
+                     WHERE token = (
+                         SELECT token
+                         FROM coven_active_ward_audit_reservation
+                         WHERE singleton = 1
+                     )
+                 )
+                 THEN RAISE(ABORT, 'Ward audit reservation is unavailable')
+             END;
+             SELECT CASE
+                 WHEN EXISTS (
+                     SELECT 1 FROM coven_active_ward_audit_reservation
+                 )
+                  AND (
+                     SELECT reserved_bytes
+                     FROM coven_ward_audit_reservations
+                     WHERE token = (
+                         SELECT token
+                         FROM coven_active_ward_audit_reservation
+                         WHERE singleton = 1
+                     )
+                  ) < ({charge})
+                 THEN RAISE(ABORT, 'Ward audit reservation is exhausted')
+             END;
+             SELECT CASE
+                 WHEN NOT EXISTS (
+                     SELECT 1 FROM coven_active_ward_audit_reservation
+                 )
+                  AND (
+                     used_bytes > limit_bytes
+                     OR COALESCE((
+                         SELECT SUM(reserved_bytes)
+                         FROM coven_ward_audit_reservations
+                     ), 0) > (limit_bytes - used_bytes)
+                     OR ({charge}) > (
+                         limit_bytes
+                         - used_bytes
+                         - COALESCE((
+                             SELECT SUM(reserved_bytes)
+                             FROM coven_ward_audit_reservations
+                         ), 0)
+                     )
+                  )
+                 THEN RAISE(ABORT, '{WARD_AUDIT_CAPACITY_SQLITE_MESSAGE}')
+             END
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1;
+             UPDATE coven_ward_audit_reservations
+             SET reserved_bytes = reserved_bytes - ({charge})
+             WHERE token = (
+                 SELECT token
+                 FROM coven_active_ward_audit_reservation
+                 WHERE singleton = 1
+             );
+             UPDATE coven_ward_audit_capacity
+             SET used_bytes = used_bytes + ({charge})
+             WHERE singleton = 1;
+         END;"
+    ))
+    .context("failed to install Ward audit capacity trigger")?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WardAuditCapacityResource {
+    Ledger,
+    Wal,
+}
+
+impl WardAuditCapacityResource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ledger => "ledger",
+            Self::Wal => "wal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WardAuditCapacityExceeded {
+    pub resource: WardAuditCapacityResource,
+    pub limit_bytes: u64,
+    pub used_bytes: u64,
+    pub required_bytes: u64,
+}
+
+impl WardAuditCapacityExceeded {
+    pub fn available_bytes(&self) -> u64 {
+        self.limit_bytes.saturating_sub(self.used_bytes)
+    }
+}
+
+impl std::fmt::Display for WardAuditCapacityExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Ward audit {} capacity exceeded: {} used plus {} required exceeds {} bytes",
+            self.resource.as_str(),
+            self.used_bytes,
+            self.required_bytes,
+            self.limit_bytes
+        )
+    }
+}
+
+impl std::error::Error for WardAuditCapacityExceeded {}
+
+pub fn ward_audit_capacity_failure(error: &anyhow::Error) -> Option<&WardAuditCapacityExceeded> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WardAuditCapacityExceeded>())
+}
+
+pub fn ward_audit_reservation_bytes(
+    conn: &Connection,
+    row_count: usize,
+    variable_payload_bytes: u64,
+) -> Result<u64> {
+    let row_overhead: i64 = conn
+        .query_row(
+            "SELECT row_overhead_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("failed to read Ward audit row overhead")?;
+    let row_overhead =
+        u64::try_from(row_overhead).context("Ward audit row overhead is negative")?;
+    let row_bytes = row_overhead
+        .checked_add(4096)
+        .and_then(|bytes| bytes.checked_mul(u64::try_from(row_count).ok()?))
+        .context("Ward audit row reservation overflowed")?;
+    variable_payload_bytes
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(row_bytes))
+        .context("Ward audit byte reservation overflowed")
+}
+
+pub struct WardAuditReservation<'a> {
+    conn: &'a Connection,
+    reservation_id: String,
+    preserve_on_drop: bool,
+    finished: bool,
+}
+
+impl<'a> WardAuditReservation<'a> {
+    pub fn acquire(
+        conn: &'a Connection,
+        store_path: &Path,
+        token: impl Into<String>,
+        purpose: &str,
+        required_bytes: u64,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            required_bytes > 0,
+            "Ward audit reservation must be non-zero"
+        );
+        anyhow::ensure!(
+            !purpose.trim().is_empty(),
+            "Ward audit reservation purpose is empty"
+        );
+        let reservation_token = token.into();
+        anyhow::ensure!(
+            !reservation_token.trim().is_empty(),
+            "Ward audit reservation token is empty"
+        );
+
+        let checkpoint = |mode: &str| {
+            conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+        };
+        let _ = checkpoint("PASSIVE");
+        let configured_wal_limit: Option<i64> = conn
+            .query_row(
+                "SELECT wal_limit_bytes
+                 FROM coven_ward_audit_capacity
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read Ward audit WAL limit before checkpoint")?;
+        if configured_wal_limit
+            .and_then(|limit| u64::try_from(limit).ok())
+            .is_some_and(|limit| {
+                let wal_bytes = file_size(&wal_path(store_path));
+                wal_bytes > limit || required_bytes > limit.saturating_sub(wal_bytes)
+            })
+        {
+            let _ = checkpoint("TRUNCATE");
+        }
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .context("failed to serialize Ward audit capacity admission")?;
+        let admitted = (|| -> Result<bool> {
+            let existing: Option<i64> = conn
+                .query_row(
+                    "SELECT reserved_bytes
+                     FROM coven_ward_audit_reservations
+                     WHERE token = ?1",
+                    [&reservation_token],
+                    |row| row.get(0),
+                )
+                .optional()
+                .context("failed to read existing Ward audit reservation")?;
+            let (limit, used, reserved, wal_limit): (i64, i64, i64, i64) = conn
+                .query_row(
+                    "SELECT capacity.limit_bytes,
+                            capacity.used_bytes,
+                            COALESCE(SUM(reservation.reserved_bytes), 0),
+                            capacity.wal_limit_bytes
+                     FROM coven_ward_audit_capacity AS capacity
+                     LEFT JOIN coven_ward_audit_reservations AS reservation ON TRUE
+                     WHERE capacity.singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .context("failed to read Ward audit capacity")?;
+            let limit = u64::try_from(limit).context("Ward audit limit is negative")?;
+            let used = u64::try_from(used).context("Ward audit usage is negative")?;
+            let reserved =
+                u64::try_from(reserved).context("Ward audit reservation usage is negative")?;
+            let wal_limit = u64::try_from(wal_limit).context("Ward audit WAL limit is negative")?;
+            let committed = used.saturating_add(reserved);
+            let existing = existing
+                .map(|bytes| {
+                    anyhow::ensure!(bytes > 0, "existing Ward audit reservation is exhausted");
+                    u64::try_from(bytes).context("existing Ward audit reservation is negative")
+                })
+                .transpose()?;
+            let admission_bytes = existing.unwrap_or(required_bytes);
+            let committed_without_current = match existing {
+                Some(existing) => committed
+                    .checked_sub(existing)
+                    .context("existing Ward audit reservation exceeds reserved capacity")?,
+                None => committed,
+            };
+            if committed_without_current > limit
+                || admission_bytes > limit.saturating_sub(committed_without_current)
+            {
+                return Err(WardAuditCapacityExceeded {
+                    resource: WardAuditCapacityResource::Ledger,
+                    limit_bytes: limit,
+                    used_bytes: committed_without_current,
+                    required_bytes: admission_bytes,
+                }
+                .into());
+            }
+            let wal_bytes = file_size(&wal_path(store_path));
+            if wal_bytes > wal_limit || admission_bytes > wal_limit.saturating_sub(wal_bytes) {
+                return Err(WardAuditCapacityExceeded {
+                    resource: WardAuditCapacityResource::Wal,
+                    limit_bytes: wal_limit,
+                    used_bytes: wal_bytes,
+                    required_bytes: admission_bytes,
+                }
+                .into());
+            }
+            if existing.is_some() {
+                return Ok(true);
+            }
+            let required = i64::try_from(required_bytes)
+                .context("Ward audit reservation exceeds SQLite integer range")?;
+            conn.execute(
+                "INSERT INTO coven_ward_audit_reservations (
+                    token, purpose, reserved_bytes
+                 ) VALUES (?1, ?2, ?3)",
+                params![reservation_token, purpose, required],
+            )
+            .context("failed to persist Ward audit reservation")?;
+            Ok(false)
+        })();
+        let reused = match admitted {
+            Ok(reused) => {
+                if let Err(error) = conn.execute_batch("COMMIT") {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error).context("failed to commit Ward audit reservation");
+                }
+                reused
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
+        conn.execute(
+            "INSERT INTO temp.coven_active_ward_audit_reservation (singleton, token)
+             VALUES (1, ?1)
+             ON CONFLICT(singleton) DO UPDATE SET token = ?1",
+            [&reservation_token],
+        )
+        .context("failed to activate Ward audit reservation")?;
+        Ok(Self {
+            conn,
+            reservation_id: reservation_token,
+            preserve_on_drop: reused,
+            finished: false,
+        })
+    }
+
+    pub fn connection(&self) -> &Connection {
+        self.conn
+    }
+
+    pub fn preserve_if_unfinished(&mut self) {
+        self.preserve_on_drop = true;
+    }
+
+    pub fn release_if_unneeded(self) -> Result<()> {
+        if self.preserve_on_drop {
+            self.preserve()
+        } else {
+            self.finish()
+        }
+    }
+
+    pub fn verify_store_path(&self, store_path: &Path) -> Result<()> {
+        let conn = open_existing_store_read_only(store_path)?
+            .context("Ward audit store disappeared after mutation")?;
+        let reserved: bool = conn
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM coven_ward_audit_reservations
+                    WHERE token = ?1
+                 )",
+                [&self.reservation_id],
+                |row| row.get(0),
+            )
+            .context("failed to verify Ward audit reservation against the live store path")?;
+        anyhow::ensure!(
+            reserved,
+            "Ward audit store identity changed after reservation"
+        );
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<()> {
+        self.preserve_on_drop = true;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .context("failed to serialize Ward audit reservation release")?;
+        let released = self.conn.execute(
+            "DELETE FROM coven_ward_audit_reservations WHERE token = ?1",
+            [&self.reservation_id],
+        );
+        match released {
+            Ok(_) => {
+                if let Err(error) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error).context("failed to commit Ward audit reservation release");
+                }
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error).context("failed to release Ward audit reservation");
+            }
+        }
+        self.clear_active()?;
+        self.finished = true;
+        let _ = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            });
+        Ok(())
+    }
+
+    pub fn preserve(mut self) -> Result<()> {
+        self.clear_active()?;
+        self.finished = true;
+        Ok(())
+    }
+
+    fn clear_active(&self) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM temp.coven_active_ward_audit_reservation
+                 WHERE singleton = 1 AND token = ?1",
+                [&self.reservation_id],
+            )
+            .context("failed to deactivate Ward audit reservation")?;
+        Ok(())
+    }
+
+    fn release_best_effort(&self) {
+        let _ = self.clear_active();
+        if self.conn.execute_batch("BEGIN IMMEDIATE").is_ok() {
+            if self
+                .conn
+                .execute(
+                    "DELETE FROM coven_ward_audit_reservations WHERE token = ?1",
+                    [&self.reservation_id],
+                )
+                .is_ok()
+            {
+                if self.conn.execute_batch("COMMIT").is_err() {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                }
+            } else {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+    }
+}
+
+impl Drop for WardAuditReservation<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if self.preserve_on_drop {
+            let _ = self.clear_active();
+        } else {
+            self.release_best_effort();
+        }
+    }
 }
 
 fn configure_read_only_connection(conn: &Connection) -> Result<()> {
@@ -3790,18 +4398,61 @@ fn extract_transcript_texts(value: &serde_json::Value) -> Vec<String> {
 pub fn vacuum_store_path(path: &Path) -> Result<StoreVacuumReport> {
     let conn = open_store(path)?;
     let pre_compaction = load_warded_surface_commitments(&conn)?;
-
-    let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
-    if event_index_rebuilt {
-        conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])
-            .context("failed to rebuild events_fts")?;
+    let mut audit_reservation = if pre_compaction.is_empty() {
+        None
+    } else {
+        let variable_payload_bytes =
+            pre_compaction.iter().try_fold(0_u64, |total, commitment| {
+                let row_bytes = commitment
+                    .familiar_id
+                    .len()
+                    .checked_add(commitment.surface.len())
+                    .and_then(|bytes| bytes.checked_add(commitment.entry_hash.len()))
+                    .context("compaction audit reservation overflowed")?;
+                total
+                    .checked_add(
+                        u64::try_from(row_bytes).context("compaction audit row overflowed")?,
+                    )
+                    .context("compaction audit reservation overflowed")
+            })?;
+        Some(WardAuditReservation::acquire(
+            &conn,
+            path,
+            format!("vacuum:{}", uuid::Uuid::new_v4()),
+            "ward-compaction-ledger",
+            ward_audit_reservation_bytes(&conn, pre_compaction.len(), variable_payload_bytes)?,
+        )?)
+    };
+    let pre_audit = (|| -> Result<bool> {
+        let event_index_rebuilt = sqlite_object_exists(&conn, "table", "events_fts")?;
+        if event_index_rebuilt {
+            conn.execute("INSERT INTO events_fts(events_fts) VALUES('rebuild')", [])
+                .context("failed to rebuild events_fts")?;
+        }
+        conn.execute_batch("PRAGMA optimize; VACUUM;")
+            .context("failed to vacuum Coven store")?;
+        Ok(event_index_rebuilt)
+    })();
+    let event_index_rebuilt = match pre_audit {
+        Ok(event_index_rebuilt) => event_index_rebuilt,
+        Err(error) => {
+            if let Some(reservation) = audit_reservation.take() {
+                reservation
+                    .finish()
+                    .context("failed to release unused compaction audit reservation")?;
+            }
+            return Err(error);
+        }
+    };
+    if let Some(reservation) = audit_reservation.as_mut() {
+        reservation.preserve_if_unfinished();
     }
-
-    conn.execute_batch("PRAGMA optimize; VACUUM;")
-        .context("failed to vacuum Coven store")?;
     let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
     let integrity_check = pragma_integrity_check(&conn)?;
     append_compaction_ledger_events(&conn, &pre_compaction)?;
+    if let Some(reservation) = audit_reservation {
+        reservation.finish()?;
+    }
 
     Ok(StoreVacuumReport {
         event_index_rebuilt,
@@ -5386,6 +6037,464 @@ pub fn artifact_payload(record: &SensitiveArtifactRecord) -> EncryptedPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_WARD_AUDIT_CAPACITY_BYTES: i64 = 256 * 1024 * 1024;
+    const TEST_WARD_AUDIT_WAL_LIMIT_BYTES: i64 = 128 * 1024 * 1024;
+    const TEST_WARD_AUDIT_JOURNAL_RETAIN_BYTES: i64 = 16 * 1024 * 1024;
+    const TEST_CAPACITY_TABLE_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS coven_ward_audit_capacity (
+            singleton          INTEGER PRIMARY KEY CHECK (singleton = 1),
+            limit_bytes        INTEGER NOT NULL CHECK (limit_bytes > 0),
+            used_bytes         INTEGER NOT NULL CHECK (used_bytes >= 0),
+            row_overhead_bytes INTEGER NOT NULL CHECK (row_overhead_bytes > 0),
+            wal_limit_bytes    INTEGER NOT NULL CHECK (wal_limit_bytes > 0)
+        );
+        INSERT OR IGNORE INTO coven_ward_audit_capacity (
+            singleton, limit_bytes, used_bytes, row_overhead_bytes, wal_limit_bytes
+        ) VALUES (1, 268435456, 0, 16384, 134217728);
+    ";
+
+    fn configure_small_audit_capacity(conn: &Connection, limit_bytes: i64) -> Result<()> {
+        conn.execute_batch(TEST_CAPACITY_TABLE_SQL)?;
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1, used_bytes = 0
+             WHERE singleton = 1",
+            [limit_bytes],
+        )?;
+        Ok(())
+    }
+
+    fn test_audit_row_charge(conn: &Connection) -> Result<i64> {
+        let row_overhead: i64 = conn.query_row(
+            "SELECT row_overhead_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let event_type = "validation_verdict";
+        let familiar_id = "sage";
+        let decision = "permit";
+        let files_touched = "[]";
+        let timestamp = "2026-09-02T18:32:26.179Z";
+        Ok(row_overhead
+            + i64::try_from(
+                event_type.len()
+                    + familiar_id.len()
+                    + 32
+                    + decision.len()
+                    + files_touched.len()
+                    + timestamp.len()
+                    + timestamp.len()
+                    + 24
+                    + event_type.len()
+                    + familiar_id.len()
+                    + 24
+                    + 24,
+            )?)
+    }
+
+    fn insert_capacity_test_audit(conn: &Connection) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO ward_audit (
+                event_type, familiar_id, ward_hash, decision, files_touched,
+                submitted_at, decided_at
+             ) VALUES (
+                'validation_verdict', 'sage', ?1, 'permit', '[]', ?2, ?2
+             )",
+            rusqlite::params![vec![0x42_u8; 32], "2026-09-02T18:32:26.179Z",],
+        )
+    }
+
+    #[test]
+    fn ward_audit_capacity_policy_initializes_durable_counter_and_connection_trigger() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+
+        let table_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM main.sqlite_master
+             WHERE type = 'table' AND name = 'coven_ward_audit_capacity'",
+            [],
+            |row| row.get(0),
+        )?;
+        let trigger_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM temp.sqlite_master
+             WHERE type = 'trigger' AND name = 'coven_ward_audit_capacity_insert'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(table_count, 1);
+        assert_eq!(trigger_count, 1);
+        let (limit, used, overhead): (i64, i64, i64) = conn.query_row(
+            "SELECT limit_bytes, used_bytes, row_overhead_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        assert_eq!(limit, TEST_WARD_AUDIT_CAPACITY_BYTES);
+        assert_eq!(used, 0);
+        assert_eq!(overhead, page_size * 4);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_policy_persists_the_wal_admission_limit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+
+        let column_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM pragma_table_info('coven_ward_audit_capacity')
+             WHERE name = 'wal_limit_bytes'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(column_count, 1);
+        let wal_limit: i64 = conn.query_row(
+            "SELECT wal_limit_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(wal_limit, TEST_WARD_AUDIT_WAL_LIMIT_BYTES);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_fills_exactly_and_preserves_existing_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let charge = test_audit_row_charge(&conn)?;
+        configure_small_audit_capacity(&conn, charge)?;
+
+        insert_capacity_test_audit(&conn)?;
+        let second = insert_capacity_test_audit(&conn);
+
+        assert!(second.is_err(), "the first byte beyond capacity must fail");
+        let (used, count, decision): (i64, i64, String) = conn.query_row(
+            "SELECT capacity.used_bytes, COUNT(audit.id), MIN(audit.decision)
+             FROM coven_ward_audit_capacity AS capacity
+             LEFT JOIN ward_audit AS audit ON TRUE
+             WHERE capacity.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(used, charge);
+        assert_eq!(count, 1);
+        assert_eq!(decision, "permit");
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_serializes_concurrent_writers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let setup = open_store(&path)?;
+        configure_small_audit_capacity(&setup, i64::MAX)?;
+        let charge = test_audit_row_charge(&setup)?;
+        configure_small_audit_capacity(&setup, charge)?;
+        drop(setup);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let writers = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<bool> {
+                    let conn = open_initialized_store(&path)?;
+                    barrier.wait();
+                    Ok(insert_capacity_test_audit(&conn).is_ok())
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("capacity writer did not panic"))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 1);
+        let conn = open_initialized_store(&path)?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_survives_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let charge = test_audit_row_charge(&conn)?;
+        configure_small_audit_capacity(&conn, charge)?;
+        insert_capacity_test_audit(&conn)?;
+        drop(conn);
+
+        initialize_store(&path)?;
+        let reopened = open_initialized_store(&path)?;
+        let second = insert_capacity_test_audit(&reopened);
+
+        assert!(second.is_err());
+        let used: i64 = reopened.query_row(
+            "SELECT used_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(used, charge);
+        let decision: String = reopened.query_row(
+            "SELECT decision FROM ward_audit ORDER BY id LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "permit");
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_reservation_survives_restart_and_protects_reserved_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let charge = test_audit_row_charge(&conn)?;
+        configure_small_audit_capacity(&conn, charge)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS coven_ward_audit_reservations (
+                token          TEXT PRIMARY KEY NOT NULL,
+                purpose        TEXT NOT NULL,
+                reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+                created_at     TEXT NOT NULL
+             );",
+        )?;
+        conn.execute(
+            "INSERT INTO coven_ward_audit_reservations (
+                token, purpose, reserved_bytes, created_at
+             ) VALUES ('test-reservation', 'restart-test', ?1, '2026-09-02T18:32:26.179Z')",
+            [charge],
+        )?;
+        drop(conn);
+
+        initialize_store(&path)?;
+        let reopened = open_initialized_store(&path)?;
+        let unreserved = insert_capacity_test_audit(&reopened);
+
+        assert!(
+            unreserved.is_err(),
+            "an unreserved writer must not consume durable reserved capacity"
+        );
+        let reservation: (String, i64) = reopened.query_row(
+            "SELECT purpose, reserved_bytes
+             FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            ["test-reservation"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(reservation, ("restart-test".to_string(), charge));
+        assert_eq!(
+            reopened.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row
+                .get::<_, i64>(0))?,
+            0
+        );
+        Ok(())
+    }
+
+    fn grow_ward_audit_test_wal_past(
+        conn: &Connection,
+        store_path: &Path,
+        minimum_bytes: u64,
+    ) -> Result<u64> {
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE IF NOT EXISTS ward_audit_wal_fill (
+                 id INTEGER PRIMARY KEY,
+                 payload BLOB NOT NULL
+             );",
+        )?;
+        let wal_path = wal_path(store_path);
+        for _ in 0..64 {
+            conn.execute(
+                "INSERT INTO ward_audit_wal_fill(payload) VALUES(zeroblob(65536))",
+                [],
+            )?;
+            let wal_bytes = std::fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            if wal_bytes > minimum_bytes {
+                return Ok(wal_bytes);
+            }
+        }
+        anyhow::bail!("test WAL did not grow beyond {minimum_bytes} bytes")
+    }
+
+    #[test]
+    fn reused_ward_audit_reservation_rechecks_pinned_wal_after_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let writer = open_store(&path)?;
+        configure_small_audit_capacity(&writer, i64::MAX)?;
+        let required = ward_audit_reservation_bytes(&writer, 1, 0)?;
+        WardAuditReservation::acquire(
+            &writer,
+            &path,
+            "restart-wal-reservation",
+            "restart-wal-test",
+            required,
+        )?
+        .preserve()?;
+
+        let wal_limit = required
+            .checked_add(64 * 1024)
+            .context("test WAL limit overflowed")?;
+        writer.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET wal_limit_bytes = ?1
+             WHERE singleton = 1",
+            [i64::try_from(wal_limit)?],
+        )?;
+        let pinned_reader = Connection::open(&path)?;
+        pinned_reader.execute_batch("BEGIN; SELECT COUNT(*) FROM ward_audit;")?;
+        grow_ward_audit_test_wal_past(&writer, &path, wal_limit)?;
+        drop(writer);
+
+        let reopened = open_initialized_store(&path)?;
+        let error = match WardAuditReservation::acquire(
+            &reopened,
+            &path,
+            "restart-wal-reservation",
+            "restart-wal-test",
+            required,
+        ) {
+            Ok(reservation) => {
+                reservation.preserve()?;
+                anyhow::bail!("reused reservation bypassed pinned WAL admission")
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            ward_audit_capacity_failure(&error),
+            Some(WardAuditCapacityExceeded {
+                resource: WardAuditCapacityResource::Wal,
+                ..
+            })
+        ));
+        assert_eq!(
+            reopened.query_row(
+                "SELECT COUNT(*) FROM temp.coven_active_ward_audit_reservation",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        assert_eq!(
+            reopened.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations
+                 WHERE token = ?1",
+                ["restart-wal-reservation"],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        drop(pinned_reader);
+        Ok(())
+    }
+
+    #[test]
+    fn reused_ward_audit_reservation_rechecks_ledger_without_double_counting() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
+        WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "ledger-reuse-reservation",
+            "ledger-reuse-test",
+            required,
+        )?
+        .preserve()?;
+
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1
+             WHERE singleton = 1",
+            [i64::try_from(required)?],
+        )?;
+        WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "ledger-reuse-reservation",
+            "ledger-reuse-test",
+            required,
+        )?
+        .preserve()?;
+
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1
+             WHERE singleton = 1",
+            [i64::try_from(required.saturating_sub(1))?],
+        )?;
+        let error = match WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "ledger-reuse-reservation",
+            "ledger-reuse-test",
+            required,
+        ) {
+            Ok(reservation) => {
+                reservation.preserve()?;
+                anyhow::bail!("reused reservation bypassed ledger admission")
+            }
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            ward_audit_capacity_failure(&error),
+            Some(WardAuditCapacityExceeded {
+                resource: WardAuditCapacityResource::Ledger,
+                ..
+            })
+        ));
+        let reserved: i64 = conn.query_row(
+            "SELECT reserved_bytes FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            ["ledger-reuse-reservation"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(u64::try_from(reserved)?, required);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_wal_policy_matches_capacity_checkpoint_bounds() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let conn = open_store(&temp.path().join("test.sqlite3"))?;
+
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let autocheckpoint_pages: i64 =
+            conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+        let journal_size_limit: i64 =
+            conn.query_row("PRAGMA journal_size_limit", [], |row| row.get(0))?;
+
+        assert_eq!(autocheckpoint_pages * page_size, 4 * 1024 * 1024);
+        assert_eq!(journal_size_limit, TEST_WARD_AUDIT_JOURNAL_RETAIN_BYTES);
+        assert!(TEST_WARD_AUDIT_WAL_LIMIT_BYTES > journal_size_limit);
+        Ok(())
+    }
 
     const LEGACY_WARD_AUDIT_V013_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS ward_audit (
@@ -8584,6 +9693,153 @@ END;
             |row| row.get(0),
         )?;
         assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn vacuum_reserves_compaction_audit_before_rebuilding_store_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        conn.execute(
+            "INSERT INTO sessions (
+                id, project_root, harness, title, status, created_at, updated_at
+             ) VALUES (
+                'session-1', '/repo', 'codex', 'test', 'completed', ?1, ?1
+             )",
+            ["2026-09-02T18:32:26.179Z"],
+        )?;
+        conn.execute(
+            "INSERT INTO events (
+                id, session_id, kind, payload_json, created_at
+             ) VALUES (
+                'event-1', 'session-1', 'output', '{\"text\":\"evidence\"}', ?1
+             )",
+            ["2026-09-02T18:32:26.179Z"],
+        )?;
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&vec![0x24; 32]],
+        )?;
+        conn.execute(
+            "INSERT INTO events_fts(events_fts) VALUES('delete-all')",
+            [],
+        )?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH 'evidence'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = 1, used_bytes = 1
+             WHERE singleton = 1",
+            [],
+        )?;
+        drop(conn);
+
+        let error = vacuum_store_path(&path).expect_err("full audit capacity must block vacuum");
+
+        assert!(
+            ward_audit_capacity_failure(&error).is_some(),
+            "unexpected error: {error:#}"
+        );
+        let conn = open_store(&path)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events_fts WHERE events_fts MATCH 'evidence'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0,
+            "vacuum must not rebuild store state before reserving compaction evidence"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'compaction_ledger'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    fn seed_failing_vacuum(path: &Path) -> Result<()> {
+        let conn = open_store(path)?;
+        conn.execute(
+            "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+             VALUES ('sage', 'SOUL.md', '11111111-1111-1111-1111-111111111111', ?1)",
+            [&vec![0x24; 32]],
+        )?;
+        conn.execute_batch("DROP TABLE events_fts_docsize")?;
+        Ok(())
+    }
+
+    fn ward_audit_reservation_count(path: &Path) -> Result<i64> {
+        let conn = open_initialized_store(path)?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    #[test]
+    fn repeated_failed_vacuums_release_reservations_across_restarts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        seed_failing_vacuum(&path)?;
+
+        for _ in 0..3 {
+            let error =
+                vacuum_store_path(&path).expect_err("broken FTS rebuild must fail the vacuum");
+            assert!(
+                format!("{error:#}").contains("failed to rebuild events_fts"),
+                "unexpected vacuum failure: {error:#}"
+            );
+            assert_eq!(
+                ward_audit_reservation_count(&path)?,
+                0,
+                "a restart must not observe capacity retained for work that never vacuumed"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_failed_vacuums_release_every_reservation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        seed_failing_vacuum(&path)?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    vacuum_store_path(&path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            let error = worker
+                .join()
+                .expect("vacuum worker did not panic")
+                .expect_err("broken FTS rebuild must fail the vacuum");
+            assert!(
+                format!("{error:#}").contains("failed to rebuild events_fts"),
+                "unexpected vacuum failure: {error:#}"
+            );
+        }
+        assert_eq!(ward_audit_reservation_count(&path)?, 0);
         Ok(())
     }
 

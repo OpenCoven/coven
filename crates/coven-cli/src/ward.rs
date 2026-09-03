@@ -44,46 +44,66 @@
 //!
 //! ## Atomic write & staging threat model
 //!
-//! [`Ward::apply`] commits each cleared edit by staging a randomized sibling
-//! file (`.{name}.ward-staged-<uuid>`, opened with `create_new`) and renaming
-//! it onto the Gate-2-validated target:
+//! [`Ward::apply`] stages every cleared edit before changing any target, then
+//! commits the batch through randomized sibling files
+//! (`.{name}.ward-staged-<uuid>`, opened with `create_new`):
 //!
 //! - **Pre-planted staging symlinks or hard links** cannot be followed: the
 //!   staging name is unpredictable and `create_new` refuses to open through
 //!   an existing directory entry.
 //! - **Symlinked targets or parent directories** are refused by Gate 2 before
-//!   any byte is written, and the target's parent is re-created and verified
+//!   any byte is written. The target's parent is re-created and verified
 //!   component-by-component (never following symlinks) immediately before
-//!   staging — a directory component swapped for a symlink after adjudication
-//!   fails closed with no side effects outside the home.
-//! - **Hard-linked targets** are harmless by construction: `rename` replaces
-//!   the directory entry and never writes through the linked inode.
+//!   staging. This narrows, but does not eliminate, a post-adjudication
+//!   parent-component swap; the accepted residual race is described below.
+//! - **Pre-existing hard-linked targets** are not written through by commit:
+//!   atomic replacement changes the directory entry instead. Hard links are
+//!   not generally harmless, however. A same-privilege process can mutate an
+//!   installed inode through another open handle or link; when the Ward
+//!   observes that drift, it preserves the entry and reports an ambiguous
+//!   potentially-committed outcome instead of deleting it as Ward-owned.
 //!
-//! Phase 5 approved writes additionally preserve the file actually displaced by
-//! the atomic commit. Linux and macOS exchange the staged and target entries;
-//! Windows uses `ReplaceFileW` with a distinct randomized sibling backup. The
-//! displaced before-image and installed bytes are verified before the batch can
-//! finalize, and rollback uses the same primitive in reverse so concurrent
-//! target bytes are preserved rather than overwritten. A reviewed file that
-//! was absent at staging is installed with a no-replace hard link to its synced
-//! staging inode; rollback first moves the entry to a randomized no-replace
-//! capture and removes it only when both inode identity and contents still
-//! belong to that apply attempt.
+//! Direct and approved writes preserve the file actually displaced by commit.
+//! Linux and macOS exchange the staged and target entries. Windows moves the
+//! target to a randomized backup and installs the staged entry with no-replace
+//! semantics, avoiding a replacement API that can traverse a final symlink.
+//! Both paths verify the displaced file identity, displaced before-image, and
+//! installed bytes before the batch can finalize. Gate 4 hashes that verified
+//! commit-displaced before-image.
+//! Rollback uses the corresponding reverse operation and accepts success only
+//! when the retained handles, identities, and contents prove the expected
+//! transition. If that proof fails, the Ward leaves potentially concurrent
+//! target entries in place and returns a typed ambiguous outcome with the
+//! affected targets. A file that was absent during preparation is installed
+//! with a no-replace hard link to its synced staging inode; rollback first moves
+//! the entry to a randomized no-replace capture and removes it only when both
+//! inode identity and contents still belong to that apply attempt.
+//! Staging, backup, and rollback cleanup follows the same rule: capture without
+//! replacement, inspect as a no-follow regular file, and reverify the retained
+//! identity and bytes at the deletion boundary. A replacement observed after
+//! the first verification is restored to the artifact path (or left at the
+//! capture path if restoration would overwrite another entry) and reported as a
+//! cleanup failure. Known non-regular entries are rejected from metadata before
+//! open; the no-follow open remains nonblocking to cover a concurrent type swap.
 //!
 //! Residual risk (accepted): a same-privilege process that can already write
 //! inside the familiar home can still swap path components in the window
-//! between the per-component verification and the final `rename`. The check
-//! narrows that race without eliminating it; full elimination needs
+//! between per-component verification and later path-based staging or commit
+//! operations. Such a swap can redirect those operations. The checks narrow
+//! that race without eliminating it; full elimination needs
 //! directory-handle-relative I/O (e.g. `openat2` + `RESOLVE_BENEATH`), which
-//! is not portable across the supported platforms. A final-component swap can
-//! also point the Gate 4 pre-write audit read at an attacker-chosen readable
-//! file, affecting only the recorded `prev_sha256` — never where bytes land.
+//! is not portable across the supported platforms. Final-component replacement
+//! is handled separately: the Ward verifies the exact regular file displaced
+//! by commit and rolls the batch back instead of emitting a false
+//! `prev_sha256`. These checks still cannot close a race won after verification
+//! but before a later path-based operation; observed identity or content drift
+//! always fails closed without overwriting or deleting the unrecognized entry.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::fs::OpenOptions;
-use std::io::{ErrorKind, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(windows)]
@@ -95,6 +115,32 @@ use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
+
+/// Shared Ward content ceiling for one retained regular-file image.
+///
+/// Gate-3 protected-surface baselines and both direct and approved writes use
+/// this 16 MiB policy so one existing target cannot force the daemon to retain
+/// an arbitrarily large before-image.
+pub(crate) const WARD_FILE_CONTENT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Maximum total proposed and before-image bytes retained by one Ward apply.
+///
+/// This includes the caller-owned proposed content buffers borrowed for the
+/// duration of the apply and every existing-file before-image retained for
+/// rollback and Gate-4 hashing, regardless of the edits' tiers.
+pub(crate) const WARD_RETAINED_CONTENT_MAX_BYTES: u64 = WARD_FILE_CONTENT_MAX_BYTES;
+
+/// Maximum edits in one submitted, approved, or recovered Ward apply.
+///
+/// An existing target can retain three descriptors through finalization: its
+/// before-image, installed staging inode, and displaced backup. Capping at 32
+/// bounds that worst case at 96 descriptors, leaving substantial headroom
+/// under the portable low 256-descriptor soft limit common on macOS and Linux
+/// for the daemon's sockets, database, logs, and unrelated concurrent work.
+pub(crate) const WARD_EDIT_MAX_COUNT: usize = 32;
+
+/// Fixed stack scratch used by bounded reads and content verification.
+const DIRECT_VERIFICATION_SCRATCH_BYTES: usize = 64 * 1024;
 
 /// Trust tier of a path within a familiar's surface.
 ///
@@ -492,6 +538,110 @@ impl FileEdit {
     }
 }
 
+pub(crate) fn validate_file_edit_budget(edits: &[FileEdit]) -> Result<WardEditBudget> {
+    let mut budget = WardEditBudget::for_edit_count(edits.len())?;
+    for edit in edits {
+        budget.reserve_proposed_content(&edit.new_contents)?;
+    }
+    Ok(budget)
+}
+
+pub(crate) fn staged_contents_decoded_len(encoding: &str, data: &str) -> Result<u64> {
+    match encoding {
+        "utf8" => u64::try_from(data.len()).map_err(|_| {
+            WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+            .into()
+        }),
+        "base64" => base64_decoded_len(data),
+        _ => bail!("staged contents use unknown encoding `{encoding}`"),
+    }
+}
+
+fn base64_decoded_len(data: &str) -> Result<u64> {
+    let mut encoded_bytes = 0_u64;
+    let mut padding = 0_u64;
+    let mut saw_padding = false;
+    for byte in data.bytes() {
+        if byte == b'\n' {
+            continue;
+        }
+        encoded_bytes = encoded_bytes.checked_add(1).ok_or({
+            WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+        })?;
+        match byte {
+            b'=' => {
+                saw_padding = true;
+                padding += 1;
+                if padding > 2 {
+                    bail!("staged base64 contents have invalid padding");
+                }
+            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' => {
+                if saw_padding {
+                    bail!("staged base64 contents have data after padding");
+                }
+            }
+            other => bail!("staged base64 contents contain invalid byte {other:#04x}"),
+        }
+    }
+    if !encoded_bytes.is_multiple_of(4) {
+        bail!("staged base64 contents length is not a multiple of 4");
+    }
+    encoded_bytes
+        .checked_div(4)
+        .and_then(|chunks| chunks.checked_mul(3))
+        .and_then(|bytes| bytes.checked_sub(padding))
+        .ok_or_else(|| {
+            WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+            .into()
+        })
+}
+
+pub(crate) fn validate_staged_edit_budget(
+    edits: &[coven_threads_core::StagedEdit],
+) -> Result<WardEditBudget> {
+    let mut budget = WardEditBudget::for_edit_count(edits.len())?;
+    for edit in edits {
+        let bytes = match &edit.contents {
+            coven_threads_core::StagedContents::Utf8(contents) => {
+                staged_contents_decoded_len("utf8", contents)?
+            }
+            coven_threads_core::StagedContents::Base64(contents) => {
+                staged_contents_decoded_len("base64", contents)?
+            }
+        };
+        budget.reserve_retained_content(bytes)?;
+    }
+    Ok(budget)
+}
+
+fn validate_approved_edit_budget(
+    edits: &[FileEdit],
+    expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Result<WardEditBudget> {
+    let mut budget = validate_file_edit_budget(edits)?;
+    WardEditBudget::for_edit_count(expected_before.len())?;
+    for contents in expected_before.values().flatten() {
+        let bytes = u64::try_from(contents.len()).map_err(|_| {
+            WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+        })?;
+        budget.reserve_retained_content(bytes)?;
+    }
+    Ok(budget)
+}
+
 /// What the Ward did — or refused to do — with one edit in an apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Disposition {
@@ -519,7 +669,7 @@ pub(crate) enum ApprovedApplyMode {
 
 #[derive(Debug)]
 struct ApprovedApplyError {
-    may_have_committed_write: bool,
+    failure: ApprovedApplyFailure,
     source: anyhow::Error,
 }
 
@@ -535,12 +685,25 @@ impl std::error::Error for ApprovedApplyError {
     }
 }
 
-fn approved_apply_error(source: anyhow::Error, may_have_committed_write: bool) -> anyhow::Error {
-    ApprovedApplyError {
-        may_have_committed_write,
-        source,
-    }
-    .into()
+#[derive(Debug, Clone)]
+pub(crate) enum ApprovedApplyFailure {
+    NoWrite,
+    RolledBack,
+    RolledBackCleanupFailed { targets: Vec<String> },
+    Applied(ApplyReport),
+    Ambiguous { targets: Vec<String> },
+}
+
+fn approved_apply_error(source: anyhow::Error, failure: ApprovedApplyFailure) -> anyhow::Error {
+    ApprovedApplyError { failure, source }.into()
+}
+
+pub(crate) fn approved_apply_failure(error: &anyhow::Error) -> Option<&ApprovedApplyFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ApprovedApplyError>()
+            .map(|failure| &failure.failure)
+    })
 }
 
 /// Classify an approved-apply error for durable decision recovery.
@@ -550,10 +713,214 @@ fn approved_apply_error(source: anyhow::Error, may_have_committed_write: bool) -
 /// durable because a write may have committed. `None` is an unclassified error
 /// and callers must conservatively preserve recovery state.
 pub(crate) fn approved_apply_error_may_have_committed_write(error: &anyhow::Error) -> Option<bool> {
+    approved_apply_failure(error).map(|failure| {
+        matches!(
+            failure,
+            ApprovedApplyFailure::Applied(_) | ApprovedApplyFailure::Ambiguous { .. }
+        )
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum DirectApplyFailure {
+    RolledBack,
+    RolledBackCleanupFailed { targets: Vec<String> },
+    Applied(ApplyReport),
+    Ambiguous { targets: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WardEditBudgetFailure {
+    BatchEditCount {
+        attempted_edits: usize,
+        max_edits: usize,
+    },
+    ProposalEnvelopeBytes {
+        attempted_bytes: u64,
+        max_bytes: u64,
+    },
+    ExistingBeforeImage {
+        target: String,
+        observed_bytes: u64,
+        max_bytes: u64,
+    },
+    BatchRetainedMemory {
+        attempted_bytes: u64,
+        max_bytes: u64,
+    },
+}
+
+impl std::fmt::Display for WardEditBudgetFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BatchEditCount {
+                attempted_edits,
+                max_edits,
+            } => write!(
+                formatter,
+                "Ward apply contains {attempted_edits} edits, \
+                 over the {max_edits}-edit limit"
+            ),
+            Self::ProposalEnvelopeBytes {
+                attempted_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "Ward proposal envelope is {attempted_bytes} bytes, \
+                 over the {max_bytes}-byte encoded-file limit"
+            ),
+            Self::ExistingBeforeImage {
+                target,
+                observed_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "Ward target `{target}` retained before-image is {observed_bytes} bytes, \
+                 over the {max_bytes}-byte per-file limit"
+            ),
+            Self::BatchRetainedMemory {
+                attempted_bytes,
+                max_bytes,
+            } => write!(
+                formatter,
+                "Ward apply batch retained-memory would be {attempted_bytes} bytes, \
+                 over the {max_bytes}-byte limit"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WardEditBudgetFailure {}
+
+pub(crate) fn ward_edit_budget_failure(error: &anyhow::Error) -> Option<&WardEditBudgetFailure> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<WardEditBudgetFailure>())
+}
+
+/// Count and retained-content accounting shared by submitted, approved, and
+/// recovered Ward edits.
+///
+/// Callers can initialize this from an untrusted edit count, then reserve
+/// borrowed proposed-content lengths without cloning or allocating. Existing
+/// before-images reserve from the same aggregate budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WardEditBudget {
+    retained_content_bytes: u64,
+}
+
+impl WardEditBudget {
+    pub(crate) fn for_edit_count(edit_count: usize) -> Result<Self> {
+        if edit_count > WARD_EDIT_MAX_COUNT {
+            return Err(WardEditBudgetFailure::BatchEditCount {
+                attempted_edits: edit_count,
+                max_edits: WARD_EDIT_MAX_COUNT,
+            }
+            .into());
+        }
+        Ok(Self {
+            retained_content_bytes: 0,
+        })
+    }
+
+    pub(crate) fn reserve_retained_content(&mut self, additional_bytes: u64) -> Result<()> {
+        self.retained_content_bytes =
+            reserve_ward_content_bytes(self.retained_content_bytes, additional_bytes)?;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_proposed_content(&mut self, contents: &[u8]) -> Result<()> {
+        let bytes = u64::try_from(contents.len()).map_err(|_| {
+            WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+        })?;
+        self.reserve_retained_content(bytes)
+    }
+
+    pub(crate) fn retained_content_bytes(self) -> u64 {
+        self.retained_content_bytes
+    }
+}
+
+#[derive(Debug)]
+struct StagingCleanupError {
+    path: PathBuf,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for StagingCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for StagingCleanupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn staging_cleanup_error(path: &Path, source: anyhow::Error) -> anyhow::Error {
+    StagingCleanupError {
+        path: path.to_path_buf(),
+        source,
+    }
+    .into()
+}
+
+fn staging_cleanup_failure_path(error: &anyhow::Error) -> Option<&Path> {
     error.chain().find_map(|cause| {
         cause
-            .downcast_ref::<ApprovedApplyError>()
-            .map(|failure| failure.may_have_committed_write)
+            .downcast_ref::<StagingCleanupError>()
+            .map(|failure| failure.path.as_path())
+    })
+}
+
+#[derive(Debug)]
+struct DirectRollbackCleanupError {
+    targets: Vec<String>,
+    messages: Vec<String>,
+}
+
+impl std::fmt::Display for DirectRollbackCleanupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "removing rollback artifacts failed: {}",
+            self.messages.join("; ")
+        )
+    }
+}
+
+#[derive(Debug)]
+struct DirectApplyError {
+    failure: DirectApplyFailure,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for DirectApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{:#}", self.source)
+    }
+}
+
+impl std::error::Error for DirectApplyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+fn direct_apply_error(source: anyhow::Error, failure: DirectApplyFailure) -> anyhow::Error {
+    DirectApplyError { failure, source }.into()
+}
+
+pub(crate) fn direct_apply_failure(error: &anyhow::Error) -> Option<&DirectApplyFailure> {
+    error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<DirectApplyError>()
+            .map(|failure| &failure.failure)
     })
 }
 
@@ -571,7 +938,8 @@ pub struct AuditRecord {
     pub resolved: String,
     /// Tier of the written path.
     pub tier: Tier,
-    /// SHA-256 (hex) of the prior contents, or `None` if the file was created.
+    /// SHA-256 (hex) of the verified commit-displaced regular-file contents,
+    /// or `None` when a no-replace creation succeeded.
     pub prev_sha256: Option<String>,
     /// SHA-256 (hex) of the written contents.
     pub next_sha256: String,
@@ -642,6 +1010,29 @@ pub struct Ward {
     protected_ci: GlobSet,
 }
 
+#[cfg(test)]
+thread_local! {
+    static EVALUATE_CALL_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_evaluate_call_count() {
+    EVALUATE_CALL_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_call_count() -> usize {
+    EVALUATE_CALL_COUNT.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn record_evaluate_call() {
+    EVALUATE_CALL_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(not(test))]
+fn record_evaluate_call() {}
+
 impl Ward {
     /// Build a Ward for the familiar rooted at `home`.
     pub fn new(home: impl Into<PathBuf>, config: WardConfig) -> Result<Self> {
@@ -686,6 +1077,7 @@ impl Ward {
     /// Adjudicate a proposal. Runs Gate 2 (surface discrimination) then Gate 1
     /// (authorization) for each target.
     pub fn evaluate(&self, proposal: &Proposal) -> Outcome {
+        record_evaluate_call();
         let decisions = proposal
             .targets
             .iter()
@@ -820,9 +1212,11 @@ impl Ward {
     /// Because writes are routed through [`Ward::evaluate`] first, Gate 2 path
     /// confinement applies to the apply too: an edit that resolves out of the
     /// familiar home (via `..`, symlink, or case collision) is refused before
-    /// any byte is written. Returns `Err` only on an I/O failure *after* the
-    /// gates cleared; a refusal or hold is a normal [`ApplyReport`], not an error.
+    /// any byte is written. Count and proposed-content budgets run before
+    /// target cloning or Gate 2; budget and I/O failures return `Err`, while a
+    /// refusal or hold is a normal [`ApplyReport`].
     pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
+        validate_file_edit_budget(edits)?;
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
@@ -867,22 +1261,13 @@ impl Ward {
             return Ok(ApplyReport { changes });
         }
 
-        // Every edit is Tier 2/3 and cleared. Write each atomically.
+        // Every edit is Tier 2/3 and cleared. Stage and commit the batch as one
+        // rollback unit so a later failure cannot strand an unaudited write.
         let canonical_home = self
             .home
             .canonicalize()
             .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
-        let mut changes = Vec::with_capacity(edits.len());
-        for (edit, decision) in edits.iter().zip(outcome.decisions) {
-            let abs = join_resolved(&canonical_home, &decision.resolved);
-            let audit = write_atomic(&canonical_home, &abs, &edit.new_contents, &decision)?;
-            changes.push(AppliedChange {
-                decision,
-                disposition: Disposition::Applied,
-                audit,
-            });
-        }
-        Ok(ApplyReport { changes })
+        write_direct_batch(&canonical_home, edits, outcome.decisions)
     }
 
     /// Apply edits after an explicit principal proposal approval has cleared the
@@ -896,13 +1281,28 @@ impl Ward {
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
+        (|| -> Result<()> {
+            let mut budget = validate_file_edit_budget(edits)?;
+            WardEditBudget::for_edit_count(expected_before.len())?;
+            for contents in expected_before.values() {
+                let bytes = u64::try_from(contents.len()).map_err(|_| {
+                    WardEditBudgetFailure::BatchRetainedMemory {
+                        attempted_bytes: u64::MAX,
+                        max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+                    }
+                })?;
+                budget.reserve_retained_content(bytes)?;
+            }
+            Ok(())
+        })()
+        .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
         let outcome = self.evaluate(&proposal);
         ensure_expected_resolutions(&outcome.decisions, expected_resolved)
-            .map_err(|error| approved_apply_error(error, false))?;
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         if outcome.is_blocked() {
             let changes = outcome
                 .decisions
@@ -924,7 +1324,7 @@ impl Ward {
             .home
             .canonicalize()
             .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
-            .map_err(|error| approved_apply_error(error, false))?;
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let expected_before = expected_before
             .iter()
             .map(|(target, contents)| (target.clone(), Some(contents.clone())))
@@ -955,13 +1355,15 @@ impl Ward {
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
+        validate_approved_edit_budget(edits, expected_before)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
         };
         let outcome = self.evaluate(&proposal);
         ensure_expected_resolutions(&outcome.decisions, expected_resolved)
-            .map_err(|error| approved_apply_error(error, false))?;
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let has_reviewed_target = outcome
             .decisions
             .iter()
@@ -990,7 +1392,7 @@ impl Ward {
             .home
             .canonicalize()
             .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
-            .map_err(|error| approved_apply_error(error, false))?;
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let changes = write_atomically_if_unchanged(
             &canonical_home,
             edits,
@@ -1056,75 +1458,7 @@ fn join_resolved(canonical_home: &Path, resolved: &str) -> PathBuf {
     path
 }
 
-/// Write `contents` to `path` atomically: stage a sibling file, then rename it
-/// into place (rename is atomic within a filesystem). Returns a Gate 4 audit
-/// record for Tier 2 writes; Tier 3 (free) writes return `None`. Tier 0/1 never
-/// reach this function — they are held or refused upstream.
-fn write_atomic(
-    canonical_home: &Path,
-    path: &Path,
-    contents: &[u8],
-    decision: &Decision,
-) -> Result<Option<AuditRecord>> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("target has no parent directory: {}", path.display()))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| anyhow!("target has no file name: {}", path.display()))?;
-
-    // Re-create and verify the parent immediately before staging. Gate 2
-    // cleared the target earlier; a directory component swapped for a symlink
-    // since then (TOCTOU) must fail closed — with no side effects outside the
-    // familiar home — rather than redirect the write.
-    let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
-    let path = canonical_parent.join(name);
-
-    let need_audit = decision.tier == Tier::Logged;
-
-    // Capture prior contents for the audit hash (only when we will log).
-    let prev = if need_audit {
-        match std::fs::read(&path) {
-            Ok(bytes) => Some(bytes),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
-            Err(err) => {
-                return Err(anyhow!(
-                    "reading prior contents of {}: {err}",
-                    path.display()
-                ))
-            }
-        }
-    } else {
-        None
-    };
-
-    let (staged, mut file) = create_staging_file(&path)?;
-    let commit = (|| -> Result<()> {
-        file.write_all(contents)
-            .with_context(|| format!("staging write to {}", staged.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing staged write to {}", staged.display()))?;
-        drop(file);
-        std::fs::rename(&staged, &path)
-            .with_context(|| format!("committing write to {}", path.display()))?;
-        Ok(())
-    })();
-    if commit.is_err() {
-        let _ = std::fs::remove_file(&staged);
-    }
-    commit?;
-
-    let audit = need_audit.then(|| AuditRecord {
-        target: decision.target.clone(),
-        resolved: decision.resolved.clone(),
-        tier: decision.tier,
-        prev_sha256: prev.as_deref().map(sha256_hex),
-        next_sha256: sha256_hex(contents),
-        bytes_written: contents.len(),
-    });
-    Ok(audit)
-}
-
+#[derive(Clone)]
 struct ApprovedWritePaths {
     staged: PathBuf,
     displaced: PathBuf,
@@ -1137,13 +1471,591 @@ impl ApprovedWritePaths {
     }
 }
 
-struct PreparedConditionalWrite {
+struct OpenRegularFile {
+    file: std::fs::File,
+    contents: Vec<u8>,
+}
+
+struct PreparedDirectWrite<'a> {
+    path: PathBuf,
+    paths: Option<ApprovedWritePaths>,
+    before: Option<OpenRegularFile>,
+    installed: Option<std::fs::File>,
+    displaced: Option<std::fs::File>,
+    new_contents: &'a [u8],
+    decision: Decision,
+}
+
+struct PreparedConditionalWrite<'a> {
     path: PathBuf,
     paths: Option<ApprovedWritePaths>,
     already_applied: bool,
     expected_before: Option<Vec<u8>>,
-    new_contents: Vec<u8>,
+    observed: Option<OpenRegularFile>,
+    installed: Option<std::fs::File>,
+    displaced: Option<std::fs::File>,
+    audit_before_sha256: Option<String>,
+    new_contents: &'a [u8],
     decision: Decision,
+}
+
+fn write_direct_batch(
+    canonical_home: &Path,
+    edits: &[FileEdit],
+    decisions: Vec<Decision>,
+) -> Result<ApplyReport> {
+    let mut retained_bytes = validate_file_edit_budget(edits)?.retained_content_bytes();
+    let mut prepared = Vec::with_capacity(edits.len());
+    for (edit, decision) in edits.iter().zip(decisions) {
+        let result = (|| -> Result<PreparedDirectWrite> {
+            let resolved = join_resolved(canonical_home, &decision.resolved);
+            let parent = resolved
+                .parent()
+                .ok_or_else(|| anyhow!("target has no parent directory: {}", resolved.display()))?;
+            let name = resolved
+                .file_name()
+                .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
+            let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
+            let path = canonical_parent.join(name);
+            let before = open_direct_before_image(&path, &decision.target, retained_bytes)?;
+            if let Some(before) = &before {
+                retained_bytes = reserve_ward_content_bytes(
+                    retained_bytes,
+                    u64::try_from(before.contents.len()).map_err(|_| {
+                        WardEditBudgetFailure::BatchRetainedMemory {
+                            attempted_bytes: u64::MAX,
+                            max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+                        }
+                    })?,
+                )?;
+            }
+            Ok(PreparedDirectWrite {
+                path,
+                paths: None,
+                before,
+                installed: None,
+                displaced: None,
+                new_contents: edit.new_contents.as_slice(),
+                decision,
+            })
+        })();
+        match result {
+            Ok(write) => prepared.push(write),
+            Err(error) => {
+                return fail_after_direct_rollback(&prepared, &[], error);
+            }
+        }
+    }
+
+    for index in 0..prepared.len() {
+        if let Err(error) = stage_direct_write(&mut prepared[index]) {
+            return fail_after_direct_rollback(&prepared, &[], error);
+        }
+    }
+
+    let mut swapped = Vec::new();
+    for index in 0..prepared.len() {
+        let commit = {
+            let write = &prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared direct write has no staging paths")?;
+            if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_direct_rollback(&prepared, &swapped, error);
+            }
+            if write.before.is_some() {
+                replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
+            } else {
+                std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
+                    format!(
+                        "target `{}` appeared during commit; refusing to overwrite it",
+                        write.decision.target
+                    )
+                })
+            }
+        };
+        if let Err(error) = commit {
+            let write = &prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared direct write has no staging paths")?;
+            let staged = write
+                .installed
+                .as_ref()
+                .context("prepared direct write has no staged-file identity")?;
+            let staged_at_target = match open_file_matches_path_if_present(staged, &write.path) {
+                Ok(matches) => matches,
+                Err(identity_error) => {
+                    return fail_after_direct_rollback(
+                        &prepared,
+                        &swapped,
+                        anyhow!(
+                            "{error:#}; checking failed commit ownership also failed: \
+                             {identity_error:#}"
+                        ),
+                    );
+                }
+            };
+            if staged_at_target
+                || (write.before.is_some() && failed_replace_displaced_target(&paths.displaced))
+            {
+                swapped.push(index);
+            }
+            return fail_after_direct_rollback(&prepared, &swapped, error);
+        }
+        swapped.push(index);
+
+        let verification = (|| -> Result<()> {
+            let write = &mut prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared direct write has no staging paths")?;
+            let staged = write
+                .installed
+                .as_ref()
+                .context("prepared direct write has no staged-file identity")?;
+            let changed = format!("target `{}` changed during commit", write.decision.target);
+            verify_installed_regular_target(
+                &write.path,
+                write.new_contents,
+                staged,
+                "committed direct target unexpectedly disappeared",
+                &changed,
+            )?;
+            if write.before.is_some() {
+                let before = write
+                    .before
+                    .as_mut()
+                    .context("existing direct target lost its before-image")?;
+                verify_displaced_regular_target(
+                    &mut before.file,
+                    &before.contents,
+                    &paths.displaced,
+                    &mut write.displaced,
+                    &changed,
+                )?;
+            } else if !open_file_matches_path(staged, &paths.staged)? {
+                bail!("target `{}` changed during commit", write.decision.target);
+            }
+            Ok(())
+        })();
+        if let Err(error) = verification {
+            return fail_after_direct_rollback(&prepared, &swapped, error);
+        }
+    }
+
+    let final_verification = (|| -> Result<()> {
+        for write in &mut prepared {
+            let installed = write
+                .installed
+                .as_ref()
+                .context("committed direct write has no staged-file handle")?;
+            let changed = format!(
+                "target `{}` changed before batch finalization",
+                write.decision.target
+            );
+            verify_installed_regular_target(
+                &write.path,
+                write.new_contents,
+                installed,
+                "direct target unexpectedly disappeared before batch finalization",
+                &changed,
+            )?;
+            if let Some(before) = write.before.as_mut() {
+                let paths = write
+                    .paths
+                    .as_ref()
+                    .context("committed direct write has no staging paths")?;
+                verify_displaced_regular_target(
+                    &mut before.file,
+                    &before.contents,
+                    &paths.displaced,
+                    &mut write.displaced,
+                    &changed,
+                )?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = final_verification {
+        return fail_after_direct_rollback(&prepared, &swapped, error);
+    }
+
+    let report = direct_apply_report(&prepared);
+    if let Err(error) = cleanup_direct_staging(&prepared) {
+        return Err(direct_apply_error(
+            error.context("direct batch was applied but backup cleanup failed"),
+            DirectApplyFailure::Applied(report),
+        ));
+    }
+    Ok(report)
+}
+
+fn reserve_ward_content_bytes(retained: u64, additional: u64) -> Result<u64> {
+    let attempted =
+        retained
+            .checked_add(additional)
+            .ok_or(WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+            })?;
+    if attempted > WARD_RETAINED_CONTENT_MAX_BYTES {
+        return Err(WardEditBudgetFailure::BatchRetainedMemory {
+            attempted_bytes: attempted,
+            max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+        }
+        .into());
+    }
+    Ok(attempted)
+}
+
+fn direct_apply_report(prepared: &[PreparedDirectWrite<'_>]) -> ApplyReport {
+    ApplyReport {
+        changes: prepared
+            .iter()
+            .map(|write| {
+                let audit = (write.decision.tier == Tier::Logged).then(|| AuditRecord {
+                    target: write.decision.target.clone(),
+                    resolved: write.decision.resolved.clone(),
+                    tier: write.decision.tier,
+                    prev_sha256: write
+                        .before
+                        .as_ref()
+                        .map(|before| sha256_hex(&before.contents)),
+                    next_sha256: sha256_hex(write.new_contents),
+                    bytes_written: write.new_contents.len(),
+                });
+                AppliedChange {
+                    decision: write.decision.clone(),
+                    disposition: Disposition::Applied,
+                    audit,
+                }
+            })
+            .collect(),
+    }
+}
+
+fn fail_after_direct_rollback(
+    prepared: &[PreparedDirectWrite<'_>],
+    swapped: &[usize],
+    error: anyhow::Error,
+) -> Result<ApplyReport> {
+    let mut known_cleanup_targets = BTreeSet::new();
+    if let Some(write) = staging_cleanup_failure_path(&error)
+        .and_then(|path| prepared.iter().find(|write| write.path == path))
+    {
+        known_cleanup_targets.insert(write.decision.target.clone());
+    }
+    let rollback = rollback_direct_writes(prepared, swapped);
+    match rollback {
+        Ok(()) => {
+            let (unresolved, ownership_errors) = find_unresolved_direct_targets(prepared);
+            if !unresolved.is_empty() {
+                let targets = unresolved
+                    .iter()
+                    .map(|&index| prepared[index].decision.target.clone())
+                    .collect();
+                return Err(direct_apply_error(
+                    anyhow!(
+                        "{error:#}; direct rollback left potentially concurrent target entries \
+                         in place: {}",
+                        ownership_errors.join("; ")
+                    ),
+                    DirectApplyFailure::Ambiguous { targets },
+                ));
+            }
+            match cleanup_direct_rollback_staging(prepared) {
+                Ok(()) if known_cleanup_targets.is_empty() => Err(direct_apply_error(
+                    error.context("direct batch was rolled back"),
+                    DirectApplyFailure::RolledBack,
+                )),
+                Ok(()) => Err(direct_apply_error(
+                    error
+                        .context("direct batch was rolled back but staging cleanup was incomplete"),
+                    DirectApplyFailure::RolledBackCleanupFailed {
+                        targets: prepared
+                            .iter()
+                            .filter(|write| known_cleanup_targets.contains(&write.decision.target))
+                            .map(|write| write.decision.target.clone())
+                            .collect(),
+                    },
+                )),
+                Err(cleanup_error) => {
+                    known_cleanup_targets.extend(cleanup_error.targets.iter().cloned());
+                    for &index in swapped {
+                        known_cleanup_targets.insert(prepared[index].decision.target.clone());
+                    }
+                    Err(direct_apply_error(
+                        anyhow!(
+                            "{error:#}; direct batch was rolled back but cleanup failed: \
+                             {cleanup_error:#}"
+                        ),
+                        DirectApplyFailure::RolledBackCleanupFailed {
+                            targets: prepared
+                                .iter()
+                                .filter(|write| {
+                                    known_cleanup_targets.contains(&write.decision.target)
+                                })
+                                .map(|write| write.decision.target.clone())
+                                .collect(),
+                        },
+                    ))
+                }
+            }
+        }
+        Err(rollback_error) => {
+            let targets = swapped
+                .iter()
+                .map(|&index| prepared[index].decision.target.clone())
+                .collect();
+            Err(direct_apply_error(
+                anyhow!("{error:#}; direct rollback was not fully proven: {rollback_error:#}"),
+                DirectApplyFailure::Ambiguous { targets },
+            ))
+        }
+    }
+}
+
+fn rollback_direct_writes(prepared: &[PreparedDirectWrite<'_>], swapped: &[usize]) -> Result<()> {
+    let mut errors = Vec::new();
+    for &index in swapped.iter().rev() {
+        let write = &prepared[index];
+        let staged = match &write.installed {
+            Some(staged) => staged,
+            None => {
+                errors.push(format!(
+                    "{}: committed write has no staged-file identity",
+                    write.decision.target
+                ));
+                continue;
+            }
+        };
+        let paths = match &write.paths {
+            Some(paths) => paths,
+            None => {
+                errors.push(format!(
+                    "{}: committed write has no staging paths",
+                    write.decision.target
+                ));
+                continue;
+            }
+        };
+        let rollback = match &write.before {
+            Some(_) => rollback_replaced_regular_target(
+                &write.path,
+                paths,
+                write.new_contents,
+                staged,
+                write.displaced.as_ref(),
+            ),
+            None => rollback_direct_created_write(write, staged),
+        };
+        if let Err(error) = rollback {
+            errors.push(format!("{}: {error:#}", write.decision.target));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!("direct rollback failed: {}", errors.join("; "))
+    }
+}
+
+fn find_unresolved_direct_targets(
+    prepared: &[PreparedDirectWrite<'_>],
+) -> (Vec<usize>, Vec<String>) {
+    let mut unresolved = Vec::new();
+    let mut errors = Vec::new();
+    for (index, write) in prepared.iter().enumerate() {
+        let Some(staged) = &write.installed else {
+            continue;
+        };
+        match open_file_matches_path_if_present(staged, &write.path) {
+            Ok(false) => continue,
+            Ok(true) => {
+                unresolved.push(index);
+                errors.push(format!(
+                    "{}: Ward staging identity remains at the target",
+                    write.decision.target
+                ));
+            }
+            Err(error) => {
+                unresolved.push(index);
+                errors.push(format!(
+                    "{}: checking ambiguous target ownership failed: {error:#}",
+                    write.decision.target
+                ));
+            }
+        }
+    }
+    (unresolved, errors)
+}
+
+fn rollback_direct_created_write(
+    write: &PreparedDirectWrite<'_>,
+    staged: &std::fs::File,
+) -> Result<()> {
+    let captured = rollback_capture_path(&write.path);
+    atomic_move_without_replace(&write.path, &captured)
+        .with_context(|| format!("capturing created direct target {}", write.path.display()))?;
+    let verification = (|| -> Result<()> {
+        if !open_file_matches_path(staged, &captured)? {
+            bail!(
+                "created target changed during direct rollback {}",
+                write.path.display()
+            );
+        }
+        let mut captured_file = open_regular_file_handle_without_following_links(&captured)?
+            .context("captured direct target unexpectedly disappeared")?;
+        if stream_regular_file_matches_and_sha256(&mut captured_file, write.new_contents)?.is_none()
+        {
+            bail!(
+                "created target bytes changed during direct rollback {}",
+                write.path.display()
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        atomic_move_without_replace(&captured, &write.path)
+            .with_context(|| format!("restoring changed direct target: {error:#}"))?;
+        return Err(error);
+    }
+    remove_owned_regular_artifact(
+        &captured,
+        staged,
+        Some(write.new_contents),
+        "captured direct target",
+    )
+}
+
+fn cleanup_direct_rollback_staging(
+    prepared: &[PreparedDirectWrite<'_>],
+) -> std::result::Result<(), DirectRollbackCleanupError> {
+    let mut errors = Vec::new();
+    let mut targets = Vec::new();
+    for write in prepared {
+        let Some(paths) = &write.paths else {
+            continue;
+        };
+        if let Err(error) = maybe_fail_direct_cleanup(&write.path) {
+            errors.push(format!("{}: {error:#}", write.path.display()));
+            targets.push(write.decision.target.clone());
+            continue;
+        }
+        let Some(installed) = write.installed.as_ref() else {
+            errors.push(format!(
+                "{}: rollback artifact has no retained staged-file identity",
+                write.path.display()
+            ));
+            targets.push(write.decision.target.clone());
+            continue;
+        };
+        if let Err(error) = maybe_replace_cleanup_artifact(&write.path, &paths.staged) {
+            errors.push(format!("{}: {error:#}", paths.staged.display()));
+            targets.push(write.decision.target.clone());
+            continue;
+        }
+        if let Err(error) = remove_owned_regular_artifact(
+            &paths.staged,
+            installed,
+            Some(write.new_contents),
+            "direct rollback staging",
+        ) {
+            errors.push(format!("{}: {error:#}", paths.staged.display()));
+            targets.push(write.decision.target.clone());
+        }
+        if paths.displaced != paths.staged {
+            if let Err(error) = ensure_artifact_path_absent(
+                &paths.displaced,
+                "direct rollback displaced-backup path",
+            ) {
+                errors.push(format!("{}: {error:#}", paths.displaced.display()));
+                if !targets.contains(&write.decision.target) {
+                    targets.push(write.decision.target.clone());
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(DirectRollbackCleanupError {
+            targets,
+            messages: errors,
+        })
+    }
+}
+
+fn cleanup_direct_staging(prepared: &[PreparedDirectWrite<'_>]) -> Result<()> {
+    let mut errors = Vec::new();
+    for write in prepared {
+        let Some(paths) = &write.paths else {
+            continue;
+        };
+        let cleanup = if write.before.is_some() {
+            &paths.displaced
+        } else {
+            &paths.staged
+        };
+        if let Err(error) = maybe_fail_direct_cleanup(&write.path) {
+            errors.push(format!("{}: {error:#}", cleanup.display()));
+            continue;
+        }
+        if let Err(error) = maybe_replace_cleanup_artifact(&write.path, cleanup) {
+            errors.push(format!("{}: {error:#}", cleanup.display()));
+            continue;
+        }
+        let (identity, expected_contents, description) = if let Some(before) = &write.before {
+            let Some(displaced) = write.displaced.as_ref() else {
+                errors.push(format!(
+                    "{}: committed backup has no retained displaced-file identity",
+                    cleanup.display()
+                ));
+                continue;
+            };
+            (
+                displaced,
+                before.contents.as_slice(),
+                "direct-write displaced backup",
+            )
+        } else {
+            let Some(installed) = write.installed.as_ref() else {
+                errors.push(format!(
+                    "{}: create staging has no retained staged-file identity",
+                    cleanup.display()
+                ));
+                continue;
+            };
+            (installed, write.new_contents, "direct-write create staging")
+        };
+        if let Err(error) =
+            remove_owned_regular_artifact(cleanup, identity, Some(expected_contents), description)
+        {
+            errors.push(format!("{}: {error:#}", cleanup.display()));
+        }
+        if paths.displaced != paths.staged {
+            let unused = if write.before.is_some() {
+                &paths.staged
+            } else {
+                &paths.displaced
+            };
+            if let Err(error) = ensure_artifact_path_absent(unused, "unused direct cleanup path") {
+                errors.push(format!("{}: {error:#}", unused.display()));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "removing direct-write backups failed: {}",
+            errors.join("; ")
+        )
+    }
 }
 
 /// Commit an approved proposal only while every target still has the exact
@@ -1161,10 +2073,12 @@ fn write_atomically_if_unchanged(
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
 ) -> Result<Vec<AppliedChange>> {
+    validate_approved_edit_budget(edits, expected_before)
+        .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
     let mut prepared = Vec::with_capacity(edits.len());
     let mut preparation_error = None;
     for (edit, decision) in edits.iter().zip(decisions) {
-        let result = (|| -> Result<PreparedConditionalWrite> {
+        let result = (|| -> Result<PreparedConditionalWrite<'_>> {
             let expected = expected_before
                 .get(&edit.target)
                 .with_context(|| format!("missing approved before-image for `{}`", edit.target))?
@@ -1178,17 +2092,11 @@ fn write_atomically_if_unchanged(
                 .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
             let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
             let path = canonical_parent.join(name);
-            let current = match std::fs::read(&path) {
-                Ok(current) => Some(current),
-                Err(error) if error.kind() == ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("reading approved target {}", path.display()))
-                }
-            };
+            let current = open_regular_file_without_following_links(&path)?;
+            let current_contents = current.as_ref().map(|current| current.contents.as_slice());
             let already_applied = mode == ApprovedApplyMode::Recovery
-                && current.as_deref() == Some(edit.new_contents.as_slice());
-            match (&expected, &current) {
+                && current_contents == Some(edit.new_contents.as_slice());
+            match (&expected, current_contents) {
                 (Some(expected), Some(current)) if current == expected || already_applied => {}
                 (Some(_), _) => {
                     bail!(
@@ -1205,12 +2113,21 @@ fn write_atomically_if_unchanged(
                     );
                 }
             }
+            let audit_before_sha256 = if already_applied {
+                expected.as_deref().map(sha256_hex)
+            } else {
+                None
+            };
             Ok(PreparedConditionalWrite {
                 path,
                 paths: None,
                 already_applied,
+                audit_before_sha256,
                 expected_before: expected,
-                new_contents: edit.new_contents.clone(),
+                observed: current,
+                installed: None,
+                displaced: None,
+                new_contents: edit.new_contents.as_slice(),
                 decision,
             })
         })();
@@ -1231,32 +2148,66 @@ fn write_atomically_if_unchanged(
         if prepared[index].already_applied {
             continue;
         }
-        match stage_contents(&prepared[index].path, &prepared[index].new_contents) {
-            Ok(paths) => prepared[index].paths = Some(paths),
+        match stage_contents(&prepared[index].path, prepared[index].new_contents) {
+            Ok((paths, installed)) => {
+                prepared[index].paths = Some(paths);
+                prepared[index].installed = Some(installed);
+            }
             Err(error) => return fail_after_conditional_rollback(&prepared, &[], error),
         }
     }
 
     let mut swapped = Vec::new();
-    for (index, write) in prepared.iter().enumerate() {
-        let Some(paths) = &write.paths else {
+    for index in 0..prepared.len() {
+        if prepared[index].already_applied {
             continue;
-        };
-        if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
-            return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
-        let commit = if write.expected_before.is_some() {
-            atomic_replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
-        } else {
-            std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
-                format!(
-                    "approved target `{}` appeared after review; refusing to overwrite it",
-                    write.decision.target
-                )
-            })
+        let commit = {
+            let write = &prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared approved write has no staging paths")?;
+            if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_conditional_rollback(&prepared, &swapped, error);
+            }
+            if write.expected_before.is_some() {
+                replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
+            } else {
+                std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
+                    format!(
+                        "approved target `{}` appeared after review; refusing to overwrite it",
+                        write.decision.target
+                    )
+                })
+            }
         };
         if let Err(error) = commit {
-            if write.expected_before.is_some() && failed_replace_displaced_target(&paths.displaced)
+            let write = &prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared approved write has no staging paths")?;
+            let installed = write
+                .installed
+                .as_ref()
+                .context("prepared approved write has no staged-file identity")?;
+            let staged_at_target = match open_file_matches_path_if_present(installed, &write.path) {
+                Ok(matches) => matches,
+                Err(identity_error) => {
+                    return fail_after_conditional_rollback(
+                        &prepared,
+                        &swapped,
+                        anyhow!(
+                            "{error:#}; checking failed approved commit ownership also failed: \
+                             {identity_error:#}"
+                        ),
+                    );
+                }
+            };
+            if staged_at_target
+                || (write.expected_before.is_some()
+                    && failed_replace_displaced_target(&paths.displaced))
             {
                 swapped.push(index);
             }
@@ -1272,30 +2223,43 @@ fn write_atomically_if_unchanged(
         swapped.push(index);
 
         let verification = (|| -> Result<()> {
-            let installed = std::fs::read(&write.path)
-                .with_context(|| format!("verifying approved write {}", write.path.display()))?;
-            match &write.expected_before {
-                Some(expected) => {
-                    let displaced = std::fs::read(&paths.displaced).with_context(|| {
-                        format!("reading displaced target {}", paths.displaced.display())
-                    })?;
-                    if displaced != *expected || installed != write.new_contents {
-                        bail!(
-                            "approved target `{}` changed during commit",
-                            write.decision.target
-                        );
-                    }
-                }
-                None => {
-                    if installed != write.new_contents
-                        || !same_file_identity(&write.path, &paths.staged)?
-                    {
-                        bail!(
-                            "approved target `{}` changed during commit",
-                            write.decision.target
-                        );
-                    }
-                }
+            let write = &mut prepared[index];
+            let paths = write
+                .paths
+                .as_ref()
+                .context("prepared approved write has no staging paths")?;
+            let installed = write
+                .installed
+                .as_ref()
+                .context("prepared approved write has no staged-file identity")?;
+            let changed = format!(
+                "approved target `{}` changed during commit",
+                write.decision.target
+            );
+            verify_installed_regular_target(
+                &write.path,
+                write.new_contents,
+                installed,
+                "committed approved target unexpectedly disappeared",
+                &changed,
+            )?;
+            if write.expected_before.is_some() {
+                let observed = write
+                    .observed
+                    .as_mut()
+                    .context("existing approved target lost its retained identity")?;
+                let expected_before = write
+                    .expected_before
+                    .as_deref()
+                    .context("existing approved target lost its expected before-image")?;
+                let displaced_sha256 = verify_displaced_regular_target(
+                    &mut observed.file,
+                    expected_before,
+                    &paths.displaced,
+                    &mut write.displaced,
+                    &changed,
+                )?;
+                write.audit_before_sha256 = Some(displaced_sha256);
             }
             Ok(())
         })();
@@ -1305,16 +2269,51 @@ fn write_atomically_if_unchanged(
     }
 
     let final_verification = (|| -> Result<()> {
-        for write in &prepared {
-            let current = std::fs::read(&write.path).with_context(|| {
-                format!("revalidating approved target {}", write.path.display())
-            })?;
-            if current != write.new_contents {
-                bail!(
-                    "approved target `{}` changed before batch finalization",
-                    write.decision.target
-                );
+        for write in &mut prepared {
+            let identity = if write.already_applied {
+                &write
+                    .observed
+                    .as_ref()
+                    .context("already-applied approved target lost its retained identity")?
+                    .file
+            } else {
+                write
+                    .installed
+                    .as_ref()
+                    .context("committed approved target lost its staged-file identity")?
+            };
+            let changed = format!(
+                "approved target `{}` changed before batch finalization",
+                write.decision.target
+            );
+            verify_installed_regular_target(
+                &write.path,
+                write.new_contents,
+                identity,
+                "approved target unexpectedly disappeared before batch finalization",
+                &changed,
+            )?;
+            if write.already_applied {
+                continue;
             }
+            let Some(expected_before) = write.expected_before.as_deref() else {
+                continue;
+            };
+            let paths = write
+                .paths
+                .as_ref()
+                .context("committed approved write has no staging paths")?;
+            let observed = write
+                .observed
+                .as_mut()
+                .context("existing approved target lost its retained identity")?;
+            verify_displaced_regular_target(
+                &mut observed.file,
+                expected_before,
+                &paths.displaced,
+                &mut write.displaced,
+                &changed,
+            )?;
         }
         Ok(())
     })();
@@ -1322,43 +2321,108 @@ fn write_atomically_if_unchanged(
         return fail_after_conditional_rollback(&prepared, &swapped, error);
     }
 
+    let changes = approved_apply_changes(&prepared);
     for write in &prepared {
         if let Some(paths) = &write.paths {
-            let cleanup = if write.expected_before.is_some() {
-                &paths.displaced
-            } else {
-                &paths.staged
-            };
-            if let Err(error) = std::fs::remove_file(cleanup)
-                .with_context(|| format!("removing approved-write backup {}", cleanup.display()))
-            {
-                return Err(approved_apply_error(error, true));
+            let (cleanup, identity, expected_contents, description) =
+                if let Some(expected_before) = write.expected_before.as_deref() {
+                    let Some(displaced) = write.displaced.as_ref() else {
+                        return Err(approved_apply_error(
+                            anyhow!("committed approved backup has no retained identity"),
+                            ApprovedApplyFailure::Applied(ApplyReport {
+                                changes: changes.clone(),
+                            }),
+                        ));
+                    };
+                    (
+                        &paths.displaced,
+                        displaced,
+                        expected_before,
+                        "approved-write displaced backup",
+                    )
+                } else {
+                    let Some(installed) = write.installed.as_ref() else {
+                        return Err(approved_apply_error(
+                            anyhow!("approved create staging has no retained identity"),
+                            ApprovedApplyFailure::Applied(ApplyReport {
+                                changes: changes.clone(),
+                            }),
+                        ));
+                    };
+                    (
+                        &paths.staged,
+                        installed,
+                        write.new_contents,
+                        "approved-write create staging",
+                    )
+                };
+            if let Err(error) = maybe_replace_cleanup_artifact(&write.path, cleanup) {
+                return Err(approved_apply_error(
+                    error,
+                    ApprovedApplyFailure::Applied(ApplyReport {
+                        changes: changes.clone(),
+                    }),
+                ));
+            }
+            if let Err(error) = remove_owned_regular_artifact(
+                cleanup,
+                identity,
+                Some(expected_contents),
+                description,
+            ) {
+                return Err(approved_apply_error(
+                    error,
+                    ApprovedApplyFailure::Applied(ApplyReport {
+                        changes: changes.clone(),
+                    }),
+                ));
+            }
+            if paths.displaced != paths.staged {
+                let unused = if write.expected_before.is_some() {
+                    &paths.staged
+                } else {
+                    &paths.displaced
+                };
+                if let Err(error) =
+                    ensure_artifact_path_absent(unused, "unused approved cleanup path")
+                {
+                    return Err(approved_apply_error(
+                        error,
+                        ApprovedApplyFailure::Applied(ApplyReport {
+                            changes: changes.clone(),
+                        }),
+                    ));
+                }
             }
         }
     }
 
-    Ok(prepared
-        .into_iter()
+    Ok(changes)
+}
+
+fn approved_apply_changes(prepared: &[PreparedConditionalWrite<'_>]) -> Vec<AppliedChange> {
+    prepared
+        .iter()
         .map(|write| {
             let audit = (write.decision.tier == Tier::Logged).then(|| AuditRecord {
                 target: write.decision.target.clone(),
                 resolved: write.decision.resolved.clone(),
                 tier: write.decision.tier,
-                prev_sha256: write.expected_before.as_deref().map(sha256_hex),
-                next_sha256: sha256_hex(&write.new_contents),
+                prev_sha256: write.audit_before_sha256.clone(),
+                next_sha256: sha256_hex(write.new_contents),
                 bytes_written: write.new_contents.len(),
             });
             AppliedChange {
-                decision: write.decision,
+                decision: write.decision.clone(),
                 disposition: Disposition::Applied,
                 audit,
             }
         })
-        .collect())
+        .collect()
 }
 
 fn rollback_conditional_writes(
-    prepared: &[PreparedConditionalWrite],
+    prepared: &[PreparedConditionalWrite<'_>],
     swapped: &[usize],
 ) -> Result<()> {
     let mut errors = Vec::new();
@@ -1371,14 +2435,14 @@ fn rollback_conditional_writes(
         let rollback = if write.expected_before.is_some() {
             restore_swapped_write(write, paths)
         } else {
-            rollback_created_write(write, paths)
+            rollback_created_write(write)
         };
         if let Err(error) = rollback {
             errors.push(format!("{}: {error:#}", write.decision.target));
         }
     }
     for write in prepared.iter().rev().filter(|write| write.already_applied) {
-        if write.expected_before.as_deref() != Some(write.new_contents.as_slice()) {
+        if write.expected_before.as_deref() != Some(write.new_contents) {
             errors.push(format!(
                 "{}: approved bytes predated this apply attempt; ownership is unproven, so \
                  recovery left them in place",
@@ -1394,60 +2458,74 @@ fn rollback_conditional_writes(
 }
 
 fn fail_after_conditional_rollback(
-    prepared: &[PreparedConditionalWrite],
+    prepared: &[PreparedConditionalWrite<'_>],
     swapped: &[usize],
     error: anyhow::Error,
 ) -> Result<Vec<AppliedChange>> {
     let rollback = rollback_conditional_writes(prepared, swapped);
     match rollback {
-        Ok(()) => {
-            cleanup_conditional_staging(prepared);
-            Err(approved_apply_error(
+        Ok(()) => match cleanup_conditional_staging(prepared) {
+            Ok(()) => Err(approved_apply_error(
                 error.context("approved proposal was rolled back"),
-                false,
+                ApprovedApplyFailure::RolledBack,
+            )),
+            Err(cleanup_error) => Err(approved_apply_error(
+                anyhow!(
+                    "{error:#}; approved proposal was rolled back but cleanup failed: \
+                     {cleanup_error:#}"
+                ),
+                ApprovedApplyFailure::RolledBackCleanupFailed {
+                    targets: prepared
+                        .iter()
+                        .filter(|write| write.paths.is_some())
+                        .map(|write| write.decision.target.clone())
+                        .collect(),
+                },
+            )),
+        },
+        Err(rollback_error) => {
+            let mut targets = swapped
+                .iter()
+                .map(|&index| prepared[index].decision.target.clone())
+                .collect::<Vec<_>>();
+            targets.extend(
+                prepared
+                    .iter()
+                    .filter(|write| write.already_applied)
+                    .map(|write| write.decision.target.clone()),
+            );
+            targets.sort();
+            targets.dedup();
+            Err(approved_apply_error(
+                anyhow!("{error:#}; conditional rollback also failed: {rollback_error:#}"),
+                ApprovedApplyFailure::Ambiguous { targets },
             ))
         }
-        Err(rollback_error) => Err(approved_apply_error(
-            anyhow!("{error:#}; conditional rollback also failed: {rollback_error:#}"),
-            true,
-        )),
     }
 }
 
 fn restore_swapped_write(
-    write: &PreparedConditionalWrite,
+    write: &PreparedConditionalWrite<'_>,
     paths: &ApprovedWritePaths,
 ) -> Result<()> {
-    let restore_bytes = std::fs::read(&paths.displaced)
-        .with_context(|| format!("reading rollback source {}", paths.displaced.display()))?;
-    atomic_replace_preserving_target(&write.path, &paths.displaced, &paths.staged).with_context(
-        || {
-            format!(
-                "restoring approved target {} from {}",
-                write.path.display(),
-                paths.displaced.display()
-            )
-        },
-    )?;
-    let verification = verify_rollback_exchange(write, &paths.staged, &restore_bytes);
-    if let Err(error) = verification {
-        atomic_replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
-            .with_context(|| {
-                format!(
-                    "putting concurrent bytes back at {} after rollback verification failed: \
-                     {error:#}",
-                    write.path.display()
-                )
-            })?;
-        return Err(error);
-    }
-    Ok(())
+    let installed = write
+        .installed
+        .as_ref()
+        .context("swapped approved write has no staged-file identity")?;
+    rollback_replaced_regular_target(
+        &write.path,
+        paths,
+        write.new_contents,
+        installed,
+        write.displaced.as_ref(),
+    )
 }
 
-fn rollback_created_write(
-    write: &PreparedConditionalWrite,
-    paths: &ApprovedWritePaths,
-) -> Result<()> {
+fn rollback_created_write(write: &PreparedConditionalWrite<'_>) -> Result<()> {
+    let installed = write
+        .installed
+        .as_ref()
+        .context("swapped approved create has no retained staged-file identity")?;
     let captured = rollback_capture_path(&write.path);
     atomic_move_without_replace(&write.path, &captured).with_context(|| {
         format!(
@@ -1456,16 +2534,21 @@ fn rollback_created_write(
         )
     })?;
     let still_owned = (|| -> Result<bool> {
-        let contents = std::fs::read(&captured)
-            .with_context(|| format!("reading rollback capture {}", captured.display()))?;
-        Ok(contents == write.new_contents && same_file_identity(&captured, &paths.staged)?)
+        let mut captured_file = open_regular_file_handle_without_following_links(&captured)?
+            .context("approved-create rollback capture is not a regular file")?;
+        Ok(
+            stream_regular_file_matches_and_sha256(&mut captured_file, write.new_contents)?
+                .is_some()
+                && open_file_matches_path(installed, &captured)?,
+        )
     })();
     match still_owned {
-        Ok(true) => {
-            std::fs::remove_file(&captured)
-                .with_context(|| format!("removing created target {}", captured.display()))?;
-            Ok(())
-        }
+        Ok(true) => remove_owned_regular_artifact(
+            &captured,
+            installed,
+            Some(write.new_contents),
+            "approved-create rollback capture",
+        ),
         Ok(false) => {
             restore_unowned_rollback_capture(write, &captured)?;
             bail!(
@@ -1484,7 +2567,7 @@ fn rollback_created_write(
 }
 
 fn restore_unowned_rollback_capture(
-    write: &PreparedConditionalWrite,
+    write: &PreparedConditionalWrite<'_>,
     captured: &Path,
 ) -> Result<()> {
     atomic_move_without_replace(captured, &write.path).with_context(|| {
@@ -1503,7 +2586,502 @@ fn rollback_capture_path(target: &Path) -> PathBuf {
     target.with_file_name(format!(".{name}.ward-rollback-{}", uuid::Uuid::new_v4()))
 }
 
+fn cleanup_capture_path(artifact: &Path) -> PathBuf {
+    let name = artifact
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    artifact.with_file_name(format!(".{name}.ward-cleanup-{}", uuid::Uuid::new_v4()))
+}
+
+fn error_has_io_kind(error: &anyhow::Error, kind: ErrorKind) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == kind)
+    })
+}
+
+fn restore_unowned_cleanup_capture(
+    artifact: &Path,
+    captured: &Path,
+    verification_error: anyhow::Error,
+) -> anyhow::Error {
+    match atomic_move_without_replace(captured, artifact) {
+        Ok(()) => verification_error.context(format!(
+            "cleanup preserved the unowned entry at {}",
+            artifact.display()
+        )),
+        Err(restore_error) => anyhow!(
+            "{verification_error:#}; cleanup preserved the unowned entry at {} because restoring \
+             it to {} failed: {restore_error:#}",
+            captured.display(),
+            artifact.display()
+        ),
+    }
+}
+
+fn remove_owned_regular_artifact(
+    artifact: &Path,
+    retained_identity: &std::fs::File,
+    expected_contents: Option<&[u8]>,
+    description: &str,
+) -> Result<()> {
+    let retained_metadata = retained_identity
+        .metadata()
+        .with_context(|| format!("reading retained {description} identity"))?;
+    if !retained_metadata.is_file() {
+        bail!("retained {description} identity is not a regular file");
+    }
+
+    let captured = cleanup_capture_path(artifact);
+    if let Err(error) = atomic_move_without_replace(artifact, &captured) {
+        if error_has_io_kind(&error, ErrorKind::NotFound) {
+            return Ok(());
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "capturing {description} {} before cleanup",
+                artifact.display()
+            )
+        });
+    }
+
+    if let Err(error) =
+        verify_owned_regular_artifact(&captured, retained_identity, expected_contents, description)
+    {
+        return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
+    }
+
+    maybe_replace_verified_cleanup_capture(&captured)?;
+    if let Err(error) =
+        verify_owned_regular_artifact(&captured, retained_identity, expected_contents, description)
+    {
+        return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
+    }
+    if let Err(error) = std::fs::remove_file(&captured)
+        .with_context(|| format!("removing captured {description} {}", captured.display()))
+    {
+        return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
+    }
+    Ok(())
+}
+
+fn verify_owned_regular_artifact(
+    artifact: &Path,
+    retained_identity: &std::fs::File,
+    expected_contents: Option<&[u8]>,
+    description: &str,
+) -> Result<()> {
+    let mut current = open_regular_file_handle_without_following_links(artifact)?
+        .with_context(|| format!("{description} is not a regular file"))?;
+    if !open_file_matches_path(retained_identity, artifact)? {
+        bail!("{description} identity changed before cleanup");
+    }
+    if let Some(expected) = expected_contents {
+        if stream_regular_file_matches_and_sha256(&mut current, expected)?.is_none() {
+            bail!("{description} bytes changed before cleanup");
+        }
+    }
+    Ok(())
+}
+
+fn ensure_artifact_path_absent(path: &Path, description: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("inspecting {description} {}", path.display()))
+        }
+        Ok(_) => bail!(
+            "{description} {} contains an entry whose ownership is unproven; preserving it",
+            path.display()
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RegularFileReadPolicy<'a> {
+    WardFile,
+    DirectBeforeImage {
+        target: &'a str,
+        retained_bytes: u64,
+    },
+}
+
+impl RegularFileReadPolicy<'_> {
+    fn max_read_bytes(self) -> u64 {
+        match self {
+            Self::WardFile => WARD_FILE_CONTENT_MAX_BYTES,
+            Self::DirectBeforeImage { retained_bytes, .. } => WARD_FILE_CONTENT_MAX_BYTES
+                .min(WARD_RETAINED_CONTENT_MAX_BYTES.saturating_sub(retained_bytes)),
+        }
+    }
+
+    fn ensure_metadata_length(self, path: &Path, observed_bytes: u64) -> Result<()> {
+        if observed_bytes > WARD_FILE_CONTENT_MAX_BYTES {
+            return Err(self.limit_error(path, observed_bytes));
+        }
+        if let Self::DirectBeforeImage { retained_bytes, .. } = self {
+            reserve_ward_content_bytes(retained_bytes, observed_bytes)?;
+        }
+        Ok(())
+    }
+
+    fn limit_error(self, path: &Path, observed_bytes: u64) -> anyhow::Error {
+        match self {
+            Self::WardFile => anyhow!(
+                "Ward regular file {} is {observed_bytes} bytes, over the \
+                 {WARD_FILE_CONTENT_MAX_BYTES}-byte content limit",
+                path.display()
+            ),
+            Self::DirectBeforeImage {
+                target,
+                retained_bytes: _,
+            } if observed_bytes > WARD_FILE_CONTENT_MAX_BYTES => {
+                WardEditBudgetFailure::ExistingBeforeImage {
+                    target: target.to_owned(),
+                    observed_bytes,
+                    max_bytes: WARD_FILE_CONTENT_MAX_BYTES,
+                }
+                .into()
+            }
+            Self::DirectBeforeImage { retained_bytes, .. } => {
+                let attempted_bytes = retained_bytes.saturating_add(observed_bytes);
+                WardEditBudgetFailure::BatchRetainedMemory {
+                    attempted_bytes,
+                    max_bytes: WARD_RETAINED_CONTENT_MAX_BYTES,
+                }
+                .into()
+            }
+        }
+    }
+}
+
+fn read_open_file_with_policy(
+    file: &mut std::fs::File,
+    path: &Path,
+    metadata_len: u64,
+    policy: RegularFileReadPolicy<'_>,
+) -> Result<Vec<u8>> {
+    policy.ensure_metadata_length(path, metadata_len)?;
+    if matches!(policy, RegularFileReadPolicy::DirectBeforeImage { .. }) {
+        maybe_grow_direct_read_target(path)?;
+    }
+    file.seek(SeekFrom::Start(0))
+        .context("seeking regular file")?;
+    let max_read_bytes = policy.max_read_bytes();
+    let capacity = usize::try_from(metadata_len.min(max_read_bytes))
+        .context("regular-file read capacity is not representable")?;
+    let mut contents = Vec::with_capacity(capacity);
+    let max_read_bytes =
+        usize::try_from(max_read_bytes).context("regular-file read limit is not representable")?;
+    let mut scratch = [0_u8; DIRECT_VERIFICATION_SCRATCH_BYTES];
+    while contents.len() < max_read_bytes {
+        let remaining = max_read_bytes - contents.len();
+        let read = file
+            .read(&mut scratch[..remaining.min(DIRECT_VERIFICATION_SCRATCH_BYTES)])
+            .context("reading regular file")?;
+        if read == 0 {
+            return Ok(contents);
+        }
+        contents.extend_from_slice(&scratch[..read]);
+    }
+    if file
+        .read(&mut scratch[..1])
+        .context("checking regular file read limit")?
+        != 0
+    {
+        let observed_bytes = u64::try_from(max_read_bytes)
+            .context("regular-file read limit is not representable")?
+            .saturating_add(1);
+        return Err(policy.limit_error(path, observed_bytes));
+    }
+    Ok(contents)
+}
+
+fn open_regular_file_without_following_links(path: &Path) -> Result<Option<OpenRegularFile>> {
+    open_regular_file_without_following_links_with_policy(path, RegularFileReadPolicy::WardFile)
+}
+
+fn open_direct_before_image(
+    path: &Path,
+    target: &str,
+    retained_bytes: u64,
+) -> Result<Option<OpenRegularFile>> {
+    open_regular_file_without_following_links_with_policy(
+        path,
+        RegularFileReadPolicy::DirectBeforeImage {
+            target,
+            retained_bytes,
+        },
+    )
+}
+
+fn open_regular_file_without_following_links_with_policy(
+    path: &Path,
+    policy: RegularFileReadPolicy<'_>,
+) -> Result<Option<OpenRegularFile>> {
+    let Some(mut file) = open_regular_file_handle_without_following_links(path)? else {
+        return Ok(None);
+    };
+    let metadata_len = file
+        .metadata()
+        .with_context(|| format!("reading direct target metadata {}", path.display()))?
+        .len();
+    let contents = read_open_file_with_policy(&mut file, path, metadata_len, policy)
+        .with_context(|| format!("reading direct target {}", path.display()))?;
+    Ok(Some(OpenRegularFile { file, contents }))
+}
+
 #[cfg(unix)]
+fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            bail!("direct target {} is not a regular file", path.display())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading direct target metadata {}", path.display()))
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening direct target {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading direct target metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("direct target {} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+#[cfg(windows)]
+fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening direct target {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading direct target metadata {}", path.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("direct target {} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading direct target metadata {}", path.display()))
+        }
+    };
+    if !metadata.is_file() {
+        bail!("direct target {} is not a regular file", path.display());
+    }
+    match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("opening direct target {}", path.display()))
+        }
+    }
+}
+
+fn stream_regular_file_matches_and_sha256(
+    file: &mut std::fs::File,
+    expected_contents: &[u8],
+) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+
+    file.seek(SeekFrom::Start(0))
+        .context("seeking regular file for verification")?;
+    let mut hasher = Sha256::new();
+    let mut offset = 0_usize;
+    let mut scratch = [0_u8; DIRECT_VERIFICATION_SCRATCH_BYTES];
+    loop {
+        let read = file
+            .read(&mut scratch)
+            .context("streaming regular file for verification")?;
+        if read == 0 {
+            break;
+        }
+        let Some(end) = offset.checked_add(read) else {
+            return Ok(None);
+        };
+        if expected_contents.get(offset..end) != Some(&scratch[..read]) {
+            return Ok(None);
+        }
+        hasher.update(&scratch[..read]);
+        offset = end;
+    }
+    if offset != expected_contents.len() {
+        return Ok(None);
+    }
+    Ok(Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
+}
+
+fn verify_installed_regular_target(
+    path: &Path,
+    expected_contents: &[u8],
+    installed_identity: &std::fs::File,
+    missing_message: &str,
+    changed_message: &str,
+) -> Result<()> {
+    let mut installed = open_regular_file_handle_without_following_links(path)?
+        .with_context(|| missing_message.to_owned())?;
+    if stream_regular_file_matches_and_sha256(&mut installed, expected_contents)?.is_none()
+        || !open_file_matches_path(installed_identity, path)?
+    {
+        bail!("{changed_message}");
+    }
+    Ok(())
+}
+
+fn verify_displaced_regular_target(
+    observed: &mut std::fs::File,
+    expected_contents: &[u8],
+    displaced_path: &Path,
+    displaced_identity: &mut Option<std::fs::File>,
+    changed_message: &str,
+) -> Result<String> {
+    let mut displaced = open_regular_file_handle_without_following_links(displaced_path)?
+        .context("commit-displaced target is not a regular file")?;
+    let displaced_sha256 =
+        stream_regular_file_matches_and_sha256(&mut displaced, expected_contents)?;
+    *displaced_identity = Some(displaced);
+    if !open_file_matches_path(observed, displaced_path)? {
+        bail!("{changed_message}");
+    }
+    let observed_sha256 = stream_regular_file_matches_and_sha256(observed, expected_contents)
+        .with_context(|| format!("reading displaced target {}", displaced_path.display()))?;
+    if displaced_sha256.is_none() || observed_sha256.is_none() {
+        bail!("{changed_message}");
+    }
+    Ok(displaced_sha256.expect("verified displaced digest is present"))
+}
+
+fn rollback_replaced_regular_target(
+    target: &Path,
+    paths: &ApprovedWritePaths,
+    installed_contents: &[u8],
+    installed_identity: &std::fs::File,
+    displaced_identity: Option<&std::fs::File>,
+) -> Result<()> {
+    if !open_file_matches_path(installed_identity, target)? {
+        bail!("target changed before rollback {}", target.display());
+    }
+    let displaced_before_rollback = match displaced_identity {
+        Some(displaced) => open_file_matches_path(displaced, &paths.displaced)?,
+        None => false,
+    };
+    restore_displaced_target(target, &paths.staged, &paths.displaced)
+        .with_context(|| format!("restoring target {}", target.display()))?;
+    if open_file_matches_path(installed_identity, target)?
+        || !open_file_matches_path(installed_identity, &paths.staged)?
+    {
+        bail!(
+            "installed file identity changed while rolling back {}",
+            target.display()
+        );
+    }
+    let displaced_restored = match displaced_identity {
+        Some(displaced) => open_file_matches_path(displaced, target)?,
+        None => false,
+    };
+    let mut displaced_installed = open_regular_file_handle_without_following_links(&paths.staged)?
+        .context("rollback-displaced installed target unexpectedly disappeared")?;
+    if stream_regular_file_matches_and_sha256(&mut displaced_installed, installed_contents)?
+        .is_none()
+    {
+        if displaced_restored {
+            replace_preserving_target(target, &paths.staged, &paths.displaced).with_context(
+                || {
+                    format!(
+                        "putting concurrently changed installed inode back at {}",
+                        target.display()
+                    )
+                },
+            )?;
+        }
+        bail!("installed bytes changed during rollback");
+    }
+    if !displaced_before_rollback || !displaced_restored {
+        bail!(
+            "commit-displaced file identity changed during rollback {}",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+fn open_file_matches_path_if_present(file: &std::fs::File, path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => open_file_matches_path(file, path),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("reading file identity {}", path.display()))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn open_file_matches_path(file: &std::fs::File, path: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let open = file.metadata().context("reading open file identity")?;
+    let path = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading file identity {}", path.display()))?;
+    Ok(path.is_file() && open.dev() == path.dev() && open.ino() == path.ino())
+}
+
+#[cfg(windows)]
+fn open_file_matches_path(file: &std::fs::File, path: &Path) -> Result<bool> {
+    Ok(windows_file_identity_from_open_file(file)? == windows_file_identity(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_file_matches_path(_file: &std::fs::File, _path: &Path) -> Result<bool> {
+    bail!("open-file identity comparison is unsupported on this platform")
+}
+
+#[cfg(all(test, unix))]
 fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
@@ -1514,7 +3092,7 @@ fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
     Ok(left.dev() == right.dev() && left.ino() == right.ino())
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
     Ok(windows_file_identity(left)? == windows_file_identity(right)?)
 }
@@ -1522,11 +3100,9 @@ fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
 #[cfg(windows)]
 fn windows_file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     let file = std::fs::OpenOptions::new()
@@ -1535,6 +3111,17 @@ fn windows_file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
         .open(path)
         .with_context(|| format!("opening file identity {}", path.display()))?;
+    windows_file_identity_from_open_file(&file)
+        .with_context(|| format!("reading file identity {}", path.display()))
+}
+
+#[cfg(windows)]
+fn windows_file_identity_from_open_file(file: &std::fs::File) -> Result<(u64, [u8; 16])> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+    };
+
     let mut info = FILE_ID_INFO::default();
     // SAFETY: `file` owns a valid handle and `info` is a correctly sized,
     // writable FILE_ID_INFO buffer that remains alive for the call.
@@ -1548,11 +3135,9 @@ fn windows_file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
         )
     };
     if result == 0 {
-        return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("reading file identity {}", path.display()));
+        return Err(std::io::Error::last_os_error()).context("reading file identity");
     }
     validate_windows_file_identity(info.VolumeSerialNumber, info.FileId.Identifier)
-        .with_context(|| format!("reading file identity {}", path.display()))
 }
 
 #[cfg(any(windows, test))]
@@ -1566,7 +3151,7 @@ fn validate_windows_file_identity(
     Ok((volume_serial_number, file_id))
 }
 
-#[cfg(not(any(unix, windows)))]
+#[cfg(all(test, not(any(unix, windows))))]
 fn same_file_identity(_left: &Path, _right: &Path) -> Result<bool> {
     bail!("file-identity comparison is unsupported on this platform")
 }
@@ -1643,36 +3228,46 @@ fn atomic_move_without_replace(_source: &Path, _destination: &Path) -> Result<()
     bail!("atomic no-replace move is unsupported on this platform")
 }
 
-fn verify_rollback_exchange(
-    write: &PreparedConditionalWrite,
-    displaced: &Path,
-    expected_restored: &[u8],
-) -> Result<()> {
-    let displaced = std::fs::read(displaced).with_context(|| {
-        format!(
-            "reading rollback-displaced bytes for {}",
-            write.path.display()
-        )
-    })?;
-    let restored = std::fs::read(&write.path)
-        .with_context(|| format!("verifying rollback of {}", write.path.display()))?;
-    if displaced != write.new_contents || restored != expected_restored {
-        bail!(
-            "target changed while rolling back approved write {}",
-            write.path.display()
-        );
-    }
-    Ok(())
-}
-
-fn cleanup_conditional_staging(prepared: &[PreparedConditionalWrite]) {
+fn cleanup_conditional_staging(prepared: &[PreparedConditionalWrite<'_>]) -> Result<()> {
+    let mut errors = Vec::new();
     for write in prepared {
         if let Some(paths) = &write.paths {
-            let _ = std::fs::remove_file(&paths.staged);
+            let Some(installed) = write.installed.as_ref() else {
+                errors.push(format!(
+                    "{}: rollback staging has no retained identity",
+                    paths.staged.display()
+                ));
+                continue;
+            };
+            if let Err(error) = maybe_replace_cleanup_artifact(&write.path, &paths.staged) {
+                errors.push(format!("{}: {error:#}", paths.staged.display()));
+                continue;
+            }
+            if let Err(error) = remove_owned_regular_artifact(
+                &paths.staged,
+                installed,
+                Some(write.new_contents),
+                "approved rollback staging",
+            ) {
+                errors.push(format!("{}: {error:#}", paths.staged.display()));
+            }
             if paths.displaced != paths.staged {
-                let _ = std::fs::remove_file(&paths.displaced);
+                if let Err(error) = ensure_artifact_path_absent(
+                    &paths.displaced,
+                    "approved rollback displaced-backup path",
+                ) {
+                    errors.push(format!("{}: {error:#}", paths.displaced.display()));
+                }
             }
         }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "removing approved rollback artifacts failed: {}",
+            errors.join("; ")
+        )
     }
 }
 
@@ -1680,36 +3275,381 @@ pub(crate) const fn supports_atomic_approved_writes() -> bool {
     cfg!(any(target_os = "linux", target_os = "macos", windows))
 }
 
-fn stage_contents(path: &Path, contents: &[u8]) -> Result<ApprovedWritePaths> {
+fn stage_direct_write(write: &mut PreparedDirectWrite<'_>) -> Result<()> {
+    let (paths, file) = stage_contents(&write.path, write.new_contents)?;
+    write.paths = Some(paths);
+    write.installed = Some(file);
+    Ok(())
+}
+
+fn stage_contents(path: &Path, contents: &[u8]) -> Result<(ApprovedWritePaths, std::fs::File)> {
     let (staged, mut file) = create_staging_file(path)?;
     let result = (|| -> Result<()> {
+        maybe_fail_staging_write(path, &staged)?;
         file.write_all(contents)
             .with_context(|| format!("staging write to {}", staged.display()))?;
         file.sync_all()
             .with_context(|| format!("syncing staged write to {}", staged.display()))?;
         Ok(())
     })();
-    drop(file);
     if let Err(error) = result {
-        let _ = std::fs::remove_file(&staged);
-        return Err(error);
+        let cleanup = remove_owned_regular_artifact(&staged, &file, None, "failed staging write");
+        return match cleanup {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(staging_cleanup_error(
+                path,
+                anyhow!("{error:#}; failed staging write cleanup also failed: {cleanup_error:#}"),
+            )),
+        };
     }
     match ApprovedWritePaths::new(path, staged.clone()) {
-        Ok(paths) => Ok(paths),
+        Ok(paths) => Ok((paths, file)),
         Err(error) => {
-            let _ = std::fs::remove_file(staged);
-            Err(error)
+            let cleanup = remove_owned_regular_artifact(
+                &staged,
+                &file,
+                Some(contents),
+                "rejected staging write",
+            );
+            match cleanup {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(staging_cleanup_error(
+                    path,
+                    anyhow!(
+                        "{error:#}; rejected staging write cleanup also failed: {cleanup_error:#}"
+                    ),
+                )),
+            }
         }
     }
 }
 
 #[cfg(test)]
-type ConditionalWriteHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<(PathBuf, Vec<u8>)>>>;
+enum ConditionalWriteAction {
+    ReplaceRegular {
+        target: PathBuf,
+        contents: Vec<u8>,
+    },
+    MutateRegular {
+        target: PathBuf,
+        contents: Vec<u8>,
+    },
+    MutateThroughHardLink {
+        target: PathBuf,
+        alias: PathBuf,
+        contents: Vec<u8>,
+    },
+    #[cfg(unix)]
+    ReplaceSymlink {
+        target: PathBuf,
+        destination: PathBuf,
+    },
+    ReplaceDirectory {
+        target: PathBuf,
+    },
+    #[cfg(unix)]
+    ReplaceFifo {
+        target: PathBuf,
+    },
+}
+
+#[cfg(test)]
+type ConditionalWriteHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<ConditionalWriteAction>>>;
+
+#[cfg(test)]
+type DirectCleanupHook = std::sync::Mutex<BTreeSet<PathBuf>>;
+
+#[cfg(test)]
+type StagingWriteFailureHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
+
+#[cfg(test)]
+type CleanupArtifactReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
+
+#[cfg(test)]
+type VerifiedCleanupCaptureReplacementHook = std::sync::Mutex<BTreeMap<PathBuf, Vec<u8>>>;
+
+#[cfg(test)]
+type DirectPostCommitSabotage = std::sync::Mutex<BTreeMap<PathBuf, PathBuf>>;
+
+#[cfg(test)]
+type EarlyStagingMoveHook = std::sync::Mutex<BTreeSet<PathBuf>>;
+
+#[cfg(test)]
+type DirectReadGrowthHook = std::sync::Mutex<BTreeMap<PathBuf, u64>>;
+
+#[cfg(test)]
+enum RollbackSabotage {
+    Remove(PathBuf),
+    Replace(PathBuf, Vec<u8>),
+}
+
+#[cfg(test)]
+type ConditionalRollbackSabotage = std::sync::Mutex<BTreeMap<PathBuf, RollbackSabotage>>;
+
+#[cfg(test)]
+type ConditionalAtomicReplacementHook =
+    std::sync::Mutex<BTreeMap<PathBuf, Vec<(PathBuf, Vec<u8>)>>>;
 
 #[cfg(test)]
 fn conditional_write_hook() -> &'static ConditionalWriteHook {
     static HOOK: std::sync::OnceLock<ConditionalWriteHook> = std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn direct_cleanup_hook() -> &'static DirectCleanupHook {
+    static HOOK: std::sync::OnceLock<DirectCleanupHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn staging_write_failure_hook() -> &'static StagingWriteFailureHook {
+    static HOOK: std::sync::OnceLock<StagingWriteFailureHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn cleanup_artifact_replacement_hook() -> &'static CleanupArtifactReplacementHook {
+    static HOOK: std::sync::OnceLock<CleanupArtifactReplacementHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn verified_cleanup_capture_replacement_hook() -> &'static VerifiedCleanupCaptureReplacementHook {
+    static HOOK: std::sync::OnceLock<VerifiedCleanupCaptureReplacementHook> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn direct_post_commit_sabotage() -> &'static DirectPostCommitSabotage {
+    static HOOK: std::sync::OnceLock<DirectPostCommitSabotage> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn early_staging_move_hook() -> &'static EarlyStagingMoveHook {
+    static HOOK: std::sync::OnceLock<EarlyStagingMoveHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+#[cfg(test)]
+fn direct_read_growth_hook() -> &'static DirectReadGrowthHook {
+    static HOOK: std::sync::OnceLock<DirectReadGrowthHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn conditional_rollback_sabotage() -> &'static ConditionalRollbackSabotage {
+    static HOOK: std::sync::OnceLock<ConditionalRollbackSabotage> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn conditional_atomic_replacement_hook() -> &'static ConditionalAtomicReplacementHook {
+    static HOOK: std::sync::OnceLock<ConditionalAtomicReplacementHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn set_direct_cleanup_failure(path: PathBuf) {
+    direct_cleanup_hook()
+        .lock()
+        .expect("direct cleanup hook lock poisoned")
+        .insert(path);
+}
+
+#[cfg(test)]
+pub(crate) fn set_staging_write_cleanup_failure(path: PathBuf, replacement: Vec<u8>) {
+    staging_write_failure_hook()
+        .lock()
+        .expect("staging write failure hook lock poisoned")
+        .insert(path, replacement);
+}
+
+#[cfg(test)]
+pub(crate) fn set_cleanup_artifact_replacement(path: PathBuf, replacement: Vec<u8>) {
+    cleanup_artifact_replacement_hook()
+        .lock()
+        .expect("cleanup artifact replacement hook lock poisoned")
+        .insert(path, replacement);
+}
+
+#[cfg(test)]
+fn set_verified_cleanup_capture_replacement(parent: PathBuf, replacement: Vec<u8>) {
+    verified_cleanup_capture_replacement_hook()
+        .lock()
+        .expect("verified cleanup capture replacement hook lock poisoned")
+        .insert(parent, replacement);
+}
+
+#[cfg(test)]
+pub(crate) fn set_direct_post_commit_store_sabotage(path: PathBuf, store: PathBuf) {
+    direct_post_commit_sabotage()
+        .lock()
+        .expect("direct post-commit sabotage lock poisoned")
+        .insert(path, store);
+}
+
+#[cfg(test)]
+fn set_early_staging_move(path: PathBuf) {
+    early_staging_move_hook()
+        .lock()
+        .expect("early staging move hook lock poisoned")
+        .insert(path);
+}
+
+#[cfg(test)]
+fn set_direct_read_growth(path: PathBuf, length: u64) {
+    direct_read_growth_hook()
+        .lock()
+        .expect("direct read growth hook lock poisoned")
+        .insert(path, length);
+}
+
+#[cfg(test)]
+fn maybe_grow_direct_read_target(path: &Path) -> Result<()> {
+    let Some(length) = direct_read_growth_hook()
+        .lock()
+        .expect("direct read growth hook lock poisoned")
+        .remove(path)
+    else {
+        return Ok(());
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening direct target {} for test growth", path.display()))?
+        .set_len(length)
+        .with_context(|| format!("growing direct target {} for test", path.display()))
+}
+
+#[cfg(not(test))]
+fn maybe_grow_direct_read_target(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn set_conditional_rollback_sabotage(trigger: PathBuf, target: PathBuf) {
+    conditional_rollback_sabotage()
+        .lock()
+        .expect("conditional rollback sabotage lock poisoned")
+        .insert(trigger, RollbackSabotage::Remove(target));
+}
+
+#[cfg(test)]
+fn set_conditional_rollback_backup_replacement(
+    trigger: PathBuf,
+    target: PathBuf,
+    replacement: Vec<u8>,
+) {
+    conditional_rollback_sabotage()
+        .lock()
+        .expect("conditional rollback sabotage lock poisoned")
+        .insert(trigger, RollbackSabotage::Replace(target, replacement));
+}
+
+#[cfg(test)]
+fn set_conditional_atomic_replacement(trigger: PathBuf, target: PathBuf, replacement: Vec<u8>) {
+    conditional_atomic_replacement_hook()
+        .lock()
+        .expect("conditional atomic replacement hook lock poisoned")
+        .entry(trigger)
+        .or_default()
+        .push((target, replacement));
+}
+
+#[cfg(test)]
+fn maybe_fail_direct_cleanup(path: &Path) -> Result<()> {
+    if let Some(store) = direct_post_commit_sabotage()
+        .lock()
+        .expect("direct post-commit sabotage lock poisoned")
+        .remove(path)
+    {
+        match std::fs::remove_file(&store) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("removing audit store for test sabotage"),
+        }
+        std::fs::create_dir(&store).context("replacing audit store with a directory")?;
+    }
+    if direct_cleanup_hook()
+        .lock()
+        .expect("direct cleanup hook lock poisoned")
+        .remove(path)
+    {
+        bail!("injected direct cleanup failure");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_direct_cleanup(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_fail_staging_write(path: &Path, staged: &Path) -> Result<()> {
+    let Some(replacement) = staging_write_failure_hook()
+        .lock()
+        .expect("staging write failure hook lock poisoned")
+        .remove(path)
+    else {
+        return Ok(());
+    };
+    std::fs::remove_file(staged)
+        .with_context(|| format!("removing staged file {}", staged.display()))?;
+    std::fs::write(staged, replacement)
+        .with_context(|| format!("replacing staged file {}", staged.display()))?;
+    bail!("injected staging write failure");
+}
+
+#[cfg(not(test))]
+fn maybe_fail_staging_write(_path: &Path, _staged: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_replace_cleanup_artifact(path: &Path, artifact: &Path) -> Result<()> {
+    let Some(replacement) = cleanup_artifact_replacement_hook()
+        .lock()
+        .expect("cleanup artifact replacement hook lock poisoned")
+        .remove(path)
+    else {
+        return Ok(());
+    };
+    std::fs::remove_file(artifact)
+        .with_context(|| format!("removing cleanup artifact {}", artifact.display()))?;
+    std::fs::write(artifact, replacement)
+        .with_context(|| format!("replacing cleanup artifact {}", artifact.display()))
+}
+
+#[cfg(not(test))]
+fn maybe_replace_cleanup_artifact(_path: &Path, _artifact: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn maybe_replace_verified_cleanup_capture(captured: &Path) -> Result<()> {
+    let parent = captured
+        .parent()
+        .context("verified cleanup capture has no parent")?;
+    let Some(replacement) = verified_cleanup_capture_replacement_hook()
+        .lock()
+        .expect("verified cleanup capture replacement hook lock poisoned")
+        .remove(parent)
+    else {
+        return Ok(());
+    };
+    std::fs::remove_file(captured)
+        .with_context(|| format!("removing verified cleanup capture {}", captured.display()))?;
+    std::fs::write(captured, replacement)
+        .with_context(|| format!("replacing verified cleanup capture {}", captured.display()))
+}
+
+#[cfg(not(test))]
+fn maybe_replace_verified_cleanup_capture(_captured: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1719,6 +3659,17 @@ pub(crate) fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
 
 #[cfg(test)]
 fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
+    set_conditional_write_test_actions(
+        trigger,
+        actions
+            .into_iter()
+            .map(|(target, contents)| ConditionalWriteAction::ReplaceRegular { target, contents })
+            .collect(),
+    );
+}
+
+#[cfg(test)]
+fn set_conditional_write_test_actions(trigger: PathBuf, actions: Vec<ConditionalWriteAction>) {
     conditional_write_hook()
         .lock()
         .expect("conditional write hook lock poisoned")
@@ -1726,18 +3677,161 @@ fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8
 }
 
 #[cfg(test)]
+fn replace_regular_final_component(target: &Path, contents: &[u8]) -> Result<()> {
+    let (staged, mut file) = create_staging_file(target)?;
+    let result = (|| -> Result<()> {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        #[cfg(windows)]
+        match std::fs::remove_file(target) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("removing replaced test target"),
+        }
+        std::fs::rename(&staged, target)
+            .with_context(|| format!("replacing final component {}", target.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(staged);
+    }
+    result
+}
+
+#[cfg(test)]
 fn maybe_run_conditional_write_hook(path: &Path) -> Result<()> {
+    if early_staging_move_hook()
+        .lock()
+        .expect("early staging move hook lock poisoned")
+        .remove(path)
+    {
+        let parent = path.parent().context("staging move target has no parent")?;
+        let name = path
+            .file_name()
+            .context("staging move target has no file name")?
+            .to_string_lossy();
+        let prefix = format!(".{name}.ward-staged-");
+        let staged = std::fs::read_dir(parent)?
+            .filter_map(|entry| entry.ok())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .with_context(|| format!("finding staged file for {}", path.display()))?;
+        std::fs::rename(staged.path(), path)?;
+    }
     let mut hook = conditional_write_hook()
         .lock()
         .expect("conditional write hook lock poisoned");
     if let Some(actions) = hook.remove(path) {
+        for action in actions {
+            match action {
+                ConditionalWriteAction::ReplaceRegular { target, contents } => {
+                    replace_regular_final_component(&target, &contents)?;
+                }
+                ConditionalWriteAction::MutateRegular { target, contents } => {
+                    std::fs::write(&target, contents)
+                        .with_context(|| format!("mutating {}", target.display()))?;
+                }
+                ConditionalWriteAction::MutateThroughHardLink {
+                    target,
+                    alias,
+                    contents,
+                } => {
+                    std::fs::hard_link(&target, &alias).with_context(|| {
+                        format!(
+                            "hard-linking {} to {} for test mutation",
+                            target.display(),
+                            alias.display()
+                        )
+                    })?;
+                    std::fs::write(&alias, contents).with_context(|| {
+                        format!("mutating {} through a hard link", target.display())
+                    })?;
+                }
+                #[cfg(unix)]
+                ConditionalWriteAction::ReplaceSymlink {
+                    target,
+                    destination,
+                } => {
+                    use std::os::unix::fs::symlink;
+
+                    std::fs::remove_file(&target)?;
+                    symlink(destination, &target).with_context(|| {
+                        format!("replacing {} with a symlink", target.display())
+                    })?;
+                }
+                ConditionalWriteAction::ReplaceDirectory { target } => {
+                    std::fs::remove_file(&target)?;
+                    std::fs::create_dir(&target).with_context(|| {
+                        format!("replacing {} with a directory", target.display())
+                    })?;
+                }
+                #[cfg(unix)]
+                ConditionalWriteAction::ReplaceFifo { target } => {
+                    use std::os::unix::ffi::OsStrExt;
+
+                    std::fs::remove_file(&target)?;
+                    let target_c = CString::new(target.as_os_str().as_bytes())
+                        .context("FIFO test target contains NUL")?;
+                    // SAFETY: `target_c` is a live, NUL-terminated pathname.
+                    if unsafe { libc::mkfifo(target_c.as_ptr(), 0o600) } != 0 {
+                        return Err(std::io::Error::last_os_error()).with_context(|| {
+                            format!("replacing {} with a FIFO", target.display())
+                        });
+                    }
+                }
+            }
+        }
+    }
+    drop(hook);
+    if let Some(sabotage) = conditional_rollback_sabotage()
+        .lock()
+        .expect("conditional rollback sabotage lock poisoned")
+        .remove(path)
+    {
+        let target = match &sabotage {
+            RollbackSabotage::Remove(target) | RollbackSabotage::Replace(target, _) => target,
+        };
+        let parent = target
+            .parent()
+            .context("rollback sabotage target has no parent")?;
+        let name = target
+            .file_name()
+            .context("rollback sabotage target has no file name")?
+            .to_string_lossy();
+        let prefixes = [
+            format!(".{name}.ward-staged-"),
+            format!(".{name}.ward-displaced-"),
+        ];
+        let artifact = std::fs::read_dir(parent)?
+            .filter_map(|entry| entry.ok())
+            .find(|entry| {
+                let candidate = entry.file_name();
+                let candidate = candidate.to_string_lossy();
+                prefixes.iter().any(|prefix| candidate.starts_with(prefix))
+            })
+            .with_context(|| format!("finding rollback artifact for {}", target.display()))?;
+        match sabotage {
+            RollbackSabotage::Remove(_) => {
+                std::fs::remove_file(artifact.path())
+                    .with_context(|| format!("sabotaging rollback for {}", target.display()))?;
+            }
+            RollbackSabotage::Replace(_, replacement) => {
+                let artifact = artifact.path();
+                std::fs::remove_file(&artifact)?;
+                std::fs::write(&artifact, replacement)?;
+            }
+        }
+    }
+    if let Some(actions) = conditional_atomic_replacement_hook()
+        .lock()
+        .expect("conditional atomic replacement hook lock poisoned")
+        .remove(path)
+    {
         for (target, replacement) in actions {
-            std::fs::write(&target, replacement).with_context(|| {
-                format!(
-                    "running conditional write test hook for {}",
-                    target.display()
-                )
-            })?;
+            let (staged, mut file) = create_staging_file(&target)?;
+            file.write_all(&replacement)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&staged, &target)?;
         }
     }
     Ok(())
@@ -1748,8 +3842,50 @@ fn maybe_run_conditional_write_hook(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn replace_preserving_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+    atomic_exchange_preserving_target(target, staged, displaced)
+}
+
+#[cfg(windows)]
+fn replace_preserving_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+    atomic_move_without_replace(target, displaced)
+        .with_context(|| format!("moving target {} to backup", target.display()))?;
+    if let Err(error) = atomic_move_without_replace(staged, target) {
+        return match atomic_move_without_replace(displaced, target) {
+            Ok(()) => Err(error.context("installing staged write")),
+            Err(restore_error) => Err(anyhow!(
+                "installing staged write failed: {error:#}; restoring the displaced \
+                 target also failed: {restore_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn restore_displaced_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+    atomic_exchange_preserving_target(target, displaced, staged)
+}
+
+#[cfg(windows)]
+fn restore_displaced_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+    atomic_move_without_replace(target, staged)
+        .with_context(|| format!("moving Ward-owned target {} aside", target.display()))?;
+    if let Err(error) = atomic_move_without_replace(displaced, target) {
+        return match atomic_move_without_replace(staged, target) {
+            Ok(()) => Err(error.context("restoring displaced target")),
+            Err(restore_error) => Err(anyhow!(
+                "restoring displaced target failed: {error:#}; restoring the Ward-owned \
+                 target also failed: {restore_error:#}"
+            )),
+        };
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
-fn atomic_replace_preserving_target(
+fn atomic_exchange_preserving_target(
     target: &Path,
     replacement: &Path,
     displaced: &Path,
@@ -1779,7 +3915,7 @@ fn atomic_replace_preserving_target(
 }
 
 #[cfg(target_os = "linux")]
-fn atomic_replace_preserving_target(
+fn atomic_exchange_preserving_target(
     target: &Path,
     replacement: &Path,
     displaced: &Path,
@@ -1810,48 +3946,6 @@ fn atomic_replace_preserving_target(
 }
 
 #[cfg(windows)]
-fn atomic_replace_preserving_target(
-    target: &Path,
-    replacement: &Path,
-    displaced: &Path,
-) -> Result<()> {
-    use windows_sys::Win32::Foundation::ERROR_UNABLE_TO_MOVE_REPLACEMENT_2;
-    use windows_sys::Win32::Storage::FileSystem::ReplaceFileW;
-
-    let target_wide = windows_path(target, "target")?;
-    let replacement_wide = windows_path(replacement, "replacement")?;
-    let displaced_wide = windows_path(displaced, "displaced")?;
-    // REPLACEFILE_WRITE_THROUGH is documented as unsupported. The staged file
-    // is synced before this call, and no ignore flags are used.
-    let result = unsafe {
-        ReplaceFileW(
-            target_wide.as_ptr(),
-            replacement_wide.as_ptr(),
-            displaced_wide.as_ptr(),
-            0,
-            std::ptr::null(),
-            std::ptr::null(),
-        )
-    };
-    if result != 0 {
-        Ok(())
-    } else {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 as i32) {
-            if let Err(recovery_error) =
-                restore_displaced_target_after_partial_replace(target, displaced)
-            {
-                return Err(anyhow!(
-                    "atomically replacing approved target failed: {error}; restoring the \
-                     documented partial replacement also failed: {recovery_error:#}"
-                ));
-            }
-        }
-        Err(error).context("atomically replacing approved target while preserving displaced bytes")
-    }
-}
-
-#[cfg(windows)]
 fn windows_path(path: &Path, label: &str) -> Result<Vec<u16>> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
     if wide.contains(&0) {
@@ -1859,22 +3953,6 @@ fn windows_path(path: &Path, label: &str) -> Result<Vec<u16>> {
     }
     wide.push(0);
     Ok(wide)
-}
-
-#[cfg(windows)]
-fn restore_displaced_target_after_partial_replace(target: &Path, displaced: &Path) -> Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
-
-    let target = windows_path(target, "target")?;
-    let displaced = windows_path(displaced, "displaced")?;
-    let result =
-        unsafe { MoveFileExW(displaced.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH) };
-    if result != 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-            .context("atomically restoring the target after a partial Windows file replacement")
-    }
 }
 
 #[cfg(windows)]
@@ -1892,7 +3970,7 @@ fn failed_replace_displaced_target(_displaced: &Path) -> bool {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn atomic_replace_preserving_target(
+fn atomic_exchange_preserving_target(
     _target: &Path,
     _replacement: &Path,
     _displaced: &Path,
@@ -1902,8 +3980,7 @@ fn atomic_replace_preserving_target(
 
 #[cfg(windows)]
 fn approved_write_displaced_path(target: &Path, _staged: &Path) -> Result<PathBuf> {
-    // Use an independent random name so observing the staged entry does not
-    // disclose the backup path before the atomic ReplaceFileW call.
+    // Windows needs a distinct, unpredictable no-replace backup path.
     for _ in 0..16 {
         let displaced = displaced_path(target);
         match std::fs::symlink_metadata(&displaced) {
@@ -2163,8 +4240,216 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[cfg(unix)]
+    const FIFO_WATCHDOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    #[cfg(unix)]
+    const FIFO_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+    #[cfg(unix)]
+    fn unblock_fifo_worker(path: &Path) -> Result<()> {
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("inspecting watchdog FIFO {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.file_type().is_fifo(),
+            "watchdog target {} is no longer a FIFO",
+            path.display()
+        );
+        if metadata.permissions().mode() & 0o600 != 0o600 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(permissions.mode() | 0o600);
+            std::fs::set_permissions(path, permissions)
+                .with_context(|| format!("making watchdog FIFO accessible {}", path.display()))?;
+        }
+        let mut endpoint = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| format!("opening watchdog FIFO endpoint {}", path.display()))?;
+        match endpoint.write_all(b"\n") {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(()),
+            Err(error) => {
+                Err(error).with_context(|| format!("nudging watchdog FIFO {}", path.display()))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn run_fifo_operation_with_watchdog<T: Send + 'static>(
+        fifo: &Path,
+        description: &'static str,
+        operation: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+            let _ = sender.send(outcome);
+        });
+
+        match receiver.recv_timeout(FIFO_WATCHDOG_TIMEOUT) {
+            Ok(outcome) => {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| panic!("{description} watchdog worker panicked"));
+                match outcome {
+                    Ok(result) => result,
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                worker.join().unwrap_or_else(|_| {
+                    panic!("{description} watchdog worker panicked before reporting completion")
+                });
+                panic!("{description} watchdog worker exited without reporting completion");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let unblock = unblock_fifo_worker(fifo);
+                let cleanup = receiver.recv_timeout(FIFO_CLEANUP_TIMEOUT);
+                let cleanup_status = match &cleanup {
+                    Ok(_) => "worker completed after FIFO unblock",
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        "worker disconnected during FIFO unblock"
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        "worker remained blocked after FIFO unblock"
+                    }
+                };
+                if !matches!(cleanup, Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                    worker.join().unwrap_or_else(|_| {
+                        panic!("{description} watchdog worker panicked during timeout cleanup")
+                    });
+                }
+                panic!(
+                    "{description} timed out after {FIFO_WATCHDOG_TIMEOUT:?}; \
+                     FIFO unblock result: {unblock:?}; {cleanup_status}"
+                );
+            }
+        }
+    }
+
     #[cfg(windows)]
     const _: () = assert!(supports_atomic_approved_writes());
+
+    #[test]
+    fn windows_approved_commits_avoid_the_symlink_following_replacement_api() {
+        let ward_source = include_str!("ward.rs");
+        let unsafe_api = ["Replace", "FileW"].concat();
+
+        assert!(
+            !ward_source.contains(&unsafe_api),
+            "approved Windows commits must use the no-replace displaced-target primitive"
+        );
+    }
+
+    #[test]
+    fn direct_apply_memory_model_has_one_payload_and_fixed_verification_scratch() {
+        let ward_source = include_str!("ward.rs");
+        let prepared_start = ward_source.find("struct PreparedDirectWrite").unwrap();
+        let prepared_end = ward_source[prepared_start..]
+            .find("struct PreparedConditionalWrite")
+            .map(|offset| prepared_start + offset)
+            .unwrap();
+        let direct_batch_start = ward_source.find("fn write_direct_batch").unwrap();
+        let direct_batch_end = ward_source[direct_batch_start..]
+            .find("fn reserve_ward_content_bytes")
+            .map(|offset| direct_batch_start + offset)
+            .unwrap();
+        let stream_start = ward_source
+            .find("fn stream_regular_file_matches_and_sha256")
+            .unwrap();
+        let stream_end = ward_source[stream_start..]
+            .find("fn verify_installed_regular_target")
+            .map(|offset| stream_start + offset)
+            .unwrap();
+        let stream_verification = &ward_source[stream_start..stream_end];
+        let full_open = ["open_regular_file_without_", "following_links("].concat();
+        let full_read = ["read_regular_file_without_", "following_links("].concat();
+        let bounded_read = ["read_open_file_with_", "policy("].concat();
+        let verification_sections = [
+            (
+                "fn rollback_direct_created_write",
+                "fn cleanup_direct_rollback_staging",
+            ),
+            (
+                "fn rollback_created_write",
+                "fn restore_unowned_rollback_capture",
+            ),
+            (
+                "fn verify_owned_regular_artifact",
+                "fn ensure_artifact_path_absent",
+            ),
+            (
+                "fn verify_installed_regular_target",
+                "fn open_file_matches_path_if_present",
+            ),
+        ];
+
+        assert!(
+            ward_source[prepared_start..prepared_end].contains("new_contents: &'a [u8]")
+                && !ward_source[prepared_start..prepared_end].contains("Vec<u8>"),
+            "PreparedDirectWrite must borrow the caller's proposed payload"
+        );
+        assert!(
+            !ward_source[direct_batch_start..direct_batch_end]
+                .contains("edit.new_contents.clone()"),
+            "direct preparation must not clone proposed payloads"
+        );
+        assert!(
+            ward_source.contains("const DIRECT_VERIFICATION_SCRATCH_BYTES: usize = 64 * 1024;"),
+            "verification scratch must remain a fixed 64 KiB buffer"
+        );
+        assert!(
+            stream_verification.contains("[0_u8; DIRECT_VERIFICATION_SCRATCH_BYTES]")
+                && !stream_verification.contains("Vec<")
+                && !stream_verification.contains("read_to_end")
+                && !stream_verification.contains(&bounded_read),
+            "stream verification must use only the fixed scratch array"
+        );
+        for (start, end) in verification_sections {
+            let start = ward_source.find(start).unwrap();
+            let end = ward_source[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .unwrap();
+            let section = &ward_source[start..end];
+            assert!(
+                !section.contains(&full_open)
+                    && !section.contains(&full_read)
+                    && !section.contains(&bounded_read),
+                "{start} must stream verification instead of allocating a full-file Vec"
+            );
+        }
+    }
+
+    #[test]
+    fn approved_apply_memory_model_borrows_proposed_payloads() {
+        let ward_source = include_str!("ward.rs");
+        let prepared_start = ward_source.find("struct PreparedConditionalWrite").unwrap();
+        let prepared_end = ward_source[prepared_start..]
+            .find("fn write_direct_batch")
+            .map(|offset| prepared_start + offset)
+            .unwrap();
+        let conditional_start = ward_source
+            .find("fn write_atomically_if_unchanged")
+            .unwrap();
+        let conditional_end = ward_source[conditional_start..]
+            .find("fn rollback_conditional_writes")
+            .map(|offset| conditional_start + offset)
+            .unwrap();
+
+        assert!(
+            ward_source[prepared_start..prepared_end].contains("new_contents: &'a [u8]")
+                && !ward_source[prepared_start..prepared_end].contains("new_contents: Vec<u8>"),
+            "approved preparation must borrow the caller's proposed payload"
+        );
+        assert!(
+            !ward_source[conditional_start..conditional_end].contains("edit.new_contents.clone()"),
+            "approved preparation must not clone proposed payloads"
+        );
+    }
 
     fn sample_config() -> WardConfig {
         WardConfig {
@@ -2225,6 +4510,20 @@ mod tests {
         }
     }
 
+    fn staging_artifact_contents(dir: &Path) -> Vec<Vec<u8>> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.contains(".ward-staged") || name.contains(".ward-displaced")
+            })
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .collect()
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unix_approved_write_paths_reuse_staging_path_for_exchange() {
@@ -2257,7 +4556,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_atomic_replace_preserves_displaced_bytes_for_commit_and_rollback() {
+    fn windows_no_replace_commit_preserves_displaced_bytes_for_commit_and_rollback() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("SOUL.md");
         let staged = tmp.path().join(".SOUL.md.ward-staged-test");
@@ -2265,12 +4564,12 @@ mod tests {
         fs::write(&staged, b"new soul").unwrap();
         let paths = ApprovedWritePaths::new(&target, staged).unwrap();
 
-        atomic_replace_preserving_target(&target, &paths.staged, &paths.displaced).unwrap();
+        replace_preserving_target(&target, &paths.staged, &paths.displaced).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"new soul");
         assert_eq!(fs::read(&paths.displaced).unwrap(), b"old soul");
         assert!(!paths.staged.exists());
 
-        atomic_replace_preserving_target(&target, &paths.displaced, &paths.staged).unwrap();
+        restore_displaced_target(&target, &paths.staged, &paths.displaced).unwrap();
         assert_eq!(fs::read(&target).unwrap(), b"old soul");
         assert_eq!(fs::read(&paths.staged).unwrap(), b"new soul");
         assert!(!paths.displaced.exists());
@@ -2285,23 +4584,6 @@ mod tests {
         assert!(!failed_replace_displaced_target(&displaced));
         fs::write(&displaced, b"old soul").unwrap();
         assert!(failed_replace_displaced_target(&displaced));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_partial_replace_recovery_restores_target_without_consuming_staged_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("SOUL.md");
-        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
-        let displaced = tmp.path().join(".SOUL.md.ward-displaced-test");
-        fs::write(&staged, b"new soul").unwrap();
-        fs::write(&displaced, b"old soul").unwrap();
-
-        restore_displaced_target_after_partial_replace(&target, &displaced).unwrap();
-
-        assert_eq!(fs::read(&target).unwrap(), b"old soul");
-        assert_eq!(fs::read(&staged).unwrap(), b"new soul");
-        assert!(!displaced.exists());
     }
 
     #[test]
@@ -3194,6 +5476,438 @@ formatter = "lenient"
     }
 
     #[test]
+    fn approved_apply_rejects_same_byte_regular_replacement_at_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), b"old memory").unwrap();
+        let logged = tmp.path().join("memory/log.md");
+        fs::write(&logged, b"old log").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("memory/log.md".to_string(), Some(b"old log".to_vec())),
+        ]);
+        set_conditional_write_test_actions(
+            logged.canonicalize().unwrap(),
+            vec![ConditionalWriteAction::ReplaceRegular {
+                target: logged.clone(),
+                contents: b"old log".to_vec(),
+            }],
+        );
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("a same-byte replacement must not become the audited before-image");
+
+        assert!(
+            format!("{error:#}").contains("changed during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(false)
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"old memory"
+        );
+        assert_eq!(fs::read(&logged).unwrap(), b"old log");
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn approved_apply_rejects_displaced_inode_mutated_after_audit_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let alias = home.join("memory/log-alias.md");
+        let reviewed = home.join("MEMORY.md");
+        fs::write(&logged, b"old log").unwrap();
+        fs::hard_link(&logged, &alias).unwrap();
+        fs::write(&reviewed, b"old memory").unwrap();
+        let edits = vec![
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("memory/log.md".to_string(), Some(b"old log".to_vec())),
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+        ]);
+        set_conditional_write_test_actions(
+            reviewed,
+            vec![ConditionalWriteAction::MutateRegular {
+                target: alias.clone(),
+                contents: b"concurrent log".to_vec(),
+            }],
+        );
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("a mutated displaced inode must not produce a stale successful audit");
+
+        assert!(
+            format!("{error:#}").contains("changed before batch finalization"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(false)
+        );
+        assert_eq!(fs::read(&logged).unwrap(), b"concurrent log");
+        assert_eq!(fs::read(&alias).unwrap(), b"concurrent log");
+        assert_eq!(fs::read(home.join("MEMORY.md")).unwrap(), b"old memory");
+        assert_eq!(staging_litter(&home), Vec::<String>::new());
+        assert_eq!(staging_litter(&home.join("memory")), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_apply_preserves_symlink_replacement_at_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), b"old memory").unwrap();
+        let logged = tmp.path().join("memory/log.md");
+        let destination = tmp.path().join("elsewhere");
+        fs::write(&logged, b"old log").unwrap();
+        fs::write(&destination, b"old log").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("memory/log.md".to_string(), Some(b"old log".to_vec())),
+        ]);
+        set_conditional_write_test_actions(
+            logged.canonicalize().unwrap(),
+            vec![ConditionalWriteAction::ReplaceSymlink {
+                target: logged.clone(),
+                destination: destination.clone(),
+            }],
+        );
+
+        ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &resolved_as_target(&edits),
+            ApprovedApplyMode::Initial,
+        )
+        .expect_err("an approved commit must not follow a replacement symlink");
+
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"old memory"
+        );
+        assert!(logged.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&logged).unwrap(), destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"old log");
+    }
+
+    #[test]
+    fn approved_apply_preserves_directory_replacement_at_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), b"old memory").unwrap();
+        let logged = tmp.path().join("memory/log.md");
+        fs::write(&logged, b"old log").unwrap();
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("memory/log.md".to_string(), Some(b"old log".to_vec())),
+        ]);
+        set_conditional_write_test_actions(
+            logged.canonicalize().unwrap(),
+            vec![ConditionalWriteAction::ReplaceDirectory {
+                target: logged.clone(),
+            }],
+        );
+
+        ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &resolved_as_target(&edits),
+            ApprovedApplyMode::Initial,
+        )
+        .expect_err("an approved commit must preserve a replacement directory");
+
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"old memory"
+        );
+        assert!(logged.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_apply_rejects_fifo_replacement_without_blocking_or_reading() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        fs::write(tmp.path().join("MEMORY.md"), b"old memory").unwrap();
+        let logged = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&logged, b"old log").unwrap();
+        set_conditional_write_test_actions(
+            logged.clone(),
+            vec![ConditionalWriteAction::ReplaceFifo {
+                target: logged.clone(),
+            }],
+        );
+
+        let ward = ward_in(tmp.path());
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("memory/log.md".to_string(), Some(b"old log".to_vec())),
+        ]);
+        let fifo = logged.clone();
+        let result = run_fifo_operation_with_watchdog(
+            &fifo,
+            "approved apply against a concurrent FIFO replacement",
+            move || {
+                ward.apply_after_coherence_approval(
+                    &edits,
+                    &Authorization::unsigned(),
+                    &expected,
+                    &resolved_as_target(&edits),
+                    ApprovedApplyMode::Initial,
+                )
+            },
+        );
+
+        result.expect_err("an approved commit must reject a replacement FIFO");
+        assert_eq!(
+            fs::read(tmp.path().join("MEMORY.md")).unwrap(),
+            b"old memory"
+        );
+        assert!(logged.symlink_metadata().unwrap().file_type().is_fifo());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_create_rollback_does_not_follow_symlink_replacement() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let reviewed = home.join("MEMORY.md");
+        let blocked = home.join("memory/log.md");
+        let fifo = home.join("symlink-destination");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a live, NUL-terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        set_conditional_write_test_actions(
+            blocked.clone(),
+            vec![
+                ConditionalWriteAction::ReplaceSymlink {
+                    target: reviewed.clone(),
+                    destination: fifo.clone(),
+                },
+                ConditionalWriteAction::ReplaceRegular {
+                    target: blocked.clone(),
+                    contents: b"concurrent blocker".to_vec(),
+                },
+            ],
+        );
+
+        let ward = ward_in(&home);
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), None),
+            ("memory/log.md".to_string(), None),
+        ]);
+        let result = ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &resolved_as_target(&edits),
+            ApprovedApplyMode::Initial,
+        );
+
+        let error = result.expect_err("concurrent replacement must make rollback ambiguous");
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(true)
+        );
+        assert!(reviewed
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read_link(&reviewed).unwrap(), fifo);
+        assert_eq!(fs::read(&blocked).unwrap(), b"concurrent blocker");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_create_rollback_does_not_read_fifo_replacement() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let reviewed = home.join("MEMORY.md");
+        let blocked = home.join("memory/log.md");
+        set_conditional_write_test_actions(
+            blocked.clone(),
+            vec![
+                ConditionalWriteAction::ReplaceFifo {
+                    target: reviewed.clone(),
+                },
+                ConditionalWriteAction::ReplaceRegular {
+                    target: blocked.clone(),
+                    contents: b"concurrent blocker".to_vec(),
+                },
+            ],
+        );
+
+        let ward = ward_in(&home);
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), None),
+            ("memory/log.md".to_string(), None),
+        ]);
+        let result = ward.apply_after_coherence_approval(
+            &edits,
+            &Authorization::unsigned(),
+            &expected,
+            &resolved_as_target(&edits),
+            ApprovedApplyMode::Initial,
+        );
+
+        let error = result.expect_err("concurrent replacement must make rollback ambiguous");
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(true)
+        );
+        assert!(reviewed.symlink_metadata().unwrap().file_type().is_fifo());
+        assert_eq!(fs::read(&blocked).unwrap(), b"concurrent blocker");
+    }
+
+    #[test]
+    fn approved_success_preserves_replaced_backup_and_reports_committed_cleanup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        let home = tmp.path().canonicalize().unwrap();
+        let reviewed = home.join("MEMORY.md");
+        fs::write(&reviewed, b"old memory").unwrap();
+        set_cleanup_artifact_replacement(
+            reviewed.clone(),
+            b"concurrent backup replacement".to_vec(),
+        );
+        let edits = vec![FileEdit::new("MEMORY.md", b"new memory".to_vec())];
+        let expected = BTreeMap::from([("MEMORY.md".to_string(), Some(b"old memory".to_vec()))]);
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("unowned backup cleanup must not report success");
+
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(true)
+        );
+        assert_eq!(fs::read(&reviewed).unwrap(), b"new memory");
+        assert_eq!(
+            staging_artifact_contents(&home),
+            vec![b"concurrent backup replacement".to_vec()]
+        );
+    }
+
+    #[test]
+    fn approved_proven_rollback_preserves_replaced_staging_and_reports_cleanup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir(tmp.path().join("memory")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let reviewed = home.join("MEMORY.md");
+        let blocked = home.join("memory/log.md");
+        fs::write(&reviewed, b"old memory").unwrap();
+        set_conditional_write_hook(blocked.clone(), b"concurrent blocker".to_vec());
+        set_cleanup_artifact_replacement(
+            reviewed.clone(),
+            b"concurrent staging replacement".to_vec(),
+        );
+        let edits = vec![
+            FileEdit::new("MEMORY.md", b"new memory".to_vec()),
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+        ];
+        let expected = BTreeMap::from([
+            ("MEMORY.md".to_string(), Some(b"old memory".to_vec())),
+            ("memory/log.md".to_string(), None),
+        ]);
+
+        let error = ward
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("the second target must force a proven rollback");
+
+        assert!(
+            format!("{error:#}").contains("cleanup failed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            approved_apply_error_may_have_committed_write(&error),
+            Some(false)
+        );
+        assert_eq!(fs::read(&reviewed).unwrap(), b"old memory");
+        assert_eq!(fs::read(&blocked).unwrap(), b"concurrent blocker");
+        assert_eq!(
+            staging_artifact_contents(&home),
+            vec![b"concurrent staging replacement".to_vec()]
+        );
+    }
+
+    #[test]
     fn approved_recovery_does_not_claim_ownership_of_same_byte_entries() {
         let tmp = tempfile::tempdir().unwrap();
         let ward = ward_in(tmp.path());
@@ -3410,6 +6124,781 @@ formatter = "lenient"
             staging_litter(&tmp.path().join("scratch")),
             Vec::<String>::new()
         );
+        assert!(tmp.path().join("scratch/notes.txt").is_dir());
+    }
+
+    #[test]
+    fn direct_apply_refuses_target_replaced_immediately_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&target, b"reviewed before-image").unwrap();
+        set_conditional_write_hook(target.clone(), b"concurrent replacement".to_vec());
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a concurrent final-component replacement must win");
+
+        assert!(
+            format!("{error:#}").contains("changed during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"concurrent replacement");
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_apply_fails_closed_on_same_byte_final_component_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&target, b"same bytes").unwrap();
+        set_conditional_write_hook(target.clone(), b"same bytes".to_vec());
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("byte equality must not hide a final-component replacement");
+
+        assert!(
+            format!("{error:#}").contains("changed during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"same bytes");
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_apply_rejects_displaced_inode_mutated_after_audit_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let alias = home.join("memory/log-alias.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"old log").unwrap();
+        fs::hard_link(&logged, &alias).unwrap();
+        set_conditional_write_test_actions(
+            free,
+            vec![ConditionalWriteAction::MutateRegular {
+                target: alias.clone(),
+                contents: b"concurrent log".to_vec(),
+            }],
+        );
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"new log".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"new output".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a mutated displaced inode must not produce a stale successful audit");
+
+        assert!(
+            format!("{error:#}").contains("changed before batch finalization"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBack)
+            ),
+            "unexpected direct failure: {error:#}"
+        );
+        assert_eq!(fs::read(&logged).unwrap(), b"concurrent log");
+        assert_eq!(fs::read(&alias).unwrap(), b"concurrent log");
+        assert!(!home.join("scratch/output.txt").exists());
+        assert_eq!(staging_litter(&home.join("memory")), Vec::<String>::new());
+        assert_eq!(staging_litter(&home.join("scratch")), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_apply_preserves_symlink_replacement_immediately_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        let destination = tmp.path().canonicalize().unwrap().join("elsewhere");
+        fs::write(&target, b"reviewed before-image").unwrap();
+        set_conditional_write_test_actions(
+            target.clone(),
+            vec![ConditionalWriteAction::ReplaceSymlink {
+                target: target.clone(),
+                destination: destination.clone(),
+            }],
+        );
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a concurrent symlink replacement must not be overwritten");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::Ambiguous { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert!(target.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_link(&target).unwrap(), destination);
+    }
+
+    #[test]
+    fn direct_apply_preserves_directory_replacement_immediately_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&target, b"reviewed before-image").unwrap();
+        set_conditional_write_test_actions(
+            target.clone(),
+            vec![ConditionalWriteAction::ReplaceDirectory {
+                target: target.clone(),
+            }],
+        );
+
+        ward.apply(
+            &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+            &Authorization::unsigned(),
+        )
+        .expect_err("a concurrent directory replacement must not be overwritten");
+
+        assert!(target.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_apply_preserves_fifo_replacement_immediately_before_commit() {
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&target, b"reviewed before-image").unwrap();
+        set_conditional_write_test_actions(
+            target.clone(),
+            vec![ConditionalWriteAction::ReplaceFifo {
+                target: target.clone(),
+            }],
+        );
+
+        let fifo = target.clone();
+        run_fifo_operation_with_watchdog(
+            &fifo,
+            "direct apply against a concurrent FIFO replacement",
+            move || {
+                ward.apply(
+                    &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                    &Authorization::unsigned(),
+                )
+            },
+        )
+        .expect_err("a concurrent FIFO replacement must not be overwritten");
+
+        assert!(target.symlink_metadata().unwrap().file_type().is_fifo());
+    }
+
+    #[test]
+    fn direct_apply_never_overwrites_a_concurrent_create_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        set_conditional_write_hook(target.clone(), b"concurrent create".to_vec());
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a concurrent create must not be overwritten");
+
+        assert!(
+            format!("{error:#}").contains("appeared during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"concurrent create");
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_apply_preserves_concurrent_replacement_of_owned_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let created = home.join("memory/log.md");
+        let blocked = home.join("scratch/blocked.txt");
+        set_conditional_write_actions(
+            blocked.clone(),
+            vec![
+                (created.clone(), b"concurrent replacement".to_vec()),
+                (blocked.clone(), b"concurrent create".to_vec()),
+            ],
+        );
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"ward contents".to_vec()),
+                    FileEdit::new("scratch/blocked.txt", b"free contents".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a replacement of an owned creation must survive rollback");
+
+        let DirectApplyFailure::Ambiguous { targets } =
+            direct_apply_failure(&error).expect("typed direct failure")
+        else {
+            panic!("expected ambiguous direct failure: {error:#}");
+        };
+        assert_eq!(targets, &vec!["memory/log.md".to_string()]);
+        assert_eq!(fs::read(created).unwrap(), b"concurrent replacement");
+        assert_eq!(fs::read(blocked).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_apply_rolls_back_a_staging_inode_moved_to_target_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        set_early_staging_move(target.clone());
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"ward contents".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("an early staging move must be detected and rolled back");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBack)
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_apply_rolls_back_logged_write_when_later_free_write_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("memory/log.md"), b"old log").unwrap();
+        let blocked = tmp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("scratch/blocked.txt");
+        set_conditional_write_hook(blocked.clone(), b"concurrent create".to_vec());
+        let edits = vec![
+            FileEdit::new("memory/log.md", b"new log".to_vec()),
+            FileEdit::new("scratch/blocked.txt", b"free contents".to_vec()),
+        ];
+
+        let error = ward
+            .apply(&edits, &Authorization::unsigned())
+            .expect_err("the direct batch must fail as a unit");
+
+        assert!(
+            format!("{error:#}").contains("appeared during commit"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            fs::read(tmp.path().join("memory/log.md")).unwrap(),
+            b"old log"
+        );
+        assert_eq!(fs::read(blocked).unwrap(), b"concurrent create");
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            staging_litter(&tmp.path().join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_apply_cleanup_failure_preserves_applied_audit_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        let target = tmp.path().canonicalize().unwrap().join("memory/log.md");
+        fs::write(&target, b"before cleanup").unwrap();
+        set_direct_cleanup_failure(target.clone());
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("memory/log.md", b"after cleanup".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("cleanup failure must preserve the applied report");
+        let DirectApplyFailure::Applied(report) =
+            direct_apply_failure(&error).expect("typed direct failure")
+        else {
+            panic!("expected applied cleanup failure: {error:#}");
+        };
+
+        assert_eq!(fs::read(&target).unwrap(), b"after cleanup");
+        assert_eq!(report.changes.len(), 1);
+        let audit = report.changes[0].audit.as_ref().expect("logged audit");
+        assert_eq!(
+            audit.prev_sha256.as_deref(),
+            Some(sha256_hex(b"before cleanup").as_str())
+        );
+        assert_eq!(audit.next_sha256, sha256_hex(b"after cleanup"));
+    }
+
+    #[test]
+    fn direct_apply_classifies_unproven_rollback_as_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        set_conditional_rollback_sabotage(free.clone(), logged.clone());
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("unproven rollback must be classified as ambiguous");
+        let DirectApplyFailure::Ambiguous { targets } =
+            direct_apply_failure(&error).expect("typed direct failure")
+        else {
+            panic!("expected ambiguous direct failure: {error:#}");
+        };
+
+        assert_eq!(targets, &vec!["memory/log.md".to_string()]);
+        assert_eq!(fs::read(logged).unwrap(), b"after");
+        assert_eq!(fs::read(free).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_apply_preserves_same_byte_concurrent_replacement_during_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        set_conditional_atomic_replacement(free.clone(), logged.clone(), b"after".to_vec());
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a byte-equal concurrent inode must not be deleted during rollback");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::Ambiguous { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(logged).unwrap(), b"after");
+        assert_eq!(fs::read(free).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_apply_preserves_bytes_mutated_through_hard_link_during_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let alias = home.join("memory/concurrent-alias.md");
+        let blocked = home.join("scratch/blocked.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_test_actions(
+            blocked.clone(),
+            vec![
+                ConditionalWriteAction::MutateThroughHardLink {
+                    target: logged.clone(),
+                    alias: alias.clone(),
+                    contents: b"concurrent bytes".to_vec(),
+                },
+                ConditionalWriteAction::ReplaceRegular {
+                    target: blocked.clone(),
+                    contents: b"concurrent create".to_vec(),
+                },
+            ],
+        );
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"ward contents".to_vec()),
+                    FileEdit::new("scratch/blocked.txt", b"free contents".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("unrecognized concurrent bytes must survive an unproven rollback");
+
+        let DirectApplyFailure::Ambiguous { targets } =
+            direct_apply_failure(&error).expect("typed direct failure")
+        else {
+            panic!("expected ambiguous direct failure: {error:#}");
+        };
+        assert_eq!(targets, &vec!["memory/log.md".to_string()]);
+        assert_eq!(fs::read(&logged).unwrap(), b"concurrent bytes");
+        assert_eq!(fs::read(&alias).unwrap(), b"concurrent bytes");
+        assert_eq!(fs::read(blocked).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_apply_cleans_staging_after_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        fs::write(tmp.path().join("memory/log.md"), b"before").unwrap();
+
+        let report = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .unwrap();
+
+        assert!(report.is_applied());
+        assert_eq!(
+            staging_litter(&tmp.path().join("memory")),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            staging_litter(&tmp.path().join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn direct_success_preserves_replaced_staging_and_reports_applied_cleanup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let target = home.join("scratch/output.txt");
+        set_cleanup_artifact_replacement(
+            target.clone(),
+            b"concurrent staging replacement".to_vec(),
+        );
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("scratch/output.txt", b"new output".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("unowned staging cleanup must not report success");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::Applied(_))
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new output");
+        assert_eq!(
+            staging_artifact_contents(&home.join("scratch")),
+            vec![b"concurrent staging replacement".to_vec()]
+        );
+    }
+
+    #[test]
+    fn direct_success_preserves_cleanup_capture_replaced_after_identity_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let target = home.join("scratch/output.txt");
+        set_verified_cleanup_capture_replacement(
+            home.join("scratch"),
+            b"post-verification replacement".to_vec(),
+        );
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("scratch/output.txt", b"new output".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("post-verification replacement must survive cleanup");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::Applied(_))
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"new output");
+        assert_eq!(
+            staging_artifact_contents(&home.join("scratch")),
+            vec![b"post-verification replacement".to_vec()]
+        );
+    }
+
+    #[test]
+    fn direct_apply_does_not_report_successful_rollback_after_backup_replacement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        set_conditional_rollback_backup_replacement(
+            free.clone(),
+            logged.clone(),
+            b"replacement backup".to_vec(),
+        );
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a replaced backup must make rollback ambiguous");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::Ambiguous { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(logged).unwrap(), b"replacement backup");
+        assert_eq!(fs::read(free).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_apply_reports_rollback_cleanup_failure_separately() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        set_direct_cleanup_failure(logged.clone());
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("rollback cleanup failure must not look fully clean");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBackCleanupFailed { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(logged).unwrap(), b"before");
+        assert_eq!(fs::read(free).unwrap(), b"concurrent create");
+    }
+
+    #[test]
+    fn direct_staging_cleanup_failure_is_not_reported_as_a_clean_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let target = home.join("scratch/output.txt");
+        set_staging_write_cleanup_failure(
+            target.clone(),
+            b"concurrent staging replacement".to_vec(),
+        );
+
+        let error = ward
+            .apply(
+                &[FileEdit::new("scratch/output.txt", b"new output".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("failed staging cleanup must not look fully rolled back");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBackCleanupFailed { targets })
+                    if targets == &vec!["scratch/output.txt".to_string()]
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert!(!target.exists());
+        assert_eq!(
+            staging_artifact_contents(&home.join("scratch")),
+            vec![b"concurrent staging replacement".to_vec()]
+        );
+    }
+
+    #[test]
+    fn direct_staging_failure_reports_every_unclean_artifact_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let first = home.join("scratch/first.txt");
+        let second = home.join("scratch/second.txt");
+        set_direct_cleanup_failure(first);
+        set_staging_write_cleanup_failure(second, b"concurrent staging replacement".to_vec());
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("scratch/first.txt", b"first".to_vec()),
+                    FileEdit::new("scratch/second.txt", b"second".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("every incomplete cleanup must be reported");
+
+        let Some(DirectApplyFailure::RolledBackCleanupFailed { targets }) =
+            direct_apply_failure(&error)
+        else {
+            panic!("unexpected error: {error:#}");
+        };
+        assert_eq!(
+            targets,
+            &vec![
+                "scratch/first.txt".to_string(),
+                "scratch/second.txt".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_proven_rollback_preserves_replaced_artifact_and_reports_cleanup_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ward = ward_in(tmp.path());
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let home = tmp.path().canonicalize().unwrap();
+        let logged = home.join("memory/log.md");
+        let free = home.join("scratch/output.txt");
+        fs::write(&logged, b"before").unwrap();
+        set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        set_cleanup_artifact_replacement(
+            logged.clone(),
+            b"concurrent rollback replacement".to_vec(),
+        );
+
+        let error = ward
+            .apply(
+                &[
+                    FileEdit::new("memory/log.md", b"after".to_vec()),
+                    FileEdit::new("scratch/output.txt", b"free".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("the second target must force a proven rollback");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBackCleanupFailed { .. })
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(&logged).unwrap(), b"before");
+        assert_eq!(fs::read(&free).unwrap(), b"concurrent create");
+        assert_eq!(
+            staging_artifact_contents(&home.join("memory")),
+            vec![b"concurrent rollback replacement".to_vec()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_fifo_target_fails_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("target");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_c` is a live, NUL-terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o000) }, 0);
+
+        let fifo_path = fifo.clone();
+        let error = run_fifo_operation_with_watchdog(
+            &fifo,
+            "opening a FIFO as a regular Ward target",
+            move || match open_regular_file_without_following_links(&fifo_path) {
+                Err(error) => error,
+                Ok(_) => panic!("FIFO metadata must be rejected before opening it"),
+            },
+        );
+        assert!(
+            format!("{error:#}").contains("not a regular file"),
+            "unexpected error: {error:#}"
+        );
     }
 
     #[cfg(unix)]
@@ -3436,7 +6925,7 @@ formatter = "lenient"
 
     #[cfg(unix)]
     #[test]
-    fn write_atomic_fails_closed_when_parent_swapped_for_symlink() {
+    fn direct_batch_fails_closed_when_parent_swapped_for_symlink() {
         use std::os::unix::fs::symlink;
 
         // Simulates the TOCTOU window: a directory component is swapped for
@@ -3457,11 +6946,13 @@ formatter = "lenient"
             tier: Tier::Free,
             verdict: Verdict::Allow,
         };
-        let err = write_atomic(
+        let err = write_direct_batch(
             &canonical_home,
-            &canonical_home.join("memory/notes/log.md"),
-            b"leak",
-            &decision,
+            &[FileEdit {
+                target: decision.target.clone(),
+                new_contents: b"leak".to_vec(),
+            }],
+            vec![decision],
         )
         .unwrap_err();
 
@@ -3470,6 +6961,438 @@ formatter = "lenient"
         assert!(!outside.join("notes").exists());
         assert!(!outside.join("log.md").exists());
         assert_eq!(staging_litter(&outside), Vec::<String>::new());
+    }
+
+    const EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX: u64 = 16 * 1024 * 1024;
+    const EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX: usize = 32;
+
+    #[test]
+    fn ward_edit_budget_reservation_is_overflow_safe() {
+        let mut budget =
+            WardEditBudget::for_edit_count(1).expect("one edit is within the Ward limit");
+        budget
+            .reserve_retained_content(1)
+            .expect("one retained byte is within the Ward limit");
+
+        let error = budget
+            .reserve_retained_content(u64::MAX)
+            .expect_err("overflowing retained content must be rejected");
+
+        assert!(matches!(
+            ward_edit_budget_failure(&error),
+            Some(WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX,
+            })
+        ));
+    }
+
+    #[test]
+    fn apply_rejects_direct_batch_above_descriptor_safe_edit_limit_before_preparation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edits = (0..=EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX)
+            .map(|index| {
+                let target = if index % 2 == 0 {
+                    format!("memory/log-{index}.md")
+                } else {
+                    format!("scratch/output-{index}.txt")
+                };
+                FileEdit::new(target, Vec::new())
+            })
+            .collect::<Vec<_>>();
+
+        let error = ward_in(tmp.path())
+            .apply(&edits, &Authorization::unsigned())
+            .expect_err("a direct batch above the edit-count limit must be rejected");
+
+        assert!(
+            format!("{error:#}").contains("33 edits"),
+            "unexpected error: {error:#}"
+        );
+        assert!(
+            !tmp.path().join("memory").exists() && !tmp.path().join("scratch").exists(),
+            "the count limit must run before preparing target parents"
+        );
+    }
+
+    #[test]
+    fn apply_accepts_descriptor_safe_edit_limit_with_mixed_tier2_tier3_existing_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("memory")).unwrap();
+        fs::create_dir_all(tmp.path().join("scratch")).unwrap();
+        let edits = (0..EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX)
+            .map(|index| {
+                let target = if index % 2 == 0 {
+                    format!("memory/log-{index}.md")
+                } else {
+                    format!("scratch/output-{index}.txt")
+                };
+                fs::write(tmp.path().join(&target), []).unwrap();
+                FileEdit::new(target, format!("after-{index}").into_bytes())
+            })
+            .collect::<Vec<_>>();
+
+        let report = ward_in(tmp.path())
+            .apply(&edits, &Authorization::unsigned())
+            .expect("the exact direct edit-count boundary must remain accepted");
+
+        assert_eq!(report.changes.len(), EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX);
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|change| change.decision.tier == Tier::Logged)
+                .count(),
+            EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX / 2
+        );
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .filter(|change| change.decision.tier == Tier::Free)
+                .count(),
+            EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX / 2
+        );
+        for (index, edit) in edits.iter().enumerate() {
+            assert_eq!(
+                fs::read(tmp.path().join(&edit.target)).unwrap(),
+                format!("after-{index}").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn apply_counts_held_tier1_edits_in_the_shared_ward_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edits = (0..=EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX)
+            .map(|index| FileEdit::new(format!("reviewed/edit-{index}.md"), Vec::new()))
+            .collect::<Vec<_>>();
+        let mut config = sample_config();
+        config.surface.push(SurfaceEntry {
+            path: "reviewed/".into(),
+            tier: Tier::Reviewed,
+        });
+        let ward = Ward::new(tmp.path(), config).unwrap();
+
+        let error = ward
+            .apply(&edits, &Authorization::unsigned())
+            .expect_err("held Tier 1 edits must use the shared Ward edit-count limit");
+
+        assert!(matches!(
+            ward_edit_budget_failure(&error),
+            Some(WardEditBudgetFailure::BatchEditCount {
+                attempted_edits: 33,
+                max_edits: EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX,
+            })
+        ));
+        assert!(
+            !tmp.path().join("reviewed").exists(),
+            "budget rejection must precede target preparation"
+        );
+    }
+
+    #[test]
+    fn apply_accepts_exact_shared_count_boundary_with_one_tier1_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut edits = vec![FileEdit::new("reviewed/held.md", Vec::new())];
+        edits.extend(
+            (0..EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX - 1)
+                .map(|index| FileEdit::new(format!("memory/log-{index}.md"), Vec::new())),
+        );
+        let mut config = sample_config();
+        config.surface.push(SurfaceEntry {
+            path: "reviewed/".into(),
+            tier: Tier::Reviewed,
+        });
+        let ward = Ward::new(tmp.path(), config).unwrap();
+
+        let report = ward
+            .apply(&edits, &Authorization::unsigned())
+            .expect("the exact shared Ward edit-count boundary must be accepted");
+
+        assert_eq!(report.changes.len(), EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX);
+        assert!(report
+            .changes
+            .iter()
+            .all(|change| change.disposition == Disposition::HeldForCoherence));
+        assert!(
+            !tmp.path().join("memory").exists(),
+            "a held mixed-tier proposal must not write its lower-tier edits"
+        );
+    }
+
+    #[test]
+    fn apply_rejects_one_tier1_plus_32_or_33_lower_tier_edits() {
+        for lower_tier_edits in [32, 33] {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut edits = vec![FileEdit::new("reviewed/held.md", Vec::new())];
+            edits.extend(
+                (0..lower_tier_edits)
+                    .map(|index| FileEdit::new(format!("memory/log-{index}.md"), Vec::new())),
+            );
+            let mut config = sample_config();
+            config.surface.push(SurfaceEntry {
+                path: "reviewed/".into(),
+                tier: Tier::Reviewed,
+            });
+            let ward = Ward::new(tmp.path(), config).unwrap();
+
+            let error = ward
+                .apply(&edits, &Authorization::unsigned())
+                .expect_err("Tier 1 must not bypass the shared Ward edit-count limit");
+
+            assert!(matches!(
+                ward_edit_budget_failure(&error),
+                Some(WardEditBudgetFailure::BatchEditCount {
+                    attempted_edits,
+                    max_edits: EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX,
+                }) if *attempted_edits == lower_tier_edits + 1
+            ));
+            assert!(!tmp.path().join("reviewed").exists());
+            assert!(!tmp.path().join("memory").exists());
+        }
+    }
+
+    #[test]
+    fn apply_rejects_oversized_proposed_content_even_when_tier1_holds_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = sample_config();
+        config.surface.push(SurfaceEntry {
+            path: "reviewed/".into(),
+            tier: Tier::Reviewed,
+        });
+        let ward = Ward::new(tmp.path(), config).unwrap();
+        let edits = vec![
+            FileEdit::new("reviewed/held.md", vec![b'x']),
+            FileEdit::new(
+                "memory/log.md",
+                vec![b'y'; EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX as usize],
+            ),
+        ];
+
+        let error = ward
+            .apply(&edits, &Authorization::unsigned())
+            .expect_err("Tier 1 must not bypass the shared retained-content budget");
+
+        assert!(matches!(
+            ward_edit_budget_failure(&error),
+            Some(WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes,
+                max_bytes: EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX,
+            }) if *attempted_bytes == EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1
+        ));
+        assert!(!tmp.path().join("reviewed").exists());
+        assert!(!tmp.path().join("memory").exists());
+    }
+
+    #[test]
+    fn approved_apply_combines_proposed_and_before_image_bytes_in_shared_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("MEMORY.md");
+        let before = vec![b'b'; EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX as usize - 1];
+        fs::write(&target, &before).unwrap();
+        let edits = vec![FileEdit::new("MEMORY.md", b"xx".to_vec())];
+        let expected_before = BTreeMap::from([("MEMORY.md".to_string(), Some(before.clone()))]);
+
+        let error = ward_in(tmp.path())
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected_before,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect_err("approved before-images and proposed bytes share one budget");
+
+        assert!(matches!(
+            ward_edit_budget_failure(&error),
+            Some(WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes,
+                max_bytes: EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX,
+            }) if *attempted_bytes == EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1
+        ));
+        assert_eq!(fs::read(&target).unwrap(), before);
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn approved_apply_accepts_exact_combined_content_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("MEMORY.md");
+        let before = vec![b'b'; EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX as usize - 1];
+        fs::write(&target, &before).unwrap();
+        let edits = vec![FileEdit::new("MEMORY.md", b"x".to_vec())];
+        let expected_before = BTreeMap::from([("MEMORY.md".to_string(), Some(before))]);
+
+        let report = ward_in(tmp.path())
+            .apply_after_coherence_approval(
+                &edits,
+                &Authorization::unsigned(),
+                &expected_before,
+                &resolved_as_target(&edits),
+                ApprovedApplyMode::Initial,
+            )
+            .expect("the exact combined retained-content boundary must be accepted");
+
+        assert!(report.is_applied());
+        assert_eq!(fs::read(&target).unwrap(), b"x");
+        assert_eq!(staging_litter(tmp.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn apply_rejects_oversized_existing_tier3_file_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        let target = home.join("scratch/large.bin");
+        let oversized = vec![b'x'; EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX as usize + 1];
+        fs::write(&target, &oversized).unwrap();
+
+        let err = ward_in(home)
+            .apply(
+                &[FileEdit::new("scratch/large.bin", b"replacement".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("an oversized Tier 3 before-image must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("retained before-image"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::metadata(&target).unwrap().len(), oversized.len() as u64);
+        assert_eq!(fs::read(&target).unwrap(), oversized);
+        assert_eq!(
+            staging_litter(home.join("scratch").as_path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn apply_rejects_sparse_existing_file_by_logical_metadata_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        let target = home.join("scratch/sparse.bin");
+        let file = std::fs::File::create(&target).unwrap();
+        file.set_len(EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1)
+            .unwrap();
+        drop(file);
+
+        let err = ward_in(home)
+            .apply(
+                &[FileEdit::new("scratch/sparse.bin", Vec::new())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("a metadata-large sparse before-image must be rejected");
+
+        assert!(
+            format!("{err:#}").contains("retained before-image"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().len(),
+            EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1
+        );
+        assert_eq!(
+            staging_litter(home.join("scratch").as_path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn apply_rejects_aggregate_retained_bytes_before_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        let each = EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX / 2 + 1;
+        let first = home.join("scratch/first.bin");
+        let second = home.join("scratch/second.bin");
+        std::fs::File::create(&first)
+            .unwrap()
+            .set_len(each)
+            .unwrap();
+        std::fs::File::create(&second)
+            .unwrap()
+            .set_len(each)
+            .unwrap();
+
+        let err = ward_in(home)
+            .apply(
+                &[
+                    FileEdit::new("scratch/first.bin", Vec::new()),
+                    FileEdit::new("scratch/second.bin", Vec::new()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("individually valid files must not exceed the batch memory limit");
+
+        assert!(
+            format!("{err:#}").contains("batch retained-memory"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(fs::metadata(&first).unwrap().len(), each);
+        assert_eq!(fs::metadata(&second).unwrap().len(), each);
+        assert_eq!(
+            staging_litter(home.join("scratch").as_path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn apply_accepts_exact_direct_retained_bytes_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        let target = home.join("scratch/boundary.bin");
+        std::fs::File::create(&target)
+            .unwrap()
+            .set_len(EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX)
+            .unwrap();
+
+        let report = ward_in(home)
+            .apply(
+                &[FileEdit::new("scratch/boundary.bin", Vec::new())],
+                &Authorization::unsigned(),
+            )
+            .expect("the exact retained-byte boundary must remain valid");
+
+        assert!(report.is_applied());
+        assert_eq!(fs::read(&target).unwrap(), Vec::<u8>::new());
+        assert_eq!(
+            staging_litter(home.join("scratch").as_path()),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn apply_rejects_file_that_grows_after_metadata_before_bounded_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        let target = home.join("scratch/growing.bin");
+        fs::write(&target, b"small").unwrap();
+        let target = target.canonicalize().unwrap();
+        set_direct_read_growth(target.clone(), EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1);
+
+        let err = ward_in(home)
+            .apply(
+                &[FileEdit::new("scratch/growing.bin", Vec::new())],
+                &Authorization::unsigned(),
+            )
+            .expect_err("growth after metadata must be caught by the bounded read");
+
+        assert!(
+            format!("{err:#}").contains("retained before-image"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().len(),
+            EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1
+        );
+        assert_eq!(
+            staging_litter(home.join("scratch").as_path()),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
