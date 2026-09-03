@@ -193,12 +193,8 @@ step(`install wrapper + native package in a temp project (${targetName})`, () =>
     `${JSON.stringify({ name: 'coven-prepublish-test', private: true, version: '0.0.0' }, null, 2)}\n`
   );
 
-  // --omit=optional avoids npm trying to fetch the optional native package by
-  // version from the public registry; we install the local tarball directly.
-  const installArgs = ['install', '--no-package-lock', '--omit=optional', platformTgz, wrapperTgz];
-  if (dashboardTarball) {
-    installArgs.push(dashboardTarball);
-  }
+  // This is a local-package smoke test: fail instead of reaching the registry.
+  const installArgs = buildLocalInstallArgs(platformTgz, wrapperTgz, dashboardTarball);
   run('npm', installArgs, {
     cwd: tempDir
   });
@@ -255,6 +251,23 @@ export async function main() {
       console.log(`\nTemp project left at ${tempDir} (--keep-tempdir).`);
     }
   }
+}
+
+export function buildLocalInstallArgs(platformTgz, wrapperTgz, dashboardTarball) {
+  const installArgs = [
+    'install',
+    '--offline',
+    '--no-package-lock',
+    '--omit=optional',
+    '--no-audit',
+    '--no-fund',
+    platformTgz,
+    wrapperTgz
+  ];
+  if (dashboardTarball) {
+    installArgs.push(dashboardTarball);
+  }
+  return installArgs;
 }
 
 export function synthesizeDryRunVersion(
