@@ -559,38 +559,48 @@ export type EventKind =
   | "receipt.recorded"
   | "feed.snapshot";
 
-export type EventPayload =
-  | {
-      revision: number;
-      definitionDigest?: Digest;
-      lifecycleState?: DefinitionLifecycleState | "tombstoned";
-      importedFrom?: string;
-    }
-  | {
-      entity: "occurrence" | "run" | "attempt";
-      from: string;
-      to: string;
-      reason: string;
-      fenceGeneration?: number;
-      attemptNumber?: number;
-      commandAdoptionKey?: AdoptionKey;
-    }
-  | {
-      disposition: MisfireDisposition;
-      collapsedSlots: Timestamp[];
-    }
-  | {
-      receiptRef: string;
-      outcome: RunOutcome;
-      sideEffectClass?: SideEffectClass;
-    }
-  | {
-      throughSequence: number;
-      state: Record<string, unknown>;
-      reason?: "retention_compaction" | "manual_snapshot";
-    };
+export interface DefinitionLifecycleEventPayload {
+  revision: number;
+  definitionDigest?: Digest;
+  lifecycleState?: DefinitionLifecycleState | "tombstoned";
+  importedFrom?: string;
+}
 
-export interface EventEnvelope {
+export interface TransitionEventPayload {
+  entity: "occurrence" | "run" | "attempt";
+  from: string;
+  to: string;
+  reason: string;
+  fenceGeneration?: number;
+  attemptNumber?: number;
+  commandAdoptionKey?: AdoptionKey;
+}
+
+export interface MisfireEventPayload {
+  disposition: MisfireDisposition;
+  collapsedSlots: Timestamp[];
+}
+
+export interface ReceiptEventPayload {
+  receiptRef: string;
+  outcome: RunOutcome;
+  sideEffectClass?: SideEffectClass;
+}
+
+export interface SnapshotEventPayload {
+  throughSequence: number;
+  state: Record<string, unknown>;
+  reason?: "retention_compaction" | "manual_snapshot";
+}
+
+export type EventPayload =
+  | DefinitionLifecycleEventPayload
+  | TransitionEventPayload
+  | MisfireEventPayload
+  | ReceiptEventPayload
+  | SnapshotEventPayload;
+
+export interface EventEnvelopeBase {
   schemaVersion: SchemaVersion;
   /** Globally unique; duplicates of a delivered eventId are redeliveries: ignore, never re-apply. */
   eventId: string;
@@ -609,12 +619,50 @@ export interface EventEnvelope {
   occurrenceId?: string;
   runId?: string;
   attemptId?: string;
-  kind: EventKind;
   summary: string;
-  payload: EventPayload;
   privacy: {
     classification: PrivacyClassification;
     retention: RetentionClass;
   };
   integrity?: Digest;
 }
+
+export type EventEnvelope = EventEnvelopeBase &
+  (
+    | {
+        kind:
+          | "definition.created"
+          | "definition.revised"
+          | "definition.activated"
+          | "definition.paused"
+          | "definition.disabled"
+          | "definition.invalidated"
+          | "definition.tombstoned"
+          | "definition.imported";
+        payload: DefinitionLifecycleEventPayload;
+      }
+    | {
+        kind: "occurrence.transitioned";
+        payload: TransitionEventPayload & { entity: "occurrence" };
+      }
+    | {
+        kind: "run.transitioned";
+        payload: TransitionEventPayload & { entity: "run" };
+      }
+    | {
+        kind: "attempt.transitioned";
+        payload: TransitionEventPayload & { entity: "attempt" };
+      }
+    | {
+        kind: "occurrence.misfire_recorded";
+        payload: MisfireEventPayload;
+      }
+    | {
+        kind: "receipt.recorded";
+        payload: ReceiptEventPayload;
+      }
+    | {
+        kind: "feed.snapshot";
+        payload: SnapshotEventPayload;
+      }
+  );

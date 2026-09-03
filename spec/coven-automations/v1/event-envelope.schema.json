@@ -102,6 +102,124 @@
       "description": "Required where the deployment requires tamper evidence (for example receipt.recorded events): digest over the canonical envelope with this member removed."
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "definition.created",
+              "definition.revised",
+              "definition.activated",
+              "definition.paused",
+              "definition.disabled",
+              "definition.invalidated",
+              "definition.tombstoned",
+              "definition.imported"
+            ]
+          }
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/definitionLifecyclePayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "occurrence.transitioned" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "allOf": [
+              { "$ref": "#/$defs/transitionPayload" },
+              {
+                "properties": { "entity": { "const": "occurrence" } },
+                "required": ["entity"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "run.transitioned" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "allOf": [
+              { "$ref": "#/$defs/transitionPayload" },
+              {
+                "properties": { "entity": { "const": "run" } },
+                "required": ["entity"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "attempt.transitioned" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "allOf": [
+              { "$ref": "#/$defs/transitionPayload" },
+              {
+                "properties": { "entity": { "const": "attempt" } },
+                "required": ["entity"]
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": { "const": "occurrence.misfire_recorded" }
+        },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/misfirePayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "receipt.recorded" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/receiptPayload" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "kind": { "const": "feed.snapshot" } },
+        "required": ["kind"]
+      },
+      "then": {
+        "properties": {
+          "payload": { "$ref": "#/$defs/snapshotPayload" }
+        }
+      }
+    }
+  ],
   "$defs": {
     "eventKind": {
       "enum": [

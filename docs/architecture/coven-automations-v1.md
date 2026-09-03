@@ -214,7 +214,7 @@ Control-action transport mapping: `POST /api/v1/actions` (`crates/coven-cli/src/
 
 Specified by `event-envelope.schema.json`.
 
-- **Envelope:** `schemaVersion`, `eventId` (globally unique), `stream {kind, id}`, gapless `sequence` per stream, `recordedAt`/`observedAt`, `producer`, optional `causation` (adoption key, cause event id, correlation id), object ids as applicable, `kind`, user-safe `summary` (no secrets, no prompts), typed `payload`, `privacy`, optional `integrity`.
+- **Envelope:** `schemaVersion`, `eventId` (globally unique), `stream {kind, id}`, gapless `sequence` per stream, `recordedAt`/`observedAt`, `producer`, optional `causation` (adoption key, cause event id, correlation id), object ids as applicable, `kind`, user-safe `summary` (no secrets, no prompts), typed `payload`, `privacy`, optional `integrity`. The event kind discriminates the payload: definition lifecycle kinds use definition payloads, each transition kind requires its matching entity, and misfire, receipt, and snapshot kinds use only their corresponding payload.
 - **Streams:** `automation/{id}`, `occurrence/{id}`, `run/{id}`, plus a global `feed`. Stream-local sequences are gapless and append via compare-and-set; out-of-order appends are refused (`STREAM_OUT_OF_ORDER`), never reordered.
 - **Delivery:** at-least-once. Consumers deduplicate on `eventId` and refuse regressions against their cursor (the golden vectors pin both).
 - **Read:** `events.read.v1` with `after` (exclusive sequence) or `from` (timestamp, resolved to a concrete cursor in the response); `events.subscribe.v1` with an opaque `checkpoint`. Expired checkpoints return `CURSOR_EXPIRED` (410) with the expiry instant — never a silent rewind.

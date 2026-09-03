@@ -6,6 +6,7 @@
 //! claim/lease, and run delivery land in follow-up modules on the same
 //! seams.
 
+pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
 pub mod health;
