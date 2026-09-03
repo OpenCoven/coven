@@ -25,7 +25,9 @@ where
 /// published Automations v1 digest recipe.
 pub fn canonicalize_without_integrity(value: &Value) -> anyhow::Result<Vec<u8>> {
     let mut covered = value.clone();
-    remove_integrity_members(&mut covered);
+    if let Value::Object(object) = &mut covered {
+        object.remove("integrity");
+    }
     canonicalize(&covered)
 }
 
@@ -49,23 +51,6 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
-}
-
-fn remove_integrity_members(value: &mut Value) {
-    match value {
-        Value::Object(object) => {
-            object.remove("integrity");
-            for child in object.values_mut() {
-                remove_integrity_members(child);
-            }
-        }
-        Value::Array(values) => {
-            for child in values {
-                remove_integrity_members(child);
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
 }
 
 fn reject_lossy_integers(value: &Value) -> anyhow::Result<()> {

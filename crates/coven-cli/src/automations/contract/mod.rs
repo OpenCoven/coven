@@ -237,6 +237,24 @@ mod tests {
             sha256_digest(&first).expect("digest first"),
             sha256_digest(&second).expect("digest second")
         );
+
+        let nested_integrity_a = json!({
+            "integrity": {"ignored": "top-level"},
+            "extensions": {"x-example": {"integrity": "nested-a"}}
+        });
+        let nested_integrity_b = json!({
+            "integrity": {"ignored": "top-level"},
+            "extensions": {"x-example": {"integrity": "nested-b"}}
+        });
+        let digest_a = sha256_hex(
+            &canonicalize_without_integrity(&nested_integrity_a)
+                .expect("canonicalize nested integrity collision"),
+        );
+        let digest_b = sha256_hex(
+            &canonicalize_without_integrity(&nested_integrity_b)
+                .expect("canonicalize changed nested integrity collision"),
+        );
+        assert_ne!(digest_a, digest_b);
     }
 
     #[test]
@@ -421,6 +439,33 @@ mod tests {
         let mut empty_summary = event_fixture();
         empty_summary["summary"] = json!("");
         assert!(serde_json::from_value::<EventEnvelope>(empty_summary).is_err());
+
+        let mut empty_rrule = fixture("definition.golden");
+        empty_rrule["trigger"]["schedule"]["rrule"] = json!("");
+        assert!(serde_json::from_value::<AutomationDefinition>(empty_rrule).is_err());
+
+        let mut empty_prompt = fixture("definition.golden");
+        empty_prompt["action"]["prompt"] = json!("");
+        assert!(serde_json::from_value::<AutomationDefinition>(empty_prompt).is_err());
+
+        let mut oversized_cwd = fixture("definition.golden");
+        oversized_cwd["action"]["cwd"] = json!("a".repeat(1_025));
+        assert!(serde_json::from_value::<AutomationDefinition>(oversized_cwd).is_err());
+
+        let mut invalid_occurrence_key = fixture("occurrence.golden");
+        invalid_occurrence_key["occurrenceKey"] = json!("not a key");
+        assert!(serde_json::from_value::<AutomationOccurrence>(invalid_occurrence_key).is_err());
+
+        let mut empty_state_reason = fixture("occurrence.golden");
+        empty_state_reason["stateReason"] = json!("");
+        assert!(serde_json::from_value::<AutomationOccurrence>(empty_state_reason).is_err());
+
+        let mut oversized_command_reason = fixture("command.create.golden");
+        oversized_command_reason["command"] = json!("definition.pause.v1");
+        oversized_command_reason["expectedRevision"] = json!(1);
+        oversized_command_reason["payload"] =
+            json!({"automationId": "daily-notes", "reason": "a".repeat(501)});
+        assert!(serde_json::from_value::<CommandRequest>(oversized_command_reason).is_err());
     }
 
     #[test]
@@ -450,6 +495,30 @@ mod tests {
             .expect("run fixture is an object")
             .remove("terminalDisposition");
         assert_round_trip::<AutomationRun>(running);
+
+        let mut running_with_finished_at = fixture("run.golden");
+        running_with_finished_at["state"] = json!("running");
+        running_with_finished_at
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("terminalDisposition");
+        assert!(serde_json::from_value::<AutomationRun>(running_with_finished_at).is_err());
+
+        let mut accepted_with_terminal_disposition = fixture("run.golden");
+        accepted_with_terminal_disposition["state"] = json!("accepted");
+        accepted_with_terminal_disposition
+            .as_object_mut()
+            .expect("run fixture is an object")
+            .remove("finishedAt");
+        assert!(
+            serde_json::from_value::<AutomationRun>(accepted_with_terminal_disposition).is_err()
+        );
+
+        let mut retry_without_prior_disposition = fixture("attempt.golden");
+        retry_without_prior_disposition["attemptNumber"] = json!(2);
+        assert!(
+            serde_json::from_value::<AutomationAttempt>(retry_without_prior_disposition).is_err()
+        );
 
         let base = json!({
             "schemaVersion": "coven.automations.v1",

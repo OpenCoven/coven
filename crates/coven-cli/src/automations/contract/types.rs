@@ -262,6 +262,44 @@ fn matches_event_ref_stream(value: &str) -> bool {
     (1..=400).contains(&value.chars().count())
 }
 
+fn matches_rrule(value: &str) -> bool {
+    (1..=512).contains(&value.chars().count())
+}
+
+fn matches_rrule_reference(value: &str) -> bool {
+    value.chars().count() <= 512
+}
+
+fn matches_prompt(value: &str) -> bool {
+    (1..=100_000).contains(&value.chars().count())
+}
+
+fn matches_working_directory(value: &str) -> bool {
+    value.chars().count() <= 1_024
+}
+
+fn matches_occurrence_key(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 320
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b':' | b'-')
+        })
+}
+
+fn matches_state_reason(value: &str) -> bool {
+    (1..=500).contains(&value.chars().count())
+}
+
+fn matches_reason(value: &str) -> bool {
+    value.chars().count() <= 500
+}
+
+fn matches_artifact_reference(value: &str) -> bool {
+    (1..=512).contains(&value.chars().count())
+}
+
 validated_string!(Timestamp, matches_timestamp);
 validated_string!(AutomationId, matches_automation_id);
 validated_string!(OccurrenceId, matches_entity_id);
@@ -290,6 +328,14 @@ validated_string!(ComponentName, matches_component_name);
 validated_string!(InstanceId, matches_instance_id);
 validated_string!(ImplementationVersion, matches_implementation_version);
 validated_string!(EventRefStream, matches_event_ref_stream);
+validated_string!(Rrule, matches_rrule);
+validated_string!(RruleReference, matches_rrule_reference);
+validated_string!(InvocationPrompt, matches_prompt);
+validated_string!(WorkingDirectory, matches_working_directory);
+validated_string!(OccurrenceKey, matches_occurrence_key);
+validated_string!(StateReason, matches_state_reason);
+validated_string!(CommandReason, matches_reason);
+validated_string!(ArtifactReference, matches_artifact_reference);
 
 macro_rules! validated_integer {
     ($name:ident, $minimum:expr, $maximum:expr) => {
@@ -827,7 +873,7 @@ pub struct DefinitionDeletion {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<PrincipalRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -882,7 +928,7 @@ pub enum ScheduleVariant {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Schedule {
-    pub rrule: String,
+    pub rrule: Rrule,
     pub timezone: Timezone,
 }
 
@@ -898,9 +944,9 @@ pub enum Timezone {
 pub struct FamiliarInvocationAction {
     pub variant: FamiliarInvocationVariant,
     pub version: VersionOne,
-    pub prompt: String,
+    pub prompt: InvocationPrompt,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    pub cwd: Option<WorkingDirectory>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -997,7 +1043,7 @@ pub enum MisfirePolicyDisposition {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeliveryPolicy {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output_target: Option<String>,
+    pub output_target: Option<WorkingDirectory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<DeliveryMode>,
 }
@@ -1054,14 +1100,14 @@ pub struct AutomationOccurrence {
     pub automation_id: AutomationId,
     pub automation_revision: PositiveInteger,
     pub trigger_identity: TriggerIdentity,
-    pub occurrence_key: String,
+    pub occurrence_key: OccurrenceKey,
     pub scheduled_for: Timestamp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observed_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eligible_at: Option<Timestamp>,
     pub state: OccurrenceState,
-    pub state_reason: String,
+    pub state_reason: StateReason,
     pub fence: OccurrenceFence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub misfire_disposition: Option<MisfireDisposition>,
@@ -1086,7 +1132,7 @@ pub struct AutomationOccurrence {
 pub struct TriggerIdentity {
     pub kind: TriggerIdentityKind,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rrule_ref: Option<String>,
+    pub rrule_ref: Option<RruleReference>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_by: Option<PrincipalRef>,
 }
@@ -1185,7 +1231,7 @@ pub struct AutomationRun {
     pub binding: RunBinding,
     state: RunState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_reason: Option<String>,
+    pub state_reason: Option<StateReason>,
     pub attempt_count: RunAttemptCount,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_attempt_id: Option<AttemptId>,
@@ -1221,17 +1267,22 @@ impl AutomationRun {
     }
 
     fn validate(&self) -> Result<(), StringConstraintError> {
-        if matches!(
+        let terminal = matches!(
             self.state,
             RunState::Succeeded
                 | RunState::Failed
                 | RunState::Cancelled
                 | RunState::TimedOut
                 | RunState::Ambiguous
-        ) && (self.finished_at.is_none() || self.terminal_disposition.is_none())
-        {
+        );
+        if terminal && (self.finished_at.is_none() || self.terminal_disposition.is_none()) {
             return Err(StringConstraintError(
                 "terminal runs require finishedAt and terminalDisposition",
+            ));
+        }
+        if !terminal && (self.finished_at.is_some() || self.terminal_disposition.is_some()) {
+            return Err(StringConstraintError(
+                "nonterminal runs must not contain finishedAt or terminalDisposition",
             ));
         }
         Ok(())
@@ -1253,7 +1304,7 @@ impl<'de> Deserialize<'de> for AutomationRun {
             automation_revision: PositiveInteger,
             binding: RunBinding,
             state: RunState,
-            state_reason: Option<String>,
+            state_reason: Option<StateReason>,
             attempt_count: RunAttemptCount,
             current_attempt_id: Option<AttemptId>,
             terminal_disposition: Option<TerminalDisposition>,
@@ -1344,7 +1395,7 @@ pub enum TerminalFailureClass {
 pub struct RunDelivery {
     pub status: RunDeliveryStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
+    pub target: Option<WorkingDirectory>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_refs: Option<Vec<ArtifactRef>>,
 }
@@ -1362,7 +1413,7 @@ pub enum RunDeliveryStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ArtifactRef {
-    pub r#ref: String,
+    pub r#ref: ArtifactReference,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<DigestValue>,
 }
@@ -1381,17 +1432,17 @@ pub enum AttemptState {
     Ambiguous,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AutomationAttempt {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub run_id: RunId,
     pub occurrence_id: OccurrenceId,
-    pub attempt_number: PositiveInteger,
+    attempt_number: PositiveInteger,
     pub adoption_key: AdoptionKey,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub prior_disposition: Option<PriorDisposition>,
+    prior_disposition: Option<PriorDisposition>,
     pub dispatch_fence: DispatchFence,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_correlation: Option<WorkerCorrelation>,
@@ -1403,13 +1454,86 @@ pub struct AutomationAttempt {
     pub output_cursors: Option<OutputCursors>,
     pub state: AttemptState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_reason: Option<String>,
+    pub state_reason: Option<StateReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<Timestamp>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extensions: Option<ExtensionBag>,
+}
+
+impl AutomationAttempt {
+    #[must_use]
+    pub const fn attempt_number(&self) -> PositiveInteger {
+        self.attempt_number
+    }
+
+    #[must_use]
+    pub fn prior_disposition(&self) -> Option<&PriorDisposition> {
+        self.prior_disposition.as_ref()
+    }
+
+    fn validate(&self) -> Result<(), StringConstraintError> {
+        if self.attempt_number.get() > 1 && self.prior_disposition.is_none() {
+            return Err(StringConstraintError(
+                "attempts after the first require priorDisposition",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for AutomationAttempt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Raw {
+            schema_version: SchemaVersion,
+            attempt_id: AttemptId,
+            run_id: RunId,
+            occurrence_id: OccurrenceId,
+            attempt_number: PositiveInteger,
+            adoption_key: AdoptionKey,
+            prior_disposition: Option<PriorDisposition>,
+            dispatch_fence: DispatchFence,
+            worker_correlation: Option<WorkerCorrelation>,
+            retry_classification: Option<RetryClassification>,
+            lease_observations: Option<Vec<LeaseObservation>>,
+            output_cursors: Option<OutputCursors>,
+            state: AttemptState,
+            state_reason: Option<StateReason>,
+            opened_at: Option<Timestamp>,
+            settled_at: Option<Timestamp>,
+            extensions: Option<ExtensionBag>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let attempt = Self {
+            schema_version: raw.schema_version,
+            attempt_id: raw.attempt_id,
+            run_id: raw.run_id,
+            occurrence_id: raw.occurrence_id,
+            attempt_number: raw.attempt_number,
+            adoption_key: raw.adoption_key,
+            prior_disposition: raw.prior_disposition,
+            dispatch_fence: raw.dispatch_fence,
+            worker_correlation: raw.worker_correlation,
+            retry_classification: raw.retry_classification,
+            lease_observations: raw.lease_observations,
+            output_cursors: raw.output_cursors,
+            state: raw.state,
+            state_reason: raw.state_reason,
+            opened_at: raw.opened_at,
+            settled_at: raw.settled_at,
+            extensions: raw.extensions,
+        };
+        attempt.validate().map_err(serde::de::Error::custom)?;
+        Ok(attempt)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1861,7 +1985,7 @@ pub struct DefinitionMutationPayload {
 pub struct DefinitionTargetPayload {
     pub automation_id: AutomationId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1879,7 +2003,7 @@ pub struct RunNowPayload {
 pub struct OccurrenceCancelPayload {
     pub occurrence_id: OccurrenceId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1887,7 +2011,7 @@ pub struct OccurrenceCancelPayload {
 pub struct RunCancelPayload {
     pub run_id: RunId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1895,7 +2019,7 @@ pub struct RunCancelPayload {
 pub struct AttemptCancelPayload {
     pub attempt_id: AttemptId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
+    pub reason: Option<CommandReason>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
