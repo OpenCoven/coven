@@ -21,6 +21,7 @@ import {
 } from './package-automations-protocol.mjs';
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const scriptPath = path.join(repositoryRoot, 'scripts', 'package-automations-protocol.mjs');
 
 function runGit(cwd, args) {
   const result = spawnSync('git', args, { cwd, encoding: 'utf8' });
@@ -373,4 +374,17 @@ test('pinned TypeScript declarations expose the implemented event page result', 
     declaration,
     /C extends "events\.read\.v1" \| "events\.subscribe\.v1" \? EventPage : Record<string, unknown>/
   );
+});
+
+test('verify CLI refuses missing required arguments with actionable usage', () => {
+  const result = spawnSync(process.execPath, [scriptPath, 'verify'], {
+    cwd: repositoryRoot,
+    encoding: 'utf8'
+  });
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stderr,
+    /Usage: package-automations-protocol\.mjs verify --bundle <archive> --source-commit <sha> --sha256 <digest>/
+  );
+  assert.doesNotMatch(result.stderr, /undefined/);
 });

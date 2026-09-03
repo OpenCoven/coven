@@ -485,10 +485,18 @@ function main() {
   const args = process.argv.slice(2);
   if (args[0] === 'verify') {
     const verifyArgs = args.slice(1);
+    const bundlePath = optionValue(verifyArgs, '--bundle');
+    const expectedSourceCommit = optionValue(verifyArgs, '--source-commit');
+    const expectedBundleSha256 = optionValue(verifyArgs, '--sha256');
+    if (!bundlePath || !expectedSourceCommit || !expectedBundleSha256) {
+      throw new Error(
+        'Usage: package-automations-protocol.mjs verify --bundle <archive> --source-commit <sha> --sha256 <digest>'
+      );
+    }
     const result = verifyAutomationsProtocolBundle({
-      bundlePath: optionValue(verifyArgs, '--bundle'),
-      expectedSourceCommit: optionValue(verifyArgs, '--source-commit'),
-      expectedBundleSha256: optionValue(verifyArgs, '--sha256')
+      bundlePath,
+      expectedSourceCommit,
+      expectedBundleSha256
     });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     return;

@@ -1491,6 +1491,16 @@ test('packageGitHubRelease refuses missing or misnamed Automations protocol bund
         packageGitHubRelease({
           releaseTag: RELEASE_TAG,
           artifactsDir,
+          outputDir: path.join(scratchDir, 'missing-inputs-out'),
+          sourceDateEpoch: SOURCE_DATE_EPOCH
+        }),
+      /v0\.4\.4 and later require sourceCommit and protocolBundlePath/i
+    );
+    assert.throws(
+      () =>
+        packageGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          artifactsDir,
           outputDir: path.join(scratchDir, 'missing-out'),
           sourceDateEpoch: SOURCE_DATE_EPOCH,
           sourceCommit: HEAD_SHA,

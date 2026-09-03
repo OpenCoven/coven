@@ -949,6 +949,11 @@ export function packageGitHubRelease({
   writeFileSync(path.join(normalizedOutputDir, CHECKSUMS_NAME), checksumText);
   const protocolAssetNames = [];
   if (releaseIncludesAutomationsProtocol(releaseTag)) {
+    if (!sourceCommit || !protocolBundlePath) {
+      throw new Error(
+        'GitHub releases v0.4.4 and later require sourceCommit and protocolBundlePath for the Automations protocol asset.'
+      );
+    }
     const protocolBundleName = automationsProtocolBundleName(sourceCommit);
     const normalizedProtocolBundlePath = path.resolve(String(protocolBundlePath));
     if (
