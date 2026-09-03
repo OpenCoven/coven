@@ -494,18 +494,24 @@ fn apply_legacy_create(
             let next_revision = next_revision(current.revision)?;
             let definition_json = serde_json::to_string(&definition)
                 .context("failed to serialize legacy routine definition")?;
+            let definition_digest =
+                super::contract::migration::definition_digest(&definition_json)?;
+            let lifecycle_state =
+                super::contract::migration::lifecycle_state(status_text(definition.status));
             let changed = conn
                 .execute(
                     "UPDATE automation_definitions
                      SET name = ?2,
                          status = ?3,
                          definition_json = ?4,
-                         revision = ?5,
+                         definition_digest = ?5,
+                         lifecycle_state = ?6,
+                         revision = ?7,
                          tombstoned_at = NULL,
-                         created_at = ?6,
-                         updated_at = ?6
+                         created_at = ?8,
+                         updated_at = ?8
                      WHERE id = ?1
-                       AND revision = ?7
+                       AND revision = ?9
                        AND tombstoned_at IS NOT NULL
                        AND authority_version = 0",
                     params![
@@ -513,6 +519,8 @@ fn apply_legacy_create(
                         definition.name,
                         status_text(definition.status),
                         definition_json,
+                        definition_digest,
+                        lifecycle_state,
                         sqlite_revision(next_revision)?,
                         adopted_at,
                         sqlite_revision(current.revision)?,
@@ -543,16 +551,21 @@ fn apply_legacy_create(
     }
     let definition_json =
         serde_json::to_string(&definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     conn.execute(
         "INSERT INTO automation_definitions (
-            id, name, status, definition_json, revision, tombstoned_at, authority_version,
-            created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, NULL, 0, ?5, ?5)",
+            id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+            tombstoned_at, authority_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 0, ?7, ?7)",
         params![
             definition.id,
             definition.name,
             status_text(definition.status),
             definition_json,
+            definition_digest,
+            lifecycle_state,
             adopted_at,
         ],
     )
@@ -604,16 +617,21 @@ fn apply_legacy_revise(
     let next_revision = next_revision(current.revision)?;
     let definition_json =
         serde_json::to_string(&definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     let changed = conn
         .execute(
             "UPDATE automation_definitions
              SET name = ?2,
                  status = ?3,
                  definition_json = ?4,
-                 revision = ?5,
-                 updated_at = ?6
+                 definition_digest = ?5,
+                 lifecycle_state = ?6,
+                 revision = ?7,
+                 updated_at = ?8
              WHERE id = ?1
-               AND revision = ?7
+               AND revision = ?9
                AND tombstoned_at IS NULL
                AND authority_version = 0",
             params![
@@ -621,6 +639,8 @@ fn apply_legacy_revise(
                 definition.name,
                 status_text(definition.status),
                 definition_json,
+                definition_digest,
+                lifecycle_state,
                 sqlite_revision(next_revision)?,
                 adopted_at,
                 sqlite_revision(current.revision)?,
@@ -704,16 +724,21 @@ fn apply_create(
     }
     let definition_json =
         serde_json::to_string(&definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     conn.execute(
         "INSERT INTO automation_definitions (
-            id, name, status, definition_json, revision, tombstoned_at, authority_version,
-            created_at, updated_at
-         ) VALUES (?1, ?2, ?3, ?4, 1, NULL, 1, ?5, ?5)",
+            id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+            tombstoned_at, authority_version, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, NULL, 1, ?7, ?7)",
         params![
             definition.id,
             definition.name,
             status_text(definition.status),
             definition_json,
+            definition_digest,
+            lifecycle_state,
             adopted_at,
         ],
     )
@@ -761,21 +786,28 @@ fn apply_revise(
     let current_revision_sql = sqlite_revision(current.revision)?;
     let definition_json =
         serde_json::to_string(&definition).context("failed to serialize routine definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let lifecycle_state =
+        super::contract::migration::lifecycle_state(status_text(definition.status));
     let changed = conn
         .execute(
             "UPDATE automation_definitions
              SET name = ?2,
                  status = ?3,
                  definition_json = ?4,
-                 revision = ?5,
+                 definition_digest = ?5,
+                 lifecycle_state = ?6,
+                 revision = ?7,
                  authority_version = 1,
-                 updated_at = ?6
-             WHERE id = ?1 AND revision = ?7",
+                 updated_at = ?8
+             WHERE id = ?1 AND revision = ?9",
             params![
                 definition.id,
                 definition.name,
                 status_text(definition.status),
                 definition_json,
+                definition_digest,
+                lifecycle_state,
                 next_revision_sql,
                 adopted_at,
                 current_revision_sql,

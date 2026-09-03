@@ -7,13 +7,16 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_runs (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
+        automation_revision INTEGER NOT NULL DEFAULT 1 CHECK (automation_revision >= 1),
+        definition_digest TEXT,
         occurrence_id TEXT,
+        receipt_id TEXT,
         session_id TEXT,
         familiar_id TEXT,
         runtime TEXT,
@@ -43,7 +46,10 @@ fn iso(instant: DateTime<Utc>) -> String {
 pub struct RunRecord {
     pub id: String,
     pub automation_id: String,
+    pub automation_revision: u64,
+    pub definition_digest: Option<String>,
     pub occurrence_id: Option<String>,
+    pub receipt_id: Option<String>,
     pub session_id: Option<String>,
     pub familiar_id: Option<String>,
     pub runtime: String,
@@ -72,14 +78,19 @@ pub fn record_run_start(
     start: RunStart<'_>,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    let (automation_revision, definition_digest) =
+        definition_pin(conn, start.automation_id, start.occurrence_id)?;
     conn.execute(
         "INSERT INTO automation_runs
-            (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-             status, started_at, timeout_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+            (id, automation_id, automation_revision, definition_digest, occurrence_id,
+             session_id, familiar_id, runtime, status, started_at, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10)",
         params![
             run_id,
             start.automation_id,
+            i64::try_from(automation_revision)
+                .context("automation revision exceeds SQLite range")?,
+            definition_digest,
             start.occurrence_id,
             start.session_id,
             start.familiar_id,
@@ -90,6 +101,61 @@ pub fn record_run_start(
     )
     .context("failed to record run start")?;
     Ok(())
+}
+
+fn definition_pin(
+    conn: &Connection,
+    automation_id: &str,
+    occurrence_id: Option<&str>,
+) -> Result<(u64, Option<String>)> {
+    if let Some(occurrence_id) = occurrence_id {
+        let occurrence = conn
+            .query_row(
+                "SELECT automation_id, automation_revision, definition_digest
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed to read occurrence definition pin")?;
+        let Some((occurrence_automation_id, revision, digest)) = occurrence else {
+            anyhow::bail!("automation occurrence `{occurrence_id}` does not exist");
+        };
+        if occurrence_automation_id != automation_id {
+            anyhow::bail!(
+                "automation occurrence `{occurrence_id}` does not belong to automation `{automation_id}`"
+            );
+        }
+        return Ok((
+            u64::try_from(revision).context("occurrence revision is negative")?,
+            digest,
+        ));
+    }
+
+    let current = conn
+        .query_row(
+            "SELECT revision, definition_digest
+             FROM automation_definitions
+             WHERE id = ?1 AND tombstoned_at IS NULL",
+            [automation_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()
+        .context("failed to read automation definition pin")?;
+    match current {
+        Some((revision, digest)) => Ok((
+            u64::try_from(revision).context("automation definition revision is negative")?,
+            digest,
+        )),
+        None => Ok((1, None)),
+    }
 }
 
 #[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
@@ -160,8 +226,9 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     let bounded = limit.clamp(1, 100);
     let mut statement = conn
         .prepare(
-            "SELECT id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                    status, exit_code, log_json, output_commit, started_at, timeout_at, finished_at
+            "SELECT id, automation_id, automation_revision, definition_digest, occurrence_id,
+                    receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
+                    output_commit, started_at, timeout_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -173,17 +240,26 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
             Ok(RunRecord {
                 id: row.get(0)?,
                 automation_id: row.get(1)?,
-                occurrence_id: row.get(2)?,
-                session_id: row.get(3)?,
-                familiar_id: row.get(4)?,
-                runtime: row.get(5)?,
-                status: row.get(6)?,
-                exit_code: row.get(7)?,
-                log_json: row.get(8)?,
-                output_commit: row.get(9)?,
-                started_at: row.get(10)?,
-                timeout_at: row.get(11)?,
-                finished_at: row.get(12)?,
+                automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                definition_digest: row.get(3)?,
+                occurrence_id: row.get(4)?,
+                receipt_id: row.get(5)?,
+                session_id: row.get(6)?,
+                familiar_id: row.get(7)?,
+                runtime: row.get(8)?,
+                status: row.get(9)?,
+                exit_code: row.get(10)?,
+                log_json: row.get(11)?,
+                output_commit: row.get(12)?,
+                started_at: row.get(13)?,
+                timeout_at: row.get(14)?,
+                finished_at: row.get(15)?,
             })
         })
         .context("failed to list runs")?;
@@ -289,6 +365,66 @@ mod tests {
             runs[0].timeout_at.as_deref(),
             Some("2026-08-28T09:30:00.000Z")
         );
+    }
+
+    #[test]
+    fn run_start_pins_the_occurrence_definition_metadata() {
+        let (_temp, conn) = temp_store();
+        let start = utc(2026, 8, 28, 9, 0);
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, definition_digest, scheduled_for,
+                state, attempt, created_at, updated_at
+             ) VALUES (
+                'occ-pinned', 'daily', 7, 'definition-seven',
+                '2026-08-28T09:00:00.000Z', 'claimed', 1,
+                '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        record_run_start(
+            &conn,
+            "run-pinned",
+            RunStart {
+                automation_id: "daily",
+                occurrence_id: Some("occ-pinned"),
+                session_id: None,
+                familiar_id: Some("cody"),
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
+
+        let pin: (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest, receipt_id
+                 FROM automation_runs
+                 WHERE id = 'run-pinned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pin, (7, "definition-seven".to_string(), None));
+
+        let error = record_run_start(
+            &conn,
+            "run-mismatched",
+            RunStart {
+                automation_id: "other",
+                occurrence_id: Some("occ-pinned"),
+                session_id: None,
+                familiar_id: Some("cody"),
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not belong to automation `other`"));
     }
 
     #[test]

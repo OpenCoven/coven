@@ -984,6 +984,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(crate::automations::runs::AUTOMATION_RUNS_SCHEMA_SQL)
         .context("failed to initialize automation_runs schema")?;
     crate::automations::runs::ensure_timeout_column(conn)?;
+    crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
 
     backfill_events_fts_if_needed(conn)?;
 

@@ -6,6 +6,7 @@ pub mod canonical_json;
 // The typed envelope is part of the public contract before routing lands.
 #[allow(dead_code)]
 pub mod error;
+pub mod migration;
 // These projections are intentionally available to the following protocol slices.
 #[allow(dead_code)]
 pub mod types;
