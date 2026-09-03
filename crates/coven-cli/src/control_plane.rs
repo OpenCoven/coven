@@ -42,6 +42,10 @@ pub struct ControlActionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<ControlEvent>,
 }
 
@@ -111,6 +115,11 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.create",
                     "coven.automations.update",
                     "coven.automations.delete",
+                    "coven.automations.definition.list.v1",
+                    "coven.automations.definition.get.v1",
+                    "coven.automations.definition.create.v1",
+                    "coven.automations.definition.revise.v1",
+                    "coven.automations.definition.tombstone.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
                     "coven.automations.run",
@@ -186,14 +195,100 @@ pub fn route_action(
                     action: action.to_string(),
                     status: ActionStatus::Completed,
                     reason: None,
+                    error: None,
+                    result: None,
                     event: Some(event),
                 },
             )
         }
-        "coven.automations.list" => {
-            automation_result(action, origin, intent_id, automation_list_payload(conn))
-        }
+        "coven.automations.list" => automation_result(
+            action,
+            origin,
+            intent_id,
+            automation_list_legacy_payload(conn),
+        ),
         "coven.automations.get" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_get_legacy_payload(conn, &id),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.create" => {
+            let definition = required_definition_field(&payload, action);
+            match definition {
+                Ok(definition) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyCreate {
+                            definition,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.update" => {
+            let definition = required_definition_field(&payload, action);
+            match definition {
+                Ok(definition) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyRevise {
+                            definition,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.delete" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyDelete {
+                            automation_id: id,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.definition.list.v1" => {
+            let include_tombstoned = payload
+                .get("includeTombstoned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            automation_result(
+                action,
+                origin,
+                intent_id,
+                automation_list_payload(conn, include_tombstoned),
+            )
+        }
+        "coven.automations.definition.get.v1" => {
             let id = required_id_field(&payload, action);
             match id {
                 Ok(id) => {
@@ -202,40 +297,120 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
-        "coven.automations.create" => {
+        "coven.automations.definition.create.v1" => {
             let definition = required_definition_field(&payload, action);
-            match definition {
-                Ok(definition) => automation_result(
-                    action,
-                    origin,
-                    intent_id,
-                    automation_create_payload(conn, &definition),
-                ),
-                Err(error) => (400, rejected_action(action, error)),
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = forbidden_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (definition, expected_revision) {
+                        (Ok(definition), Ok(())) => {
+                            crate::automations::command_adoption::DefinitionCommand::Create {
+                                definition,
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.create.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["definition", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.update" => {
+        "coven.automations.definition.revise.v1" => {
             let definition = required_definition_field(&payload, action);
-            match definition {
-                Ok(definition) => automation_result(
-                    action,
-                    origin,
-                    intent_id,
-                    automation_update_payload(conn, &definition),
-                ),
-                Err(error) => (400, rejected_action(action, error)),
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (definition, expected_revision) {
+                        (Ok(definition), Ok(expected_revision)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Revise {
+                                definition,
+                                expected_revision: Some(expected_revision),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.revise.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["definition", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.delete" => {
+        "coven.automations.definition.tombstone.v1" => {
             let id = required_id_field(&payload, action);
-            match id {
-                Ok(id) => automation_result(
-                    action,
-                    origin,
-                    intent_id,
-                    automation_delete_payload(conn, &id),
-                ),
-                Err(error) => (400, rejected_action(action, error)),
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (id, expected_revision) {
+                        (Ok(id), Ok(expected_revision)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Delete {
+                                automation_id: id,
+                                expected_revision: Some(expected_revision),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.tombstone.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["id", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
             }
         }
         "coven.automations.tick" => {
@@ -308,6 +483,8 @@ fn automation_event(
         action: action.to_string(),
         status: ActionStatus::Completed,
         reason: None,
+        error: None,
+        result: None,
         event: Some(ControlEvent {
             kind: "automations.changed",
             action: action.to_string(),
@@ -330,6 +507,169 @@ fn automation_result(
     }
 }
 
+fn automation_legacy_command_result(
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    result: anyhow::Result<crate::automations::command_adoption::DefinitionCommandResponse>,
+) -> (u16, ControlActionResponse) {
+    match result {
+        Ok(response)
+            if matches!(
+                response.outcome,
+                crate::automations::command_adoption::DefinitionCommandOutcome::Committed
+                    | crate::automations::command_adoption::DefinitionCommandOutcome::Replayed
+            ) =>
+        {
+            (
+                200,
+                automation_event(
+                    action,
+                    origin,
+                    intent_id,
+                    response.result.unwrap_or_else(|| json!({})),
+                ),
+            )
+        }
+        Ok(response) => {
+            let reason = response
+                .error
+                .map(|error| error.message.as_str().to_owned())
+                .unwrap_or_else(|| "automation command was rejected".to_owned());
+            (400, rejected_action(action, reason))
+        }
+        Err(error) => (400, rejected_action(action, format!("{error:#}"))),
+    }
+}
+
+fn automation_command_result(
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    result: anyhow::Result<crate::automations::command_adoption::DefinitionCommandResponse>,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::command_adoption::DefinitionCommandOutcome;
+    use crate::automations::contract::error::ErrorCode;
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            let error = automation_error(ErrorCode::Internal, format!("{error:#}"));
+            return typed_rejection(action, error);
+        }
+    };
+    match response.outcome {
+        DefinitionCommandOutcome::Committed | DefinitionCommandOutcome::Replayed => {
+            let outcome = match response.outcome {
+                DefinitionCommandOutcome::Committed => "committed",
+                DefinitionCommandOutcome::Replayed => "replayed",
+                DefinitionCommandOutcome::Rejected => unreachable!(),
+            };
+            let kind = if response.outcome == DefinitionCommandOutcome::Committed {
+                "automations.changed"
+            } else {
+                "automations.replayed"
+            };
+            let mut payload = json!({
+                "outcome": outcome,
+                "revision": response.revision,
+                "result": response.result,
+            });
+            if let Some(first_committed_at) = response.replay_first_committed_at {
+                payload["replay"] = json!({
+                    "firstCommittedAt": first_committed_at,
+                });
+            }
+            let event = if response.outcome == DefinitionCommandOutcome::Committed {
+                Some(ControlEvent {
+                    kind,
+                    action: action.to_string(),
+                    origin,
+                    intent_id,
+                    payload: payload.clone(),
+                })
+            } else {
+                None
+            };
+            (
+                200,
+                ControlActionResponse {
+                    ok: true,
+                    accepted: true,
+                    action: action.to_string(),
+                    status: ActionStatus::Completed,
+                    reason: None,
+                    error: None,
+                    result: Some(payload),
+                    event,
+                },
+            )
+        }
+        DefinitionCommandOutcome::Rejected => typed_rejection(
+            action,
+            response
+                .error
+                .expect("rejected automation command carries typed error"),
+        ),
+    }
+}
+
+fn validation_rejection(action: &str, reason: String) -> (u16, ControlActionResponse) {
+    let error = automation_error(
+        crate::automations::contract::error::ErrorCode::ValidationFailed,
+        reason,
+    );
+    typed_rejection(action, error)
+}
+
+fn automation_error(
+    code: crate::automations::contract::error::ErrorCode,
+    message: impl Into<String>,
+) -> crate::automations::contract::error::ErrorEnvelope {
+    let message = message.into();
+    let bounded = if message.is_empty() {
+        "automation command failed".to_owned()
+    } else {
+        message.chars().take(1_000).collect()
+    };
+    crate::automations::contract::error::ErrorEnvelope::try_new(code, bounded, false)
+        .expect("bounded non-empty automation error message is valid")
+}
+
+fn typed_rejection(
+    action: &str,
+    error: crate::automations::contract::error::ErrorEnvelope,
+) -> (u16, ControlActionResponse) {
+    let status = error.http_status();
+    let reason = error.message.as_str().to_owned();
+    let error = serde_json::to_value(error).expect("typed automation error serializes");
+    (
+        status,
+        ControlActionResponse {
+            ok: false,
+            accepted: false,
+            action: action.to_owned(),
+            status: ActionStatus::Rejected,
+            reason: Some(reason),
+            error: Some(error),
+            result: None,
+            event: None,
+        },
+    )
+}
+
+fn legacy_adoption_key(action: &str, intent_id: Option<&str>) -> String {
+    match intent_id {
+        Some(intent_id) => {
+            let digest = crate::automations::contract::sha256_hex(
+                format!("{action}\0{intent_id}").as_bytes(),
+            );
+            format!("legacy:{digest}")
+        }
+        None => format!("legacy:{}", uuid::Uuid::new_v4().simple()),
+    }
+}
+
 fn required_id_field(payload: &Value, action: &str) -> Result<String, String> {
     payload
         .get("id")
@@ -340,15 +680,57 @@ fn required_id_field(payload: &Value, action: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{action} requires string field `id`"))
 }
 
-fn required_definition_field(
-    payload: &Value,
-    action: &str,
-) -> Result<crate::automations::RoutineDefinition, String> {
+fn required_definition_field(payload: &Value, action: &str) -> Result<Value, String> {
     let Some(definition) = payload.get("definition") else {
         return Err(format!("{action} requires object field `definition`"));
     };
-    crate::automations::RoutineDefinition::from_json(definition)
-        .map_err(|error| format!("{action}: {error}"))
+    if !definition.is_object() {
+        return Err(format!("{action} requires object field `definition`"));
+    }
+    Ok(definition.clone())
+}
+
+fn required_adoption_key(payload: &Value, action: &str) -> Result<String, String> {
+    payload
+        .get("adoptionKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{action} requires string field `adoptionKey`"))
+}
+
+fn required_expected_revision(payload: &Value, action: &str) -> Result<u64, String> {
+    payload
+        .get("expectedRevision")
+        .and_then(Value::as_u64)
+        .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
+        .ok_or_else(|| format!("{action} requires positive safe-integer field `expectedRevision`"))
+}
+
+fn forbidden_expected_revision(payload: &Value, action: &str) -> Result<(), String> {
+    if payload.get("expectedRevision").is_some() {
+        Err(format!("{action} forbids field `expectedRevision`"))
+    } else {
+        Ok(())
+    }
+}
+
+fn command_request_fields(payload: &Value, fields: &[&str]) -> Value {
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|field| {
+                payload
+                    .get(*field)
+                    .map(|value| ((*field).to_owned(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn automation_tick_payload(
@@ -460,7 +842,7 @@ fn automation_runs_payload(
     }
 }
 
-fn automation_list_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
+fn automation_list_legacy_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
     let records = crate::automations::store::list_definitions(conn);
     match records {
         Ok(records) => {
@@ -478,7 +860,7 @@ fn automation_list_payload(conn: &rusqlite::Connection) -> Result<Value, String>
     }
 }
 
-fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+fn automation_get_legacy_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
     match crate::automations::store::get_definition(conn, id) {
         Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
             Ok(routine) => Ok(json!({ "routine": routine })),
@@ -489,36 +871,50 @@ fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value
     }
 }
 
-fn automation_create_payload(
+fn automation_list_payload(
     conn: &rusqlite::Connection,
-    definition: &crate::automations::RoutineDefinition,
+    include_tombstoned: bool,
 ) -> Result<Value, String> {
-    match crate::automations::store::insert_definition(conn, definition) {
-        Ok(record) => Ok(json!({
-            "routine": definition.to_json(),
-            "createdAt": record.created_at,
-        })),
+    let records =
+        crate::automations::store::list_definitions_with_tombstones(conn, include_tombstoned);
+    match records {
+        Ok(records) => {
+            let mut routines = Vec::with_capacity(records.len());
+            let mut revision_by_id = std::collections::BTreeMap::new();
+            let mut tombstoned_at_by_id = std::collections::BTreeMap::new();
+            for record in records {
+                let id = record.id.clone();
+                let routine =
+                    serde_json::from_str::<Value>(&record.definition_json).map_err(|error| {
+                        format!("stored routine `{}` is unreadable: {error}", record.id)
+                    })?;
+                revision_by_id.insert(id.clone(), record.revision);
+                if let Some(tombstoned_at) = record.tombstoned_at {
+                    tombstoned_at_by_id.insert(id, tombstoned_at);
+                }
+                routines.push(routine);
+            }
+            Ok(json!({
+                "routines": routines,
+                "revisionById": revision_by_id,
+                "tombstonedAtById": tombstoned_at_by_id,
+            }))
+        }
         Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_update_payload(
-    conn: &rusqlite::Connection,
-    definition: &crate::automations::RoutineDefinition,
-) -> Result<Value, String> {
-    match crate::automations::store::update_definition(conn, definition) {
-        Ok(Some(record)) => Ok(json!({
-            "routine": definition.to_json(),
-            "updatedAt": record.updated_at,
-        })),
-        Ok(None) => Err(format!("no routine with id `{}`", definition.id)),
-        Err(error) => Err(format!("{error:#}")),
-    }
-}
-
-fn automation_delete_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    match crate::automations::store::delete_definition(conn, id) {
-        Ok(deleted) => Ok(json!({ "id": id, "deleted": deleted })),
+fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+    match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
+        Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
+            Ok(routine) => Ok(json!({
+                "routine": routine,
+                "revision": record.revision,
+                "tombstonedAt": record.tombstoned_at,
+            })),
+            Err(error) => Err(format!("stored routine is unreadable: {error}")),
+        },
+        Ok(None) => Ok(json!({ "routine": Value::Null })),
         Err(error) => Err(format!("{error:#}")),
     }
 }
@@ -533,6 +929,8 @@ pub fn rejected_action(
         action: action.into(),
         status: ActionStatus::Rejected,
         reason: Some(reason.into()),
+        error: None,
+        result: None,
         event: None,
     }
 }

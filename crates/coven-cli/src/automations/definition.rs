@@ -49,7 +49,7 @@ pub enum RoutineOverlap {
 /// A validated routine definition. Serialized to `definition_json` in the
 /// store with camelCase keys, mirroring the control-plane wire style.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutineDefinition {
     pub schema_version: u32,
     pub id: String,
@@ -88,6 +88,41 @@ impl RoutineDefinition {
             .map_err(|error| format!("routine definition failed validation: {error}"))?;
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    pub fn from_legacy_json(value: &Value) -> Result<Self, String> {
+        Self::from_json(&Self::legacy_wire_projection(value))
+    }
+
+    pub(crate) fn legacy_wire_projection(value: &Value) -> Value {
+        const LEGACY_FIELDS: &[&str] = &[
+            "schemaVersion",
+            "id",
+            "name",
+            "status",
+            "rrule",
+            "timezone",
+            "misfire",
+            "overlap",
+            "timeoutMinutes",
+            "runtime",
+            "familiarId",
+            "cwd",
+            "outputTarget",
+            "prompt",
+            "model",
+            "tags",
+        ];
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| LEGACY_FIELDS.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -143,6 +178,7 @@ impl RoutineDefinition {
     }
 
     /// Normalized wire form (camelCase, schema stamped) used by list/get.
+    #[allow(dead_code)]
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
@@ -229,5 +265,18 @@ mod tests {
             .insert("outputTarget".to_string(), json!("result.md"));
         let error = RoutineDefinition::from_json(&value).unwrap_err();
         assert!(error.contains("outputTarget is not supported"), "{error}");
+    }
+
+    #[test]
+    fn legacy_parser_ignores_unknown_fields_while_v1_parser_rejects_them() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("futureField".to_string(), json!("ignored by legacy"));
+
+        assert!(RoutineDefinition::from_legacy_json(&value).is_ok());
+        let error = RoutineDefinition::from_json(&value).unwrap_err();
+        assert!(error.contains("unknown field `futureField`"), "{error}");
     }
 }

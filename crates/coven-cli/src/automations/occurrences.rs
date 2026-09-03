@@ -245,6 +245,10 @@ pub fn insert_claimed_occurrence(
            AND NOT EXISTS (
              SELECT 1 FROM automation_runs
              WHERE automation_id = ?2 AND status = 'running'
+         )
+           AND EXISTS (
+             SELECT 1 FROM automation_definitions
+             WHERE id = ?2 AND tombstoned_at IS NULL
          )",
         params![
             occurrence_id,
@@ -1082,6 +1086,7 @@ mod tests {
     #[test]
     fn lease_is_expired_at_its_exact_deadline() {
         let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap();
         assert!(insert_claimed_occurrence(
             &conn,
