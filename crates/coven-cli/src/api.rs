@@ -298,6 +298,17 @@ impl std::fmt::Display for RuntimeOwnershipPublicationError {
 
 impl std::error::Error for RuntimeOwnershipPublicationError {}
 
+#[derive(Debug)]
+pub(crate) struct RuntimeLaunchAdmissionClosedError;
+
+impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon is shutting down; refusing to launch a new live session")
+    }
+}
+
+impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -587,6 +598,20 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 }
             };
             let (status, response) = control_plane::route_action(payload, &conn, runtime);
+            if status == 200
+                && response.accepted
+                && matches!(
+                    response.action.as_str(),
+                    "coven.automations.create"
+                        | "coven.automations.update"
+                        | "coven.automations.delete"
+                        | "coven.automations.definition.create.v1"
+                        | "coven.automations.definition.revise.v1"
+                        | "coven.automations.definition.tombstone.v1"
+                )
+            {
+                crate::automations::daemon_tick::wake_automations_scheduler(coven_home);
+            }
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),

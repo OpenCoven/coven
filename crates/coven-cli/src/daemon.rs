@@ -265,10 +265,11 @@ impl LiveLaunchGate {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        anyhow::ensure!(
-            !state.closed,
-            "daemon is shutting down; refusing to launch a new live session"
-        );
+        if state.closed {
+            return Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ));
+        }
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1);
         state.in_flight.insert(id, None);
@@ -971,10 +972,12 @@ impl LiveSessionRuntime {
         ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
     ) -> Result<()> {
-        anyhow::ensure!(
-            !self.shutting_down.load(Ordering::Acquire),
-            "daemon is shutting down; refusing to launch a new session"
-        );
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.record_no_process_receipt(launch, strict_containment)?;
+            return Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ));
+        }
         let familiar_ctx = match (&self.coven_home, launch.familiar_id.as_deref()) {
             (Some(home), familiar_id) => {
                 crate::familiar_identity::resolve_optional(home, familiar_id)?
@@ -1070,7 +1073,18 @@ impl LiveSessionRuntime {
         // handle is in the live registry. Shutdown closes and drains this gate,
         // so a detached request handler cannot lose a pre-registration Unix
         // process group when the daemon exits.
-        let launch_admission = self.begin_launch()?;
+        let launch_admission = match self.begin_launch() {
+            Ok(admission) => admission,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::api::RuntimeLaunchAdmissionClosedError>()
+                    .is_some() =>
+            {
+                self.record_no_process_receipt(launch, strict_containment)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
             // Defense in depth: only allow Stream mode for harnesses that
@@ -1164,6 +1178,41 @@ impl LiveSessionRuntime {
         )?;
         launch_admission.release();
         publish_established_runtime_ownership(&mut ownership_established)
+    }
+
+    fn record_no_process_receipt(
+        &self,
+        launch: &SessionLaunch,
+        strict_containment: bool,
+    ) -> Result<()> {
+        if !strict_containment {
+            return Ok(());
+        }
+        let coven_home = self
+            .coven_home
+            .as_deref()
+            .context("strict automation containment requires COVEN_HOME")?;
+        let receipt_path =
+            crate::automations::runner::containment_receipt_path(coven_home, &launch.id);
+        let receipt_dir = receipt_path
+            .parent()
+            .context("automation containment receipt path has no parent")?;
+        std::fs::create_dir_all(receipt_dir).with_context(|| {
+            format!(
+                "failed creating automation containment receipt directory `{}`",
+                receipt_dir.display()
+            )
+        })?;
+        crate::pty_runner::write_containment_receipt(
+            &receipt_path,
+            crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT,
+        )
+        .with_context(|| {
+            format!(
+                "failed recording no-process automation containment receipt `{}`",
+                receipt_path.display()
+            )
+        })
     }
 
     fn deliver_initial_stream_prompt(&self, launch: &SessionLaunch) -> Result<()> {
@@ -4314,8 +4363,15 @@ pub fn serve_forever(
         status_path: status_path.clone(),
         pid: status.pid,
     };
-    let mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+    let tcp_listener = if let Some(addr) = tcp_addr {
+        let listener = bind_tcp_listener(addr)?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure interruptible TCP API listener")?;
+        Some(listener)
+    } else {
+        None
+    };
     append_daemon_recovery_log(
         coven_home,
         &format!(
@@ -4332,13 +4388,12 @@ pub fn serve_forever(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
-    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let automations_scheduler =
+        crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
 
-    let (tcp_thread, active_tcp_connection) = if let Some(addr) = tcp_addr {
-        let tcp_listener = bind_tcp_listener(addr)?;
-        tcp_listener
-            .set_nonblocking(true)
-            .context("failed to configure interruptible TCP API listener")?;
+    let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
         let tcp_home = coven_home.to_path_buf();
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
@@ -4525,9 +4580,12 @@ pub fn serve_forever(
     // a request and be sitting inside a 30-second socket read; the documented
     // daemon-stop budget is two seconds, so shutdown must not wait for that
     // client before it kills live sessions.
+    let scheduler_shutdown_deadline = Instant::now() + Duration::from_millis(250);
+    automations_scheduler.request_shutdown();
     let runtime_shutdown = runtime
         .shutdown_all()
         .context("failed to terminate live sessions during daemon shutdown");
+    let scheduler_shutdown = automations_scheduler.finish_shutdown(scheduler_shutdown_deadline);
     let tcp_shutdown = if let Some(tcp_thread) = tcp_thread {
         let deadline = Instant::now() + Duration::from_millis(250);
         while !tcp_thread.is_finished() && Instant::now() < deadline {
@@ -4552,7 +4610,7 @@ pub fn serve_forever(
     } else {
         Ok(())
     };
-    let shutdown_result = runtime_shutdown.and(tcp_shutdown);
+    let shutdown_result = scheduler_shutdown.and(runtime_shutdown).and(tcp_shutdown);
     drop(unix_listener);
     drop(mobile_gateway);
     drop(shutdown_guard);
@@ -5276,9 +5334,6 @@ fn serve_forever_with_lifetime_job_installer(
         .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
-    let _mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
-
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
@@ -5293,7 +5348,10 @@ fn serve_forever_with_lifetime_job_installer(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
-    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let _automations_scheduler =
+        crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let _mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
