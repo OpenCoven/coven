@@ -14,6 +14,36 @@
     "adoption": "Consult command-envelope semantics. The case pins what a conformant command handler commits or refuses, independent of transport.",
     "changefeed": "Consult event-envelope semantics. The case pins duplicate handling, ordering, and deterministic read-model rehydration."
   },
+  "timezoneVectors": [
+    {
+      "name": "new-york-spring-forward-gap-skips",
+      "timezone": "America/New_York",
+      "rrule": "FREQ=DAILY;BYHOUR=2",
+      "from": "2026-03-07T08:00:00.000Z",
+      "expected": "2026-03-09T06:00:00.000Z"
+    },
+    {
+      "name": "new-york-fall-back-fold-selects-first",
+      "timezone": "America/New_York",
+      "rrule": "FREQ=DAILY;BYHOUR=1",
+      "from": "2026-11-01T04:00:00.000Z",
+      "expected": "2026-11-01T05:00:00.000Z"
+    },
+    {
+      "name": "utc-leap-day",
+      "timezone": "utc",
+      "rrule": "FREQ=DAILY;BYHOUR=9",
+      "from": "2028-02-28T10:00:00.000Z",
+      "expected": "2028-02-29T09:00:00.000Z"
+    },
+    {
+      "name": "utc-weekly-year-boundary",
+      "timezone": "utc",
+      "rrule": "FREQ=WEEKLY;BYDAY=FR;BYHOUR=8",
+      "from": "2026-12-31T12:00:00.000Z",
+      "expected": "2027-01-01T08:00:00.000Z"
+    }
+  ],
   "fixtures": {
     "definition.golden": {
       "schemaVersion": "coven.automations.v1",

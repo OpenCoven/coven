@@ -279,6 +279,10 @@ fn matches_rrule_reference(value: &str) -> bool {
     value.chars().count() <= 512
 }
 
+fn matches_timezone(value: &str) -> bool {
+    value != "local" && (value == "utc" || value.parse::<chrono_tz::Tz>().is_ok())
+}
+
 fn matches_prompt(value: &str) -> bool {
     (1..=100_000).contains(&value.chars().count())
 }
@@ -419,6 +423,7 @@ validated_string!(ImplementationVersion, matches_implementation_version);
 validated_string!(EventRefStream, matches_event_ref_stream);
 validated_string!(Rrule, matches_rrule);
 validated_string!(RruleReference, matches_rrule_reference);
+validated_string!(Timezone, matches_timezone);
 validated_string!(InvocationPrompt, matches_prompt);
 validated_string!(WorkingDirectory, matches_working_directory);
 validated_string!(OccurrenceKey, matches_occurrence_key);
@@ -1181,13 +1186,6 @@ pub enum ScheduleVariant {
 pub struct Schedule {
     pub rrule: Rrule,
     pub timezone: Timezone,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Timezone {
-    Local,
-    Utc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

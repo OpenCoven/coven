@@ -4,7 +4,8 @@
   "notes": [
     "Machine-readable compatibility matrix for coven.automations.v1.",
     "changeClass defines what a future change to any field or variant is, and what a v1 consumer/producer must do when it meets it.",
-    "Consumers and producers must refuse incompatible profiles explicitly with SCHEMA_VERSION_UNSUPPORTED; they never approximate or degrade silently."
+    "Consumers and producers must refuse incompatible profiles explicitly with SCHEMA_VERSION_UNSUPPORTED; they never approximate or degrade silently.",
+    "This profile is still proposed. The UTC/IANA timezone correction is a pre-stabilization contract revision: older source-bound bundles remain immutable historical artifacts, and consumers must pin the exact bundle they validated."
   ],
   "changeClasses": [
     {
@@ -47,6 +48,7 @@
     { "object": "AutomationDefinition", "field": "deletion", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
     { "object": "AutomationDefinition", "field": "display", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
     { "object": "AutomationDefinition", "field": "trigger", "status": "required-since-v1", "changeClass": "additive-variant" },
+    { "object": "AutomationDefinition", "field": "trigger.schedule.timezone", "status": "required-since-v1; canonical utc or validated IANA TZID; local is compatibility input outside the durable object; Unix TZ overrides must be utc or an exact IANA TZID and otherwise fail closed", "changeClass": "incompatible-field-change" },
     { "object": "AutomationDefinition", "field": "conditions", "status": "optional-since-v1", "changeClass": "additive-variant" },
     { "object": "AutomationDefinition", "field": "action", "status": "required-since-v1", "changeClass": "additive-variant" },
     { "object": "AutomationDefinition", "field": "binding", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
