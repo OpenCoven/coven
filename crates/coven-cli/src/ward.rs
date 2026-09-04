@@ -52,10 +52,10 @@
 //!   staging name is unpredictable and `create_new` refuses to open through
 //!   an existing directory entry.
 //! - **Symlinked targets or parent directories** are refused by Gate 2 before
-//!   any byte is written. The target's parent is re-created and verified
-//!   component-by-component (never following symlinks) immediately before
-//!   staging. This narrows, but does not eliminate, a post-adjudication
-//!   parent-component swap; the accepted residual race is described below.
+//!   any byte is written. The target's parent is opened component-by-component
+//!   without following links and retained as the authority for staging,
+//!   commit, verification, rollback, and cleanup. Absolute paths retained
+//!   beside those handles are diagnostic labels only.
 //! - **Pre-existing hard-linked targets** are not written through by commit:
 //!   atomic replacement changes the directory entry instead. Hard links are
 //!   not generally harmless, however. A same-privilege process can mutate an
@@ -64,9 +64,19 @@
 //!   potentially-committed outcome instead of deleting it as Ward-owned.
 //!
 //! Direct and approved writes preserve the file actually displaced by commit.
+//! Linux uses `openat2` with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS |
+//! RESOLVE_NO_SYMLINKS` for parent and target opens, then `*at` operations for
+//! every sibling mutation. Kernels without `openat2` fall back to
+//! component-at-a-time `openat` with `O_NOFOLLOW`; because only one normalized
+//! component is resolved per retained handle, that fallback cannot traverse a
+//! replacement ancestor. macOS uses the corresponding
+//! `openat`/`fstatat`/`linkat`/`unlinkat` operations and `renameatx_np` through
+//! rustix. Windows retains non-share-delete directory handles, opens entries
+//! without following reparse points, and moves exact source handles relative
+//! to the retained destination directory with `SetFileInformationByHandle`.
 //! Linux and macOS exchange the staged and target entries. Windows moves the
 //! target to a randomized backup and installs the staged entry with no-replace
-//! semantics, avoiding a replacement API that can traverse a final symlink.
+//! semantics.
 //! Both paths verify the displaced file identity, displaced before-image, and
 //! installed bytes before the batch can finalize. Gate 4 hashes that verified
 //! commit-displaced before-image.
@@ -80,37 +90,42 @@
 //! inode identity and contents still belong to that apply attempt.
 //! Staging, backup, and rollback cleanup follows the same rule: capture without
 //! replacement, inspect as a no-follow regular file, and reverify the retained
-//! identity and bytes at the deletion boundary. A replacement observed after
+//! identity and bytes immediately before deletion. A replacement observed after
 //! the first verification is restored to the artifact path (or left at the
 //! capture path if restoration would overwrite another entry) and reported as a
-//! cleanup failure. Known non-regular entries are rejected from metadata before
-//! open; the no-follow open remains nonblocking to cover a concurrent type swap.
+//! cleanup failure. POSIX has no conditional unlink-by-inode primitive, so a
+//! same-privilege replacement in the final verify-to-`unlinkat` interval remains
+//! tracked by #924 rather than being overstated as closed here. Known
+//! non-regular entries are rejected from metadata before open; the no-follow
+//! open remains nonblocking to cover a concurrent type swap.
 //!
-//! Residual risk (accepted): a same-privilege process that can already write
-//! inside the familiar home can still swap path components in the window
-//! between per-component verification and later path-based staging or commit
-//! operations. Such a swap can redirect those operations. The checks narrow
-//! that race without eliminating it; full elimination needs
-//! directory-handle-relative I/O (e.g. `openat2` + `RESOLVE_BENEATH`), which
-//! is not portable across the supported platforms. Final-component replacement
-//! is handled separately: the Ward verifies the exact regular file displaced
-//! by commit and rolls the batch back instead of emitting a false
-//! `prev_sha256`. These checks still cannot close a race won after verification
-//! but before a later path-based operation; observed identity or content drift
-//! always fails closed without overwriting or deleting the unrecognized entry.
+//! Residual risk (accepted): on Unix, a same-privilege process can rename an
+//! already-open parent directory. Ward operations remain attached to that
+//! original directory object, even if it is moved elsewhere; they never follow
+//! the replacement pathname. Windows prevents that rename while the retained
+//! directory handle is live. Final-component replacement remains a separate
+//! race: the Ward verifies the exact regular file displaced by commit and rolls
+//! the batch back instead of emitting a false `prev_sha256`. Observed identity
+//! or content drift always fails closed without overwriting or deleting the
+//! unrecognized entry. The configured familiar-home spelling is rebound before
+//! mutation, so retargeting an initially symlinked workspace also fails closed.
 
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(all(test, unix))]
 use std::ffi::CString;
-use std::fs::OpenOptions;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-use std::os::unix::ffi::OsStrExt;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
+use std::ops::Deref;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(not(unix))]
+use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
+#[cfg(not(unix))]
+use cap_std::fs::OpenOptions as CapOpenOptions;
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use unicode_casefold::UnicodeCaseFold;
@@ -1077,18 +1092,31 @@ impl Ward {
     /// Adjudicate a proposal. Runs Gate 2 (surface discrimination) then Gate 1
     /// (authorization) for each target.
     pub fn evaluate(&self, proposal: &Proposal) -> Outcome {
+        self.evaluate_with_home(proposal, None)
+    }
+
+    fn evaluate_with_home(&self, proposal: &Proposal, canonical_home: Option<&Path>) -> Outcome {
         record_evaluate_call();
         let decisions = proposal
             .targets
             .iter()
-            .map(|target| self.evaluate_target(target, &proposal.authorization))
+            .map(|target| self.evaluate_target(target, &proposal.authorization, canonical_home))
             .collect();
         Outcome { decisions }
     }
 
-    fn evaluate_target(&self, target: &str, authorization: &Authorization) -> Decision {
+    fn evaluate_target(
+        &self,
+        target: &str,
+        authorization: &Authorization,
+        canonical_home: Option<&Path>,
+    ) -> Decision {
         // Gate 2: surface discrimination — resolve the real target.
-        let resolved = match self.materialize(target) {
+        let resolved = match canonical_home {
+            Some(canonical_home) => self.materialize_with_home(target, canonical_home),
+            None => self.materialize(target),
+        };
+        let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(reason) => {
                 return Decision {
@@ -1170,24 +1198,32 @@ impl Ward {
     /// Returns the resolved path (forward-slashed, relative to home) or a
     /// [`BlockReason`] if the target cannot be safely confined to the home.
     fn materialize(&self, target: &str) -> std::result::Result<String, BlockReason> {
-        // 1. Lexically normalize the joined path (fold `.` and `..`). A target
-        //    that would climb above the home is a traversal escape.
-        let normalized = lexical_join(&self.home, target).ok_or(BlockReason::TraversalEscape)?;
-
-        // 2. Resolve symlinks on the longest existing prefix. If the canonical
-        //    prefix leaves the (canonical) home, it is a symlink escape.
         let canonical_home = self
             .home
             .canonicalize()
             .map_err(|err| BlockReason::Unresolvable {
                 detail: format!("home `{}`: {err}", self.home.display()),
             })?;
+        self.materialize_with_home(target, &canonical_home)
+    }
 
-        let resolved_abs = resolve_within(&canonical_home, &normalized)?;
+    fn materialize_with_home(
+        &self,
+        target: &str,
+        canonical_home: &Path,
+    ) -> std::result::Result<String, BlockReason> {
+        // 1. Lexically normalize the joined path (fold `.` and `..`). A target
+        //    that would climb above the home is a traversal escape.
+        let normalized =
+            lexical_join(canonical_home, target).ok_or(BlockReason::TraversalEscape)?;
+
+        // 2. Resolve symlinks on the longest existing prefix. If the canonical
+        //    prefix leaves the canonical home, it is a symlink escape.
+        let resolved_abs = resolve_within(canonical_home, &normalized)?;
 
         // 3. Express the resolved path relative to the home, forward-slashed.
         let rel = resolved_abs
-            .strip_prefix(&canonical_home)
+            .strip_prefix(canonical_home)
             .map_err(|_| BlockReason::SymlinkEscape)?;
         Ok(to_forward_slashes(rel))
     }
@@ -1217,11 +1253,13 @@ impl Ward {
     /// refusal or hold is a normal [`ApplyReport`].
     pub fn apply(&self, edits: &[FileEdit], authorization: &Authorization) -> Result<ApplyReport> {
         validate_file_edit_budget(edits)?;
+        let anchored_home = AnchoredHome::open(&self.home)?;
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
-        let outcome = self.evaluate(&proposal);
+        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        maybe_swap_evaluated_home(&self.home)?;
 
         // Decide the proposal-wide disposition before touching the filesystem.
         let unit = if outcome.is_blocked() {
@@ -1260,14 +1298,11 @@ impl Ward {
                 .collect();
             return Ok(ApplyReport { changes });
         }
+        anchored_home.verify_path_unchanged()?;
 
         // Every edit is Tier 2/3 and cleared. Stage and commit the batch as one
         // rollback unit so a later failure cannot strand an unaudited write.
-        let canonical_home = self
-            .home
-            .canonicalize()
-            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))?;
-        write_direct_batch(&canonical_home, edits, outcome.decisions)
+        write_direct_batch(&anchored_home, edits, outcome.decisions)
     }
 
     /// Apply edits after an explicit principal proposal approval has cleared the
@@ -1296,11 +1331,15 @@ impl Ward {
             Ok(())
         })()
         .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let anchored_home = AnchoredHome::open(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|e| e.target.clone()).collect(),
             authorization: authorization.clone(),
         };
-        let outcome = self.evaluate(&proposal);
+        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        maybe_swap_evaluated_home(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         ensure_expected_resolutions(&outcome.decisions, expected_resolved)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         if outcome.is_blocked() {
@@ -1319,18 +1358,15 @@ impl Ward {
                 .collect();
             return Ok(ApplyReport { changes });
         }
-
-        let canonical_home = self
-            .home
-            .canonicalize()
-            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
+        anchored_home
+            .verify_path_unchanged()
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let expected_before = expected_before
             .iter()
             .map(|(target, contents)| (target.clone(), Some(contents.clone())))
             .collect();
         let changes = write_atomically_if_unchanged(
-            &canonical_home,
+            &anchored_home,
             edits,
             outcome.decisions,
             &expected_before,
@@ -1357,11 +1393,15 @@ impl Ward {
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let anchored_home = AnchoredHome::open(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
         };
-        let outcome = self.evaluate(&proposal);
+        let outcome = self.evaluate_with_home(&proposal, Some(&anchored_home.absolute));
+        maybe_swap_evaluated_home(&self.home)
+            .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         ensure_expected_resolutions(&outcome.decisions, expected_resolved)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let has_reviewed_target = outcome
@@ -1387,14 +1427,11 @@ impl Ward {
                 .collect();
             return Ok(ApplyReport { changes });
         }
-
-        let canonical_home = self
-            .home
-            .canonicalize()
-            .with_context(|| format!("ward home `{}` is not resolvable", self.home.display()))
+        anchored_home
+            .verify_path_unchanged()
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let changes = write_atomically_if_unchanged(
-            &canonical_home,
+            &anchored_home,
             edits,
             outcome.decisions,
             expected_before,
@@ -1458,14 +1495,190 @@ fn join_resolved(canonical_home: &Path, resolved: &str) -> PathBuf {
     path
 }
 
+struct AnchoredHome {
+    dir: Arc<Dir>,
+    configured: PathBuf,
+    absolute: PathBuf,
+}
+
+impl AnchoredHome {
+    fn open(home: &Path) -> Result<Self> {
+        let absolute = home
+            .canonicalize()
+            .with_context(|| format!("ward home `{}` is not resolvable", home.display()))?;
+        let dir = Dir::open_ambient_dir(&absolute, ambient_authority())
+            .with_context(|| format!("opening familiar home {}", absolute.display()))?;
+        let anchored = Self {
+            dir: Arc::new(dir),
+            configured: home.to_path_buf(),
+            absolute,
+        };
+        if !anchored.binding_matches()? {
+            bail!(
+                "ward home `{}` changed while its authority handle was opened",
+                home.display()
+            );
+        }
+        Ok(anchored)
+    }
+
+    fn verify_path_unchanged(&self) -> Result<()> {
+        if self.binding_matches()? {
+            Ok(())
+        } else {
+            bail!(
+                "ward home `{}` changed during Gate 2; refusing to write",
+                self.configured.display()
+            )
+        }
+    }
+
+    fn binding_matches(&self) -> Result<bool> {
+        let Ok(current_absolute) = self.configured.canonicalize() else {
+            return Ok(false);
+        };
+        if current_absolute != self.absolute {
+            return Ok(false);
+        }
+        directory_handle_matches_path(&self.dir, &current_absolute)
+    }
+}
+
+#[cfg(unix)]
+fn directory_handle_matches_path(directory: &Dir, path: &Path) -> Result<bool> {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+
+    let opened = rustix::fs::fstat(directory.as_fd())
+        .map_err(std::io::Error::from)
+        .with_context(|| format!("reading familiar-home handle identity {}", path.display()))?;
+    let named = std::fs::symlink_metadata(path)
+        .with_context(|| format!("reading familiar-home path identity {}", path.display()))?;
+    Ok(named.file_type().is_dir()
+        && opened.st_dev as u64 == named.dev()
+        && opened.st_ino as u64 == named.ino())
+}
+
+#[cfg(windows)]
+fn directory_handle_matches_path(directory: &Dir, path: &Path) -> Result<bool> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let opened = directory
+        .try_clone()
+        .context("duplicating familiar-home authority handle")?
+        .into_std_file();
+    let named = std::fs::OpenOptions::new()
+        .access_mode(0)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .with_context(|| format!("opening familiar-home path identity {}", path.display()))?;
+    let metadata = named
+        .metadata()
+        .with_context(|| format!("reading familiar-home path metadata {}", path.display()))?;
+    Ok(metadata.is_dir()
+        && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
+        && windows_file_identity_from_open_file(&opened)?
+            == windows_file_identity_from_open_file(&named)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn directory_handle_matches_path(_directory: &Dir, _path: &Path) -> Result<bool> {
+    bail!("familiar-home identity comparison is unsupported on this platform")
+}
+
+#[derive(Clone)]
+struct AnchoredEntry {
+    parent: Arc<Dir>,
+    name: OsString,
+    absolute: PathBuf,
+}
+
+impl AnchoredEntry {
+    fn new(parent: Arc<Dir>, parent_path: &Path, name: &OsStr) -> Self {
+        Self {
+            parent,
+            name: name.to_os_string(),
+            absolute: parent_path.join(name),
+        }
+    }
+
+    fn sibling(&self, name: OsString) -> Self {
+        Self {
+            parent: Arc::clone(&self.parent),
+            absolute: self
+                .absolute
+                .parent()
+                .expect("anchored entry has a parent")
+                .join(&name),
+            name,
+        }
+    }
+}
+
+impl Deref for AnchoredEntry {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.absolute
+    }
+}
+
+impl AsRef<Path> for AnchoredEntry {
+    fn as_ref(&self) -> &Path {
+        &self.absolute
+    }
+}
+
+impl PartialEq for AnchoredEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.absolute == other.absolute
+    }
+}
+
+impl Eq for AnchoredEntry {}
+
+impl std::fmt::Debug for AnchoredEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.absolute.fmt(formatter)
+    }
+}
+
+impl PartialEq<PathBuf> for AnchoredEntry {
+    fn eq(&self, other: &PathBuf) -> bool {
+        self.absolute == *other
+    }
+}
+
+impl PartialEq<&Path> for AnchoredEntry {
+    fn eq(&self, other: &&Path) -> bool {
+        self.absolute == *other
+    }
+}
+
+struct AnchoredParent {
+    dir: Arc<Dir>,
+    absolute: PathBuf,
+}
+
+impl AnchoredParent {
+    fn entry(&self, name: &OsStr) -> AnchoredEntry {
+        AnchoredEntry::new(Arc::clone(&self.dir), &self.absolute, name)
+    }
+}
+
 #[derive(Clone)]
 struct ApprovedWritePaths {
-    staged: PathBuf,
-    displaced: PathBuf,
+    staged: AnchoredEntry,
+    displaced: AnchoredEntry,
 }
 
 impl ApprovedWritePaths {
-    fn new(target: &Path, staged: PathBuf) -> Result<Self> {
+    fn new(target: &AnchoredEntry, staged: AnchoredEntry) -> Result<Self> {
         let displaced = approved_write_displaced_path(target, &staged)?;
         Ok(Self { staged, displaced })
     }
@@ -1477,7 +1690,7 @@ struct OpenRegularFile {
 }
 
 struct PreparedDirectWrite<'a> {
-    path: PathBuf,
+    path: AnchoredEntry,
     paths: Option<ApprovedWritePaths>,
     before: Option<OpenRegularFile>,
     installed: Option<std::fs::File>,
@@ -1487,7 +1700,7 @@ struct PreparedDirectWrite<'a> {
 }
 
 struct PreparedConditionalWrite<'a> {
-    path: PathBuf,
+    path: AnchoredEntry,
     paths: Option<ApprovedWritePaths>,
     already_applied: bool,
     expected_before: Option<Vec<u8>>,
@@ -1500,7 +1713,7 @@ struct PreparedConditionalWrite<'a> {
 }
 
 fn write_direct_batch(
-    canonical_home: &Path,
+    home: &AnchoredHome,
     edits: &[FileEdit],
     decisions: Vec<Decision>,
 ) -> Result<ApplyReport> {
@@ -1508,15 +1721,16 @@ fn write_direct_batch(
     let mut prepared = Vec::with_capacity(edits.len());
     for (edit, decision) in edits.iter().zip(decisions) {
         let result = (|| -> Result<PreparedDirectWrite> {
-            let resolved = join_resolved(canonical_home, &decision.resolved);
+            let resolved = join_resolved(&home.absolute, &decision.resolved);
             let parent = resolved
                 .parent()
                 .ok_or_else(|| anyhow!("target has no parent directory: {}", resolved.display()))?;
             let name = resolved
                 .file_name()
                 .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
-            let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
-            let path = canonical_parent.join(name);
+            let canonical_parent = prepare_staging_parent(home, parent)?;
+            let path = canonical_parent.entry(name);
+            maybe_swap_prepared_parent(&path)?;
             let before = open_direct_before_image(&path, &decision.target, retained_bytes)?;
             if let Some(before) = &before {
                 retained_bytes = reserve_ward_content_bytes(
@@ -1567,7 +1781,7 @@ fn write_direct_batch(
             if write.before.is_some() {
                 replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
             } else {
-                std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
+                hard_link_without_replace(&paths.staged, &write.path).with_context(|| {
                     format!(
                         "target `{}` appeared during commit; refusing to overwrite it",
                         write.decision.target
@@ -2067,7 +2281,7 @@ fn cleanup_direct_staging(prepared: &[PreparedDirectWrite<'_>]) -> Result<()> {
 /// restores them and rolls back every earlier edit owned by this apply attempt.
 /// Already-applied bytes are accepted so crash recovery remains idempotent.
 fn write_atomically_if_unchanged(
-    canonical_home: &Path,
+    home: &AnchoredHome,
     edits: &[FileEdit],
     decisions: Vec<Decision>,
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
@@ -2083,15 +2297,16 @@ fn write_atomically_if_unchanged(
                 .get(&edit.target)
                 .with_context(|| format!("missing approved before-image for `{}`", edit.target))?
                 .clone();
-            let resolved = join_resolved(canonical_home, &decision.resolved);
+            let resolved = join_resolved(&home.absolute, &decision.resolved);
             let parent = resolved
                 .parent()
                 .ok_or_else(|| anyhow!("target has no parent directory: {}", resolved.display()))?;
             let name = resolved
                 .file_name()
                 .ok_or_else(|| anyhow!("target has no file name: {}", resolved.display()))?;
-            let canonical_parent = prepare_staging_parent(canonical_home, parent)?;
-            let path = canonical_parent.join(name);
+            let canonical_parent = prepare_staging_parent(home, parent)?;
+            let path = canonical_parent.entry(name);
+            maybe_swap_prepared_parent(&path)?;
             let current = open_regular_file_without_following_links(&path)?;
             let current_contents = current.as_ref().map(|current| current.contents.as_slice());
             let already_applied = mode == ApprovedApplyMode::Recovery
@@ -2174,7 +2389,7 @@ fn write_atomically_if_unchanged(
             if write.expected_before.is_some() {
                 replace_preserving_target(&write.path, &paths.staged, &paths.displaced)
             } else {
-                std::fs::hard_link(&paths.staged, &write.path).with_context(|| {
+                hard_link_without_replace(&paths.staged, &write.path).with_context(|| {
                     format!(
                         "approved target `{}` appeared after review; refusing to overwrite it",
                         write.decision.target
@@ -2568,7 +2783,7 @@ fn rollback_created_write(write: &PreparedConditionalWrite<'_>) -> Result<()> {
 
 fn restore_unowned_rollback_capture(
     write: &PreparedConditionalWrite<'_>,
-    captured: &Path,
+    captured: &AnchoredEntry,
 ) -> Result<()> {
     atomic_move_without_replace(captured, &write.path).with_context(|| {
         format!(
@@ -2578,20 +2793,20 @@ fn restore_unowned_rollback_capture(
     })
 }
 
-fn rollback_capture_path(target: &Path) -> PathBuf {
+fn rollback_capture_path(target: &AnchoredEntry) -> AnchoredEntry {
     let name = target
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    target.with_file_name(format!(".{name}.ward-rollback-{}", uuid::Uuid::new_v4()))
+    target.sibling(format!(".{name}.ward-rollback-{}", uuid::Uuid::new_v4()).into())
 }
 
-fn cleanup_capture_path(artifact: &Path) -> PathBuf {
+fn cleanup_capture_path(artifact: &AnchoredEntry) -> AnchoredEntry {
     let name = artifact
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    artifact.with_file_name(format!(".{name}.ward-cleanup-{}", uuid::Uuid::new_v4()))
+    artifact.sibling(format!(".{name}.ward-cleanup-{}", uuid::Uuid::new_v4()).into())
 }
 
 fn error_has_io_kind(error: &anyhow::Error, kind: ErrorKind) -> bool {
@@ -2603,8 +2818,8 @@ fn error_has_io_kind(error: &anyhow::Error, kind: ErrorKind) -> bool {
 }
 
 fn restore_unowned_cleanup_capture(
-    artifact: &Path,
-    captured: &Path,
+    artifact: &AnchoredEntry,
+    captured: &AnchoredEntry,
     verification_error: anyhow::Error,
 ) -> anyhow::Error {
     match atomic_move_without_replace(captured, artifact) {
@@ -2622,7 +2837,7 @@ fn restore_unowned_cleanup_capture(
 }
 
 fn remove_owned_regular_artifact(
-    artifact: &Path,
+    artifact: &AnchoredEntry,
     retained_identity: &std::fs::File,
     expected_contents: Option<&[u8]>,
     description: &str,
@@ -2659,7 +2874,7 @@ fn remove_owned_regular_artifact(
     {
         return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
     }
-    if let Err(error) = std::fs::remove_file(&captured)
+    if let Err(error) = remove_anchored_file(&captured)
         .with_context(|| format!("removing captured {description} {}", captured.display()))
     {
         return Err(restore_unowned_cleanup_capture(artifact, &captured, error));
@@ -2668,7 +2883,7 @@ fn remove_owned_regular_artifact(
 }
 
 fn verify_owned_regular_artifact(
-    artifact: &Path,
+    artifact: &AnchoredEntry,
     retained_identity: &std::fs::File,
     expected_contents: Option<&[u8]>,
     description: &str,
@@ -2686,16 +2901,59 @@ fn verify_owned_regular_artifact(
     Ok(())
 }
 
-fn ensure_artifact_path_absent(path: &Path, description: &str) -> Result<()> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("inspecting {description} {}", path.display()))
-        }
-        Ok(_) => bail!(
+fn ensure_artifact_path_absent(path: &AnchoredEntry, description: &str) -> Result<()> {
+    if !anchored_entry_exists(path)
+        .with_context(|| format!("inspecting {description} {}", path.display()))?
+    {
+        Ok(())
+    } else {
+        bail!(
             "{description} {} contains an entry whose ownership is unproven; preserving it",
             path.display()
-        ),
+        )
+    }
+}
+
+fn anchored_entry_exists(path: &AnchoredEntry) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        match rustix::fs::statat(
+            path.parent.as_fd(),
+            &path.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match path.parent.symlink_metadata(&path.name) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn remove_anchored_file(path: &AnchoredEntry) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        rustix::fs::unlinkat(
+            path.parent.as_fd(),
+            &path.name,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(not(unix))]
+    {
+        path.parent.remove_file(&path.name).map_err(Into::into)
     }
 }
 
@@ -2799,12 +3057,14 @@ fn read_open_file_with_policy(
     Ok(contents)
 }
 
-fn open_regular_file_without_following_links(path: &Path) -> Result<Option<OpenRegularFile>> {
+fn open_regular_file_without_following_links(
+    path: &AnchoredEntry,
+) -> Result<Option<OpenRegularFile>> {
     open_regular_file_without_following_links_with_policy(path, RegularFileReadPolicy::WardFile)
 }
 
 fn open_direct_before_image(
-    path: &Path,
+    path: &AnchoredEntry,
     target: &str,
     retained_bytes: u64,
 ) -> Result<Option<OpenRegularFile>> {
@@ -2818,7 +3078,7 @@ fn open_direct_before_image(
 }
 
 fn open_regular_file_without_following_links_with_policy(
-    path: &Path,
+    path: &AnchoredEntry,
     policy: RegularFileReadPolicy<'_>,
 ) -> Result<Option<OpenRegularFile>> {
     let Some(mut file) = open_regular_file_handle_without_following_links(path)? else {
@@ -2833,27 +3093,96 @@ fn open_regular_file_without_following_links_with_policy(
     Ok(Some(OpenRegularFile { file, contents }))
 }
 
-#[cfg(unix)]
-fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
-    use std::os::unix::fs::OpenOptionsExt;
+fn reject_known_non_regular_entry(path: &AnchoredEntry) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
 
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            bail!("direct target {} is not a regular file", path.display())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading direct target metadata {}", path.display()))
+        match rustix::fs::statat(
+            path.parent.as_fd(),
+            &path.name,
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Ok(metadata)
+                if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                    == rustix::fs::FileType::RegularFile =>
+            {
+                Ok(())
+            }
+            Ok(_) => bail!("direct target {} is not a regular file", path.display()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(std::io::Error::from(error))
+                .with_context(|| format!("reading direct target metadata {}", path.display())),
         }
     }
-    let file = match std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)
+    #[cfg(not(unix))]
     {
-        Ok(file) => file,
+        match path.parent.symlink_metadata(&path.name) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
+            Ok(_) => bail!("direct target {} is not a regular file", path.display()),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("reading direct target metadata {}", path.display())),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_regular_file_handle_without_following_links(
+    path: &AnchoredEntry,
+) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsFd;
+
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+
+    reject_known_non_regular_entry(path)?;
+    let file = match openat2(
+        path.parent.as_fd(),
+        &path.name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(file) => std::fs::File::from(file),
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            return open_regular_file_handle_portable(path);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening direct target {}", path.display()))
+        }
+    };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("reading direct target metadata {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("direct target {} is not a regular file", path.display());
+    }
+    Ok(Some(file))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_regular_file_handle_without_following_links(
+    path: &AnchoredEntry,
+) -> Result<Option<std::fs::File>> {
+    open_regular_file_handle_portable(path)
+}
+
+#[cfg(unix)]
+fn open_regular_file_handle_portable(path: &AnchoredEntry) -> Result<Option<std::fs::File>> {
+    use std::os::fd::AsFd;
+
+    reject_known_non_regular_entry(path)?;
+    let file = match rustix::fs::openat(
+        path.parent.as_fd(),
+        &path.name,
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::CLOEXEC
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::NONBLOCK,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(file) => std::fs::File::from(file),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("opening direct target {}", path.display()))
@@ -2869,19 +3198,23 @@ fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Optio
 }
 
 #[cfg(windows)]
-fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
-    use std::os::windows::fs::OpenOptionsExt;
+fn open_regular_file_handle_without_following_links(
+    path: &AnchoredEntry,
+) -> Result<Option<std::fs::File>> {
+    use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
-    let file = match std::fs::OpenOptions::new()
+    reject_known_non_regular_entry(path)?;
+    let mut options = CapOpenOptions::new();
+    options
         .read(true)
+        .follow(FollowSymlinks::No)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)
-    {
-        Ok(file) => file,
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    let file = match path.parent.open_with(&path.name, &options) {
+        Ok(file) => file.into_std(),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| format!("opening direct target {}", path.display()))
@@ -2897,20 +3230,12 @@ fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Optio
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_regular_file_handle_without_following_links(path: &Path) -> Result<Option<std::fs::File>> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("reading direct target metadata {}", path.display()))
-        }
-    };
-    if !metadata.is_file() {
-        bail!("direct target {} is not a regular file", path.display());
-    }
-    match std::fs::OpenOptions::new().read(true).open(path) {
-        Ok(file) => Ok(Some(file)),
+fn open_regular_file_handle_without_following_links(
+    path: &AnchoredEntry,
+) -> Result<Option<std::fs::File>> {
+    reject_known_non_regular_entry(path)?;
+    match path.parent.open(&path.name) {
+        Ok(file) => Ok(Some(file.into_std())),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => {
             Err(error).with_context(|| format!("opening direct target {}", path.display()))
@@ -2958,7 +3283,7 @@ fn stream_regular_file_matches_and_sha256(
 }
 
 fn verify_installed_regular_target(
-    path: &Path,
+    path: &AnchoredEntry,
     expected_contents: &[u8],
     installed_identity: &std::fs::File,
     missing_message: &str,
@@ -2977,7 +3302,7 @@ fn verify_installed_regular_target(
 fn verify_displaced_regular_target(
     observed: &mut std::fs::File,
     expected_contents: &[u8],
-    displaced_path: &Path,
+    displaced_path: &AnchoredEntry,
     displaced_identity: &mut Option<std::fs::File>,
     changed_message: &str,
 ) -> Result<String> {
@@ -2998,7 +3323,7 @@ fn verify_displaced_regular_target(
 }
 
 fn rollback_replaced_regular_target(
-    target: &Path,
+    target: &AnchoredEntry,
     paths: &ApprovedWritePaths,
     installed_contents: &[u8],
     installed_identity: &std::fs::File,
@@ -3051,33 +3376,35 @@ fn rollback_replaced_regular_target(
     Ok(())
 }
 
-fn open_file_matches_path_if_present(file: &std::fs::File, path: &Path) -> Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => open_file_matches_path(file, path),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("reading file identity {}", path.display()))
-        }
-    }
+fn open_file_matches_path_if_present(file: &std::fs::File, path: &AnchoredEntry) -> Result<bool> {
+    open_file_matches_path(file, path)
 }
 
 #[cfg(unix)]
-fn open_file_matches_path(file: &std::fs::File, path: &Path) -> Result<bool> {
+fn open_file_matches_path(file: &std::fs::File, path: &AnchoredEntry) -> Result<bool> {
     use std::os::unix::fs::MetadataExt;
 
+    let Some(current) = open_regular_file_handle_without_following_links(path)? else {
+        return Ok(false);
+    };
     let open = file.metadata().context("reading open file identity")?;
-    let path = std::fs::symlink_metadata(path)
+    let path = current
+        .metadata()
         .with_context(|| format!("reading file identity {}", path.display()))?;
-    Ok(path.is_file() && open.dev() == path.dev() && open.ino() == path.ino())
+    Ok(open.dev() == path.dev() && open.ino() == path.ino())
 }
 
 #[cfg(windows)]
-fn open_file_matches_path(file: &std::fs::File, path: &Path) -> Result<bool> {
-    Ok(windows_file_identity_from_open_file(file)? == windows_file_identity(path)?)
+fn open_file_matches_path(file: &std::fs::File, path: &AnchoredEntry) -> Result<bool> {
+    let Some(current) = open_regular_file_handle_without_following_links(path)? else {
+        return Ok(false);
+    };
+    Ok(windows_file_identity_from_open_file(file)?
+        == windows_file_identity_from_open_file(&current)?)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn open_file_matches_path(_file: &std::fs::File, _path: &Path) -> Result<bool> {
+fn open_file_matches_path(_file: &std::fs::File, _path: &AnchoredEntry) -> Result<bool> {
     bail!("open-file identity comparison is unsupported on this platform")
 }
 
@@ -3097,7 +3424,7 @@ fn same_file_identity(left: &Path, right: &Path) -> Result<bool> {
     Ok(windows_file_identity(left)? == windows_file_identity(right)?)
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn windows_file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -3151,80 +3478,131 @@ fn validate_windows_file_identity(
     Ok((volume_serial_number, file_id))
 }
 
+fn hard_link_without_replace(source: &AnchoredEntry, destination: &AnchoredEntry) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        rustix::fs::linkat(
+            source.parent.as_fd(),
+            &source.name,
+            destination.parent.as_fd(),
+            &destination.name,
+            rustix::fs::AtFlags::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .with_context(|| {
+            format!(
+                "linking {} to {} without replacement",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        source
+            .parent
+            .hard_link(&source.name, destination.parent.as_ref(), &destination.name)
+            .with_context(|| {
+                format!(
+                    "linking {} to {} without replacement",
+                    source.display(),
+                    destination.display()
+                )
+            })
+    }
+}
+
 #[cfg(all(test, not(any(unix, windows))))]
 fn same_file_identity(_left: &Path, _right: &Path) -> Result<bool> {
     bail!("file-identity comparison is unsupported on this platform")
 }
 
-#[cfg(target_os = "macos")]
-fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    const RENAME_EXCL: u32 = 0x0000_0004;
-    unsafe extern "C" {
-        fn renamex_np(
-            from: *const libc::c_char,
-            to: *const libc::c_char,
-            flags: u32,
-        ) -> libc::c_int;
-    }
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn atomic_move_without_replace(source: &AnchoredEntry, destination: &AnchoredEntry) -> Result<()> {
+    use std::os::fd::AsFd;
 
-    let source = CString::new(source.as_os_str().as_bytes()).context("source path contains NUL")?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .context("destination path contains NUL")?;
-    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
-    let result = unsafe { renamex_np(source.as_ptr(), destination.as_ptr(), RENAME_EXCL) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    const RENAME_NOREPLACE: libc::c_uint = 1;
-    let source = CString::new(source.as_os_str().as_bytes()).context("source path contains NUL")?;
-    let destination = CString::new(destination.as_os_str().as_bytes())
-        .context("destination path contains NUL")?;
-    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
-    }
+    rustix::fs::renameat_with(
+        source.parent.as_fd(),
+        &source.name,
+        destination.parent.as_fd(),
+        &destination.name,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)
+    .context("atomically moving file without replacement")
 }
 
 #[cfg(windows)]
-fn atomic_move_without_replace(source: &Path, destination: &Path) -> Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
+fn atomic_move_without_replace(source: &AnchoredEntry, destination: &AnchoredEntry) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
 
-    let source = windows_path(source, "source")?;
-    let destination = windows_path(destination, "destination")?;
+    use cap_std::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileRenameInfo, SetFileInformationByHandle, FILE_FLAG_OPEN_REPARSE_POINT, FILE_RENAME_INFO,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    const DELETE_ACCESS: u32 = 0x0001_0000;
+
+    let mut options = CapOpenOptions::new();
+    options
+        .access_mode(DELETE_ACCESS)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .follow(FollowSymlinks::No);
+    let source_file = source
+        .parent
+        .open_with(&source.name, &options)
+        .with_context(|| format!("opening move source {}", source.display()))?;
+    let metadata = source_file
+        .metadata()
+        .with_context(|| format!("reading move source {}", source.display()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        bail!("move source {} is not a regular file", source.display());
+    }
+
+    let destination_name = destination.name.encode_wide().collect::<Vec<_>>();
+    let file_name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
+    let info_size = file_name_offset
+        .checked_add(destination_name.len() * std::mem::size_of::<u16>())
+        .context("Windows rename buffer size overflow")?;
+    let mut buffer = vec![0_u64; info_size.div_ceil(std::mem::size_of::<u64>())];
+    let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    // SAFETY: `buffer` is aligned and large enough for FILE_RENAME_INFO plus
+    // the UTF-16 destination name, and all handles remain live for the call.
     let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
+        (*info).Anonymous.ReplaceIfExists = false;
+        (*info).RootDirectory = destination.parent.as_raw_handle() as _;
+        (*info).FileNameLength =
+            u32::try_from(destination_name.len() * 2).context("Windows rename name is too long")?;
+        std::ptr::copy_nonoverlapping(
+            destination_name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            destination_name.len(),
+        );
+        SetFileInformationByHandle(
+            source_file.as_raw_handle() as _,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(info_size).context("Windows rename buffer is too large")?,
         )
     };
-    if result != 0 {
-        Ok(())
-    } else {
+    if result == 0 {
         Err(std::io::Error::last_os_error()).context("atomically moving file without replacement")
+    } else {
+        Ok(())
     }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn atomic_move_without_replace(_source: &Path, _destination: &Path) -> Result<()> {
+fn atomic_move_without_replace(
+    _source: &AnchoredEntry,
+    _destination: &AnchoredEntry,
+) -> Result<()> {
     bail!("atomic no-replace move is unsupported on this platform")
 }
 
@@ -3282,7 +3660,10 @@ fn stage_direct_write(write: &mut PreparedDirectWrite<'_>) -> Result<()> {
     Ok(())
 }
 
-fn stage_contents(path: &Path, contents: &[u8]) -> Result<(ApprovedWritePaths, std::fs::File)> {
+fn stage_contents(
+    path: &AnchoredEntry,
+    contents: &[u8],
+) -> Result<(ApprovedWritePaths, std::fs::File)> {
     let (staged, mut file) = create_staging_file(path)?;
     let result = (|| -> Result<()> {
         maybe_fail_staging_write(path, &staged)?;
@@ -3351,6 +3732,11 @@ enum ConditionalWriteAction {
     ReplaceFifo {
         target: PathBuf,
     },
+    #[cfg(unix)]
+    SwapParentDirectory {
+        parent: PathBuf,
+        moved_parent: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -3373,6 +3759,34 @@ type EarlyStagingMoveHook = std::sync::Mutex<BTreeSet<PathBuf>>;
 
 #[cfg(test)]
 type DirectReadGrowthHook = std::sync::Mutex<BTreeMap<PathBuf, u64>>;
+
+#[cfg(test)]
+struct PreparedParentSwap {
+    moved_parent: PathBuf,
+    replacement: PreparedParentReplacement,
+}
+
+#[cfg(test)]
+enum PreparedParentReplacement {
+    Directory,
+    #[cfg(unix)]
+    Symlink(PathBuf),
+}
+
+#[cfg(test)]
+type PreparedParentSwapHook = std::sync::Mutex<BTreeMap<PathBuf, PreparedParentSwap>>;
+
+#[cfg(all(test, unix))]
+struct EvaluatedHomeSwap {
+    moved_home: PathBuf,
+    destination: PathBuf,
+}
+
+#[cfg(all(test, unix))]
+type EvaluatedHomeSwapHook = std::sync::Mutex<BTreeMap<PathBuf, EvaluatedHomeSwap>>;
+
+#[cfg(all(test, unix))]
+type EvaluatedHomeSymlinkSwapHook = std::sync::Mutex<BTreeMap<PathBuf, PathBuf>>;
 
 #[cfg(test)]
 enum RollbackSabotage {
@@ -3427,6 +3841,24 @@ fn early_staging_move_hook() -> &'static EarlyStagingMoveHook {
 #[cfg(test)]
 fn direct_read_growth_hook() -> &'static DirectReadGrowthHook {
     static HOOK: std::sync::OnceLock<DirectReadGrowthHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn prepared_parent_swap_hook() -> &'static PreparedParentSwapHook {
+    static HOOK: std::sync::OnceLock<PreparedParentSwapHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn evaluated_home_swap_hook() -> &'static EvaluatedHomeSwapHook {
+    static HOOK: std::sync::OnceLock<EvaluatedHomeSwapHook> = std::sync::OnceLock::new();
+    HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(all(test, unix))]
+fn evaluated_home_symlink_swap_hook() -> &'static EvaluatedHomeSymlinkSwapHook {
+    static HOOK: std::sync::OnceLock<EvaluatedHomeSymlinkSwapHook> = std::sync::OnceLock::new();
     HOOK.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
@@ -3488,6 +3920,129 @@ fn set_direct_read_growth(path: PathBuf, length: u64) {
         .lock()
         .expect("direct read growth hook lock poisoned")
         .insert(path, length);
+}
+
+#[cfg(test)]
+fn set_prepared_parent_swap(target: PathBuf, moved_parent: PathBuf) {
+    prepared_parent_swap_hook()
+        .lock()
+        .expect("prepared parent swap hook lock poisoned")
+        .insert(
+            target,
+            PreparedParentSwap {
+                moved_parent,
+                replacement: PreparedParentReplacement::Directory,
+            },
+        );
+}
+
+#[cfg(all(test, unix))]
+fn set_evaluated_home_swap(home: PathBuf, moved_home: PathBuf, destination: PathBuf) {
+    evaluated_home_swap_hook()
+        .lock()
+        .expect("evaluated home swap hook lock poisoned")
+        .insert(
+            home,
+            EvaluatedHomeSwap {
+                moved_home,
+                destination,
+            },
+        );
+}
+
+#[cfg(all(test, unix))]
+fn set_evaluated_home_symlink_swap(home: PathBuf, destination: PathBuf) {
+    evaluated_home_symlink_swap_hook()
+        .lock()
+        .expect("evaluated home symlink swap hook lock poisoned")
+        .insert(home, destination);
+}
+
+#[cfg(all(test, unix))]
+fn set_prepared_parent_symlink_swap(target: PathBuf, moved_parent: PathBuf, destination: PathBuf) {
+    prepared_parent_swap_hook()
+        .lock()
+        .expect("prepared parent swap hook lock poisoned")
+        .insert(
+            target,
+            PreparedParentSwap {
+                moved_parent,
+                replacement: PreparedParentReplacement::Symlink(destination),
+            },
+        );
+}
+
+#[cfg(test)]
+fn maybe_swap_prepared_parent(path: &AnchoredEntry) -> Result<()> {
+    let Some(swap) = prepared_parent_swap_hook()
+        .lock()
+        .expect("prepared parent swap hook lock poisoned")
+        .remove(path.as_ref())
+    else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .context("prepared parent swap target has no parent")?;
+    std::fs::rename(parent, &swap.moved_parent).with_context(|| {
+        format!(
+            "moving prepared parent {} to {}",
+            parent.display(),
+            swap.moved_parent.display()
+        )
+    })?;
+    match swap.replacement {
+        PreparedParentReplacement::Directory => std::fs::create_dir(parent)
+            .with_context(|| format!("creating replacement parent {}", parent.display()))?,
+        #[cfg(unix)]
+        PreparedParentReplacement::Symlink(destination) => {
+            std::os::unix::fs::symlink(&destination, parent).with_context(|| {
+                format!(
+                    "linking replacement parent {} to {}",
+                    parent.display(),
+                    destination.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_swap_prepared_parent(_path: &AnchoredEntry) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn maybe_swap_evaluated_home(home: &Path) -> Result<()> {
+    if let Some(destination) = evaluated_home_symlink_swap_hook()
+        .lock()
+        .expect("evaluated home symlink swap hook lock poisoned")
+        .remove(home)
+    {
+        std::fs::remove_file(home)?;
+        std::os::unix::fs::symlink(destination, home)?;
+        return Ok(());
+    }
+
+    let canonical_home = home
+        .canonicalize()
+        .with_context(|| format!("canonicalizing test home {}", home.display()))?;
+    let Some(swap) = evaluated_home_swap_hook()
+        .lock()
+        .expect("evaluated home swap hook lock poisoned")
+        .remove(&canonical_home)
+    else {
+        return Ok(());
+    };
+    std::fs::rename(&canonical_home, &swap.moved_home)?;
+    std::os::unix::fs::symlink(&swap.destination, &canonical_home)?;
+    Ok(())
+}
+
+#[cfg(not(all(test, unix)))]
+fn maybe_swap_evaluated_home(_home: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3649,18 +4204,19 @@ fn set_conditional_write_test_actions(trigger: PathBuf, actions: Vec<Conditional
 
 #[cfg(test)]
 fn replace_regular_final_component(target: &Path, contents: &[u8]) -> Result<()> {
-    let (staged, mut file) = create_staging_file(target)?;
+    let target = anchored_test_entry(target)?;
+    let (staged, mut file) = create_staging_file(&target)?;
     let result = (|| -> Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
         #[cfg(windows)]
-        match std::fs::remove_file(target) {
+        match std::fs::remove_file(&target) {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("removing replaced test target"),
         }
-        std::fs::rename(&staged, target)
+        std::fs::rename(&staged, &target)
             .with_context(|| format!("replacing final component {}", target.display()))
     })();
     if result.is_err() {
@@ -3749,6 +4305,22 @@ fn maybe_run_conditional_write_hook(path: &Path) -> Result<()> {
                         });
                     }
                 }
+                #[cfg(unix)]
+                ConditionalWriteAction::SwapParentDirectory {
+                    parent,
+                    moved_parent,
+                } => {
+                    std::fs::rename(&parent, &moved_parent).with_context(|| {
+                        format!(
+                            "moving prepared parent {} to {}",
+                            parent.display(),
+                            moved_parent.display()
+                        )
+                    })?;
+                    std::fs::create_dir(&parent).with_context(|| {
+                        format!("creating replacement parent {}", parent.display())
+                    })?;
+                }
             }
         }
     }
@@ -3798,6 +4370,7 @@ fn maybe_run_conditional_write_hook(path: &Path) -> Result<()> {
         .remove(path)
     {
         for (target, replacement) in actions {
+            let target = anchored_test_entry(&target)?;
             let (staged, mut file) = create_staging_file(&target)?;
             file.write_all(&replacement)?;
             file.sync_all()?;
@@ -3813,13 +4386,32 @@ fn maybe_run_conditional_write_hook(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+fn anchored_test_entry(path: &Path) -> Result<AnchoredEntry> {
+    let parent = path
+        .parent()
+        .context("test entry has no parent directory")?;
+    let name = path.file_name().context("test entry has no file name")?;
+    let directory = Dir::open_ambient_dir(parent, ambient_authority())
+        .with_context(|| format!("opening test parent {}", parent.display()))?;
+    Ok(AnchoredEntry::new(Arc::new(directory), parent, name))
+}
+
 #[cfg(not(windows))]
-fn replace_preserving_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+fn replace_preserving_target(
+    target: &AnchoredEntry,
+    staged: &AnchoredEntry,
+    displaced: &AnchoredEntry,
+) -> Result<()> {
     atomic_exchange_preserving_target(target, staged, displaced)
 }
 
 #[cfg(windows)]
-fn replace_preserving_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+fn replace_preserving_target(
+    target: &AnchoredEntry,
+    staged: &AnchoredEntry,
+    displaced: &AnchoredEntry,
+) -> Result<()> {
     atomic_move_without_replace(target, displaced)
         .with_context(|| format!("moving target {} to backup", target.display()))?;
     if let Err(error) = atomic_move_without_replace(staged, target) {
@@ -3835,12 +4427,20 @@ fn replace_preserving_target(target: &Path, staged: &Path, displaced: &Path) -> 
 }
 
 #[cfg(not(windows))]
-fn restore_displaced_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+fn restore_displaced_target(
+    target: &AnchoredEntry,
+    staged: &AnchoredEntry,
+    displaced: &AnchoredEntry,
+) -> Result<()> {
     atomic_exchange_preserving_target(target, displaced, staged)
 }
 
 #[cfg(windows)]
-fn restore_displaced_target(target: &Path, staged: &Path, displaced: &Path) -> Result<()> {
+fn restore_displaced_target(
+    target: &AnchoredEntry,
+    staged: &AnchoredEntry,
+    displaced: &AnchoredEntry,
+) -> Result<()> {
     atomic_move_without_replace(target, staged)
         .with_context(|| format!("moving Ward-owned target {} aside", target.display()))?;
     if let Err(error) = atomic_move_without_replace(displaced, target) {
@@ -3855,80 +4455,31 @@ fn restore_displaced_target(target: &Path, staged: &Path, displaced: &Path) -> R
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn atomic_exchange_preserving_target(
-    target: &Path,
-    replacement: &Path,
-    displaced: &Path,
+    target: &AnchoredEntry,
+    replacement: &AnchoredEntry,
+    displaced: &AnchoredEntry,
 ) -> Result<()> {
     if replacement != displaced {
-        bail!("macOS approved-write exchange requires a shared replacement/backup path");
+        bail!("approved-write exchange requires a shared replacement/backup path");
     }
-    const RENAME_SWAP: u32 = 0x0000_0002;
-    unsafe extern "C" {
-        fn renamex_np(
-            from: *const libc::c_char,
-            to: *const libc::c_char,
-            flags: u32,
-        ) -> libc::c_int;
-    }
+    use std::os::fd::AsFd;
 
-    let replacement = CString::new(replacement.as_os_str().as_bytes())
-        .context("replacement path contains NUL")?;
-    let target = CString::new(target.as_os_str().as_bytes()).context("target path contains NUL")?;
-    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
-    let result = unsafe { renamex_np(replacement.as_ptr(), target.as_ptr(), RENAME_SWAP) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("atomically exchanging approved target")
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn atomic_exchange_preserving_target(
-    target: &Path,
-    replacement: &Path,
-    displaced: &Path,
-) -> Result<()> {
-    if replacement != displaced {
-        bail!("Linux approved-write exchange requires a shared replacement/backup path");
-    }
-    const RENAME_EXCHANGE: libc::c_uint = 1 << 1;
-    let replacement = CString::new(replacement.as_os_str().as_bytes())
-        .context("replacement path contains NUL")?;
-    let target = CString::new(target.as_os_str().as_bytes()).context("target path contains NUL")?;
-    // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            replacement.as_ptr(),
-            libc::AT_FDCWD,
-            target.as_ptr(),
-            RENAME_EXCHANGE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error()).context("atomically exchanging approved target")
-    }
+    rustix::fs::renameat_with(
+        replacement.parent.as_fd(),
+        &replacement.name,
+        target.parent.as_fd(),
+        &target.name,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(std::io::Error::from)
+    .context("atomically exchanging approved target")
 }
 
 #[cfg(windows)]
-fn windows_path(path: &Path, label: &str) -> Result<Vec<u16>> {
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if wide.contains(&0) {
-        bail!("{label} path contains NUL");
-    }
-    wide.push(0);
-    Ok(wide)
-}
-
-#[cfg(windows)]
-fn failed_replace_displaced_target(displaced: &Path) -> bool {
-    match std::fs::symlink_metadata(displaced) {
+fn failed_replace_displaced_target(displaced: &AnchoredEntry) -> bool {
+    match displaced.parent.symlink_metadata(&displaced.name) {
         Ok(_) => true,
         Err(error) if error.kind() == ErrorKind::NotFound => false,
         Err(_) => true,
@@ -3936,25 +4487,28 @@ fn failed_replace_displaced_target(displaced: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn failed_replace_displaced_target(_displaced: &Path) -> bool {
+fn failed_replace_displaced_target(_displaced: &AnchoredEntry) -> bool {
     false
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn atomic_exchange_preserving_target(
-    _target: &Path,
-    _replacement: &Path,
-    _displaced: &Path,
+    _target: &AnchoredEntry,
+    _replacement: &AnchoredEntry,
+    _displaced: &AnchoredEntry,
 ) -> Result<()> {
     bail!("atomic approved-write exchange is unsupported on this platform")
 }
 
 #[cfg(windows)]
-fn approved_write_displaced_path(target: &Path, _staged: &Path) -> Result<PathBuf> {
+fn approved_write_displaced_path(
+    target: &AnchoredEntry,
+    _staged: &AnchoredEntry,
+) -> Result<AnchoredEntry> {
     // Windows needs a distinct, unpredictable no-replace backup path.
     for _ in 0..16 {
         let displaced = displaced_path(target);
-        match std::fs::symlink_metadata(&displaced) {
+        match displaced.parent.symlink_metadata(&displaced.name) {
             Err(err) if err.kind() == ErrorKind::NotFound => return Ok(displaced),
             Ok(_) => continue,
             Err(err) => {
@@ -3974,17 +4528,20 @@ fn approved_write_displaced_path(target: &Path, _staged: &Path) -> Result<PathBu
 }
 
 #[cfg(not(windows))]
-fn approved_write_displaced_path(_target: &Path, staged: &Path) -> Result<PathBuf> {
-    Ok(staged.to_path_buf())
+fn approved_write_displaced_path(
+    _target: &AnchoredEntry,
+    staged: &AnchoredEntry,
+) -> Result<AnchoredEntry> {
+    Ok(staged.clone())
 }
 
 #[cfg(windows)]
-fn displaced_path(path: &Path) -> PathBuf {
+fn displaced_path(path: &AnchoredEntry) -> AnchoredEntry {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy())
         .unwrap_or_default();
-    path.with_file_name(format!(".{name}.ward-displaced-{}", uuid::Uuid::new_v4()))
+    path.sibling(format!(".{name}.ward-displaced-{}", uuid::Uuid::new_v4()).into())
 }
 
 /// Create a fresh sibling staging file for an atomic write.
@@ -3992,14 +4549,38 @@ fn displaced_path(path: &Path) -> PathBuf {
 /// The staging path is intentionally unpredictable and opened with
 /// `create_new(true)` so a pre-planted symlink or hard link cannot be followed
 /// before the final rename commits the edit into the Gate-2-validated target.
-fn create_staging_file(path: &Path) -> Result<(PathBuf, std::fs::File)> {
+fn create_staging_file(path: &AnchoredEntry) -> Result<(AnchoredEntry, std::fs::File)> {
     for _ in 0..16 {
         let staged = staged_path(path);
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)
-        {
+        #[cfg(unix)]
+        let opened = {
+            use std::os::fd::AsFd;
+
+            rustix::fs::openat(
+                staged.parent.as_fd(),
+                &staged.name,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::CREATE
+                    | rustix::fs::OFlags::EXCL
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::from_raw_mode(0o666),
+            )
+            .map(std::fs::File::from)
+        };
+        #[cfg(not(unix))]
+        let opened = {
+            let mut options = CapOpenOptions::new();
+            options
+                .write(true)
+                .create_new(true)
+                .follow(FollowSymlinks::No);
+            staged
+                .parent
+                .open_with(&staged.name, &options)
+                .map(cap_std::fs::File::into_std)
+        };
+        match opened {
             Ok(file) => return Ok((staged, file)),
             Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
             Err(err) => {
@@ -4015,12 +4596,12 @@ fn create_staging_file(path: &Path) -> Result<(PathBuf, std::fs::File)> {
 }
 
 /// A randomized sibling staging path for an atomic write.
-fn staged_path(path: &Path) -> PathBuf {
+fn staged_path(path: &AnchoredEntry) -> AnchoredEntry {
     let name = path
         .file_name()
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
-    path.with_file_name(format!(".{name}.ward-staged-{}", uuid::Uuid::new_v4()))
+    path.sibling(format!(".{name}.ward-staged-{}", uuid::Uuid::new_v4()).into())
 }
 
 /// Re-create and verify the staging parent directory component-by-component,
@@ -4031,16 +4612,20 @@ fn staged_path(path: &Path) -> PathBuf {
 /// non-following) `create_dir` and then checked via `symlink_metadata` to be a
 /// real directory — so a component swapped for an escaping symlink after
 /// adjudication fails closed without creating anything outside the home.
-fn prepare_staging_parent(canonical_home: &Path, parent: &Path) -> Result<PathBuf> {
-    let rel = parent.strip_prefix(canonical_home).map_err(|_| {
+fn prepare_staging_parent(home: &AnchoredHome, parent: &Path) -> Result<AnchoredParent> {
+    let rel = parent.strip_prefix(&home.absolute).map_err(|_| {
         anyhow!(
             "staging parent `{}` is not under the familiar home `{}`",
             parent.display(),
-            canonical_home.display()
+            home.absolute.display()
         )
     })?;
 
-    let mut verified = canonical_home.to_path_buf();
+    let mut verified = home.absolute.clone();
+    let mut directory = home
+        .dir
+        .try_clone()
+        .with_context(|| format!("duplicating familiar home {}", home.absolute.display()))?;
     for component in rel.components() {
         let Component::Normal(part) = component else {
             bail!(
@@ -4050,39 +4635,122 @@ fn prepare_staging_parent(canonical_home: &Path, parent: &Path) -> Result<PathBu
         };
         verified.push(part);
 
-        match std::fs::symlink_metadata(&verified) {
-            Ok(meta) if meta.is_dir() => continue,
-            Ok(_) => bail!(
-                "staging parent component `{}` is not a real directory — refusing to \
-                 follow it outside the familiar home",
-                verified.display()
-            ),
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("verifying staging parent {}", verified.display()))
-            }
-        }
-
-        match std::fs::create_dir(&verified) {
-            Ok(()) => {}
-            // A concurrent apply may have created it; the re-check below rules.
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                return Err(err).with_context(|| format!("creating {}", verified.display()))
-            }
-        }
-        let meta = std::fs::symlink_metadata(&verified)
+        let exists = entry_is_directory_nofollow(&directory, part)
             .with_context(|| format!("verifying staging parent {}", verified.display()))?;
-        if !meta.is_dir() {
-            bail!(
-                "staging parent component `{}` is not a real directory — refusing to \
-                 follow it outside the familiar home",
-                verified.display()
-            );
+
+        if !exists {
+            match create_child_directory(&directory, part) {
+                Ok(()) => {}
+                // A concurrent apply may have created it; the re-check below rules.
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("creating {}", verified.display()))
+                }
+            }
+            let is_directory = entry_is_directory_nofollow(&directory, part)
+                .with_context(|| format!("verifying staging parent {}", verified.display()))?;
+            if !is_directory {
+                bail!(
+                    "staging parent component `{}` is not a real directory — refusing to \
+                     follow it outside the familiar home",
+                    verified.display()
+                );
+            }
+        }
+        directory = open_child_dir_nofollow(&directory, part)
+            .with_context(|| format!("opening staging parent {}", verified.display()))?;
+    }
+    Ok(AnchoredParent {
+        dir: Arc::new(directory),
+        absolute: verified,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn open_child_dir_nofollow(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    use std::os::fd::AsFd;
+
+    use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+
+    match openat2(
+        parent.as_fd(),
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => Ok(Dir::from_std_file(fd.into())),
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => parent.open_dir_nofollow(name),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_child_dir_nofollow(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        rustix::fs::openat(
+            parent.as_fd(),
+            name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .map(|fd| Dir::from_std_file(fd.into()))
+        .map_err(Into::into)
+    }
+    #[cfg(not(unix))]
+    {
+        parent.open_dir_nofollow(name)
+    }
+}
+
+fn entry_is_directory_nofollow(parent: &Dir, name: &OsStr) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        match rustix::fs::statat(parent.as_fd(), name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => {
+                if rustix::fs::FileType::from_raw_mode(metadata.st_mode)
+                    == rustix::fs::FileType::Directory
+                {
+                    Ok(true)
+                } else {
+                    bail!("staging parent component is not a real directory")
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
         }
     }
-    Ok(verified)
+    #[cfg(not(unix))]
+    {
+        match parent.symlink_metadata(name) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
+            Ok(_) => bail!("staging parent component is not a real directory"),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+fn create_child_directory(parent: &Dir, name: &OsStr) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+
+        rustix::fs::mkdirat(parent.as_fd(), name, rustix::fs::Mode::from_raw_mode(0o777))
+            .map_err(Into::into)
+    }
+    #[cfg(not(unix))]
+    {
+        parent.create_dir(name)
+    }
 }
 
 /// Lowercase hex SHA-256 of `bytes`.
@@ -4498,8 +5166,10 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn unix_approved_write_paths_reuse_staging_path_for_exchange() {
-        let staged = PathBuf::from(".SOUL.md.ward-staged-test");
-        let paths = ApprovedWritePaths::new(Path::new("SOUL.md"), staged.clone()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = anchored_test_entry(&tmp.path().join("SOUL.md")).unwrap();
+        let staged = target.sibling(".SOUL.md.ward-staged-test".into());
+        let paths = ApprovedWritePaths::new(&target, staged.clone()).unwrap();
 
         assert_eq!(paths.staged, staged);
         assert_eq!(paths.displaced, staged);
@@ -4509,8 +5179,8 @@ mod tests {
     #[test]
     fn windows_approved_write_paths_select_distinct_displaced_sibling() {
         let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("SOUL.md");
-        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
+        let target = anchored_test_entry(&tmp.path().join("SOUL.md")).unwrap();
+        let staged = target.sibling(".SOUL.md.ward-staged-test".into());
         let paths = ApprovedWritePaths::new(&target, staged.clone()).unwrap();
 
         assert_eq!(paths.staged, staged);
@@ -4529,8 +5199,8 @@ mod tests {
     #[test]
     fn windows_no_replace_commit_preserves_displaced_bytes_for_commit_and_rollback() {
         let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("SOUL.md");
-        let staged = tmp.path().join(".SOUL.md.ward-staged-test");
+        let target = anchored_test_entry(&tmp.path().join("SOUL.md")).unwrap();
+        let staged = target.sibling(".SOUL.md.ward-staged-test".into());
         fs::write(&target, b"old soul").unwrap();
         fs::write(&staged, b"new soul").unwrap();
         let paths = ApprovedWritePaths::new(&target, staged).unwrap();
@@ -4550,7 +5220,8 @@ mod tests {
     #[test]
     fn windows_partial_replace_state_requires_rollback_before_cleanup() {
         let tmp = tempfile::tempdir().unwrap();
-        let displaced = tmp.path().join(".SOUL.md.ward-displaced-test");
+        let displaced =
+            anchored_test_entry(&tmp.path().join(".SOUL.md.ward-displaced-test")).unwrap();
 
         assert!(!failed_replace_displaced_target(&displaced));
         fs::write(&displaced, b"old soul").unwrap();
@@ -6857,11 +7528,11 @@ formatter = "lenient"
         // SAFETY: `fifo_c` is a live, NUL-terminated pathname.
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o000) }, 0);
 
-        let fifo_path = fifo.clone();
+        let fifo_entry = anchored_test_entry(&fifo).unwrap();
         let error = run_fifo_operation_with_watchdog(
             &fifo,
             "opening a FIFO as a regular Ward target",
-            move || match open_regular_file_without_following_links(&fifo_path) {
+            move || match open_regular_file_without_following_links(&fifo_entry) {
                 Err(error) => error,
                 Ok(_) => panic!("FIFO metadata must be rejected before opening it"),
             },
@@ -6917,8 +7588,9 @@ formatter = "lenient"
             tier: Tier::Free,
             verdict: Verdict::Allow,
         };
+        let anchored_home = AnchoredHome::open(&canonical_home).unwrap();
         let err = write_direct_batch(
-            &canonical_home,
+            &anchored_home,
             &[FileEdit {
                 target: decision.target.clone(),
                 new_contents: b"leak".to_vec(),
@@ -6932,6 +7604,273 @@ formatter = "lenient"
         assert!(!outside.join("notes").exists());
         assert!(!outside.join("log.md").exists());
         assert_eq!(staging_litter(&outside), Vec::<String>::new());
+    }
+
+    #[test]
+    fn direct_write_stays_bound_to_parent_opened_before_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let parent = home.join("scratch/nested");
+        let moved_parent = home.join("scratch/nested-before-swap");
+        fs::create_dir_all(&parent).unwrap();
+
+        let target = parent.join("output.txt");
+        set_prepared_parent_swap(target.clone(), moved_parent.clone());
+
+        let result = ward_in(&home).apply(
+            &[FileEdit::new("scratch/nested/output.txt", b"safe".to_vec())],
+            &Authorization::unsigned(),
+        );
+
+        #[cfg(not(windows))]
+        {
+            let report = result.unwrap();
+            assert_eq!(report.changes.len(), 1);
+            assert!(!target.exists());
+            assert_eq!(fs::read(moved_parent.join("output.txt")).unwrap(), b"safe");
+            assert_eq!(staging_litter(&parent), Vec::<String>::new());
+        }
+        #[cfg(windows)]
+        {
+            result.expect_err("the retained Windows parent handle must block its rename");
+            assert!(!target.exists());
+            assert!(!moved_parent.exists());
+            assert_eq!(staging_litter(&parent), Vec::<String>::new());
+        }
+    }
+
+    #[test]
+    fn approved_write_stays_bound_to_parent_opened_before_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let parent = home.join("memory/nested");
+        let moved_parent = home.join("memory/nested-before-swap");
+        fs::create_dir_all(&parent).unwrap();
+        let target = parent.join("log.md");
+        fs::write(&target, b"before").unwrap();
+        set_prepared_parent_swap(target.clone(), moved_parent.clone());
+
+        let edit = FileEdit::new("memory/nested/log.md", b"after".to_vec());
+        let decision = Decision {
+            target: edit.target.clone(),
+            resolved: edit.target.clone(),
+            tier: Tier::Logged,
+            verdict: Verdict::Allow,
+        };
+        let anchored_home = AnchoredHome::open(&home).unwrap();
+        let result = write_atomically_if_unchanged(
+            &anchored_home,
+            std::slice::from_ref(&edit),
+            vec![decision],
+            &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
+            ApprovedApplyMode::Initial,
+        );
+
+        #[cfg(not(windows))]
+        {
+            let changes = result.unwrap();
+            assert_eq!(changes.len(), 1);
+            let expected_before_digest = sha256_hex(b"before");
+            assert_eq!(
+                changes[0]
+                    .audit
+                    .as_ref()
+                    .and_then(|audit| audit.prev_sha256.as_deref()),
+                Some(expected_before_digest.as_str())
+            );
+            assert_eq!(fs::read(moved_parent.join("log.md")).unwrap(), b"after");
+            assert!(!target.exists());
+            assert_eq!(staging_litter(&parent), Vec::<String>::new());
+        }
+        #[cfg(windows)]
+        {
+            result.expect_err("the retained Windows parent handle must block its rename");
+            assert_eq!(fs::read(&target).unwrap(), b"before");
+            assert!(!moved_parent.exists());
+            assert_eq!(staging_litter(&parent), Vec::<String>::new());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_write_does_not_follow_parent_symlink_installed_after_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let home = home.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        let parent = home.join("scratch/nested");
+        let moved_parent = home.join("scratch/nested-before-swap");
+        fs::create_dir_all(&parent).unwrap();
+
+        let target = parent.join("output.txt");
+        set_prepared_parent_symlink_swap(target, moved_parent.clone(), outside.clone());
+
+        let report = ward_in(&home)
+            .apply(
+                &[FileEdit::new("scratch/nested/output.txt", b"safe".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .unwrap();
+
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(fs::read(moved_parent.join("output.txt")).unwrap(), b"safe");
+        assert!(!outside.join("output.txt").exists());
+        assert_eq!(staging_litter(&outside), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_write_stays_bound_to_home_evaluated_before_root_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let moved_home = tmp.path().join("home-before-swap");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(home.join("scratch")).unwrap();
+        fs::create_dir_all(outside.join("scratch")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        set_evaluated_home_swap(home.clone(), moved_home.clone(), outside.clone());
+
+        let error = ward_in(&home)
+            .apply(
+                &[FileEdit::new("scratch/output.txt", b"safe".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed during Gate 2"));
+        assert!(!moved_home.join("scratch/output.txt").exists());
+        assert!(!outside.join("scratch/output.txt").exists());
+        assert_eq!(
+            staging_litter(&outside.join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_write_rejects_retargeted_symlink_home_after_gate2() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let original = tmp.path().join("original");
+        let outside = tmp.path().join("outside");
+        let configured = tmp.path().join("workspace");
+        fs::create_dir_all(original.join("scratch")).unwrap();
+        fs::create_dir_all(outside.join("scratch")).unwrap();
+        symlink(&original, &configured).unwrap();
+        set_evaluated_home_symlink_swap(configured.clone(), outside.clone());
+
+        let error = ward_in(&configured)
+            .apply(
+                &[FileEdit::new("scratch/output.txt", b"safe".to_vec())],
+                &Authorization::unsigned(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("changed during Gate 2"));
+        assert!(!original.join("scratch/output.txt").exists());
+        assert!(!outside.join("scratch/output.txt").exists());
+        assert_eq!(
+            staging_litter(&outside.join("scratch")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_write_stays_bound_to_home_evaluated_before_root_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let moved_home = tmp.path().join("home-before-swap");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(home.join("SOUL.md"), b"before").unwrap();
+        fs::write(outside.join("SOUL.md"), b"before").unwrap();
+        let home = home.canonicalize().unwrap();
+        let outside = outside.canonicalize().unwrap();
+        set_evaluated_home_swap(home.clone(), moved_home.clone(), outside.clone());
+        let edit = FileEdit::new("SOUL.md", b"after".to_vec());
+
+        let error = ward_in(&home)
+            .apply_after_threads_approval(
+                std::slice::from_ref(&edit),
+                &Authorization::signed_by("SHA256:principal-key"),
+                &BTreeMap::from([(edit.target.clone(), b"before".to_vec())]),
+                &resolved_as_target(std::slice::from_ref(&edit)),
+                ApprovedApplyMode::Initial,
+            )
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("changed during Gate 2"));
+        assert_eq!(fs::read(moved_home.join("SOUL.md")).unwrap(), b"before");
+        assert_eq!(fs::read(outside.join("SOUL.md")).unwrap(), b"before");
+        assert_eq!(staging_litter(&outside), Vec::<String>::new());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn direct_rollback_stays_bound_to_parent_renamed_before_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let parent = home.join("memory/nested");
+        let moved_parent = home.join("memory/nested-before-swap");
+        fs::create_dir_all(&parent).unwrap();
+        let first = parent.join("first.md");
+        let second = parent.join("second.md");
+        fs::write(&first, b"before").unwrap();
+
+        set_conditional_write_test_actions(
+            first.clone(),
+            vec![ConditionalWriteAction::SwapParentDirectory {
+                parent: parent.clone(),
+                moved_parent: moved_parent.clone(),
+            }],
+        );
+        set_conditional_write_test_actions(
+            second.clone(),
+            vec![ConditionalWriteAction::ReplaceRegular {
+                target: moved_parent.join("second.md"),
+                contents: b"concurrent".to_vec(),
+            }],
+        );
+
+        let error = ward_in(&home)
+            .apply(
+                &[
+                    FileEdit::new("memory/nested/first.md", b"after".to_vec()),
+                    FileEdit::new("memory/nested/second.md", b"ward".to_vec()),
+                ],
+                &Authorization::unsigned(),
+            )
+            .expect_err("the second target must force rollback");
+
+        assert!(
+            matches!(
+                direct_apply_failure(&error),
+                Some(DirectApplyFailure::RolledBack)
+            ),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(fs::read(moved_parent.join("first.md")).unwrap(), b"before");
+        assert_eq!(
+            fs::read(moved_parent.join("second.md")).unwrap(),
+            b"concurrent"
+        );
+        assert!(!first.exists());
+        assert!(!second.exists());
+        assert_eq!(staging_litter(&moved_parent), Vec::<String>::new());
+        assert_eq!(staging_litter(&parent), Vec::<String>::new());
     }
 
     const EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX: u64 = 16 * 1024 * 1024;

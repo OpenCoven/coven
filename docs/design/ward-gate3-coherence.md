@@ -169,16 +169,28 @@ with evidence:
   stage through the *authority* lane as a unit, exactly as today; the
   coherence lane only takes proposals whose sole hold reason is Tier-1
   review.
-- Staging-write hardening invariants (randomized `create_new` staging and
-  `prepare_staging_parent` no-follow walk) remain intact. Approval uses the
-  conditional atomic writer, including no-replace creation and rollback that
-  preserves concurrent bytes. A first apply must still observe the exact
-  reviewed before-image even when a concurrent writer produced identical
-  after-bytes; only a durable crash-recovery intent may accept already-applied
-  bytes. A clean pre-write failure or proven rollback removes that recovery
-  state, so a retry cannot promote concurrent bytes into an idempotent apply.
-  Recovery also persists the Gate-2-resolved surface, and the Ward's final
-  adjudication must match that binding before it writes.
+- Staging-write hardening invariants (randomized create-new staging and
+  no-follow parent traversal) remain intact. The resolved parent is retained as
+  a directory handle, and approval routes target opens, staging, commit,
+  verification, rollback, and cleanup through sibling names relative to that
+  handle. Linux uses `openat2` beneath/no-symlink resolution with a
+  one-component `openat` fallback; macOS uses `*at` operations; Windows retains
+  non-share-delete directory handles and handle-relative no-replace moves.
+  Approval still uses the conditional atomic writer, including no-replace
+  creation and rollback that preserves concurrent bytes. A first apply must
+  still observe the exact reviewed before-image even when a concurrent writer
+  produced identical after-bytes; only a durable crash-recovery intent may
+  accept already-applied bytes. A clean pre-write failure or proven rollback
+  removes that recovery state, so a retry cannot promote concurrent bytes into
+  an idempotent apply. Recovery also persists the Gate-2-resolved surface, and
+  the Ward's final adjudication must match that binding before it writes.
+- Gate 2 and mutation share one retained familiar-root handle. The configured
+  workspace spelling is re-resolved immediately before mutation as well, so
+  retargeting an initially symlinked workspace fails closed.
+- Retained directory handles do not create a POSIX conditional-unlink
+  primitive. Cleanup still revalidates retained identity and bytes immediately
+  before `unlinkat`, but the final same-privilege verify-to-unlink interval is
+  inherited from #911 and tracked separately by #924.
 - `ward_audit` stays append-only with existing event tags; probe evidence
   rides in existing text columns. Logged edits carried in an approved proposal
   append their Gate-4 `apply_audit` rows in the same database transaction as

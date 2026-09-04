@@ -77,6 +77,42 @@ The `directBatch*` detail labels remain for API compatibility but apply to
 every Ward tier and to approved/recovered proposals. Repeating the unchanged
 request or approval returns the same error.
 
+## Directory-handle write boundary
+
+After Gate 2 resolves a target, Ward opens its parent one normalized component
+at a time without following symlinks. The retained parent handle, not the
+display pathname, authorizes every later target open, staging-file creation,
+hard-link install, exchange, rollback capture, identity check, and cleanup.
+Renaming a parent and replacing its old pathname therefore cannot redirect a
+write or leave Ward artifacts in the replacement directory.
+
+Ward also retains the configured familiar-home spelling as part of this
+binding. If that spelling was a symlink and is retargeted during Gate 2, or if
+the named root is otherwise replaced, the pre-write recheck fails and no target
+is mutated.
+
+- **Linux:** parent and target opens use `openat2` with `RESOLVE_BENEATH`,
+  `RESOLVE_NO_MAGICLINKS`, and `RESOLVE_NO_SYMLINKS`. On kernels without
+  `openat2`, Ward falls back to one-component `openat` calls with `O_NOFOLLOW`;
+  subsequent mutations remain relative to the retained descriptor.
+- **macOS:** Ward uses descriptor-relative `openat`, `fstatat`, `linkat`,
+  `unlinkat`, and `renameatx_np` operations. If an opened parent is renamed,
+  the transaction continues against that original directory object rather
+  than the replacement pathname.
+- **Windows:** parent directories are retained without delete sharing, so a
+  concurrent rename fails while a transaction owns the handle. Entries are
+  opened without following reparse points, and no-replace moves name the
+  destination relative to the retained directory handle.
+
+Absolute paths remain in errors and audit-facing diagnostics only. Final-entry
+replacement is still handled by the retained inode/file-ID and exact-content
+checks: unproven ownership produces the existing typed ambiguous or cleanup
+failure outcome rather than deletion. On Unix, `unlinkat` cannot condition the
+final removal on an already-open inode. A same-privilege replacement in the
+interval after the last ownership check is therefore a separate inherited
+cleanup limitation tracked by #924; #912 closes ancestor and root redirection,
+not that POSIX primitive gap.
+
 ## Pending proposals
 
 Two lanes stage here, distinguished by `reviewKind`:
