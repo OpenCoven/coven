@@ -340,6 +340,10 @@ def validate_scorecard(
                 errors.append(f"{prefix} target status requires a target")
             if row["value"] is not None:
                 errors.append(f"{prefix} target row requires a null current value")
+        if status in ("Not yet measured", "Target/SLO") and row[
+            "evidenceRef"
+        ] is not None:
+            errors.append(f"{prefix} evidenceRef must be null for status {status}")
 
         evidence_ref = row["evidenceRef"]
         if evidence_ref is not None and not isinstance(evidence_ref, str):

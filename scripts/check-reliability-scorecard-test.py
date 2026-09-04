@@ -201,6 +201,20 @@ class ReliabilityScorecardTests(unittest.TestCase):
         self.assertTrue(any("named owner" in error for error in errors))
         self.assertTrue(any("null value" in error for error in errors))
 
+    def test_unmeasured_and_target_rows_require_null_evidence_refs(self) -> None:
+        data = self.canonical_data()
+        row = next(row for row in data["rows"] if row["status"] == "Not yet measured")
+        row["evidenceRef"] = "README.md"
+        errors = self.validate(data, markdown=self.checker().render_scorecard(data))
+        self.assertTrue(any("evidenceRef must be null for status" in error for error in errors))
+
+        row["status"] = "Target/SLO"
+        row["evidenceKind"] = "target"
+        row["target"] = 0
+        row["evidenceRef"] = ""
+        errors = self.validate(data, markdown=self.checker().render_scorecard(data))
+        self.assertTrue(any("evidenceRef must be null for status" in error for error in errors))
+
     def test_thresholds_require_an_explicit_breach_action(self) -> None:
         data = self.canonical_data()
         row = data["rows"][0]
