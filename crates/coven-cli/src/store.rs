@@ -1401,6 +1401,22 @@ impl<'a> WardAuditReservation<'a> {
             !reservation_token.trim().is_empty(),
             "Ward audit reservation token is empty"
         );
+        let active_token: Option<String> = conn
+            .query_row(
+                "SELECT token
+                 FROM temp.coven_active_ward_audit_reservation
+                 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read active Ward audit reservation")?;
+        anyhow::ensure!(
+            active_token
+                .as_deref()
+                .is_none_or(|active| active == reservation_token),
+            "a different Ward audit reservation is already active on this connection"
+        );
 
         let checkpoint = |mode: &str| {
             conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |row| {
@@ -6927,6 +6943,39 @@ END;
             Some(r#"{"kind":"ssh","host":"executor.internal"}"#)
         );
         assert_eq!(record.last_error.as_deref(), Some("connection refused"));
+        Ok(())
+    }
+
+    #[test]
+    fn second_active_ward_audit_reservation_on_one_connection_is_rejected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
+        let first = WardAuditReservation::acquire(&conn, &path, "first", "first-test", required)?;
+
+        let error =
+            match WardAuditReservation::acquire(&conn, &path, "second", "second-test", required) {
+                Ok(reservation) => {
+                    reservation.preserve()?;
+                    anyhow::bail!("second active reservation on one connection was accepted")
+                }
+                Err(error) => error,
+            };
+        assert!(error
+            .to_string()
+            .contains("a different Ward audit reservation is already active"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = 'second'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+
+        first.finish()?;
         Ok(())
     }
 
