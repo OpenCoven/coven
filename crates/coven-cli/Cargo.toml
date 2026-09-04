@@ -68,6 +68,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 unicode-width = "0.2"
 textwrap = "0.16"
 unicode-casefold = "0.2.0"
+chrono-tz = "0.10.4"
+iana-time-zone = "0.1.65"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

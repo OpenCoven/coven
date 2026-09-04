@@ -111,6 +111,16 @@ pub struct ImportedDefinitionEventInput<'a> {
     pub observed_at: &'a str,
 }
 
+pub struct MigratedDefinitionEventInput<'a> {
+    pub automation_id: &'a str,
+    pub revision: u64,
+    pub definition_digest: Option<&'a str>,
+    pub lifecycle_state: &'a str,
+    pub migration: &'a str,
+    pub recorded_at: &'a str,
+    pub observed_at: &'a str,
+}
+
 #[derive(Debug)]
 pub enum EventStoreError {
     Sqlite(rusqlite::Error),
@@ -403,6 +413,35 @@ pub fn append_imported_definition_event(
             lifecycle_state: input.lifecycle_state,
             adoption_key: None,
             imported_from: Some(input.imported_from),
+            recorded_at: input.recorded_at,
+            observed_at: input.observed_at,
+        },
+    )
+}
+
+pub fn append_migrated_definition_event(
+    conn: &Connection,
+    input: MigratedDefinitionEventInput<'_>,
+) -> Result<EventRef> {
+    let preimage = format!(
+        "definition.revised\0{}\0{}\0{}\0{}",
+        input.automation_id,
+        input.revision,
+        input.definition_digest.unwrap_or(""),
+        input.migration
+    );
+    let digest = super::canonical_json::sha256_hex(preimage.as_bytes());
+    append_definition_lifecycle_event(
+        conn,
+        DefinitionLifecycleEventInput {
+            event_id: &format!("evt{}", &digest[..32]),
+            event_kind: "definition.revised",
+            automation_id: input.automation_id,
+            revision: input.revision,
+            definition_digest: input.definition_digest,
+            lifecycle_state: input.lifecycle_state,
+            adoption_key: None,
+            imported_from: None,
             recorded_at: input.recorded_at,
             observed_at: input.observed_at,
         },

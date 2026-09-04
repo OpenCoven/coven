@@ -209,6 +209,47 @@ mod tests {
     }
 
     #[test]
+    fn schedule_timezone_accepts_iana_and_refuses_legacy_local() {
+        let mut iana = fixture("definition.golden");
+        iana["trigger"]["schedule"]["timezone"] = json!("America/New_York");
+        let iana = with_definition_integrity(iana);
+        assert_round_trip::<AutomationDefinition>(iana);
+
+        let mut local = fixture("definition.golden");
+        local["trigger"]["schedule"]["timezone"] = json!("local");
+        let local = with_definition_integrity(local);
+        assert!(serde_json::from_value::<AutomationDefinition>(local).is_err());
+    }
+
+    #[test]
+    fn published_timezone_vectors_match_scheduler_behavior() {
+        for vector in vectors()["timezoneVectors"].as_array().unwrap() {
+            let timezone =
+                serde_json::from_value::<crate::automations::definition::RoutineTimezone>(
+                    vector["timezone"].clone(),
+                )
+                .unwrap();
+            let from = chrono::DateTime::parse_from_rfc3339(vector["from"].as_str().unwrap())
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            let expected =
+                chrono::DateTime::parse_from_rfc3339(vector["expected"].as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc);
+
+            let actual = crate::automations::schedule::next_due(
+                vector["rrule"].as_str().unwrap(),
+                timezone,
+                from,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(actual, expected, "{}", vector["name"]);
+        }
+    }
+
+    #[test]
     fn every_error_code_has_its_frozen_http_status() {
         let expected = [
             (ErrorCode::SchemaVersionUnsupported, 400),

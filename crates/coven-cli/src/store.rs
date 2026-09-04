@@ -1014,6 +1014,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation events schema")?;
     crate::automations::contract::events::backfill_definition_event_baselines(conn)
         .context("failed to backfill automation definition event baselines")?;
+    crate::automations::store::migrate_durable_local_timezones(conn)?;
 
     backfill_events_fts_if_needed(conn)?;
 

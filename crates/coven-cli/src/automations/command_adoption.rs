@@ -153,7 +153,13 @@ pub fn execute_definition_command(
     }
 
     let (command_name, automation_id) = command_identity(&command);
-    let mut response = apply_command(&transaction, command, adopted_at)?;
+    let effective_adopted_at = match automation_id.as_deref() {
+        Some(automation_id) => {
+            super::store::monotonic_definition_timestamp(&transaction, automation_id, adopted_at)?
+        }
+        None => adopted_at.to_owned(),
+    };
+    let mut response = apply_command(&transaction, command, &effective_adopted_at)?;
     if response.mutation_committed {
         if let (Some(automation_id), Some(revision)) = (automation_id.as_deref(), response.revision)
         {
@@ -176,7 +182,7 @@ pub fn execute_definition_command(
                     definition_digest: record.definition_digest.as_deref(),
                     lifecycle_state,
                     adoption_key: adoption_key.as_str(),
-                    observed_at: adopted_at,
+                    observed_at: &effective_adopted_at,
                 },
             )?);
         }
@@ -214,7 +220,7 @@ pub fn execute_definition_command(
                 stored_revision,
                 serde_json::to_string(&stored)
                     .context("failed to serialize automation command outcome")?,
-                adopted_at,
+                effective_adopted_at,
             ],
         )
         .context("failed to persist automation command adoption")?;
@@ -525,7 +531,9 @@ fn apply_legacy_create(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_legacy_json(definition_value) {
+    let definition = match RoutineDefinition::from_legacy_json(definition_value)
+        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
+    {
         Ok(definition) => definition,
         Err(error) => {
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
@@ -626,7 +634,9 @@ fn apply_legacy_revise(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_legacy_json(definition_value) {
+    let definition = match RoutineDefinition::from_legacy_json(definition_value)
+        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
+    {
         Ok(definition) => definition,
         Err(error) => {
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
@@ -748,7 +758,9 @@ fn apply_create(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_json(definition_value) {
+    let definition = match RoutineDefinition::from_json(definition_value)
+        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
+    {
         Ok(definition) => definition,
         Err(error) => {
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
@@ -800,7 +812,9 @@ fn apply_revise(
     expected_revision: Option<u64>,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_json(definition_value) {
+    let definition = match RoutineDefinition::from_json(definition_value)
+        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
+    {
         Ok(definition) => definition,
         Err(error) => {
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
@@ -1219,6 +1233,61 @@ mod tests {
     }
 
     #[test]
+    fn local_compatibility_input_is_resolved_before_commit() {
+        let (_temp, conn) = temp_store();
+
+        let response = execute_definition_command(
+            &conn,
+            "adopt:create:local-normalized:0001",
+            DefinitionCommand::Create {
+                definition: definition("local-normalized", "Local normalized"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.outcome, DefinitionCommandOutcome::Committed);
+        let record = get_definition(&conn, "local-normalized").unwrap().unwrap();
+        let stored: Value = serde_json::from_str(&record.definition_json).unwrap();
+        assert_ne!(stored["timezone"], "local");
+        assert_eq!(
+            response.result.unwrap()["routine"]["timezone"],
+            stored["timezone"]
+        );
+    }
+
+    #[test]
+    fn unknown_iana_timezone_is_a_durable_validation_rejection() {
+        let (_temp, conn) = temp_store();
+        let mut invalid = definition("invalid-timezone", "Invalid timezone");
+        invalid["timezone"] = json!("Mars/Olympus");
+
+        let response = execute_definition_command(
+            &conn,
+            "adopt:create:invalid-timezone:0001",
+            DefinitionCommand::Create {
+                definition: invalid,
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            response.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::ValidationFailed)
+        );
+        assert!(response
+            .error
+            .unwrap()
+            .message
+            .as_str()
+            .contains("valid IANA timezone"));
+        assert!(get_definition(&conn, "invalid-timezone").unwrap().is_none());
+        assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[test]
     fn committed_definition_command_appends_one_typed_event_and_replay_appends_none() {
         let (_temp, conn) = temp_store();
         let command = DefinitionCommand::Create {
@@ -1540,6 +1609,148 @@ mod tests {
         let stored = get_definition(&conn, "daily").unwrap().unwrap();
         assert_eq!(stored.name, "Revised");
         assert_eq!(stored.revision, 2);
+    }
+
+    #[test]
+    fn backward_clock_revision_keeps_a_monotonic_effective_timestamp() {
+        let (_temp, conn) = temp_store();
+        execute_definition_command(
+            &conn,
+            "adopt:create:clock-regression:0001",
+            DefinitionCommand::Create {
+                definition: definition("clock-regression", "Clock regression"),
+            },
+            "2026-09-03T12:00:00.000Z",
+        )
+        .unwrap();
+        let mut revised = definition("clock-regression", "Clock regression revised");
+        revised["rrule"] = json!("FREQ=DAILY;BYHOUR=11");
+
+        let response = execute_definition_command(
+            &conn,
+            "adopt:revise:clock-regression:0002",
+            DefinitionCommand::Revise {
+                definition: revised,
+                expected_revision: Some(1),
+            },
+            "2026-09-03T10:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.outcome, DefinitionCommandOutcome::Committed);
+        let (updated_at, adoption_at): (String, String) = conn
+            .query_row(
+                "SELECT definition.updated_at, adoption.adopted_at
+                 FROM automation_definitions AS definition
+                 JOIN automation_command_adoptions AS adoption
+                   ON adoption.automation_id = definition.id
+                  AND adoption.revision = definition.revision
+                 WHERE definition.id = 'clock-regression'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(updated_at, "2026-09-03T12:00:00.000Z");
+        assert_eq!(adoption_at, updated_at);
+        let revised_event: Value = conn
+            .query_row(
+                "SELECT event_json
+                 FROM automation_events
+                 WHERE stream_kind = 'automation'
+                   AND stream_id = 'clock-regression'
+                   AND sequence = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|event| serde_json::from_str(&event).unwrap())
+            .unwrap();
+        assert_eq!(revised_event["recordedAt"], updated_at);
+        assert_eq!(revised_event["observedAt"], updated_at);
+    }
+
+    #[test]
+    fn revision_timestamp_does_not_precede_the_latest_historical_event() {
+        let (_temp, conn) = temp_store();
+        let body = definition("event-clock-regression", "Event clock regression");
+        let definition: RoutineDefinition = RoutineDefinition::from_json(&body)
+            .unwrap()
+            .resolve_timezone_for_persistence()
+            .unwrap();
+        let definition_json = serde_json::to_string(&definition).unwrap();
+        let digest =
+            super::super::contract::migration::definition_digest(&definition_json).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
+             ) VALUES (
+                'event-clock-regression', 'Event clock regression', 'PAUSED', ?1, 1, ?2,
+                'paused', NULL, 1, '2026-09-03T10:00:00.000Z', '2026-09-03T10:00:00.000Z'
+             )",
+            params![definition_json, digest],
+        )
+        .unwrap();
+        super::super::contract::events::append_imported_definition_event(
+            &conn,
+            super::super::contract::events::ImportedDefinitionEventInput {
+                automation_id: "event-clock-regression",
+                revision: 1,
+                definition_digest: Some(&digest),
+                lifecycle_state: "paused",
+                imported_from: "legacy-coven-store",
+                recorded_at: "2026-09-03T12:00:00.000Z",
+                observed_at: "2026-09-03T10:00:00.000Z",
+            },
+        )
+        .unwrap();
+        super::super::contract::events::append_migrated_definition_event(
+            &conn,
+            super::super::contract::events::MigratedDefinitionEventInput {
+                automation_id: "event-clock-regression",
+                revision: 1,
+                definition_digest: Some(&digest),
+                lifecycle_state: "paused",
+                migration: "pre-fix-clock-regression",
+                recorded_at: "2026-09-03T10:00:00.000Z",
+                observed_at: "2026-09-03T10:00:00.000Z",
+            },
+        )
+        .unwrap();
+        let mut revised = body;
+        revised["name"] = json!("Event clock regression revised");
+
+        execute_definition_command(
+            &conn,
+            "adopt:revise:event-clock-regression:0002",
+            DefinitionCommand::Revise {
+                definition: revised,
+                expected_revision: Some(1),
+            },
+            "2026-09-03T11:00:00.000Z",
+        )
+        .unwrap();
+
+        let updated_at: String = conn
+            .query_row(
+                "SELECT updated_at FROM automation_definitions
+                 WHERE id = 'event-clock-regression'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, "2026-09-03T12:00:00.000Z");
+        let event: Value = conn
+            .query_row(
+                "SELECT event_json FROM automation_events
+                 WHERE stream_kind = 'automation'
+                   AND stream_id = 'event-clock-regression'
+                  AND sequence = 2",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map(|event| serde_json::from_str(&event).unwrap())
+            .unwrap();
+        assert_eq!(event["recordedAt"], updated_at);
     }
 
     #[test]

@@ -269,6 +269,8 @@ prompt = "Do the legacy thing."
             .unwrap()
             .unwrap();
         assert_eq!(record.status, "PAUSED");
+        let stored: serde_json::Value = serde_json::from_str(&record.definition_json).unwrap();
+        assert_ne!(stored["timezone"], "local");
         let event: String = conn
             .query_row(
                 "SELECT event_json FROM automation_events

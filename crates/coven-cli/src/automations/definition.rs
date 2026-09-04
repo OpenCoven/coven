@@ -5,7 +5,8 @@
 //! are the source of truth for identity and lifecycle; execution state lives
 //! in the occurrence ledger, not here (coven#816).
 
-use serde::{Deserialize, Serialize};
+use chrono_tz::Tz;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use super::rrule::{parse_rrule, ParsedRrule};
@@ -25,11 +26,108 @@ pub enum RoutineStatus {
     Paused,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineTimezone {
+    /// Compatibility input only. Durable definitions must resolve this to an
+    /// exact IANA zone before they are stored.
     Local,
     Utc,
+    Iana(Tz),
+}
+
+impl RoutineTimezone {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "utc" => Ok(Self::Utc),
+            value => value.parse::<Tz>().map(Self::Iana).map_err(|_| {
+                format!(
+                    "timezone must be `utc`, compatibility input `local`, or a valid IANA timezone, got `{value}`"
+                )
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Utc => "utc",
+            Self::Iana(timezone) => timezone.name(),
+        }
+    }
+
+    pub fn resolve_for_persistence(self) -> Result<Self, String> {
+        if self != Self::Local {
+            return Ok(self);
+        }
+        #[cfg(unix)]
+        match std::env::var("TZ") {
+            Ok(value) => {
+                let timezone = Self::parse(&value).map_err(|_| {
+                    format!("TZ override must be `utc` or an exact IANA timezone, got `{value}`")
+                })?;
+                if timezone == Self::Local {
+                    return Err(
+                        "TZ override must resolve to `utc` or an exact IANA timezone, not `local`"
+                            .to_string(),
+                    );
+                }
+                return Ok(timezone);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(
+                    "TZ override must be valid UTF-8 naming `utc` or an exact IANA timezone"
+                        .to_string(),
+                );
+            }
+        }
+        self.resolve_local_with(|| {
+            iana_time_zone::get_timezone()
+                .map_err(|error| format!("could not determine the system IANA timezone: {error}"))
+        })
+    }
+
+    pub(crate) fn resolve_local_with(
+        self,
+        resolver: impl FnOnce() -> Result<String, String>,
+    ) -> Result<Self, String> {
+        if self != Self::Local {
+            return Ok(self);
+        }
+        let resolved = resolver()?;
+        let timezone = Self::parse(&resolved)?;
+        if timezone == Self::Local {
+            return Err(
+                "system timezone resolver returned `local` instead of an exact IANA timezone"
+                    .to_string(),
+            );
+        }
+        Ok(timezone)
+    }
+
+    pub fn is_durable(self) -> bool {
+        self != Self::Local
+    }
+}
+
+impl Serialize for RoutineTimezone {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RoutineTimezone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,6 +275,22 @@ impl RoutineDefinition {
         Ok(())
     }
 
+    pub fn validate_durable(&self) -> Result<(), String> {
+        self.validate()?;
+        if !self.timezone.is_durable() {
+            return Err(
+                "timezone `local` is compatibility input only and must resolve to an exact IANA timezone before persistence"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolve_timezone_for_persistence(mut self) -> Result<Self, String> {
+        self.timezone = self.timezone.resolve_for_persistence()?;
+        Ok(self)
+    }
+
     /// Normalized wire form (camelCase, schema stamped) used by list/get.
     #[allow(dead_code)]
     pub fn to_json(&self) -> Value {
@@ -213,6 +327,92 @@ mod tests {
         assert_eq!(definition.status, RoutineStatus::Paused);
         assert_eq!(definition.timezone, RoutineTimezone::Local);
         assert_eq!(definition.timeout_minutes, 30);
+    }
+
+    #[test]
+    fn accepts_a_valid_iana_timezone() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("timezone".to_string(), json!("America/New_York"));
+
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(definition).unwrap()["timezone"],
+            "America/New_York"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_iana_timezone() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("timezone".to_string(), json!("Mars/Olympus"));
+
+        let error = RoutineDefinition::from_json(&value).unwrap_err();
+
+        assert!(error.contains("valid IANA timezone"), "{error}");
+    }
+
+    #[test]
+    fn local_resolution_fails_explicitly_when_the_platform_cannot_prove_a_zone() {
+        let error = RoutineTimezone::Local
+            .resolve_local_with(|| Err("platform did not provide a TZID".to_string()))
+            .unwrap_err();
+
+        assert_eq!(error, "platform did not provide a TZID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_rejects_an_unrepresentable_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_rejects_an_unrepresentable_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let error = RoutineTimezone::Local
+                .resolve_for_persistence()
+                .unwrap_err();
+            assert!(error.contains("TZ"), "{error}");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", ":/tmp/coven-custom-zoneinfo")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_prefers_an_iana_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_IANA_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_prefers_an_iana_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let timezone = RoutineTimezone::Local.resolve_for_persistence().unwrap();
+            assert_eq!(timezone.as_str(), "Pacific/Kiritimati");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Pacific/Kiritimati")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
     }
 
     #[test]
