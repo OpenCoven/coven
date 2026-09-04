@@ -771,13 +771,13 @@ pub(crate) fn persist_apply_audit_records_on_connection(
     if report.audit_records().next().is_none() {
         return Ok(());
     }
-    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
     let owns_transaction = conn.is_autocommit();
     if owns_transaction {
         conn.execute_batch("BEGIN IMMEDIATE")
             .context("starting apply-audit batch transaction")?;
     }
     let result = (|| -> Result<()> {
+        let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
         append_apply_audit_records(
             conn,
             None,
