@@ -23,6 +23,57 @@ pub const RUNTIME_AUTHORITY_CAPABILITY: &str = "automations.runtime-authority.v1
 
 const BINDING_DOMAIN: &[u8] = b"opencoven:coven-automations-authority-binding:v1";
 const RECEIPT_DOMAIN: &[u8] = b"opencoven:coven-automations-authority-receipt-evidence:v1";
+const AUTHORITY_EXTENSION_FIELDS: [&str; 4] =
+    ["profile", "kind", "executionBinding", "receiptEvidence"];
+const EXECUTION_BINDING_FIELDS: [&str; 19] = [
+    "profile",
+    "kind",
+    "bindingId",
+    "base",
+    "principal",
+    "authorization",
+    "familiar",
+    "contextProjection",
+    "threads",
+    "capabilities",
+    "approval",
+    "risk",
+    "runtime",
+    "versions",
+    "decisionTimestamp",
+    "producer",
+    "privacy",
+    "integrity",
+    "authentication",
+];
+const RECEIPT_EVIDENCE_FIELDS: [&str; 26] = [
+    "profile",
+    "kind",
+    "receiptId",
+    "automationId",
+    "automationRevision",
+    "definitionDigest",
+    "occurrenceId",
+    "occurrenceFenceGeneration",
+    "runId",
+    "attemptId",
+    "attemptNumber",
+    "baseReceiptDigest",
+    "bindingId",
+    "bindingDigest",
+    "principalId",
+    "familiar",
+    "authorization",
+    "capabilities",
+    "approval",
+    "risk",
+    "runtime",
+    "decisionTimestamp",
+    "producer",
+    "privacy",
+    "integrity",
+    "authentication",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityConsumerClass {
@@ -270,16 +321,15 @@ pub fn validate_authority_profile(
             ));
         }
     }
+    if let Some(field) = unknown_top_level_authority_field(value) {
+        return Err(AuthorityProfileError::new(
+            AuthorityProfileErrorCode::SchemaUnknownField,
+            format!("unknown top-level authority field {field}"),
+        ));
+    }
     let extension: AutomationAuthorityExtension =
         serde_json::from_value(value.clone()).map_err(|error| {
-            AuthorityProfileError::new(
-                if error.to_string().contains("unknown field") {
-                    AuthorityProfileErrorCode::SchemaUnknownField
-                } else {
-                    AuthorityProfileErrorCode::SchemaInvalid
-                },
-                error.to_string(),
-            )
+            AuthorityProfileError::new(AuthorityProfileErrorCode::SchemaInvalid, error.to_string())
         })?;
     extension.validate_structure(phase)?;
     let verifier = verifier.ok_or_else(|| {
@@ -290,6 +340,31 @@ pub fn validate_authority_profile(
     })?;
     verifier.verify(&extension, phase)?;
     Ok(AuthorityProfileDisposition::Validated(Box::new(extension)))
+}
+
+fn unknown_top_level_authority_field(value: &Value) -> Option<String> {
+    let extension = value.as_object()?;
+    if let Some(field) = extension
+        .keys()
+        .find(|field| !AUTHORITY_EXTENSION_FIELDS.contains(&field.as_str()))
+    {
+        return Some(field.clone());
+    }
+    for (member, fields) in [
+        ("executionBinding", EXECUTION_BINDING_FIELDS.as_slice()),
+        ("receiptEvidence", RECEIPT_EVIDENCE_FIELDS.as_slice()),
+    ] {
+        let Some(object) = extension.get(member).and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(field) = object
+            .keys()
+            .find(|field| !fields.contains(&field.as_str()))
+        {
+            return Some(format!("{member}.{field}"));
+        }
+    }
+    None
 }
 
 macro_rules! validated_text {
@@ -629,8 +704,11 @@ pub struct AuthorityAuthorizationBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ActiveFamiliarStatus {
+pub enum FamiliarStatusAtDecision {
     Active,
+    Revoked,
+    Retired,
+    Stale,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -641,7 +719,7 @@ pub struct AuthorityFamiliarBinding {
     pub declaration_digest: DigestValue,
     pub embodiment_binding_id: AuthorityOpaqueIdentifier,
     pub embodiment_digest: DigestValue,
-    pub status_at_decision: ActiveFamiliarStatus,
+    pub status_at_decision: FamiliarStatusAtDecision,
     pub verified_at: AuthorityTimestamp,
     pub freshness_policy_version: AuthorityOpaqueIdentifier,
     pub freshness_bound_seconds: u16,
@@ -761,8 +839,9 @@ pub enum AuthorityApprovalBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ApprovedState {
+pub enum ApprovalEvidenceState {
     Approved,
+    Revoked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -770,7 +849,7 @@ pub enum ApprovedState {
 pub struct ApprovalEvidence {
     pub approval_id: AuthorityOpaqueIdentifier,
     pub approval_digest: DigestValue,
-    pub state: ApprovedState,
+    pub state: ApprovalEvidenceState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1044,7 +1123,7 @@ pub struct AuthorityReceiptFamiliar {
     pub familiar_root_id: AuthorityOpaqueIdentifier,
     pub identity_revision_id: AuthorityOpaqueIdentifier,
     pub declaration_digest: DigestValue,
-    pub status_at_decision: ActiveFamiliarStatus,
+    pub status_at_decision: FamiliarStatusAtDecision,
     pub verified_at: AuthorityTimestamp,
     pub freshness_policy_version: AuthorityOpaqueIdentifier,
     pub freshness_bound_seconds: u16,
@@ -1193,6 +1272,7 @@ impl AutomationExecutionBinding {
         if self.familiar.freshness_bound_seconds > 300 {
             return Err(schema_error("familiar freshness bound exceeds 300 seconds"));
         }
+        validate_familiar_status(self.familiar.status_at_decision)?;
         validate_authorization_chronology(
             &self.authorization,
             &self.decision_timestamp,
@@ -1224,6 +1304,7 @@ impl AutomationReceiptAuthorityEvidence {
         if self.familiar.freshness_bound_seconds > 300 {
             return Err(schema_error("familiar freshness bound exceeds 300 seconds"));
         }
+        validate_familiar_status(self.familiar.status_at_decision)?;
         validate_familiar_times(&self.familiar, &self.decision_timestamp)?;
         validate_capability_grant(
             &self.capabilities.requested,
@@ -1304,6 +1385,16 @@ fn validate_authorization_chronology(
         ));
     }
     validate_familiar_times(familiar, decision)
+}
+
+fn validate_familiar_status(status: FamiliarStatusAtDecision) -> Result<(), AuthorityProfileError> {
+    if status != FamiliarStatusAtDecision::Active {
+        return Err(AuthorityProfileError::new(
+            AuthorityProfileErrorCode::FamiliarStatusInvalid,
+            "familiar is not active at the authority decision",
+        ));
+    }
+    Ok(())
 }
 
 trait FamiliarTimes {
@@ -1409,8 +1500,17 @@ fn validate_approval(
     correlation: ApprovalCorrelation<'_>,
 ) -> Result<(), AuthorityProfileError> {
     match approval {
-        AuthorityApprovalBinding::HumanPerRun { consumption, .. }
-        | AuthorityApprovalBinding::ProtectedOwnerPerRun { consumption, .. } => {
+        AuthorityApprovalBinding::HumanPerRun {
+            evidence,
+            consumption,
+            ..
+        }
+        | AuthorityApprovalBinding::ProtectedOwnerPerRun {
+            evidence,
+            consumption,
+            ..
+        } => {
+            validate_approval_evidence(evidence)?;
             validate_approval_consumption(
                 ApprovalCorrelation {
                     request_digest: &consumption.request_digest,
@@ -1424,10 +1524,12 @@ fn validate_approval(
             )?;
         }
         AuthorityApprovalBinding::BoundedRecurring {
+            evidence,
             use_kind,
             consumption,
             ..
         } => {
+            validate_approval_evidence(evidence)?;
             if !correlation
                 .occurrence_id
                 .as_str()
@@ -1463,6 +1565,16 @@ fn validate_approval(
             }
         }
         AuthorityApprovalBinding::NotRequired { .. } => {}
+    }
+    Ok(())
+}
+
+fn validate_approval_evidence(evidence: &ApprovalEvidence) -> Result<(), AuthorityProfileError> {
+    if evidence.state != ApprovalEvidenceState::Approved {
+        return Err(AuthorityProfileError::new(
+            AuthorityProfileErrorCode::ApprovalRevoked,
+            "approval evidence is revoked",
+        ));
     }
     Ok(())
 }

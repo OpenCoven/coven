@@ -96,7 +96,9 @@ the inverse evidence check: each committed index must be present, and one
 unambiguous ownership record must exactly match the signed binding, occurrence,
 run, attempt, fence, nonce, adoption key, and approval consumption. This lets a
 legitimate completed run remain verifiable without allowing the same authority
-to authorize another dispatch.
+to authorize another dispatch. Exact attempt identifiers and single-use
+human/protected-owner approval identifiers are ownership keys; unrelated
+bounded-recurring history is not conflicting solely by approval identifier.
 
 The companion has two executable validation projections without dispatch
 integration. The Node conformance validator owns portable vectors and

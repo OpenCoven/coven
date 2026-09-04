@@ -905,6 +905,13 @@ function dispatchConsumptions(trusted) {
   return Array.isArray(trusted.dispatchConsumptions) ? trusted.dispatchConsumptions : [];
 }
 
+function isPerRunApproval(approval) {
+  return (
+    approval?.requirement === 'human_per_run' ||
+    approval?.requirement === 'protected_owner_per_run'
+  );
+}
+
 function assertPreDispatchReplayState(value, trusted) {
   const consumptions = dispatchConsumptions(trusted);
   if (
@@ -943,11 +950,18 @@ function assertTerminalDispatchConsumption(value, trusted) {
   }
 
   const expected = expectedDispatchConsumption(value);
+  const perRunApprovalId = isPerRunApproval(expected.approval)
+    ? expected.approval.approvalId
+    : null;
   const related = dispatchConsumptions(trusted).filter(
     (entry) =>
       entry.bindingId === expected.bindingId ||
       entry.nonce === expected.nonce ||
       entry.adoptionKey === expected.adoptionKey ||
+      entry.attemptId === expected.attemptId ||
+      (perRunApprovalId !== null &&
+        isPerRunApproval(entry.approval) &&
+        entry.approval.approvalId === perRunApprovalId) ||
       (entry.runId === expected.runId && entry.attemptNumber === expected.attemptNumber) ||
       (entry.occurrenceId === expected.occurrenceId &&
         entry.fenceGeneration === expected.fenceGeneration)

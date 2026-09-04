@@ -155,7 +155,7 @@ fn runtime_authority_propagates_typed_semantic_refusals() {
 }
 
 #[test]
-fn runtime_authority_rejects_explicit_null_and_unknown_fields() {
+fn runtime_authority_rejects_explicit_null_authority() {
     let null_extensions = ExtensionBag::new(BTreeMap::from([(
         AUTHORITY_EXTENSION_KEY.to_owned(),
         Value::Null,
@@ -171,9 +171,45 @@ fn runtime_authority_rejects_explicit_null_and_unknown_fields() {
     )
     .expect_err("explicit null must fail closed");
     assert_eq!(null_error.code(), AuthorityProfileErrorCode::ProfileMissing);
+}
+
+#[test]
+fn runtime_authority_distinguishes_top_level_and_nested_unknown_fields() {
+    for projection in ["extension", "binding", "receipt"] {
+        let mut value =
+            serde_json::to_value(authority_extensions()).expect("serialize extension bag");
+        match projection {
+            "extension" => value[AUTHORITY_EXTENSION_KEY]["ambientAuthority"] = json!(true),
+            "binding" => {
+                value[AUTHORITY_EXTENSION_KEY]["executionBinding"]["ambientAuthority"] =
+                    json!(true);
+            }
+            "receipt" => {
+                value[AUTHORITY_EXTENSION_KEY]["receiptEvidence"]["ambientAuthority"] = json!(true);
+            }
+            _ => unreachable!(),
+        }
+        let malformed: ExtensionBag =
+            serde_json::from_value(value).expect("opaque base extension bag");
+        let malformed_error = validate_authority_profile(
+            &malformed,
+            AuthorityConsumerClass::RuntimeAuthorityV1,
+            &["coven.automations.v1", "coven.automations.authority.v1"],
+            &["automations.runtime-authority.v1"],
+            AuthorityValidationPhase::Terminal,
+            Some(&AcceptingVerifier),
+        )
+        .expect_err("closed authority projection must reject unknown fields");
+        assert_eq!(
+            malformed_error.code(),
+            AuthorityProfileErrorCode::SchemaUnknownField,
+            "{projection}"
+        );
+    }
 
     let mut value = serde_json::to_value(authority_extensions()).expect("serialize extension bag");
-    value[AUTHORITY_EXTENSION_KEY]["executionBinding"]["runtime"]["ambientAuthority"] = json!(true);
+    value[AUTHORITY_EXTENSION_KEY]["executionBinding"]["runtime"]["ambientCapability"] =
+        json!(true);
     let malformed: ExtensionBag = serde_json::from_value(value).expect("opaque base extension bag");
     let malformed_error = validate_authority_profile(
         &malformed,
@@ -183,11 +219,69 @@ fn runtime_authority_rejects_explicit_null_and_unknown_fields() {
         AuthorityValidationPhase::PreDispatch,
         Some(&AcceptingVerifier),
     )
-    .expect_err("closed authority projection must reject unknown fields");
+    .expect_err("nested unknown authority fields must fail closed");
     assert_eq!(
         malformed_error.code(),
-        AuthorityProfileErrorCode::SchemaUnknownField
+        AuthorityProfileErrorCode::SchemaInvalid
     );
+}
+
+#[test]
+fn runtime_authority_returns_typed_familiar_status_refusals() {
+    for projection in ["executionBinding", "receiptEvidence"] {
+        for status in ["revoked", "retired", "stale"] {
+            let mut value =
+                serde_json::to_value(authority_extensions()).expect("serialize extension bag");
+            value[AUTHORITY_EXTENSION_KEY][projection]["familiar"]["statusAtDecision"] =
+                json!(status);
+            let extensions: ExtensionBag =
+                serde_json::from_value(value).expect("opaque base extension bag");
+
+            let error = validate_authority_profile(
+                &extensions,
+                AuthorityConsumerClass::RuntimeAuthorityV1,
+                &["coven.automations.v1", "coven.automations.authority.v1"],
+                &["automations.runtime-authority.v1"],
+                AuthorityValidationPhase::Terminal,
+                Some(&AcceptingVerifier),
+            )
+            .expect_err("non-active familiar status must fail closed");
+
+            assert_eq!(
+                error.code(),
+                AuthorityProfileErrorCode::FamiliarStatusInvalid,
+                "{projection} {status}"
+            );
+        }
+    }
+}
+
+#[test]
+fn runtime_authority_returns_typed_approval_revocation_refusals() {
+    for projection in ["executionBinding", "receiptEvidence"] {
+        let mut value =
+            serde_json::to_value(authority_extensions()).expect("serialize extension bag");
+        value[AUTHORITY_EXTENSION_KEY][projection]["approval"]["evidence"]["state"] =
+            json!("revoked");
+        let extensions: ExtensionBag =
+            serde_json::from_value(value).expect("opaque base extension bag");
+
+        let error = validate_authority_profile(
+            &extensions,
+            AuthorityConsumerClass::RuntimeAuthorityV1,
+            &["coven.automations.v1", "coven.automations.authority.v1"],
+            &["automations.runtime-authority.v1"],
+            AuthorityValidationPhase::Terminal,
+            Some(&AcceptingVerifier),
+        )
+        .expect_err("revoked approval evidence must fail closed");
+
+        assert_eq!(
+            error.code(),
+            AuthorityProfileErrorCode::ApprovalRevoked,
+            "{projection}"
+        );
+    }
 }
 
 #[test]

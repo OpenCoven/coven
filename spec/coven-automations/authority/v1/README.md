@@ -96,8 +96,12 @@ trusted committed state is refused. Terminal verification requires those
 records to be present instead: the nonce and adoption indexes, the applicable
 approval-consumption index, and exactly one dispatch ownership record must all
 identify the signed binding, occurrence, run, attempt, fence, and approval
-consumption. Missing records are unverifiable; overlapping records owned by a
-different dispatch are mismatches. A terminal receipt never turns a consumed
+consumption. Ownership overlap includes an exact attempt identifier collision
+and, for human or protected-owner single-use approval, an exact approval
+identifier collision. An otherwise unrelated bounded-recurring history record
+does not conflict solely because it carries the same approval identifier.
+Missing records are unverifiable; overlapping records owned by a different
+dispatch are mismatches. A terminal receipt never turns a consumed
 authorization back into a fresh authorization.
 
 ## Normative inputs
