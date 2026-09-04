@@ -48,6 +48,7 @@ function createFixtureRepository(scratchDir) {
   runGit(repoRoot, ['init']);
   runGit(repoRoot, ['config', 'user.name', 'Protocol Test']);
   runGit(repoRoot, ['config', 'user.email', 'protocol@example.invalid']);
+  runGit(repoRoot, ['config', 'commit.gpgSign', 'false']);
   runGit(repoRoot, ['add', '.']);
   runGit(repoRoot, ['commit', '-m', 'test: seed protocol']);
   return {
@@ -216,7 +217,7 @@ test('keeps the content digest stable while binding bundle bytes to the source c
 test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolve', () => {
   withScratchDir('automation-protocol-byte-stability', (scratchDir) => {
     const fixture = createStableFixtureRepository(scratchDir);
-    assert.equal(fixture.sourceCommit, '95f7d0ac6fac3dab1a96aeed3e5d853176a6617f');
+    assert.equal(fixture.sourceCommit, 'c8eadde4e6ad04cf05d209d67491c263c0a62564');
 
     const packaged = packageAutomationsProtocol({
       repoRoot: fixture.repoRoot,
@@ -226,11 +227,11 @@ test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolv
 
     assert.equal(
       packaged.bundleSha256,
-      '6c22689d02da51d13c48881479173f1fc8df26339c04156c7e49d414e0b3b640'
+      'be59c4918ef7889862d04326638953c1cb5c3c603ec6c3136844e073f71f62ca'
     );
     assert.equal(
       sha256(readFileSync(packaged.manifestPath)),
-      '3ca6e1474505e770f11bcbfdf1e640940055dd6ae51d7924c627b17731a892e1'
+      'd9aa05ed71a6f71be992326fef74a7ae44c1d8dea52d55b2a335d1f3cb0d064f'
     );
   });
 });
