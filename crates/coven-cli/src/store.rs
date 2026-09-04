@@ -1409,6 +1409,7 @@ impl<'a> WardAuditReservation<'a> {
             &uuid::Uuid::new_v4().to_string(),
         )
         .context("failed to initialize Ward audit store identity")?;
+        let owns_transaction = conn.is_autocommit();
         let active_token: Option<String> = conn
             .query_row(
                 "SELECT token
@@ -1453,8 +1454,10 @@ impl<'a> WardAuditReservation<'a> {
         {
             let _ = checkpoint("TRUNCATE");
         }
-        conn.execute_batch("BEGIN IMMEDIATE")
-            .context("failed to serialize Ward audit capacity admission")?;
+        if owns_transaction {
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .context("failed to serialize Ward audit capacity admission")?;
+        }
         let admitted = (|| -> Result<Option<u64>> {
             let existing: Option<i64> = conn
                 .query_row(
@@ -1544,14 +1547,18 @@ impl<'a> WardAuditReservation<'a> {
         })();
         let previous_reserved_bytes = match admitted {
             Ok(previous_reserved_bytes) => {
-                if let Err(error) = conn.execute_batch("COMMIT") {
-                    let _ = conn.execute_batch("ROLLBACK");
-                    return Err(error).context("failed to commit Ward audit reservation");
+                if owns_transaction {
+                    if let Err(error) = conn.execute_batch("COMMIT") {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Err(error).context("failed to commit Ward audit reservation");
+                    }
                 }
                 previous_reserved_bytes
             }
             Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK");
+                if owns_transaction {
+                    let _ = conn.execute_batch("ROLLBACK");
+                }
                 return Err(error);
             }
         };
@@ -1563,8 +1570,10 @@ impl<'a> WardAuditReservation<'a> {
         );
         if let Err(error) = activation {
             let restore = (|| -> Result<()> {
-                conn.execute_batch("BEGIN IMMEDIATE")
-                    .context("failed to begin Ward audit reservation restoration")?;
+                if owns_transaction {
+                    conn.execute_batch("BEGIN IMMEDIATE")
+                        .context("failed to begin Ward audit reservation restoration")?;
+                }
                 let restored = match previous_reserved_bytes {
                     Some(previous_reserved_bytes) => conn.execute(
                         "UPDATE coven_ward_audit_reservations
@@ -1583,11 +1592,17 @@ impl<'a> WardAuditReservation<'a> {
                     ),
                 };
                 match restored {
-                    Ok(_) => conn
-                        .execute_batch("COMMIT")
-                        .context("failed to commit Ward audit reservation restoration"),
+                    Ok(_) => {
+                        if owns_transaction {
+                            conn.execute_batch("COMMIT")
+                                .context("failed to commit Ward audit reservation restoration")?;
+                        }
+                        Ok(())
+                    }
                     Err(restore_error) => {
-                        let _ = conn.execute_batch("ROLLBACK");
+                        if owns_transaction {
+                            let _ = conn.execute_batch("ROLLBACK");
+                        }
                         Err(restore_error).context("failed to restore Ward audit reservation")
                     }
                 }
@@ -7109,6 +7124,38 @@ END;
             conn.query_row(
                 "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = ?1",
                 ["activation-fail"],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_reservation_can_join_an_existing_transaction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
+
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        let reservation =
+            WardAuditReservation::acquire(&conn, &path, "joined", "joined-test", required)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = ?1",
+                ["joined"],
+                |row| row.get::<_, i64>(0),
+            )?,
+            1
+        );
+        reservation.preserve()?;
+        conn.execute_batch("ROLLBACK")?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = ?1",
+                ["joined"],
                 |row| row.get::<_, i64>(0),
             )?,
             0

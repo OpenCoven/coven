@@ -277,6 +277,24 @@ pub(crate) fn build_weave_state(
     )
 }
 
+fn build_read_only_weave_state(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+) -> Result<WeaveState> {
+    build_weave_state_for_writer(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        false,
+        None,
+    )
+}
+
 pub(crate) fn build_weave_state_for_writer(
     conn: &Connection,
     familiar_id: &str,
@@ -777,7 +795,7 @@ pub(crate) fn persist_apply_audit_records_on_connection(
             .context("starting apply-audit batch transaction")?;
     }
     let result = (|| -> Result<()> {
-        let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+        let state = build_read_only_weave_state(conn, familiar_id, workspace, config, &[])?;
         append_apply_audit_records(
             conn,
             None,
