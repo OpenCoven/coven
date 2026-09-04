@@ -105,6 +105,8 @@ jobs:
           fi
           python scripts/check-coven-privacy.py --range "${BEFORE_SHA}..${AFTER_SHA}"
       - run: python3 scripts/classify-ci-changes-test.py
+      - run: python3 scripts/check-reliability-scorecard-test.py
+      - run: python3 scripts/check-reliability-scorecard.py
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
       - run: node --test scripts/package-github-release-test.mjs
