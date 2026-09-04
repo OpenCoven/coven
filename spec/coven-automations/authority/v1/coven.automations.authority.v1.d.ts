@@ -77,7 +77,7 @@ export type ApprovalBinding =
       evidence: {
         approvalId: OpaqueIdentifier;
         approvalDigest: Digest;
-        state: "approved";
+        state: "approved" | "revoked";
       };
       scopeDigest: Digest;
       expiresAt: Timestamp;
@@ -99,7 +99,7 @@ export type ApprovalBinding =
       evidence: {
         approvalId: OpaqueIdentifier;
         approvalDigest: Digest;
-        state: "approved";
+        state: "approved" | "revoked";
       };
       scopeDigest: Digest;
       expiresAt: Timestamp;
@@ -167,7 +167,7 @@ export interface AutomationExecutionBindingCommon {
     declarationDigest: Digest;
     embodimentBindingId: OpaqueIdentifier;
     embodimentDigest: Digest;
-    statusAtDecision: "active";
+    statusAtDecision: "active" | "revoked" | "retired" | "stale";
     verifiedAt: Timestamp;
     freshnessPolicyVersion: OpaqueIdentifier;
     freshnessBoundSeconds: number;
@@ -264,7 +264,7 @@ export interface AutomationReceiptAuthorityEvidenceCommon {
     familiarRootId: OpaqueIdentifier;
     identityRevisionId: OpaqueIdentifier;
     declarationDigest: Digest;
-    statusAtDecision: "active";
+    statusAtDecision: "active" | "revoked" | "retired" | "stale";
     verifiedAt: Timestamp;
     freshnessPolicyVersion: OpaqueIdentifier;
     freshnessBoundSeconds: number;

@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
 import {
+  packageContractProfile,
   packageAutomationsProtocol,
   reproduceHistoricalAutomationsProtocolArtifact,
   verifyAutomationsProtocolBundle
@@ -232,6 +233,40 @@ test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolv
     assert.equal(
       sha256(readFileSync(packaged.manifestPath)),
       'd9aa05ed71a6f71be992326fef74a7ae44c1d8dea52d55b2a335d1f3cb0d064f'
+    );
+  });
+});
+
+test('reports an empty contract profile tree without masking the packaging error', () => {
+  withScratchDir('automation-protocol-empty-profile', (scratchDir) => {
+    const repoRoot = path.join(scratchDir, 'repo');
+    const specDir = path.join(repoRoot, 'spec', 'empty-profile');
+    mkdirSync(specDir, { recursive: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Empty profile fixture\n');
+    runGit(repoRoot, ['init']);
+    runGit(repoRoot, ['config', 'user.name', 'Protocol Test']);
+    runGit(repoRoot, ['config', 'user.email', 'protocol@example.invalid']);
+    runGit(repoRoot, ['config', 'commit.gpgSign', 'false']);
+    runGit(repoRoot, ['add', '.']);
+    runGit(repoRoot, ['commit', '-m', 'test: seed empty profile']);
+    const sourceCommit = runGit(repoRoot, ['rev-parse', 'HEAD']);
+
+    assert.throws(
+      () =>
+        packageContractProfile({
+          repoRoot,
+          outputDir: path.join(scratchDir, 'out'),
+          sourceCommit,
+          config: {
+            contractProfile: 'fixture.empty.v1',
+            bundleSchemaVersion: 'fixture.bundle.v1',
+            specRelativeDir: 'spec/empty-profile',
+            archiveRoot: 'fixture-empty-v1',
+            bundlePrefix: 'fixture-empty-v1-contract',
+            label: 'Empty fixture profile'
+          }
+        }),
+      /Empty fixture profile input tree is empty: spec\/empty-profile/
     );
   });
 });

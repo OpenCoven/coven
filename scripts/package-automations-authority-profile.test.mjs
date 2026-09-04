@@ -416,6 +416,7 @@ test('models every immutable execution binding anchor and minimized receipt evid
     'automation-receipt-authority-evidence.schema.json'
   );
 
+  const common = readJson('common.schema.json');
   const binding = readJson('automation-execution-binding.schema.json');
   for (const required of [
     'profile',
@@ -441,6 +442,29 @@ test('models every immutable execution binding anchor and minimized receipt evid
     assert.ok(binding.required.includes(required), `binding requires ${required}`);
   }
   const receipt = readJson('automation-receipt-authority-evidence.schema.json');
+  assert.deepEqual(binding.properties.familiar.properties.statusAtDecision.enum, [
+    'active',
+    'revoked',
+    'retired',
+    'stale'
+  ]);
+  assert.deepEqual(receipt.properties.familiar.properties.statusAtDecision.enum, [
+    'active',
+    'revoked',
+    'retired',
+    'stale'
+  ]);
+  for (const approval of common.$defs.approvalBinding.oneOf.filter(
+    (candidate) => candidate.properties.evidence.type === 'object'
+  )) {
+    assert.deepEqual(approval.properties.evidence.properties.state.enum, ['approved', 'revoked']);
+  }
+  const declarations = readFileSync(
+    path.join(profileDir, 'coven.automations.authority.v1.d.ts'),
+    'utf8'
+  );
+  assert.match(declarations, /statusAtDecision: "active" \| "revoked" \| "retired" \| "stale";/u);
+  assert.match(declarations, /state: "approved" \| "revoked";/u);
   for (const required of ['validTime', 'revocation', 'retirement']) {
     assert.ok(
       binding.properties.familiar.required.includes(required),

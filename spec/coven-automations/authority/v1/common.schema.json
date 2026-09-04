@@ -246,7 +246,7 @@
               "properties": {
                 "approvalId": { "$ref": "#/$defs/opaqueIdentifier" },
                 "approvalDigest": { "$ref": "#/$defs/digest" },
-                "state": { "const": "approved" }
+                "state": { "enum": ["approved", "revoked"] }
               }
             },
             "scopeDigest": { "$ref": "#/$defs/digest" },
@@ -308,7 +308,7 @@
               "properties": {
                 "approvalId": { "$ref": "#/$defs/opaqueIdentifier" },
                 "approvalDigest": { "$ref": "#/$defs/digest" },
-                "state": { "const": "approved" }
+                "state": { "enum": ["approved", "revoked"] }
               }
             },
             "scopeDigest": { "$ref": "#/$defs/digest" },

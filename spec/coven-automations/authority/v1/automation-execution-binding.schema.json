@@ -179,7 +179,9 @@
         "declarationDigest": { "$ref": "common.schema.json#/$defs/digest" },
         "embodimentBindingId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
         "embodimentDigest": { "$ref": "common.schema.json#/$defs/digest" },
-        "statusAtDecision": { "const": "active" },
+        "statusAtDecision": {
+          "enum": ["active", "revoked", "retired", "stale"]
+        },
         "verifiedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
         "freshnessPolicyVersion": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
         "freshnessBoundSeconds": {

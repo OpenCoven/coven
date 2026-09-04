@@ -280,7 +280,7 @@ function buildContractProfileArtifact(repoRoot, sourceCommit, profile, trackedFi
     };
   });
   if (files.length === 0) {
-    throw new Error(`${profile.label} input tree is empty: ${specDir}`);
+    throw new Error(`${profile.label} input tree is empty: ${profile.specRelativeDir}`);
   }
 
   const contractContentSha256 = sha256(
