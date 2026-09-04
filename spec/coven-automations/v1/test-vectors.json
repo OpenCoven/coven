@@ -2024,6 +2024,45 @@
       }
     },
     {
+      "name": "event-kind-payload-mismatch-rejected",
+      "kind": "schema",
+      "targetSchema": "event-envelope.schema.json",
+      "expected": "reject",
+      "object": {
+        "schemaVersion": "coven.automations.v1",
+        "eventId": "evtmis08b4d2f7a91c603",
+        "stream": {
+          "kind": "occurrence",
+          "id": "daily-notes-1756544400000"
+        },
+        "sequence": 6,
+        "recordedAt": "2026-08-30T09:00:06.000Z",
+        "observedAt": "2026-08-30T09:00:06.000Z",
+        "producer": {
+          "component": "coven-daemon",
+          "instanceId": "daemon@host-a"
+        },
+        "automationId": "daily-notes",
+        "occurrenceId": "daily-notes-1756544400000",
+        "kind": "receipt.recorded",
+        "summary": "mismatched event kind and payload",
+        "payload": {
+          "entity": "occurrence",
+          "from": "running",
+          "to": "succeeded",
+          "reason": "run_settled",
+          "fenceGeneration": 1
+        },
+        "privacy": {
+          "classification": "operational",
+          "retention": {
+            "classification": "standard"
+          }
+        }
+      },
+      "reason": "An event kind must select exactly its corresponding payload shape; consumers must not infer semantics from a contradictory pair."
+    },
+    {
       "name": "event-duplicate-delivery-is-ignored",
       "kind": "changefeed",
       "stream": {

@@ -20,6 +20,8 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_occurrences (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
+        automation_revision INTEGER NOT NULL DEFAULT 1 CHECK (automation_revision >= 1),
+        definition_digest TEXT,
         scheduled_for TEXT NOT NULL,
         kind TEXT NOT NULL DEFAULT 'scheduled',
         state TEXT NOT NULL DEFAULT 'planned',
@@ -235,9 +237,11 @@ pub fn insert_claimed_occurrence(
     let expires_iso = iso(expires);
     conn.execute(
         "INSERT OR IGNORE INTO automation_occurrences
-            (id, automation_id, scheduled_for, kind, state, lease_owner,
-             lease_expires_at, attempt, created_at, updated_at)
-         SELECT ?1, ?2, ?5, 'manual', 'claimed', ?3, ?4, 1, ?6, ?6
+            (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+             state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
+         SELECT ?1, ?2, definition.revision, definition.definition_digest, ?5, 'manual',
+                'claimed', ?3, ?4, 1, ?6, ?6
+         FROM automation_definitions AS definition
          WHERE NOT EXISTS (
              SELECT 1 FROM automation_occurrences
              WHERE automation_id = ?2 AND state IN ('claimed', 'running')
@@ -245,7 +249,10 @@ pub fn insert_claimed_occurrence(
            AND NOT EXISTS (
              SELECT 1 FROM automation_runs
              WHERE automation_id = ?2 AND status = 'running'
-         )",
+         )
+           AND definition.id = ?2
+           AND definition.tombstoned_at IS NULL
+           AND definition.definition_digest IS NOT NULL",
         params![
             occurrence_id,
             automation_id,
@@ -478,6 +485,38 @@ pub fn plan_latest_due_occurrence(
     if definition.status != RoutineStatus::Active {
         return Ok(PlanOutcome::NotDue);
     }
+    let current = super::store::get_definition(conn, &definition.id)
+        .map_err(|error| format!("failed to load routine `{}`: {error:#}", definition.id))?
+        .ok_or_else(|| format!("routine `{}` vanished while planning", definition.id))?;
+    let Some(current_digest) = current.definition_digest else {
+        return Err(format!(
+            "routine `{}` has unverifiable definition metadata",
+            definition.id
+        ));
+    };
+    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "failed to digest stored routine `{}`: {error:#}",
+                definition.id
+            )
+        })?;
+    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "stored routine `{}` is unreadable while planning: {error}",
+                definition.id
+            )
+        })?;
+    if current.status != "ACTIVE"
+        || persisted_digest != current_digest
+        || persisted_definition != *definition
+    {
+        return Err(format!(
+            "routine `{}` definition changed while planning",
+            definition.id
+        ));
+    }
     let Some(slot) = latest_due_slot_after(definition, created_at, now)? else {
         return Ok(PlanOutcome::NotDue);
     };
@@ -488,14 +527,45 @@ pub fn plan_latest_due_occurrence(
     let changed = conn
         .execute(
             "INSERT OR IGNORE INTO automation_occurrences
-                (id, automation_id, scheduled_for, kind, state, attempt, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'scheduled', 'planned', 0, ?4, ?4)",
-            params![id, definition.id, slot_iso, now_iso],
+                (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+                 state, attempt, created_at, updated_at)
+             SELECT ?1, ?2, definition.revision, definition.definition_digest, ?3,
+                    'scheduled', 'planned', 0, ?4, ?4
+             FROM automation_definitions AS definition
+             WHERE definition.id = ?2
+               AND definition.revision = ?5
+               AND definition.definition_digest = ?6
+               AND definition.status = 'ACTIVE'
+               AND definition.tombstoned_at IS NULL
+               AND definition.definition_digest IS NOT NULL",
+            params![
+                id,
+                definition.id,
+                slot_iso,
+                now_iso,
+                i64::try_from(current.revision)
+                    .map_err(|_| "definition revision exceeds SQLite range")?,
+                current_digest,
+            ],
         )
         .map_err(|error| format!("failed to fence occurrence: {error}"))?;
 
     if changed == 0 {
-        return Ok(PlanOutcome::AlreadyFenced);
+        let already_fenced: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_occurrences WHERE id = ?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to inspect occurrence fence: {error}"))?;
+        return if already_fenced {
+            Ok(PlanOutcome::AlreadyFenced)
+        } else {
+            Err(format!(
+                "routine `{}` definition changed while planning",
+                definition.id
+            ))
+        };
     }
 
     Ok(PlanOutcome::Planned(PlannedOccurrence {
@@ -547,7 +617,7 @@ pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickRe
 mod tests {
     use super::*;
     use crate::automations::definition::RoutineDefinition;
-    use crate::automations::store::insert_definition;
+    use crate::automations::store::{insert_definition, update_definition};
     use crate::store::initialize_store;
     use chrono::{TimeZone, Timelike};
     use serde_json::json;
@@ -704,6 +774,100 @@ mod tests {
         let second = tick_planning(&conn, real_now()).unwrap();
         assert!(second.planned.is_empty());
         assert_eq!(second.already_fenced, 1);
+    }
+
+    #[test]
+    fn new_occurrences_pin_the_current_definition_revision_and_digest() {
+        let (_temp, conn) = temp_store();
+        let initial = definition("pinned", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &initial).unwrap();
+        let mut routine = initial;
+        routine.prompt = "Revision two.".to_string();
+        let revised = update_definition(&conn, &routine).unwrap().unwrap();
+        let expected_digest = revised.definition_digest.unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+
+        let PlanOutcome::Planned(planned) =
+            plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap()
+        else {
+            panic!("expected a planned occurrence");
+        };
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-pinned",
+            "pinned",
+            "operator",
+            60,
+            now + chrono::Duration::minutes(1),
+        )
+        .unwrap());
+
+        for occurrence_id in [planned.id.as_str(), "manual-pinned"] {
+            let pin: (i64, String) = conn
+                .query_row(
+                    "SELECT automation_revision, definition_digest
+                     FROM automation_occurrences
+                     WHERE id = ?1",
+                    [occurrence_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pin, (2, expected_digest.clone()));
+        }
+    }
+
+    #[test]
+    fn planning_refuses_a_definition_that_changed_after_it_was_loaded() {
+        let (_temp, conn) = temp_store();
+        let stale = definition("planning-race", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &stale).unwrap();
+        let paused = definition("planning-race", "PAUSED", "FREQ=DAILY;BYHOUR=10");
+        update_definition(&conn, &paused).unwrap().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+
+        let error = plan_latest_due_occurrence(&conn, &stale, created_at, now).unwrap_err();
+
+        assert!(error.contains("definition changed while planning"));
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences WHERE automation_id = 'planning-race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn planning_accepts_legacy_optional_fields_that_normalize_on_serialize() {
+        let (_temp, conn) = temp_store();
+        let definition_json = r#"{"schemaVersion":1,"id":"legacy-normalized","name":"Legacy normalized","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"coven-code","familiarId":null,"cwd":"/tmp/project","outputTarget":null,"prompt":"Do the thing.","model":null,"tags":[]}"#;
+        let digest =
+            crate::automations::contract::migration::definition_digest(definition_json).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
+             ) VALUES (
+                'legacy-normalized', 'Legacy normalized', 'ACTIVE', ?1, 1, ?2, 'active',
+                NULL, 0, '2026-08-29T08:00:00.000Z', '2026-08-29T08:00:00.000Z'
+             )",
+            rusqlite::params![definition_json, digest],
+        )
+        .unwrap();
+        let definition: RoutineDefinition = serde_json::from_str(definition_json).unwrap();
+
+        let outcome = plan_latest_due_occurrence(
+            &conn,
+            &definition,
+            Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PlanOutcome::Planned(_)));
     }
 
     #[test]
@@ -1082,6 +1246,7 @@ mod tests {
     #[test]
     fn lease_is_expired_at_its_exact_deadline() {
         let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap();
         assert!(insert_claimed_occurrence(
             &conn,

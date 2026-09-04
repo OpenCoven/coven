@@ -10,7 +10,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, TransactionBehavior};
 use serde::Deserialize;
 
 use super::definition::{RoutineDefinition, RoutineStatus, RoutineTimezone};
@@ -165,8 +165,32 @@ pub fn import_legacy_codex_automations(conn: &Connection) -> Result<ImportReport
             continue;
         }
 
-        match insert_definition(conn, &definition) {
-            Ok(_) => report.imported.push(id),
+        let imported = (|| {
+            let transaction =
+                rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+                    .context("failed to begin legacy automation import transaction")?;
+            insert_definition(&transaction, &definition)?;
+            let record = super::store::get_definition(&transaction, &definition.id)?
+                .context("imported automation definition is missing")?;
+            super::contract::events::append_imported_definition_event(
+                &transaction,
+                super::contract::events::ImportedDefinitionEventInput {
+                    automation_id: &record.id,
+                    revision: record.revision,
+                    definition_digest: record.definition_digest.as_deref(),
+                    lifecycle_state: &record.lifecycle_state,
+                    imported_from: "codex-automation-toml",
+                    recorded_at: &record.updated_at,
+                    observed_at: &record.updated_at,
+                },
+            )?;
+            transaction
+                .commit()
+                .context("failed to commit legacy automation import")?;
+            Ok::<_, anyhow::Error>(())
+        })();
+        match imported {
+            Ok(()) => report.imported.push(id),
             Err(error) => report.failures.push(format!("{id}: {error:#}")),
         }
     }
@@ -245,5 +269,16 @@ prompt = "Do the legacy thing."
             .unwrap()
             .unwrap();
         assert_eq!(record.status, "PAUSED");
+        let event: String = conn
+            .query_row(
+                "SELECT event_json FROM automation_events
+                 WHERE stream_kind = 'automation' AND stream_id = 'legacy-daily'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_str(&event).unwrap();
+        assert_eq!(event["kind"], "definition.imported");
+        assert_eq!(event["payload"]["importedFrom"], "codex-automation-toml");
     }
 }

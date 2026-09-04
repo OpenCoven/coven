@@ -40,7 +40,23 @@ All error responses use the structured envelope documented in the [API contract]
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
 | GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
-| POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | `{ ok, accepted, status, event }` · `400 invalid_request` |
+| POST | `/api/v1/actions` | Route a known control-plane action id (intent envelope). | Legacy actions: `{ ok, accepted, status, event }`; versioned Automations commands: `{ ok, accepted, status, result?, event? }` · typed mapped errors |
+
+The unversioned `coven.automations.create`, `.update`, `.delete`, `.list`, and
+`.get` action ids retain their original permissive request parsing and event
+response shapes for legacy-managed definitions. Once a definition is created
+or revised through the versioned authority API, legacy update cannot overwrite
+it and legacy delete reports it as already absent, preserving CAS and revision
+history. Legacy delete/recreate remains wire-compatible while internally
+retaining a monotonic revision fence against stale v1 commands.
+Transactional definition clients use
+`coven.automations.definition.create.v1`,
+`coven.automations.definition.revise.v1`, and
+`coven.automations.definition.tombstone.v1`: every mutation requires
+`adoptionKey`, and revise/tombstone require `expectedRevision`. Exact replays
+return the stored `result` without a second event. The corresponding
+`.get.v1` and `.list.v1` actions expose authority revisions; `.list.v1` accepts
+`includeTombstoned: true` to include retained tombstones.
 
 The health `capabilities` object currently contains all 16 fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,

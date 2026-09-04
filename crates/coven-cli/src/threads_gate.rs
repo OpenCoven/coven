@@ -796,7 +796,7 @@ pub(crate) fn persist_apply_audit_records_on_connection(
 ///
 /// Proposal finalization uses this form so `apply_audit` rows and the terminal
 /// proposal event commit as one unit. Direct writes wrap it in their own
-/// transaction via [`persist_apply_audit_records`].
+/// transaction via [`persist_apply_audit_records_on_connection`].
 pub(crate) fn append_apply_audit_records(
     conn: &Connection,
     proposal_id: Option<&str>,

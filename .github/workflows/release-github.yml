@@ -91,6 +91,11 @@ jobs:
           node scripts/package-github-release.mjs verify-npm-signatures \
             --npm-version "$NPM_VERSION" \
             --audit-dir github-release-npm-audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.source.outputs.head_sha }}
+          path: github-release-protocol-source
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -136,13 +141,28 @@ jobs:
         env:
           RELEASE_TAG: ${{ steps.source.outputs.release_tag }}
           SOURCE_DATE_EPOCH: ${{ steps.source.outputs.source_date_epoch }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
         run: |
           set -euo pipefail
+          PROTOCOL_ARGS=()
+          if [[ -f github-release-protocol-source/scripts/package-automations-protocol.mjs ]]; then
+            SOURCE_COMMIT="$HEAD_SHA" \
+              node github-release-protocol-source/scripts/package-automations-protocol.mjs \
+                --output github-release-protocol
+            PROTOCOL_BUNDLE="$PWD/github-release-protocol/coven-automations-v1-contract-${HEAD_SHA}.tar.gz"
+            PROTOCOL_SHA256="$(sha256sum "$PROTOCOL_BUNDLE" | awk '{print $1}')"
+            node scripts/package-automations-protocol.mjs verify \
+              --bundle "$PROTOCOL_BUNDLE" \
+              --source-commit "$HEAD_SHA" \
+              --sha256 "$PROTOCOL_SHA256"
+            PROTOCOL_ARGS=(--source-commit "$HEAD_SHA" --protocol-bundle "$PROTOCOL_BUNDLE")
+          fi
           node scripts/package-github-release.mjs package \
             --release-tag "$RELEASE_TAG" \
             --artifacts-dir github-release-source \
             --output-dir github-release-assets \
-            --source-date-epoch "$SOURCE_DATE_EPOCH"
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            "${PROTOCOL_ARGS[@]}"
       - name: Synchronize canonical GitHub release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -29,24 +29,44 @@ pub(crate) fn containment_receipt_path(coven_home: &Path, session_id: &str) -> P
         .join(format!("{session_id}.receipt"))
 }
 
+fn receipt_proves_containment(
+    receipt: Option<&[u8]>,
+    previous_daemon_launch: bool,
+    windows_job_guarantee: bool,
+) -> bool {
+    if windows_job_guarantee && previous_daemon_launch {
+        return true;
+    }
+    match receipt {
+        Some(receipt) => {
+            receipt == crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT
+                || receipt == crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT
+        }
+        None => previous_daemon_launch,
+    }
+}
+
 pub(crate) fn recover_restart_containment(
     coven_home: &Path,
     conn: &Connection,
     now: DateTime<Utc>,
-    startup: bool,
+    startup_cutoff: Option<DateTime<Utc>>,
 ) -> Result<usize, String> {
-    let candidates: Vec<String> = {
+    let candidates: Vec<(String, String, String, Option<String>)> = {
         let mut statement = conn
             .prepare(
-                "SELECT r.session_id
+                "SELECT r.session_id, s.created_at, o.kind, o.lease_owner
                  FROM automation_runs AS r
                  JOIN sessions AS s ON s.id = r.session_id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
                  WHERE r.status = 'running'
                    AND s.status IN ('created', 'orphaned')",
             )
             .map_err(|error| format!("failed to prepare containment recovery query: {error}"))?;
         let candidates = statement
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
             .map_err(|error| format!("failed to query containment recovery candidates: {error}"))?
             .collect::<Result<_, _>>()
             .map_err(|error| format!("failed to read containment recovery candidate: {error}"))?;
@@ -54,25 +74,32 @@ pub(crate) fn recover_restart_containment(
     };
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let mut recovered = 0;
-    for session_id in candidates {
+    for (session_id, created_at, occurrence_kind, lease_owner) in candidates {
+        let created_at = DateTime::parse_from_rfc3339(&created_at)
+            .map_err(|error| {
+                format!(
+                    "automation session `{session_id}` has invalid created_at during containment recovery: {error}"
+                )
+            })?
+            .with_timezone(&Utc);
+        let previous_daemon_launch = startup_cutoff.is_some_and(|cutoff| {
+            occurrence_kind == "scheduled"
+                && lease_owner.as_deref() == Some("daemon")
+                && created_at.timestamp_millis() < cutoff.timestamp_millis()
+        });
         let path = containment_receipt_path(coven_home, &session_id);
-        let disposition_proven = if cfg!(windows) {
-            startup
-        } else {
-            match std::fs::read(&path) {
-                Ok(receipt) => {
-                    receipt == crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT
-                        || receipt == crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => startup,
-                Err(error) => {
-                    return Err(format!(
-                        "failed to read containment receipt `{}`: {error}",
-                        path.display()
-                    ));
-                }
+        let receipt = match std::fs::read(&path) {
+            Ok(receipt) => Some(receipt),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "failed to read containment receipt `{}`: {error}",
+                    path.display()
+                ));
             }
         };
+        let disposition_proven =
+            receipt_proves_containment(receipt.as_deref(), previous_daemon_launch, cfg!(windows));
         if !disposition_proven {
             continue;
         }
@@ -124,12 +151,14 @@ pub(crate) fn cleanup_terminal_containment_receipts(
         let Some(session_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        let terminal = conn
+        let removable = conn
             .query_row(
                 "SELECT EXISTS(
                     SELECT 1 FROM sessions
                     WHERE id = ?1
                       AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')
+                 ) OR NOT EXISTS(
+                     SELECT 1 FROM sessions WHERE id = ?1
                  )",
                 [session_id],
                 |row| row.get::<_, bool>(0),
@@ -137,7 +166,7 @@ pub(crate) fn cleanup_terminal_containment_receipts(
             .map_err(|error| {
                 format!("failed to inspect session `{session_id}` for receipt cleanup: {error}")
             })?;
-        if terminal {
+        if removable {
             std::fs::remove_file(&path).map_err(|error| {
                 format!(
                     "failed to remove terminal containment receipt `{}`: {error}",
@@ -162,25 +191,6 @@ fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
-fn persist_launch(
-    conn: &Connection,
-    run_id: &str,
-    occurrence_id: &str,
-    definition: &RoutineDefinition,
-    launch: &SessionLaunch,
-    now: DateTime<Utc>,
-) -> Result<(), String> {
-    persist_launch_with_clock(
-        conn,
-        run_id,
-        occurrence_id,
-        definition,
-        launch,
-        now,
-        Utc::now,
-    )
-}
-
 fn persist_launch_with_clock(
     conn: &Connection,
     run_id: &str,
@@ -193,6 +203,7 @@ fn persist_launch_with_clock(
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
+    ensure_dispatch_definition_pin(&transaction, occurrence_id, definition)?;
     let now = clock().max(not_before);
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let claim_is_current: bool = transaction
@@ -362,9 +373,58 @@ fn dispatch_occurrence(
     cwd: &str,
     now: DateTime<Utc>,
 ) -> Result<RunOutcome, String> {
+    let mut clock = Utc::now;
+    let cancelled = || false;
+    let mut control = DispatchControl {
+        clock: &mut clock,
+        cancelled: &cancelled,
+    };
+    match dispatch_occurrence_with_clock(
+        conn,
+        runtime,
+        definition,
+        occurrence_id,
+        cwd,
+        now,
+        &mut control,
+    )? {
+        DispatchAttempt::Completed(outcome) => Ok(outcome),
+        DispatchAttempt::Deferred => {
+            Err("manual dispatch was unexpectedly deferred before runtime ownership".to_string())
+        }
+    }
+}
+
+enum DispatchAttempt {
+    Completed(RunOutcome),
+    Deferred,
+}
+
+struct DispatchControl<'a> {
+    clock: &'a mut dyn FnMut() -> DateTime<Utc>,
+    cancelled: &'a dyn Fn() -> bool,
+}
+
+fn dispatch_occurrence_with_clock(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    definition: &RoutineDefinition,
+    occurrence_id: &str,
+    cwd: &str,
+    now: DateTime<Utc>,
+    control: &mut DispatchControl<'_>,
+) -> Result<DispatchAttempt, String> {
     let run_id = fresh_id("run");
     let launch = build_session_launch(definition, cwd)?;
-    persist_launch(conn, &run_id, occurrence_id, definition, &launch, now)?;
+    persist_launch_with_clock(
+        conn,
+        &run_id,
+        occurrence_id,
+        definition,
+        &launch,
+        now,
+        &mut control.clock,
+    )?;
 
     let ownership_published = Cell::new(false);
     let ownership_publication_error = RefCell::new(None);
@@ -382,12 +442,12 @@ fn dispatch_occurrence(
             }
         };
     match runtime.launch_contained_adopted_session(&launch, None, &mut ownership_established) {
-        Ok(()) if ownership_published.get() => Ok(RunOutcome {
+        Ok(()) if ownership_published.get() => Ok(DispatchAttempt::Completed(RunOutcome {
             run_id,
             status: "running".to_string(),
             session_id: Some(launch.id),
             error: None,
-        }),
+        })),
         result if ownership_published.get() => {
             let error = match result {
                 Ok(()) => None,
@@ -395,17 +455,17 @@ fn dispatch_occurrence(
                     "runtime ownership was established but launch acknowledgement failed: {error:#}"
                 )),
             };
-            Ok(RunOutcome {
+            Ok(DispatchAttempt::Completed(RunOutcome {
                 run_id,
                 status: "running".to_string(),
                 session_id: Some(launch.id),
                 error,
-            })
+            }))
         }
         Ok(()) => {
             let publication_error =
                 publish_runtime_ownership(conn, occurrence_id, &launch.id, now).err();
-            Ok(RunOutcome {
+            Ok(DispatchAttempt::Completed(RunOutcome {
                 run_id,
                 status: "running".to_string(),
                 session_id: Some(launch.id),
@@ -414,7 +474,7 @@ fn dispatch_occurrence(
                         "runtime accepted launch without publishing ownership; completion is ambiguous: {error:#}"
                     )
                 }),
-            })
+            }))
         }
         Err(error)
             if error
@@ -437,24 +497,208 @@ fn dispatch_occurrence(
                 ),
                 (None, None) => format!("{error:#}"),
             };
-            Ok(RunOutcome {
+            Ok(DispatchAttempt::Completed(RunOutcome {
                 run_id,
                 status: "running".to_string(),
                 session_id: Some(launch.id),
                 error: Some(error),
-            })
+            }))
+        }
+        Err(error)
+            if (control.cancelled)()
+                && error
+                    .downcast_ref::<crate::api::RuntimeLaunchAdmissionClosedError>()
+                    .is_some() =>
+        {
+            restore_preownership_launch_for_retry(conn, occurrence_id, &run_id, &launch.id, now)?;
+            Ok(DispatchAttempt::Deferred)
         }
         Err(error) => {
             let reason = format!("{error:#}");
             settle_rejected_launch(conn, occurrence_id, &run_id, &launch.id, &reason, now)?;
-            Ok(RunOutcome {
+            Ok(DispatchAttempt::Completed(RunOutcome {
                 run_id,
                 status: "failed".to_string(),
                 session_id: None,
                 error: Some(reason),
-            })
+            }))
         }
     }
+}
+
+fn restore_preownership_launch_for_retry(
+    conn: &Connection,
+    occurrence_id: &str,
+    run_id: &str,
+    session_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin cancelled launch restoration: {error}"))?;
+    restore_preownership_launch_for_retry_in(&transaction, occurrence_id, run_id, session_id, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit cancelled launch restoration: {error}"))
+}
+
+fn restore_preownership_launch_for_retry_in(
+    conn: &Connection,
+    occurrence_id: &str,
+    run_id: &str,
+    session_id: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let deleted_run = conn
+        .execute(
+            "DELETE FROM automation_runs
+             WHERE id = ?1 AND occurrence_id = ?2 AND session_id = ?3 AND status = 'running'",
+            rusqlite::params![run_id, occurrence_id, session_id],
+        )
+        .map_err(|error| format!("failed to remove cancelled automation run: {error}"))?;
+    if deleted_run != 1 {
+        return Err("cancelled automation run changed before restoration".to_string());
+    }
+    let deleted_session = conn
+        .execute(
+            "DELETE FROM sessions WHERE id = ?1 AND status = 'created'",
+            [session_id],
+        )
+        .map_err(|error| format!("failed to remove cancelled automation session: {error}"))?;
+    if deleted_session != 1 {
+        return Err("cancelled automation session changed before restoration".to_string());
+    }
+    let restored_occurrence = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'planned',
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 failure_reason = NULL,
+                 updated_at = ?2
+             WHERE id = ?1 AND state = 'claimed' AND lease_owner = 'daemon'",
+            rusqlite::params![
+                occurrence_id,
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .map_err(|error| format!("failed to restore cancelled automation occurrence: {error}"))?;
+    if restored_occurrence != 1 {
+        return Err("cancelled automation occurrence changed before restoration".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn recover_no_process_preownership_launches(
+    coven_home: &Path,
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin pre-ownership launch recovery: {error}"))?;
+    let candidates: Vec<(String, String, String)> = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT r.id, r.session_id, r.occurrence_id
+                 FROM automation_runs AS r
+                 JOIN sessions AS s ON s.id = r.session_id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 WHERE r.status = 'running'
+                   AND s.status = 'created'
+                   AND o.state = 'claimed'
+                   AND o.lease_owner = 'daemon'",
+            )
+            .map_err(|error| format!("failed to prepare pre-ownership launch recovery: {error}"))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .map_err(|error| format!("failed to query pre-ownership launches: {error}"))?;
+        let mut candidates = Vec::new();
+        for row in rows {
+            candidates.push(
+                row.map_err(|error| format!("failed to read pre-ownership launch: {error}"))?,
+            );
+        }
+        candidates
+    };
+    let retryable = candidates
+        .into_iter()
+        .filter(|(_, session_id, _)| {
+            std::fs::read(containment_receipt_path(coven_home, session_id))
+                .is_ok_and(|receipt| receipt == crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT)
+        })
+        .collect::<Vec<_>>();
+    for (run_id, session_id, occurrence_id) in &retryable {
+        restore_preownership_launch_for_retry_in(
+            &transaction,
+            occurrence_id,
+            run_id,
+            session_id,
+            now,
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit pre-ownership launch recovery: {error}"))?;
+    Ok(retryable.len())
+}
+
+fn ensure_dispatch_definition_pin(
+    conn: &Connection,
+    occurrence_id: &str,
+    definition: &RoutineDefinition,
+) -> Result<(), String> {
+    let (automation_id, automation_revision, occurrence_digest): (String, i64, Option<String>) =
+        conn.query_row(
+            "SELECT automation_id, automation_revision, definition_digest
+             FROM automation_occurrences
+             WHERE id = ?1",
+            [occurrence_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| format!("failed to read occurrence definition pin: {error}"))?;
+    if automation_id != definition.id {
+        return Err(format!(
+            "occurrence `{occurrence_id}` belongs to `{automation_id}`, not `{}`",
+            definition.id
+        ));
+    }
+    let Some(occurrence_digest) = occurrence_digest else {
+        return Err(format!(
+            "occurrence `{occurrence_id}` has unverifiable legacy definition history"
+        ));
+    };
+    let Some(current) =
+        super::store::get_definition(conn, &automation_id).map_err(|error| format!("{error:#}"))?
+    else {
+        return Err(format!(
+            "routine `{automation_id}` vanished after occurrence fencing"
+        ));
+    };
+    let current_revision =
+        i64::try_from(current.revision).map_err(|_| "definition revision exceeds SQLite range")?;
+    if current_revision != automation_revision
+        || current.definition_digest.as_deref() != Some(occurrence_digest.as_str())
+    {
+        return Err(format!(
+            "definition revision changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
+        .map_err(|error| format!("failed to digest stored routine `{automation_id}`: {error:#}"))?;
+    if persisted_digest != occurrence_digest {
+        return Err(format!(
+            "stored definition digest changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
+        .map_err(|error| format!("stored routine `{automation_id}` is unreadable: {error}"))?;
+    if persisted_definition != *definition {
+        return Err(format!(
+            "definition body changed after occurrence fencing for `{automation_id}`"
+        ));
+    }
+    Ok(())
 }
 
 /// Runs a routine once, now: fences and claims an immediate occurrence,
@@ -492,14 +736,18 @@ pub fn run_routine_now(
         });
     }
 
-    dispatch_occurrence(
-        conn,
-        runtime,
-        definition,
-        &occurrence_id,
-        cwd,
-        Utc::now().max(now),
-    )
+    let dispatch_now = Utc::now().max(now);
+    match dispatch_occurrence(conn, runtime, definition, &occurrence_id, cwd, dispatch_now) {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            if !settle_occurrence(conn, &occurrence_id, "failed", Some(&error), dispatch_now)? {
+                return Err(format!(
+                    "{error}; manual occurrence changed before rejection settlement"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Builds the shared SessionLaunch for a routine run. Every run — manual or
@@ -534,10 +782,31 @@ pub struct DispatchReport {
 /// Dispatches every claimed occurrence through the same durable launch
 /// primitive as manual runs. Successful launch acknowledgements remain
 /// nonterminal until session evidence is reconciled.
-pub fn dispatch_claimed_occurrences(
+#[cfg(test)]
+fn dispatch_claimed_occurrences(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
+) -> Result<DispatchReport, String> {
+    dispatch_claimed_occurrences_with_clock(conn, runtime, now, Utc::now)
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_claimed_occurrences_with_clock(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+    clock: impl FnMut() -> DateTime<Utc>,
+) -> Result<DispatchReport, String> {
+    dispatch_claimed_occurrences_with_clock_and_cancel(conn, runtime, now, clock, || false)
+}
+
+pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+    mut clock: impl FnMut() -> DateTime<Utc>,
+    cancelled: impl Fn() -> bool,
 ) -> Result<DispatchReport, String> {
     let mut report = DispatchReport::default();
     recover_expired_leases(conn, now)?;
@@ -570,7 +839,11 @@ pub fn dispatch_claimed_occurrences(
     };
 
     for (occurrence_id, automation_id) in claimed {
-        let check_now = Utc::now();
+        if cancelled() {
+            restore_unlaunched_daemon_claims_for_retry(conn, clock().max(now))?;
+            break;
+        }
+        let check_now = clock().max(now);
         recover_expired_leases(conn, check_now)?;
         let dispatchable: bool = conn
             .query_row(
@@ -619,25 +892,34 @@ pub fn dispatch_claimed_occurrences(
             continue;
         };
 
-        let dispatch_now = Utc::now();
-        match dispatch_occurrence(
+        let dispatch_now = clock().max(check_now);
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+        };
+        match dispatch_occurrence_with_clock(
             conn,
             runtime,
             &definition,
             &occurrence_id,
             cwd,
             dispatch_now,
+            &mut control,
         ) {
-            Ok(outcome) if outcome.status == "running" => {
+            Ok(DispatchAttempt::Completed(outcome)) if outcome.status == "running" => {
                 report.dispatched.push(outcome.run_id);
             }
-            Ok(outcome) => {
+            Ok(DispatchAttempt::Completed(outcome)) => {
                 report.failed.push(format!(
                     "{automation_id}: {}",
                     outcome
                         .error
                         .unwrap_or_else(|| "launch did not enter running state".to_string())
                 ));
+            }
+            Ok(DispatchAttempt::Deferred) => {
+                restore_unlaunched_daemon_claims_for_retry(conn, clock().max(dispatch_now))?;
+                break;
             }
             Err(reason) => {
                 settle_occurrence(
@@ -653,6 +935,30 @@ pub fn dispatch_claimed_occurrences(
     }
 
     Ok(report)
+}
+
+pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, String> {
+    let restored = conn
+        .execute(
+            "UPDATE automation_occurrences
+         SET state = 'planned',
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             failure_reason = NULL,
+             updated_at = ?1
+         WHERE state = 'claimed'
+           AND lease_owner = 'daemon'
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_runs
+               WHERE automation_runs.occurrence_id = automation_occurrences.id
+           )",
+            [now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)],
+        )
+        .map_err(|error| format!("failed to restore unlaunched daemon claims: {error}"))?;
+    Ok(restored)
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -972,9 +1278,10 @@ pub fn load_definition_for_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automations::definition::RoutineDefinition;
+    use crate::automations::definition::{RoutineDefinition, RoutineStatus};
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
+    use chrono::TimeZone;
     use serde_json::json;
 
     struct RejectingRuntime;
@@ -1260,6 +1567,296 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovers_crashed_preownership_launch_for_retry() {
+        let (temp, conn) = temp_store();
+        let routine = definition("crashed-preownership");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "crashed-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "crashed-run",
+            "crashed-occurrence",
+            &routine,
+            &launch,
+            now,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_no_process_preownership_launches(temp.path(), &conn, now).unwrap(),
+            0,
+            "created state alone must not authorize replay"
+        );
+        let receipt = containment_receipt_path(temp.path(), &launch.id);
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        crate::pty_runner::write_containment_receipt(
+            &receipt,
+            crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT,
+        )
+        .unwrap();
+        assert_eq!(
+            recover_no_process_preownership_launches(temp.path(), &conn, now).unwrap(),
+            1
+        );
+
+        let (state, lease_owner, attempt): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state, lease_owner, attempt
+                 FROM automation_occurrences
+                 WHERE id = 'crashed-occurrence'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+        assert_eq!(lease_owner, None);
+        assert_eq!(attempt, 1);
+        let run_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM automation_runs", [], |row| row.get(0))
+            .unwrap();
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(run_count, 0);
+        assert_eq!(session_count, 0);
+    }
+
+    #[test]
+    fn startup_restores_unlaunched_daemon_claim_without_reusing_attempt() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("unlaunched-claim");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "unlaunched-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            now,
+        )
+        .unwrap());
+
+        assert_eq!(
+            restore_unlaunched_daemon_claims_for_retry(&conn, now).unwrap(),
+            1
+        );
+
+        let (state, lease_owner, attempt): (String, Option<String>, i64) = conn
+            .query_row(
+                "SELECT state, lease_owner, attempt
+                 FROM automation_occurrences
+                 WHERE id = 'unlaunched-occurrence'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+        assert_eq!(lease_owner, None);
+        assert_eq!(attempt, 1);
+    }
+
+    #[test]
+    fn startup_missing_receipt_does_not_contain_manual_launch() {
+        let (temp, conn) = temp_store();
+        let routine = definition("manual-startup-race");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-startup-occurrence",
+            &routine.id,
+            "manual",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "manual-startup-run",
+            "manual-startup-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_excludes_new_daemon_launch_without_receipt() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("new-daemon-launch");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let startup_cutoff = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap()
+            + chrono::Duration::microseconds(400);
+        let launched_at = startup_cutoff + chrono::Duration::microseconds(100);
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (launched_at - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let report = super::super::occurrences::tick(&conn, launched_at).unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "new-daemon-run",
+            occurrence_id,
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(1),
+            Some(startup_cutoff),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_does_not_contain_manual_kind_with_daemon_owner() {
+        let (temp, conn) = temp_store();
+        let routine = definition("manual-daemon-owner");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-daemon-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "manual-daemon-run",
+            "manual-daemon-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
+    }
+
+    #[test]
+    fn startup_cutoff_contains_previous_scheduled_daemon_launch_without_receipt() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("previous-scheduled-launch");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 10, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (launched_at - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let report = super::super::occurrences::tick(&conn, launched_at).unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_at(
+            &conn,
+            "previous-scheduled-run",
+            occurrence_id,
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+
+        let recovered = recover_restart_containment(
+            temp.path(),
+            &conn,
+            launched_at + chrono::Duration::seconds(2),
+            Some(launched_at + chrono::Duration::seconds(1)),
+        )
+        .unwrap();
+
+        assert_eq!(recovered, 1);
+        assert_eq!(
+            crate::store::get_session(&conn, &launch.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "killed"
+        );
+    }
+
+    #[test]
+    fn windows_previous_daemon_job_proves_containment_with_partial_receipt() {
+        assert!(receipt_proves_containment(Some(b"partial"), true, true));
+        assert!(!receipt_proves_containment(Some(b"partial"), true, false));
+    }
+
+    #[test]
     fn accepted_launch_keeps_occurrence_and_run_running() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily")).unwrap();
@@ -1369,6 +1966,137 @@ mod tests {
         assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn dispatch_refuses_an_occurrence_after_its_definition_revision_changes() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("revision-race");
+        insert_definition(&conn, &routine).unwrap();
+        let claimed_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "revision-one-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let mut revised = routine.clone();
+        revised.prompt = "A different action.".to_string();
+        let definition_json = serde_json::to_string(&revised).unwrap();
+        let definition_digest =
+            crate::automations::contract::migration::definition_digest(&definition_json).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET definition_json = ?2, definition_digest = ?3, revision = 2
+             WHERE id = ?1",
+            rusqlite::params![routine.id, definition_json, definition_digest],
+        )
+        .unwrap();
+
+        let report = dispatch_claimed_occurrences(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            claimed_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert!(report.dispatched.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].contains("definition revision changed after occurrence fencing"));
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'revision-one-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(super::super::runs::list_runs(&conn, &routine.id, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn dispatch_accepts_legacy_optional_fields_that_normalize_on_serialize() {
+        let (_temp, conn) = temp_store();
+        let definition_json = r#"{"schemaVersion":1,"id":"legacy-normalized","name":"Legacy normalized","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"coven-code","familiarId":null,"cwd":"/tmp/project","outputTarget":null,"prompt":"Do the thing.","model":null,"tags":[]}"#;
+        let digest =
+            crate::automations::contract::migration::definition_digest(definition_json).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
+             ) VALUES (
+                'legacy-normalized', 'Legacy normalized', 'ACTIVE', ?1, 1, ?2, 'active',
+                NULL, 0, ?3, ?3
+             )",
+            rusqlite::params![
+                definition_json,
+                digest,
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let definition: RoutineDefinition = serde_json::from_str(definition_json).unwrap();
+        let claimed_at = Utc::now();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "legacy-normalized-occurrence",
+            &definition.id,
+            "daemon",
+            60,
+            claimed_at,
+        )
+        .unwrap());
+
+        let report = dispatch_claimed_occurrences(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            claimed_at + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        assert_eq!(report.dispatched.len(), 1);
+        assert!(report.failed.is_empty());
+    }
+
+    #[test]
+    fn manual_dispatch_drift_settles_its_claim_before_returning() {
+        let (_temp, conn) = temp_store();
+        let stale = definition("manual-revision-race");
+        insert_definition(&conn, &stale).unwrap();
+        let mut revised = stale.clone();
+        revised.prompt = "Revision two.".to_string();
+        super::super::store::update_definition(&conn, &revised)
+            .unwrap()
+            .unwrap();
+
+        let error = run_routine_now(&conn, &crate::api::NoopSessionRuntime, &stale, Utc::now())
+            .unwrap_err();
+
+        assert!(error.contains("definition body changed after occurrence fencing"));
+        let claim_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'manual-revision-race' AND state = 'claimed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(claim_count, 0);
+        let failed_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'manual-revision-race' AND state = 'failed'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_count, 1);
     }
 
     #[test]
@@ -1598,7 +2326,7 @@ mod tests {
             temp.path(),
             &conn,
             launched_at + chrono::Duration::seconds(1),
-            false,
+            None,
         )
         .unwrap();
         assert_eq!(recovered, 1);
@@ -1635,7 +2363,8 @@ mod tests {
         std::fs::write(receipt, b"").unwrap();
 
         assert_eq!(
-            recover_restart_containment(temp.path(), &conn, launched_at, true).unwrap(),
+            recover_restart_containment(temp.path(), &conn, launched_at, Some(launched_at))
+                .unwrap(),
             0
         );
         assert_eq!(
@@ -1645,9 +2374,10 @@ mod tests {
     }
 
     #[test]
-    fn receipt_cleanup_removes_only_terminal_session_evidence() {
+    fn receipt_cleanup_removes_terminal_and_missing_sessions_but_keeps_active_evidence() {
         let (temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily")).unwrap();
+        insert_definition(&conn, &definition("active")).unwrap();
         let launched_at = Utc::now();
         let terminal = run_routine_now(
             &conn,
@@ -1672,14 +2402,25 @@ mod tests {
             crate::pty_runner::CONTAINMENT_QUIESCENT_RECEIPT,
         )
         .unwrap();
-        let active_receipt = containment_receipt_path(temp.path(), "active-session");
+        let active = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("active"),
+            launched_at,
+        )
+        .unwrap();
+        let active_receipt =
+            containment_receipt_path(temp.path(), active.session_id.as_deref().unwrap());
         std::fs::write(&active_receipt, b"").unwrap();
+        let missing_receipt = containment_receipt_path(temp.path(), "missing-session");
+        std::fs::write(&missing_receipt, b"").unwrap();
 
         assert_eq!(
             cleanup_terminal_containment_receipts(temp.path(), &conn).unwrap(),
-            1
+            2
         );
         assert!(!terminal_receipt.exists());
+        assert!(!missing_receipt.exists());
         assert!(active_receipt.exists());
     }
 
@@ -2109,6 +2850,36 @@ mod tests {
     }
 
     #[test]
+    fn stale_definition_cannot_create_a_manual_occurrence_after_tombstone() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("tombstoned");
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET revision = 2,
+                 tombstoned_at = '2026-09-03T09:00:00.000Z',
+                 updated_at = '2026-09-03T09:00:00.000Z'
+             WHERE id = 'tombstoned'",
+            [],
+        )
+        .unwrap();
+
+        let outcome =
+            run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, Utc::now()).unwrap();
+
+        assert_eq!(outcome.status, "failed");
+        let occurrence_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'tombstoned'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_count, 0);
+    }
+
+    #[test]
     fn expired_preownership_launch_recovers_run_and_occurrence_together() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
@@ -2274,7 +3045,7 @@ mod tests {
             launched_at,
         )
         .unwrap();
-        assert!(super::super::store::delete_definition(&conn, "daily").unwrap());
+        assert!(super::super::store::remove_definition_for_test(&conn, "daily").unwrap());
 
         let timed_out_at = persisted_timeout_at(&conn, "daily");
         assert!(
