@@ -1412,10 +1412,8 @@ impl<'a> WardAuditReservation<'a> {
             .optional()
             .context("failed to read active Ward audit reservation")?;
         anyhow::ensure!(
-            active_token
-                .as_deref()
-                .is_none_or(|active| active == reservation_token),
-            "a different Ward audit reservation is already active on this connection"
+            active_token.is_none(),
+            "a Ward audit reservation is already active on this connection"
         );
 
         let checkpoint = |mode: &str| {
@@ -6947,13 +6945,25 @@ END;
     }
 
     #[test]
-    fn second_active_ward_audit_reservation_on_one_connection_is_rejected() -> Result<()> {
+    fn overlapping_ward_audit_reservations_on_one_connection_are_rejected() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("test.sqlite3");
         let conn = open_store(&path)?;
         configure_small_audit_capacity(&conn, i64::MAX)?;
         let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
         let first = WardAuditReservation::acquire(&conn, &path, "first", "first-test", required)?;
+
+        let same_token_error =
+            match WardAuditReservation::acquire(&conn, &path, "first", "first-test", required) {
+                Ok(reservation) => {
+                    reservation.preserve()?;
+                    anyhow::bail!("overlapping reservation with the same token was accepted")
+                }
+                Err(error) => error,
+            };
+        assert!(same_token_error
+            .to_string()
+            .contains("a Ward audit reservation is already active"));
 
         let error =
             match WardAuditReservation::acquire(&conn, &path, "second", "second-test", required) {
@@ -6965,7 +6975,7 @@ END;
             };
         assert!(error
             .to_string()
-            .contains("a different Ward audit reservation is already active"));
+            .contains("a Ward audit reservation is already active"));
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = 'second'",
