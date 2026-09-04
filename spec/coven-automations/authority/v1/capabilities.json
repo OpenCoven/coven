@@ -27,6 +27,7 @@
     "authenticationMethods": ["ed25519"]
   },
   "errorCodes": [
+    "AUTHORITY_ADAPTER_MISSING",
     "AUTHORITY_ADOPTION_REPLAYED",
     "AUTHORITY_APPROVAL_EXPIRED",
     "AUTHORITY_APPROVAL_EXHAUSTED",
@@ -63,12 +64,21 @@
     "AUTHORITY_RUNTIME_DOWNGRADE",
     "AUTHORITY_SCHEMA_INVALID",
     "AUTHORITY_SCHEMA_UNKNOWN_FIELD",
-    "AUTHORITY_STALE"
+    "AUTHORITY_STALE",
+    "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
   ],
   "failClosed": [
     {
       "condition": "profile capability is not explicitly advertised",
       "errorCodes": ["AUTHORITY_PROFILE_REQUIRED"]
+    },
+    {
+      "condition": "required Rust or runtime verification adapter is unavailable",
+      "errorCodes": ["AUTHORITY_ADAPTER_MISSING"]
+    },
+    {
+      "condition": "trusted replay, runtime, approval, or authentication state is missing",
+      "errorCodes": ["AUTHORITY_TRUSTED_STATE_UNAVAILABLE"]
     },
     {
       "condition": "required extension value is absent",
@@ -144,8 +154,9 @@
   ],
   "negotiationRules": [
     "Advertising coven.automations.v1 alone never claims Runtime Authority conformance.",
-    "Generic base-v1 consumers preserve the namespaced value byte-for-byte as opaque JSON and never use it to grant, deny, or infer authority.",
+    "Generic base-v1 consumers preserve the namespaced JSON value losslessly as opaque data and never use it to grant, deny, or infer authority.",
     "Runtime Authority consumers require this capability, validate the profile schema and semantics, independently verify integrity/authentication, and refuse dispatch when any required evidence is absent or unverifiable.",
+    "Runtime Authority consumers require a trusted verification adapter; no adapter or incomplete trusted state is a typed refusal, never a string-only fallback.",
     "degrade_to_proposal and reject decisions never produce an AutomationExecutionBinding because they authorize no runtime dispatch."
   ]
 }

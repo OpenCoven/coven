@@ -57,6 +57,8 @@
     "ijsonInvalid": "AUTHORITY_IJSON_INVALID",
     "integrityInvalid": "AUTHORITY_INTEGRITY_INVALID",
     "authenticationInvalid": "AUTHORITY_AUTHENTICATION_INVALID",
-    "authenticationUnverifiable": "AUTHORITY_AUTHENTICATION_UNVERIFIABLE"
+    "authenticationUnverifiable": "AUTHORITY_AUTHENTICATION_UNVERIFIABLE",
+    "adapterMissing": "AUTHORITY_ADAPTER_MISSING",
+    "trustedStateUnavailable": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
   }
 }

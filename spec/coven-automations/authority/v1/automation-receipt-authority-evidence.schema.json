@@ -111,7 +111,10 @@
         "statusAtDecision",
         "verifiedAt",
         "freshnessPolicyVersion",
-        "freshnessBoundSeconds"
+        "freshnessBoundSeconds",
+        "validTime",
+        "revocation",
+        "retirement"
       ],
       "properties": {
         "familiarRootId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
@@ -124,7 +127,10 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 300
-        }
+        },
+        "validTime": { "$ref": "common.schema.json#/$defs/familiarValidity" },
+        "revocation": { "$ref": "common.schema.json#/$defs/familiarRevocation" },
+        "retirement": { "$ref": "common.schema.json#/$defs/familiarRetirement" }
       }
     },
     "authorization": {
@@ -189,22 +195,7 @@
     },
     "decisionTimestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
     "producer": { "$ref": "common.schema.json#/$defs/producer" },
-    "privacy": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "classification",
-        "retention",
-        "redactionStatus",
-        "sensitiveMaterialIncluded"
-      ],
-      "properties": {
-        "classification": { "enum": ["operational", "sensitive", "restricted"] },
-        "retention": { "enum": ["ephemeral_24h", "authority_evidence_90d", "authority_evidence_1y"] },
-        "redactionStatus": { "enum": ["not_required", "redacted", "tombstoned"] },
-        "sensitiveMaterialIncluded": { "const": false }
-      }
-    },
+    "privacy": { "$ref": "common.schema.json#/$defs/authorityPrivacy" },
     "integrity": { "$ref": "common.schema.json#/$defs/integrity" },
     "authentication": { "$ref": "common.schema.json#/$defs/authentication" }
   }

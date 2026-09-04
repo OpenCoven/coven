@@ -22,6 +22,13 @@ const BASE_PROFILE_CONFIG = {
   label: 'Automations protocol'
 };
 
+const BASE_V1 = {
+  commit: '8a796807b37d4ad33eaeca37498debf1ca55dd49',
+  bundle: '512460db71d4257d7a4d33ea306578e66d9ac499d9384eb9c2b8e2b4e2e32363',
+  content: '3c145eb92a93426ed64631f6487a8cd12903b0a49a6e752269f594ac50a779f5',
+  files: 17
+};
+
 function compareLexically(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -240,8 +247,31 @@ export function packageContractProfile({ repoRoot, outputDir, sourceCommit, conf
       `${profile.label} input tree does not exactly match tracked source files`
     );
   }
+  const artifact = buildContractProfileArtifact(
+    normalizedRepoRoot,
+    normalizedSourceCommit,
+    profile,
+    trackedFiles
+  );
+
+  mkdirSync(normalizedOutputDir, { recursive: true });
+  const bundleName = `${profile.bundlePrefix}-${normalizedSourceCommit}.tar.gz`;
+  const bundlePath = path.join(normalizedOutputDir, bundleName);
+  const manifestPath = path.join(normalizedOutputDir, 'manifest.json');
+  writeFileSync(bundlePath, artifact.bundleBytes);
+  writeFileSync(manifestPath, artifact.manifestBytes);
+
+  return {
+    bundlePath,
+    manifestPath,
+    bundleSha256: artifact.bundleSha256,
+    contractContentSha256: artifact.contractContentSha256
+  };
+}
+
+function buildContractProfileArtifact(repoRoot, sourceCommit, profile, trackedFiles) {
   const files = trackedFiles.map(({ path: relativePath, object }) => {
-    const bytes = runGitBytes(normalizedRepoRoot, ['cat-file', 'blob', object]);
+    const bytes = runGitBytes(repoRoot, ['cat-file', 'blob', object]);
     return {
       path: relativePath,
       sha256: sha256(bytes),
@@ -259,7 +289,7 @@ export function packageContractProfile({ repoRoot, outputDir, sourceCommit, conf
   const manifest = {
     schemaVersion: profile.bundleSchemaVersion,
     contractProfile: profile.contractProfile,
-    sourceCommit: normalizedSourceCommit,
+    sourceCommit,
     contractContentSha256,
     files: files.map(({ path: relativePath, sha256: digest, size }) => ({
       path: relativePath,
@@ -280,16 +310,9 @@ export function packageContractProfile({ repoRoot, outputDir, sourceCommit, conf
   ].sort((left, right) => compareLexically(left.name, right.name));
   const bundleBytes = createTarGz(archiveEntries);
 
-  mkdirSync(normalizedOutputDir, { recursive: true });
-  const bundleName = `${profile.bundlePrefix}-${normalizedSourceCommit}.tar.gz`;
-  const bundlePath = path.join(normalizedOutputDir, bundleName);
-  const manifestPath = path.join(normalizedOutputDir, 'manifest.json');
-  writeFileSync(bundlePath, bundleBytes);
-  writeFileSync(manifestPath, manifestBytes);
-
   return {
-    bundlePath,
-    manifestPath,
+    bundleBytes,
+    manifestBytes,
     bundleSha256: sha256(bundleBytes),
     contractContentSha256
   };
@@ -300,6 +323,39 @@ export function packageAutomationsProtocol(options) {
     ...options,
     config: BASE_PROFILE_CONFIG
   });
+}
+
+export function reproduceHistoricalAutomationsProtocolArtifact(repoRoot) {
+  const normalizedRepoRoot = path.resolve(String(repoRoot));
+  const profile = normalizeProfileConfig(BASE_PROFILE_CONFIG);
+  const trackedFiles = trackedContractFiles(
+    normalizedRepoRoot,
+    BASE_V1.commit,
+    profile.specRelativeDir,
+    profile.label
+  );
+  const artifact = buildContractProfileArtifact(
+    normalizedRepoRoot,
+    BASE_V1.commit,
+    profile,
+    trackedFiles
+  );
+  const reproduced = {
+    sourceCommit: BASE_V1.commit,
+    bundleSha256: artifact.bundleSha256,
+    contractContentSha256: artifact.contractContentSha256,
+    fileCount: trackedFiles.length
+  };
+  if (
+    reproduced.bundleSha256 !== BASE_V1.bundle ||
+    reproduced.contractContentSha256 !== BASE_V1.content ||
+    reproduced.fileCount !== BASE_V1.files
+  ) {
+    throw new Error(
+      `Historical Automations v1 artifact reproduction mismatch: ${JSON.stringify(reproduced)}`
+    );
+  }
+  return reproduced;
 }
 
 function tarString(header, offset, length) {

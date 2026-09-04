@@ -17,6 +17,7 @@ import { gunzipSync, gzipSync } from 'node:zlib';
 
 import {
   packageAutomationsProtocol,
+  reproduceHistoricalAutomationsProtocolArtifact,
   verifyAutomationsProtocolBundle
 } from './package-automations-protocol.mjs';
 
@@ -205,32 +206,41 @@ test('keeps the content digest stable while binding bundle bytes to the source c
       sourceCommit: secondCommit
     });
 
-    test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolve', () => {
-      withScratchDir('automation-protocol-byte-stability', (scratchDir) => {
-        const fixture = createStableFixtureRepository(scratchDir);
-        assert.equal(fixture.sourceCommit, '95f7d0ac6fac3dab1a96aeed3e5d853176a6617f');
-
-        const packaged = packageAutomationsProtocol({
-          repoRoot: fixture.repoRoot,
-          outputDir: path.join(scratchDir, 'out'),
-          sourceCommit: fixture.sourceCommit
-        });
-
-        assert.equal(
-          packaged.bundleSha256,
-          '6c22689d02da51d13c48881479173f1fc8df26339c04156c7e49d414e0b3b640'
-        );
-        assert.equal(
-          sha256(readFileSync(packaged.manifestPath)),
-          '3ca6e1474505e770f11bcbfdf1e640940055dd6ae51d7924c627b17731a892e1'
-        );
-      });
-    });
-
     const firstManifest = JSON.parse(readFileSync(first.manifestPath, 'utf8'));
     const secondManifest = JSON.parse(readFileSync(second.manifestPath, 'utf8'));
     assert.equal(firstManifest.contractContentSha256, secondManifest.contractContentSha256);
     assert.notEqual(first.bundleSha256, second.bundleSha256);
+  });
+});
+
+test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolve', () => {
+  withScratchDir('automation-protocol-byte-stability', (scratchDir) => {
+    const fixture = createStableFixtureRepository(scratchDir);
+    assert.equal(fixture.sourceCommit, '95f7d0ac6fac3dab1a96aeed3e5d853176a6617f');
+
+    const packaged = packageAutomationsProtocol({
+      repoRoot: fixture.repoRoot,
+      outputDir: path.join(scratchDir, 'out'),
+      sourceCommit: fixture.sourceCommit
+    });
+
+    assert.equal(
+      packaged.bundleSha256,
+      '6c22689d02da51d13c48881479173f1fc8df26339c04156c7e49d414e0b3b640'
+    );
+    assert.equal(
+      sha256(readFileSync(packaged.manifestPath)),
+      '3ca6e1474505e770f11bcbfdf1e640940055dd6ae51d7924c627b17731a892e1'
+    );
+  });
+});
+
+test('reproduces the immutable historical base-v1 artifact byte for byte', () => {
+  assert.deepEqual(reproduceHistoricalAutomationsProtocolArtifact(repositoryRoot), {
+    sourceCommit: '8a796807b37d4ad33eaeca37498debf1ca55dd49',
+    bundleSha256: '512460db71d4257d7a4d33ea306578e66d9ac499d9384eb9c2b8e2b4e2e32363',
+    contractContentSha256: '3c145eb92a93426ed64631f6487a8cd12903b0a49a6e752269f594ac50a779f5',
+    fileCount: 17
   });
 });
 

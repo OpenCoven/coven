@@ -17,6 +17,8 @@
     "runtimeAuthorityConsumerBehavior": "require-validate-verify-or-refuse"
   },
   "unknownProfileBehavior": "fail-closed",
+  "upstreamArtifacts": "upstream-artifacts.json",
+  "rustProjection": "crates/coven-cli/src/automations/contract/authority.rs",
   "normativeInputs": {
     "familiarContract": {
       "repository": "OpenCoven/familiar-contract",

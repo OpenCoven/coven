@@ -38,9 +38,10 @@ missing, mismatched, or unverifiable authority evidence fails closed.
 - `AutomationExecutionBinding` is the immutable, one-attempt dispatch snapshot.
   It pins the base definition/occurrence/run/attempt anchors, authenticated
   principal, replay state, familiar root/revision/status, authorized projection
-  identifiers, Threads decision and protected-surface manifest, capability and
-  approval decisions, risk, exact runtime selection, policy/profile versions,
-  producer, timestamp, integrity, and authentication.
+  identifiers, familiar validity/revocation/retirement checks, Threads decision
+  and protected-surface manifest, capability and approval decisions, risk,
+  exact runtime selection, policy/profile versions, privacy/redaction
+  classification, producer, timestamp, integrity, and authentication.
 - `AutomationReceiptAuthorityEvidence` is the minimized receipt projection
   carried beside the binding in the authority extension. It
   preserves the authenticated base receipt digest plus exact binding,
@@ -76,7 +77,9 @@ to the bound is valid, while an age strictly greater than the bound is stale.
 All values must be I-JSON-compatible before schema validation or RFC 8785
 canonicalization. Implementations recursively reject unpaired UTF-16
 surrogates in string values and object member names; malformed Unicode cannot
-be signed, verified, or dispatched.
+be signed, verified, or dispatched. Negative vectors encode invalid UTF-16 as
+ASCII mutation instructions and construct the invalid value only in memory, so
+the published `test-vectors.json` remains strict I-JSON and parses with `jq`.
 
 Replay validation is phase-specific. Before dispatch, a nonce, adoption key,
 per-run approval identifier, or recurring consumption tuple already present in
@@ -95,9 +98,35 @@ authorization back into a fresh authorization.
 - Protected-action authority and approvals:
   `OpenCoven/coven-threads@c3bd46bcadb6396db8436c47411a4d0eac17192b`
 
+`upstream-artifacts.json` pins the SHA-256 and byte length of the reviewed
+Familiar schema/manifest/automation vectors and Threads
+manifest/decision-schema/authority vectors at those commits. Consumers use
+those canaries to detect a moved tag, substituted export, or locally copied
+parallel contract.
+
 This profile consumes those semantics without copying ownership into Coven.
 Rust remains the runtime authority. The TypeScript declaration is a pinned
 projection only.
+
+## Validation seams
+
+`scripts/validate-automations-authority-profile.mjs` exports
+`negotiateAuthorityProfile`. Generic base-v1 consumers return the complete
+extensions object unchanged and never inspect unknown profiles. Runtime
+Authority consumers must advertise the base profile, companion profile, and
+`automations.runtime-authority.v1` before the companion is parsed.
+
+The Rust projection lives in
+`crates/coven-cli/src/automations/contract/authority.rs`. Its
+`validate_authority_profile` boundary performs closed typed projection,
+chronology, digest, receipt-correlation, and capability negotiation checks,
+then requires an `AuthorityEvidenceVerifier`. That adapter is the deliberately
+narrow future dispatch seam for trusted Familiar, Threads, replay, approval,
+runtime, and signature evidence. A missing adapter returns
+`AUTHORITY_ADAPTER_MISSING`; unavailable trusted data returns a typed refusal
+instead of falling back to the base run's string references.
+
+No scheduler or runtime launch path calls this seam in this slice.
 
 ## Artifact
 

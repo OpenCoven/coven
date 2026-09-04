@@ -91,6 +91,18 @@ run, attempt, fence, nonce, adoption key, and approval consumption. This lets a
 legitimate completed run remain verifiable without allowing the same authority
 to authorize another dispatch.
 
+The companion has two executable validation projections without dispatch
+integration. The Node conformance validator owns portable vectors and
+advertisement checks. The Rust projection under
+`automations/contract/authority.rs` parses the closed profile, verifies its JCS
+digest and receipt correlation, and requires a narrow
+`AuthorityEvidenceVerifier` for deployment-owned Familiar, Threads, replay,
+approval, runtime, and signature evidence. Runtime Authority never falls back
+to base-v1 string references: absent adapters return
+`AUTHORITY_ADAPTER_MISSING`, absent trusted state returns
+`AUTHORITY_TRUSTED_STATE_UNAVAILABLE`, and generic base consumers continue to
+preserve unknown extensions without interpretation.
+
 ## Data model
 
 All objects are JSON per draft 2020-12 schemas under `spec/coven-automations/v1/`, with `additionalProperties: false`: unknown fields fail closed, and optional, non-semantic data travels only in the explicit `extensions` bag (keys `x-*` or reverse-DNS; preserved on round-trip, never interpreted until promoted by a new profile).

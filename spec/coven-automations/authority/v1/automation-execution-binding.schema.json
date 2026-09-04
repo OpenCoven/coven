@@ -74,6 +74,7 @@
     "versions",
     "decisionTimestamp",
     "producer",
+    "privacy",
     "integrity",
     "authentication"
   ],
@@ -167,7 +168,10 @@
         "statusAtDecision",
         "verifiedAt",
         "freshnessPolicyVersion",
-        "freshnessBoundSeconds"
+        "freshnessBoundSeconds",
+        "validTime",
+        "revocation",
+        "retirement"
       ],
       "properties": {
         "familiarRootId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
@@ -182,7 +186,10 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 300
-        }
+        },
+        "validTime": { "$ref": "common.schema.json#/$defs/familiarValidity" },
+        "revocation": { "$ref": "common.schema.json#/$defs/familiarRevocation" },
+        "retirement": { "$ref": "common.schema.json#/$defs/familiarRetirement" }
       }
     },
     "contextProjection": {
@@ -285,6 +292,7 @@
     },
     "decisionTimestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
     "producer": { "$ref": "common.schema.json#/$defs/producer" },
+    "privacy": { "$ref": "common.schema.json#/$defs/authorityPrivacy" },
     "integrity": { "$ref": "common.schema.json#/$defs/integrity" },
     "authentication": { "$ref": "common.schema.json#/$defs/authentication" }
   }

@@ -6,6 +6,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const PROFILE = 'coven.automations.authority.v1';
+const BASE_PROFILE = 'coven.automations.v1';
+const RUNTIME_AUTHORITY_CAPABILITY = 'automations.runtime-authority.v1';
+const AUTHORITY_EXTENSION_KEY = PROFILE;
 const BINDING_DOMAIN = 'opencoven:coven-automations-authority-binding:v1';
 const RECEIPT_DOMAIN = 'opencoven:coven-automations-authority-receipt-evidence:v1';
 const PROFILE_DIR = path.join(
@@ -33,6 +36,7 @@ const BINDING_KEYS = new Set([
   'versions',
   'decisionTimestamp',
   'producer',
+  'privacy',
   'integrity',
   'authentication'
 ]);
@@ -73,6 +77,82 @@ const EXTENSION_KEYS = new Set([
   'receiptEvidence'
 ]);
 
+const TRUSTED_REQUIRED_KEYS = [
+  'dispatchNow',
+  'receiptId',
+  'bindingId',
+  'bindingDigest',
+  'baseReceiptDigest',
+  'automationId',
+  'automationRevision',
+  'principalId',
+  'principalAuthorizationProofRef',
+  'familiarRootId',
+  'identityRevisionId',
+  'familiarDeclarationDigest',
+  'familiarEmbodimentBindingId',
+  'familiarEmbodimentDigest',
+  'familiarValidFrom',
+  'familiarValidUntil',
+  'familiarRevocationState',
+  'familiarRevocationCheckedAt',
+  'familiarRetirementState',
+  'familiarRetirementCheckedAt',
+  'definitionDigest',
+  'occurrenceId',
+  'occurrenceKey',
+  'occurrenceFenceGeneration',
+  'runId',
+  'attemptId',
+  'attemptNumber',
+  'adoptionKey',
+  'projectId',
+  'workspaceId',
+  'contextProjectionIds',
+  'memoryProjectionIds',
+  'threadsDecisionDigest',
+  'protectedSurfaceManifestId',
+  'protectedSurfaceManifestDigest',
+  'runtimeDescriptorDigest',
+  'runtimeId',
+  'runtimeDescriptorVersion',
+  'runtimeSelectionRationale',
+  'runtimeCapabilities',
+  'policyDigest',
+  'policyVersion',
+  'decisionTimestamp',
+  'familiarFreshnessPolicyVersion',
+  'familiarFreshnessBoundSeconds',
+  'authorizationOperation',
+  'authorizationRequestId',
+  'authorizationRequestDigest',
+  'authorizationOutcome',
+  'consumptionSnapshotDigest',
+  'requestedCapabilities',
+  'grantedCapabilities',
+  'deniedCapabilities',
+  'degradedCapabilities',
+  'approvalRequirement',
+  'approvalId',
+  'approvalDigest',
+  'approvalScopeDigest',
+  'approvalExpiresAt',
+  'approvalConsumptionDigest',
+  'approvalUse',
+  'approvalConsumption',
+  'riskClass',
+  'sideEffectClass',
+  'privacyClassification',
+  'privacyRetention',
+  'privacyRedactionStatus',
+  'authenticationProofs',
+  'replayedNonces',
+  'replayedAdoptionKeys',
+  'consumedApprovalIds',
+  'consumedRecurringOccurrences',
+  'dispatchConsumptions'
+];
+
 export class AuthorityProfileError extends Error {
   constructor(code, message) {
     super(message);
@@ -86,7 +166,11 @@ function refuse(code, message) {
 }
 
 function isPlainObject(value) {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
 }
 
 function assertWellFormedString(value) {
@@ -104,21 +188,70 @@ function assertWellFormedString(value) {
   }
 }
 
-function assertIJson(value) {
+function assertIJson(value, ancestors = new Set()) {
   if (typeof value === 'string') {
     assertWellFormedString(value);
     return;
   }
+  if (value === null || typeof value === 'boolean') {
+    return;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON contains a non-finite number');
+    }
+    return;
+  }
+  if (typeof value !== 'object') {
+    refuse('AUTHORITY_IJSON_INVALID', 'Authority value is not JSON');
+  }
+  if (ancestors.has(value)) {
+    refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON contains a cycle');
+  }
+  ancestors.add(value);
   if (Array.isArray(value)) {
-    value.forEach(assertIJson);
+    const ownKeys = Reflect.ownKeys(value);
+    if (
+      ownKeys.some(
+        (key) =>
+          typeof key !== 'string' ||
+          (key !== 'length' &&
+            (!/^(0|[1-9][0-9]*)$/.test(key) ||
+              Number(key) >= value.length ||
+              String(Number(key)) !== key))
+      )
+    ) {
+      refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON array has non-index properties');
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.hasOwn(value, index)) {
+        refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON array is sparse');
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON array has non-data entries');
+      }
+      assertIJson(value[index], ancestors);
+    }
+    ancestors.delete(value);
     return;
   }
   if (isPlainObject(value)) {
-    for (const [key, child] of Object.entries(value)) {
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string') {
+        refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON object has a symbol key');
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !Object.hasOwn(descriptor, 'value')) {
+        refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON object has a non-data property');
+      }
       assertWellFormedString(key);
-      assertIJson(child);
+      assertIJson(descriptor.value, ancestors);
     }
+    ancestors.delete(value);
+    return;
   }
+  refuse('AUTHORITY_IJSON_INVALID', 'Authority value contains a non-JSON object');
 }
 
 function canonicalJson(value) {
@@ -277,10 +410,11 @@ function schemaErrors(value, schema, rootSchema, schemas, location = '$') {
     if (typeof value !== 'string') {
       return [`${location}: expected string`];
     }
-    if (schema.minLength !== undefined && value.length < schema.minLength) {
+    const length = [...value].length;
+    if (schema.minLength !== undefined && length < schema.minLength) {
       return [`${location}: string below minimum length`];
     }
-    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+    if (schema.maxLength !== undefined && length > schema.maxLength) {
       return [`${location}: string above maximum length`];
     }
     if (schema.pattern && !new RegExp(schema.pattern).test(value)) {
@@ -377,6 +511,51 @@ function assertProfile(value) {
   }
   if (value.profile !== PROFILE) {
     refuse('AUTHORITY_PROFILE_UNKNOWN', `Unsupported authority profile ${value.profile}`);
+  }
+}
+
+function assertTrustedState(trusted) {
+  if (!isPlainObject(trusted)) {
+    refuse(
+      'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+      'Trusted authority state is unavailable'
+    );
+  }
+  const missing = TRUSTED_REQUIRED_KEYS.find((key) => !Object.hasOwn(trusted, key));
+  if (missing) {
+    refuse(
+      'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+      `Trusted authority state is missing ${missing}`
+    );
+  }
+  for (const key of [
+    'contextProjectionIds',
+    'memoryProjectionIds',
+    'runtimeCapabilities',
+    'requestedCapabilities',
+    'grantedCapabilities',
+    'deniedCapabilities',
+    'degradedCapabilities',
+    'replayedNonces',
+    'replayedAdoptionKeys',
+    'consumedApprovalIds',
+    'consumedRecurringOccurrences',
+    'dispatchConsumptions'
+  ]) {
+    if (!Array.isArray(trusted[key])) {
+      refuse(
+        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+        `Trusted authority state ${key} must be an array`
+      );
+    }
+  }
+  for (const key of ['approvalUse', 'approvalConsumption', 'authenticationProofs']) {
+    if (!isPlainObject(trusted[key])) {
+      refuse(
+        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+        `Trusted authority state ${key} must be an object`
+      );
+    }
   }
 }
 
@@ -517,6 +696,47 @@ function assertFamiliarFreshness(value, trusted, dispatchNow, decisionAt) {
     refuse('AUTHORITY_SCHEMA_INVALID', 'Familiar verification timestamp is invalid');
   }
   const verifiedAt = Date.parse(value.familiar.verifiedAt);
+  const validFrom = Date.parse(value.familiar?.validTime?.notBefore);
+  const validUntil = Date.parse(value.familiar?.validTime?.notAfter);
+  const revocationCheckedAt = Date.parse(value.familiar?.revocation?.checkedAt);
+  const retirementCheckedAt = Date.parse(value.familiar?.retirement?.checkedAt);
+  if (
+    !isTimestamp(value.familiar?.validTime?.notBefore) ||
+    !isTimestamp(value.familiar?.validTime?.notAfter) ||
+    !isTimestamp(value.familiar?.revocation?.checkedAt) ||
+    !isTimestamp(value.familiar?.retirement?.checkedAt)
+  ) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Familiar validity timestamp is invalid');
+  }
+  if (
+    value.familiar.validTime.notBefore !== trusted.familiarValidFrom ||
+    value.familiar.validTime.notAfter !== trusted.familiarValidUntil ||
+    value.familiar.revocation.state !== trusted.familiarRevocationState ||
+    value.familiar.revocation.checkedAt !== trusted.familiarRevocationCheckedAt ||
+    value.familiar.retirement.state !== trusted.familiarRetirementState ||
+    value.familiar.retirement.checkedAt !== trusted.familiarRetirementCheckedAt
+  ) {
+    refuse('AUTHORITY_FAMILIAR_MISMATCH', 'Familiar validity evidence does not match');
+  }
+  if (
+    validFrom > decisionAt ||
+    decisionAt >= validUntil ||
+    dispatchNow >= validUntil ||
+    validFrom >= validUntil
+  ) {
+    refuse('AUTHORITY_FAMILIAR_STALE', 'Familiar validity does not cover dispatch');
+  }
+  if (
+    revocationCheckedAt > decisionAt ||
+    revocationCheckedAt > dispatchNow ||
+    retirementCheckedAt > decisionAt ||
+    retirementCheckedAt > dispatchNow
+  ) {
+    refuse(
+      'AUTHORITY_FAMILIAR_TIME_INVALID',
+      'Familiar lifecycle checks cannot follow decision or dispatch'
+    );
+  }
   if (verifiedAt > decisionAt || verifiedAt > dispatchNow) {
     refuse(
       'AUTHORITY_FAMILIAR_TIME_INVALID',
@@ -789,9 +1009,25 @@ function assertBinding(value, trusted, { phase = 'pre_dispatch' } = {}) {
   }
   if (
     digestValue(value.familiar?.declarationDigest) !== trusted.familiarDeclarationDigest ||
+    value.familiar?.embodimentBindingId !== trusted.familiarEmbodimentBindingId ||
     digestValue(value.familiar?.embodimentDigest) !== trusted.familiarEmbodimentDigest
   ) {
     refuse('AUTHORITY_FAMILIAR_MISMATCH', 'Familiar evidence digest does not match');
+  }
+  if (
+    value.privacy?.sensitiveMaterialIncluded !== false
+  ) {
+    refuse(
+      'AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN',
+      'Authority binding contains unauthorized sensitive material'
+    );
+  }
+  if (
+    value.privacy?.classification !== trusted.privacyClassification ||
+    value.privacy?.retention !== trusted.privacyRetention ||
+    value.privacy?.redactionStatus !== trusted.privacyRedactionStatus
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Authority privacy classification does not match');
   }
   if (
     value.contextProjection?.projectId !== trusted.projectId ||
@@ -891,6 +1127,16 @@ function assertReceiptEvidence(value, trusted) {
     value.approval?.requirement === 'not_required'
   ) {
     refuse('AUTHORITY_APPROVAL_REQUIRED', 'Receipt authorization requires approval evidence');
+  }
+  if (
+    value.privacy?.classification !== trusted.privacyClassification ||
+    value.privacy?.retention !== trusted.privacyRetention ||
+    value.privacy?.redactionStatus !== trusted.privacyRedactionStatus
+  ) {
+    refuse(
+      'AUTHORITY_RECEIPT_BINDING_MISMATCH',
+      'Receipt privacy classification does not match'
+    );
   }
   if (
     value.authorization?.outcome === 'permit' &&
@@ -1004,20 +1250,32 @@ function assertReceiptEvidence(value, trusted) {
   assertAuthentication(value, trusted);
 }
 
-function assertExtension(value, trusted) {
+function assertExtension(value, trusted, phase) {
   assertClosedTopLevel(value, EXTENSION_KEYS);
   if (value.kind !== 'AutomationAuthorityExtension') {
     refuse('AUTHORITY_SCHEMA_INVALID', 'Authority extension kind is invalid');
   }
+  if (phase !== undefined && !['pre_dispatch', 'terminal'].includes(phase)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', `Unknown authority validation phase ${phase}`);
+  }
   const terminal =
-    value.receiptEvidence !== null ||
-    trusted.receiptId !== null ||
-    trusted.baseReceiptDigest !== null;
+    phase === 'terminal' ||
+    (phase === undefined &&
+      (value.receiptEvidence !== null ||
+        trusted.receiptId !== null ||
+        trusted.baseReceiptDigest !== null));
+  if (phase === 'pre_dispatch' && value.receiptEvidence !== null) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Pre-dispatch authority cannot contain receipt evidence');
+  }
   assertBinding(value.executionBinding, trusted, {
     phase: terminal ? 'terminal' : 'pre_dispatch'
   });
   if (value.receiptEvidence === null) {
-    if (trusted.receiptId !== null || trusted.baseReceiptDigest !== null) {
+    if (
+      terminal ||
+      trusted.receiptId !== null ||
+      trusted.baseReceiptDigest !== null
+    ) {
       refuse(
         'AUTHORITY_RECEIPT_EVIDENCE_REQUIRED',
         'Terminal receipt state requires authenticated authority evidence'
@@ -1116,7 +1374,8 @@ function assertExtension(value, trusted) {
       digestValue(binding.runtime.descriptorDigest) ||
     !sameSet(receipt.runtime.capabilities, binding.runtime.capabilities) ||
     receipt.decisionTimestamp !== binding.decisionTimestamp ||
-    !sameJson(receipt.producer, binding.producer)
+    !sameJson(receipt.producer, binding.producer) ||
+    !sameJson(receipt.privacy, binding.privacy)
   ) {
     refuse('AUTHORITY_RECEIPT_BINDING_MISMATCH', 'Receipt evidence was spliced');
   }
@@ -1124,19 +1383,64 @@ function assertExtension(value, trusted) {
   assertSchema(value, 'authority-extension.schema.json');
 }
 
-export function validateAuthorityValue(value, trusted, target) {
+export function validateAuthorityValue(value, trusted, target, { phase } = {}) {
   assertIJson(value);
   assertProfile(value);
+  assertTrustedState(trusted);
   if (target === 'binding') {
     assertBinding(value, trusted);
   } else if (target === 'receiptEvidence') {
     assertReceiptEvidence(value, trusted);
   } else if (target === 'extension') {
-    assertExtension(value, trusted);
+    assertExtension(value, trusted, phase);
   } else {
     refuse('AUTHORITY_SCHEMA_INVALID', `Unknown vector target ${target}`);
   }
   return value;
+}
+
+export function negotiateAuthorityProfile({
+  consumerClass,
+  advertisedProfiles,
+  advertisedCapabilities,
+  extensions,
+  trusted,
+  phase = 'terminal'
+}) {
+  assertIJson(extensions);
+  if (!isPlainObject(extensions)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Extensions must be an object');
+  }
+  if (consumerClass === 'generic-base-v1') {
+    return {
+      disposition: 'preserved-opaque',
+      extensions: structuredClone(extensions)
+    };
+  }
+  if (consumerClass !== 'runtime-authority-v1') {
+    refuse('AUTHORITY_PROFILE_UNKNOWN', `Unknown authority consumer ${consumerClass}`);
+  }
+  if (
+    !Array.isArray(advertisedProfiles) ||
+    !advertisedProfiles.includes(BASE_PROFILE) ||
+    !advertisedProfiles.includes(PROFILE) ||
+    !Array.isArray(advertisedCapabilities) ||
+    !advertisedCapabilities.includes(RUNTIME_AUTHORITY_CAPABILITY)
+  ) {
+    refuse(
+      'AUTHORITY_PROFILE_REQUIRED',
+      'Runtime Authority requires explicit profile and capability advertisement'
+    );
+  }
+  if (!Object.hasOwn(extensions, AUTHORITY_EXTENSION_KEY)) {
+    refuse('AUTHORITY_PROFILE_MISSING', 'Authority extension is missing');
+  }
+  const authority = extensions[AUTHORITY_EXTENSION_KEY];
+  validateAuthorityValue(authority, trusted, 'extension', { phase });
+  return {
+    disposition: 'validated',
+    authority
+  };
 }
 
 function pointerComponents(pointer) {
@@ -1154,12 +1458,68 @@ function applyMutation(value, mutation) {
     return value;
   }
   const components = pointerComponents(mutation.path);
+  if (mutation.op === 'addEncodedKey') {
+    let target = value;
+    for (const component of components) {
+      target = target[component];
+    }
+    if (
+      mutation.encoding !== 'utf16-code-unit' ||
+      !/^[0-9a-f]{4}$/i.test(mutation.codeUnit) ||
+      !isPlainObject(target)
+    ) {
+      refuse('AUTHORITY_SCHEMA_INVALID', 'Invalid encoded object-key mutation');
+    }
+    target[String.fromCharCode(Number.parseInt(mutation.codeUnit, 16))] = mutation.value;
+    return value;
+  }
+  if (mutation.op === 'addArrayProperty' || mutation.op === 'addSymbolKey') {
+    let target = value;
+    for (const component of components) {
+      target = target[component];
+    }
+    if (mutation.op === 'addArrayProperty') {
+      if (!Array.isArray(target) || typeof mutation.key !== 'string') {
+        refuse('AUTHORITY_SCHEMA_INVALID', 'Invalid array-property mutation');
+      }
+      target[mutation.key] = mutation.value;
+    } else {
+      if (!isPlainObject(target) || typeof mutation.key !== 'string') {
+        refuse('AUTHORITY_SCHEMA_INVALID', 'Invalid symbol-key mutation');
+      }
+      target[Symbol(mutation.key)] = mutation.value;
+    }
+    return value;
+  }
   const last = components.pop();
   let parent = value;
   for (const component of components) {
     parent = parent[component];
   }
-  if (mutation.op === 'remove') {
+  if (mutation.op === 'replaceSparseArray') {
+    const sparse = [];
+    sparse.length = 2;
+    sparse[1] = mutation.value;
+    parent[last] = sparse;
+  } else if (mutation.op === 'replaceNonJson') {
+    const replacements = {
+      nan: Number.NaN,
+      undefined,
+      date: new Date(0)
+    };
+    if (!Object.hasOwn(replacements, mutation.kind)) {
+      refuse('AUTHORITY_SCHEMA_INVALID', 'Invalid non-JSON mutation');
+    }
+    parent[last] = replacements[mutation.kind];
+  } else if (mutation.op === 'replaceEncodedString') {
+    if (
+      mutation.encoding !== 'utf16-code-unit' ||
+      !/^[0-9a-f]{4}$/i.test(mutation.codeUnit)
+    ) {
+      refuse('AUTHORITY_SCHEMA_INVALID', 'Invalid encoded string mutation');
+    }
+    parent[last] = String.fromCharCode(Number.parseInt(mutation.codeUnit, 16));
+  } else if (mutation.op === 'remove') {
     delete parent[last];
   } else if (mutation.op === 'replace') {
     parent[last] = mutation.value;
@@ -1196,7 +1556,9 @@ export function runAuthorityVectors(vectors) {
   let accepted = 0;
   let refused = 0;
   for (const vector of vectors.cases) {
-    let value = vectorFixture(vectors, vector.target);
+    let value = Object.hasOwn(vector, 'input')
+      ? structuredClone(vector.input)
+      : vectorFixture(vectors, vector.target);
     for (const mutation of vector.mutations ?? (vector.mutation ? [vector.mutation] : [])) {
       value = applyMutation(value, mutation);
     }
@@ -1207,7 +1569,7 @@ export function runAuthorityVectors(vectors) {
       trustedState ? vectors.trustedStates?.[trustedState] : undefined
     );
     trusted = mergeTrusted(trusted, vector.trustedPatch);
-    for (const mutation of vector.trustedMutations ?? []) {
+    for (const mutation of vector.trustedMutations ?? (vector.trustedMutation ? [vector.trustedMutation] : [])) {
       trusted = applyMutation(trusted, mutation);
     }
     try {
@@ -1228,8 +1590,61 @@ export function runAuthorityVectors(vectors) {
       refused += 1;
     }
   }
+  for (const vector of vectors.negotiationCases ?? []) {
+    let extensions = vector.extensionFixture
+      ? {
+          [AUTHORITY_EXTENSION_KEY]: {
+            profile: PROFILE,
+            kind: 'AutomationAuthorityExtension',
+            executionBinding: structuredClone(vectors.fixtures.binding),
+            receiptEvidence: structuredClone(vectors.fixtures.receiptEvidence)
+          }
+        }
+      : structuredClone(vector.extensions);
+    for (const mutation of vector.mutations ?? (vector.mutation ? [vector.mutation] : [])) {
+      extensions = applyMutation(extensions, mutation);
+    }
+    let trusted = mergeTrusted(
+      vectors.trusted,
+      vector.trustedState ? vectors.trustedStates?.[vector.trustedState] : undefined
+    );
+    trusted = mergeTrusted(trusted, vector.trustedPatch);
+    for (const mutation of vector.trustedMutations ?? []) {
+      trusted = applyMutation(trusted, mutation);
+    }
+    try {
+      const result = negotiateAuthorityProfile({
+        consumerClass: vector.consumerClass,
+        advertisedProfiles: vector.advertisedProfiles,
+        advertisedCapabilities: vector.advertisedCapabilities,
+        extensions,
+        trusted,
+        phase: vector.phase
+      });
+      if (vector.expected !== 'accept') {
+        throw new Error(`${vector.id}: expected refusal ${vector.errorCode}, got accept`);
+      }
+      if (
+        vector.consumerClass === 'generic-base-v1' &&
+        !sameJson(result.extensions, vector.extensions)
+      ) {
+        throw new Error(`${vector.id}: generic consumer changed opaque extensions`);
+      }
+      accepted += 1;
+    } catch (error) {
+      if (vector.expected !== 'refuse') {
+        throw new Error(`${vector.id}: expected accept, got ${error.code ?? error.message}`);
+      }
+      if (error.code !== vector.errorCode) {
+        throw new Error(
+          `${vector.id}: expected ${vector.errorCode}, got ${error.code ?? error.message}`
+        );
+      }
+      refused += 1;
+    }
+  }
   return {
-    total: vectors.cases.length,
+    total: vectors.cases.length + (vectors.negotiationCases?.length ?? 0),
     accepted,
     refused
   };

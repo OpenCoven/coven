@@ -36,6 +36,28 @@ export interface AuthorityAuthentication {
   signature: string;
 }
 
+export interface FamiliarValidity {
+  notBefore: Timestamp;
+  notAfter: Timestamp;
+}
+
+export interface FamiliarRevocation {
+  state: "not_revoked";
+  checkedAt: Timestamp;
+}
+
+export interface FamiliarRetirement {
+  state: "not_retired";
+  checkedAt: Timestamp;
+}
+
+export interface AuthorityPrivacy {
+  classification: "operational" | "sensitive" | "restricted";
+  retention: "ephemeral_24h" | "authority_evidence_90d" | "authority_evidence_1y";
+  redactionStatus: "not_required" | "redacted" | "tombstoned";
+  sensitiveMaterialIncluded: false;
+}
+
 export interface DeniedCapability {
   capability: Capability;
   reasonCode: OpaqueIdentifier;
@@ -149,6 +171,9 @@ export interface AutomationExecutionBindingCommon {
     verifiedAt: Timestamp;
     freshnessPolicyVersion: OpaqueIdentifier;
     freshnessBoundSeconds: number;
+    validTime: FamiliarValidity;
+    revocation: FamiliarRevocation;
+    retirement: FamiliarRetirement;
   };
   contextProjection: {
     projectId: OpaqueIdentifier;
@@ -193,6 +218,7 @@ export interface AutomationExecutionBindingCommon {
   };
   decisionTimestamp: Timestamp;
   producer: AuthorityProducer;
+  privacy: AuthorityPrivacy;
   integrity: Digest;
   authentication: AuthorityAuthentication;
 }
@@ -242,6 +268,9 @@ export interface AutomationReceiptAuthorityEvidenceCommon {
     verifiedAt: Timestamp;
     freshnessPolicyVersion: OpaqueIdentifier;
     freshnessBoundSeconds: number;
+    validTime: FamiliarValidity;
+    revocation: FamiliarRevocation;
+    retirement: FamiliarRetirement;
   };
   capabilities: {
     requested: Capability[];
@@ -262,12 +291,7 @@ export interface AutomationReceiptAuthorityEvidenceCommon {
   };
   decisionTimestamp: Timestamp;
   producer: AuthorityProducer;
-  privacy: {
-    classification: "operational" | "sensitive" | "restricted";
-    retention: "ephemeral_24h" | "authority_evidence_90d" | "authority_evidence_1y";
-    redactionStatus: "not_required" | "redacted" | "tombstoned";
-    sensitiveMaterialIncluded: false;
-  };
+  privacy: AuthorityPrivacy;
   integrity: Digest;
   authentication: AuthorityAuthentication;
 }

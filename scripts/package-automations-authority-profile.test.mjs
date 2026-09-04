@@ -45,10 +45,12 @@ const REQUIRED_FILES = [
   'conformance-manifest.json',
   'coven.automations.authority.v1.d.ts',
   'protocol-version.json',
-  'test-vectors.json'
+  'test-vectors.json',
+  'upstream-artifacts.json'
 ];
 
 const REQUIRED_NEGATIVE_VECTOR_IDS = [
+  'explicit-null-authority-value',
   'missing-profile',
   'unknown-profile',
   'malformed-binding-capabilities',
@@ -64,6 +66,9 @@ const REQUIRED_NEGATIVE_VECTOR_IDS = [
   'forged-principal',
   'mismatched-familiar-root',
   'mismatched-familiar-revision',
+  'mismatched-familiar-declaration-digest',
+  'mismatched-familiar-embodiment-digest',
+  'mismatched-familiar-embodiment-binding-id',
   'stale-familiar',
   'stale-familiar-verification',
   'future-familiar-verification',
@@ -94,7 +99,11 @@ const REQUIRED_NEGATIVE_VECTOR_IDS = [
   'stale-policy',
   'old-occurrence-fence',
   'tampered-binding-digest',
+  'tampered-authentication-signature',
   'trusted-binding-digest-mismatch',
+  'missing-trusted-replay-state',
+  'missing-trusted-proof-store',
+  'missing-trusted-runtime-capabilities',
   'rehashed-payload-reused-proof',
   'unverifiable-authentication',
   'unknown-field',
@@ -111,7 +120,28 @@ const REQUIRED_NEGATIVE_VECTOR_IDS = [
   'ungranted-capability-exercised',
   'unpaired-surrogate-object-key',
   'unpaired-surrogate-runtime-id',
-  'unauthorized-sensitive-evidence'
+  'unauthorized-sensitive-evidence',
+  'binding-privacy-mismatch',
+  'receipt-privacy-splice'
+];
+
+const REQUIRED_NEGOTIATION_VECTOR_IDS = [
+  'generic-unknown-extension-preserved',
+  'generic-non-finite-number-refused',
+  'generic-undefined-refused',
+  'generic-non-json-object-refused',
+  'generic-sparse-array-refused',
+  'generic-array-property-refused',
+  'generic-symbol-key-refused',
+  'runtime-authority-advertised',
+  'runtime-authority-pre-dispatch-advertised',
+  'runtime-authority-capability-missing',
+  'runtime-authority-terminal-evidence-missing',
+  'runtime-authority-unknown-profile'
+];
+
+const REQUIRED_POSITIVE_VECTOR_IDS = [
+  'astral-runtime-id-64-code-points'
 ];
 
 function readJson(relativePath) {
@@ -199,6 +229,87 @@ test('publishes the complete separately versioned authority companion profile', 
     version.normativeInputs.covenThreads.commit,
     'c3bd46bcadb6396db8436c47411a4d0eac17192b'
   );
+  const upstreamArtifacts = readJson('upstream-artifacts.json');
+  assert.deepEqual(upstreamArtifacts, {
+    profile: 'coven.automations.authority.v1',
+    artifacts: [
+      {
+        repository: 'OpenCoven/familiar-contract',
+        commit: '13d150a32a817da19bb4e5053f2205b15db0bb0a',
+        path: 'schemas/familiar-embodiment-binding.schema.json',
+        sha256: '9cafde21a460f688add8e796651e6af98cec26361c839f29400cb21f65afafdf',
+        size: 10999
+      },
+      {
+        repository: 'OpenCoven/familiar-contract',
+        commit: '13d150a32a817da19bb4e5053f2205b15db0bb0a',
+        path: 'tests/conformance/embodiment-bindings/manifest.json',
+        sha256: '14aea1848afa808b64688f3b5379a37a26253f0d846a2cd655d9651e32348a80',
+        size: 10844
+      },
+      {
+        repository: 'OpenCoven/familiar-contract',
+        commit: '13d150a32a817da19bb4e5053f2205b15db0bb0a',
+        path:
+          'tests/conformance/embodiment-bindings/positive/09-scheduled-automation-run.json',
+        sha256: '5980fc5b312a3e1dd1d90fa7967166a57bc941101aa88e58683223180ad5ed60',
+        size: 4544
+      },
+      {
+        repository: 'OpenCoven/familiar-contract',
+        commit: '13d150a32a817da19bb4e5053f2205b15db0bb0a',
+        path:
+          'tests/conformance/embodiment-bindings/negative/02-stale-cached-revision.json',
+        sha256: '996ca1e225993c11e4cee190dfe024d54b7df70c970d5482e4356059b64548a9',
+        size: 4572
+      },
+      {
+        repository: 'OpenCoven/familiar-contract',
+        commit: '13d150a32a817da19bb4e5053f2205b15db0bb0a',
+        path:
+          'tests/conformance/embodiment-bindings/negative/14-unverifiable-authentication.json',
+        sha256: '6c995e8ac33b03c20205f16ae5636b4e29e4b212d9bc75fcf23a8666eec072c0',
+        size: 4454
+      },
+      {
+        repository: 'OpenCoven/coven-threads',
+        commit: 'c3bd46bcadb6396db8436c47411a4d0eac17192b',
+        path: 'profiles/automation-authority/v1/manifest.json',
+        sha256: 'f58778c2661549e7ca9e69003906c3c116c1dda7f5a4487f6594279706fbf03a',
+        size: 42629
+      },
+      {
+        repository: 'OpenCoven/coven-threads',
+        commit: 'c3bd46bcadb6396db8436c47411a4d0eac17192b',
+        path: 'profiles/automation-authority/v1/schemas/decision.schema.json',
+        sha256: '8602dc0156becd6f0fdd85fcafe81a968c4e38ce4b8123f27813aed6df2e7369',
+        size: 7138
+      },
+      {
+        repository: 'OpenCoven/coven-threads',
+        commit: 'c3bd46bcadb6396db8436c47411a4d0eac17192b',
+        path: 'profiles/automation-authority/v1/vectors/01-r0-read-permit.json',
+        sha256: 'e05338aa37d97944445fb3ec24fa99c99ba64e8cc23663eea44a6c34b188101c',
+        size: 7004
+      },
+      {
+        repository: 'OpenCoven/coven-threads',
+        commit: 'c3bd46bcadb6396db8436c47411a4d0eac17192b',
+        path:
+          'profiles/automation-authority/v1/vectors/14-runtime-capability-downgrade.json',
+        sha256: 'db2214f672dfc01a179e881d637df4098442f494ad21403353160e1f743e1994',
+        size: 9308
+      },
+      {
+        repository: 'OpenCoven/coven-threads',
+        commit: 'c3bd46bcadb6396db8436c47411a4d0eac17192b',
+        path:
+          'profiles/automation-authority/v1/vectors/15-stale-fence-before-dispatch.json',
+        sha256: '9d4974407abab985ec91bdc9ea52d0c25497a75fcc07ceb011a46c47ca72de65',
+        size: 9309
+      }
+    ]
+  });
   assert.equal(version.historicalBaseArtifact.artifactId, 9909975069);
   assert.equal(
     version.historicalBaseArtifact['bundleSha256'],
@@ -314,13 +425,24 @@ test('models every immutable execution binding anchor and minimized receipt evid
     'versions',
     'decisionTimestamp',
     'producer',
+    'privacy',
     'integrity',
     'authentication'
   ]) {
     assert.ok(binding.required.includes(required), `binding requires ${required}`);
   }
-
   const receipt = readJson('automation-receipt-authority-evidence.schema.json');
+  for (const required of ['validTime', 'revocation', 'retirement']) {
+    assert.ok(
+      binding.properties.familiar.required.includes(required),
+      `binding familiar requires ${required}`
+    );
+    assert.ok(
+      receipt.properties.familiar.required.includes(required),
+      `receipt familiar requires ${required}`
+    );
+  }
+
   for (const required of [
     'receiptId',
     'automationId',
@@ -370,13 +492,23 @@ test('runs positive and explicit fail-closed authority vectors', async () => {
     .map((vector) => vector.id)
     .sort();
   assert.deepEqual(negativeIds, [...REQUIRED_NEGATIVE_VECTOR_IDS].sort());
+  const positiveIds = vectors.cases
+    .filter((vector) => vector.expected === 'accept')
+    .map((vector) => vector.id);
+  for (const id of REQUIRED_POSITIVE_VECTOR_IDS) {
+    assert.equal(positiveIds.includes(id), true, `missing positive vector ${id}`);
+  }
+  assert.deepEqual(
+    vectors.negotiationCases.map((vector) => vector.id).sort(),
+    [...REQUIRED_NEGOTIATION_VECTOR_IDS].sort()
+  );
 
   const { runAuthorityVectors } = await import(pathToFileURL(validatorPath));
   const summary = runAuthorityVectors(vectors);
   assert.deepEqual(summary, {
-    total: 68,
-    accepted: 5,
-    refused: 63
+    total: 91,
+    accepted: 9,
+    refused: 82
   });
   for (const vector of vectors.cases.filter((entry) => entry.expected === 'refuse')) {
     assert.equal(
@@ -386,6 +518,20 @@ test('runs positive and explicit fail-closed authority vectors', async () => {
     );
   }
   assert.equal(capabilities.errorCodes.includes('AUTHORITY_UNVERIFIABLE'), false);
+  assert.equal(capabilities.errorCodes.includes('AUTHORITY_ADAPTER_MISSING'), true);
+  assert.equal(capabilities.errorCodes.includes('AUTHORITY_TRUSTED_STATE_UNAVAILABLE'), true);
+});
+
+test('publishes strict I-JSON conformance vectors consumable by jq', () => {
+  const result = spawnSync('jq', ['empty', path.join(profileDir, 'test-vectors.json')], {
+    cwd: repositoryRoot,
+    encoding: 'utf8'
+  });
+  assert.equal(
+    result.status,
+    0,
+    `jq rejected published authority vectors\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`
+  );
 });
 
 test('packages and independently verifies a deterministic authority profile bundle', async () => {

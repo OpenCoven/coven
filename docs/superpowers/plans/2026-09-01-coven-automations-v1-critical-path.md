@@ -846,6 +846,18 @@ cargo test --workspace --locked
 
 **Depends on:** Tasks 2, 3B, and 3C
 
+**Companion-profile checkpoint:** the first independently publishable slice is
+the separately advertised `coven.automations.authority.v1` profile under
+`spec/coven-automations/authority/v1/`. It travels only through the frozen base
+run `extensions` bag, carries an immutable execution binding plus
+receipt-correlated authority evidence, and pins the reviewed Familiar Contract
+and Threads commits and file digests in `upstream-artifacts.json`. Portable
+Node validation and the Rust projection/adapter seam are in scope; scheduler
+dispatch, persistence, and production adapters remain in Steps 3–9 below.
+Generic base consumers preserve the value opaquely. Runtime Authority
+consumers advertise all required profiles/capabilities and fail closed on
+missing adapters or trusted state.
+
 **Files:**
 - Create: `crates/coven-cli/src/automations/binding.rs`
 - Create: `crates/coven-cli/src/automations/authority.rs`

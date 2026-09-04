@@ -17,8 +17,11 @@
   "compatibilityMatrix": "compatibility-matrix.json",
   "goldenVectors": "test-vectors.json",
   "typescriptProjection": "coven.automations.authority.v1.d.ts",
+  "upstreamArtifacts": "upstream-artifacts.json",
   "requiredSuites": [
     "draft-2020-12-schema-validation",
+    "explicit-profile-and-capability-negotiation",
+    "generic-unknown-extension-opaque-preservation",
     "strict-unknown-field-refusal",
     "principal-and-familiar-exact-binding",
     "identity-status-and-freshness",
@@ -35,6 +38,7 @@
     "integrity-and-authentication-verification",
     "recursive-ijson-unpaired-surrogate-refusal",
     "privacy-minimized-receipt-evidence",
+    "trusted-adapter-data-required",
     "deterministic-packed-artifact-verification",
     "frozen-base-v1-byte-stability"
   ],

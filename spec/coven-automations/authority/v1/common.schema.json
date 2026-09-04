@@ -124,6 +124,51 @@
         }
       }
     },
+    "familiarValidity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notBefore", "notAfter"],
+      "properties": {
+        "notBefore": { "$ref": "#/$defs/timestamp" },
+        "notAfter": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "familiarRevocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "checkedAt"],
+      "properties": {
+        "state": { "const": "not_revoked" },
+        "checkedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "familiarRetirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "checkedAt"],
+      "properties": {
+        "state": { "const": "not_retired" },
+        "checkedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "authorityPrivacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "retention",
+        "redactionStatus",
+        "sensitiveMaterialIncluded"
+      ],
+      "properties": {
+        "classification": { "enum": ["operational", "sensitive", "restricted"] },
+        "retention": {
+          "enum": ["ephemeral_24h", "authority_evidence_90d", "authority_evidence_1y"]
+        },
+        "redactionStatus": { "enum": ["not_required", "redacted", "tombstoned"] },
+        "sensitiveMaterialIncluded": { "const": false }
+      }
+    },
     "integrity": {
       "type": "object",
       "additionalProperties": false,
