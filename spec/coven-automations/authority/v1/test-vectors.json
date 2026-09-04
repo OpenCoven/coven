@@ -1,0 +1,787 @@
+{
+  "contractProfile": "coven.automations.authority.v1",
+  "version": 1,
+  "digestRecipe": {
+    "canonicalization": "RFC 8785 (JCS) over the top-level object with integrity and authentication removed",
+    "bindingDomain": "opencoven:coven-automations-authority-binding:v1",
+    "receiptEvidenceDomain": "opencoven:coven-automations-authority-receipt-evidence:v1",
+    "digest": "SHA-256 lowercase hexadecimal over UTF8(domain) || 0x00 || UTF8(canonical-json)"
+  },
+  "trusted": {
+    "dispatchNow": "2026-09-03T12:00:00.000Z",
+    "receiptId": "receipt.daily-notes-1",
+    "bindingId": "binding:daily-notes-1",
+    "bindingDigest": "6e1410f7139821e0a7333ad7c83fc6de0679d2cfdc23120df59a3a9ed2eed1d2",
+    "baseReceiptDigest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "automationId": "daily-notes",
+    "automationRevision": 4,
+    "principalId": "principal:val",
+    "principalAuthorizationProofRef": "proof:principal-session-1",
+    "familiarRootId": "familiar:charm",
+    "identityRevisionId": "revision:charm-42",
+    "familiarDeclarationDigest": "5555555555555555555555555555555555555555555555555555555555555555",
+    "familiarEmbodimentDigest": "6666666666666666666666666666666666666666666666666666666666666666",
+    "definitionDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "occurrenceId": "occurrence.daily-notes-20260903",
+    "occurrenceKey": "daily-notes@2026-09-03T12:00:00.000Z",
+    "occurrenceFenceGeneration": 7,
+    "runId": "run.daily-notes-1",
+    "attemptId": "attempt.daily-notes-1-1",
+    "attemptNumber": 1,
+    "adoptionKey": "adopt:daily-notes-1-1",
+    "projectId": "project:coven",
+    "workspaceId": "workspace:c857",
+    "contextProjectionIds": ["context:automation-definition-4"],
+    "memoryProjectionIds": ["memory-projection:daily-notes-approved"],
+    "threadsDecisionDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+    "protectedSurfaceManifestId": "manifest:protected-surfaces-8",
+    "protectedSurfaceManifestDigest": "9999999999999999999999999999999999999999999999999999999999999999",
+    "runtimeDescriptorDigest": "7777777777777777777777777777777777777777777777777777777777777777",
+    "runtimeId": "runtime:coven-code",
+    "runtimeDescriptorVersion": "1.4.0",
+    "runtimeSelectionRationale": "exact_requirement_match",
+    "runtimeCapabilities": [
+      "analysis.read",
+      "artifact.write"
+    ],
+    "policyDigest": "8888888888888888888888888888888888888888888888888888888888888888",
+    "policyVersion": "policy:automation-12",
+    "decisionTimestamp": "2026-09-03T11:59:59.000Z",
+    "familiarFreshnessPolicyVersion": "familiar-freshness:1",
+    "familiarFreshnessBoundSeconds": 300,
+    "authorizationOperation": "automation.dispatch",
+    "authorizationRequestId": "request:daily-notes-1",
+    "authorizationRequestDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "authorizationOutcome": "requires_approval",
+    "consumptionSnapshotDigest": "4444444444444444444444444444444444444444444444444444444444444444",
+    "requestedCapabilities": ["analysis.read", "artifact.write"],
+    "grantedCapabilities": ["analysis.read", "artifact.write"],
+    "deniedCapabilities": [],
+    "degradedCapabilities": [],
+    "approvalRequirement": "bounded_recurring",
+    "approvalId": "approval:daily-notes-1",
+    "approvalDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "approvalScopeDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "approvalExpiresAt": "2026-09-03T12:05:00.000Z",
+    "approvalConsumptionDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "approvalUse": {
+      "kind": "recurring",
+      "grantId": "grant:daily-notes",
+      "maxUses": 2,
+      "occurrencePrefix": "occurrence.daily-notes-",
+      "priorUses": 1
+    },
+    "approvalConsumption": {
+      "state": "consumed_for_dispatch",
+      "eventId": "approval-event:daily-notes-1",
+      "eventDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "requestDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "decisionDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "occurrenceId": "occurrence.daily-notes-20260903",
+      "runId": "run.daily-notes-1",
+      "attemptNumber": 1,
+      "fenceGeneration": 7,
+      "usageNumber": 2
+    },
+    "riskClass": "R1",
+    "sideEffectClass": "local_write",
+    "authenticationProofs": {
+      "proof:authority-binding-1": {
+        "method": "ed25519",
+        "keyId": "key:coven-authority-1",
+        "publicKeyDerHex": "302a300506032b65700321006101102893cf351e4d58a73e566f3778b66f7bcd69629e8d168e3e5a7ff05f52"
+      },
+      "proof:authority-receipt-1": {
+        "method": "ed25519",
+        "keyId": "key:coven-authority-1",
+        "publicKeyDerHex": "302a300506032b65700321006101102893cf351e4d58a73e566f3778b66f7bcd69629e8d168e3e5a7ff05f52"
+      }
+    },
+    "replayedNonces": [],
+    "replayedAdoptionKeys": [],
+    "consumedApprovalIds": [],
+    "consumedRecurringOccurrences": []
+  },
+  "trustedStates": {
+    "terminalRecurring": {
+      "replayedNonces": ["nonce:daily-notes-1"],
+      "replayedAdoptionKeys": ["adopt:daily-notes-1-1"],
+      "consumedApprovalIds": [],
+      "consumedRecurringOccurrences": [
+        "{\"attemptNumber\":1,\"decisionDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"fenceGeneration\":7,\"grantId\":\"grant:daily-notes\",\"occurrenceId\":\"occurrence.daily-notes-20260903\",\"requestDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"runId\":\"run.daily-notes-1\"}"
+      ],
+      "dispatchConsumptions": [
+        {
+          "bindingId": "binding:daily-notes-1",
+          "nonce": "nonce:daily-notes-1",
+          "adoptionKey": "adopt:daily-notes-1-1",
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "runId": "run.daily-notes-1",
+          "attemptId": "attempt.daily-notes-1-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "approval": {
+            "requirement": "bounded_recurring",
+            "approvalId": "approval:daily-notes-1",
+            "use": {
+              "kind": "recurring",
+              "grantId": "grant:daily-notes",
+              "maxUses": 2,
+              "occurrencePrefix": "occurrence.daily-notes-",
+              "priorUses": 1
+            },
+            "consumption": {
+              "state": "consumed_for_dispatch",
+              "eventId": "approval-event:daily-notes-1",
+              "eventDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              },
+              "requestDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              "decisionDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              "occurrenceId": "occurrence.daily-notes-20260903",
+              "runId": "run.daily-notes-1",
+              "attemptNumber": 1,
+              "fenceGeneration": 7,
+              "usageNumber": 2
+            }
+          }
+        }
+      ]
+    },
+    "terminalPerRun": {
+      "bindingDigest": "755a80736e84006590d9e8d9878217fe8864b172cc55c103e967ff61fabf2d14",
+      "approvalRequirement": "human_per_run",
+      "approvalUse": { "kind": "single_use" },
+      "approvalConsumption": {
+        "state": "consumed_for_dispatch",
+        "eventId": "approval-event:daily-notes-1",
+        "eventDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "requestDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+        "decisionDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+        "occurrenceId": "occurrence.daily-notes-20260903",
+        "runId": "run.daily-notes-1",
+        "attemptNumber": 1,
+        "fenceGeneration": 7
+      },
+      "authenticationProofs": {
+        "proof:authority-binding-1": {
+          "method": "ed25519",
+          "keyId": "key:coven-authority-1",
+          "publicKeyDerHex": "302a300506032b6570032100c97c455cd6697958deb2128de5beb14e04636a5872ee2aaaf13828fc31ab2628"
+        },
+        "proof:authority-receipt-1": {
+          "method": "ed25519",
+          "keyId": "key:coven-authority-1",
+          "publicKeyDerHex": "302a300506032b6570032100c97c455cd6697958deb2128de5beb14e04636a5872ee2aaaf13828fc31ab2628"
+        }
+      },
+      "replayedNonces": ["nonce:daily-notes-1"],
+      "replayedAdoptionKeys": ["adopt:daily-notes-1-1"],
+      "consumedApprovalIds": ["approval:daily-notes-1"],
+      "consumedRecurringOccurrences": [],
+      "dispatchConsumptions": [
+        {
+          "bindingId": "binding:daily-notes-1",
+          "nonce": "nonce:daily-notes-1",
+          "adoptionKey": "adopt:daily-notes-1-1",
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "runId": "run.daily-notes-1",
+          "attemptId": "attempt.daily-notes-1-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "approval": {
+            "requirement": "human_per_run",
+            "approvalId": "approval:daily-notes-1",
+            "use": { "kind": "single_use" },
+            "consumption": {
+              "state": "consumed_for_dispatch",
+              "eventId": "approval-event:daily-notes-1",
+              "eventDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              },
+              "requestDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              "decisionDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              "occurrenceId": "occurrence.daily-notes-20260903",
+              "runId": "run.daily-notes-1",
+              "attemptNumber": 1,
+              "fenceGeneration": 7
+            }
+          }
+        }
+      ]
+    }
+  },
+  "fixtures": {
+    "binding": {
+      "profile": "coven.automations.authority.v1",
+      "kind": "AutomationExecutionBinding",
+      "bindingId": "binding:daily-notes-1",
+      "base": {
+        "automationId": "daily-notes",
+        "automationRevision": 4,
+        "definitionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        "occurrenceId": "occurrence.daily-notes-20260903",
+        "occurrenceKey": "daily-notes@2026-09-03T12:00:00.000Z",
+        "occurrenceFenceGeneration": 7,
+        "runId": "run.daily-notes-1",
+        "attemptId": "attempt.daily-notes-1-1",
+        "attemptNumber": 1,
+        "adoptionKey": "adopt:daily-notes-1-1"
+      },
+      "principal": {
+        "principalId": "principal:val",
+        "authorizationProofRef": "proof:principal-session-1",
+        "authenticationState": "authenticated"
+      },
+      "authorization": {
+        "operation": "automation.dispatch",
+        "requestId": "request:daily-notes-1",
+        "requestDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "decisionId": "decision:daily-notes-1",
+        "decisionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "nonce": "nonce:daily-notes-1",
+        "issuedAt": "2026-09-03T11:59:00.000Z",
+        "validFrom": "2026-09-03T11:59:00.000Z",
+        "validUntil": "2026-09-03T12:05:00.000Z",
+        "replayState": "fresh",
+        "consumptionSnapshotId": "snapshot:authority-19",
+        "consumptionSnapshotDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "consumptionStoreRevision": 19,
+        "outcome": "requires_approval"
+      },
+      "familiar": {
+        "familiarRootId": "familiar:charm",
+        "identityRevisionId": "revision:charm-42",
+        "declarationDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "embodimentBindingId": "embodiment:daily-notes-1",
+        "embodimentDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "6666666666666666666666666666666666666666666666666666666666666666"
+        },
+        "statusAtDecision": "active",
+        "verifiedAt": "2026-09-03T11:59:59.000Z",
+        "freshnessPolicyVersion": "familiar-freshness:1",
+        "freshnessBoundSeconds": 300
+      },
+      "contextProjection": {
+        "projectId": "project:coven",
+        "workspaceId": "workspace:c857",
+        "contextProjectionIds": [
+          "context:automation-definition-4"
+        ],
+        "memoryProjectionIds": [
+          "memory-projection:daily-notes-approved"
+        ]
+      },
+      "threads": {
+        "decisionId": "decision:daily-notes-1",
+        "decisionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "protectedSurfaceManifestId": "manifest:protected-surfaces-8",
+        "protectedSurfaceManifestDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "9999999999999999999999999999999999999999999999999999999999999999"
+        }
+      },
+      "capabilities": {
+        "requested": [
+          "analysis.read",
+          "artifact.write"
+        ],
+        "granted": [
+          "analysis.read",
+          "artifact.write"
+        ],
+        "denied": [],
+        "degraded": []
+      },
+      "approval": {
+        "requirement": "bounded_recurring",
+        "evidence": {
+          "approvalId": "approval:daily-notes-1",
+          "approvalDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "state": "approved"
+        },
+        "scopeDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "expiresAt": "2026-09-03T12:05:00.000Z",
+        "use": {
+          "kind": "recurring",
+          "grantId": "grant:daily-notes",
+          "maxUses": 2,
+          "occurrencePrefix": "occurrence.daily-notes-",
+          "priorUses": 1
+        },
+        "consumption": {
+          "state": "consumed_for_dispatch",
+          "eventId": "approval-event:daily-notes-1",
+          "eventDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "requestDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "decisionDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "runId": "run.daily-notes-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "usageNumber": 2
+        }
+      },
+      "risk": {
+        "riskClass": "R1",
+        "sideEffectClass": "local_write"
+      },
+      "runtime": {
+        "runtimeId": "runtime:coven-code",
+        "descriptorVersion": "1.4.0",
+        "descriptorDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "7777777777777777777777777777777777777777777777777777777777777777"
+        },
+        "capabilities": [
+          "analysis.read",
+          "artifact.write"
+        ],
+        "selectionRationale": "exact_requirement_match"
+      },
+      "versions": {
+        "baseProfile": "coven.automations.v1",
+        "authorityProfile": "coven.automations.authority.v1",
+        "familiarProfile": "familiar.embodiment_binding.v1",
+        "threadsProfile": "automation-authority/1.0.0",
+        "policyVersion": "policy:automation-12",
+        "policyDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "8888888888888888888888888888888888888888888888888888888888888888"
+        }
+      },
+      "decisionTimestamp": "2026-09-03T11:59:59.000Z",
+      "producer": {
+        "component": "coven-daemon",
+        "instanceId": "daemon:host-a",
+        "implementationVersion": "0.4.4"
+      },
+      "integrity": {
+        "algorithm": "sha256",
+        "canonicalization": "jcs-rfc8785",
+        "value": "6e1410f7139821e0a7333ad7c83fc6de0679d2cfdc23120df59a3a9ed2eed1d2"
+      },
+      "authentication": {
+        "method": "ed25519",
+        "keyId": "key:coven-authority-1",
+        "proofRef": "proof:authority-binding-1",
+        "signedDigest": "6e1410f7139821e0a7333ad7c83fc6de0679d2cfdc23120df59a3a9ed2eed1d2",
+        "signature": "c7fa382c0628926b7e8d0ca3fa1241ea64e39719e725aca100a7e49d8eb56c91d82159459c0ff6de18c0dce8a843e4a38d15aed12a1b1894d6353fe7591c7602"
+      }
+    },
+    "receiptEvidence": {
+      "profile": "coven.automations.authority.v1",
+      "kind": "AutomationReceiptAuthorityEvidence",
+      "receiptId": "receipt.daily-notes-1",
+      "automationId": "daily-notes",
+      "automationRevision": 4,
+      "definitionDigest": {
+        "algorithm": "sha256",
+        "canonicalization": "jcs-rfc8785",
+        "value": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "occurrenceId": "occurrence.daily-notes-20260903",
+      "occurrenceFenceGeneration": 7,
+      "runId": "run.daily-notes-1",
+      "attemptId": "attempt.daily-notes-1-1",
+      "attemptNumber": 1,
+      "baseReceiptDigest": {
+        "algorithm": "sha256",
+        "canonicalization": "jcs-rfc8785",
+        "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "bindingId": "binding:daily-notes-1",
+      "bindingDigest": {
+        "algorithm": "sha256",
+        "canonicalization": "jcs-rfc8785",
+        "value": "6e1410f7139821e0a7333ad7c83fc6de0679d2cfdc23120df59a3a9ed2eed1d2"
+      },
+      "principalId": "principal:val",
+      "familiar": {
+        "familiarRootId": "familiar:charm",
+        "identityRevisionId": "revision:charm-42",
+        "declarationDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "5555555555555555555555555555555555555555555555555555555555555555"
+        },
+        "statusAtDecision": "active",
+        "verifiedAt": "2026-09-03T11:59:59.000Z",
+        "freshnessPolicyVersion": "familiar-freshness:1",
+        "freshnessBoundSeconds": 300
+      },
+      "authorization": {
+        "operation": "automation.dispatch",
+        "requestId": "request:daily-notes-1",
+        "requestDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "decisionId": "decision:daily-notes-1",
+        "decisionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3333333333333333333333333333333333333333333333333333333333333333"
+        },
+        "consumptionSnapshotDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "4444444444444444444444444444444444444444444444444444444444444444"
+        },
+        "outcome": "requires_approval"
+      },
+      "capabilities": {
+        "requested": [
+          "analysis.read",
+          "artifact.write"
+        ],
+        "granted": [
+          "analysis.read",
+          "artifact.write"
+        ],
+        "denied": [],
+        "degraded": [],
+        "exercised": [
+          "analysis.read",
+          "artifact.write"
+        ]
+      },
+      "approval": {
+        "requirement": "bounded_recurring",
+        "evidence": {
+          "approvalId": "approval:daily-notes-1",
+          "approvalDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "state": "approved"
+        },
+        "scopeDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "expiresAt": "2026-09-03T12:05:00.000Z",
+        "use": {
+          "kind": "recurring",
+          "grantId": "grant:daily-notes",
+          "maxUses": 2,
+          "occurrencePrefix": "occurrence.daily-notes-",
+          "priorUses": 1
+        },
+        "consumption": {
+          "state": "consumed_for_dispatch",
+          "eventId": "approval-event:daily-notes-1",
+          "eventDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "requestDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          "decisionDigest": {
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": "3333333333333333333333333333333333333333333333333333333333333333"
+          },
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "runId": "run.daily-notes-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "usageNumber": 2
+        }
+      },
+      "risk": {
+        "riskClass": "R1",
+        "sideEffectClass": "local_write"
+      },
+      "runtime": {
+        "runtimeId": "runtime:coven-code",
+        "descriptorVersion": "1.4.0",
+        "descriptorDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "7777777777777777777777777777777777777777777777777777777777777777"
+        },
+        "capabilities": [
+          "analysis.read",
+          "artifact.write"
+        ]
+      },
+      "decisionTimestamp": "2026-09-03T11:59:59.000Z",
+      "producer": {
+        "component": "coven-daemon",
+        "instanceId": "daemon:host-a",
+        "implementationVersion": "0.4.4"
+      },
+      "privacy": {
+        "classification": "operational",
+        "retention": "authority_evidence_90d",
+        "redactionStatus": "not_required",
+        "sensitiveMaterialIncluded": false
+      },
+      "integrity": {
+        "algorithm": "sha256",
+        "canonicalization": "jcs-rfc8785",
+        "value": "94f5e74b3f6c9ccd7edb03f37d826b70ffdde58325df58c788dfe17beaa6185f"
+      },
+      "authentication": {
+        "method": "ed25519",
+        "keyId": "key:coven-authority-1",
+        "proofRef": "proof:authority-receipt-1",
+        "signedDigest": "94f5e74b3f6c9ccd7edb03f37d826b70ffdde58325df58c788dfe17beaa6185f",
+        "signature": "3112969a5b3cb391f91ac9ecab6ad3e76a29af3963f80850eb96db794b88fff161d098b921561ca63c0a637566b9fa58f76f74b30ad7cc46d60bf8131efa810d"
+      }
+    }
+  },
+  "cases": [
+    { "id": "valid-bounded-recurring-second-use", "target": "binding", "trustedPatch": { "consumedApprovalIds": ["approval:daily-notes-1"] }, "expected": "accept" },
+    { "id": "valid-receipt-evidence", "target": "receiptEvidence", "expected": "accept" },
+    { "id": "valid-extension", "target": "extension", "expected": "accept" },
+    {
+      "id": "valid-terminal-per-run-consumption",
+      "target": "extension",
+      "trustedState": "terminalPerRun",
+      "mutations": [
+        {
+          "op": "replace",
+          "path": "/executionBinding/approval",
+          "value": {
+            "requirement": "human_per_run",
+            "evidence": {
+              "approvalId": "approval:daily-notes-1",
+              "approvalDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "state": "approved"
+            },
+            "scopeDigest": {
+              "algorithm": "sha256",
+              "canonicalization": "jcs-rfc8785",
+              "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "expiresAt": "2026-09-03T12:05:00.000Z",
+            "use": { "kind": "single_use" },
+            "consumption": {
+              "state": "consumed_for_dispatch",
+              "eventId": "approval-event:daily-notes-1",
+              "eventDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              },
+              "requestDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              "decisionDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              "occurrenceId": "occurrence.daily-notes-20260903",
+              "runId": "run.daily-notes-1",
+              "attemptNumber": 1,
+              "fenceGeneration": 7
+            }
+          }
+        },
+        { "op": "replace", "path": "/executionBinding/integrity/value", "value": "755a80736e84006590d9e8d9878217fe8864b172cc55c103e967ff61fabf2d14" },
+        { "op": "replace", "path": "/executionBinding/authentication/signedDigest", "value": "755a80736e84006590d9e8d9878217fe8864b172cc55c103e967ff61fabf2d14" },
+        { "op": "replace", "path": "/executionBinding/authentication/signature", "value": "7172c6e67c322993b51bb4f1c430eb3019fd2cb2214accf770fe6c17d02c0f33643096c4b071f6ff622a251255c0c524261d5e884a0efdbfd53ed5d1f0d44d03" },
+        { "op": "replace", "path": "/receiptEvidence/bindingDigest/value", "value": "755a80736e84006590d9e8d9878217fe8864b172cc55c103e967ff61fabf2d14" },
+        {
+          "op": "replace",
+          "path": "/receiptEvidence/approval",
+          "value": {
+            "requirement": "human_per_run",
+            "evidence": {
+              "approvalId": "approval:daily-notes-1",
+              "approvalDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "state": "approved"
+            },
+            "scopeDigest": {
+              "algorithm": "sha256",
+              "canonicalization": "jcs-rfc8785",
+              "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            },
+            "expiresAt": "2026-09-03T12:05:00.000Z",
+            "use": { "kind": "single_use" },
+            "consumption": {
+              "state": "consumed_for_dispatch",
+              "eventId": "approval-event:daily-notes-1",
+              "eventDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+              },
+              "requestDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              "decisionDigest": {
+                "algorithm": "sha256",
+                "canonicalization": "jcs-rfc8785",
+                "value": "3333333333333333333333333333333333333333333333333333333333333333"
+              },
+              "occurrenceId": "occurrence.daily-notes-20260903",
+              "runId": "run.daily-notes-1",
+              "attemptNumber": 1,
+              "fenceGeneration": 7
+            }
+          }
+        },
+        { "op": "replace", "path": "/receiptEvidence/integrity/value", "value": "5a487faceaf43bab9447f567812d9e860398cbc5172ab8cd8edaaa42bc8ae4cd" },
+        { "op": "replace", "path": "/receiptEvidence/authentication/signedDigest", "value": "5a487faceaf43bab9447f567812d9e860398cbc5172ab8cd8edaaa42bc8ae4cd" },
+        { "op": "replace", "path": "/receiptEvidence/authentication/signature", "value": "f5bbd20f51e85d669946730fc01bae42aec4f8fbd08c671a5ab7b47d02dd4673e49376413aaf62e2da51f53f356f01cc9a309c103da4de8efe39c55db25cfc09" }
+      ],
+      "expected": "accept"
+    },
+    { "id": "missing-profile", "target": "binding", "mutation": { "op": "remove", "path": "/profile" }, "expected": "refuse", "errorCode": "AUTHORITY_PROFILE_MISSING" },
+    { "id": "unknown-profile", "target": "binding", "mutation": { "op": "replace", "path": "/profile", "value": "coven.automations.authority.v2" }, "expected": "refuse", "errorCode": "AUTHORITY_PROFILE_UNKNOWN" },
+    { "id": "malformed-profile", "target": "binding", "mutation": { "op": "replace", "path": "/profile", "value": 1 }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "malformed-authorization-timestamp", "target": "binding", "mutation": { "op": "replace", "path": "/authorization/validUntil", "value": "not-a-time" }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "malformed-binding-capabilities", "target": "binding", "mutation": { "op": "replace", "path": "/capabilities/requested", "value": {} }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "malformed-null-execution-binding", "target": "extension", "mutation": { "op": "replace", "path": "/executionBinding", "value": null }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "binding-id-mismatch", "target": "binding", "mutation": { "op": "replace", "path": "/bindingId", "value": "binding:replacement" }, "expected": "refuse", "errorCode": "AUTHORITY_BINDING_MISMATCH" },
+    { "id": "trusted-binding-digest-mismatch", "target": "binding", "trustedPatch": { "bindingDigest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }, "expected": "refuse", "errorCode": "AUTHORITY_BINDING_MISMATCH" },
+    { "id": "forged-principal", "target": "binding", "mutation": { "op": "replace", "path": "/principal/principalId", "value": "principal:forged" }, "expected": "refuse", "errorCode": "AUTHORITY_PRINCIPAL_MISMATCH" },
+    { "id": "mismatched-familiar-root", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/familiarRootId", "value": "familiar:other" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_MISMATCH" },
+    { "id": "mismatched-familiar-revision", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/identityRevisionId", "value": "revision:charm-41" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_MISMATCH" },
+    { "id": "stale-familiar", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/statusAtDecision", "value": "stale" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_STATUS_INVALID" },
+    { "id": "stale-familiar-verification", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/verifiedAt", "value": "2026-09-03T11:54:59.000Z" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_STALE" },
+    { "id": "future-familiar-verification", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/verifiedAt", "value": "2026-09-03T12:00:00.001Z" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_TIME_INVALID" },
+    { "id": "familiar-freshness-inclusive-boundary", "target": "binding", "trustedPatch": { "dispatchNow": "2026-09-03T12:04:59.000Z" }, "expected": "accept" },
+    { "id": "revoked-familiar", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/statusAtDecision", "value": "revoked" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_STATUS_INVALID" },
+    { "id": "retired-familiar", "target": "binding", "mutation": { "op": "replace", "path": "/familiar/statusAtDecision", "value": "retired" }, "expected": "refuse", "errorCode": "AUTHORITY_FAMILIAR_STATUS_INVALID" },
+    { "id": "nonce-replay", "target": "binding", "trustedPatch": { "replayedNonces": ["nonce:daily-notes-1"] }, "expected": "refuse", "errorCode": "AUTHORITY_NONCE_REPLAYED" },
+    { "id": "adoption-replay", "target": "binding", "trustedPatch": { "replayedAdoptionKeys": ["adopt:daily-notes-1-1"] }, "expected": "refuse", "errorCode": "AUTHORITY_ADOPTION_REPLAYED" },
+    { "id": "approval-reuse", "target": "binding", "mutations": [{ "op": "replace", "path": "/approval/requirement", "value": "human_per_run" }, { "op": "replace", "path": "/approval/use", "value": { "kind": "single_use" } }, { "op": "replace", "path": "/approval/consumption", "value": { "state": "consumed_for_dispatch", "eventId": "approval-event:daily-notes-1", "eventDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc" }, "requestDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "2222222222222222222222222222222222222222222222222222222222222222" }, "decisionDigest": { "algorithm": "sha256", "canonicalization": "jcs-rfc8785", "value": "3333333333333333333333333333333333333333333333333333333333333333" }, "occurrenceId": "occurrence.daily-notes-20260903", "runId": "run.daily-notes-1", "attemptNumber": 1, "fenceGeneration": 7 } }], "trustedPatch": { "approvalRequirement": "human_per_run", "approvalUse": { "kind": "single_use" }, "approvalConsumption": { "state": "consumed_for_dispatch", "eventId": "approval-event:daily-notes-1", "eventDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "requestDigest": "2222222222222222222222222222222222222222222222222222222222222222", "decisionDigest": "3333333333333333333333333333333333333333333333333333333333333333", "occurrenceId": "occurrence.daily-notes-20260903", "runId": "run.daily-notes-1", "attemptNumber": 1, "fenceGeneration": 7 }, "consumedApprovalIds": ["approval:daily-notes-1"] }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_REUSED" },
+    { "id": "bounded-recurring-approval-exhausted", "target": "binding", "trustedPatch": { "approvalUse": { "kind": "recurring", "grantId": "grant:daily-notes", "maxUses": 2, "occurrencePrefix": "occurrence.daily-notes-", "priorUses": 2 } }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_EXHAUSTED" },
+    { "id": "bounded-recurring-occurrence-out-of-scope", "target": "binding", "mutations": [{ "op": "replace", "path": "/base/occurrenceId", "value": "occurrence.other-20260903" }, { "op": "replace", "path": "/approval/consumption/occurrenceId", "value": "occurrence.other-20260903" }], "trustedPatch": { "occurrenceId": "occurrence.other-20260903", "approvalConsumption": { "state": "consumed_for_dispatch", "eventId": "approval-event:daily-notes-1", "eventDigest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "requestDigest": "2222222222222222222222222222222222222222222222222222222222222222", "decisionDigest": "3333333333333333333333333333333333333333333333333333333333333333", "occurrenceId": "occurrence.other-20260903", "runId": "run.daily-notes-1", "attemptNumber": 1, "fenceGeneration": 7, "usageNumber": 2 } }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_SCOPE_MISMATCH" },
+    { "id": "bounded-recurring-occurrence-replay", "target": "binding", "trustedPatch": { "consumedRecurringOccurrences": ["{\"attemptNumber\":1,\"decisionDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"fenceGeneration\":7,\"grantId\":\"grant:daily-notes\",\"occurrenceId\":\"occurrence.daily-notes-20260903\",\"requestDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"runId\":\"run.daily-notes-1\"}"] }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_REUSED" },
+    { "id": "terminal-dispatch-binding-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/bindingId", "value": "binding:other" }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-dispatch-nonce-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/nonce", "value": "nonce:other" }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-dispatch-adoption-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/adoptionKey", "value": "adopt:other" }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-dispatch-run-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/runId", "value": "run.other" }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-dispatch-attempt-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/attemptNumber", "value": 2 }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-dispatch-fence-owner-mismatch", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions/0/fenceGeneration", "value": 8 }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH" },
+    { "id": "terminal-committed-nonce-missing", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/replayedNonces", "value": [] }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING" },
+    { "id": "terminal-committed-adoption-missing", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/replayedAdoptionKeys", "value": [] }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING" },
+    { "id": "terminal-committed-recurring-consumption-missing", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/consumedRecurringOccurrences", "value": [] }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING" },
+    { "id": "terminal-dispatch-ownership-missing", "target": "extension", "trustedMutations": [{ "op": "replace", "path": "/dispatchConsumptions", "value": [] }], "expected": "refuse", "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING" },
+    { "id": "approval-expired", "target": "binding", "mutation": { "op": "replace", "path": "/approval/expiresAt", "value": "2026-09-03T11:59:59.000Z" }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_EXPIRED" },
+    { "id": "approval-revoked", "target": "binding", "mutation": { "op": "replace", "path": "/approval/evidence/state", "value": "revoked" }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_REVOKED" },
+    { "id": "approval-required-bypass", "target": "binding", "mutation": { "op": "replace", "path": "/approval/requirement", "value": "not_required" }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_REQUIRED" },
+    { "id": "capability-escalation", "target": "binding", "mutation": { "op": "add", "path": "/capabilities/granted/-", "value": "network.publish" }, "expected": "refuse", "errorCode": "AUTHORITY_CAPABILITY_ESCALATION" },
+    { "id": "runtime-downgrade", "target": "binding", "mutation": { "op": "replace", "path": "/runtime/descriptorDigest/value", "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd" }, "expected": "refuse", "errorCode": "AUTHORITY_RUNTIME_DOWNGRADE" },
+    { "id": "stale-policy", "target": "binding", "mutation": { "op": "replace", "path": "/versions/policyDigest/value", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }, "expected": "refuse", "errorCode": "AUTHORITY_POLICY_STALE" },
+    { "id": "old-occurrence-fence", "target": "binding", "mutation": { "op": "replace", "path": "/base/occurrenceFenceGeneration", "value": 6 }, "expected": "refuse", "errorCode": "AUTHORITY_FENCE_STALE" },
+    { "id": "authorization-issued-after-dispatch", "target": "binding", "mutation": { "op": "replace", "path": "/authorization/issuedAt", "value": "2026-09-03T12:00:00.001Z" }, "expected": "refuse", "errorCode": "AUTHORITY_CHRONOLOGY_INVALID" },
+    { "id": "decision-after-dispatch", "target": "binding", "mutation": { "op": "replace", "path": "/decisionTimestamp", "value": "2026-09-03T12:00:00.001Z" }, "expected": "refuse", "errorCode": "AUTHORITY_CHRONOLOGY_INVALID" },
+    { "id": "authorization-invalid-ordering", "target": "binding", "mutation": { "op": "replace", "path": "/authorization/issuedAt", "value": "2026-09-03T11:59:30.000Z" }, "expected": "refuse", "errorCode": "AUTHORITY_CHRONOLOGY_INVALID" },
+    { "id": "authorization-valid-until-exclusive", "target": "binding", "mutations": [{ "op": "replace", "path": "/decisionTimestamp", "value": "2026-09-03T12:00:00.000Z" }, { "op": "replace", "path": "/familiar/verifiedAt", "value": "2026-09-03T12:00:00.000Z" }], "trustedPatch": { "dispatchNow": "2026-09-03T12:05:00.000Z", "decisionTimestamp": "2026-09-03T12:00:00.000Z" }, "expected": "refuse", "errorCode": "AUTHORITY_STALE" },
+    { "id": "tampered-binding-digest", "target": "binding", "mutation": { "op": "replace", "path": "/integrity/value", "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }, "expected": "refuse", "errorCode": "AUTHORITY_INTEGRITY_INVALID" },
+    { "id": "rehashed-payload-reused-proof", "target": "binding", "mutations": [{ "op": "replace", "path": "/producer/instanceId", "value": "daemon:host-b" }, { "op": "replace", "path": "/integrity/value", "value": "9dbcfe0673c89452195c086b9838b8679495b4452146fc90876298b6176a37f9" }, { "op": "replace", "path": "/authentication/signedDigest", "value": "9dbcfe0673c89452195c086b9838b8679495b4452146fc90876298b6176a37f9" }], "expected": "refuse", "errorCode": "AUTHORITY_AUTHENTICATION_INVALID" },
+    { "id": "unverifiable-authentication", "target": "binding", "mutation": { "op": "replace", "path": "/authentication/proofRef", "value": "proof:unknown" }, "expected": "refuse", "errorCode": "AUTHORITY_AUTHENTICATION_UNVERIFIABLE" },
+    { "id": "unknown-field", "target": "binding", "mutation": { "op": "add", "path": "/ambientAuthority", "value": true }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_UNKNOWN_FIELD" },
+    { "id": "unknown-nested-field", "target": "binding", "mutation": { "op": "add", "path": "/runtime/ambientCapability", "value": true }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "receipt-binding-splice", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/bindingId", "value": "binding:other" }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_BINDING_MISMATCH" },
+    { "id": "base-receipt-digest-mismatch", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/baseReceiptDigest/value", "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_CORRELATION_MISMATCH" },
+    { "id": "receipt-id-mismatch", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/receiptId", "value": "receipt.other" }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_CORRELATION_MISMATCH" },
+    { "id": "receipt-authorization-splice", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/authorization/requestId", "value": "request:other" }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_BINDING_MISMATCH" },
+    { "id": "receipt-approval-splice", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/approval/use/priorUses", "value": 0 }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_BINDING_MISMATCH" },
+    { "id": "receipt-approval-required-bypass", "target": "receiptEvidence", "mutation": { "op": "replace", "path": "/approval", "value": { "requirement": "not_required", "evidence": null, "scopeDigest": null, "expiresAt": null, "use": null, "consumption": { "state": "not_required" } } }, "trustedPatch": { "approvalRequirement": "not_required" }, "expected": "refuse", "errorCode": "AUTHORITY_APPROVAL_REQUIRED" },
+    { "id": "receipt-risk-splice", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/risk/riskClass", "value": "R4" }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_BINDING_MISMATCH" },
+    { "id": "receipt-grant-splice", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/capabilities/granted", "value": ["analysis.read"] }, "expected": "refuse", "errorCode": "AUTHORITY_CAPABILITY_ESCALATION" },
+    { "id": "missing-terminal-receipt-evidence", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence", "value": null }, "expected": "refuse", "errorCode": "AUTHORITY_RECEIPT_EVIDENCE_REQUIRED" },
+    { "id": "malformed-receipt-capabilities", "target": "receiptEvidence", "mutation": { "op": "remove", "path": "/capabilities/exercised" }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "malformed-extension-receipt-capabilities", "target": "extension", "mutation": { "op": "remove", "path": "/receiptEvidence/capabilities/exercised" }, "expected": "refuse", "errorCode": "AUTHORITY_SCHEMA_INVALID" },
+    { "id": "unpaired-surrogate-runtime-id", "target": "binding", "mutation": { "op": "replace", "path": "/runtime/runtimeId", "value": "\ud800" }, "expected": "refuse", "errorCode": "AUTHORITY_IJSON_INVALID" },
+    { "id": "unpaired-surrogate-object-key", "target": "binding", "mutation": { "op": "add", "path": "/runtime/\udc00", "value": true }, "expected": "refuse", "errorCode": "AUTHORITY_IJSON_INVALID" },
+    { "id": "ungranted-capability-exercised", "target": "extension", "mutation": { "op": "add", "path": "/receiptEvidence/capabilities/exercised/-", "value": "network.publish" }, "expected": "refuse", "errorCode": "AUTHORITY_CAPABILITY_ESCALATION" },
+    { "id": "unauthorized-sensitive-evidence", "target": "extension", "mutation": { "op": "replace", "path": "/receiptEvidence/privacy/sensitiveMaterialIncluded", "value": true }, "expected": "refuse", "errorCode": "AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN" }
+  ]
+}

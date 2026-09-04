@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/authority/v1/automation-receipt-authority-evidence.schema.json",
+  "title": "Coven AutomationReceipt authority evidence companion v1",
+  "description": "Privacy-minimized authority evidence carried as the receiptEvidence sidecar in the AutomationRun authority extension. It authenticates the base receipt digest and correlates to the binding without copying credentials, prompts, memory content, declaration bodies, or unrestricted paths.",
+  "allOf": [
+    {
+      "if": {
+        "required": ["authorization"],
+        "properties": {
+          "authorization": {
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "const": "requires_approval" }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["approval"],
+        "properties": {
+          "approval": {
+            "required": ["requirement"],
+            "properties": {
+              "requirement": {
+                "enum": ["human_per_run", "protected_owner_per_run", "bounded_recurring"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["authorization"],
+        "properties": {
+          "authorization": {
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "const": "permit" }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["approval"],
+        "properties": {
+          "approval": {
+            "required": ["requirement"],
+            "properties": {
+              "requirement": { "const": "not_required" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "kind",
+    "receiptId",
+    "automationId",
+    "automationRevision",
+    "definitionDigest",
+    "occurrenceId",
+    "occurrenceFenceGeneration",
+    "runId",
+    "attemptId",
+    "attemptNumber",
+    "baseReceiptDigest",
+    "bindingId",
+    "bindingDigest",
+    "principalId",
+    "familiar",
+    "authorization",
+    "capabilities",
+    "approval",
+    "risk",
+    "runtime",
+    "decisionTimestamp",
+    "producer",
+    "privacy",
+    "integrity",
+    "authentication"
+  ],
+  "properties": {
+    "profile": { "const": "coven.automations.authority.v1" },
+    "kind": { "const": "AutomationReceiptAuthorityEvidence" },
+    "receiptId": { "$ref": "common.schema.json#/$defs/baseReceiptId" },
+    "automationId": { "$ref": "common.schema.json#/$defs/baseAutomationId" },
+    "automationRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "definitionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "occurrenceId": { "$ref": "common.schema.json#/$defs/baseOccurrenceId" },
+    "occurrenceFenceGeneration": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "runId": { "$ref": "common.schema.json#/$defs/baseRunId" },
+    "attemptId": { "$ref": "common.schema.json#/$defs/baseAttemptId" },
+    "attemptNumber": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+    "baseReceiptDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "bindingId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+    "bindingDigest": { "$ref": "common.schema.json#/$defs/digest" },
+    "principalId": { "$ref": "common.schema.json#/$defs/basePrincipalId" },
+    "familiar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "familiarRootId",
+        "identityRevisionId",
+        "declarationDigest",
+        "statusAtDecision",
+        "verifiedAt",
+        "freshnessPolicyVersion",
+        "freshnessBoundSeconds"
+      ],
+      "properties": {
+        "familiarRootId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "identityRevisionId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "declarationDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "statusAtDecision": { "const": "active" },
+        "verifiedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "freshnessPolicyVersion": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "freshnessBoundSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "requestId",
+        "requestDigest",
+        "decisionId",
+        "decisionDigest",
+        "consumptionSnapshotDigest",
+        "outcome"
+      ],
+      "properties": {
+        "operation": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "requestId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "requestDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "decisionId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "decisionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "consumptionSnapshotDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "outcome": { "enum": ["permit", "requires_approval"] }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "granted", "denied", "degraded", "exercised"],
+      "properties": {
+        "requested": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "granted": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "denied": { "$ref": "common.schema.json#/$defs/deniedCapabilities" },
+        "degraded": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "exercised": { "$ref": "common.schema.json#/$defs/capabilitySet" }
+      }
+    },
+    "approval": { "$ref": "common.schema.json#/$defs/approvalBinding" },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["riskClass", "sideEffectClass"],
+      "properties": {
+        "riskClass": { "$ref": "common.schema.json#/$defs/riskClass" },
+        "sideEffectClass": { "$ref": "common.schema.json#/$defs/sideEffectClass" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtimeId", "descriptorVersion", "descriptorDigest", "capabilities"],
+      "properties": {
+        "runtimeId": { "$ref": "common.schema.json#/$defs/baseRuntimeId" },
+        "descriptorVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]*$"
+        },
+        "descriptorDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "capabilities": { "$ref": "common.schema.json#/$defs/capabilitySet" }
+      }
+    },
+    "decisionTimestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "producer": { "$ref": "common.schema.json#/$defs/producer" },
+    "privacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "retention",
+        "redactionStatus",
+        "sensitiveMaterialIncluded"
+      ],
+      "properties": {
+        "classification": { "enum": ["operational", "sensitive", "restricted"] },
+        "retention": { "enum": ["ephemeral_24h", "authority_evidence_90d", "authority_evidence_1y"] },
+        "redactionStatus": { "enum": ["not_required", "redacted", "tombstoned"] },
+        "sensitiveMaterialIncluded": { "const": false }
+      }
+    },
+    "integrity": { "$ref": "common.schema.json#/$defs/integrity" },
+    "authentication": { "$ref": "common.schema.json#/$defs/authentication" }
+  }
+}

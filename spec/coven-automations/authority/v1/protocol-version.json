@@ -1,0 +1,40 @@
+{
+  "protocol": "Coven Automations Runtime Authority",
+  "contractProfile": "coven.automations.authority.v1",
+  "version": 1,
+  "status": "proposed",
+  "baseProfile": "coven.automations.v1",
+  "canonicalization": "jcs-rfc8785",
+  "digestAlgorithm": "sha256",
+  "transport": {
+    "container": "base-v1 extensions bag",
+    "extensionKey": "coven.automations.authority.v1",
+    "requiredOn": [
+      "AutomationRun.extensions"
+    ],
+    "receiptEvidence": "receipt-correlated-sidecar-inside-authority-extension",
+    "genericBaseConsumerBehavior": "preserve-opaque-never-interpret",
+    "runtimeAuthorityConsumerBehavior": "require-validate-verify-or-refuse"
+  },
+  "unknownProfileBehavior": "fail-closed",
+  "normativeInputs": {
+    "familiarContract": {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "profile": "familiar.embodiment_binding.v1"
+    },
+    "covenThreads": {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "profile": "automation-authority/1.0.0"
+    }
+  },
+  "historicalBaseArtifact": {
+    "artifactId": 9909975069,
+    "sourceCommit": "8a796807b37d4ad33eaeca37498debf1ca55dd49",
+    "bundleSha256": "512460db71d4257d7a4d33ea306578e66d9ac499d9384eb9c2b8e2b4e2e32363",
+    "contractContentSha256": "3c145eb92a93426ed64631f6487a8cd12903b0a49a6e752269f594ac50a779f5",
+    "fileCount": 17,
+    "disposition": "historical-only-never-reuse-or-relabel"
+  }
+}

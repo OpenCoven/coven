@@ -109,6 +109,7 @@ jobs:
       - run: python3 scripts/check-ci-workflow-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs
+      - run: node --test scripts/package-automations-authority-profile.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       - run: scripts/check-workflows.sh
 
@@ -149,6 +150,45 @@ jobs:
           path: |
             ${{ runner.temp }}/coven-automations-v1-contract/coven-automations-v1-contract-${{ github.sha }}.tar.gz
             ${{ runner.temp }}/coven-automations-v1-contract/manifest.json
+          if-no-files-found: error
+
+  automations-authority-profile-bundle:
+    name: Automations Runtime Authority v1 profile bundle
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - name: Package exact-commit Automations authority profile
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          AUTHORITY_ARTIFACT_DIR: ${{ runner.temp }}/coven-automations-authority-v1-contract
+        run: |
+          set -euo pipefail
+          node --test scripts/package-automations-authority-profile.test.mjs
+          node scripts/package-automations-authority-profile.mjs \
+            --output "$AUTHORITY_ARTIFACT_DIR"
+          AUTHORITY_PROFILE_BUNDLE="$AUTHORITY_ARTIFACT_DIR/coven-automations-authority-v1-contract-${SOURCE_COMMIT}.tar.gz"
+          AUTHORITY_PROFILE_SHA256="$(sha256sum "$AUTHORITY_PROFILE_BUNDLE" | awk '{print $1}')"
+          node scripts/package-automations-authority-profile.mjs verify \
+            --bundle "$AUTHORITY_PROFILE_BUNDLE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --sha256 "$AUTHORITY_PROFILE_SHA256"
+          jq -e --arg sourceCommit "$SOURCE_COMMIT" \
+            '.sourceCommit == $sourceCommit and .contractProfile == "coven.automations.authority.v1" and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
+            "$AUTHORITY_ARTIFACT_DIR/manifest.json"
+      - name: Upload exact-commit Automations authority profile
+        uses: actions/upload-artifact@v7
+        with:
+          name: coven-automations-authority-v1-contract-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/coven-automations-authority-v1-contract/coven-automations-authority-v1-contract-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/coven-automations-authority-v1-contract/manifest.json
           if-no-files-found: error
 
   rust-lint-linux:
@@ -589,6 +629,7 @@ jobs:
       - changes
       - policy-guard
       - automations-protocol-bundle
+      - automations-authority-profile-bundle
       - rust-lint-linux
       - rust-test-linux
       - rust-test-windows
@@ -617,7 +658,7 @@ jobs:
               for name, data in jobs.items()
               if data["result"] not in {"success", "skipped"}
           }
-          for required in ("changes", "policy-guard", "automations-protocol-bundle"):
+          for required in ("changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"):
               if jobs[required]["result"] != "success":
                   bad[required] = jobs[required]["result"]
           if bad:

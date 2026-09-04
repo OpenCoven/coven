@@ -56,6 +56,28 @@ function createFixtureRepository(scratchDir) {
   };
 }
 
+function createStableFixtureRepository(scratchDir) {
+  const fixture = createFixtureRepository(scratchDir);
+  const result = spawnSync('git', ['commit', '--amend', '--no-edit', '--reset-author'], {
+    cwd: fixture.repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
+      GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z'
+    }
+  });
+  assert.equal(
+    result.status,
+    0,
+    `stable fixture commit failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`
+  );
+  return {
+    ...fixture,
+    sourceCommit: runGit(fixture.repoRoot, ['rev-parse', 'HEAD'])
+  };
+}
+
 function parseTarGz(bytes) {
   const tar = gunzipSync(bytes);
   const entries = [];
@@ -181,6 +203,28 @@ test('keeps the content digest stable while binding bundle bytes to the source c
       repoRoot: fixture.repoRoot,
       outputDir: path.join(scratchDir, 'second'),
       sourceCommit: secondCommit
+    });
+
+    test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolve', () => {
+      withScratchDir('automation-protocol-byte-stability', (scratchDir) => {
+        const fixture = createStableFixtureRepository(scratchDir);
+        assert.equal(fixture.sourceCommit, '95f7d0ac6fac3dab1a96aeed3e5d853176a6617f');
+
+        const packaged = packageAutomationsProtocol({
+          repoRoot: fixture.repoRoot,
+          outputDir: path.join(scratchDir, 'out'),
+          sourceCommit: fixture.sourceCommit
+        });
+
+        assert.equal(
+          packaged.bundleSha256,
+          '6c22689d02da51d13c48881479173f1fc8df26339c04156c7e49d414e0b3b640'
+        );
+        assert.equal(
+          sha256(readFileSync(packaged.manifestPath)),
+          '3ca6e1474505e770f11bcbfdf1e640940055dd6ae51d7924c627b17731a892e1'
+        );
+      });
     });
 
     const firstManifest = JSON.parse(readFileSync(first.manifestPath, 'utf8'));

@@ -1,0 +1,1259 @@
+#!/usr/bin/env node
+
+import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+
+const PROFILE = 'coven.automations.authority.v1';
+const BINDING_DOMAIN = 'opencoven:coven-automations-authority-binding:v1';
+const RECEIPT_DOMAIN = 'opencoven:coven-automations-authority-receipt-evidence:v1';
+const PROFILE_DIR = path.join(
+  path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'),
+  'spec',
+  'coven-automations',
+  'authority',
+  'v1'
+);
+
+const BINDING_KEYS = new Set([
+  'profile',
+  'kind',
+  'bindingId',
+  'base',
+  'principal',
+  'authorization',
+  'familiar',
+  'contextProjection',
+  'threads',
+  'capabilities',
+  'approval',
+  'risk',
+  'runtime',
+  'versions',
+  'decisionTimestamp',
+  'producer',
+  'integrity',
+  'authentication'
+]);
+
+const RECEIPT_KEYS = new Set([
+  'profile',
+  'kind',
+  'receiptId',
+  'automationId',
+  'automationRevision',
+  'definitionDigest',
+  'occurrenceId',
+  'occurrenceFenceGeneration',
+  'runId',
+  'attemptId',
+  'attemptNumber',
+  'baseReceiptDigest',
+  'bindingId',
+  'bindingDigest',
+  'principalId',
+  'familiar',
+  'authorization',
+  'capabilities',
+  'approval',
+  'risk',
+  'runtime',
+  'decisionTimestamp',
+  'producer',
+  'privacy',
+  'integrity',
+  'authentication'
+]);
+
+const EXTENSION_KEYS = new Set([
+  'profile',
+  'kind',
+  'executionBinding',
+  'receiptEvidence'
+]);
+
+export class AuthorityProfileError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.name = 'AuthorityProfileError';
+    this.code = code;
+  }
+}
+
+function refuse(code, message) {
+  throw new AuthorityProfileError(code, message);
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertWellFormedString(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON contains an unpaired high surrogate');
+      }
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      refuse('AUTHORITY_IJSON_INVALID', 'Authority JSON contains an unpaired low surrogate');
+    }
+  }
+}
+
+function assertIJson(value) {
+  if (typeof value === 'string') {
+    assertWellFormedString(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach(assertIJson);
+    return;
+  }
+  if (isPlainObject(value)) {
+    for (const [key, child] of Object.entries(value)) {
+      assertWellFormedString(key);
+      assertIJson(child);
+    }
+  }
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') {
+    if (typeof value === 'string') {
+      assertWellFormedString(value);
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value)) {
+      refuse('AUTHORITY_SCHEMA_INVALID', 'Authority profile numbers must be safe integers');
+    }
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(',')}]`;
+  }
+  if (!isPlainObject(value)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority profile values must be JSON values');
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => {
+      assertWellFormedString(key);
+      return `${JSON.stringify(key)}:${canonicalJson(value[key])}`;
+    })
+    .join(',')}}`;
+}
+
+function isTimestamp(value) {
+  if (
+    typeof value !== 'string' ||
+    !/^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\.[0-9]{3})?Z$/.test(
+      value
+    )
+  ) {
+    return false;
+  }
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) {
+    return false;
+  }
+  const normalized = new Date(milliseconds).toISOString();
+  return value.includes('.') ? normalized === value : normalized.replace('.000Z', 'Z') === value;
+}
+
+function schemaRegistry() {
+  return new Map(
+    [
+      'common.schema.json',
+      'authority-extension.schema.json',
+      'automation-execution-binding.schema.json',
+      'automation-receipt-authority-evidence.schema.json'
+    ].map((name) => [name, JSON.parse(readFileSync(path.join(PROFILE_DIR, name), 'utf8'))])
+  );
+}
+
+function resolvePointer(value, fragment) {
+  if (!fragment) {
+    return value;
+  }
+  return fragment
+    .replace(/^#\//, '')
+    .split('/')
+    .map((component) => component.replaceAll('~1', '/').replaceAll('~0', '~'))
+    .reduce((current, component) => current?.[component], value);
+}
+
+function schemaErrors(value, schema, rootSchema, schemas, location = '$') {
+  if (schema.$ref) {
+    const [fileName, fragment = ''] = schema.$ref.split('#');
+    const referencedRoot = fileName ? schemas.get(fileName) : rootSchema;
+    const referenced = resolvePointer(referencedRoot, fragment ? `#${fragment}` : '');
+    if (!referenced) {
+      return [`${location}: unresolved schema reference ${schema.$ref}`];
+    }
+    return schemaErrors(value, referenced, referencedRoot, schemas, location);
+  }
+
+  if (schema.oneOf) {
+    const matching = schema.oneOf.filter(
+      (candidate) => schemaErrors(value, candidate, rootSchema, schemas, location).length === 0
+    );
+    return matching.length === 1 ? [] : [`${location}: expected exactly one schema branch`];
+  }
+  if (schema.allOf) {
+    const errors = schema.allOf.flatMap((candidate) =>
+      schemaErrors(value, candidate, rootSchema, schemas, location)
+    );
+    if (errors.length > 0) {
+      return errors;
+    }
+  }
+  if (schema.if) {
+    const conditionMatches = schemaErrors(value, schema.if, rootSchema, schemas, location).length === 0;
+    const branch = conditionMatches ? schema.then : schema.else;
+    if (branch) {
+      const errors = schemaErrors(value, branch, rootSchema, schemas, location);
+      if (errors.length > 0) {
+        return errors;
+      }
+    }
+  }
+  if (schema.type === undefined && (schema.required || schema.properties)) {
+    if (!isPlainObject(value)) {
+      return [];
+    }
+    const errors = [];
+    for (const required of schema.required ?? []) {
+      if (!Object.hasOwn(value, required)) {
+        errors.push(`${location}: missing ${required}`);
+      }
+    }
+    for (const [key, childSchema] of Object.entries(schema.properties ?? {})) {
+      if (Object.hasOwn(value, key)) {
+        errors.push(
+          ...schemaErrors(value[key], childSchema, rootSchema, schemas, `${location}/${key}`)
+        );
+      }
+    }
+    if (errors.length > 0) {
+      return errors;
+    }
+  }
+
+  if (Object.hasOwn(schema, 'const') && canonicalJson(value) !== canonicalJson(schema.const)) {
+    return [`${location}: value does not match const`];
+  }
+  if (
+    schema.enum &&
+    !schema.enum.some((candidate) => canonicalJson(value) === canonicalJson(candidate))
+  ) {
+    return [`${location}: value is not in enum`];
+  }
+
+  if (schema.type === 'null') {
+    return value === null ? [] : [`${location}: expected null`];
+  }
+  if (schema.type === 'boolean') {
+    return typeof value === 'boolean' ? [] : [`${location}: expected boolean`];
+  }
+  if (schema.type === 'integer') {
+    if (!Number.isSafeInteger(value)) {
+      return [`${location}: expected safe integer`];
+    }
+    if (schema.minimum !== undefined && value < schema.minimum) {
+      return [`${location}: integer below minimum`];
+    }
+    if (schema.maximum !== undefined && value > schema.maximum) {
+      return [`${location}: integer above maximum`];
+    }
+    return [];
+  }
+  if (schema.type === 'string') {
+    if (typeof value !== 'string') {
+      return [`${location}: expected string`];
+    }
+    if (schema.minLength !== undefined && value.length < schema.minLength) {
+      return [`${location}: string below minimum length`];
+    }
+    if (schema.maxLength !== undefined && value.length > schema.maxLength) {
+      return [`${location}: string above maximum length`];
+    }
+    if (schema.pattern && !new RegExp(schema.pattern).test(value)) {
+      return [`${location}: string does not match pattern`];
+    }
+    if (schema.format === 'date-time' && !isTimestamp(value)) {
+      return [`${location}: invalid date-time`];
+    }
+    return [];
+  }
+  if (schema.type === 'array') {
+    if (!Array.isArray(value)) {
+      return [`${location}: expected array`];
+    }
+    const errors = [];
+    if (schema.minItems !== undefined && value.length < schema.minItems) {
+      errors.push(`${location}: array below minimum length`);
+    }
+    if (schema.maxItems !== undefined && value.length > schema.maxItems) {
+      errors.push(`${location}: array above maximum length`);
+    }
+    if (schema.uniqueItems) {
+      const serialized = value.map(canonicalJson);
+      if (new Set(serialized).size !== serialized.length) {
+        errors.push(`${location}: array items are not unique`);
+      }
+    }
+    if (schema.items) {
+      value.forEach((item, index) => {
+        errors.push(...schemaErrors(item, schema.items, rootSchema, schemas, `${location}/${index}`));
+      });
+    }
+    return errors;
+  }
+  if (schema.type === 'object') {
+    if (!isPlainObject(value)) {
+      return [`${location}: expected object`];
+    }
+    const errors = [];
+    for (const required of schema.required ?? []) {
+      if (!Object.hasOwn(value, required)) {
+        errors.push(`${location}: missing ${required}`);
+      }
+    }
+    if (schema.additionalProperties === false) {
+      for (const key of Object.keys(value)) {
+        if (!Object.hasOwn(schema.properties ?? {}, key)) {
+          errors.push(`${location}: unknown field ${key}`);
+        }
+      }
+    }
+    for (const [key, childSchema] of Object.entries(schema.properties ?? {})) {
+      if (Object.hasOwn(value, key)) {
+        errors.push(
+          ...schemaErrors(value[key], childSchema, rootSchema, schemas, `${location}/${key}`)
+        );
+      }
+    }
+    return errors;
+  }
+  return [];
+}
+
+function assertSchema(value, schemaName) {
+  const schemas = schemaRegistry();
+  const schema = schemas.get(schemaName);
+  const errors = schemaErrors(value, schema, schema, schemas);
+  if (errors.length > 0) {
+    refuse('AUTHORITY_SCHEMA_INVALID', errors[0]);
+  }
+}
+
+export function computeAuthorityDigest(value, target) {
+  const unsigned = structuredClone(value);
+  delete unsigned.integrity;
+  delete unsigned.authentication;
+  const domain = target === 'binding' ? BINDING_DOMAIN : RECEIPT_DOMAIN;
+  return createHash('sha256')
+    .update(Buffer.from(domain))
+    .update(Buffer.from([0]))
+    .update(Buffer.from(canonicalJson(unsigned)))
+    .digest('hex');
+}
+
+function assertProfile(value) {
+  if (!isPlainObject(value)) {
+    refuse('AUTHORITY_PROFILE_MISSING', 'Authority companion value is absent');
+  }
+  if (!Object.hasOwn(value, 'profile')) {
+    refuse('AUTHORITY_PROFILE_MISSING', 'Authority companion profile is missing');
+  }
+  if (typeof value.profile !== 'string') {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority companion profile must be a string');
+  }
+  if (value.profile !== PROFILE) {
+    refuse('AUTHORITY_PROFILE_UNKNOWN', `Unsupported authority profile ${value.profile}`);
+  }
+}
+
+function assertClosedTopLevel(value, allowedKeys) {
+  if (!isPlainObject(value)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority profile value must be an object');
+  }
+  const unknown = Object.keys(value).find((key) => !allowedKeys.has(key));
+  if (unknown) {
+    refuse('AUTHORITY_SCHEMA_UNKNOWN_FIELD', `Unknown authority field ${unknown}`);
+  }
+  const missing = [...allowedKeys].find((key) => !Object.hasOwn(value, key));
+  if (missing) {
+    refuse('AUTHORITY_SCHEMA_INVALID', `Missing authority field ${missing}`);
+  }
+}
+
+function digestValue(value) {
+  return value?.value;
+}
+
+function sameSet(left, right) {
+  return (
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length === right.length &&
+    [...left].sort().every((value, index) => value === [...right].sort()[index])
+  );
+}
+
+function sameArray(left, right) {
+  return (
+    Array.isArray(left) &&
+    Array.isArray(right) &&
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+function sameJson(left, right) {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function assertAuthentication(value, trusted) {
+  const proof = trusted.authenticationProofs[value.authentication?.proofRef];
+  if (!proof) {
+    refuse(
+      'AUTHORITY_AUTHENTICATION_UNVERIFIABLE',
+      'Authority authentication proof is not independently verifiable'
+    );
+  }
+  if (
+    value.authentication?.method !== proof.method ||
+    value.authentication?.keyId !== proof.keyId ||
+    value.authentication?.signedDigest !== value.integrity?.value
+  ) {
+    refuse('AUTHORITY_AUTHENTICATION_INVALID', 'Authority authentication binding is invalid');
+  }
+  let publicKey;
+  let signature;
+  try {
+    publicKey = createPublicKey({
+      key: Buffer.from(proof.publicKeyDerHex, 'hex'),
+      format: 'der',
+      type: 'spki'
+    });
+    signature = Buffer.from(value.authentication.signature, 'hex');
+  } catch {
+    refuse('AUTHORITY_AUTHENTICATION_UNVERIFIABLE', 'Authority authentication key is invalid');
+  }
+  if (
+    signature.toString('hex') !== value.authentication.signature ||
+    !verifySignature(
+      null,
+      Buffer.from(value.authentication.signedDigest, 'hex'),
+      publicKey,
+      signature
+    )
+  ) {
+    refuse('AUTHORITY_AUTHENTICATION_INVALID', 'Authority authentication signature is invalid');
+  }
+}
+
+function assertIntegrity(value, target) {
+  const expected = computeAuthorityDigest(value, target);
+  if (digestValue(value.integrity) !== expected) {
+    refuse('AUTHORITY_INTEGRITY_INVALID', 'Authority integrity digest mismatch');
+  }
+}
+
+function assertBaseCorrelation(value, trusted) {
+  if (
+    value.principal?.principalId !== trusted.principalId ||
+    value.principal?.authorizationProofRef !== trusted.principalAuthorizationProofRef ||
+    value.principal?.authenticationState !== 'authenticated'
+  ) {
+    refuse('AUTHORITY_PRINCIPAL_MISMATCH', 'Authenticated principal does not match');
+  }
+  if (
+    value.familiar?.familiarRootId !== trusted.familiarRootId ||
+    value.familiar?.identityRevisionId !== trusted.identityRevisionId
+  ) {
+    refuse('AUTHORITY_FAMILIAR_MISMATCH', 'Familiar root or revision does not match');
+  }
+  if (value.familiar?.statusAtDecision !== 'active') {
+    refuse('AUTHORITY_FAMILIAR_STATUS_INVALID', 'Familiar is not active at decision time');
+  }
+}
+
+function assertCapabilities(value, trusted) {
+  if (
+    !Array.isArray(value.capabilities?.requested) ||
+    !Array.isArray(value.capabilities?.granted) ||
+    !Array.isArray(value.capabilities?.denied) ||
+    !Array.isArray(value.capabilities?.degraded)
+  ) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority capability sets must be arrays');
+  }
+  const requested = new Set(value.capabilities?.requested);
+  if (
+    !Array.isArray(value.capabilities?.granted) ||
+    value.capabilities.granted.some(
+      (capability) => !requested.has(capability) || !trusted.runtimeCapabilities.includes(capability)
+    )
+  ) {
+    refuse('AUTHORITY_CAPABILITY_ESCALATION', 'Granted capability exceeds request or runtime');
+  }
+}
+
+function assertFamiliarFreshness(value, trusted, dispatchNow, decisionAt) {
+  if (
+    value.familiar?.freshnessPolicyVersion !== trusted.familiarFreshnessPolicyVersion ||
+    value.familiar?.freshnessBoundSeconds !== trusted.familiarFreshnessBoundSeconds
+  ) {
+    refuse('AUTHORITY_FAMILIAR_STALE', 'Familiar freshness policy does not match trusted state');
+  }
+  if (!isTimestamp(value.familiar?.verifiedAt)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Familiar verification timestamp is invalid');
+  }
+  const verifiedAt = Date.parse(value.familiar.verifiedAt);
+  if (verifiedAt > decisionAt || verifiedAt > dispatchNow) {
+    refuse(
+      'AUTHORITY_FAMILIAR_TIME_INVALID',
+      'Familiar verification cannot follow the authority decision or dispatch'
+    );
+  }
+  if (dispatchNow - verifiedAt > value.familiar.freshnessBoundSeconds * 1000) {
+    refuse('AUTHORITY_FAMILIAR_STALE', 'Familiar verification exceeds its freshness bound');
+  }
+}
+
+function recurringConsumptionKey(approval) {
+  return canonicalJson({
+    grantId: approval.use.grantId,
+    requestDigest: digestValue(approval.consumption.requestDigest),
+    decisionDigest: digestValue(approval.consumption.decisionDigest),
+    occurrenceId: approval.consumption.occurrenceId,
+    runId: approval.consumption.runId,
+    attemptNumber: approval.consumption.attemptNumber,
+    fenceGeneration: approval.consumption.fenceGeneration
+  });
+}
+
+function expectedDispatchConsumption(value) {
+  const approval =
+    value.approval.requirement === 'not_required'
+      ? null
+      : {
+          requirement: value.approval.requirement,
+          approvalId: value.approval.evidence.approvalId,
+          use: value.approval.use,
+          consumption: value.approval.consumption
+        };
+  return {
+    bindingId: value.bindingId,
+    nonce: value.authorization.nonce,
+    adoptionKey: value.base.adoptionKey,
+    occurrenceId: value.base.occurrenceId,
+    runId: value.base.runId,
+    attemptId: value.base.attemptId,
+    attemptNumber: value.base.attemptNumber,
+    fenceGeneration: value.base.occurrenceFenceGeneration,
+    approval
+  };
+}
+
+function dispatchConsumptions(trusted) {
+  return Array.isArray(trusted.dispatchConsumptions) ? trusted.dispatchConsumptions : [];
+}
+
+function assertPreDispatchReplayState(value, trusted) {
+  const consumptions = dispatchConsumptions(trusted);
+  if (
+    trusted.replayedNonces.includes(value.authorization?.nonce) ||
+    consumptions.some((entry) => entry.nonce === value.authorization?.nonce)
+  ) {
+    refuse('AUTHORITY_NONCE_REPLAYED', 'Authorization nonce was already adopted');
+  }
+  if (
+    trusted.replayedAdoptionKeys.includes(value.base?.adoptionKey) ||
+    consumptions.some((entry) => entry.adoptionKey === value.base?.adoptionKey)
+  ) {
+    refuse('AUTHORITY_ADOPTION_REPLAYED', 'Attempt adoption key was already adopted');
+  }
+}
+
+function assertTerminalDispatchConsumption(value, trusted) {
+  const recurringKey =
+    value.approval.requirement === 'bounded_recurring'
+      ? recurringConsumptionKey(value.approval)
+      : null;
+  const approvalRecorded =
+    value.approval.requirement === 'not_required' ||
+    (value.approval.requirement === 'bounded_recurring'
+      ? trusted.consumedRecurringOccurrences.includes(recurringKey)
+      : trusted.consumedApprovalIds.includes(value.approval.evidence.approvalId));
+  if (
+    !trusted.replayedNonces.includes(value.authorization.nonce) ||
+    !trusted.replayedAdoptionKeys.includes(value.base.adoptionKey) ||
+    !approvalRecorded
+  ) {
+    refuse(
+      'AUTHORITY_DISPATCH_CONSUMPTION_MISSING',
+      'Terminal authority evidence is missing a committed replay or approval record'
+    );
+  }
+
+  const expected = expectedDispatchConsumption(value);
+  const related = dispatchConsumptions(trusted).filter(
+    (entry) =>
+      entry.bindingId === expected.bindingId ||
+      entry.nonce === expected.nonce ||
+      entry.adoptionKey === expected.adoptionKey ||
+      (entry.runId === expected.runId && entry.attemptNumber === expected.attemptNumber)
+  );
+  if (related.length === 0) {
+    refuse(
+      'AUTHORITY_DISPATCH_CONSUMPTION_MISSING',
+      'Terminal authority evidence has no committed dispatch ownership record'
+    );
+  }
+  if (related.length !== 1 || !sameJson(related[0], expected)) {
+    refuse(
+      'AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH',
+      'Committed dispatch ownership does not match the signed binding'
+    );
+  }
+}
+
+function assertApproval(value, trusted, dispatchNow, { enforceReplay = true } = {}) {
+  const approval = value.approval;
+  if (approval?.requirement !== trusted.approvalRequirement) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Approval requirement does not match trusted state');
+  }
+  if (approval.requirement === 'not_required') {
+    return;
+  }
+  if (approval.evidence?.state === 'revoked') {
+    refuse('AUTHORITY_APPROVAL_REVOKED', 'Approval is revoked');
+  }
+  if (!isTimestamp(approval.expiresAt) || Date.parse(approval.expiresAt) <= dispatchNow) {
+    refuse('AUTHORITY_APPROVAL_EXPIRED', 'Approval is expired');
+  }
+  if (
+    approval.evidence?.state !== 'approved' ||
+    approval.evidence?.approvalId !== trusted.approvalId ||
+    digestValue(approval.evidence?.approvalDigest) !== trusted.approvalDigest ||
+    digestValue(approval.scopeDigest) !== trusted.approvalScopeDigest ||
+    approval.expiresAt !== trusted.approvalExpiresAt ||
+    digestValue(approval.consumption?.eventDigest) !== trusted.approvalConsumptionDigest ||
+    approval.consumption?.state !== 'consumed_for_dispatch' ||
+    digestValue(approval.consumption?.requestDigest) !==
+      digestValue(value.authorization?.requestDigest) ||
+    digestValue(approval.consumption?.decisionDigest) !==
+      digestValue(value.authorization?.decisionDigest) ||
+    approval.consumption?.occurrenceId !== value.base?.occurrenceId ||
+    approval.consumption?.runId !== value.base?.runId ||
+    approval.consumption?.attemptNumber !== value.base?.attemptNumber ||
+    approval.consumption?.fenceGeneration !== value.base?.occurrenceFenceGeneration ||
+    approval.consumption?.eventId !== trusted.approvalConsumption.eventId ||
+    digestValue(approval.consumption?.eventDigest) !==
+      trusted.approvalConsumption.eventDigest ||
+    digestValue(approval.consumption?.requestDigest) !==
+      trusted.approvalConsumption.requestDigest ||
+    digestValue(approval.consumption?.decisionDigest) !==
+      trusted.approvalConsumption.decisionDigest ||
+    approval.consumption?.occurrenceId !== trusted.approvalConsumption.occurrenceId ||
+    approval.consumption?.runId !== trusted.approvalConsumption.runId ||
+    approval.consumption?.attemptNumber !== trusted.approvalConsumption.attemptNumber ||
+    approval.consumption?.fenceGeneration !== trusted.approvalConsumption.fenceGeneration
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Approval evidence or consumption does not match dispatch');
+  }
+
+  if (approval.requirement === 'bounded_recurring') {
+    if (
+      approval.use?.kind !== 'recurring' ||
+      approval.use.kind !== trusted.approvalUse.kind ||
+      approval.use.grantId !== trusted.approvalUse.grantId ||
+      approval.use.maxUses !== trusted.approvalUse.maxUses ||
+      approval.use.occurrencePrefix !== trusted.approvalUse.occurrencePrefix
+    ) {
+      refuse('AUTHORITY_APPROVAL_REQUIRED', 'Recurring approval grant does not match trusted state');
+    }
+    if (!value.base.occurrenceId.startsWith(approval.use.occurrencePrefix)) {
+      refuse(
+        'AUTHORITY_APPROVAL_SCOPE_MISMATCH',
+        'Recurring approval does not cover this occurrence'
+      );
+    }
+    if (trusted.approvalUse.priorUses >= approval.use.maxUses) {
+      refuse('AUTHORITY_APPROVAL_EXHAUSTED', 'Recurring approval usage bound is exhausted');
+    }
+    if (approval.use.priorUses !== trusted.approvalUse.priorUses) {
+      refuse('AUTHORITY_APPROVAL_REUSED', 'Recurring approval usage snapshot is stale');
+    }
+    if (
+      approval.consumption.usageNumber !== approval.use.priorUses + 1 ||
+      approval.consumption.usageNumber !== trusted.approvalConsumption.usageNumber
+    ) {
+      refuse('AUTHORITY_APPROVAL_REUSED', 'Recurring approval usage is not monotonic');
+    }
+    if (
+      enforceReplay &&
+      (trusted.consumedRecurringOccurrences.includes(recurringConsumptionKey(approval)) ||
+        dispatchConsumptions(trusted).some(
+          (entry) =>
+            entry.approval?.requirement === 'bounded_recurring' &&
+            recurringConsumptionKey(entry.approval) === recurringConsumptionKey(approval)
+        ))
+    ) {
+      refuse('AUTHORITY_APPROVAL_REUSED', 'Recurring approval already consumed this occurrence');
+    }
+    return;
+  }
+
+  if (
+    approval.use?.kind !== 'single_use' ||
+    !sameJson(approval.use, trusted.approvalUse) ||
+    approval.consumption?.usageNumber !== undefined
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Per-run approval must be single use');
+  }
+  if (
+    enforceReplay &&
+    (trusted.consumedApprovalIds.includes(approval.evidence.approvalId) ||
+      dispatchConsumptions(trusted).some(
+        (entry) => entry.approval?.approvalId === approval.evidence.approvalId
+      ))
+  ) {
+    refuse('AUTHORITY_APPROVAL_REUSED', 'Per-run approval was already consumed');
+  }
+}
+
+function assertBinding(value, trusted, { phase = 'pre_dispatch' } = {}) {
+  assertClosedTopLevel(value, BINDING_KEYS);
+  if (value.kind !== 'AutomationExecutionBinding') {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority binding kind is invalid');
+  }
+  if (value.bindingId !== trusted.bindingId) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Binding identity does not match trusted state');
+  }
+  assertBaseCorrelation(value, trusted);
+  if (
+    value.base?.automationId !== trusted.automationId ||
+    value.base?.automationRevision !== trusted.automationRevision ||
+    digestValue(value.base?.definitionDigest) !== trusted.definitionDigest ||
+    value.base?.occurrenceId !== trusted.occurrenceId ||
+    value.base?.occurrenceKey !== trusted.occurrenceKey ||
+    value.base?.runId !== trusted.runId ||
+    value.base?.attemptId !== trusted.attemptId ||
+    value.base?.attemptNumber !== trusted.attemptNumber ||
+    value.base?.adoptionKey !== trusted.adoptionKey
+  ) {
+    refuse('AUTHORITY_DEFINITION_MISMATCH', 'Definition digest does not match');
+  }
+  if (value.base?.occurrenceFenceGeneration !== trusted.occurrenceFenceGeneration) {
+    refuse('AUTHORITY_FENCE_STALE', 'Occurrence fence is stale');
+  }
+  if (phase === 'pre_dispatch') {
+    assertPreDispatchReplayState(value, trusted);
+  }
+  if (value.authorization?.replayState !== 'fresh') {
+    refuse('AUTHORITY_REPLAYED', 'Authority replay state is not fresh');
+  }
+  if (
+    digestValue(value.authorization?.decisionDigest) !== trusted.threadsDecisionDigest ||
+    digestValue(value.threads?.decisionDigest) !== trusted.threadsDecisionDigest ||
+    value.authorization?.operation !== trusted.authorizationOperation ||
+    value.authorization?.requestId !== trusted.authorizationRequestId ||
+    digestValue(value.authorization?.requestDigest) !== trusted.authorizationRequestDigest ||
+    digestValue(value.authorization?.consumptionSnapshotDigest) !==
+      trusted.consumptionSnapshotDigest ||
+    value.authorization?.outcome !== trusted.authorizationOutcome ||
+    value.authorization?.decisionId !== value.threads?.decisionId ||
+    value.threads?.protectedSurfaceManifestId !== trusted.protectedSurfaceManifestId ||
+    digestValue(value.threads?.protectedSurfaceManifestDigest) !==
+      trusted.protectedSurfaceManifestDigest
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Threads authority binding does not match');
+  }
+  assertCapabilities(value, trusted);
+  if (
+    !sameSet(value.capabilities?.requested, trusted.requestedCapabilities) ||
+    !sameSet(value.capabilities?.granted, trusted.grantedCapabilities) ||
+    !sameJson(value.capabilities?.denied, trusted.deniedCapabilities) ||
+    !sameSet(value.capabilities?.degraded, trusted.degradedCapabilities)
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Capability decision does not match trusted state');
+  }
+  if (
+    digestValue(value.familiar?.declarationDigest) !== trusted.familiarDeclarationDigest ||
+    digestValue(value.familiar?.embodimentDigest) !== trusted.familiarEmbodimentDigest
+  ) {
+    refuse('AUTHORITY_FAMILIAR_MISMATCH', 'Familiar evidence digest does not match');
+  }
+  if (
+    value.contextProjection?.projectId !== trusted.projectId ||
+    value.contextProjection?.workspaceId !== trusted.workspaceId ||
+    !sameArray(value.contextProjection?.contextProjectionIds, trusted.contextProjectionIds) ||
+    !sameArray(value.contextProjection?.memoryProjectionIds, trusted.memoryProjectionIds)
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Authorized context projection does not match');
+  }
+  const dispatchNow = Date.parse(trusted.dispatchNow);
+  if (
+    !isTimestamp(value.authorization?.issuedAt) ||
+    !isTimestamp(value.authorization?.validFrom) ||
+    !isTimestamp(value.authorization?.validUntil)
+  ) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authorization timestamp is invalid');
+  }
+  if (!isTimestamp(value.decisionTimestamp) || !Number.isFinite(dispatchNow)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority decision or dispatch timestamp is invalid');
+  }
+  const issuedAt = Date.parse(value.authorization.issuedAt);
+  const validFrom = Date.parse(value.authorization.validFrom);
+  const validUntil = Date.parse(value.authorization.validUntil);
+  const decisionAt = Date.parse(value.decisionTimestamp);
+  if (
+    issuedAt > validFrom ||
+    validFrom > decisionAt ||
+    decisionAt > dispatchNow ||
+    validFrom >= validUntil
+  ) {
+    refuse(
+      'AUTHORITY_CHRONOLOGY_INVALID',
+      'Authority timestamps must satisfy issuedAt <= validFrom <= decisionTimestamp <= dispatchNow < validUntil'
+    );
+  }
+  assertFamiliarFreshness(value, trusted, dispatchNow, decisionAt);
+  if (validUntil <= dispatchNow) {
+    refuse('AUTHORITY_STALE', 'Authorization validity does not cover dispatch');
+  }
+  if (
+    value.authorization?.outcome === 'requires_approval' &&
+    value.approval?.requirement === 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Authorization requires approval evidence');
+  }
+  if (
+    value.authorization?.outcome === 'permit' &&
+    value.approval?.requirement !== 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Permit outcome cannot carry required approval evidence');
+  }
+  assertApproval(value, trusted, dispatchNow, { enforceReplay: phase === 'pre_dispatch' });
+  if (
+    value.runtime?.runtimeId !== trusted.runtimeId ||
+    value.runtime?.descriptorVersion !== trusted.runtimeDescriptorVersion ||
+    digestValue(value.runtime?.descriptorDigest) !== trusted.runtimeDescriptorDigest ||
+    !sameSet(value.runtime?.capabilities, trusted.runtimeCapabilities) ||
+    value.runtime?.selectionRationale !== trusted.runtimeSelectionRationale
+  ) {
+    refuse('AUTHORITY_RUNTIME_DOWNGRADE', 'Runtime descriptor or capabilities changed');
+  }
+  if (
+    value.versions?.baseProfile !== 'coven.automations.v1' ||
+    value.versions?.authorityProfile !== PROFILE ||
+    value.versions?.familiarProfile !== 'familiar.embodiment_binding.v1' ||
+    value.versions?.threadsProfile !== 'automation-authority/1.0.0' ||
+    value.versions?.policyVersion !== trusted.policyVersion ||
+    digestValue(value.versions?.policyDigest) !== trusted.policyDigest ||
+    value.decisionTimestamp !== trusted.decisionTimestamp
+  ) {
+    refuse('AUTHORITY_POLICY_STALE', 'Policy snapshot is stale');
+  }
+  assertSchema(value, 'automation-execution-binding.schema.json');
+  assertIntegrity(value, 'binding');
+  assertAuthentication(value, trusted);
+  if (digestValue(value.integrity) !== trusted.bindingDigest) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Binding digest does not match trusted state');
+  }
+  if (phase === 'terminal') {
+    assertTerminalDispatchConsumption(value, trusted);
+  }
+}
+
+function assertReceiptEvidence(value, trusted) {
+  assertClosedTopLevel(value, RECEIPT_KEYS);
+  if (value.kind !== 'AutomationReceiptAuthorityEvidence') {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority receipt evidence kind is invalid');
+  }
+  if (value.privacy?.sensitiveMaterialIncluded !== false) {
+    refuse(
+      'AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN',
+      'Authority receipt evidence contains unauthorized sensitive material'
+    );
+  }
+  if (
+    value.authorization?.outcome === 'requires_approval' &&
+    value.approval?.requirement === 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Receipt authorization requires approval evidence');
+  }
+  if (
+    value.authorization?.outcome === 'permit' &&
+    value.approval?.requirement !== 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Receipt permit cannot carry required approval evidence');
+  }
+  assertSchema(value, 'automation-receipt-authority-evidence.schema.json');
+  if (value.principalId !== trusted.principalId) {
+    refuse('AUTHORITY_PRINCIPAL_MISMATCH', 'Receipt principal does not match');
+  }
+  if (
+    value.familiar?.familiarRootId !== trusted.familiarRootId ||
+    value.familiar?.identityRevisionId !== trusted.identityRevisionId
+  ) {
+    refuse('AUTHORITY_FAMILIAR_MISMATCH', 'Receipt familiar binding does not match');
+  }
+  if (value.familiar?.statusAtDecision !== 'active') {
+    refuse('AUTHORITY_FAMILIAR_STATUS_INVALID', 'Receipt familiar status is not active');
+  }
+  const dispatchNow = Date.parse(trusted.dispatchNow);
+  const decisionAt = Date.parse(value.decisionTimestamp);
+  if (!Number.isFinite(dispatchNow) || !Number.isFinite(decisionAt) || decisionAt > dispatchNow) {
+    refuse('AUTHORITY_CHRONOLOGY_INVALID', 'Receipt decision cannot follow dispatch');
+  }
+  assertFamiliarFreshness(value, trusted, dispatchNow, decisionAt);
+  if (
+    value.receiptId !== trusted.receiptId ||
+    digestValue(value.baseReceiptDigest) !== trusted.baseReceiptDigest ||
+    value.bindingId !== trusted.bindingId ||
+    digestValue(value.bindingDigest) !== trusted.bindingDigest
+  ) {
+    refuse(
+      'AUTHORITY_RECEIPT_CORRELATION_MISMATCH',
+      'Receipt evidence does not match the authenticated base receipt'
+    );
+  }
+  if (
+    value.automationId !== trusted.automationId ||
+    value.automationRevision !== trusted.automationRevision ||
+    digestValue(value.definitionDigest) !== trusted.definitionDigest ||
+    value.occurrenceId !== trusted.occurrenceId ||
+    value.occurrenceFenceGeneration !== trusted.occurrenceFenceGeneration ||
+    value.runId !== trusted.runId ||
+    value.attemptId !== trusted.attemptId ||
+    value.attemptNumber !== trusted.attemptNumber
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Receipt base correlation does not match');
+  }
+  assertCapabilities(value, trusted);
+  if (
+    !sameSet(value.capabilities?.requested, trusted.requestedCapabilities) ||
+    !sameSet(value.capabilities?.granted, trusted.grantedCapabilities) ||
+    !sameJson(value.capabilities?.denied, trusted.deniedCapabilities) ||
+    !sameSet(value.capabilities?.degraded, trusted.degradedCapabilities)
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Receipt capability decision does not match');
+  }
+  if (
+    value.capabilities?.exercised.some(
+      (capability) => !value.capabilities.granted.includes(capability)
+    )
+  ) {
+    refuse(
+      'AUTHORITY_CAPABILITY_ESCALATION',
+      'Receipt claims a capability outside its granted capability set'
+    );
+  }
+  if (
+    value.runtime?.runtimeId !== trusted.runtimeId ||
+    value.runtime?.descriptorVersion !== trusted.runtimeDescriptorVersion ||
+    digestValue(value.runtime?.descriptorDigest) !== trusted.runtimeDescriptorDigest ||
+    !sameSet(value.runtime?.capabilities, trusted.runtimeCapabilities)
+  ) {
+    refuse('AUTHORITY_RUNTIME_DOWNGRADE', 'Receipt runtime snapshot changed');
+  }
+  assertApproval(
+    {
+      approval: value.approval,
+      authorization: value.authorization,
+      base: {
+        occurrenceId: value.occurrenceId,
+        runId: value.runId,
+        attemptNumber: value.attemptNumber,
+        occurrenceFenceGeneration: value.occurrenceFenceGeneration
+      }
+    },
+    trusted,
+    dispatchNow,
+    { enforceReplay: false }
+  );
+  if (
+    digestValue(value.familiar?.declarationDigest) !== trusted.familiarDeclarationDigest ||
+    value.authorization?.operation !== trusted.authorizationOperation ||
+    value.authorization?.requestId !== trusted.authorizationRequestId ||
+    digestValue(value.authorization?.requestDigest) !== trusted.authorizationRequestDigest ||
+    digestValue(value.authorization?.decisionDigest) !== trusted.threadsDecisionDigest ||
+    digestValue(value.authorization?.consumptionSnapshotDigest) !==
+      trusted.consumptionSnapshotDigest ||
+    value.authorization?.outcome !== trusted.authorizationOutcome ||
+    value.risk?.riskClass !== trusted.riskClass ||
+    value.risk?.sideEffectClass !== trusted.sideEffectClass ||
+    value.decisionTimestamp !== trusted.decisionTimestamp
+  ) {
+    refuse('AUTHORITY_BINDING_MISMATCH', 'Receipt authority correlation does not match');
+  }
+  if (!isTimestamp(value.decisionTimestamp)) {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Receipt decision timestamp is invalid');
+  }
+  assertIntegrity(value, 'receiptEvidence');
+  assertAuthentication(value, trusted);
+}
+
+function assertExtension(value, trusted) {
+  assertClosedTopLevel(value, EXTENSION_KEYS);
+  if (value.kind !== 'AutomationAuthorityExtension') {
+    refuse('AUTHORITY_SCHEMA_INVALID', 'Authority extension kind is invalid');
+  }
+  const terminal =
+    value.receiptEvidence !== null ||
+    trusted.receiptId !== null ||
+    trusted.baseReceiptDigest !== null;
+  assertBinding(value.executionBinding, trusted, {
+    phase: terminal ? 'terminal' : 'pre_dispatch'
+  });
+  if (value.receiptEvidence === null) {
+    if (trusted.receiptId !== null || trusted.baseReceiptDigest !== null) {
+      refuse(
+        'AUTHORITY_RECEIPT_EVIDENCE_REQUIRED',
+        'Terminal receipt state requires authenticated authority evidence'
+      );
+    }
+    assertSchema(value, 'authority-extension.schema.json');
+    return;
+  }
+  const binding = value.executionBinding;
+  const receipt = value.receiptEvidence;
+  assertProfile(receipt);
+  assertClosedTopLevel(receipt, RECEIPT_KEYS);
+  if (receipt.privacy?.sensitiveMaterialIncluded !== false) {
+    refuse(
+      'AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN',
+      'Authority receipt evidence contains unauthorized sensitive material'
+    );
+  }
+  if (
+    receipt.authorization?.outcome === 'requires_approval' &&
+    receipt.approval?.requirement === 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Receipt authorization requires approval evidence');
+  }
+  if (
+    receipt.authorization?.outcome === 'permit' &&
+    receipt.approval?.requirement !== 'not_required'
+  ) {
+    refuse('AUTHORITY_APPROVAL_REQUIRED', 'Receipt permit cannot carry required approval evidence');
+  }
+  assertSchema(receipt, 'automation-receipt-authority-evidence.schema.json');
+  if (
+    receipt.receiptId !== trusted.receiptId ||
+    digestValue(receipt.baseReceiptDigest) !== trusted.baseReceiptDigest ||
+    receipt.bindingId !== binding.bindingId ||
+    digestValue(receipt.bindingDigest) !== binding.integrity.value
+  ) {
+    refuse(
+      receipt.receiptId !== trusted.receiptId ||
+      digestValue(receipt.baseReceiptDigest) !== trusted.baseReceiptDigest
+        ? 'AUTHORITY_RECEIPT_CORRELATION_MISMATCH'
+        : 'AUTHORITY_RECEIPT_BINDING_MISMATCH',
+      'Receipt evidence is not correlated to the trusted receipt and binding'
+    );
+  }
+  if (
+    receipt.capabilities.exercised.some(
+      (capability) =>
+        !receipt.capabilities.granted.includes(capability) ||
+        !binding.capabilities.granted.includes(capability)
+    )
+  ) {
+    refuse(
+      'AUTHORITY_CAPABILITY_ESCALATION',
+      'Receipt claims a capability that was not granted by both evidence and binding'
+    );
+  }
+  if (
+    receipt.automationId !== binding.base.automationId ||
+    receipt.automationRevision !== binding.base.automationRevision ||
+    digestValue(receipt.definitionDigest) !== digestValue(binding.base.definitionDigest) ||
+    receipt.occurrenceId !== binding.base.occurrenceId ||
+    receipt.occurrenceFenceGeneration !== binding.base.occurrenceFenceGeneration ||
+    receipt.runId !== binding.base.runId ||
+    receipt.attemptId !== binding.base.attemptId ||
+    receipt.attemptNumber !== binding.base.attemptNumber ||
+    receipt.principalId !== binding.principal.principalId ||
+    receipt.familiar.familiarRootId !== binding.familiar.familiarRootId ||
+    receipt.familiar.identityRevisionId !== binding.familiar.identityRevisionId ||
+    digestValue(receipt.familiar.declarationDigest) !==
+      digestValue(binding.familiar.declarationDigest) ||
+    receipt.familiar.statusAtDecision !== binding.familiar.statusAtDecision ||
+    receipt.familiar.verifiedAt !== binding.familiar.verifiedAt ||
+    receipt.familiar.freshnessPolicyVersion !== binding.familiar.freshnessPolicyVersion ||
+    receipt.familiar.freshnessBoundSeconds !== binding.familiar.freshnessBoundSeconds ||
+    receipt.authorization.operation !== binding.authorization.operation ||
+    receipt.authorization.requestId !== binding.authorization.requestId ||
+    digestValue(receipt.authorization.requestDigest) !==
+      digestValue(binding.authorization.requestDigest) ||
+    receipt.authorization.decisionId !== binding.authorization.decisionId ||
+    digestValue(receipt.authorization.decisionDigest) !==
+      digestValue(binding.authorization.decisionDigest) ||
+    digestValue(receipt.authorization.consumptionSnapshotDigest) !==
+      digestValue(binding.authorization.consumptionSnapshotDigest) ||
+    receipt.authorization.outcome !== binding.authorization.outcome ||
+    !sameSet(receipt.capabilities.requested, binding.capabilities.requested) ||
+    !sameSet(receipt.capabilities.granted, binding.capabilities.granted) ||
+    !sameJson(receipt.capabilities.denied, binding.capabilities.denied) ||
+    !sameSet(receipt.capabilities.degraded, binding.capabilities.degraded) ||
+    !sameJson(receipt.approval, binding.approval) ||
+    receipt.risk.riskClass !== binding.risk.riskClass ||
+    receipt.risk.sideEffectClass !== binding.risk.sideEffectClass ||
+    receipt.runtime.runtimeId !== binding.runtime.runtimeId ||
+    receipt.runtime.descriptorVersion !== binding.runtime.descriptorVersion ||
+    digestValue(receipt.runtime.descriptorDigest) !==
+      digestValue(binding.runtime.descriptorDigest) ||
+    !sameSet(receipt.runtime.capabilities, binding.runtime.capabilities) ||
+    receipt.decisionTimestamp !== binding.decisionTimestamp ||
+    !sameJson(receipt.producer, binding.producer)
+  ) {
+    refuse('AUTHORITY_RECEIPT_BINDING_MISMATCH', 'Receipt evidence was spliced');
+  }
+  assertReceiptEvidence(receipt, trusted);
+  assertSchema(value, 'authority-extension.schema.json');
+}
+
+export function validateAuthorityValue(value, trusted, target) {
+  assertIJson(value);
+  assertProfile(value);
+  if (target === 'binding') {
+    assertBinding(value, trusted);
+  } else if (target === 'receiptEvidence') {
+    assertReceiptEvidence(value, trusted);
+  } else if (target === 'extension') {
+    assertExtension(value, trusted);
+  } else {
+    refuse('AUTHORITY_SCHEMA_INVALID', `Unknown vector target ${target}`);
+  }
+  return value;
+}
+
+function pointerComponents(pointer) {
+  if (typeof pointer !== 'string' || !pointer.startsWith('/')) {
+    refuse('AUTHORITY_SCHEMA_INVALID', `Invalid mutation path ${pointer}`);
+  }
+  return pointer
+    .slice(1)
+    .split('/')
+    .map((component) => component.replaceAll('~1', '/').replaceAll('~0', '~'));
+}
+
+function applyMutation(value, mutation) {
+  if (!mutation) {
+    return value;
+  }
+  const components = pointerComponents(mutation.path);
+  const last = components.pop();
+  let parent = value;
+  for (const component of components) {
+    parent = parent[component];
+  }
+  if (mutation.op === 'remove') {
+    delete parent[last];
+  } else if (mutation.op === 'replace') {
+    parent[last] = mutation.value;
+  } else if (mutation.op === 'add' && last === '-' && Array.isArray(parent)) {
+    parent.push(mutation.value);
+  } else if (mutation.op === 'add') {
+    parent[last] = mutation.value;
+  } else {
+    refuse('AUTHORITY_SCHEMA_INVALID', `Unsupported mutation ${mutation.op}`);
+  }
+  return value;
+}
+
+function vectorFixture(vectors, target) {
+  if (target === 'extension') {
+    return {
+      profile: PROFILE,
+      kind: 'AutomationAuthorityExtension',
+      executionBinding: structuredClone(vectors.fixtures.binding),
+      receiptEvidence: structuredClone(vectors.fixtures.receiptEvidence)
+    };
+  }
+  return structuredClone(vectors.fixtures[target]);
+}
+
+function mergeTrusted(base, patch = {}) {
+  return {
+    ...structuredClone(base),
+    ...structuredClone(patch)
+  };
+}
+
+export function runAuthorityVectors(vectors) {
+  let accepted = 0;
+  let refused = 0;
+  for (const vector of vectors.cases) {
+    let value = vectorFixture(vectors, vector.target);
+    for (const mutation of vector.mutations ?? (vector.mutation ? [vector.mutation] : [])) {
+      value = applyMutation(value, mutation);
+    }
+    const trustedState =
+      vector.trustedState ?? (vector.target === 'extension' ? 'terminalRecurring' : undefined);
+    let trusted = mergeTrusted(
+      vectors.trusted,
+      trustedState ? vectors.trustedStates?.[trustedState] : undefined
+    );
+    trusted = mergeTrusted(trusted, vector.trustedPatch);
+    for (const mutation of vector.trustedMutations ?? []) {
+      trusted = applyMutation(trusted, mutation);
+    }
+    try {
+      validateAuthorityValue(value, trusted, vector.target);
+      if (vector.expected !== 'accept') {
+        throw new Error(`${vector.id}: expected refusal ${vector.errorCode}, got accept`);
+      }
+      accepted += 1;
+    } catch (error) {
+      if (vector.expected !== 'refuse') {
+        throw new Error(`${vector.id}: expected accept, got ${error.code ?? error.message}`);
+      }
+      if (error.code !== vector.errorCode) {
+        throw new Error(
+          `${vector.id}: expected ${vector.errorCode}, got ${error.code ?? error.message}`
+        );
+      }
+      refused += 1;
+    }
+  }
+  return {
+    total: vectors.cases.length,
+    accepted,
+    refused
+  };
+}
+
+function main() {
+  const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const vectorsPath = path.join(
+    repositoryRoot,
+    'spec',
+    'coven-automations',
+    'authority',
+    'v1',
+    'test-vectors.json'
+  );
+  const vectors = JSON.parse(readFileSync(vectorsPath, 'utf8'));
+  process.stdout.write(`${JSON.stringify(runAuthorityVectors(vectors))}\n`);
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  try {
+    main();
+  } catch (error) {
+    console.error(error?.message ?? String(error));
+    process.exitCode = 1;
+  }
+}

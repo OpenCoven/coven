@@ -1,0 +1,151 @@
+{
+  "version": 1,
+  "contractProfile": "coven.automations.authority.v1",
+  "baseProfile": "coven.automations.v1",
+  "advertisement": {
+    "requiredCapability": "automations.runtime-authority.v1",
+    "extensionKey": "coven.automations.authority.v1",
+    "extensionKind": "AutomationAuthorityExtension",
+    "bindingKind": "AutomationExecutionBinding",
+    "receiptEvidenceKind": "AutomationReceiptAuthorityEvidence"
+  },
+  "supported": {
+    "riskClasses": ["R0", "R1", "R2", "R3", "R4"],
+    "decisionOutcomes": ["permit", "requires_approval"],
+    "approvalRequirements": [
+      "not_required",
+      "human_per_run",
+      "protected_owner_per_run",
+      "bounded_recurring"
+    ],
+    "runtimeSelectionRationales": [
+      "exact_requirement_match",
+      "policy_preferred",
+      "only_conformant_runtime",
+      "operator_pinned"
+    ],
+    "authenticationMethods": ["ed25519"]
+  },
+  "errorCodes": [
+    "AUTHORITY_ADOPTION_REPLAYED",
+    "AUTHORITY_APPROVAL_EXPIRED",
+    "AUTHORITY_APPROVAL_EXHAUSTED",
+    "AUTHORITY_APPROVAL_REQUIRED",
+    "AUTHORITY_APPROVAL_REUSED",
+    "AUTHORITY_APPROVAL_REVOKED",
+    "AUTHORITY_APPROVAL_SCOPE_MISMATCH",
+    "AUTHORITY_AUTHENTICATION_INVALID",
+    "AUTHORITY_AUTHENTICATION_UNVERIFIABLE",
+    "AUTHORITY_BINDING_MISMATCH",
+    "AUTHORITY_CAPABILITY_ESCALATION",
+    "AUTHORITY_CHRONOLOGY_INVALID",
+    "AUTHORITY_DEFINITION_MISMATCH",
+    "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH",
+    "AUTHORITY_DISPATCH_CONSUMPTION_MISSING",
+    "AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN",
+    "AUTHORITY_FAMILIAR_MISMATCH",
+    "AUTHORITY_FAMILIAR_STALE",
+    "AUTHORITY_FAMILIAR_STATUS_INVALID",
+    "AUTHORITY_FAMILIAR_TIME_INVALID",
+    "AUTHORITY_FENCE_STALE",
+    "AUTHORITY_INTEGRITY_INVALID",
+    "AUTHORITY_IJSON_INVALID",
+    "AUTHORITY_NONCE_REPLAYED",
+    "AUTHORITY_POLICY_STALE",
+    "AUTHORITY_PRINCIPAL_MISMATCH",
+    "AUTHORITY_PROFILE_MISSING",
+    "AUTHORITY_PROFILE_REQUIRED",
+    "AUTHORITY_PROFILE_UNKNOWN",
+    "AUTHORITY_RECEIPT_BINDING_MISMATCH",
+    "AUTHORITY_RECEIPT_CORRELATION_MISMATCH",
+    "AUTHORITY_RECEIPT_EVIDENCE_REQUIRED",
+    "AUTHORITY_REPLAYED",
+    "AUTHORITY_RUNTIME_DOWNGRADE",
+    "AUTHORITY_SCHEMA_INVALID",
+    "AUTHORITY_SCHEMA_UNKNOWN_FIELD",
+    "AUTHORITY_STALE"
+  ],
+  "failClosed": [
+    {
+      "condition": "profile capability is not explicitly advertised",
+      "errorCodes": ["AUTHORITY_PROFILE_REQUIRED"]
+    },
+    {
+      "condition": "required extension value is absent",
+      "errorCodes": ["AUTHORITY_PROFILE_MISSING", "AUTHORITY_RECEIPT_EVIDENCE_REQUIRED"]
+    },
+    {
+      "condition": "profile, kind, field, or value is unknown or malformed",
+      "errorCodes": [
+        "AUTHORITY_PROFILE_UNKNOWN",
+        "AUTHORITY_SCHEMA_INVALID",
+        "AUTHORITY_SCHEMA_UNKNOWN_FIELD"
+      ]
+    },
+    {
+      "condition": "principal, familiar, definition, occurrence, run, attempt, runtime, policy, or protected-surface binding differs from the trusted dispatch snapshot",
+      "errorCodes": [
+        "AUTHORITY_BINDING_MISMATCH",
+        "AUTHORITY_DEFINITION_MISMATCH",
+        "AUTHORITY_FAMILIAR_MISMATCH",
+        "AUTHORITY_PRINCIPAL_MISMATCH",
+        "AUTHORITY_RECEIPT_BINDING_MISMATCH",
+        "AUTHORITY_RECEIPT_CORRELATION_MISMATCH"
+      ]
+    },
+    {
+      "condition": "nonce, adoption key, decision, approval, or occurrence fence was already consumed or superseded",
+      "errorCodes": [
+        "AUTHORITY_ADOPTION_REPLAYED",
+        "AUTHORITY_APPROVAL_REUSED",
+        "AUTHORITY_FENCE_STALE",
+        "AUTHORITY_NONCE_REPLAYED",
+        "AUTHORITY_REPLAYED"
+      ]
+    },
+    {
+      "condition": "terminal evidence lacks committed dispatch records or those records belong to a different binding, run, attempt, nonce, adoption key, fence, or approval consumption",
+      "errorCodes": [
+        "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH",
+        "AUTHORITY_DISPATCH_CONSUMPTION_MISSING"
+      ]
+    },
+    {
+      "condition": "validity, identity status, approval lifecycle, policy, manifest, runtime descriptor, or capability snapshot is stale",
+      "errorCodes": [
+        "AUTHORITY_APPROVAL_EXPIRED",
+        "AUTHORITY_APPROVAL_EXHAUSTED",
+        "AUTHORITY_APPROVAL_REQUIRED",
+        "AUTHORITY_APPROVAL_REVOKED",
+        "AUTHORITY_APPROVAL_SCOPE_MISMATCH",
+        "AUTHORITY_CAPABILITY_ESCALATION",
+        "AUTHORITY_CHRONOLOGY_INVALID",
+        "AUTHORITY_FAMILIAR_STALE",
+        "AUTHORITY_FAMILIAR_STATUS_INVALID",
+        "AUTHORITY_FAMILIAR_TIME_INVALID",
+        "AUTHORITY_POLICY_STALE",
+        "AUTHORITY_RUNTIME_DOWNGRADE",
+        "AUTHORITY_STALE"
+      ]
+    },
+    {
+      "condition": "digest or authentication evidence cannot be independently verified",
+      "errorCodes": [
+        "AUTHORITY_AUTHENTICATION_INVALID",
+        "AUTHORITY_AUTHENTICATION_UNVERIFIABLE",
+        "AUTHORITY_INTEGRITY_INVALID",
+        "AUTHORITY_IJSON_INVALID"
+      ]
+    },
+    {
+      "condition": "receipt evidence would expose unauthorized sensitive material",
+      "errorCodes": ["AUTHORITY_EVIDENCE_PROJECTION_FORBIDDEN"]
+    }
+  ],
+  "negotiationRules": [
+    "Advertising coven.automations.v1 alone never claims Runtime Authority conformance.",
+    "Generic base-v1 consumers preserve the namespaced value byte-for-byte as opaque JSON and never use it to grant, deny, or infer authority.",
+    "Runtime Authority consumers require this capability, validate the profile schema and semantics, independently verify integrity/authentication, and refuse dispatch when any required evidence is absent or unverifiable.",
+    "degrade_to_proposal and reject decisions never produce an AutomationExecutionBinding because they authorize no runtime dispatch."
+  ]
+}

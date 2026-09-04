@@ -13,10 +13,14 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
-const CONTRACT_PROFILE = 'coven.automations.v1';
-const BUNDLE_SCHEMA_VERSION = 'coven.automations.bundle.v1';
-const SPEC_RELATIVE_DIR = 'spec/coven-automations/v1';
-const ARCHIVE_ROOT = 'coven-automations-v1';
+const BASE_PROFILE_CONFIG = {
+  contractProfile: 'coven.automations.v1',
+  bundleSchemaVersion: 'coven.automations.bundle.v1',
+  specRelativeDir: 'spec/coven-automations/v1',
+  archiveRoot: 'coven-automations-v1',
+  bundlePrefix: 'coven-automations-v1-contract',
+  label: 'Automations protocol'
+};
 
 function compareLexically(left, right) {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -145,21 +149,21 @@ function createTarGz(entries) {
   return gzip;
 }
 
-function assertCleanSource(repoRoot, sourceCommit) {
+function assertCleanSource(repoRoot, sourceCommit, label) {
   if (!/^[0-9a-f]{40}$/.test(sourceCommit)) {
-    throw new Error(`Automations protocol source commit must be a lowercase 40-character Git SHA: ${sourceCommit}`);
+    throw new Error(`${label} source commit must be a lowercase 40-character Git SHA: ${sourceCommit}`);
   }
   const head = runGit(repoRoot, ['rev-parse', 'HEAD']);
   if (head !== sourceCommit) {
-    throw new Error(`Automations protocol source commit ${sourceCommit} does not match HEAD ${head}`);
+    throw new Error(`${label} source commit ${sourceCommit} does not match HEAD ${head}`);
   }
   const status = runGit(repoRoot, ['status', '--porcelain=v1', '--untracked-files=all']);
   if (status !== '') {
-    throw new Error(`Automations protocol input tree is dirty:\n${status}`);
+    throw new Error(`${label} input tree is dirty:\n${status}`);
   }
 }
 
-function trackedContractFiles(repoRoot, sourceCommit) {
+function trackedContractFiles(repoRoot, sourceCommit, specRelativeDir, label) {
   const tree = runGitBytes(repoRoot, [
     'ls-tree',
     '-r',
@@ -167,16 +171,16 @@ function trackedContractFiles(repoRoot, sourceCommit) {
     '--full-tree',
     sourceCommit,
     '--',
-    SPEC_RELATIVE_DIR
+    specRelativeDir
   ]).toString('utf8');
-  const prefix = `${SPEC_RELATIVE_DIR}/`;
+  const prefix = `${specRelativeDir}/`;
   return tree
     .split('\0')
     .filter(Boolean)
     .map((record) => {
       const separator = record.indexOf('\t');
       if (separator === -1) {
-        throw new Error(`Invalid git ls-tree record for Automations protocol: ${record}`);
+        throw new Error(`Invalid git ls-tree record for ${label}: ${record}`);
       }
       const [mode, type, object] = record.slice(0, separator).split(' ');
       const sourcePath = record.slice(separator + 1);
@@ -186,7 +190,7 @@ function trackedContractFiles(repoRoot, sourceCommit) {
         !sourcePath.startsWith(prefix)
       ) {
         throw new Error(
-          `Automations protocol input tree must contain only regular files: ${sourcePath}`
+          `${label} input tree must contain only regular files: ${sourcePath}`
         );
       }
       return {
@@ -197,20 +201,43 @@ function trackedContractFiles(repoRoot, sourceCommit) {
     .sort((left, right) => compareLexically(left.path, right.path));
 }
 
-export function packageAutomationsProtocol({ repoRoot, outputDir, sourceCommit }) {
+function normalizeProfileConfig(config) {
+  const normalized = {
+    contractProfile: String(config.contractProfile),
+    bundleSchemaVersion: String(config.bundleSchemaVersion),
+    specRelativeDir: String(config.specRelativeDir),
+    archiveRoot: String(config.archiveRoot),
+    bundlePrefix: String(config.bundlePrefix),
+    label: String(config.label)
+  };
+  for (const [key, value] of Object.entries(normalized)) {
+    if (!value) {
+      throw new Error(`Contract profile packaging config ${key} is required`);
+    }
+  }
+  return normalized;
+}
+
+export function packageContractProfile({ repoRoot, outputDir, sourceCommit, config }) {
+  const profile = normalizeProfileConfig(config);
   const normalizedRepoRoot = path.resolve(String(repoRoot));
   const normalizedOutputDir = path.resolve(String(outputDir));
   const normalizedSourceCommit = String(sourceCommit).trim();
-  assertCleanSource(normalizedRepoRoot, normalizedSourceCommit);
+  assertCleanSource(normalizedRepoRoot, normalizedSourceCommit, profile.label);
 
-  const specDir = path.join(normalizedRepoRoot, ...SPEC_RELATIVE_DIR.split('/'));
-  const trackedFiles = trackedContractFiles(normalizedRepoRoot, normalizedSourceCommit);
+  const specDir = path.join(normalizedRepoRoot, ...profile.specRelativeDir.split('/'));
+  const trackedFiles = trackedContractFiles(
+    normalizedRepoRoot,
+    normalizedSourceCommit,
+    profile.specRelativeDir,
+    profile.label
+  );
   const filesystemFiles = listContractFiles(specDir);
   if (
     filesystemFiles.join('\n') !== trackedFiles.map((file) => file.path).join('\n')
   ) {
     throw new Error(
-      'Automations protocol input tree does not exactly match tracked source files'
+      `${profile.label} input tree does not exactly match tracked source files`
     );
   }
   const files = trackedFiles.map(({ path: relativePath, object }) => {
@@ -223,15 +250,15 @@ export function packageAutomationsProtocol({ repoRoot, outputDir, sourceCommit }
     };
   });
   if (files.length === 0) {
-    throw new Error(`Automations protocol input tree is empty: ${specDir}`);
+    throw new Error(`${profile.label} input tree is empty: ${specDir}`);
   }
 
   const contractContentSha256 = sha256(
     Buffer.from(files.map((file) => `${file.path}\0${file.sha256}\n`).join(''))
   );
   const manifest = {
-    schemaVersion: BUNDLE_SCHEMA_VERSION,
-    contractProfile: CONTRACT_PROFILE,
+    schemaVersion: profile.bundleSchemaVersion,
+    contractProfile: profile.contractProfile,
     sourceCommit: normalizedSourceCommit,
     contractContentSha256,
     files: files.map(({ path: relativePath, sha256: digest, size }) => ({
@@ -243,7 +270,7 @@ export function packageAutomationsProtocol({ repoRoot, outputDir, sourceCommit }
   const manifestBytes = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`);
   const archiveEntries = [
     ...files.map((file) => ({
-      name: `${ARCHIVE_ROOT}/${file.path}`,
+      name: `${profile.archiveRoot}/${file.path}`,
       data: file.bytes
     })),
     {
@@ -254,7 +281,7 @@ export function packageAutomationsProtocol({ repoRoot, outputDir, sourceCommit }
   const bundleBytes = createTarGz(archiveEntries);
 
   mkdirSync(normalizedOutputDir, { recursive: true });
-  const bundleName = `coven-automations-v1-contract-${normalizedSourceCommit}.tar.gz`;
+  const bundleName = `${profile.bundlePrefix}-${normalizedSourceCommit}.tar.gz`;
   const bundlePath = path.join(normalizedOutputDir, bundleName);
   const manifestPath = path.join(normalizedOutputDir, 'manifest.json');
   writeFileSync(bundlePath, bundleBytes);
@@ -266,6 +293,13 @@ export function packageAutomationsProtocol({ repoRoot, outputDir, sourceCommit }
     bundleSha256: sha256(bundleBytes),
     contractContentSha256
   };
+}
+
+export function packageAutomationsProtocol(options) {
+  return packageContractProfile({
+    ...options,
+    config: BASE_PROFILE_CONFIG
+  });
 }
 
 function tarString(header, offset, length) {
@@ -283,7 +317,7 @@ function tarOctal(header, offset, length) {
   return Number.parseInt(value, 8);
 }
 
-function parseTarGz(bundleBytes) {
+function parseTarGz(bundleBytes, label) {
   const canonicalGzipHeader = Buffer.from([
     0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff
   ]);
@@ -291,13 +325,13 @@ function parseTarGz(bundleBytes) {
     bundleBytes.length < canonicalGzipHeader.length ||
     !bundleBytes.subarray(0, canonicalGzipHeader.length).equals(canonicalGzipHeader)
   ) {
-    throw new Error('Automations protocol bundle gzip header is not normalized');
+    throw new Error(`${label} bundle gzip header is not normalized`);
   }
   let tar;
   try {
     tar = gunzipSync(bundleBytes);
   } catch (error) {
-    throw new Error(`Automations protocol bundle gzip is invalid: ${error?.message ?? String(error)}`);
+    throw new Error(`${label} bundle gzip is invalid: ${error?.message ?? String(error)}`);
   }
   const entries = [];
   let offset = 0;
@@ -308,7 +342,7 @@ function parseTarGz(bundleBytes) {
         offset + 1024 !== tar.length ||
         !tar.subarray(offset, offset + 1024).every((byte) => byte === 0)
       ) {
-        throw new Error('Automations protocol tar has an invalid terminator');
+        throw new Error(`${label} tar has an invalid terminator`);
       }
       return entries;
     }
@@ -317,7 +351,7 @@ function parseTarGz(bundleBytes) {
     checksumHeader.fill(0x20, 148, 156);
     const actualChecksum = checksumHeader.reduce((sum, byte) => sum + byte, 0);
     if (actualChecksum !== expectedChecksum) {
-      throw new Error('Automations protocol tar header checksum mismatch');
+      throw new Error(`${label} tar header checksum mismatch`);
     }
     const basename = tarString(header, 0, 100);
     const prefix = tarString(header, 345, 155);
@@ -336,7 +370,7 @@ function parseTarGz(bundleBytes) {
       mtime !== 0 ||
       !header.equals(createTarHeader(name, size))
     ) {
-      throw new Error(`Automations protocol tar metadata is not normalized for ${name}`);
+      throw new Error(`${label} tar metadata is not normalized for ${name}`);
     }
     if (
       name === '' ||
@@ -344,28 +378,30 @@ function parseTarGz(bundleBytes) {
       name.includes('\\') ||
       name.split('/').some((component) => component === '' || component === '.' || component === '..')
     ) {
-      throw new Error(`Automations protocol tar contains unsafe path ${JSON.stringify(name)}`);
+      throw new Error(`${label} tar contains unsafe path ${JSON.stringify(name)}`);
     }
     const dataStart = offset + 512;
     const dataEnd = dataStart + size;
     if (dataEnd > tar.length) {
-      throw new Error(`Automations protocol tar entry exceeds archive bounds: ${name}`);
+      throw new Error(`${label} tar entry exceeds archive bounds: ${name}`);
     }
     const paddedEnd = dataStart + Math.ceil(size / 512) * 512;
     if (!tar.subarray(dataEnd, paddedEnd).every((byte) => byte === 0)) {
-      throw new Error(`Automations protocol tar padding is not normalized for ${name}`);
+      throw new Error(`${label} tar padding is not normalized for ${name}`);
     }
     entries.push({ name, data: tar.subarray(dataStart, dataEnd) });
     offset = paddedEnd;
   }
-  throw new Error('Automations protocol tar is missing its terminator');
+  throw new Error(`${label} tar is missing its terminator`);
 }
 
-export function verifyAutomationsProtocolBundle({
+export function verifyContractProfileBundle({
   bundlePath,
   expectedSourceCommit,
-  expectedBundleSha256
+  expectedBundleSha256,
+  config
 }) {
+  const profile = normalizeProfileConfig(config);
   const normalizedSourceCommit = String(expectedSourceCommit).trim();
   if (!/^[0-9a-f]{40}$/.test(normalizedSourceCommit)) {
     throw new Error(`Expected source commit must be a lowercase 40-character Git SHA: ${normalizedSourceCommit}`);
@@ -381,7 +417,7 @@ export function verifyAutomationsProtocolBundle({
       `Automations protocol bundle SHA-256 mismatch: expected ${normalizedExpectedBundleSha256}, got ${actualBundleSha256}`
     );
   }
-  const entries = parseTarGz(bundleBytes);
+  const entries = parseTarGz(bundleBytes, profile.label);
   const names = entries.map((entry) => entry.name);
   if (new Set(names).size !== names.length) {
     throw new Error('Automations protocol bundle contains duplicate archive entries');
@@ -401,8 +437,8 @@ export function verifyAutomationsProtocolBundle({
     throw new Error(`Automations protocol manifest is invalid JSON: ${error?.message ?? String(error)}`);
   }
   if (
-    manifest.schemaVersion !== BUNDLE_SCHEMA_VERSION ||
-    manifest.contractProfile !== CONTRACT_PROFILE
+    manifest.schemaVersion !== profile.bundleSchemaVersion ||
+    manifest.contractProfile !== profile.contractProfile
   ) {
     throw new Error('Automations protocol manifest profile is invalid');
   }
@@ -418,7 +454,7 @@ export function verifyAutomationsProtocolBundle({
     entries
       .filter((entry) => entry.name !== 'manifest.json')
       .map((entry) => {
-        const prefix = `${ARCHIVE_ROOT}/`;
+        const prefix = `${profile.archiveRoot}/`;
         if (!entry.name.startsWith(prefix)) {
           throw new Error(`Unexpected Automations protocol archive entry: ${entry.name}`);
         }
@@ -465,6 +501,13 @@ export function verifyAutomationsProtocolBundle({
     contractContentSha256: actualContentSha256,
     fileCount: manifest.files.length
   };
+}
+
+export function verifyAutomationsProtocolBundle(options) {
+  return verifyContractProfileBundle({
+    ...options,
+    config: BASE_PROFILE_CONFIG
+  });
 }
 
 function optionValue(args, name) {
