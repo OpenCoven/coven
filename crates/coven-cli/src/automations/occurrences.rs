@@ -499,23 +499,27 @@ fn iso(instant: DateTime<Utc>) -> String {
 /// Reads the ACTIVE definitions from the store as validated records.
 fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<String>)> {
     let records = super::store::list_definitions(conn)?;
+    let quarantined: BTreeSet<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT automation_id
+                 FROM automation_retry_state
+                 WHERE quarantined_at IS NOT NULL",
+            )
+            .context("failed to prepare retry quarantine list")?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .context("failed to list retry quarantines")?;
+        rows.collect::<std::result::Result<_, _>>()
+            .context("failed to read retry quarantine")?
+    };
     let mut definitions = Vec::new();
     let mut failures = Vec::new();
     for record in records {
         if record.status != "ACTIVE" {
             continue;
         }
-        let quarantined: bool = conn
-            .query_row(
-                "SELECT EXISTS(
-                    SELECT 1 FROM automation_retry_state
-                    WHERE automation_id = ?1 AND quarantined_at IS NOT NULL
-                )",
-                [&record.id],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("failed to inspect retry quarantine for `{}`", record.id))?;
-        if quarantined {
+        if quarantined.contains(&record.id) {
             continue;
         }
         let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {

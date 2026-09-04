@@ -1057,10 +1057,20 @@ fn automation_runs_payload(
 ) -> Result<Value, String> {
     match crate::automations::runs::list_runs(conn, id, limit) {
         Ok(records) => {
+            let mut attempts_by_run = std::collections::HashMap::new();
+            for attempt in crate::automations::runs::list_attempts_for_automation(conn, id, limit)
+                .map_err(|error| format!("{error:#}"))?
+            {
+                attempts_by_run
+                    .entry(attempt.run_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(attempt);
+            }
             let mut runs = Vec::with_capacity(records.len());
             for record in &records {
-                let attempts = crate::automations::runs::list_attempts(conn, &record.id)
-                    .map_err(|error| format!("{error:#}"))?
+                let attempts = attempts_by_run
+                    .remove(&record.id)
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|attempt| {
                         json!({

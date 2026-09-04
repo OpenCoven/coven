@@ -418,6 +418,7 @@ pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bo
     .context("failed to inspect automation retry quarantine")
 }
 
+#[cfg(test)]
 pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecord>> {
     let mut statement = conn
         .prepare(
@@ -432,30 +433,63 @@ pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecor
         )
         .context("failed to prepare automation attempt list")?;
     let rows = statement
-        .query_map([run_id], |row| {
-            Ok(AttemptRecord {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                occurrence_id: row.get(2)?,
-                attempt_number: row.get(3)?,
-                adoption_key: row.get(4)?,
-                occurrence_fence_generation: row.get(5)?,
-                dispatch_generation: row.get(6)?,
-                state: row.get(7)?,
-                failure_class: row.get(8)?,
-                prior_attempt_number: row.get(9)?,
-                prior_disposition: row.get(10)?,
-                retry_classification: row.get(11)?,
-                not_before: row.get(12)?,
-                session_id: row.get(13)?,
-                state_reason: row.get(14)?,
-                opened_at: row.get(15)?,
-                settled_at: row.get(16)?,
-            })
-        })
+        .query_map([run_id], attempt_record_from_row)
         .context("failed to list automation attempts")?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .context("failed to read automation attempt")
+}
+
+pub fn list_attempts_for_automation(
+    conn: &Connection,
+    automation_id: &str,
+    run_limit: i64,
+) -> Result<Vec<AttemptRecord>> {
+    let bounded = run_limit.clamp(1, 100);
+    let mut statement = conn
+        .prepare(
+            "SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, not_before, session_id, state_reason,
+                    opened_at, settled_at
+             FROM automation_attempts
+             WHERE run_id IN (
+                 SELECT id
+                 FROM automation_runs
+                 WHERE automation_id = ?1
+                 ORDER BY started_at DESC
+                 LIMIT ?2
+             )
+             ORDER BY run_id, attempt_number ASC",
+        )
+        .context("failed to prepare automation attempt batch list")?;
+    let rows = statement
+        .query_map(params![automation_id, bounded], attempt_record_from_row)
+        .context("failed to list automation attempt batch")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation attempt batch")
+}
+
+fn attempt_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRecord> {
+    Ok(AttemptRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        occurrence_id: row.get(2)?,
+        attempt_number: row.get(3)?,
+        adoption_key: row.get(4)?,
+        occurrence_fence_generation: row.get(5)?,
+        dispatch_generation: row.get(6)?,
+        state: row.get(7)?,
+        failure_class: row.get(8)?,
+        prior_attempt_number: row.get(9)?,
+        prior_disposition: row.get(10)?,
+        retry_classification: row.get(11)?,
+        not_before: row.get(12)?,
+        session_id: row.get(13)?,
+        state_reason: row.get(14)?,
+        opened_at: row.get(15)?,
+        settled_at: row.get(16)?,
+    })
 }
 
 pub fn record_retry_exhaustion(
