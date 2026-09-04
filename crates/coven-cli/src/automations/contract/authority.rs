@@ -410,6 +410,10 @@ impl AuthorityCapabilitySet {
     fn is_subset_of(&self, other: &Self) -> bool {
         self.0.iter().all(|capability| other.0.contains(capability))
     }
+
+    fn has_same_members(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.is_subset_of(other)
+    }
 }
 
 impl<'de> Deserialize<'de> for AuthorityCapabilitySet {
@@ -1154,14 +1158,26 @@ impl AutomationAuthorityExtension {
             || receipt.familiar.valid_time != binding.familiar.valid_time
             || receipt.familiar.revocation != binding.familiar.revocation
             || receipt.familiar.retirement != binding.familiar.retirement
-            || receipt.capabilities.requested != binding.capabilities.requested
-            || receipt.capabilities.granted != binding.capabilities.granted
+            || !receipt
+                .capabilities
+                .requested
+                .has_same_members(&binding.capabilities.requested)
+            || !receipt
+                .capabilities
+                .granted
+                .has_same_members(&binding.capabilities.granted)
             || receipt.capabilities.denied != binding.capabilities.denied
-            || receipt.capabilities.degraded != binding.capabilities.degraded
+            || !receipt
+                .capabilities
+                .degraded
+                .has_same_members(&binding.capabilities.degraded)
             || receipt.runtime.runtime_id != binding.runtime.runtime_id
             || receipt.runtime.descriptor_version != binding.runtime.descriptor_version
             || receipt.runtime.descriptor_digest != binding.runtime.descriptor_digest
-            || receipt.runtime.capabilities != binding.runtime.capabilities
+            || !receipt
+                .runtime
+                .capabilities
+                .has_same_members(&binding.runtime.capabilities)
         {
             return Err(AuthorityProfileError::new(
                 AuthorityProfileErrorCode::ReceiptBindingMismatch,
@@ -1188,7 +1204,17 @@ impl AutomationExecutionBinding {
             &self.runtime.capabilities,
         )?;
         validate_outcome_approval(self.authorization.outcome, &self.approval)?;
-        validate_approval(&self.approval)?;
+        validate_approval(
+            &self.approval,
+            ApprovalCorrelation {
+                request_digest: &self.authorization.request_digest,
+                decision_digest: &self.authorization.decision_digest,
+                occurrence_id: &self.base.occurrence_id,
+                run_id: &self.base.run_id,
+                attempt_number: self.base.attempt_number,
+                fence_generation: self.base.occurrence_fence_generation,
+            },
+        )?;
         validate_integrity(self, &self.integrity, &self.authentication, BINDING_DOMAIN)
     }
 }
@@ -1215,7 +1241,17 @@ impl AutomationReceiptAuthorityEvidence {
                 "receipt exercises a capability that was not granted",
             ));
         }
-        validate_approval(&self.approval)?;
+        validate_approval(
+            &self.approval,
+            ApprovalCorrelation {
+                request_digest: &self.authorization.request_digest,
+                decision_digest: &self.authorization.decision_digest,
+                occurrence_id: &self.occurrence_id,
+                run_id: &self.run_id,
+                attempt_number: self.attempt_number,
+                fence_generation: self.occurrence_fence_generation,
+            },
+        )?;
         validate_integrity(self, &self.integrity, &self.authentication, RECEIPT_DOMAIN)
     }
 }
@@ -1272,6 +1308,7 @@ fn validate_authorization_chronology(
 
 trait FamiliarTimes {
     fn verified_at(&self) -> &AuthorityTimestamp;
+    fn freshness_bound_seconds(&self) -> u16;
     fn valid_time(&self) -> &FamiliarValidTime;
     fn revocation(&self) -> &FamiliarRevocation;
     fn retirement(&self) -> &FamiliarRetirement;
@@ -1280,6 +1317,9 @@ trait FamiliarTimes {
 impl FamiliarTimes for AuthorityFamiliarBinding {
     fn verified_at(&self) -> &AuthorityTimestamp {
         &self.verified_at
+    }
+    fn freshness_bound_seconds(&self) -> u16 {
+        self.freshness_bound_seconds
     }
     fn valid_time(&self) -> &FamiliarValidTime {
         &self.valid_time
@@ -1295,6 +1335,9 @@ impl FamiliarTimes for AuthorityFamiliarBinding {
 impl FamiliarTimes for AuthorityReceiptFamiliar {
     fn verified_at(&self) -> &AuthorityTimestamp {
         &self.verified_at
+    }
+    fn freshness_bound_seconds(&self) -> u16 {
+        self.freshness_bound_seconds
     }
     fn valid_time(&self) -> &FamiliarValidTime {
         &self.valid_time
@@ -1329,16 +1372,83 @@ fn validate_familiar_times(
             "familiar verification cannot follow the decision",
         ));
     }
+    if decision.saturating_sub(verified) > i64::from(familiar.freshness_bound_seconds()) * 1_000 {
+        return Err(AuthorityProfileError::new(
+            AuthorityProfileErrorCode::FamiliarStale,
+            "familiar verification exceeds its freshness bound at the decision",
+        ));
+    }
     Ok(())
 }
 
-fn validate_approval(approval: &AuthorityApprovalBinding) -> Result<(), AuthorityProfileError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ApprovalCorrelation<'a> {
+    request_digest: &'a DigestValue,
+    decision_digest: &'a DigestValue,
+    occurrence_id: &'a OccurrenceId,
+    run_id: &'a RunId,
+    attempt_number: PositiveInteger,
+    fence_generation: PositiveInteger,
+}
+
+fn validate_approval_consumption(
+    consumption: ApprovalCorrelation<'_>,
+    expected: ApprovalCorrelation<'_>,
+) -> Result<(), AuthorityProfileError> {
+    if consumption != expected {
+        return Err(AuthorityProfileError::new(
+            AuthorityProfileErrorCode::ApprovalRequired,
+            "approval consumption does not match the authorized dispatch",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_approval(
+    approval: &AuthorityApprovalBinding,
+    correlation: ApprovalCorrelation<'_>,
+) -> Result<(), AuthorityProfileError> {
     match approval {
+        AuthorityApprovalBinding::HumanPerRun { consumption, .. }
+        | AuthorityApprovalBinding::ProtectedOwnerPerRun { consumption, .. } => {
+            validate_approval_consumption(
+                ApprovalCorrelation {
+                    request_digest: &consumption.request_digest,
+                    decision_digest: &consumption.decision_digest,
+                    occurrence_id: &consumption.occurrence_id,
+                    run_id: &consumption.run_id,
+                    attempt_number: consumption.attempt_number,
+                    fence_generation: consumption.fence_generation,
+                },
+                correlation,
+            )?;
+        }
         AuthorityApprovalBinding::BoundedRecurring {
             use_kind,
             consumption,
             ..
         } => {
+            if !correlation
+                .occurrence_id
+                .as_str()
+                .starts_with(use_kind.occurrence_prefix.as_str())
+            {
+                return Err(AuthorityProfileError::new(
+                    AuthorityProfileErrorCode::ApprovalScopeMismatch,
+                    "bounded recurring approval does not cover the occurrence",
+                ));
+            }
+            validate_approval_consumption(
+                ApprovalCorrelation {
+                    request_digest: &consumption.request_digest,
+                    decision_digest: &consumption.decision_digest,
+                    occurrence_id: &consumption.occurrence_id,
+                    run_id: &consumption.run_id,
+                    attempt_number: consumption.attempt_number,
+                    fence_generation: consumption.fence_generation,
+                },
+                correlation,
+            )?;
             if use_kind.max_uses == 0
                 || use_kind.max_uses > 366
                 || use_kind.prior_uses > 365
@@ -1352,9 +1462,7 @@ fn validate_approval(approval: &AuthorityApprovalBinding) -> Result<(), Authorit
                 ));
             }
         }
-        AuthorityApprovalBinding::NotRequired { .. }
-        | AuthorityApprovalBinding::HumanPerRun { .. }
-        | AuthorityApprovalBinding::ProtectedOwnerPerRun { .. } => {}
+        AuthorityApprovalBinding::NotRequired { .. } => {}
     }
     Ok(())
 }
@@ -1402,4 +1510,239 @@ fn timestamp_millis(value: &AuthorityTimestamp) -> Result<i64, AuthorityProfileE
 
 fn schema_error(message: impl Into<String>) -> AuthorityProfileError {
     AuthorityProfileError::new(AuthorityProfileErrorCode::SchemaInvalid, message)
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    const VECTORS: &str =
+        include_str!("../../../../../spec/coven-automations/authority/v1/test-vectors.json");
+
+    fn fixture(name: &str) -> Value {
+        serde_json::from_str::<Value>(VECTORS)
+            .expect("authority vectors")
+            .pointer(&format!("/fixtures/{name}"))
+            .expect("authority fixture")
+            .clone()
+    }
+
+    fn resign(value: &mut Value, domain: &[u8]) -> String {
+        let mut body = value.clone();
+        let object = body.as_object_mut().expect("authority object");
+        object.remove("integrity");
+        object.remove("authentication");
+        let canonical = canonicalize(&body).expect("canonical authority value");
+        let mut preimage = Vec::with_capacity(domain.len() + canonical.len() + 1);
+        preimage.extend_from_slice(domain);
+        preimage.push(0);
+        preimage.extend_from_slice(&canonical);
+        let digest = sha256_hex(&preimage);
+        value["integrity"]["value"] = json!(digest);
+        value["authentication"]["signedDigest"] = json!(digest);
+        digest
+    }
+
+    fn extension(binding: Value, receipt: Value) -> AutomationAuthorityExtension {
+        serde_json::from_value(json!({
+            "profile": AUTHORITY_PROFILE,
+            "kind": "AutomationAuthorityExtension",
+            "executionBinding": binding,
+            "receiptEvidence": receipt
+        }))
+        .expect("authority extension")
+    }
+
+    #[test]
+    fn receipt_binding_capability_sets_correlate_without_array_order() {
+        for (label, binding_path, receipt_path) in [
+            (
+                "requested",
+                "/capabilities/requested",
+                "/capabilities/requested",
+            ),
+            ("granted", "/capabilities/granted", "/capabilities/granted"),
+            (
+                "degraded",
+                "/capabilities/degraded",
+                "/capabilities/degraded",
+            ),
+            ("runtime", "/runtime/capabilities", "/runtime/capabilities"),
+        ] {
+            let mut binding = fixture("binding");
+            let mut receipt = fixture("receiptEvidence");
+            *binding
+                .pointer_mut(binding_path)
+                .expect("binding capability set") = json!(["analysis.read", "artifact.write"]);
+            *receipt
+                .pointer_mut(receipt_path)
+                .expect("receipt capability set") = json!(["artifact.write", "analysis.read"]);
+            let binding_digest = resign(&mut binding, BINDING_DOMAIN);
+            receipt["bindingDigest"]["value"] = json!(binding_digest);
+            resign(&mut receipt, RECEIPT_DOMAIN);
+
+            extension(binding, receipt)
+                .validate_structure(AuthorityValidationPhase::Terminal)
+                .unwrap_or_else(|error| {
+                    panic!("{label} capability set order must not affect correlation: {error}")
+                });
+        }
+    }
+
+    #[test]
+    fn binding_rejects_familiar_age_beyond_signed_bound() {
+        let mut binding = fixture("binding");
+        binding["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:58.999Z");
+        resign(&mut binding, BINDING_DOMAIN);
+        let binding: AutomationExecutionBinding =
+            serde_json::from_value(binding).expect("execution binding");
+
+        let error = binding
+            .validate_structure()
+            .expect_err("stale familiar verification must fail closed");
+        assert_eq!(error.code(), AuthorityProfileErrorCode::FamiliarStale);
+    }
+
+    #[test]
+    fn receipt_rejects_familiar_age_beyond_signed_bound() {
+        let mut receipt = fixture("receiptEvidence");
+        receipt["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:58.999Z");
+        resign(&mut receipt, RECEIPT_DOMAIN);
+        let receipt: AutomationReceiptAuthorityEvidence =
+            serde_json::from_value(receipt).expect("receipt authority evidence");
+
+        let error = receipt
+            .validate_structure()
+            .expect_err("stale receipt familiar verification must fail closed");
+        assert_eq!(error.code(), AuthorityProfileErrorCode::FamiliarStale);
+    }
+
+    #[test]
+    fn binding_accepts_familiar_age_equal_to_signed_bound() {
+        let mut binding = fixture("binding");
+        binding["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:59.000Z");
+        resign(&mut binding, BINDING_DOMAIN);
+        let binding: AutomationExecutionBinding =
+            serde_json::from_value(binding).expect("execution binding");
+
+        binding
+            .validate_structure()
+            .expect("familiar age equal to the bound remains valid");
+    }
+
+    #[test]
+    fn binding_rejects_approval_consumption_anchor_mismatches() {
+        for (path, replacement) in [
+            (
+                "/approval/consumption/requestDigest/value",
+                json!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+            ),
+            (
+                "/approval/consumption/decisionDigest/value",
+                json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            ),
+            (
+                "/approval/consumption/occurrenceId",
+                json!("occurrence.other-20260903"),
+            ),
+            ("/approval/consumption/runId", json!("run.other-1")),
+            ("/approval/consumption/attemptNumber", json!(2)),
+            ("/approval/consumption/fenceGeneration", json!(8)),
+        ] {
+            let mut binding = fixture("binding");
+            *binding
+                .pointer_mut(path)
+                .expect("approval consumption field") = replacement;
+            resign(&mut binding, BINDING_DOMAIN);
+            let binding: AutomationExecutionBinding =
+                serde_json::from_value(binding).expect("execution binding");
+
+            let error = match binding.validate_structure() {
+                Ok(()) => panic!("{path} mismatch must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
+                AuthorityProfileErrorCode::ApprovalRequired,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_rejects_approval_consumption_anchor_mismatches() {
+        for (path, replacement) in [
+            (
+                "/approval/consumption/requestDigest/value",
+                json!("dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"),
+            ),
+            (
+                "/approval/consumption/decisionDigest/value",
+                json!("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+            ),
+            (
+                "/approval/consumption/occurrenceId",
+                json!("occurrence.other-20260903"),
+            ),
+            ("/approval/consumption/runId", json!("run.other-1")),
+            ("/approval/consumption/attemptNumber", json!(2)),
+            ("/approval/consumption/fenceGeneration", json!(8)),
+        ] {
+            let mut receipt = fixture("receiptEvidence");
+            *receipt
+                .pointer_mut(path)
+                .expect("approval consumption field") = replacement;
+            resign(&mut receipt, RECEIPT_DOMAIN);
+            let receipt: AutomationReceiptAuthorityEvidence =
+                serde_json::from_value(receipt).expect("receipt authority evidence");
+
+            let error = match receipt.validate_structure() {
+                Ok(()) => panic!("{path} mismatch must fail closed"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code(),
+                AuthorityProfileErrorCode::ApprovalRequired,
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn binding_rejects_recurring_occurrence_outside_prefix() {
+        let mut binding = fixture("binding");
+        binding["base"]["occurrenceId"] = json!("occurrence.other-20260903");
+        binding["approval"]["consumption"]["occurrenceId"] = json!("occurrence.other-20260903");
+        resign(&mut binding, BINDING_DOMAIN);
+        let binding: AutomationExecutionBinding =
+            serde_json::from_value(binding).expect("execution binding");
+
+        let error = binding
+            .validate_structure()
+            .expect_err("recurring occurrence outside its prefix must fail closed");
+        assert_eq!(
+            error.code(),
+            AuthorityProfileErrorCode::ApprovalScopeMismatch
+        );
+    }
+
+    #[test]
+    fn receipt_rejects_recurring_occurrence_outside_prefix() {
+        let mut receipt = fixture("receiptEvidence");
+        receipt["occurrenceId"] = json!("occurrence.other-20260903");
+        receipt["approval"]["consumption"]["occurrenceId"] = json!("occurrence.other-20260903");
+        resign(&mut receipt, RECEIPT_DOMAIN);
+        let receipt: AutomationReceiptAuthorityEvidence =
+            serde_json::from_value(receipt).expect("receipt authority evidence");
+
+        let error = receipt
+            .validate_structure()
+            .expect_err("receipt recurring occurrence outside its prefix must fail closed");
+        assert_eq!(
+            error.code(),
+            AuthorityProfileErrorCode::ApprovalScopeMismatch
+        );
+    }
 }

@@ -26,6 +26,13 @@ mismatched, or unverifiable.
 Ed25519 public-key DER and 64-byte signatures use lowercase hexadecimal in
 the conformance inputs and contract objects.
 
+Every field that references `capabilitySet` is a mathematical set serialized
+as a unique JSON array. An implementation must preserve each signed object's
+array order when computing or verifying its JCS bytes, but compares capability
+members without regard to order when correlating trusted state, bindings,
+receipt evidence, and runtime descriptors. `denied` remains an ordered array
+of capability/reason records and exact-matches as serialized.
+
 The base-v1 `AutomationReceipt` schema intentionally remains byte-for-byte
 unchanged and has no `extensions` member. Therefore receipt authority evidence
 is not injected into that frozen object. It is a companion sidecar inside the
@@ -63,9 +70,11 @@ binds the upstream Threads recurring grant identifier, `maxUses`,
 occurrence identifier starts with that prefix, `priorUses < maxUses`, and the
 current consumption has `usageNumber == priorUses + 1`. The authenticated
 consumption commits the request and decision digests, occurrence and run
-identifiers, attempt number, and fence generation; replaying that exact tuple
-is refused. Receipt evidence repeats the exact approval and consumption
-snapshot so it can be correlated to the dispatched binding.
+identifiers, attempt number, and fence generation; those values must
+exact-match the authorization and base dispatch anchors in both the binding
+and receipt evidence. Replaying that exact tuple is refused. Receipt evidence
+repeats the exact approval and consumption snapshot so it can be correlated to
+the dispatched binding.
 
 Dispatch chronology is
 `issuedAt <= validFrom <= decisionTimestamp <= dispatchNow < validUntil`.
@@ -119,10 +128,12 @@ Authority consumers must advertise the base profile, companion profile, and
 The Rust projection lives in
 `crates/coven-cli/src/automations/contract/authority.rs`. Its
 `validate_authority_profile` boundary performs closed typed projection,
-chronology, digest, receipt-correlation, and capability negotiation checks,
-then requires an `AuthorityEvidenceVerifier`. That adapter is the deliberately
-narrow future dispatch seam for trusted Familiar, Threads, replay, approval,
-runtime, and signature evidence. A missing adapter returns
+chronology, familiar freshness at the signed decision, approval/base
+correlation, digest, receipt-correlation, and capability negotiation checks,
+then requires an `AuthorityEvidenceVerifier`. The deployment adapter also
+checks familiar freshness at dispatch and is the deliberately narrow future
+dispatch seam for trusted Familiar, Threads, replay, approval, runtime, and
+signature evidence. A missing adapter returns
 `AUTHORITY_ADAPTER_MISSING`; unavailable trusted data returns a typed refusal
 instead of falling back to the base run's string references.
 

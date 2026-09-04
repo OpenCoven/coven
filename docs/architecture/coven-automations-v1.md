@@ -73,6 +73,13 @@ the current dispatch consumption tuple. It may be reused only while
 only with `usageNumber == priorUses + 1`; replay of the same request, decision,
 occurrence, run, attempt, and fence tuple fails closed.
 
+Capability-set fields are mathematical sets serialized as unique arrays.
+Their per-object array order remains authenticated by JCS, while semantic
+correlation between trusted state, the binding, receipt evidence, and runtime
+descriptors is order-insensitive. Approval consumption request/decision
+digests and occurrence/run/attempt/fence anchors must exact-match the signed
+authorization and base dispatch.
+
 Authority chronology is
 `issuedAt <= validFrom <= decisionTimestamp <= dispatchNow < validUntil`.
 `validUntil` is exclusive. Familiar verification must be at or before both the

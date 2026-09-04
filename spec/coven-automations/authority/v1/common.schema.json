@@ -98,6 +98,7 @@
       "pattern": "^[a-z][a-z0-9.-]*$"
     },
     "capabilitySet": {
+      "description": "A mathematical capability set serialized as a unique array. Array order remains part of each object's authenticated JCS bytes, but correlation compares members without regard to order.",
       "type": "array",
       "maxItems": 128,
       "uniqueItems": true,
