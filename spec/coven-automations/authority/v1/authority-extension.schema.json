@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/authority/v1/authority-extension.schema.json",
+  "title": "Coven Automations authority extension envelope v1",
+  "description": "The value stored at AutomationRun.extensions['coven.automations.authority.v1']. The immutable execution binding is present before dispatch. Once a terminal base AutomationReceipt exists, its minimized authority evidence is attached here as a receipt-correlated sidecar because the frozen base receipt schema has no extensions member.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "kind",
+    "executionBinding",
+    "receiptEvidence"
+  ],
+  "properties": {
+    "profile": { "const": "coven.automations.authority.v1" },
+    "kind": { "const": "AutomationAuthorityExtension" },
+    "executionBinding": {
+      "$ref": "automation-execution-binding.schema.json"
+    },
+    "receiptEvidence": {
+      "oneOf": [
+        { "type": "null" },
+        { "$ref": "automation-receipt-authority-evidence.schema.json" }
+      ]
+    }
+  }
+}

@@ -149,7 +149,8 @@ async function main() {
         outputDir: requiredOption(options, 'output-dir'),
         sourceDateEpoch: requiredOption(options, 'source-date-epoch'),
         sourceCommit: options.get('source-commit'),
-        protocolBundlePath: options.get('protocol-bundle')
+        protocolBundlePath: options.get('protocol-bundle'),
+        authorityProfileBundlePath: options.get('authority-profile-bundle')
       });
       return;
     }
@@ -204,6 +205,14 @@ export function automationsProtocolBundleName(sourceCommit) {
   return `coven-automations-v1-contract-${normalized}.tar.gz`;
 }
 
+export function automationsAuthorityProfileBundleName(sourceCommit) {
+  const normalized = String(sourceCommit).trim();
+  if (!/^[0-9a-f]{40}$/.test(normalized)) {
+    throw new Error(`Automations authority profile source commit must be a lowercase 40-character Git SHA: ${normalized}`);
+  }
+  return `coven-automations-authority-v1-contract-${normalized}.tar.gz`;
+}
+
 function releaseIncludesAutomationsProtocol(releaseTag) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   const version = npmVersion.split('.').map(Number);
@@ -223,7 +232,10 @@ export function canonicalReleaseAssetNames(releaseTag, sourceCommit) {
   return [
     ...Object.values(PACKAGE_DEFINITIONS).map((definition) => definition.assetName(npmVersion)),
     ...(releaseIncludesAutomationsProtocol(releaseTag)
-      ? [automationsProtocolBundleName(sourceCommit)]
+      ? [
+          automationsProtocolBundleName(sourceCommit),
+          automationsAuthorityProfileBundleName(sourceCommit)
+        ]
       : []),
     CHECKSUMS_NAME
   ];
@@ -921,7 +933,8 @@ export function packageGitHubRelease({
   outputDir,
   sourceDateEpoch,
   sourceCommit,
-  protocolBundlePath
+  protocolBundlePath,
+  authorityProfileBundlePath
 }) {
   const { npmVersion } = parseReleaseTag(releaseTag);
   const normalizedArtifactsDir = path.resolve(String(artifactsDir));
@@ -949,9 +962,9 @@ export function packageGitHubRelease({
   writeFileSync(path.join(normalizedOutputDir, CHECKSUMS_NAME), checksumText);
   const protocolAssetNames = [];
   if (releaseIncludesAutomationsProtocol(releaseTag)) {
-    if (!sourceCommit || !protocolBundlePath) {
+    if (!sourceCommit || !protocolBundlePath || !authorityProfileBundlePath) {
       throw new Error(
-        'GitHub releases v0.4.4 and later require sourceCommit and protocolBundlePath for the Automations protocol asset.'
+        'GitHub releases v0.4.4 and later require sourceCommit, protocolBundlePath, and authorityProfileBundlePath for the Automations contract assets.'
       );
     }
     const protocolBundleName = automationsProtocolBundleName(sourceCommit);
@@ -970,6 +983,25 @@ export function packageGitHubRelease({
       path.join(normalizedOutputDir, protocolBundleName)
     );
     protocolAssetNames.push(protocolBundleName);
+
+    const authorityProfileBundleName = automationsAuthorityProfileBundleName(sourceCommit);
+    const normalizedAuthorityProfileBundlePath = path.resolve(
+      String(authorityProfileBundlePath)
+    );
+    if (
+      path.basename(normalizedAuthorityProfileBundlePath) !== authorityProfileBundleName ||
+      !existsSync(normalizedAuthorityProfileBundlePath) ||
+      !statSync(normalizedAuthorityProfileBundlePath).isFile()
+    ) {
+      throw new Error(
+        `Refusing GitHub release: authority profile bundle must be a regular file named ${authorityProfileBundleName}.`
+      );
+    }
+    copyFileSync(
+      normalizedAuthorityProfileBundlePath,
+      path.join(normalizedOutputDir, authorityProfileBundleName)
+    );
+    protocolAssetNames.push(authorityProfileBundleName);
   }
 
   return {

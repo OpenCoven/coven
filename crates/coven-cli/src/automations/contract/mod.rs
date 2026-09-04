@@ -3,6 +3,10 @@
 // The protocol surface lands before the command router that consumes it.
 #[allow(dead_code)]
 pub mod canonical_json;
+// The separately advertised authority companion remains a projection and
+// validation seam until dispatch adapters land.
+#[allow(dead_code)]
+pub mod authority;
 // The typed envelope is part of the public contract before routing lands.
 #[allow(dead_code)]
 pub mod error;
@@ -15,6 +19,12 @@ pub mod types;
 // This binary crate has no external consumer yet; these define the intended
 // contract surface for the later routing and SDK integration slices.
 #[allow(unused_imports)]
+pub use authority::{
+    validate_authority_profile, AuthorityConsumerClass, AuthorityEvidenceVerifier,
+    AuthorityProfileDisposition, AuthorityProfileError, AuthorityProfileErrorCode,
+    AuthorityValidationPhase, AutomationAuthorityExtension,
+};
+#[allow(unused_imports)]
 pub use canonical_json::{canonicalize, canonicalize_without_integrity, sha256_digest, sha256_hex};
 #[allow(unused_imports)]
 pub use error::{ErrorCode, ErrorEnvelope};
@@ -23,6 +33,9 @@ pub use types::{
     AutomationAttempt, AutomationDefinition, AutomationOccurrence, AutomationReceipt,
     AutomationRun, CommandRequest, CommandResponse, EventEnvelope,
 };
+
+#[cfg(test)]
+mod authority_tests;
 
 #[cfg(test)]
 mod tests {

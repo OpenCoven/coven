@@ -1,0 +1,59 @@
+{
+  "protocol": "Coven Automations Runtime Authority",
+  "contractProfile": "coven.automations.authority.v1",
+  "baseProfile": "coven.automations.v1",
+  "objects": [
+    "AutomationAuthorityExtension",
+    "AutomationExecutionBinding",
+    "AutomationReceiptAuthorityEvidence"
+  ],
+  "schemas": [
+    "common.schema.json",
+    "authority-extension.schema.json",
+    "automation-execution-binding.schema.json",
+    "automation-receipt-authority-evidence.schema.json"
+  ],
+  "capabilities": "capabilities.json",
+  "compatibilityMatrix": "compatibility-matrix.json",
+  "goldenVectors": "test-vectors.json",
+  "typescriptProjection": "coven.automations.authority.v1.d.ts",
+  "upstreamArtifacts": "upstream-artifacts.json",
+  "requiredSuites": [
+    "draft-2020-12-schema-validation",
+    "explicit-profile-and-capability-negotiation",
+    "generic-unknown-extension-opaque-preservation",
+    "strict-unknown-field-refusal",
+    "principal-and-familiar-exact-binding",
+    "identity-status-and-freshness",
+    "familiar-freshness-policy-and-inclusive-boundary",
+    "authorization-and-dispatch-chronology",
+    "nonce-adoption-decision-and-approval-replay",
+    "terminal-dispatch-consumption-presence-and-exact-ownership",
+    "approval-expiry-revocation-and-consumption",
+    "bounded-recurring-approval-scope-usage-and-exhaustion",
+    "terminal-receipt-evidence-required",
+    "authenticated-base-receipt-digest-correlation",
+    "receipt-to-binding-exact-match",
+    "capability-runtime-policy-and-fence-exact-match",
+    "integrity-and-authentication-verification",
+    "recursive-ijson-unpaired-surrogate-refusal",
+    "privacy-minimized-receipt-evidence",
+    "trusted-adapter-data-required",
+    "deterministic-packed-artifact-verification",
+    "frozen-base-v1-byte-stability"
+  ],
+  "normativeInputs": [
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a"
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b"
+    }
+  ],
+  "releaseState": "proposed",
+  "productionReady": false,
+  "scope": "contract-and-artifact-only",
+  "runtimeDispatchIntegration": false
+}

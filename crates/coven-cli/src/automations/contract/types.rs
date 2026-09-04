@@ -511,6 +511,11 @@ impl ExtensionBag {
             Err(StringConstraintError("ExtensionBag"))
         }
     }
+
+    #[must_use]
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.0.get(key)
+    }
 }
 
 impl Serialize for ExtensionBag {

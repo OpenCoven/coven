@@ -16,7 +16,9 @@ import { fileURLToPath } from 'node:url';
 import { gunzipSync, gzipSync } from 'node:zlib';
 
 import {
+  packageContractProfile,
   packageAutomationsProtocol,
+  reproduceHistoricalAutomationsProtocolArtifact,
   verifyAutomationsProtocolBundle
 } from './package-automations-protocol.mjs';
 
@@ -47,12 +49,35 @@ function createFixtureRepository(scratchDir) {
   runGit(repoRoot, ['init']);
   runGit(repoRoot, ['config', 'user.name', 'Protocol Test']);
   runGit(repoRoot, ['config', 'user.email', 'protocol@example.invalid']);
+  runGit(repoRoot, ['config', 'commit.gpgSign', 'false']);
   runGit(repoRoot, ['add', '.']);
   runGit(repoRoot, ['commit', '-m', 'test: seed protocol']);
   return {
     repoRoot,
     specDir,
     sourceCommit: runGit(repoRoot, ['rev-parse', 'HEAD'])
+  };
+}
+
+function createStableFixtureRepository(scratchDir) {
+  const fixture = createFixtureRepository(scratchDir);
+  const result = spawnSync('git', ['commit', '--amend', '--no-edit', '--reset-author'], {
+    cwd: fixture.repoRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_DATE: '2026-01-01T00:00:00Z',
+      GIT_COMMITTER_DATE: '2026-01-01T00:00:00Z'
+    }
+  });
+  assert.equal(
+    result.status,
+    0,
+    `stable fixture commit failed\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}`
+  );
+  return {
+    ...fixture,
+    sourceCommit: runGit(fixture.repoRoot, ['rev-parse', 'HEAD'])
   };
 }
 
@@ -187,6 +212,71 @@ test('keeps the content digest stable while binding bundle bytes to the source c
     const secondManifest = JSON.parse(readFileSync(second.manifestPath, 'utf8'));
     assert.equal(firstManifest.contractContentSha256, secondManifest.contractContentSha256);
     assert.notEqual(first.bundleSha256, second.bundleSha256);
+  });
+});
+
+test('keeps the frozen base-v1 bundle bytes stable while packaging helpers evolve', () => {
+  withScratchDir('automation-protocol-byte-stability', (scratchDir) => {
+    const fixture = createStableFixtureRepository(scratchDir);
+    assert.equal(fixture.sourceCommit, 'c8eadde4e6ad04cf05d209d67491c263c0a62564');
+
+    const packaged = packageAutomationsProtocol({
+      repoRoot: fixture.repoRoot,
+      outputDir: path.join(scratchDir, 'out'),
+      sourceCommit: fixture.sourceCommit
+    });
+
+    assert.equal(
+      packaged.bundleSha256,
+      'be59c4918ef7889862d04326638953c1cb5c3c603ec6c3136844e073f71f62ca'
+    );
+    assert.equal(
+      sha256(readFileSync(packaged.manifestPath)),
+      'd9aa05ed71a6f71be992326fef74a7ae44c1d8dea52d55b2a335d1f3cb0d064f'
+    );
+  });
+});
+
+test('reports an empty contract profile tree without masking the packaging error', () => {
+  withScratchDir('automation-protocol-empty-profile', (scratchDir) => {
+    const repoRoot = path.join(scratchDir, 'repo');
+    const specDir = path.join(repoRoot, 'spec', 'empty-profile');
+    mkdirSync(specDir, { recursive: true });
+    writeFileSync(path.join(repoRoot, 'README.md'), '# Empty profile fixture\n');
+    runGit(repoRoot, ['init']);
+    runGit(repoRoot, ['config', 'user.name', 'Protocol Test']);
+    runGit(repoRoot, ['config', 'user.email', 'protocol@example.invalid']);
+    runGit(repoRoot, ['config', 'commit.gpgSign', 'false']);
+    runGit(repoRoot, ['add', '.']);
+    runGit(repoRoot, ['commit', '-m', 'test: seed empty profile']);
+    const sourceCommit = runGit(repoRoot, ['rev-parse', 'HEAD']);
+
+    assert.throws(
+      () =>
+        packageContractProfile({
+          repoRoot,
+          outputDir: path.join(scratchDir, 'out'),
+          sourceCommit,
+          config: {
+            contractProfile: 'fixture.empty.v1',
+            bundleSchemaVersion: 'fixture.bundle.v1',
+            specRelativeDir: 'spec/empty-profile',
+            archiveRoot: 'fixture-empty-v1',
+            bundlePrefix: 'fixture-empty-v1-contract',
+            label: 'Empty fixture profile'
+          }
+        }),
+      /Empty fixture profile input tree is empty: spec\/empty-profile/
+    );
+  });
+});
+
+test('reproduces the immutable historical base-v1 artifact byte for byte', () => {
+  assert.deepEqual(reproduceHistoricalAutomationsProtocolArtifact(repositoryRoot), {
+    sourceCommit: '8a796807b37d4ad33eaeca37498debf1ca55dd49',
+    bundleSha256: '512460db71d4257d7a4d33ea306578e66d9ac499d9384eb9c2b8e2b4e2e32363',
+    contractContentSha256: '3c145eb92a93426ed64631f6487a8cd12903b0a49a6e752269f594ac50a779f5',
+    fileCount: 17
   });
 });
 

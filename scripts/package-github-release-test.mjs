@@ -52,15 +52,28 @@ const EXPECTED_ARCHIVES = [
   'coven-v0.4.4-windows-x64.zip'
 ].sort();
 const PROTOCOL_BUNDLE_NAME = `coven-automations-v1-contract-${HEAD_SHA}.tar.gz`;
-const EXPECTED_ASSET_NAMES = [...EXPECTED_ARCHIVES, PROTOCOL_BUNDLE_NAME, 'SHA256SUMS'].sort();
+const AUTHORITY_PROFILE_BUNDLE_NAME =
+  `coven-automations-authority-v1-contract-${HEAD_SHA}.tar.gz`;
+const EXPECTED_ASSET_NAMES = [
+  ...EXPECTED_ARCHIVES,
+  PROTOCOL_BUNDLE_NAME,
+  AUTHORITY_PROFILE_BUNDLE_NAME,
+  'SHA256SUMS'
+].sort();
 
 function packageCanonicalRelease(options) {
   const protocolBundlePath = path.join(path.dirname(options.outputDir), PROTOCOL_BUNDLE_NAME);
+  const authorityProfileBundlePath = path.join(
+    path.dirname(options.outputDir),
+    AUTHORITY_PROFILE_BUNDLE_NAME
+  );
   writeFileSync(protocolBundlePath, 'deterministic protocol bundle\n');
+  writeFileSync(authorityProfileBundlePath, 'deterministic authority profile bundle\n');
   return packageGitHubRelease({
     ...options,
     sourceCommit: HEAD_SHA,
-    protocolBundlePath
+    protocolBundlePath,
+    authorityProfileBundlePath
   });
 }
 
@@ -554,6 +567,10 @@ test('release-github workflow supports automatic and recovery triggers with pinn
   );
   assert.match(
     workflowText,
+    /package-automations-authority-profile\.mjs[\s\S]*--authority-profile-bundle "\$AUTHORITY_PROFILE_BUNDLE"/
+  );
+  assert.match(
+    workflowText,
     /if \[\[ -f github-release-protocol-source\/scripts\/package-automations-protocol\.mjs \]\]/
   );
   assert.match(
@@ -613,6 +630,10 @@ test('canonical release asset names and package definitions match the public con
   assert.ok(
     canonicalReleaseAssetNames('v0.5.0', HEAD_SHA).includes(PROTOCOL_BUNDLE_NAME),
     'later minor releases must retain the canonical protocol asset'
+  );
+  assert.ok(
+    canonicalReleaseAssetNames('v0.5.0', HEAD_SHA).includes(AUTHORITY_PROFILE_BUNDLE_NAME),
+    'later minor releases must retain the canonical authority profile asset'
   );
 });
 
@@ -1482,7 +1503,7 @@ test('packageGitHubRelease rejects missing or extra source artifact files', () =
   });
 });
 
-test('packageGitHubRelease refuses missing or misnamed Automations protocol bundles', () => {
+test('packageGitHubRelease refuses missing or misnamed Automations contract bundles', () => {
   withScratchDir('invalid-protocol-bundle', (scratchDir) => {
     const artifactsDir = path.join(scratchDir, 'artifacts');
     cpSync(fixtureRoot, artifactsDir, { recursive: true });
@@ -1494,8 +1515,10 @@ test('packageGitHubRelease refuses missing or misnamed Automations protocol bund
           outputDir: path.join(scratchDir, 'missing-inputs-out'),
           sourceDateEpoch: SOURCE_DATE_EPOCH
         }),
-      /v0\.4\.4 and later require sourceCommit and protocolBundlePath/i
+      /v0\.4\.4 and later require sourceCommit, protocolBundlePath, and authorityProfileBundlePath/i
     );
+    const authorityProfileBundlePath = path.join(scratchDir, AUTHORITY_PROFILE_BUNDLE_NAME);
+    writeFileSync(authorityProfileBundlePath, 'authority profile bundle\n');
     assert.throws(
       () =>
         packageGitHubRelease({
@@ -1504,7 +1527,8 @@ test('packageGitHubRelease refuses missing or misnamed Automations protocol bund
           outputDir: path.join(scratchDir, 'missing-out'),
           sourceDateEpoch: SOURCE_DATE_EPOCH,
           sourceCommit: HEAD_SHA,
-          protocolBundlePath: path.join(scratchDir, PROTOCOL_BUNDLE_NAME)
+          protocolBundlePath: path.join(scratchDir, PROTOCOL_BUNDLE_NAME),
+          authorityProfileBundlePath
         }),
       /protocol bundle must be a regular file/i
     );
@@ -1519,9 +1543,30 @@ test('packageGitHubRelease refuses missing or misnamed Automations protocol bund
           outputDir: path.join(scratchDir, 'misnamed-out'),
           sourceDateEpoch: SOURCE_DATE_EPOCH,
           sourceCommit: HEAD_SHA,
-          protocolBundlePath: wrongName
+          protocolBundlePath: wrongName,
+          authorityProfileBundlePath
         }),
       new RegExp(`protocol bundle must be a regular file named ${PROTOCOL_BUNDLE_NAME}`)
+    );
+
+    const protocolBundlePath = path.join(scratchDir, PROTOCOL_BUNDLE_NAME);
+    writeFileSync(protocolBundlePath, 'protocol bundle\n');
+    assert.throws(
+      () =>
+        packageGitHubRelease({
+          releaseTag: RELEASE_TAG,
+          artifactsDir,
+          outputDir: path.join(scratchDir, 'missing-authority-out'),
+          sourceDateEpoch: SOURCE_DATE_EPOCH,
+          sourceCommit: HEAD_SHA,
+          protocolBundlePath,
+          authorityProfileBundlePath: path.join(
+            scratchDir,
+            'missing',
+            AUTHORITY_PROFILE_BUNDLE_NAME
+          )
+        }),
+      /authority profile bundle must be a regular file/i
     );
   });
 });
