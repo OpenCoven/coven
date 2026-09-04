@@ -25,6 +25,9 @@ use crate::{
     privacy, project, session_launch, store, ward,
 };
 
+pub use crate::api_response::ApiResponse;
+pub(crate) use crate::api_response::{api_error, json_response};
+
 const MAX_EVENTS_LIMIT: i64 = 1_000;
 const EVENT_CANDIDATE_BATCH_LIMIT: usize = 16;
 const MAX_EVENT_CANDIDATE_BYTES: usize = coven_client::MAX_RESPONSE_BODY_BYTES;
@@ -547,13 +550,6 @@ pub struct EventsResponse {
 pub struct SessionPageResponse {
     pub sessions: Vec<store::SessionRecord>,
     pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiResponse {
-    pub status: u16,
-    pub content_type: &'static str,
-    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5098,14 +5094,7 @@ where
     body.push_str(&events_json);
     body.push_str(&events_response_tail(last_seq, has_more));
     debug_assert!(body.len() < coven_client::MAX_RESPONSE_BODY_BYTES);
-    Ok((
-        ApiResponse {
-            status: 200,
-            content_type: "application/json",
-            body,
-        },
-        stats,
-    ))
+    Ok((ApiResponse::json_body(200, body), stats))
 }
 
 fn events_response_tail(last_seq: Option<i64>, has_more: bool) -> String {
@@ -12619,30 +12608,6 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
     let cutoff = (Utc::now() - Duration::seconds(crate::daemon::STALE_CREATED_TTL_SECS))
         .to_rfc3339_opts(SecondsFormat::Nanos, true);
     let _ = store::mark_stale_created_sessions_failed(conn, &cutoff, &current_timestamp());
-}
-
-pub(crate) fn api_error(
-    status: u16,
-    code: &str,
-    message: &str,
-    details: Option<Value>,
-) -> Result<ApiResponse> {
-    let mut error = json!({
-        "code": code,
-        "message": message,
-    });
-    if let Some(d) = details {
-        error["details"] = d;
-    }
-    json_response(status, &json!({ "error": error }))
-}
-
-pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {
-    Ok(ApiResponse {
-        status,
-        content_type: "application/json",
-        body: serde_json::to_string(body).context("failed to serialize API response")?,
-    })
 }
 
 #[cfg(test)]
