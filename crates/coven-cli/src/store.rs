@@ -1447,7 +1447,7 @@ impl<'a> WardAuditReservation<'a> {
         }
         conn.execute_batch("BEGIN IMMEDIATE")
             .context("failed to serialize Ward audit capacity admission")?;
-        let admitted = (|| -> Result<bool> {
+        let admitted = (|| -> Result<Option<u64>> {
             let existing: Option<i64> = conn
                 .query_row(
                     "SELECT reserved_bytes
@@ -1511,17 +1511,17 @@ impl<'a> WardAuditReservation<'a> {
                 }
                 .into());
             }
-            if existing.is_some() {
+            if let Some(existing_bytes) = existing {
                 let required = i64::try_from(required_bytes)
                     .context("Ward audit reservation exceeds SQLite integer range")?;
                 conn.execute(
                     "UPDATE coven_ward_audit_reservations
                      SET reserved_bytes = ?2
                      WHERE token = ?1",
-                    params![reservation_token, required],
+                    params![&reservation_token, required],
                 )
                 .context("failed to resize existing Ward audit reservation")?;
-                return Ok(true);
+                return Ok(Some(existing_bytes));
             }
             let required = i64::try_from(required_bytes)
                 .context("Ward audit reservation exceeds SQLite integer range")?;
@@ -1529,35 +1529,74 @@ impl<'a> WardAuditReservation<'a> {
                 "INSERT INTO coven_ward_audit_reservations (
                     token, purpose, reserved_bytes
                  ) VALUES (?1, ?2, ?3)",
-                params![reservation_token, purpose, required],
+                params![&reservation_token, purpose, required],
             )
             .context("failed to persist Ward audit reservation")?;
-            Ok(false)
+            Ok(None)
         })();
-        let reused = match admitted {
-            Ok(reused) => {
+        let previous_reserved_bytes = match admitted {
+            Ok(previous_reserved_bytes) => {
                 if let Err(error) = conn.execute_batch("COMMIT") {
                     let _ = conn.execute_batch("ROLLBACK");
                     return Err(error).context("failed to commit Ward audit reservation");
                 }
-                reused
+                previous_reserved_bytes
             }
             Err(error) => {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(error);
             }
         };
-        conn.execute(
+        let activation = conn.execute(
             "INSERT INTO temp.coven_active_ward_audit_reservation (singleton, token)
              VALUES (1, ?1)
              ON CONFLICT(singleton) DO UPDATE SET token = ?1",
             [&reservation_token],
-        )
-        .context("failed to activate Ward audit reservation")?;
+        );
+        if let Err(error) = activation {
+            let restore = (|| -> Result<()> {
+                conn.execute_batch("BEGIN IMMEDIATE")
+                    .context("failed to begin Ward audit reservation restoration")?;
+                let restored = match previous_reserved_bytes {
+                    Some(previous_reserved_bytes) => conn.execute(
+                        "UPDATE coven_ward_audit_reservations
+                         SET reserved_bytes = ?2
+                         WHERE token = ?1",
+                        params![
+                            &reservation_token,
+                            i64::try_from(previous_reserved_bytes).context(
+                                "previous Ward audit reservation exceeds SQLite integer range"
+                            )?
+                        ],
+                    ),
+                    None => conn.execute(
+                        "DELETE FROM coven_ward_audit_reservations WHERE token = ?1",
+                        [&reservation_token],
+                    ),
+                };
+                match restored {
+                    Ok(_) => conn
+                        .execute_batch("COMMIT")
+                        .context("failed to commit Ward audit reservation restoration"),
+                    Err(restore_error) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(restore_error).context("failed to restore Ward audit reservation")
+                    }
+                }
+            })();
+            let activation_error =
+                anyhow::Error::from(error).context("failed to activate Ward audit reservation");
+            return match restore {
+                Ok(()) => Err(activation_error),
+                Err(restore_error) => Err(activation_error).context(format!(
+                    "failed to roll back durable Ward audit reservation after activation failure: {restore_error:#}"
+                )),
+            };
+        }
         Ok(Self {
             conn,
             reservation_id: reservation_token,
-            preserve_on_drop: reused,
+            preserve_on_drop: previous_reserved_bytes.is_some(),
             finished: false,
         })
     }
@@ -7018,6 +7057,50 @@ END;
                 |row| row.get::<_, i64>(0),
             )?,
             i64::try_from(grown)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_active_marker_rolls_back_new_durable_reservation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        conn.execute_batch(
+            r#"
+            CREATE TEMP TRIGGER fail_activate_ward_audit_reservation
+            BEFORE INSERT ON coven_active_ward_audit_reservation
+            BEGIN
+                SELECT RAISE(ABORT, 'injected activation failure');
+            END;
+            "#,
+        )?;
+
+        let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
+        let error = match WardAuditReservation::acquire(
+            &conn,
+            &path,
+            "activation-fail",
+            "test",
+            required,
+        ) {
+            Ok(reservation) => {
+                reservation.preserve()?;
+                anyhow::bail!("activation failure test unexpectedly acquired a reservation")
+            }
+            Err(error) => error,
+        };
+        assert!(error
+            .to_string()
+            .contains("failed to activate Ward audit reservation"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token = ?1",
+                ["activation-fail"],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
         );
         Ok(())
     }
