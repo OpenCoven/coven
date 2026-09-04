@@ -25,8 +25,14 @@ use crate::{
     privacy, project, session_launch, store, ward,
 };
 
+pub(crate) use crate::api_health::health_response_for_authority;
+use crate::api_health::HealthResponse;
+#[cfg(test)]
+pub use crate::api_health::COVEN_VERSION;
+pub use crate::api_health::{health_response, COVEN_API_NAMED_VERSION};
 pub use crate::api_response::ApiResponse;
 pub(crate) use crate::api_response::{api_error, json_response};
+pub(crate) use crate::request_authority::RequestAuthority;
 
 const MAX_EVENTS_LIMIT: i64 = 1_000;
 const EVENT_CANDIDATE_BATCH_LIMIT: usize = 16;
@@ -46,9 +52,6 @@ const PROPOSAL_JSON_MAX_PROBE_RESULTS: usize = 256;
 const PROPOSAL_JSON_MAX_KEY_BYTES: usize = 128;
 const PROPOSAL_JSON_MAX_METADATA_STRING_BYTES: usize = 64 * 1024;
 const PROPOSAL_JSON_MAX_ESTIMATED_HEAP_BYTES: u64 = 128 * 1024 * 1024;
-pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
-pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
-
 fn ward_write_audit_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -435,105 +438,6 @@ fn maybe_fail_proposal_decision(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthCapabilities {
-    pub sessions: bool,
-    pub events: bool,
-    pub travel: bool,
-    pub scheduler: bool,
-    pub hub: bool,
-    pub executor_dispatch: bool,
-    pub event_cursor: String,
-    pub structured_errors: bool,
-    pub session_handoff: bool,
-    /// Whether `POST /sessions` accepts the exact, fail-closed
-    /// `launchPolicy` contract documented for unattended Codex work.
-    #[serde(default)]
-    pub session_launch_policy: bool,
-    /// Whether the `afs.*` route family is served at all.
-    pub afs: bool,
-    /// Mount backend, or `false` when none is available. A client must branch
-    /// on this rather than assume mounting works: SDK-only operation is a
-    /// supported mode, not a degraded one.
-    pub afs_mount: MountCapability,
-    /// Whether the daemon can materialize a delta into a git branch.
-    pub afs_commit: bool,
-    /// Whether `afs.session.commit` accepts the side-effect-free `dryRun`
-    /// contract. Clients must not infer this from `afsCommit`: older daemons
-    /// accepted commit requests before preview semantics existed.
-    #[serde(default)]
-    pub afs_commit_dry_run: bool,
-    /// Exact execution-binding contracts accepted by bound session
-    /// launch/input/kill. Additive: absent/older wire payloads default to
-    /// empty rather than failing deserialization.
-    #[serde(default)]
-    pub execution_binding_contracts: Vec<String>,
-    /// Exact request-adoption contracts accepted by dedicated adopted
-    /// launch/input routes. Additive: absent/older wire payloads default to
-    /// empty rather than failing deserialization.
-    #[serde(default)]
-    pub request_adoption_contracts: Vec<String>,
-}
-
-/// `afsMount`: a backend name, or `false`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum MountCapability {
-    Backend(String),
-    Unavailable(bool),
-}
-
-impl MountCapability {
-    /// What this daemon can actually mount.
-    ///
-    /// `false` on every platform and build without a backend, and `false` by
-    /// default even where one exists: the NFS export serves a single delta
-    /// rather than the merged base+delta view DESIGN.md §3.2 specifies (bead
-    /// `coven-vlw`), and an agent process could not write through the mount on
-    /// macOS (bead `coven-x77`). Advertising a backend before those close
-    /// would promise something the daemon cannot deliver, so the opt-in in
-    /// `afs_mount` gates it.
-    pub fn detect() -> Self {
-        match crate::afs_mount::backend() {
-            Some(backend) => Self::Backend(backend.to_string()),
-            None => Self::Unavailable(false),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HubHealth {
-    pub role: String,
-    pub hub_id: String,
-    pub nodes_total: usize,
-    pub nodes_available: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HealthResponse {
-    pub ok: bool,
-    pub api_version: String,
-    pub coven_version: String,
-    pub capabilities: HealthCapabilities,
-    pub daemon: Option<DaemonStatus>,
-    /// Hub control-plane summary (role + node availability). `None` when the
-    /// response is built without store access (e.g. CLI status printing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hub: Option<HubHealth>,
-    /// Daemon-owned event persistence health.  Omitted for status rendering
-    /// paths that do not have a live runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_writer: Option<crate::event_writer::EventWriterHealth>,
-    /// Local SQLite pressure and bounded-maintenance state. This remains
-    /// present when collection fails so health consumers can distinguish a
-    /// storage problem from a daemon that is simply not running.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<store::StorageHealth>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EventCursor {
     pub after_seq: i64,
 }
@@ -720,62 +624,6 @@ impl SessionRuntime for NoopSessionRuntime {
 
     fn kill_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestAuthority {
-    /// Filesystem-permission-protected Unix socket or owner-only Windows pipe.
-    OwnerLocalIpc,
-    /// Optional loopback TCP listener. Host/Origin checks reduce browser risk,
-    /// but they do not prove that the caller owns the daemon process.
-    Tcp,
-}
-
-impl RequestAuthority {
-    fn allows_session_launch_policy(self) -> bool {
-        matches!(self, Self::OwnerLocalIpc)
-    }
-
-    fn allows_ward_proposal_access(self) -> bool {
-        matches!(self, Self::OwnerLocalIpc)
-    }
-}
-
-pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
-    health_response_for_authority(daemon, RequestAuthority::OwnerLocalIpc)
-}
-
-pub(crate) fn health_response_for_authority(
-    daemon: Option<DaemonStatus>,
-    authority: RequestAuthority,
-) -> HealthResponse {
-    HealthResponse {
-        ok: true,
-        api_version: COVEN_API_NAMED_VERSION.to_string(),
-        coven_version: COVEN_VERSION.to_string(),
-        capabilities: HealthCapabilities {
-            sessions: true,
-            events: true,
-            travel: true,
-            scheduler: true,
-            hub: true,
-            executor_dispatch: true,
-            event_cursor: "sequence".to_string(),
-            structured_errors: true,
-            session_handoff: true,
-            session_launch_policy: authority.allows_session_launch_policy(),
-            afs: true,
-            afs_mount: MountCapability::detect(),
-            afs_commit: true,
-            afs_commit_dry_run: true,
-            execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
-            request_adoption_contracts: vec![crate::request_adoption::CONTRACT.to_string()],
-        },
-        daemon,
-        hub: None,
-        event_writer: None,
-        storage: None,
     }
 }
 
@@ -12855,56 +12703,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn older_health_payloads_default_afs_commit_dry_run_to_false() -> anyhow::Result<()> {
-        let current = health_response(None);
-        let mut payload = serde_json::to_value(&current)?;
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("afsCommitDryRun");
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("sessionLaunchPolicy");
-
-        let decoded: HealthResponse = serde_json::from_value(payload)?;
-        assert!(!decoded.capabilities.afs_commit_dry_run);
-        assert!(!decoded.capabilities.session_launch_policy);
-        Ok(())
-    }
-
-    #[test]
-    fn health_request_adoption_contracts_are_additive_and_defaulted() -> anyhow::Result<()> {
-        let current = health_response(None);
-        let mut payload = serde_json::to_value(&current)?;
-
-        assert_eq!(
-            payload["capabilities"]["requestAdoptionContracts"],
-            json!([crate::request_adoption::CONTRACT])
-        );
-        assert_eq!(
-            payload["capabilities"]["executionBindingContracts"],
-            json!([crate::execution_binding::CONTRACT])
-        );
-        assert!(
-            payload["daemon"].is_null(),
-            "daemon metadata must retain its null variant"
-        );
-
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("requestAdoptionContracts");
-        let decoded: HealthResponse = serde_json::from_value(payload)?;
-        assert!(decoded.capabilities.request_adoption_contracts.is_empty());
-        assert_eq!(
-            decoded.capabilities.execution_binding_contracts,
-            vec![crate::execution_binding::CONTRACT.to_string()]
-        );
-        Ok(())
-    }
-
-    #[test]
     fn afs_session_create_get_and_list_round_trip() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = afs_project(temp.path());
@@ -13303,28 +13101,6 @@ pub(crate) mod tests {
         assert_eq!(included.sessions[2].id, "oldest");
         assert!(included.sessions[2].archived_at.is_some());
         Ok(())
-    }
-
-    #[test]
-    fn builds_health_response() {
-        let response = health_response(None);
-
-        assert!(response.ok);
-        assert_eq!(response.api_version, COVEN_API_NAMED_VERSION);
-        assert_eq!(response.coven_version, COVEN_VERSION);
-        assert!(response.capabilities.sessions);
-        assert!(response.capabilities.events);
-        assert!(response.capabilities.travel);
-        assert!(response.capabilities.scheduler);
-        assert!(response.capabilities.hub);
-        assert!(response.capabilities.executor_dispatch);
-        assert_eq!(response.capabilities.event_cursor, "sequence");
-        assert!(response.capabilities.structured_errors);
-        assert!(response.capabilities.session_launch_policy);
-        assert_eq!(response.daemon, None);
-        assert_eq!(response.hub, None);
-        assert_eq!(response.event_writer, None);
-        assert_eq!(response.storage, None);
     }
 
     #[test]
