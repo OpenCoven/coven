@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import tempfile
 import unittest
 
 
@@ -181,6 +182,58 @@ class SecurityPolicyTests(unittest.TestCase):
         errors = self.validate(policy)
         self.assertTrue(any("relative link does not resolve" in error for error in errors))
 
+    def test_absolute_policy_link_fails_even_when_the_file_exists(self) -> None:
+        with tempfile.NamedTemporaryFile() as outside:
+            policy = self.canonical_policy().replace(
+                "docs/API-CONTRACT.md",
+                pathlib.Path(outside.name).as_posix(),
+                1,
+            )
+            errors = self.validate(policy)
+        self.assertTrue(any("must stay within the repository" in error for error in errors))
+
+    def test_policy_link_cannot_traverse_outside_the_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            parent = pathlib.Path(directory)
+            root = parent / "repository"
+            root.mkdir()
+            (parent / "outside.md").write_text("outside", encoding="utf-8")
+            policy = self.canonical_policy().replace(
+                "docs/API-CONTRACT.md",
+                "../outside.md",
+                1,
+            )
+            errors = self.validate(policy, root=root)
+        self.assertTrue(any("must stay within the repository" in error for error in errors))
+
+    def test_windows_drive_policy_link_is_not_treated_as_external(self) -> None:
+        policy = self.canonical_policy().replace(
+            "docs/API-CONTRACT.md",
+            "C:\\Users\\example\\policy.md",
+            1,
+        )
+        errors = self.validate(policy)
+        self.assertTrue(any("must stay within the repository" in error for error in errors))
+
+    def test_unc_policy_link_cannot_escape_the_repository(self) -> None:
+        policy = self.canonical_policy().replace(
+            "docs/API-CONTRACT.md",
+            "\\\\server\\share\\policy.md",
+            1,
+        )
+        errors = self.validate(policy)
+        self.assertTrue(any("must stay within the repository" in error for error in errors))
+
+    def test_file_uri_policy_link_is_not_treated_as_external(self) -> None:
+        with tempfile.NamedTemporaryFile() as outside:
+            policy = self.canonical_policy().replace(
+                "docs/API-CONTRACT.md",
+                pathlib.Path(outside.name).as_uri(),
+                1,
+            )
+            errors = self.validate(policy)
+        self.assertTrue(any("must stay within the repository" in error for error in errors))
+
     def test_readme_must_link_policy_and_private_advisories(self) -> None:
         readme = self.canonical_readme().replace("(SECURITY.md)", "(README.md)")
         readme = readme.replace(
@@ -190,7 +243,10 @@ class SecurityPolicyTests(unittest.TestCase):
         errors = self.validate(self.canonical_policy(), readme=readme)
         self.assertTrue(any("README.md must link to SECURITY.md" in error for error in errors))
         self.assertTrue(
-            any("README.md must link to private advisories" in error for error in errors)
+            any(
+                "README.md must link to the public Security Advisories page" in error
+                for error in errors
+            )
         )
 
     def test_ci_runs_security_policy_test_and_checker(self) -> None:

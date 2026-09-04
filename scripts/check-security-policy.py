@@ -27,6 +27,7 @@ PRIVATE_ADVISORY_URL = (
     "https://github.com/OpenCoven/coven/security/advisories/new"
 )
 README_ADVISORY_URL = "https://github.com/OpenCoven/coven/security/advisories"
+WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 RETIRED_SCOPE = re.compile(
     r"\b(?:OpenCoven Security Disclosure Addendum|"
     r"organization-wide OpenCoven security addendum|OpenTrust)\b|"
@@ -63,6 +64,12 @@ def relative_links(content: str) -> list[str]:
     for match in MARKDOWN_LINK.finditer(content):
         target = match.group(1).strip().strip("<>")
         if not target or target.startswith("#"):
+            continue
+        if WINDOWS_ABSOLUTE_PATH.match(target):
+            links.append(target)
+            continue
+        if target.lower().startswith("file:"):
+            links.append(target)
             continue
         if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", target):
             continue
@@ -108,7 +115,24 @@ def validate_policy(
         errors.append("SECURITY.md must keep private advisories as the primary path")
 
     for target in relative_links(policy):
-        if not (root / target).is_file():
+        if (
+            pathlib.PurePath(target).is_absolute()
+            or WINDOWS_ABSOLUTE_PATH.match(target)
+            or target.startswith("\\")
+            or target.lower().startswith("file:")
+        ):
+            errors.append(
+                f"SECURITY.md relative link must stay within the repository: {target}"
+            )
+            continue
+
+        resolved_root = root.resolve()
+        resolved_target = (root / target).resolve()
+        if not resolved_target.is_relative_to(resolved_root):
+            errors.append(
+                f"SECURITY.md relative link must stay within the repository: {target}"
+            )
+        elif not resolved_target.is_file():
             errors.append(
                 f"SECURITY.md relative link does not resolve: {target}"
             )
@@ -116,7 +140,7 @@ def validate_policy(
     if "(SECURITY.md)" not in readme:
         errors.append("README.md must link to SECURITY.md")
     if README_ADVISORY_URL not in readme:
-        errors.append("README.md must link to private advisories")
+        errors.append("README.md must link to the public Security Advisories page")
 
     return errors
 
