@@ -1270,7 +1270,7 @@ pub fn load_definition_for_run(
     let definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
         .map_err(|error| format!("stored routine `{id}` is unreadable: {error}"))?;
     definition
-        .validate()
+        .validate_durable()
         .map_err(|error| format!("stored routine `{id}` is invalid: {error}"))?;
     Ok(Some(definition))
 }
@@ -1720,7 +1720,9 @@ mod tests {
             + chrono::Duration::microseconds(400);
         let launched_at = startup_cutoff + chrono::Duration::microseconds(100);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
             rusqlite::params![
                 routine.id,
                 (launched_at - chrono::Duration::days(1))
@@ -1811,7 +1813,9 @@ mod tests {
         insert_definition(&conn, &routine).unwrap();
         let launched_at = Utc.with_ymd_and_hms(2026, 9, 3, 10, 0, 0).unwrap();
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
             rusqlite::params![
                 routine.id,
                 (launched_at - chrono::Duration::days(1))

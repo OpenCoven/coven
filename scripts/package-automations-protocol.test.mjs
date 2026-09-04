@@ -376,6 +376,26 @@ test('pinned TypeScript declarations expose the implemented event page result', 
   );
 });
 
+test('published timezone contract exposes UTC and IANA without durable local', () => {
+  const specDir = path.join(repositoryRoot, 'spec', 'coven-automations', 'v1');
+  const declaration = readFileSync(path.join(specDir, 'coven.automations.v1.d.ts'), 'utf8');
+  const schema = JSON.parse(
+    readFileSync(path.join(specDir, 'automation-definition.schema.json'), 'utf8')
+  );
+
+  assert.match(
+    declaration,
+    /export type IanaTimezoneId = string & \{ readonly __ianaTimezoneId: unique symbol \};/
+  );
+  assert.match(declaration, /timezone: "utc" \| IanaTimezoneId;/);
+  assert.doesNotMatch(declaration, /timezone: "local"/);
+
+  const timezone = schema.$defs.scheduleTrigger.properties.schedule.properties.timezone;
+  assert.deepEqual(timezone.anyOf, [{ const: 'utc' }, { format: 'iana-time-zone' }]);
+  assert.deepEqual(timezone.requiredIanaValidation, true);
+  assert.deepEqual(timezone.not, { const: 'local' });
+});
+
 test('verify CLI refuses missing required arguments with actionable usage', () => {
   const result = spawnSync(process.execPath, [scriptPath, 'verify'], {
     cwd: repositoryRoot,

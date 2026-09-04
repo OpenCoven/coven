@@ -30,6 +30,8 @@ export interface Digest {
 
 export type AdoptionKey = string;
 export type CorrelationId = string;
+/** Exact IANA TZID validated by the Rust authority before persistence. */
+export type IanaTimezoneId = string & { readonly __ianaTimezoneId: unique symbol };
 
 export interface PrincipalRef {
   principalId: string;
@@ -143,7 +145,7 @@ export interface ScheduleTrigger {
   schedule: {
     /** Scoped RRULE: FREQ=DAILY|WEEKLY, optional BYHOUR list, optional BYDAY list for weekly. */
     rrule: string;
-    timezone: "local" | "utc";
+    timezone: "utc" | IanaTimezoneId;
   };
 }
 

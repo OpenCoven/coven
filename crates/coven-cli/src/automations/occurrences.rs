@@ -415,6 +415,13 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
             ));
             continue;
         }
+        if let Err(error) = definition.validate_durable() {
+            failures.push(format!(
+                "stored routine `{}` is invalid: {error}",
+                record.id
+            ));
+            continue;
+        }
         if definition.status != RoutineStatus::Active {
             continue;
         }
@@ -464,6 +471,42 @@ fn latest_due_slot_after(
     Ok(latest)
 }
 
+fn latest_scheduled_slot(
+    conn: &Connection,
+    automation_id: &str,
+    automation_revision: u64,
+    definition_digest: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let latest: Option<String> = conn
+        .query_row(
+            "SELECT MAX(scheduled_for)
+             FROM automation_occurrences
+             WHERE automation_id = ?1
+               AND automation_revision = ?2
+               AND definition_digest = ?3
+               AND kind = 'scheduled'",
+            params![
+                automation_id,
+                i64::try_from(automation_revision)
+                    .map_err(|_| "definition revision exceeds SQLite range")?,
+                definition_digest,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read latest scheduled occurrence: {error}"))?;
+    latest
+        .map(|timestamp| {
+            DateTime::parse_from_rfc3339(&timestamp)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    format!(
+                        "routine `{automation_id}` has an invalid scheduled occurrence timestamp: {error}"
+                    )
+                })
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanOutcome {
     Planned(PlannedOccurrence),
@@ -477,6 +520,60 @@ pub enum PlanOutcome {
 /// occurrences are only idempotency fences; manual-run timestamps never
 /// advance the schedule cursor.
 pub fn plan_latest_due_occurrence(
+    conn: &Connection,
+    definition: &RoutineDefinition,
+    created_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<PlanOutcome, String> {
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| format!("failed to begin occurrence planning transaction: {error}"))?;
+    } else {
+        conn.execute_batch("SAVEPOINT coven_automation_occurrence_planning")
+            .map_err(|error| format!("failed to create occurrence planning savepoint: {error}"))?;
+    }
+
+    let result = plan_latest_due_occurrence_in_transaction(conn, definition, created_at, now);
+    match result {
+        Ok(outcome) => {
+            let committed = if owns_transaction {
+                conn.execute_batch("COMMIT")
+                    .map_err(|error| format!("failed to commit occurrence planning: {error}"))
+            } else {
+                conn.execute_batch("RELEASE SAVEPOINT coven_automation_occurrence_planning")
+                    .map_err(|error| {
+                        format!("failed to release occurrence planning savepoint: {error}")
+                    })
+            };
+            if let Err(error) = committed {
+                if owns_transaction {
+                    let _ = conn.execute_batch("ROLLBACK");
+                } else {
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT coven_automation_occurrence_planning;
+                         RELEASE SAVEPOINT coven_automation_occurrence_planning;",
+                    );
+                }
+                return Err(error);
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if owns_transaction {
+                let _ = conn.execute_batch("ROLLBACK");
+            } else {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT coven_automation_occurrence_planning;
+                     RELEASE SAVEPOINT coven_automation_occurrence_planning;",
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn plan_latest_due_occurrence_in_transaction(
     conn: &Connection,
     definition: &RoutineDefinition,
     created_at: DateTime<Utc>,
@@ -517,8 +614,26 @@ pub fn plan_latest_due_occurrence(
             definition.id
         ));
     }
-    let Some(slot) = latest_due_slot_after(definition, created_at, now)? else {
-        return Ok(PlanOutcome::NotDue);
+    let revision_updated_at = DateTime::parse_from_rfc3339(&current.updated_at)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            format!(
+                "routine `{}` has invalid revision updated_at: {error}",
+                definition.id
+            )
+        })?;
+    let revision_effective_at = created_at.max(revision_updated_at);
+    let latest_scheduled =
+        latest_scheduled_slot(conn, &definition.id, current.revision, &current_digest)?;
+    let cursor = latest_scheduled.map_or(revision_effective_at, |latest| {
+        revision_effective_at.max(latest)
+    });
+    let Some(slot) = latest_due_slot_after(definition, cursor, now)? else {
+        return Ok(if latest_scheduled.is_some_and(|latest| latest <= now) {
+            PlanOutcome::AlreadyFenced
+        } else {
+            PlanOutcome::NotDue
+        });
     };
 
     let slot_iso = iso(slot);
@@ -760,7 +875,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -787,6 +904,11 @@ mod tests {
         let expected_digest = revised.definition_digest.unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
 
         let PlanOutcome::Planned(planned) =
             plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap()
@@ -878,7 +1000,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(4))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -921,7 +1045,21 @@ mod tests {
         let created_at = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 30, 23, 30, 0).unwrap();
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = ?2",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
             rusqlite::params![iso(created_at), routine.id],
         )
         .unwrap();
@@ -931,6 +1069,216 @@ mod tests {
             panic!("expected the latest missed occurrence, got {outcome:?}");
         };
         assert_eq!(occurrence.scheduled_for, "2026-08-30T23:00:00.000Z");
+    }
+
+    #[test]
+    fn clock_forward_collapses_to_latest_and_backward_replan_adds_no_older_fence() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("clock-jump", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
+
+        let first_now = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        assert!(matches!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, first_now).unwrap(),
+            PlanOutcome::Planned(_)
+        ));
+
+        let forward_now = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).unwrap();
+        let PlanOutcome::Planned(forward) =
+            plan_latest_due_occurrence(&conn, &routine, created_at, forward_now).unwrap()
+        else {
+            panic!("forward jump should plan the latest due slot");
+        };
+        assert_eq!(forward.scheduled_for, "2026-01-05T09:00:00.000Z");
+
+        let backward_now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, backward_now).unwrap(),
+            PlanOutcome::NotDue
+        );
+
+        let slots: Vec<String> = conn
+            .prepare(
+                "SELECT scheduled_for FROM automation_occurrences
+                 WHERE automation_id = ?1 ORDER BY scheduled_for",
+            )
+            .unwrap()
+            .query_map([&routine.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            slots,
+            vec!["2026-01-01T09:00:00.000Z", "2026-01-05T09:00:00.000Z"]
+        );
+    }
+
+    #[test]
+    fn revised_schedule_plans_only_slots_after_the_revision_effective_time() {
+        let (_temp, conn) = temp_store();
+        let initial = definition("future-only", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &initial).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 30, 8, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), initial.id],
+        )
+        .unwrap();
+        let first_now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+        let PlanOutcome::Planned(first) =
+            plan_latest_due_occurrence(&conn, &initial, created_at, first_now).unwrap()
+        else {
+            panic!("expected the original revision's 09:00 occurrence");
+        };
+        assert_eq!(first.scheduled_for, "2026-08-30T09:00:00.000Z");
+
+        let revised = definition("future-only", "ACTIVE", "FREQ=DAILY;BYHOUR=11");
+        update_definition(&conn, &revised).unwrap().unwrap();
+        let revised_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(revised_at), revised.id],
+        )
+        .unwrap();
+
+        let same_day = Utc.with_ymd_and_hms(2026, 8, 30, 12, 30, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &revised, created_at, same_day).unwrap(),
+            PlanOutcome::NotDue
+        );
+
+        let older_revision_slot = Utc.with_ymd_and_hms(2026, 8, 31, 11, 0, 0).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, scheduled_for, kind,
+                state, attempt, created_at, updated_at
+             ) VALUES (?1, ?2, 1, ?3, 'scheduled', 'succeeded', 1, ?3, ?3)",
+            rusqlite::params![
+                format!("{}-{}", revised.id, older_revision_slot.timestamp_millis()),
+                revised.id,
+                iso(older_revision_slot),
+            ],
+        )
+        .unwrap();
+        let duplicate_time = Utc.with_ymd_and_hms(2026, 8, 31, 11, 30, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &revised, created_at, duplicate_time).unwrap(),
+            PlanOutcome::AlreadyFenced
+        );
+
+        let next_day = Utc.with_ymd_and_hms(2026, 9, 1, 11, 30, 0).unwrap();
+        let PlanOutcome::Planned(next) =
+            plan_latest_due_occurrence(&conn, &revised, created_at, next_day).unwrap()
+        else {
+            panic!("expected the first post-revision 11:00 occurrence");
+        };
+        assert_eq!(next.scheduled_for, "2026-09-01T11:00:00.000Z");
+
+        let pins: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT scheduled_for, automation_revision
+                 FROM automation_occurrences
+                 WHERE automation_id = ?1
+                 ORDER BY scheduled_for",
+            )
+            .unwrap()
+            .query_map([&revised.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            pins,
+            vec![
+                ("2026-08-30T09:00:00.000Z".to_string(), 1),
+                ("2026-08-31T11:00:00.000Z".to_string(), 1),
+                ("2026-09-01T11:00:00.000Z".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrated_revision_one_uses_updated_at_as_its_effective_time() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("migrated-revision-one", "ACTIVE", "FREQ=DAILY;BYHOUR=11");
+        insert_definition(&conn, &routine).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![iso(created_at), iso(updated_at), routine.id],
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 30, 0).unwrap();
+
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap(),
+            PlanOutcome::NotDue
+        );
+    }
+
+    #[test]
+    fn unverifiable_reused_id_history_does_not_advance_the_current_revision_cursor() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("reused-id", "ACTIVE", "FREQ=DAILY;BYHOUR=13");
+        let record = insert_definition(&conn, &routine).unwrap();
+        let effective_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(effective_at), routine.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, definition_digest,
+                scheduled_for, kind, state, attempt, created_at, updated_at
+             ) VALUES (
+                'old-unverifiable', ?1, 1, NULL,
+                '2026-09-05T09:00:00.000Z', 'scheduled', 'succeeded', 1,
+                '2026-08-01T09:00:00.000Z', '2026-08-01T09:05:00.000Z'
+             )",
+            [&routine.id],
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 13, 30, 0).unwrap();
+        let PlanOutcome::Planned(planned) =
+            plan_latest_due_occurrence(&conn, &routine, effective_at, now).unwrap()
+        else {
+            panic!("unverifiable reused-id history delayed the current definition");
+        };
+
+        assert_eq!(planned.scheduled_for, "2026-08-30T13:00:00.000Z");
+        let current_pin: (i64, String) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [&planned.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            current_pin,
+            (
+                1,
+                record
+                    .definition_digest
+                    .expect("inserted definition digest")
+            )
+        );
     }
 
     #[test]
@@ -944,6 +1292,13 @@ mod tests {
         insert_definition(&conn, &routine).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 30, 23, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -1003,7 +1358,7 @@ mod tests {
         insert_definition(&conn, &invalid).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap();
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1",
+            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1",
             rusqlite::params![iso(created_at)],
         )
         .unwrap();
@@ -1043,7 +1398,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -1118,15 +1475,17 @@ mod tests {
             let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
             let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 59, 0).unwrap();
             conn.execute(
-                "UPDATE automation_definitions SET created_at = ?1 WHERE id = ?2",
+                "UPDATE automation_definitions
+                 SET created_at = ?1, updated_at = ?1
+                 WHERE id = ?2",
                 rusqlite::params![iso(created_at), routine.id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO automation_occurrences
-                    (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                    (id, automation_id, scheduled_for, kind, state, lease_owner, lease_expires_at,
                      attempt, created_at, updated_at)
-                 VALUES ('manual', ?1, '2026-08-30T09:30:00.000Z', ?2, 'manual', ?3, 1, ?3, ?3)",
+                 VALUES ('manual', ?1, '2026-08-30T09:30:00.000Z', 'manual', ?2, 'manual', ?3, 1, ?3, ?3)",
                 rusqlite::params![
                     routine.id,
                     manual_state,
@@ -1151,6 +1510,13 @@ mod tests {
         insert_definition(&conn, &routine).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
         let slot = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
         assert!(insert_claimed_occurrence(
             &conn,
             "manual-exact-slot",
@@ -1217,7 +1583,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -1301,7 +1669,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();

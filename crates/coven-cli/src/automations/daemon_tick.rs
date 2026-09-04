@@ -450,7 +450,9 @@ mod tests {
         let old_created = (chrono::Utc::now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -681,7 +683,9 @@ mod tests {
 
     fn set_created_at(conn: &rusqlite::Connection, id: &str, created_at: &str) {
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?2 WHERE id = ?1",
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
             rusqlite::params![id, created_at],
         )
         .unwrap();

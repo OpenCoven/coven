@@ -21,7 +21,11 @@
     "triggerPolicies": [
       { "variant": "misfire.latest", "notes": "On recovery only the latest missed slot runs; earlier slots collapse, never backfill." },
       { "variant": "overlap.forbid", "notes": "A run is skipped when the previous occurrence has not settled." },
-      { "variant": "timeout.required", "notes": "Every definition carries a bounded per-run timeout, 1..=44640 minutes." }
+      { "variant": "timeout.required", "notes": "Every definition carries a bounded per-run timeout, 1..=44640 minutes." },
+      { "variant": "timezone.utc", "notes": "UTC scheduling is unchanged and serialized as `utc`." },
+      { "variant": "timezone.iana", "notes": "Durable schedules bind an exact IANA TZID validated by the Rust authority; host timezone changes do not reinterpret the definition." },
+      { "variant": "dst.gap.skip", "notes": "A nonexistent wall-clock slot in a spring-forward gap is skipped, never shifted." },
+      { "variant": "dst.fold.first", "notes": "An ambiguous wall-clock slot in a fall-back fold selects the first occurrence, the earlier UTC instant." }
     ],
     "deliveryPolicies": [],
     "retentionPolicies": [
@@ -41,6 +45,10 @@
     {
       "variant": "misfire.backfill",
       "reason": "v1 misfire semantics collapse missed slots; backfill would change occurrence-key identity."
+    },
+    {
+      "variant": "timezone.local.durable",
+      "reason": "`local` is accepted only by compatibility entry points and must resolve to an exact IANA TZID before persistence."
     },
     {
       "variant": "outputTarget.atomic",

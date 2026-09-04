@@ -36,6 +36,12 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 - Digests are SHA-256 over RFC 8785 (JCS) canonical JSON — never over ad-hoc serialization.
 - Contract profile (`coven.automations.v1`) is independent of implementation release versions.
 - Historical records pin the exact definition revision and digest they were created and executed against, and are never reinterpreted by current definitions.
+- Durable schedule timezones are canonical `utc` or validated IANA TZIDs. Legacy
+  `local` is accepted only at compatibility boundaries, resolved before
+  persistence, and recorded as an explicit definition-revision migration.
+- Spring-forward gaps skip nonexistent wall times. Fall-back folds select the
+  first occurrence (the earlier UTC instant). Both rules are deterministic and
+  pinned by `test-vectors.json`.
 
 ## Conformance
 
