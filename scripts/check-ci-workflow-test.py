@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pathlib
+import re
 import unittest
 
 CI_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / '.github' / 'workflows' / 'ci.yml'
@@ -13,6 +14,21 @@ SETUP_NODE_SHA = "820762786026740c76f36085b0efc47a31fe5020"
 CI_TEXT = CI_WORKFLOW.read_text(encoding='utf-8')
 RELEASE_TEXT = RELEASE_WORKFLOW.read_text(encoding='utf-8')
 RELEASE_GITHUB_TEXT = RELEASE_GITHUB_WORKFLOW.read_text(encoding='utf-8')
+
+
+def ci_job_block(job: str) -> str:
+    """Return the ci.yml text belonging to one top-level job.
+
+    Kept deliberately text-based: none of the repository's guards depend on
+    PyYAML, and adding that dependency for one assertion would make the whole
+    policy job harder to run.
+    """
+    marker = f"\n  {job}:\n"
+    if marker not in CI_TEXT:
+        raise AssertionError(f'ci.yml has no job named {job!r}')
+    remainder = CI_TEXT[CI_TEXT.index(marker) + 1 :]
+    following_job = re.search(r"\n  [A-Za-z0-9_-]+:\n", remainder)
+    return remainder[: following_job.start()] if following_job else remainder
 
 
 class CheckCiWorkflowTests(unittest.TestCase):
@@ -68,6 +84,26 @@ class CheckCiWorkflowTests(unittest.TestCase):
             "if: ${{ github.event_name == 'pull_request' && needs.changes.outputs.npm_packaging == 'true' }}",
             CI_TEXT,
         )
+
+    def test_benchmark_harness_tests_run_outside_the_push_only_job(self) -> None:
+        command = (
+            'node --test scripts/benchmark-cli.test.mjs '
+            'scripts/benchmark-chaos.test.mjs'
+        )
+        baseline = ci_job_block('performance-baseline')
+        policy_guard = ci_job_block('policy-guard')
+
+        # `performance-baseline` runs the harness tests too, but it is gated on
+        # push, so its copy cannot fail a pull request that breaks the harness.
+        self.assertIn(command, baseline)
+        self.assertIn("if: ${{ github.event_name == 'push' }}", baseline)
+
+        # `policy-guard` is the coverage that actually reaches a pull request,
+        # so the command must be there and the job must carry no event gate of
+        # its own. Asserting the command against the whole file would pass on
+        # the push-only copy alone and prove nothing.
+        self.assertIn(command, policy_guard)
+        self.assertNotIn("\n    if:", policy_guard)
         pull_request_job = CI_TEXT.split("\n  npm-onboarding-pr:\n", 1)[1].split(
             "\n  npm-onboarding-main:\n", 1
         )[0]
