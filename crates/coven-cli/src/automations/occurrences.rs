@@ -1051,19 +1051,6 @@ mod tests {
             rusqlite::params![iso(created_at), routine.id],
         )
         .unwrap();
-        conn.execute(
-            "UPDATE automation_definitions
-             SET created_at = ?1, updated_at = ?1
-             WHERE id = ?2",
-            rusqlite::params![iso(created_at), routine.id],
-        )
-        .unwrap();
-        conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
-            rusqlite::params![iso(created_at), routine.id],
-        )
-        .unwrap();
-
         let outcome = plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap();
         let PlanOutcome::Planned(occurrence) = outcome else {
             panic!("expected the latest missed occurrence, got {outcome:?}");
