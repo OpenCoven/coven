@@ -557,6 +557,65 @@ function assertTrustedState(trusted) {
       );
     }
   }
+  trusted.dispatchConsumptions.forEach((entry, index) => {
+    if (!isPlainObject(entry)) {
+      refuse(
+        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+        `Trusted dispatch consumption ${index} must be an object`
+      );
+    }
+    for (const [key, maximum] of [
+      ['bindingId', 256],
+      ['nonce', 256],
+      ['adoptionKey', 200],
+      ['occurrenceId', 160],
+      ['runId', 160],
+      ['attemptId', 160]
+    ]) {
+      if (
+        typeof entry[key] !== 'string' ||
+        [...entry[key]].length === 0 ||
+        [...entry[key]].length > maximum
+      ) {
+        refuse(
+          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+          `Trusted dispatch consumption ${index}.${key} is invalid`
+        );
+      }
+    }
+    for (const key of ['attemptNumber', 'fenceGeneration']) {
+      if (!Number.isSafeInteger(entry[key]) || entry[key] < 1) {
+        refuse(
+          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+          `Trusted dispatch consumption ${index}.${key} is invalid`
+        );
+      }
+    }
+    if (!Object.hasOwn(entry, 'approval')) {
+      refuse(
+        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+        `Trusted dispatch consumption ${index}.approval is missing`
+      );
+    }
+    if (entry.approval !== null) {
+      if (
+        !isPlainObject(entry.approval) ||
+        !['human_per_run', 'protected_owner_per_run', 'bounded_recurring'].includes(
+          entry.approval.requirement
+        ) ||
+        typeof entry.approval.approvalId !== 'string' ||
+        [...entry.approval.approvalId].length === 0 ||
+        [...entry.approval.approvalId].length > 256 ||
+        !isPlainObject(entry.approval.use) ||
+        !isPlainObject(entry.approval.consumption)
+      ) {
+        refuse(
+          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+          `Trusted dispatch consumption ${index}.approval is invalid`
+        );
+      }
+    }
+  });
 }
 
 function assertClosedTopLevel(value, allowedKeys) {
@@ -830,7 +889,9 @@ function assertTerminalDispatchConsumption(value, trusted) {
       entry.bindingId === expected.bindingId ||
       entry.nonce === expected.nonce ||
       entry.adoptionKey === expected.adoptionKey ||
-      (entry.runId === expected.runId && entry.attemptNumber === expected.attemptNumber)
+      (entry.runId === expected.runId && entry.attemptNumber === expected.attemptNumber) ||
+      (entry.occurrenceId === expected.occurrenceId &&
+        entry.fenceGeneration === expected.fenceGeneration)
   );
   if (related.length === 0) {
     refuse(

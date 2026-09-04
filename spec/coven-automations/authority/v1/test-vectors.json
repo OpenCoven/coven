@@ -1293,6 +1293,89 @@
       "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING"
     },
     {
+      "id": "malformed-terminal-dispatch-consumption-null",
+      "target": "extension",
+      "trustedMutation": {
+        "op": "add",
+        "path": "/dispatchConsumptions/-",
+        "value": null
+      },
+      "expected": "refuse",
+      "errorCode": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
+    },
+    {
+      "id": "malformed-terminal-dispatch-consumption-object",
+      "target": "extension",
+      "trustedMutation": {
+        "op": "add",
+        "path": "/dispatchConsumptions/-",
+        "value": {
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "fenceGeneration": 7
+        }
+      },
+      "expected": "refuse",
+      "errorCode": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
+    },
+    {
+      "id": "terminal-dispatch-occurrence-fence-conflict",
+      "target": "extension",
+      "trustedMutation": {
+        "op": "add",
+        "path": "/dispatchConsumptions/-",
+        "value": {
+          "bindingId": "binding:conflicting",
+          "nonce": "nonce:conflicting",
+          "adoptionKey": "adopt:conflicting",
+          "occurrenceId": "occurrence.daily-notes-20260903",
+          "runId": "run.conflicting",
+          "attemptId": "attempt.conflicting-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "approval": null
+        }
+      },
+      "expected": "refuse",
+      "errorCode": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH"
+    },
+    {
+      "id": "valid-terminal-unrelated-and-prior-fence-history",
+      "target": "extension",
+      "trustedMutations": [
+        {
+          "op": "add",
+          "path": "/dispatchConsumptions/-",
+          "value": {
+            "bindingId": "binding:unrelated",
+            "nonce": "nonce:unrelated",
+            "adoptionKey": "adopt:unrelated",
+            "occurrenceId": "occurrence.other-20260903",
+            "runId": "run.unrelated",
+            "attemptId": "attempt.unrelated-1",
+            "attemptNumber": 1,
+            "fenceGeneration": 7,
+            "approval": null
+          }
+        },
+        {
+          "op": "add",
+          "path": "/dispatchConsumptions/-",
+          "value": {
+            "bindingId": "binding:historical",
+            "nonce": "nonce:historical",
+            "adoptionKey": "adopt:historical",
+            "occurrenceId": "occurrence.daily-notes-20260903",
+            "runId": "run.historical",
+            "attemptId": "attempt.historical-1",
+            "attemptNumber": 1,
+            "fenceGeneration": 6,
+            "approval": null
+          }
+        }
+      ],
+      "expected": "accept"
+    },
+    {
       "id": "approval-expired",
       "target": "binding",
       "mutation": {

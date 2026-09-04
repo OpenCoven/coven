@@ -93,6 +93,9 @@ const REQUIRED_NEGATIVE_VECTOR_IDS = [
   'terminal-dispatch-nonce-owner-mismatch',
   'terminal-dispatch-run-owner-mismatch',
   'terminal-dispatch-attempt-owner-mismatch',
+  'malformed-terminal-dispatch-consumption-null',
+  'malformed-terminal-dispatch-consumption-object',
+  'terminal-dispatch-occurrence-fence-conflict',
   'binding-id-mismatch',
   'capability-escalation',
   'runtime-downgrade',
@@ -141,7 +144,8 @@ const REQUIRED_NEGOTIATION_VECTOR_IDS = [
 ];
 
 const REQUIRED_POSITIVE_VECTOR_IDS = [
-  'astral-runtime-id-64-code-points'
+  'astral-runtime-id-64-code-points',
+  'valid-terminal-unrelated-and-prior-fence-history'
 ];
 
 function readJson(relativePath) {
@@ -506,9 +510,9 @@ test('runs positive and explicit fail-closed authority vectors', async () => {
   const { runAuthorityVectors } = await import(pathToFileURL(validatorPath));
   const summary = runAuthorityVectors(vectors);
   assert.deepEqual(summary, {
-    total: 91,
-    accepted: 9,
-    refused: 82
+    total: 95,
+    accepted: 10,
+    refused: 85
   });
   for (const vector of vectors.cases.filter((entry) => entry.expected === 'refuse')) {
     assert.equal(
