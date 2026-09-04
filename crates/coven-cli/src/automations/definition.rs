@@ -57,6 +57,31 @@ impl RoutineTimezone {
     }
 
     pub fn resolve_for_persistence(self) -> Result<Self, String> {
+        if self != Self::Local {
+            return Ok(self);
+        }
+        #[cfg(unix)]
+        match std::env::var("TZ") {
+            Ok(value) => {
+                let timezone = Self::parse(&value).map_err(|_| {
+                    format!("TZ override must be `utc` or an exact IANA timezone, got `{value}`")
+                })?;
+                if timezone == Self::Local {
+                    return Err(
+                        "TZ override must resolve to `utc` or an exact IANA timezone, not `local`"
+                            .to_string(),
+                    );
+                }
+                return Ok(timezone);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(
+                    "TZ override must be valid UTF-8 naming `utc` or an exact IANA timezone"
+                        .to_string(),
+                );
+            }
+        }
         self.resolve_local_with(|| {
             iana_time_zone::get_timezone()
                 .map_err(|error| format!("could not determine the system IANA timezone: {error}"))
@@ -340,6 +365,54 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "platform did not provide a TZID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_rejects_an_unrepresentable_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_rejects_an_unrepresentable_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let error = RoutineTimezone::Local
+                .resolve_for_persistence()
+                .unwrap_err();
+            assert!(error.contains("TZ"), "{error}");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", ":/tmp/coven-custom-zoneinfo")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_prefers_an_iana_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_IANA_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_prefers_an_iana_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let timezone = RoutineTimezone::Local.resolve_for_persistence().unwrap();
+            assert_eq!(timezone.as_str(), "Pacific/Kiritimati");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Pacific/Kiritimati")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
     }
 
     #[test]

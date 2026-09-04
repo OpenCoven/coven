@@ -48,7 +48,7 @@
     { "object": "AutomationDefinition", "field": "deletion", "status": "optional-since-v1", "changeClass": "additive-optional-field" },
     { "object": "AutomationDefinition", "field": "display", "status": "required-since-v1", "changeClass": "incompatible-field-change" },
     { "object": "AutomationDefinition", "field": "trigger", "status": "required-since-v1", "changeClass": "additive-variant" },
-    { "object": "AutomationDefinition", "field": "trigger.schedule.timezone", "status": "required-since-v1; canonical utc or validated IANA TZID; local is compatibility input outside the durable object", "changeClass": "incompatible-field-change" },
+    { "object": "AutomationDefinition", "field": "trigger.schedule.timezone", "status": "required-since-v1; canonical utc or validated IANA TZID; local is compatibility input outside the durable object; Unix TZ overrides must be utc or an exact IANA TZID and otherwise fail closed", "changeClass": "incompatible-field-change" },
     { "object": "AutomationDefinition", "field": "conditions", "status": "optional-since-v1", "changeClass": "additive-variant" },
     { "object": "AutomationDefinition", "field": "action", "status": "required-since-v1", "changeClass": "additive-variant" },
     { "object": "AutomationDefinition", "field": "binding", "status": "required-since-v1", "changeClass": "incompatible-field-change" },

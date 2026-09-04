@@ -25,6 +25,6 @@
     "All objects in this profile are JSON per draft 2020-12 schemas in this directory.",
     "Digests and any future signatures are computed over RFC 8785 (JCS) canonical JSON, never over ad-hoc serialization.",
     "Timestamps are RFC 3339 UTC with millisecond precision (for example 2026-08-30T09:00:00.000Z), matching the #816 store encoding.",
-    "Durable schedule timezones are canonical `utc` or exact IANA TZIDs. Legacy `local` is resolved before persistence and is not a durable v1 value."
+    "Durable schedule timezones are canonical `utc` or exact IANA TZIDs. Legacy `local` is resolved before persistence and is not a durable v1 value; on Unix, an effective TZ override must itself be `utc` or an exact IANA TZID and otherwise fails closed."
   ]
 }

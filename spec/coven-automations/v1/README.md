@@ -38,7 +38,10 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 - Historical records pin the exact definition revision and digest they were created and executed against, and are never reinterpreted by current definitions.
 - Durable schedule timezones are canonical `utc` or validated IANA TZIDs. Legacy
   `local` is accepted only at compatibility boundaries, resolved before
-  persistence, and recorded as an explicit definition-revision migration.
+  persistence, and recorded as an explicit definition-revision migration. On
+  Unix, an effective `TZ` override must itself name `utc` or an exact IANA TZID;
+  POSIX rules, zone-file paths, and malformed values fail closed rather than
+  silently falling back to the host zone.
 - Spring-forward gaps skip nonexistent wall times. Fall-back folds select the
   first occurrence (the earlier UTC instant). Both rules are deterministic and
   pinned by `test-vectors.json`.

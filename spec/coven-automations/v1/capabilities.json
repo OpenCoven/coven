@@ -48,7 +48,7 @@
     },
     {
       "variant": "timezone.local.durable",
-      "reason": "`local` is accepted only by compatibility entry points and must resolve to an exact IANA TZID before persistence."
+      "reason": "`local` is accepted only by compatibility entry points and must resolve to `utc` or an exact IANA TZID before persistence; Unix TZ overrides that are POSIX rules, zone-file paths, or malformed values fail closed."
     },
     {
       "variant": "outputTarget.atomic",
