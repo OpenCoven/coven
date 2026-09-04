@@ -567,6 +567,12 @@ fn render_ward_pending(body: &Value) -> String {
         "\nDecide: coven ward approve <id> [--note \"rationale\"] · \
          coven ward reject <id> [--note \"reason\"]\n",
     );
+    if body.get("hasMore").and_then(Value::as_bool) == Some(true) {
+        out.push_str(
+            "\nMore pending proposals remain. Use the API `nextCursor` with \
+             `GET /api/v1/threads/proposals?cursor=...` to fetch the next bounded page.\n",
+        );
+    }
     out
 }
 
@@ -1571,6 +1577,29 @@ mod tests {
             rendered.contains("reject <id> [--note \"reason\"]"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn ward_pending_renderer_surfaces_bounded_page_continuation() {
+        let body = json!({
+            "proposals": [{
+                "proposalId": "proposal-1",
+                "familiarId": "sage",
+                "reviewKind": "coherence",
+                "stagedAt": "2026-07-27T00:00:00Z",
+                "targets": ["reviewed/SKILL.md"]
+            }],
+            "hasMore": true,
+            "nextCursor": "opaque"
+        });
+
+        let rendered = render_ward_pending(&body);
+
+        assert!(
+            rendered.contains("More pending proposals remain"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("nextCursor"), "{rendered}");
     }
 
     #[test]

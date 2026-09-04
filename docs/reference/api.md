@@ -5,7 +5,7 @@ read_when:
   - Building a client against `/api/v1`
 title: "Coven API reference"
 description: "Endpoint reference for every route the Coven daemon serves under /api/v1: contract discovery, sessions and events, observability reads, familiars, skills, store, cast, travel, scheduler, and the hub control plane."
-source_adjacent_reason: "Tracks the daemon API implemented in this repository."
+source_adjacent_reason: "Tracks the daemon API and security contracts implemented in this repository."
 ---
 
 
@@ -177,7 +177,96 @@ or public state.
 |---|---|---|---|---|
 | POST | `/api/v1/cast` | Submit a cast line (status/delegation shorthand) to the cockpit session. | `202 { accepted, cast_id, echo }` | `400 invalid_request` |
 | PUT | `/api/v1/familiars/:id/icon` | Update a familiar's icon glyph. | updated familiar | `400`, `404` |
-| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Held writes stage with deterministic Gate-3 probe evidence; applied writes append `apply_audit` rows to the `ward_audit` ledger. | edit report | `400`, `403` (ward denial), `404` |
+| POST | `/api/v1/familiars/:id/edits` | Ward-adjudicated writes into a familiar home (Gates 1–2, fail-closed, audited). Held writes stage with deterministic Gate-3 probe evidence; applied writes append `apply_audit` rows to the `ward_audit` ledger. | edit report | `400`, `403` (ward denial), `404`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
+
+Direct multi-edit requests stage every cleared Tier-2/Tier-3 change before
+commit and share one rollback boundary. Direct writes and proposal approvals
+share one commit-through-Gate-4 serialization boundary, so ledger order matches
+filesystem commit order across both pathways. A commit failure that is fully
+rolled back returns `500 ward_apply_failed` with `writeApplied: false`. If all
+writes commit but randomized backup cleanup fails, Coven
+persists the complete Gate-4 audit report before returning `500
+ward_apply_cleanup_failed` with
+`writeApplied: true` and `retrySafe: false`. A proven rollback with incomplete
+staging/backup cleanup returns `500 ward_apply_rollback_cleanup_failed` with
+`writeApplied: false`, the affected `targets`, and `retrySafe: false`. If
+rollback cannot be proven, the response is `500 ward_apply_ambiguous` with
+`writeApplied: null`, affected `targets`, and `retrySafe: false`; clients must
+inspect state rather than blindly retry.
+
+If the files commit but the Gate-4 transaction cannot be persisted, the
+endpoint returns `500 audit_persist_failed` with `writeApplied: true`,
+`retrySafe: false`, and the complete per-change `audit` records in `changes`.
+Those returned records are the recoverable audit outcome required for the
+committed write; they are not a claim that the ledger append succeeded.
+Clients must retain/escalate that response and reconcile the ledger rather
+than replaying the file edit.
+
+Every submitted Ward request accepts at most 32 edits, including Tier-0/Tier-1
+edits that will be held or staged and Tier-2/Tier-3 edits eligible for direct
+apply. Proposed contents may total at most 16 MiB (16,777,216 bytes). During
+direct apply, proposal approval, and recovery, existing-file before-images
+consume the same 16 MiB aggregate retained-content budget; no single
+before-image may exceed 16 MiB.
+
+Transport framing bounds the initial JSON parse before this handler runs:
+loopback TCP accepts at most 1 MiB and the local Unix-socket/Windows-pipe
+transport accepts at most 4 MiB. Immediately after extracting the body’s
+borrowed edit array, the handler checks the edit count and proposed byte total.
+That check precedes `FileEdit` allocation, content cloning, Ward/Gate-2
+adjudication, gate-store access, probe execution, and proposal staging, so the
+transport-bounded parse cannot fan out into attacker-sized follow-on work.
+
+Approved and recovered on-disk proposals are untrusted and are checked again
+before full envelope deserialization, staged-content decoding, or any target
+open/staging. The pending edits, `materialized_diff.surfaces`,
+`decisionState.beforeImages`, and derived replay-byte collections each pass
+their own 32-entry/16 MiB bound first. Materialized `after` bytes are then
+matched exactly by surface identity and content against `pending.edits`;
+persisted before-images are included in the logical apply aggregate. This
+prevents duplicated Phase-5 fields from amplifying a small pending edit into an
+unbounded typed allocation.
+
+The generic proposal-envelope parser retains its 406,847,488-byte (388 MiB)
+syntactic ceiling, derived from the 16 MiB content policy, worst-case
+tagged-string/decimal-byte-array expansion, and 4 MiB of structural overhead.
+Active pending storage is intentionally much smaller: no individual pending
+proposal and no aggregate pending set may exceed the 64 MiB global pending
+quota described below. Metadata rejects either ceiling before allocating the
+body, and the subsequent bounded read catches concurrent growth.
+Decision-state rewrites use compact JSON so valid proposals do not gain
+avoidable formatting amplification.
+
+One existing edit can retain three file descriptors through finalization (the
+before-image, installed staging inode, and displaced backup), so 32 bounds the
+worst case at 96 descriptors and leaves substantial daemon headroom under the
+portable low 256-descriptor soft limit common on macOS and Linux.
+
+After validation, direct preparation borrows the proposed buffers instead of
+cloning them. Existing targets are rejected from logical metadata length before
+allocation when possible, so sparse files over the limit are too large even if
+their allocated disk blocks are small. The subsequent read is also capped,
+covering growth after metadata inspection.
+
+This is a retained-content budget rather than a hard whole-process heap limit.
+Bounded reads and installed/displaced-byte verification use one fixed 64 KiB
+stack scratch buffer at a time, plus constant-size SHA-256 state and, when
+needed, one 64-character digest; verification never allocates a file-sized
+`Vec`. A limit failure occurs before staging or commit and returns `413
+ward_apply_too_large` with `writeApplied: false`. Approval leaves the pending
+proposal (or durable recovery claim) intact and performs no partial write.
+Details identify `directBatchEdits` (including `attemptedEdits` and `maxEdits`),
+`existingBeforeImageBytes` (including `target`, `observedBytes`, and
+`maxBytes`), `directBatchRetainedBytes` (including `attemptedBytes` and
+`maxBytes`), or `proposalEnvelopeBytes` for the encoded on-disk cap. The
+`directBatch*` labels are retained for wire compatibility but apply to all Ward
+edits and approved/recovered proposals. Operators should shrink or archive an
+oversized existing target; clients should split an over-count or
+aggregate-heavy request. A globally oversized pending envelope instead returns
+`proposal_quota_exceeded`; list/scheduler maintenance quarantines it out of the
+active queue, after which the operator can inspect or remove the quarantine
+artifact. Retry only after changing the target, request, or pending capacity
+that exceeded the reported limit.
 
 ## Ward proposals (threads)
 
@@ -189,10 +278,112 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|
 | GET | `/api/v1/threads/weaves` | Per-familiar weave/authority state (degraded configs reported inline). | weave entries | — |
-| GET | `/api/v1/threads/proposals` | Pending proposals with compact `probeSummary` evidence (unparseable files reported as `degraded` entries, newest first). | `{ proposals }` | — |
-| GET | `/api/v1/threads/proposals/:id` | One pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request` / `404 proposal_not_found` |
-| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. | decision report | `400`, `404`, `409` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. | decision report | `400`, `404`, `409` |
+| GET | `/api/v1/threads/proposals` | Owner-local cursor-paginated pending proposals with compact `probeSummary` evidence. `limit` defaults to and is capped at 64; pass the opaque `nextCursor` as `cursor`. Invalid files are reported once as `degraded` and quarantined. | `{ proposals, limit, hasMore, nextCursor }` | `400 invalid_request`, `403 transport_forbidden` |
+| GET | `/api/v1/threads/proposals/:id` | Owner-local detail for one pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request`, `403 transport_forbidden`, `404 proposal_not_found` |
+| POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
+
+Proposal metadata includes familiar identity, target paths, writer
+fingerprints, hashes, and probe diagnostics, so reads and mutations both
+require owner-local IPC. Automatic expiry/apply and interrupted-decision
+recovery are internal daemon work and have no TCP route. Any loopback TCP
+request under `/api/v1/threads/proposals` fails with stable
+`403 transport_forbidden` before UUID parsing, pending-file lookup, claim
+creation, target access, or audit append. The response includes
+`details: { requiredAuthority: "owner_local_ipc", writeApplied: false }`.
+Host/Origin allowlists do not elevate TCP authority.
+
+### Pending-proposal capacity and bounded maintenance
+
+The active `~/.coven/pending/` store admits at most **64 proposals** totaling
+at most **64 MiB (67,108,864 bytes)** of actual serialized file bytes. Pending
+`.json` files and durable `.json.approve.deciding` /
+`.json.reject.deciding` claims both count. The limits are deliberately far
+below "hundreds of MiB per item times a large queue": local request bodies are
+already capped at 4 MiB, so 64 MiB leaves room for several maximum-size local
+submissions or a broad backlog of ordinary reviews while bounding disk use and
+aggregate parse cost. The same admission path applies to owner-local IPC and
+the optional loopback TCP listener.
+
+Admission serializes creators with both an in-process mutex and an
+OS-backed lock file. While holding that lock Coven reconciles count and logical
+bytes from the actual directory, uses checked arithmetic, and includes the
+exact final serialized bytes before atomically renaming the sibling staging
+file into place. Approval-claim and recovery-state rewrites replace the old
+file in the same byte accounting. Rejection and expiry retain a bounded
+per-file terminal rewrite escape hatch so a queue already at or above quota can
+still be audited and drained; those paths never mutate a target and consume the
+claim immediately after the terminal audit. No fragile persisted counter is
+trusted, so restart reconciliation is automatic. Approval, rejection, veto,
+expiry, terminal retry cleanup, operator deletion, and quarantine release
+capacity as soon as their active file leaves the pending directory.
+
+Quota refusal is the stable `413 proposal_quota_exceeded` contract. Details
+carry `limit: pendingProposalCount` with `currentCount`, `attemptedCount`, and
+`maxCount`, or `limit: pendingProposalBytes` with `currentBytes`,
+`incomingBytes`, `attemptedBytes`, and `maxBytes`. Both forms include
+`writeApplied: false` and `retrySafe: true`. A proposal larger than the entire
+64 MiB quota is rejected before publication; sibling staging files are cleaned
+and no target mutation occurs.
+
+List pages use deterministic on-disk filename ordering so the opaque cursor can
+advance without parsing the full backlog. At most the requested 1–64 files are
+opened and parsed in one request. The scheduler similarly processes at most
+**16 proposal or recovery-claim files per 30-second tick** and persists its
+round-robin cursor, so human-only entries cannot starve later automatic work.
+
+Pending proposals expire after **30 days**. Expiry follows the durable decision
+path: Coven records a `proposal_rejected` audit row with decision `expired`,
+removes the active file, and never applies its target. An interrupted expiry
+persists an internal decision request and resumes safely on a later tick.
+
+### Durable audit capacity
+
+The append-only `ward_audit` ledger has a durable default capacity of
+**256 MiB (268,435,456 charged bytes)**. Charges are deterministic: exact
+serialized SQLite field lengths plus a conservative four-page per-row overhead.
+The capacity row and in-flight reservations live in `coven.sqlite3`, so daemon
+restart cannot forget committed use or hand reserved bytes to a competing
+writer. Admission uses `BEGIN IMMEDIATE`; the reservation is acquired while the
+same process-wide Ward write/audit lock is held, before Gate-4 validation,
+proposal publication, claim creation, or target mutation. The connection-local
+insert trigger debits that durable reservation in the same SQLite transaction
+as each audit row, so concurrent writers cannot over-admit.
+
+SQLite WAL behavior is bounded separately. Writable connections checkpoint
+after roughly **4 MiB**, retain at most **16 MiB** after reset, and Ward
+admission enforces a durable **128 MiB** WAL ceiling after attempting
+`PASSIVE` and, when necessary, `TRUNCATE` checkpointing. A long-lived reader
+that pins the WAL therefore causes a fail-closed admission error rather than
+unbounded growth.
+
+Capacity refusal is stable `507 ward_audit_capacity_exceeded`. Details include
+`resource` (`ledger` or `wal`), `limitBytes`, `usedBytes`, `requiredBytes`,
+`availableBytes`, `writeApplied`, and `retrySafe`. Normal admission failures
+return `writeApplied: false` before proposal publication or file mutation.
+Recovery paths that may already have committed bytes report
+`writeApplied: null`; existing exceptional post-commit responses continue to
+report `writeApplied: true` and include the complete returned per-change audit
+outcome rather than claiming rollback.
+
+Coven never deletes, truncates, or compacts `ward_audit` evidence. When capacity
+is exhausted, stop the daemon, take and verify a consistent SQLite backup of
+`coven.sqlite3` (including committed WAL content), and use
+`coven ward audit <familiar> --json` as a bounded human-readable verification
+view. Then raise the operator-controlled
+`coven_ward_audit_capacity.limit_bytes` in the stopped database; raise
+`wal_limit_bytes` only when the storage budget permits. Retain the backup as
+the archive before restarting. Coven has no automatic audit prune path, and
+operators must not delete rows from `ward_audit`; append-only triggers reject
+updates and deletes.
+
+Before JSON parsing, list, detail, approval, recovery, and scheduler paths
+require a regular file and preflight logical metadata size. Invalid,
+non-regular, corrupt, or globally oversized scheduler/list candidates move to
+`~/.coven/pending/quarantine/` and leave the hot path. Quarantined bytes are not
+active quota, but they still consume disk; operators should inspect the daemon
+recovery log, retain any evidence they need, and remove archived quarantine
+files on their normal storage-retention schedule.
 
 Probe evidence is additive sidecar data, so the underlying
 `coven_threads_core::PendingProposal` remains backward-readable. A missing

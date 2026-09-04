@@ -63,6 +63,7 @@ mod privacy;
 mod project;
 mod prompt_refs;
 mod proposal_scheduler;
+mod proposal_store;
 mod pty_runner;
 mod repos_config;
 mod reset;

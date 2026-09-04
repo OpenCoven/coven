@@ -62,7 +62,7 @@ const PROTECTED_CHANNELS: [threads::Channel; 3] = [
 /// until the Phase 3 portability format defines the real contract hash.
 const SERIALIZATION_CONTRACT: &[u8] = b"coven-threads:serialization-contract:v0.1.0";
 const SERIALIZATION_FORMAT_VERSION: &str = "0.1.0";
-const MAX_SURFACE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SURFACE_BYTES: u64 = crate::ward::WARD_FILE_CONTENT_MAX_BYTES;
 
 /// What the gate decided about a proposal, as a unit.
 #[derive(Debug)]
@@ -172,6 +172,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         gated_targets,
         authorization,
     } = *req;
+    ward::validate_file_edit_budget(edits)?;
     if gated_targets.is_empty() {
         return Ok(GateReport {
             verdicts: Vec::new(),
@@ -272,6 +273,24 @@ pub(crate) fn build_weave_state(
         config,
         extra_targets,
         bootstrap_missing_baselines,
+        None,
+    )
+}
+
+fn build_read_only_weave_state(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+) -> Result<WeaveState> {
+    build_weave_state_for_writer(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        false,
         None,
     )
 }
@@ -415,6 +434,49 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
     Ok(read_surface_if_exists(workspace, surface)?.unwrap_or_default())
 }
 
+#[derive(Clone, Copy)]
+enum SurfaceReadPolicy {
+    WardFile,
+    WardEditBudget { retained_content_bytes: u64 },
+}
+
+impl SurfaceReadPolicy {
+    fn max_bytes(self) -> u64 {
+        match self {
+            Self::WardFile => MAX_SURFACE_BYTES,
+            Self::WardEditBudget {
+                retained_content_bytes,
+            } => MAX_SURFACE_BYTES
+                .min(ward::WARD_RETAINED_CONTENT_MAX_BYTES.saturating_sub(retained_content_bytes)),
+        }
+    }
+
+    fn limit_error(self, surface: &str, observed_bytes: u64) -> anyhow::Error {
+        match self {
+            Self::WardFile => anyhow::anyhow!(
+                "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
+            ),
+            Self::WardEditBudget {
+                retained_content_bytes: _,
+            } if observed_bytes > ward::WARD_FILE_CONTENT_MAX_BYTES => {
+                ward::WardEditBudgetFailure::ExistingBeforeImage {
+                    target: surface.to_string(),
+                    observed_bytes,
+                    max_bytes: ward::WARD_FILE_CONTENT_MAX_BYTES,
+                }
+                .into()
+            }
+            Self::WardEditBudget {
+                retained_content_bytes,
+            } => ward::WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: retained_content_bytes.saturating_add(observed_bytes),
+                max_bytes: ward::WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+            .into(),
+        }
+    }
+}
+
 /// The confined surface read with file absence preserved.
 ///
 /// Probe evidence needs to distinguish an absent baseline from an existing
@@ -422,6 +484,37 @@ pub(crate) fn read_surface(workspace: &Path, surface: &str) -> Result<Vec<u8>> {
 /// authority weave keeps its historical absent-as-empty convention through
 /// [`read_surface`].
 pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<Option<Vec<u8>>> {
+    read_surface_if_exists_with_policy(workspace, surface, SurfaceReadPolicy::WardFile)
+}
+
+pub(crate) fn read_surface_if_exists_with_budget(
+    workspace: &Path,
+    surface: &str,
+    budget: &mut ward::WardEditBudget,
+) -> Result<Option<Vec<u8>>> {
+    let contents = read_surface_if_exists_with_policy(
+        workspace,
+        surface,
+        SurfaceReadPolicy::WardEditBudget {
+            retained_content_bytes: budget.retained_content_bytes(),
+        },
+    )?;
+    if let Some(contents) = contents.as_deref() {
+        budget.reserve_retained_content(u64::try_from(contents.len()).map_err(|_| {
+            ward::WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: ward::WARD_RETAINED_CONTENT_MAX_BYTES,
+            }
+        })?)?;
+    }
+    Ok(contents)
+}
+
+fn read_surface_if_exists_with_policy(
+    workspace: &Path,
+    surface: &str,
+    policy: SurfaceReadPolicy,
+) -> Result<Option<Vec<u8>>> {
     if surface.starts_with('/') || surface.starts_with('\\') {
         anyhow::bail!("protected surface `{surface}` must be workspace-relative");
     }
@@ -486,10 +579,9 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
     if !metadata.is_file() {
         anyhow::bail!("protected surface `{surface}` is not a regular file inside the workspace");
     }
-    if metadata.len() > MAX_SURFACE_BYTES {
-        anyhow::bail!(
-            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
-        );
+    let max_bytes = policy.max_bytes();
+    if metadata.len() > max_bytes {
+        return Err(policy.limit_error(surface, metadata.len()));
     }
     let mut options = OpenOptions::new();
     options
@@ -507,19 +599,15 @@ pub(crate) fn read_surface_if_exists(workspace: &Path, surface: &str) -> Result<
     if !opened_metadata.is_file() || metadata_is_windows_reparse_point(&opened_metadata) {
         anyhow::bail!("protected surface `{surface}` is not a regular file inside the workspace");
     }
-    if opened_metadata.len() > MAX_SURFACE_BYTES {
-        anyhow::bail!(
-            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
-        );
+    if opened_metadata.len() > max_bytes {
+        return Err(policy.limit_error(surface, opened_metadata.len()));
     }
-    let mut bytes = Vec::with_capacity(opened_metadata.len().min(MAX_SURFACE_BYTES) as usize);
-    file.take(MAX_SURFACE_BYTES + 1)
+    let mut bytes = Vec::with_capacity(opened_metadata.len().min(max_bytes) as usize);
+    file.take(max_bytes + 1)
         .read_to_end(&mut bytes)
         .with_context(|| format!("reading surface `{surface}`"))?;
-    if bytes.len() as u64 > MAX_SURFACE_BYTES {
-        anyhow::bail!(
-            "protected surface `{surface}` exceeds the {MAX_SURFACE_BYTES}-byte baseline cap"
-        );
+    if bytes.len() as u64 > max_bytes {
+        return Err(policy.limit_error(surface, bytes.len() as u64));
     }
     Ok(Some(bytes))
 }
@@ -680,8 +768,19 @@ pub(crate) fn append_audit_row(
 /// SHA-256 and the pre-write hash plus byte count ride in the `detail` JSON
 /// (`{"prev_sha256":…,"bytes_written":…}`). The weave view is read-only:
 /// persisting audit rows must not bootstrap baselines.
+#[cfg(test)]
 pub fn persist_apply_audit_records(
     conn: &mut Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    report: &ward::ApplyReport,
+) -> Result<()> {
+    persist_apply_audit_records_on_connection(conn, familiar_id, workspace, config, report)
+}
+
+pub(crate) fn persist_apply_audit_records_on_connection(
+    conn: &Connection,
     familiar_id: &str,
     workspace: &Path,
     config: &ward::WardConfig,
@@ -690,28 +789,39 @@ pub fn persist_apply_audit_records(
     if report.audit_records().next().is_none() {
         return Ok(());
     }
-    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
-    let transaction = conn
-        .transaction()
-        .context("starting apply-audit batch transaction")?;
-    append_apply_audit_records(
-        &transaction,
-        None,
-        familiar_id,
-        state.weave.weave_hash(),
-        report,
-        threads::Channel::Mutation,
-    )?;
-    transaction
-        .commit()
-        .context("committing apply-audit batch transaction")
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .context("starting apply-audit batch transaction")?;
+    }
+    let result = (|| -> Result<()> {
+        let state = build_read_only_weave_state(conn, familiar_id, workspace, config, &[])?;
+        append_apply_audit_records(
+            conn,
+            None,
+            familiar_id,
+            state.weave.weave_hash(),
+            report,
+            threads::Channel::Mutation,
+        )?;
+        if owns_transaction {
+            conn.execute_batch("COMMIT")
+                .context("committing apply-audit batch transaction")?;
+        }
+        Ok(())
+    })();
+    if result.is_err() && owns_transaction {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
 }
 
 /// Append the Ward's logged apply records to an existing transaction scope.
 ///
 /// Proposal finalization uses this form so `apply_audit` rows and the terminal
-/// proposal event commit as one unit. Direct writes wrap it in their own
-/// transaction via [`persist_apply_audit_records`].
+/// proposal event commit as one unit. Direct writes use
+/// [`persist_apply_audit_records_on_connection`] to append within the existing
+/// transaction when present, or a dedicated transaction otherwise.
 pub(crate) fn append_apply_audit_records(
     conn: &Connection,
     proposal_id: Option<&str>,
@@ -818,6 +928,7 @@ pub fn stage_coherence_proposal(
     edits: &[ward::FileEdit],
     authorization: &ward::Authorization,
 ) -> Result<(PathBuf, String)> {
+    ward::validate_file_edit_budget(edits)?;
     let request_writer = match &authorization.principal_signature_fingerprint {
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
@@ -903,6 +1014,7 @@ fn stage_pending_proposal(
     now: time::OffsetDateTime,
     probe_context: StagingProbeContext<'_>,
 ) -> Result<(PathBuf, String)> {
+    ward::validate_file_edit_budget(edits)?;
     let proposal = threads::PendingProposal {
         id: threads::ProposalId::new(),
         familiar_id: *familiar_uuid,
@@ -950,12 +1062,7 @@ fn stage_pending_proposal(
         })
         .context("serializing pending proposal")?
     };
-    // Atomic sibling-staged write, same discipline as the Ward's own writes.
-    let staged = path.with_extension("json.staged");
-    std::fs::write(&staged, &body)
-        .with_context(|| format!("staging pending proposal at {}", staged.display()))?;
-    std::fs::rename(&staged, &path)
-        .with_context(|| format!("committing pending proposal at {}", path.display()))?;
+    crate::proposal_store::publish_new(coven_home, &path, &body)?;
     Ok((path, proposal.id.0.to_string()))
 }
 
@@ -1065,6 +1172,52 @@ tier = 2
             )
             .unwrap();
         assert_eq!(count, 0, "the failed batch must leave no partial rows");
+    }
+
+    #[test]
+    fn persist_apply_audit_records_uses_an_existing_transaction() {
+        let f = fixture();
+        let config = ward_config();
+        let ward = ward::Ward::new(f.workspace.clone(), config.clone()).unwrap();
+        let report = ward
+            .apply(
+                &[
+                    ward::FileEdit::new("notes/a.md", "one"),
+                    ward::FileEdit::new("notes/b.md", "two"),
+                ],
+                &ward::Authorization::unsigned(),
+            )
+            .unwrap();
+
+        f.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        persist_apply_audit_records_on_connection(&f.conn, "sage", &f.workspace, &config, &report)
+            .unwrap();
+        let count_in_transaction: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_in_transaction, 2,
+            "existing transaction should see both audit rows"
+        );
+
+        f.conn.execute_batch("ROLLBACK").unwrap();
+        let count_after_rollback: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after_rollback, 0,
+            "outer rollback must still control audit rows"
+        );
     }
 
     fn soul_edit() -> Vec<ward::FileEdit> {
