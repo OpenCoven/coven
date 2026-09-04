@@ -95,6 +95,8 @@ const REQUIRED_NEGATIVE_VECTOR_IDS = [
   'terminal-dispatch-attempt-owner-mismatch',
   'malformed-terminal-dispatch-consumption-null',
   'malformed-terminal-dispatch-consumption-object',
+  'malformed-unrelated-dispatch-consumption-identifier',
+  'malformed-unrelated-dispatch-consumption-approval',
   'terminal-dispatch-occurrence-fence-conflict',
   'binding-id-mismatch',
   'capability-escalation',
@@ -510,9 +512,9 @@ test('runs positive and explicit fail-closed authority vectors', async () => {
   const { runAuthorityVectors } = await import(pathToFileURL(validatorPath));
   const summary = runAuthorityVectors(vectors);
   assert.deepEqual(summary, {
-    total: 95,
+    total: 97,
     accepted: 10,
-    refused: 85
+    refused: 87
   });
   for (const vector of vectors.cases.filter((entry) => entry.expected === 'refuse')) {
     assert.equal(

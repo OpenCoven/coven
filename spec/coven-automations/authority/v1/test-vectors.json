@@ -1209,6 +1209,11 @@
           "op": "replace",
           "path": "/dispatchConsumptions/0/runId",
           "value": "run.other"
+        },
+        {
+          "op": "replace",
+          "path": "/dispatchConsumptions/0/approval/consumption/runId",
+          "value": "run.other"
         }
       ],
       "expected": "refuse",
@@ -1222,6 +1227,11 @@
           "op": "replace",
           "path": "/dispatchConsumptions/0/attemptNumber",
           "value": 2
+        },
+        {
+          "op": "replace",
+          "path": "/dispatchConsumptions/0/approval/consumption/attemptNumber",
+          "value": 2
         }
       ],
       "expected": "refuse",
@@ -1234,6 +1244,11 @@
         {
           "op": "replace",
           "path": "/dispatchConsumptions/0/fenceGeneration",
+          "value": 8
+        },
+        {
+          "op": "replace",
+          "path": "/dispatchConsumptions/0/approval/consumption/fenceGeneration",
           "value": 8
         }
       ],
@@ -1312,6 +1327,53 @@
         "value": {
           "occurrenceId": "occurrence.daily-notes-20260903",
           "fenceGeneration": 7
+        }
+      },
+      "expected": "refuse",
+      "errorCode": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
+    },
+    {
+      "id": "malformed-unrelated-dispatch-consumption-identifier",
+      "target": "extension",
+      "trustedMutation": {
+        "op": "add",
+        "path": "/dispatchConsumptions/-",
+        "value": {
+          "bindingId": " ",
+          "nonce": "nonce:unrelated-invalid",
+          "adoptionKey": "adopt:unrelated-invalid",
+          "occurrenceId": "occurrence.other-invalid",
+          "runId": "run.unrelated-invalid",
+          "attemptId": "attempt.unrelated-invalid-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "approval": null
+        }
+      },
+      "expected": "refuse",
+      "errorCode": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
+    },
+    {
+      "id": "malformed-unrelated-dispatch-consumption-approval",
+      "target": "extension",
+      "trustedMutation": {
+        "op": "add",
+        "path": "/dispatchConsumptions/-",
+        "value": {
+          "bindingId": "binding:unrelated-approval",
+          "nonce": "nonce:unrelated-approval",
+          "adoptionKey": "adopt:unrelated-approval",
+          "occurrenceId": "occurrence.other-approval",
+          "runId": "run.unrelated-approval",
+          "attemptId": "attempt.unrelated-approval-1",
+          "attemptNumber": 1,
+          "fenceGeneration": 7,
+          "approval": {
+            "requirement": "bounded_recurring",
+            "approvalId": "approval:unrelated",
+            "use": {},
+            "consumption": {}
+          }
         }
       },
       "expected": "refuse",

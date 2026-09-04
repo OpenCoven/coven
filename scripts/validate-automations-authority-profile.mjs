@@ -77,6 +77,53 @@ const EXTENSION_KEYS = new Set([
   'receiptEvidence'
 ]);
 
+const DISPATCH_CONSUMPTION_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'bindingId',
+    'nonce',
+    'adoptionKey',
+    'occurrenceId',
+    'runId',
+    'attemptId',
+    'attemptNumber',
+    'fenceGeneration',
+    'approval'
+  ],
+  properties: {
+    bindingId: { $ref: 'common.schema.json#/$defs/opaqueIdentifier' },
+    nonce: { $ref: 'common.schema.json#/$defs/opaqueIdentifier' },
+    adoptionKey: { $ref: 'common.schema.json#/$defs/baseAdoptionKey' },
+    occurrenceId: { $ref: 'common.schema.json#/$defs/baseOccurrenceId' },
+    runId: { $ref: 'common.schema.json#/$defs/baseRunId' },
+    attemptId: { $ref: 'common.schema.json#/$defs/baseAttemptId' },
+    attemptNumber: { type: 'integer', minimum: 1, maximum: 9007199254740991 },
+    fenceGeneration: { type: 'integer', minimum: 1, maximum: 9007199254740991 },
+    approval: {}
+  }
+};
+
+const DISPATCH_APPROVAL_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['requirement', 'approvalId', 'use', 'consumption'],
+  properties: {
+    requirement: {
+      enum: ['human_per_run', 'protected_owner_per_run', 'bounded_recurring']
+    },
+    approvalId: { $ref: 'common.schema.json#/$defs/opaqueIdentifier' },
+    use: {},
+    consumption: {}
+  }
+};
+
+const TRUSTED_PLACEHOLDER_DIGEST = {
+  algorithm: 'sha256',
+  canonicalization: 'jcs-rfc8785',
+  value: '0'.repeat(64)
+};
+
 const TRUSTED_REQUIRED_KEYS = [
   'dispatchNow',
   'receiptId',
@@ -158,6 +205,76 @@ export class AuthorityProfileError extends Error {
     super(message);
     this.name = 'AuthorityProfileError';
     this.code = code;
+  }
+}
+
+function trustedSchemaErrors(value, schema) {
+  const schemas = schemaRegistry();
+  return schemaErrors(value, schema, schema, schemas);
+}
+
+function refuseTrustedDispatch(index, detail) {
+  refuse(
+    'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
+    `Trusted dispatch consumption ${index} is invalid: ${detail}`
+  );
+}
+
+function assertTrustedDispatchConsumption(entry, index) {
+  const recordErrors = trustedSchemaErrors(entry, DISPATCH_CONSUMPTION_SCHEMA);
+  if (recordErrors.length > 0) {
+    refuseTrustedDispatch(index, recordErrors[0]);
+  }
+  if (entry.approval === null) {
+    return;
+  }
+  const approvalErrors = trustedSchemaErrors(entry.approval, DISPATCH_APPROVAL_SCHEMA);
+  if (approvalErrors.length > 0) {
+    refuseTrustedDispatch(index, approvalErrors[0]);
+  }
+
+  const syntheticApproval = {
+    requirement: entry.approval.requirement,
+    evidence: {
+      approvalId: entry.approval.approvalId,
+      approvalDigest: TRUSTED_PLACEHOLDER_DIGEST,
+      state: 'approved'
+    },
+    scopeDigest: TRUSTED_PLACEHOLDER_DIGEST,
+    expiresAt: '2000-01-01T00:00:00.000Z',
+    use: entry.approval.use,
+    consumption: entry.approval.consumption
+  };
+  const schemas = schemaRegistry();
+  const common = schemas.get('common.schema.json');
+  const shapeErrors = schemaErrors(
+    syntheticApproval,
+    common.$defs.approvalBinding,
+    common,
+    schemas
+  );
+  if (shapeErrors.length > 0) {
+    refuseTrustedDispatch(index, shapeErrors[0]);
+  }
+
+  const consumption = entry.approval.consumption;
+  if (
+    consumption.occurrenceId !== entry.occurrenceId ||
+    consumption.runId !== entry.runId ||
+    consumption.attemptNumber !== entry.attemptNumber ||
+    consumption.fenceGeneration !== entry.fenceGeneration
+  ) {
+    refuseTrustedDispatch(index, 'approval consumption does not match its ownership record');
+  }
+  if (entry.approval.requirement === 'bounded_recurring') {
+    const use = entry.approval.use;
+    if (
+      !entry.occurrenceId.startsWith(use.occurrencePrefix) ||
+      use.priorUses >= use.maxUses ||
+      consumption.usageNumber !== use.priorUses + 1
+    ) {
+      refuseTrustedDispatch(index, 'bounded recurring approval semantics are invalid');
+    }
   }
 }
 
@@ -557,65 +674,7 @@ function assertTrustedState(trusted) {
       );
     }
   }
-  trusted.dispatchConsumptions.forEach((entry, index) => {
-    if (!isPlainObject(entry)) {
-      refuse(
-        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
-        `Trusted dispatch consumption ${index} must be an object`
-      );
-    }
-    for (const [key, maximum] of [
-      ['bindingId', 256],
-      ['nonce', 256],
-      ['adoptionKey', 200],
-      ['occurrenceId', 160],
-      ['runId', 160],
-      ['attemptId', 160]
-    ]) {
-      if (
-        typeof entry[key] !== 'string' ||
-        [...entry[key]].length === 0 ||
-        [...entry[key]].length > maximum
-      ) {
-        refuse(
-          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
-          `Trusted dispatch consumption ${index}.${key} is invalid`
-        );
-      }
-    }
-    for (const key of ['attemptNumber', 'fenceGeneration']) {
-      if (!Number.isSafeInteger(entry[key]) || entry[key] < 1) {
-        refuse(
-          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
-          `Trusted dispatch consumption ${index}.${key} is invalid`
-        );
-      }
-    }
-    if (!Object.hasOwn(entry, 'approval')) {
-      refuse(
-        'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
-        `Trusted dispatch consumption ${index}.approval is missing`
-      );
-    }
-    if (entry.approval !== null) {
-      if (
-        !isPlainObject(entry.approval) ||
-        !['human_per_run', 'protected_owner_per_run', 'bounded_recurring'].includes(
-          entry.approval.requirement
-        ) ||
-        typeof entry.approval.approvalId !== 'string' ||
-        [...entry.approval.approvalId].length === 0 ||
-        [...entry.approval.approvalId].length > 256 ||
-        !isPlainObject(entry.approval.use) ||
-        !isPlainObject(entry.approval.consumption)
-      ) {
-        refuse(
-          'AUTHORITY_TRUSTED_STATE_UNAVAILABLE',
-          `Trusted dispatch consumption ${index}.approval is invalid`
-        );
-      }
-    }
-  });
+  trusted.dispatchConsumptions.forEach(assertTrustedDispatchConsumption);
 }
 
 function assertClosedTopLevel(value, allowedKeys) {
