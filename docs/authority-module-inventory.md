@@ -49,9 +49,11 @@ characterization tests of each module.
    The seam is pure serialization: handlers still own status, code, message,
    details, and precedence, while focused tests pin the transport shape,
    optional-details behavior, and serialization error context.
-3. **Health/capability mapping and `RequestAuthority`** — the advertised
-   capability surface is an authority decision (`sessionLaunchPolicy` depends
-   on it); map it independently of session orchestration.
+3. **Health/capability mapping and `RequestAuthority` — done (slice 3).**
+   Transport-derived permission decisions moved to `request_authority.rs`;
+   health payload types and base capability mapping moved to `api_health.rs`.
+   `sessionLaunchPolicy` remains derived from the same request authority, while
+   store, hub, and event-writer collection stays in the API route orchestrator.
 4. **Sessions route family** — launch/complete/input/kill/handoff/events/log
    handlers share process-lifecycle authority; extract as one bounded family
    only with crash/restart characterization in place.
@@ -83,6 +85,10 @@ gates. Behavioral changes require a separate, separately approved PR.
   migration path. Policy decisions never move into the store layer.
 - **Executor/process lifecycle**: `pty_runner.rs` (and daemon supervision);
   never coupled to API formatting.
+- **Request transport authority**: `request_authority.rs`; permission checks
+  derive from the daemon-selected transport authority, never caller payloads.
+- **Health capability contract**: `api_health.rs`; capability advertisement
+  and wire types stay independent of live store, hub, and writer collection.
 - **Response/error envelope mapping**: `api_response.rs`; mapping stays pure
   (no I/O, no policy). Route-specific response decisions remain with their
   owning handler until a characterized domain extraction moves them.
