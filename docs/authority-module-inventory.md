@@ -44,9 +44,11 @@ characterization tests of each module.
    moved from `api.rs` to `api_routes.rs`. Pure parsing; rejection envelopes
    (`404 invalid_request` with `apiVersion`/`supportedApiVersions`,
    `404 not_found`) pinned by tests. No behavior change.
-2. **Response/error envelope mapping** (`api_error`, `json_response`,
-   `ApiResponse`, error-code precedence) — pure mapping, fan-in from every
-   handler; extract behind the same public envelopes.
+2. **Response/error envelope mapping — done (slice 2).** `ApiResponse`,
+   `api_error`, and `json_response` moved from `api.rs` to `api_response.rs`.
+   The seam is pure serialization: handlers still own status, code, message,
+   details, and precedence, while focused tests pin the transport shape,
+   optional-details behavior, and serialization error context.
 3. **Health/capability mapping and `RequestAuthority`** — the advertised
    capability surface is an authority decision (`sessionLaunchPolicy` depends
    on it); map it independently of session orchestration.
@@ -81,8 +83,9 @@ gates. Behavioral changes require a separate, separately approved PR.
   migration path. Policy decisions never move into the store layer.
 - **Executor/process lifecycle**: `pty_runner.rs` (and daemon supervision);
   never coupled to API formatting.
-- **Response/event mapping**: `api.rs` mapping helpers until slice 2 gives
-  them their own module; mapping stays pure (no I/O, no policy).
+- **Response/error envelope mapping**: `api_response.rs`; mapping stays pure
+  (no I/O, no policy). Route-specific response decisions remain with their
+  owning handler until a characterized domain extraction moves them.
 
 New cross-cutting responsibilities must justify staying inside a large module
 rather than joining the extracted contract.
