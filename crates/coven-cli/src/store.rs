@@ -37,6 +37,7 @@ const WARD_AUDIT_JOURNAL_RETAIN_BYTES: u64 = 16 * 1024 * 1024;
 const WARD_AUDIT_ROW_OVERHEAD_PAGES: u64 = 4;
 const WARD_AUDIT_CAPACITY_TRIGGER: &str = "coven_ward_audit_capacity_insert";
 const WARD_AUDIT_CAPACITY_SQLITE_MESSAGE: &str = "ward audit capacity exceeded";
+const STORE_INSTANCE_ID_KEY: &str = "store_instance_id";
 const BOUNDED_PRUNE_SENSITIVE_ARTIFACTS_BY_EXPIRY_SQL: &str = "DELETE FROM sensitive_artifacts
      WHERE rowid IN (
         SELECT rowid FROM sensitive_artifacts
@@ -1376,6 +1377,7 @@ pub fn ward_audit_reservation_bytes(
 pub struct WardAuditReservation<'a> {
     conn: &'a Connection,
     reservation_id: String,
+    store_id: String,
     preserve_on_drop: bool,
     finished: bool,
 }
@@ -1401,6 +1403,12 @@ impl<'a> WardAuditReservation<'a> {
             !reservation_token.trim().is_empty(),
             "Ward audit reservation token is empty"
         );
+        let store_id = get_or_insert_store_meta(
+            conn,
+            STORE_INSTANCE_ID_KEY,
+            &uuid::Uuid::new_v4().to_string(),
+        )
+        .context("failed to initialize Ward audit store identity")?;
         let active_token: Option<String> = conn
             .query_row(
                 "SELECT token
@@ -1596,6 +1604,7 @@ impl<'a> WardAuditReservation<'a> {
         Ok(Self {
             conn,
             reservation_id: reservation_token,
+            store_id,
             preserve_on_drop: previous_reserved_bytes.is_some(),
             finished: false,
         })
@@ -1620,6 +1629,8 @@ impl<'a> WardAuditReservation<'a> {
     pub fn verify_store_path(&self, store_path: &Path) -> Result<()> {
         let conn = open_existing_store_read_only(store_path)?
             .context("Ward audit store disappeared after mutation")?;
+        let store_id = get_store_meta(&conn, STORE_INSTANCE_ID_KEY)?
+            .context("Ward audit store identity is unavailable after mutation")?;
         let reserved: bool = conn
             .query_row(
                 "SELECT EXISTS (
@@ -1632,7 +1643,7 @@ impl<'a> WardAuditReservation<'a> {
             )
             .context("failed to verify Ward audit reservation against the live store path")?;
         anyhow::ensure!(
-            reserved,
+            reserved && store_id == self.store_id,
             "Ward audit store identity changed after reservation"
         );
         Ok(())
@@ -7102,6 +7113,35 @@ END;
             )?,
             0
         );
+        Ok(())
+    }
+
+    #[test]
+    fn verify_store_path_rejects_a_different_store_with_the_same_token() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("original.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let required = ward_audit_reservation_bytes(&conn, 1, 0)?;
+        let reservation =
+            WardAuditReservation::acquire(&conn, &path, "shared-token", "original", required)?;
+
+        let replacement_path = temp.path().join("replacement.sqlite3");
+        let replacement = open_store(&replacement_path)?;
+        configure_small_audit_capacity(&replacement, i64::MAX)?;
+        set_store_meta(&replacement, STORE_INSTANCE_ID_KEY, "replacement-store")?;
+        replacement.execute(
+            "INSERT INTO coven_ward_audit_reservations (token, purpose, reserved_bytes)
+             VALUES (?1, ?2, ?3)",
+            params!["shared-token", "replacement", i64::try_from(required)?],
+        )?;
+
+        let error = reservation
+            .verify_store_path(&replacement_path)
+            .expect_err("store identity mismatch must be rejected");
+        assert!(error
+            .to_string()
+            .contains("Ward audit store identity changed after reservation"));
         Ok(())
     }
 
