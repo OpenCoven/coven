@@ -37,6 +37,81 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
 - Unknown profiles fail closed with `SCHEMA_VERSION_UNSUPPORTED` (`coven.automations.v0` and future `coven.automations.v2` are both refusals — golden vectors pin both).
 - Additive evolution rules and per-field change classes are machine-readable in `compatibility-matrix.json`; see [Compatibility and evolution](#compatibility-and-evolution).
 
+### Runtime Authority companion profile
+
+Runtime Authority is negotiated separately as
+`coven.automations.authority.v1`; it is not implied by base-v1 support and does
+not change the base profile. Its artifacts live under
+[`spec/coven-automations/authority/v1/`](../../spec/coven-automations/authority/v1/).
+
+The companion envelope travels under the exact key
+`AutomationRun.extensions["coven.automations.authority.v1"]`. A generic
+`coven.automations.v1` consumer preserves that value as opaque JSON and never
+interprets it. A Coven deployment claiming Runtime Authority conformance must
+also advertise `automations.runtime-authority.v1`, require the companion on
+each authoritative `AutomationRun`, validate and independently verify it, and
+fail closed when it is absent, malformed, stale, replayed, mismatched, or
+unverifiable.
+
+The run projection is an immutable `AutomationExecutionBinding`; the receipt
+projection is minimized `AutomationReceiptAuthorityEvidence`. Because the
+frozen base-v1 receipt schema has no `extensions` member, receipt evidence is a
+receipt-correlated sidecar in the run's authority extension rather than a new
+field on the base receipt. The sidecar is nullable only before settlement; a
+terminal base receipt requires evidence carrying its authenticated digest and
+exactly matching the binding's authority decision. Both preserve the base
+automation/occurrence/run/attempt correlation. Neither may include raw
+credentials, prompts, memory content, familiar declaration bodies, or
+unrestricted filesystem paths. Authority semantics remain owned by Familiar
+Contract and Coven Threads; Coven binds their pinned evidence to its own
+scheduler/runtime anchors.
+
+Per-run approvals remain single-use. A bounded-recurring Threads grant instead
+pins its grant id, maximum use count, occurrence prefix, prior usage count, and
+the current dispatch consumption tuple. It may be reused only while
+`priorUses < maxUses`, only for an occurrence matching the signed prefix, and
+only with `usageNumber == priorUses + 1`; replay of the same request, decision,
+occurrence, run, attempt, and fence tuple fails closed.
+
+Capability-set fields are mathematical sets serialized as unique arrays.
+Their per-object array order remains authenticated by JCS, while semantic
+correlation between trusted state, the binding, receipt evidence, and runtime
+descriptors is order-insensitive. Approval consumption request/decision
+digests and occurrence/run/attempt/fence anchors must exact-match the signed
+authorization and base dispatch.
+
+Authority chronology is
+`issuedAt <= validFrom <= decisionTimestamp <= dispatchNow < validUntil`.
+`validUntil` is exclusive. Familiar verification must be at or before both the
+decision and dispatch, and its age at dispatch may equal but not exceed the
+signed trusted freshness bound (at most 300 seconds in this profile). The
+authority value must also be valid I-JSON: unpaired UTF-16 surrogates in any
+nested string or object key are rejected before schema validation and RFC 8785
+canonicalization.
+
+Replay state is evaluated at the relevant lifecycle boundary. Pre-dispatch
+validation rejects any nonce, adoption key, per-run approval id, or recurring
+consumption tuple already committed by a dispatch. Terminal verification does
+the inverse evidence check: each committed index must be present, and one
+unambiguous ownership record must exactly match the signed binding, occurrence,
+run, attempt, fence, nonce, adoption key, and approval consumption. This lets a
+legitimate completed run remain verifiable without allowing the same authority
+to authorize another dispatch. Exact attempt identifiers and single-use
+human/protected-owner approval identifiers are ownership keys; unrelated
+bounded-recurring history is not conflicting solely by approval identifier.
+
+The companion has two executable validation projections without dispatch
+integration. The Node conformance validator owns portable vectors and
+advertisement checks. The Rust projection under
+`automations/contract/authority.rs` parses the closed profile, verifies its JCS
+digest and receipt correlation, and requires a narrow
+`AuthorityEvidenceVerifier` for deployment-owned Familiar, Threads, replay,
+approval, runtime, and signature evidence. Runtime Authority never falls back
+to base-v1 string references: absent adapters return
+`AUTHORITY_ADAPTER_MISSING`, absent trusted state returns
+`AUTHORITY_TRUSTED_STATE_UNAVAILABLE`, and generic base consumers continue to
+preserve unknown extensions without interpretation.
+
 ## Data model
 
 All objects are JSON per draft 2020-12 schemas under `spec/coven-automations/v1/`, with `additionalProperties: false`: unknown fields fail closed, and optional, non-semantic data travels only in the explicit `extensions` bag (keys `x-*` or reverse-DNS; preserved on round-trip, never interpreted until promoted by a new profile).
@@ -114,6 +189,12 @@ Specified by `automation-receipt.schema.json`. Immutable and versioned; written 
 - `outcome` with partial failures and recovery disposition; timestamps; `producer` identity.
 - `integrity` — digest over the canonical receipt body plus an `authentication` marker (`none | producer-hmac | cosign`); unauthenticated receipts are integrity-checked but not provenance-proof, and consumers MUST surface the distinction.
 - `privacy` — classification and retention.
+
+When Runtime Authority is advertised, the authority extension on the
+correlated `AutomationRun` contains the separately validated receipt-evidence
+sidecar after settlement. The frozen base receipt remains unchanged. Base
+consumers still treat the run extension as opaque and do not gain Runtime
+Authority conformance merely by retaining it.
 
 ## Lifecycle semantics (state machines)
 

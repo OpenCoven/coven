@@ -151,7 +151,14 @@ That single push is the entire release. The workflow takes over from there.
 3. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
 4. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
 5. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
-6. **Automations protocol bundle** — starting with `v0.4.4`, rebuilds `spec/coven-automations/v1/` from the exact tagged commit into a deterministic source-bound bundle. The embedded manifest records every contract file digest and a commit-independent `contractContentSha256`. GitHub-only recovery of older tags preserves their original four-archive-plus-checksum asset contract.
+6. **Automations contract bundles** — starting with `v0.4.4`, rebuilds both
+   `spec/coven-automations/v1/` and the separately advertised
+   `spec/coven-automations/authority/v1/` companion profile from the exact
+   tagged commit into deterministic source-bound bundles. Each embedded
+   manifest records every contract file digest and a commit-independent
+   `contractContentSha256`. The authority bundle never replaces or relabels the
+   base bundle. GitHub-only recovery of older tags preserves their original
+   four-archive-plus-checksum asset contract.
 
 ### Postflight
 
@@ -174,11 +181,12 @@ The workflow creates or repairs one GitHub Release titled `Coven vX.Y.Z` using t
 - `coven-vX.Y.Z-linux-x64.tar.gz`
 - `coven-vX.Y.Z-windows-x64.zip`
 - `coven-automations-v1-contract-<tagged-commit>.tar.gz`
+- `coven-automations-authority-v1-contract-<tagged-commit>.tar.gz`
 - `SHA256SUMS`
 
 `SHA256SUMS` contains exactly four lexically ordered entries naming only the
-four native archive filenames. The Automations protocol bundle is verified
-separately through its embedded `manifest.json`; it must never be added to
+four native archive filenames. Both Automations contract bundles are verified
+separately through their embedded `manifest.json`; neither is added to
 `SHA256SUMS`. The GitHub Release is the public binary/checksum surface; npm
 provenance remains the package-integrity surface.
 

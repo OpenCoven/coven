@@ -155,7 +155,20 @@ jobs:
               --bundle "$PROTOCOL_BUNDLE" \
               --source-commit "$HEAD_SHA" \
               --sha256 "$PROTOCOL_SHA256"
-            PROTOCOL_ARGS=(--source-commit "$HEAD_SHA" --protocol-bundle "$PROTOCOL_BUNDLE")
+            SOURCE_COMMIT="$HEAD_SHA" \
+              node github-release-protocol-source/scripts/package-automations-authority-profile.mjs \
+                --output github-release-authority-profile
+            AUTHORITY_PROFILE_BUNDLE="$PWD/github-release-authority-profile/coven-automations-authority-v1-contract-${HEAD_SHA}.tar.gz"
+            AUTHORITY_PROFILE_SHA256="$(sha256sum "$AUTHORITY_PROFILE_BUNDLE" | awk '{print $1}')"
+            node scripts/package-automations-authority-profile.mjs verify \
+              --bundle "$AUTHORITY_PROFILE_BUNDLE" \
+              --source-commit "$HEAD_SHA" \
+              --sha256 "$AUTHORITY_PROFILE_SHA256"
+            PROTOCOL_ARGS=(
+              --source-commit "$HEAD_SHA"
+              --protocol-bundle "$PROTOCOL_BUNDLE"
+              --authority-profile-bundle "$AUTHORITY_PROFILE_BUNDLE"
+            )
           fi
           node scripts/package-github-release.mjs package \
             --release-tag "$RELEASE_TAG" \
