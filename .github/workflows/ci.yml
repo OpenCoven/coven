@@ -77,6 +77,8 @@ jobs:
       - run: python3 scripts/check-api-contract-docs-test.py
       - run: python3 scripts/check-api-contract-docs.py
       - run: python3 scripts/check-docs-ownership-test.py
+      - run: python3 scripts/check-security-policy-test.py
+      - run: python3 scripts/check-security-policy.py
       - run: python scripts/check-secrets.py
       - name: Documentation ownership guard (pull request changes)
         if: github.event_name == 'pull_request'
