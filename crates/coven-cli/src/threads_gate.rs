@@ -772,8 +772,11 @@ pub(crate) fn persist_apply_audit_records_on_connection(
         return Ok(());
     }
     let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
-    conn.execute_batch("BEGIN IMMEDIATE")
-        .context("starting apply-audit batch transaction")?;
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .context("starting apply-audit batch transaction")?;
+    }
     let result = (|| -> Result<()> {
         append_apply_audit_records(
             conn,
@@ -783,10 +786,13 @@ pub(crate) fn persist_apply_audit_records_on_connection(
             report,
             threads::Channel::Mutation,
         )?;
-        conn.execute_batch("COMMIT")
-            .context("committing apply-audit batch transaction")
+        if owns_transaction {
+            conn.execute_batch("COMMIT")
+                .context("committing apply-audit batch transaction")?;
+        }
+        Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && owns_transaction {
         let _ = conn.execute_batch("ROLLBACK");
     }
     result
@@ -795,8 +801,9 @@ pub(crate) fn persist_apply_audit_records_on_connection(
 /// Append the Ward's logged apply records to an existing transaction scope.
 ///
 /// Proposal finalization uses this form so `apply_audit` rows and the terminal
-/// proposal event commit as one unit. Direct writes wrap it in their own
-/// transaction via [`persist_apply_audit_records_on_connection`].
+/// proposal event commit as one unit. Direct writes use
+/// [`persist_apply_audit_records_on_connection`] to append within the existing
+/// transaction when present, or a dedicated transaction otherwise.
 pub(crate) fn append_apply_audit_records(
     conn: &Connection,
     proposal_id: Option<&str>,
@@ -1147,6 +1154,52 @@ tier = 2
             )
             .unwrap();
         assert_eq!(count, 0, "the failed batch must leave no partial rows");
+    }
+
+    #[test]
+    fn persist_apply_audit_records_uses_an_existing_transaction() {
+        let f = fixture();
+        let config = ward_config();
+        let ward = ward::Ward::new(f.workspace.clone(), config.clone()).unwrap();
+        let report = ward
+            .apply(
+                &[
+                    ward::FileEdit::new("notes/a.md", "one"),
+                    ward::FileEdit::new("notes/b.md", "two"),
+                ],
+                &ward::Authorization::unsigned(),
+            )
+            .unwrap();
+
+        f.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        persist_apply_audit_records_on_connection(&f.conn, "sage", &f.workspace, &config, &report)
+            .unwrap();
+        let count_in_transaction: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_in_transaction, 2,
+            "existing transaction should see both audit rows"
+        );
+
+        f.conn.execute_batch("ROLLBACK").unwrap();
+        let count_after_rollback: i64 = f
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count_after_rollback, 0,
+            "outer rollback must still control audit rows"
+        );
     }
 
     fn soul_edit() -> Vec<ward::FileEdit> {
