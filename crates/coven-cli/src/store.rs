@@ -1483,7 +1483,7 @@ impl<'a> WardAuditReservation<'a> {
                     u64::try_from(bytes).context("existing Ward audit reservation is negative")
                 })
                 .transpose()?;
-            let admission_bytes = existing.unwrap_or(required_bytes);
+            let admission_bytes = required_bytes;
             let committed_without_current = match existing {
                 Some(existing) => committed
                     .checked_sub(existing)
@@ -1512,6 +1512,15 @@ impl<'a> WardAuditReservation<'a> {
                 .into());
             }
             if existing.is_some() {
+                let required = i64::try_from(required_bytes)
+                    .context("Ward audit reservation exceeds SQLite integer range")?;
+                conn.execute(
+                    "UPDATE coven_ward_audit_reservations
+                     SET reserved_bytes = ?2
+                     WHERE token = ?1",
+                    params![reservation_token, required],
+                )
+                .context("failed to resize existing Ward audit reservation")?;
                 return Ok(true);
             }
             let required = i64::try_from(required_bytes)
@@ -6986,6 +6995,30 @@ END;
         );
 
         first.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn reused_ward_audit_reservation_resizes_to_current_request() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("test.sqlite3");
+        let conn = open_store(&path)?;
+        configure_small_audit_capacity(&conn, i64::MAX)?;
+        let initial = ward_audit_reservation_bytes(&conn, 1, 0)?;
+        let grown = ward_audit_reservation_bytes(&conn, 2, 0)?;
+        WardAuditReservation::acquire(&conn, &path, "resize", "resize-test", initial)?
+            .preserve()?;
+
+        WardAuditReservation::acquire(&conn, &path, "resize", "resize-test", grown)?.preserve()?;
+
+        assert_eq!(
+            conn.query_row(
+                "SELECT reserved_bytes FROM coven_ward_audit_reservations WHERE token = ?1",
+                ["resize"],
+                |row| row.get::<_, i64>(0),
+            )?,
+            i64::try_from(grown)?
+        );
         Ok(())
     }
 
