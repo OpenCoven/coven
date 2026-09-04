@@ -127,6 +127,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
+                    "coven.automations.unquarantine",
                 ],
             },
             Capability {
@@ -515,6 +516,19 @@ pub fn route_action(
                     origin,
                     intent_id,
                     automation_health_payload(conn, &id, now),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.unquarantine" => {
+            let id = required_id_field(&payload, action);
+            let now = chrono::Utc::now();
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_unquarantine_payload(conn, &id, now),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
             }
@@ -968,10 +982,33 @@ fn automation_health_payload(
                 "leaseOwner": health.lease_owner,
                 "leaseExpiresAt": health.lease_expires_at,
                 "staleReason": health.stale_reason,
+                "currentAttempt": health.current_attempt,
+                "maxAttempts": health.max_attempts,
+                "retryNotBefore": health.retry_not_before,
+                "consecutiveExhaustions": health.consecutive_exhaustions,
+                "quarantinedAt": health.quarantined_at,
+                "quarantineFailureClass": health.quarantine_failure_class,
+                "quarantineReason": health.quarantine_reason,
             }
         })),
         Err(error) => Err(format!("{error:#}")),
     }
+}
+
+fn automation_unquarantine_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    if crate::automations::store::get_definition(conn, id)
+        .map_err(|error| format!("{error:#}"))?
+        .is_none()
+    {
+        return Err(format!("no routine with id `{id}`"));
+    }
+    crate::automations::runs::clear_retry_quarantine(conn, id, now)
+        .map(|released| json!({ "automationId": id, "released": released }))
+        .map_err(|error| format!("{error:#}"))
 }
 
 fn automation_import_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
@@ -994,12 +1031,14 @@ fn automation_run_payload(
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
             match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
-                Ok(outcome) if outcome.status == "running" => Ok(json!({
+                Ok(outcome) if matches!(outcome.status.as_str(), "running" | "retry_scheduled") => {
+                    Ok(json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
                     "sessionId": outcome.session_id,
                     "error": outcome.error,
-                })),
+                    }))
+                }
                 Ok(outcome) => Err(outcome
                     .error
                     .unwrap_or_else(|| "routine run did not enter running state".to_string())),
@@ -1018,25 +1057,59 @@ fn automation_runs_payload(
 ) -> Result<Value, String> {
     match crate::automations::runs::list_runs(conn, id, limit) {
         Ok(records) => {
-            let runs: Vec<Value> = records
-                .iter()
-                .map(|record| {
-                    json!({
-                        "id": record.id,
-                        "automationId": record.automation_id,
-                        "occurrenceId": record.occurrence_id,
-                        "sessionId": record.session_id,
-                        "familiarId": record.familiar_id,
-                        "runtime": record.runtime,
-                        "status": record.status,
-                        "exitCode": record.exit_code,
-                        "logJson": record.log_json,
-                        "outputCommit": record.output_commit,
-                        "startedAt": record.started_at,
-                        "finishedAt": record.finished_at,
+            let mut attempts_by_run = std::collections::HashMap::new();
+            for attempt in crate::automations::runs::list_attempts_for_automation(conn, id, limit)
+                .map_err(|error| format!("{error:#}"))?
+            {
+                attempts_by_run
+                    .entry(attempt.run_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(attempt);
+            }
+            let mut runs = Vec::with_capacity(records.len());
+            for record in &records {
+                let attempts = attempts_by_run
+                    .remove(&record.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|attempt| {
+                        json!({
+                            "id": attempt.id,
+                            "runId": attempt.run_id,
+                            "occurrenceId": attempt.occurrence_id,
+                            "attemptNumber": attempt.attempt_number,
+                            "adoptionKey": attempt.adoption_key,
+                            "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+                            "dispatchGeneration": attempt.dispatch_generation,
+                            "state": attempt.state,
+                            "failureClass": attempt.failure_class,
+                            "priorAttemptNumber": attempt.prior_attempt_number,
+                            "priorDisposition": attempt.prior_disposition,
+                            "retryClassification": attempt.retry_classification,
+                            "notBefore": attempt.not_before,
+                            "sessionId": attempt.session_id,
+                            "stateReason": attempt.state_reason,
+                            "openedAt": attempt.opened_at,
+                            "settledAt": attempt.settled_at,
+                        })
                     })
-                })
-                .collect();
+                    .collect::<Vec<_>>();
+                runs.push(json!({
+                    "id": record.id,
+                    "automationId": record.automation_id,
+                    "occurrenceId": record.occurrence_id,
+                    "sessionId": record.session_id,
+                    "familiarId": record.familiar_id,
+                    "runtime": record.runtime,
+                    "status": record.status,
+                    "exitCode": record.exit_code,
+                    "logJson": record.log_json,
+                    "outputCommit": record.output_commit,
+                    "startedAt": record.started_at,
+                    "finishedAt": record.finished_at,
+                    "attempts": attempts,
+                }));
+            }
             Ok(json!({ "runs": runs }))
         }
         Err(error) => Err(format!("{error:#}")),
@@ -1143,6 +1216,7 @@ mod tests {
 
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
+    struct RetryableRejectedRuntime;
 
     impl SessionRuntime for OwnershipThenErrorRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
@@ -1184,6 +1258,36 @@ mod tests {
             _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
             anyhow::bail!("synthetic launch rejection")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionRuntime for RetryableRejectedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch uses strict adopted containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            Err(
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "runtime unavailable")
+                    .into(),
+            )
         }
 
         fn send_input(
@@ -1389,6 +1493,122 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("synthetic launch rejection")));
+    }
+
+    #[test]
+    fn retry_scheduled_manual_run_remains_an_accepted_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "retrying",
+            "name": "Retrying",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "retrying"}),
+            &conn,
+            &RetryableRejectedRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert!(response.accepted);
+        let payload = &response.event.as_ref().unwrap().payload;
+        assert_eq!(payload["status"], "retry_scheduled");
+        assert!(payload["runId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(payload["sessionId"].is_null());
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("runtime unavailable")));
+    }
+
+    #[test]
+    fn automation_health_exposes_quarantine_and_unquarantine_releases_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "quarantined",
+            "name": "Quarantined",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "INSERT INTO automation_retry_state
+                (automation_id, consecutive_exhaustions, quarantined_at,
+                 failure_class, reason, updated_at)
+             VALUES ('quarantined', 1, '2026-08-27T09:05:00.000Z',
+                     'runtime_unavailable', 'runtime stayed offline',
+                     '2026-08-27T09:05:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let (health_status, health_response) = route_action(
+            json!({"action": "coven.automations.health", "id": "quarantined"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(health_status, 200);
+        let health = &health_response.event.as_ref().unwrap().payload["health"];
+        assert_eq!(health["maxAttempts"], 2);
+        assert_eq!(health["quarantineFailureClass"], "runtime_unavailable");
+        assert_eq!(health["quarantineReason"], "runtime stayed offline");
+        assert!(health["quarantinedAt"].is_string());
+
+        let (release_status, release_response) = route_action(
+            json!({"action": "coven.automations.unquarantine", "id": "quarantined"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(release_status, 200);
+        assert_eq!(
+            release_response.event.as_ref().unwrap().payload["released"],
+            true
+        );
+        assert!(!crate::automations::runs::is_retry_quarantined(&conn, "quarantined").unwrap());
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.unquarantine"));
     }
 
     #[test]

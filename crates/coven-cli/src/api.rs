@@ -927,6 +927,8 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                         | "coven.automations.definition.create.v1"
                         | "coven.automations.definition.revise.v1"
                         | "coven.automations.definition.tombstone.v1"
+                        | "coven.automations.run"
+                        | "coven.automations.unquarantine"
                 )
             {
                 crate::automations::daemon_tick::wake_automations_scheduler(coven_home);

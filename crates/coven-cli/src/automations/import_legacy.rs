@@ -151,6 +151,7 @@ pub fn import_legacy_codex_automations(conn: &Connection) -> Result<ImportReport
             misfire: super::definition::RoutineMisfire::Latest,
             overlap: super::definition::RoutineOverlap::Forbid,
             timeout_minutes: 60,
+            retry: super::definition::RoutineRetryPolicy::default(),
             runtime: "coven-code".to_string(),
             familiar_id: None,
             cwd: None,

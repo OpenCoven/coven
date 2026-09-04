@@ -7,7 +7,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::definition::RoutineDefinition;
 use super::schedule::next_due;
@@ -23,6 +23,13 @@ pub struct RoutineHealth {
     pub lease_owner: Option<String>,
     pub lease_expires_at: Option<String>,
     pub stale_reason: Option<String>,
+    pub current_attempt: Option<i64>,
+    pub max_attempts: u8,
+    pub retry_not_before: Option<String>,
+    pub consecutive_exhaustions: i64,
+    pub quarantined_at: Option<String>,
+    pub quarantine_failure_class: Option<String>,
+    pub quarantine_reason: Option<String>,
 }
 
 fn max_iso(
@@ -42,9 +49,23 @@ pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
         .map_err(anyhow::Error::msg)?
         .ok_or_else(|| anyhow::anyhow!("no routine with id `{id}`"))?;
 
-    let next_due_at = next_due(&definition.rrule, definition.timezone, now)
-        .map_err(|error| anyhow::anyhow!("{error}"))?
-        .map(|slot| slot.to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    let retry_state: Option<(i64, String, String, String)> = conn
+        .query_row(
+            "SELECT consecutive_exhaustions, quarantined_at, failure_class, reason
+             FROM automation_retry_state
+             WHERE automation_id = ?1 AND quarantined_at IS NOT NULL",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .context("failed to read automation retry quarantine")?;
+    let next_due_at = if retry_state.is_some() {
+        None
+    } else {
+        next_due(&definition.rrule, definition.timezone, now)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .map(|slot| slot.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+    };
 
     let last_planned_at = max_iso(
         conn,
@@ -94,6 +115,25 @@ pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
         Err(rusqlite::Error::QueryReturnedNoRows) => (None, None, None),
         Err(error) => return Err(error).context("failed to read live lease"),
     };
+    let retry_wait: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT a.attempt_number, a.not_before
+             FROM automation_attempts AS a
+             JOIN automation_runs AS r ON r.id = a.run_id
+             WHERE r.automation_id = ?1
+               AND r.status = 'running'
+               AND a.state = 'adopted'
+             ORDER BY a.attempt_number DESC
+             LIMIT 1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .context("failed to read pending automation retry")?;
+    let (consecutive_exhaustions, quarantined_at, quarantine_failure_class, quarantine_reason) =
+        retry_state
+            .map(|(count, at, class, reason)| (count, Some(at), Some(class), Some(reason)))
+            .unwrap_or((0, None, None, None));
 
     Ok(RoutineHealth {
         automation_id: id.to_string(),
@@ -105,6 +145,13 @@ pub fn routine_health(conn: &Connection, id: &str, now: DateTime<Utc>) -> Result
         lease_owner,
         lease_expires_at,
         stale_reason,
+        current_attempt: retry_wait.as_ref().map(|(attempt, _)| *attempt),
+        max_attempts: definition.retry.max_attempts,
+        retry_not_before: retry_wait.map(|(_, not_before)| not_before),
+        consecutive_exhaustions,
+        quarantined_at,
+        quarantine_failure_class,
+        quarantine_reason,
     })
 }
 
@@ -208,6 +255,72 @@ mod tests {
             health.lease_expires_at.as_deref(),
             Some("2026-08-27T10:00:00.000Z")
         );
+    }
+
+    #[test]
+    fn health_reports_persisted_retry_wait() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("retrying");
+        routine.retry.max_attempts = 3;
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('o1', 'retrying', '2026-08-27T09:00:00.000Z', 'planned', 1,
+                     '2026-08-27T09:00:00.000Z', '2026-08-27T09:00:01.000Z');
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at)
+             VALUES ('r1', 'retrying', 'o1', 'coven-code', 'running',
+                     '2026-08-27T09:00:00.000Z');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, prior_attempt_number,
+                 prior_disposition, retry_classification, not_before, opened_at)
+             VALUES ('a2', 'r1', 'o1', 2, 'automation:r1:2', 1, 'adopted', 1,
+                     'failed', 'automatic_retry', '2026-08-27T09:05:00.000Z',
+                     '2026-08-27T09:00:01.000Z');",
+        )
+        .unwrap();
+
+        let health = routine_health(&conn, "retrying", utc(2026, 8, 27, 9, 1)).unwrap();
+        assert_eq!(health.current_attempt, Some(2));
+        assert_eq!(health.max_attempts, 3);
+        assert_eq!(
+            health.retry_not_before.as_deref(),
+            Some("2026-08-27T09:05:00.000Z")
+        );
+    }
+
+    #[test]
+    fn health_reports_retry_exhaustion_quarantine() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("quarantined")).unwrap();
+        conn.execute(
+            "INSERT INTO automation_retry_state
+                (automation_id, consecutive_exhaustions, quarantined_at,
+                 failure_class, reason, updated_at)
+             VALUES ('quarantined', 1, '2026-08-27T09:05:00.000Z',
+                     'runtime_unavailable', 'runtime stayed offline',
+                     '2026-08-27T09:05:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let health = routine_health(&conn, "quarantined", utc(2026, 8, 27, 10, 0)).unwrap();
+        assert_eq!(health.next_due_at, None);
+        assert_eq!(
+            health.quarantined_at.as_deref(),
+            Some("2026-08-27T09:05:00.000Z")
+        );
+        assert_eq!(
+            health.quarantine_failure_class.as_deref(),
+            Some("runtime_unavailable")
+        );
+        assert_eq!(
+            health.quarantine_reason.as_deref(),
+            Some("runtime stayed offline")
+        );
+        assert_eq!(health.consecutive_exhaustions, 1);
     }
 
     #[test]

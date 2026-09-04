@@ -5,10 +5,13 @@
 //! are the source of truth for identity and lifecycle; execution state lives
 //! in the occurrence ledger, not here (coven#816).
 
+use std::collections::BTreeSet;
+
 use chrono_tz::Tz;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use super::contract::types::{BackoffPolicy, RetryableClass};
 use super::rrule::{parse_rrule, ParsedRrule};
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
@@ -144,6 +147,38 @@ pub enum RoutineOverlap {
     Forbid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutineRetryPolicy {
+    pub max_attempts: u8,
+    pub backoff_policy: BackoffPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retryable_classes: BTreeSet<RetryableClass>,
+}
+
+impl Default for RoutineRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::new(),
+        }
+    }
+}
+
+impl RoutineRetryPolicy {
+    fn is_disabled(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn retries(&self, failure_class: RetryableClass) -> bool {
+        self.retryable_classes.contains(&failure_class)
+    }
+}
+
 /// A validated routine definition. Serialized to `definition_json` in the
 /// store with camelCase keys, mirroring the control-plane wire style.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -160,6 +195,8 @@ pub struct RoutineDefinition {
     pub overlap: RoutineOverlap,
     /// Per-run wall-clock timeout in minutes. Bounded and required.
     pub timeout_minutes: u32,
+    #[serde(default, skip_serializing_if = "RoutineRetryPolicy::is_disabled")]
+    pub retry: RoutineRetryPolicy,
     /// Runtime identifier (harness), default `coven-code`.
     pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -203,6 +240,7 @@ impl RoutineDefinition {
             "misfire",
             "overlap",
             "timeoutMinutes",
+            "retry",
             "runtime",
             "familiarId",
             "cwd",
@@ -254,6 +292,27 @@ impl RoutineDefinition {
             .map_err(|error| format!("rrule failed validation: {error}"))?;
         if self.timeout_minutes == 0 || self.timeout_minutes > 60 * 24 * 31 {
             return Err("timeoutMinutes must be 1..=44640".to_string());
+        }
+        if self.retry.max_attempts == 0 || self.retry.max_attempts > 10 {
+            return Err("retry.maxAttempts must be 1..=10".to_string());
+        }
+        if self
+            .retry
+            .backoff_seconds
+            .is_some_and(|seconds| seconds == 0)
+        {
+            return Err("retry.backoffSeconds must be 1..=86400".to_string());
+        }
+        if self
+            .retry
+            .backoff_seconds
+            .is_some_and(|seconds| seconds > 86_400)
+        {
+            return Err("retry.backoffSeconds must be 1..=86400".to_string());
+        }
+        if self.retry.backoff_policy == BackoffPolicy::Fixed && self.retry.backoff_seconds.is_none()
+        {
+            return Err("fixed retry backoff requires retry.backoffSeconds".to_string());
         }
         if self.runtime.trim().is_empty() || self.runtime.len() > 64 {
             return Err("runtime must be 1..=64 characters".to_string());
@@ -356,6 +415,30 @@ mod tests {
         let error = RoutineDefinition::from_json(&value).unwrap_err();
 
         assert!(error.contains("valid IANA timezone"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_bounded_retry_policy() {
+        let mut value = valid_definition();
+        value.as_object_mut().unwrap().insert(
+            "retry".to_string(),
+            json!({
+                "maxAttempts": 3,
+                "backoffPolicy": "exponential",
+                "backoffSeconds": 5,
+                "retryableClasses": ["runtime_unavailable"]
+            }),
+        );
+
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+        let serialized = serde_json::to_value(definition).unwrap();
+
+        assert_eq!(serialized["retry"]["maxAttempts"], 3);
+        assert_eq!(serialized["retry"]["backoffPolicy"], "exponential");
+        assert_eq!(
+            serialized["retry"]["retryableClasses"],
+            json!(["runtime_unavailable"])
+        );
     }
 
     #[test]

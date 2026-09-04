@@ -25,7 +25,13 @@
       { "variant": "timezone.utc", "notes": "UTC scheduling is unchanged and serialized as `utc`." },
       { "variant": "timezone.iana", "notes": "Durable schedules bind an exact IANA TZID validated by the Rust authority; host timezone changes do not reinterpret the definition." },
       { "variant": "dst.gap.skip", "notes": "A nonexistent wall-clock slot in a spring-forward gap is skipped, never shifted." },
-      { "variant": "dst.fold.first", "notes": "An ambiguous wall-clock slot in a fall-back fold selects the first occurrence, the earlier UTC instant." }
+      { "variant": "dst.fold.first", "notes": "An ambiguous wall-clock slot in a fall-back fold selects the first occurrence, the earlier UTC instant." },
+      { "variant": "retry.attempts", "notes": "Automatic retries create immutable attempts within one durable run; attempt numbers and adoption keys are never reused." },
+      { "variant": "retry.backoff.none", "notes": "The next attempt is immediately eligible after a safely classified failure." },
+      { "variant": "retry.backoff.fixed", "notes": "The next attempt becomes eligible after the configured fixed delay." },
+      { "variant": "retry.backoff.exponential", "notes": "The next attempt uses deterministic full jitter bounded by the configured exponential ceiling." },
+      { "variant": "retry.safe-classes", "notes": "Only transient_dispatch, lease_expired, and runtime_unavailable are automatically retryable; ambiguous or ownership-retained outcomes never auto-retry." },
+      { "variant": "retry.exhaustion-quarantine", "notes": "Exhausting a configured retry policy quarantines the definition until an explicit operator release." }
     ],
     "deliveryPolicies": [],
     "retentionPolicies": [
