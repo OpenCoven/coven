@@ -187,7 +187,7 @@ fn reconcile_non_utf8_active_names_locked(pending_dir: &Path) -> Result<()> {
         if !is_non_utf8_active_proposal_name(&entry.file_name()) {
             continue;
         }
-        let _ = quarantine_locked(pending_dir, &entry.path(), "invalid-name");
+        quarantine_locked(pending_dir, &entry.path(), "invalid-name")?;
     }
     Ok(())
 }
