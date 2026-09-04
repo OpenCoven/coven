@@ -158,6 +158,11 @@ pub fn claim_due_occurrence(
              WHERE automation_id = ?1
                AND state = 'planned'
                AND scheduled_for <= ?2
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_runs.occurrence_id = automation_occurrences.id
+                     AND automation_runs.status = 'running'
+               )
                AND scheduled_for < (
                    SELECT MAX(scheduled_for)
                    FROM automation_occurrences
@@ -185,13 +190,48 @@ pub fn claim_due_occurrence(
                )
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs
-                   WHERE automation_id = ?1 AND status = 'running'
+                   WHERE automation_id = ?1
+                     AND status = 'running'
+                     AND occurrence_id IS NOT automation_occurrences.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM automation_runs AS retry_run
+                   JOIN automation_attempts AS retry_attempt
+                     ON retry_attempt.run_id = retry_run.id
+                   WHERE retry_run.occurrence_id = automation_occurrences.id
+                     AND retry_run.status = 'running'
+                     AND retry_attempt.state = 'adopted'
+                     AND (
+                         retry_attempt.not_before > ?2
+                         OR retry_run.timeout_at <= ?2
+                     )
                )
                AND id = (
                    SELECT id FROM automation_occurrences
-                   WHERE automation_id = ?1
-                     AND state = 'planned'
-                     AND scheduled_for <= ?2
+                   WHERE automation_occurrences.automation_id = ?1
+                     AND automation_occurrences.state = 'planned'
+                     AND automation_occurrences.scheduled_for <= ?2
+                     AND NOT EXISTS (
+                         SELECT 1 FROM automation_runs
+                         WHERE automation_runs.automation_id = ?1
+                           AND automation_runs.status = 'running'
+                           AND automation_runs.occurrence_id
+                               IS NOT automation_occurrences.id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM automation_runs AS retry_run
+                         JOIN automation_attempts AS retry_attempt
+                           ON retry_attempt.run_id = retry_run.id
+                         WHERE retry_run.occurrence_id = automation_occurrences.id
+                           AND retry_run.status = 'running'
+                           AND retry_attempt.state = 'adopted'
+                           AND (
+                               retry_attempt.not_before > ?2
+                               OR retry_run.timeout_at <= ?2
+                           )
+                     )
                    ORDER BY scheduled_for DESC
                    LIMIT 1
                )",
@@ -211,6 +251,37 @@ pub fn claim_due_occurrence(
             |row| row.get(0),
         )
         .map_err(|error| format!("failed to read claim: {error}"))?;
+    let retry_run_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_runs AS r
+                JOIN automation_attempts AS a ON a.run_id = r.id
+                WHERE r.occurrence_id = ?1
+                  AND r.status = 'running'
+                  AND a.state = 'adopted'
+            )",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to inspect claimed retry attempt: {error}"))?;
+    if retry_run_exists {
+        let rebound = transaction
+            .execute(
+                "UPDATE automation_attempts
+                 SET occurrence_fence_generation = (
+                     SELECT attempt FROM automation_occurrences WHERE id = ?1
+                 )
+                 WHERE occurrence_id = ?1
+                   AND state = 'adopted'
+                   AND not_before <= ?2",
+                params![id, now_iso],
+            )
+            .map_err(|error| format!("failed to bind retry attempt to claim fence: {error}"))?;
+        if rebound != 1 {
+            return Err("claimed retry attempt changed before fence binding".to_string());
+        }
+    }
     transaction
         .commit()
         .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
@@ -252,7 +323,11 @@ pub fn insert_claimed_occurrence(
          )
            AND definition.id = ?2
            AND definition.tombstoned_at IS NULL
-           AND definition.definition_digest IS NOT NULL",
+           AND definition.definition_digest IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_retry_state
+               WHERE automation_id = ?2 AND quarantined_at IS NOT NULL
+           )",
         params![
             occurrence_id,
             automation_id,
@@ -372,6 +447,38 @@ pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
             Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
         }
     }
+    let retry_automations: Vec<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT o.automation_id
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE o.state = 'planned'
+                   AND r.status = 'running'
+                   AND a.state = 'adopted'
+                   AND a.not_before <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM automation_retry_state AS q
+                       WHERE q.automation_id = o.automation_id
+                         AND q.quarantined_at IS NOT NULL
+                   )
+                 ORDER BY o.automation_id",
+            )
+            .context("failed to prepare pending retry claims")?;
+        let rows = statement
+            .query_map([iso(now)], |row| row.get(0))
+            .context("failed to query pending retry claims")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read pending retry claim")?
+    };
+    for automation_id in retry_automations {
+        match claim_due_occurrence(conn, &automation_id, "daemon", 60, now) {
+            Ok(Some(id)) => report.claimed.push(id),
+            Ok(None) => {}
+            Err(error) => report.failed.push(format!("{automation_id}: {error}")),
+        }
+    }
 
     let paused: i64 = conn
         .query_row(
@@ -396,6 +503,19 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
     let mut failures = Vec::new();
     for record in records {
         if record.status != "ACTIVE" {
+            continue;
+        }
+        let quarantined: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM automation_retry_state
+                    WHERE automation_id = ?1 AND quarantined_at IS NOT NULL
+                )",
+                [&record.id],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("failed to inspect retry quarantine for `{}`", record.id))?;
+        if quarantined {
             continue;
         }
         let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {

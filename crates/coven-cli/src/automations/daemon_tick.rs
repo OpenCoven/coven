@@ -1004,7 +1004,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_definition_mutation_wakes_only_its_registered_home() {
+    fn successful_automation_actions_wake_only_their_registered_home() {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         for home in [first.path(), second.path()] {
@@ -1065,6 +1065,24 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(first_wake.generation(), 1);
+        assert_eq!(second_wake.generation(), 0);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "wake-test"
+        })
+        .to_string();
+        let run_response = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            first.path(),
+            None,
+            Some(&run_body),
+        )
+        .unwrap();
+
+        assert_eq!(run_response.status, 200);
+        assert_eq!(first_wake.generation(), 2);
         assert_eq!(second_wake.generation(), 0);
     }
 

@@ -15,6 +15,7 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         automation_id TEXT NOT NULL,
         automation_revision INTEGER NOT NULL DEFAULT 1 CHECK (automation_revision >= 1),
         definition_digest TEXT,
+        definition_json TEXT,
         occurrence_id TEXT,
         receipt_id TEXT,
         session_id TEXT,
@@ -32,6 +33,98 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_started
         ON automation_runs(automation_id, started_at DESC);
+";
+
+pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS automation_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL,
+        occurrence_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 10),
+        adoption_key TEXT NOT NULL UNIQUE,
+        occurrence_fence_generation INTEGER NOT NULL
+            CHECK (occurrence_fence_generation >= 1),
+        dispatch_generation INTEGER NOT NULL DEFAULT 0
+            CHECK (dispatch_generation >= 0),
+        state TEXT NOT NULL CHECK (
+            state IN (
+                'adopted', 'dispatching', 'started', 'observing',
+                'succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous'
+            )
+        ),
+        failure_class TEXT CHECK (
+            failure_class IS NULL OR failure_class IN (
+                'transient_dispatch', 'lease_expired', 'runtime_unavailable',
+                'launch_refused', 'runtime_error', 'timeout', 'cancelled',
+                'ambiguous_evidence'
+            )
+        ),
+        prior_attempt_number INTEGER CHECK (
+            prior_attempt_number IS NULL OR prior_attempt_number >= 1
+        ),
+        prior_disposition TEXT CHECK (
+            prior_disposition IS NULL OR prior_disposition IN (
+                'failed', 'timed_out', 'cancelled', 'ambiguous'
+            )
+        ),
+        retry_classification TEXT NOT NULL CHECK (
+            retry_classification IN (
+                'initial', 'automatic_retry', 'operator_retry', 'operator_recovery'
+            )
+        ),
+        not_before TEXT NOT NULL,
+        session_id TEXT UNIQUE,
+        state_reason TEXT,
+        opened_at TEXT NOT NULL,
+        settled_at TEXT,
+        FOREIGN KEY (run_id) REFERENCES automation_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE RESTRICT,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+        UNIQUE (run_id, attempt_number),
+        CHECK (
+            (attempt_number = 1
+             AND prior_attempt_number IS NULL
+             AND prior_disposition IS NULL)
+            OR
+            (attempt_number > 1
+             AND prior_attempt_number = attempt_number - 1
+             AND prior_disposition IS NOT NULL)
+        )
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_automation_attempts_dispatch
+        ON automation_attempts(state, not_before);
+
+    CREATE TRIGGER IF NOT EXISTS automation_attempts_terminal_immutable
+    BEFORE UPDATE ON automation_attempts
+    WHEN OLD.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal automation attempt is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_attempts_delete_terminal_refused
+    BEFORE DELETE ON automation_attempts
+    WHEN OLD.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal automation attempt cannot be deleted');
+    END;
+
+    CREATE TABLE IF NOT EXISTS automation_retry_state (
+        automation_id TEXT PRIMARY KEY NOT NULL,
+        consecutive_exhaustions INTEGER NOT NULL DEFAULT 0
+            CHECK (consecutive_exhaustions >= 0),
+        quarantined_at TEXT,
+        failure_class TEXT,
+        reason TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (automation_id)
+            REFERENCES automation_definitions(id) ON DELETE CASCADE,
+        CHECK (
+            (quarantined_at IS NULL AND failure_class IS NULL AND reason IS NULL)
+            OR
+            (quarantined_at IS NOT NULL AND failure_class IS NOT NULL AND reason IS NOT NULL)
+        )
+    );
 ";
 
 #[allow(dead_code)]
@@ -62,6 +155,27 @@ pub struct RunRecord {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub id: String,
+    pub run_id: String,
+    pub occurrence_id: String,
+    pub attempt_number: i64,
+    pub adoption_key: String,
+    pub occurrence_fence_generation: i64,
+    pub dispatch_generation: i64,
+    pub state: String,
+    pub failure_class: Option<String>,
+    pub prior_attempt_number: Option<i64>,
+    pub prior_disposition: Option<String>,
+    pub retry_classification: String,
+    pub not_before: String,
+    pub session_id: Option<String>,
+    pub state_reason: Option<String>,
+    pub opened_at: String,
+    pub settled_at: Option<String>,
+}
+
 #[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub struct RunStart<'a> {
     pub automation_id: &'a str,
@@ -78,19 +192,20 @@ pub fn record_run_start(
     start: RunStart<'_>,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    let (automation_revision, definition_digest) =
+    let (automation_revision, definition_digest, definition_json) =
         definition_pin(conn, start.automation_id, start.occurrence_id)?;
     conn.execute(
         "INSERT INTO automation_runs
-            (id, automation_id, automation_revision, definition_digest, occurrence_id,
+            (id, automation_id, automation_revision, definition_digest, definition_json, occurrence_id,
              session_id, familiar_id, runtime, status, started_at, timeout_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'running', ?9, ?10)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10, ?11)",
         params![
             run_id,
             start.automation_id,
             i64::try_from(automation_revision)
                 .context("automation revision exceeds SQLite range")?,
             definition_digest,
+            definition_json,
             start.occurrence_id,
             start.session_id,
             start.familiar_id,
@@ -107,7 +222,7 @@ fn definition_pin(
     conn: &Connection,
     automation_id: &str,
     occurrence_id: Option<&str>,
-) -> Result<(u64, Option<String>)> {
+) -> Result<(u64, Option<String>, Option<String>)> {
     if let Some(occurrence_id) = occurrence_id {
         let occurrence = conn
             .query_row(
@@ -133,28 +248,48 @@ fn definition_pin(
                 "automation occurrence `{occurrence_id}` does not belong to automation `{automation_id}`"
             );
         }
+        let definition_json = conn
+            .query_row(
+                "SELECT definition_json
+                 FROM automation_definitions
+                 WHERE id = ?1
+                   AND revision = ?2
+                   AND definition_digest IS ?3",
+                params![automation_id, revision, digest],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read pinned automation definition")?;
         return Ok((
             u64::try_from(revision).context("occurrence revision is negative")?,
             digest,
+            definition_json,
         ));
     }
 
     let current = conn
         .query_row(
-            "SELECT revision, definition_digest
+            "SELECT revision, definition_digest, definition_json
              FROM automation_definitions
              WHERE id = ?1 AND tombstoned_at IS NULL",
             [automation_id],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()
         .context("failed to read automation definition pin")?;
     match current {
-        Some((revision, digest)) => Ok((
+        Some((revision, digest, definition_json)) => Ok((
             u64::try_from(revision).context("automation definition revision is negative")?,
             digest,
+            Some(definition_json),
         )),
-        None => Ok((1, None)),
+        None => Ok((1, None, None)),
     }
 }
 
@@ -268,30 +403,126 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     for row in rows {
         records.push(row.context("failed to read run row")?);
     }
-
     Ok(records)
 }
 
+pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM automation_retry_state
+            WHERE automation_id = ?1 AND quarantined_at IS NOT NULL
+        )",
+        [automation_id],
+        |row| row.get(0),
+    )
+    .context("failed to inspect automation retry quarantine")
+}
+
+pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, not_before, session_id, state_reason,
+                    opened_at, settled_at
+             FROM automation_attempts
+             WHERE run_id = ?1
+             ORDER BY attempt_number ASC",
+        )
+        .context("failed to prepare automation attempt list")?;
+    let rows = statement
+        .query_map([run_id], |row| {
+            Ok(AttemptRecord {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                occurrence_id: row.get(2)?,
+                attempt_number: row.get(3)?,
+                adoption_key: row.get(4)?,
+                occurrence_fence_generation: row.get(5)?,
+                dispatch_generation: row.get(6)?,
+                state: row.get(7)?,
+                failure_class: row.get(8)?,
+                prior_attempt_number: row.get(9)?,
+                prior_disposition: row.get(10)?,
+                retry_classification: row.get(11)?,
+                not_before: row.get(12)?,
+                session_id: row.get(13)?,
+                state_reason: row.get(14)?,
+                opened_at: row.get(15)?,
+                settled_at: row.get(16)?,
+            })
+        })
+        .context("failed to list automation attempts")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation attempt")
+}
+
+pub fn record_retry_exhaustion(
+    conn: &Connection,
+    automation_id: &str,
+    failure_class: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO automation_retry_state
+            (automation_id, consecutive_exhaustions, quarantined_at,
+             failure_class, reason, updated_at)
+         VALUES (?1, 1, ?2, ?3, ?4, ?2)
+         ON CONFLICT(automation_id) DO UPDATE SET
+             consecutive_exhaustions = automation_retry_state.consecutive_exhaustions + 1,
+             quarantined_at = excluded.quarantined_at,
+             failure_class = excluded.failure_class,
+             reason = excluded.reason,
+             updated_at = excluded.updated_at",
+        params![automation_id, iso(now), failure_class, reason],
+    )
+    .context("failed to quarantine exhausted automation")?;
+    Ok(())
+}
+
+pub fn clear_retry_quarantine(
+    conn: &Connection,
+    automation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE automation_retry_state
+             SET consecutive_exhaustions = 0,
+                 quarantined_at = NULL,
+                 failure_class = NULL,
+                 reason = NULL,
+                 updated_at = ?2
+             WHERE automation_id = ?1 AND quarantined_at IS NOT NULL",
+            params![automation_id, iso(now)],
+        )
+        .context("failed to clear automation retry quarantine")?;
+    Ok(changed == 1)
+}
+
 pub fn ensure_timeout_column(conn: &Connection) -> Result<()> {
-    let present = {
+    let columns = {
         let mut statement = conn
             .prepare("PRAGMA table_info(automation_runs)")
             .context("failed to inspect automation_runs columns")?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))
             .context("failed to query automation_runs columns")?;
-        let mut present = false;
+        let mut names = Vec::new();
         for column in columns {
-            if column.context("failed to read automation_runs column")? == "timeout_at" {
-                present = true;
-                break;
-            }
+            names.push(column.context("failed to read automation_runs column")?);
         }
-        present
+        names
     };
-    if !present {
+    if !columns.iter().any(|column| column == "timeout_at") {
         conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN timeout_at TEXT")
             .context("failed to add automation_runs.timeout_at")?;
+    }
+    if !columns.iter().any(|column| column == "definition_json") {
+        conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN definition_json TEXT")
+            .context("failed to add automation_runs.definition_json")?;
     }
     Ok(())
 }
@@ -312,6 +543,30 @@ mod tests {
         initialize_store(&path).unwrap();
         let conn = crate::store::open_store(&path).unwrap();
         (temp, conn)
+    }
+
+    #[test]
+    fn run_schema_migration_adds_timeout_and_definition_snapshot_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+
+        ensure_timeout_column(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "timeout_at"));
+        assert!(columns.iter().any(|column| column == "definition_json"));
     }
 
     #[test]
@@ -510,5 +765,69 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{error:#}").contains("succeeded, failed, or cancelled"));
+    }
+
+    #[test]
+    fn attempt_ledger_is_unique_and_terminal_rows_are_immutable() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('occ-attempt', 'daily', '2026-08-28T09:00:00.000Z', 'failed', 1,
+                     '2026-08-28T09:00:00.000Z', '2026-08-28T09:01:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, finished_at)
+             VALUES ('run-attempt', 'daily', 'occ-attempt', 'coven-code', 'failed',
+                     '2026-08-28T09:00:00.000Z', '2026-08-28T09:01:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                retry_classification, not_before, opened_at, settled_at
+             ) VALUES (
+                'attempt-1', 'run-attempt', 'occ-attempt', 1, 'run-attempt:1',
+                1, 1, 'failed', 'initial',
+                '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z',
+                '2026-08-28T09:01:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let duplicate_number = conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                retry_classification, not_before, opened_at
+             ) VALUES (
+                'attempt-duplicate-number', 'run-attempt', 'occ-attempt', 1,
+                'run-attempt:duplicate', 1, 0, 'adopted', 'automatic_retry',
+                '2026-08-28T09:02:00.000Z', '2026-08-28T09:01:00.000Z'
+             )",
+            [],
+        );
+        assert!(duplicate_number.is_err());
+
+        let update_terminal = conn.execute(
+            "UPDATE automation_attempts SET state = 'adopted' WHERE id = 'attempt-1'",
+            [],
+        );
+        assert!(update_terminal.is_err());
+        let delete_terminal =
+            conn.execute("DELETE FROM automation_attempts WHERE id = 'attempt-1'", []);
+        assert!(delete_terminal.is_err());
+
+        let attempts = list_attempts(&conn, "run-attempt").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[0].state, "failed");
+        assert_eq!(attempts[0].retry_classification, "initial");
     }
 }

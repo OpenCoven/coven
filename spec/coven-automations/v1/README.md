@@ -45,6 +45,15 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 - Spring-forward gaps skip nonexistent wall times. Fall-back folds select the
   first occurrence (the earlier UTC instant). Both rules are deterministic and
   pinned by `test-vectors.json`.
+- Native retries preserve one run across immutable attempts. Only the protocol
+  classes `transient_dispatch`, `lease_expired`, and `runtime_unavailable` may
+  auto-retry, and only when pre-side-effect evidence proves the disposition.
+  Ownership-retained and ambiguous outcomes never auto-retry.
+- Retry eligibility is persisted as `notBefore` from the observed failure
+  time. Fixed delays are exact; exponential delays use deterministic full
+  jitter bounded to one day. Retry waiting remains inside the original run
+  timeout, and exhaustion quarantines the definition until an explicit
+  operator release.
 
 ## Conformance
 

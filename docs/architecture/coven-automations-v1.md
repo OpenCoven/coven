@@ -145,6 +145,44 @@ adopted -> dispatching -> started -> observing
 
 `ambiguous` is terminal for the attempt (dispatch sent but no deterministic ack, or evidence lost). The occurrence carries the recovery; the attempt never re-opens. `dispatching -> failed` covers deterministic launch refusal; `dispatching -> ambiguous` covers unconfirmed dispatch.
 
+The native Rust runner persists this model in `automation_attempts`. The first
+dispatch opens attempt 1 before runtime side effects; retries append a new row
+with a deterministic adoption key, the prior attempt number/disposition, the
+claim fence generation, and a persisted `not_before`. A terminal attempt row
+cannot be updated or deleted. `coven.automations.runs` includes the attempt
+ledger, and `coven.automations.health` exposes the current retry wait and
+configured attempt bound. The run also stores the exact validated definition
+JSON beside its revision and digest, so restart recovery and later attempts use
+the accepted policy/binding even if the live definition is revised.
+
+Automatic retry is deliberately narrower than a generic launch error:
+
+- `runtime_unavailable` is reserved for pre-ownership I/O evidence such as a
+  missing or unreachable runtime.
+- `transient_dispatch` is reserved for pre-ownership interruption, queue
+  backpressure, or timeout evidence.
+- `lease_expired` is retried only when the containment receipt proves no
+  process started. Lease age alone is not sufficient.
+- Unknown launch failures settle as `launch_refused`. Any path that established
+  or may have retained runtime ownership remains nonterminal or ambiguous and
+  never auto-retries.
+
+Backoff is durable and restart-safe. `none` is immediately eligible, `fixed`
+uses the configured delay, and `exponential` uses deterministic full jitter
+derived from the run id and next attempt number. Delays begin when the
+pre-ownership failure is observed, not when dispatch began. The ceiling is
+capped at one day. The scheduler will not claim the retry before `not_before`,
+and overlap protection continues to block every other occurrence while the
+same run waits. The original per-run wall-clock deadline includes retry
+backoff: expiration atomically fails the occurrence and run and terminalizes
+the pending attempt without launching another runtime session.
+
+When a configured retryable class exhausts `maxAttempts`, Coven terminally
+fails the run and occurrence and records `automation_retry_state` quarantine.
+Quarantined definitions do not plan, claim, or accept manual runs. Health
+reports the exhaustion count, failure class, reason, and quarantine timestamp;
+the explicit `coven.automations.unquarantine` control action releases it.
+
 ### Run
 
 ```text
