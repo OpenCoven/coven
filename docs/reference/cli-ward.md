@@ -101,8 +101,10 @@ is mutated.
   than the replacement pathname.
 - **Windows:** parent directories are retained without delete sharing, so a
   concurrent rename fails while a transaction owns the handle. Entries are
-  opened without following reparse points, and no-replace moves name the
-  destination relative to the retained directory handle.
+  opened without following reparse points. No-replace moves operate on the
+  exact opened source handle and use the destination's stable absolute spelling;
+  the retained root and parent handles prevent its ancestors from being renamed
+  during the call.
 
 Absolute paths remain in errors and audit-facing diagnostics only. Final-entry
 replacement is still handled by the retained inode/file-ID and exact-content

@@ -72,8 +72,9 @@
 //! replacement ancestor. macOS uses the corresponding
 //! `openat`/`fstatat`/`linkat`/`unlinkat` operations and `renameatx_np` through
 //! rustix. Windows retains non-share-delete directory handles, opens entries
-//! without following reparse points, and moves exact source handles relative
-//! to the retained destination directory with `SetFileInformationByHandle`.
+//! without following reparse points, and moves exact source handles with
+//! `SetFileInformationByHandle`; the stable absolute destination spelling is
+//! safe because the retained handles prevent ancestor renames.
 //! Linux and macOS exchange the staged and target entries. Windows moves the
 //! target to a randomized backup and installs the staged entry with no-replace
 //! semantics.
@@ -120,8 +121,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
+#[cfg(any(target_os = "linux", not(unix)))]
+use cap_fs_ext::DirExt;
 #[cfg(not(unix))]
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 #[cfg(not(unix))]
@@ -3145,11 +3148,12 @@ fn open_regular_file_handle_without_following_links(
     ) {
         Ok(file) => std::fs::File::from(file),
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+        Err(error) if error.raw_os_error() == libc::ENOSYS => {
             return open_regular_file_handle_portable(path);
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("opening direct target {}", path.display()))
+            return Err(std::io::Error::from(error))
+                .with_context(|| format!("opening direct target {}", path.display()))
         }
     };
     let metadata = file
@@ -3565,10 +3569,17 @@ fn atomic_move_without_replace(source: &AnchoredEntry, destination: &AnchoredEnt
         bail!("move source {} is not a regular file", source.display());
     }
 
-    let destination_name = destination.name.encode_wide().collect::<Vec<_>>();
+    // The Win32 API's absolute-name form is more widely supported than a
+    // RootDirectory-relative FILE_RENAME_INFO. Retained non-share-delete
+    // handles keep every destination ancestor stable for this call.
+    let destination_name = destination
+        .absolute
+        .as_os_str()
+        .encode_wide()
+        .collect::<Vec<_>>();
     let file_name_offset = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
     let info_size = file_name_offset
-        .checked_add(destination_name.len() * std::mem::size_of::<u16>())
+        .checked_add((destination_name.len() + 1) * std::mem::size_of::<u16>())
         .context("Windows rename buffer size overflow")?;
     let mut buffer = vec![0_u64; info_size.div_ceil(std::mem::size_of::<u64>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
@@ -3576,7 +3587,7 @@ fn atomic_move_without_replace(source: &AnchoredEntry, destination: &AnchoredEnt
     // the UTF-16 destination name, and all handles remain live for the call.
     let result = unsafe {
         (*info).Anonymous.ReplaceIfExists = false;
-        (*info).RootDirectory = destination.parent.as_raw_handle() as _;
+        (*info).RootDirectory = std::ptr::null_mut();
         (*info).FileNameLength =
             u32::try_from(destination_name.len() * 2).context("Windows rename name is too long")?;
         std::ptr::copy_nonoverlapping(
@@ -4680,8 +4691,8 @@ fn open_child_dir_nofollow(parent: &Dir, name: &OsStr) -> std::io::Result<Dir> {
         ResolveFlags::BENEATH | ResolveFlags::NO_MAGICLINKS | ResolveFlags::NO_SYMLINKS,
     ) {
         Ok(fd) => Ok(Dir::from_std_file(fd.into())),
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => parent.open_dir_nofollow(name),
-        Err(error) => Err(error),
+        Err(error) if error.raw_os_error() == libc::ENOSYS => parent.open_dir_nofollow(name),
+        Err(error) => Err(error.into()),
     }
 }
 

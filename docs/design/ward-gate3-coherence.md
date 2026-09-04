@@ -175,7 +175,9 @@ with evidence:
   verification, rollback, and cleanup through sibling names relative to that
   handle. Linux uses `openat2` beneath/no-symlink resolution with a
   one-component `openat` fallback; macOS uses `*at` operations; Windows retains
-  non-share-delete directory handles and handle-relative no-replace moves.
+  non-share-delete directory handles and moves exact source handles to stable
+  absolute destination spellings whose ancestors cannot be renamed while those
+  handles are live.
   Approval still uses the conditional atomic writer, including no-replace
   creation and rollback that preserves concurrent bytes. A first apply must
   still observe the exact reviewed before-image even when a concurrent writer
