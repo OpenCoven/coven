@@ -5080,6 +5080,154 @@ mod tests {
     }
 
     #[test]
+    fn unproven_timeout_stop_enters_recovery_without_automatic_retry() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("timeout-recovery");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 5, 9, 0, 0).unwrap();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+
+        let failures = enforce_run_timeouts(&conn, &FailedKillRuntime, timed_out_at).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("termination is unproven"));
+
+        let lifecycle: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT o.state, a.state, a.failure_class, a.state_reason
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "recovery_required".to_string(),
+                "ambiguous".to_string(),
+                Some("ambiguous_evidence".to_string()),
+                Some("timeout stop was not confirmed".to_string()),
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "an unconfirmed timeout stop must not become an automatic retry"
+        );
+        assert_eq!(
+            crate::store::get_session(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+            )
+            .unwrap()
+            .expect("persisted session")
+            .status,
+            "running",
+            "an unconfirmed stop must not be represented as a stopped session"
+        );
+    }
+
+    #[test]
+    fn timeout_wins_over_late_completion_without_opening_a_retry() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("timeout-race");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc.with_ymd_and_hms(2026, 9, 5, 9, 0, 0).unwrap();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+
+        assert!(
+            enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !crate::store::update_session_terminal_if_active(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+                "completed",
+                Some(0),
+                &(timed_out_at + chrono::Duration::milliseconds(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .unwrap(),
+            "a late completion must lose to the already-recorded timeout stop"
+        );
+        assert_eq!(
+            settle_finished_runs(&conn, timed_out_at).unwrap(),
+            SettlementReport::default(),
+            "a losing completion observation must not produce a second settlement"
+        );
+
+        let lifecycle: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "timed_out".to_string(),
+                "timed_out".to_string(),
+                "timed_out".to_string(),
+                Some("timeout".to_string()),
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "a timeout must remain a timeout unless persisted policy explicitly permits retry"
+        );
+    }
+
+    #[test]
     fn missing_cwd_fails_without_launching() {
         let (_temp, conn) = temp_store();
         let mut definition = definition("nocwd");

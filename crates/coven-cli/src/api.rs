@@ -14903,6 +14903,287 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    fn start_running_automation_for_cancellation(
+    ) -> anyhow::Result<(tempfile::TempDir, String, String, String)> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:cancellation-target:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "cancellation-target",
+                "name": "Cancellation target",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "familiarId": "charm",
+                "prompt": "Wait for cancellation."
+            }
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let started = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&run_body),
+        )?;
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: Value = serde_json::from_str(&started.body)?;
+        let run_id = started["event"]["payload"]["runId"]
+            .as_str()
+            .context("run action must return a run id")?
+            .to_string();
+        let session_id = started["event"]["payload"]["sessionId"]
+            .as_str()
+            .context("run action must return a runtime correlation")?
+            .to_string();
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        assert_eq!(history.status, 200, "{}", history.body);
+        let history: Value = serde_json::from_str(&history.body)?;
+        let attempt_id = history["event"]["payload"]["runs"][0]["attempts"][0]["id"]
+            .as_str()
+            .context("running automation must expose its current attempt")?
+            .to_string();
+        Ok((temp_dir, run_id, attempt_id, session_id))
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_attempt_or_runtime_correlation() -> anyhow::Result<()> {
+        let (temp_dir, run_id, _attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let cancel_body = json!({
+            "action": "coven.automations.run.cancel.v1",
+            "adoptionKey": "adopt:cancel:cancellation-target:stale",
+            "runId": run_id,
+            "attemptId": "attempt-stale",
+            "runtimeCorrelation": { "sessionId": "session-stale" },
+            "scope": "run",
+            "reason": "stale operator request",
+            "requestedBy": { "principalId": "operator:aria" }
+        })
+        .to_string();
+
+        let rejected = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(rejected.status, 409, "{}", rejected.body);
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        let history: Value = serde_json::from_str(&history.body)?;
+        assert_eq!(history["event"]["payload"]["runs"][0]["id"], run_id);
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["sessionId"],
+            session_id
+        );
+        assert_eq!(history["event"]["payload"]["runs"][0]["status"], "running");
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["attempts"][0]["state"],
+            "started"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_persists_its_lifecycle_and_survives_definition_tombstone() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let cancel_body = json!({
+            "action": "coven.automations.run.cancel.v1",
+            "adoptionKey": "adopt:cancel:cancellation-target:0003",
+            "runId": run_id,
+            "attemptId": attempt_id,
+            "runtimeCorrelation": { "sessionId": session_id },
+            "scope": "run",
+            "reason": "operator requested shutdown",
+            "requestedBy": { "principalId": "operator:aria" }
+        })
+        .to_string();
+        let cancelled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.body);
+        let cancelled: Value = serde_json::from_str(&cancelled.body)?;
+        let payload = &cancelled["event"]["payload"];
+        assert_eq!(payload["runId"], run_id);
+        assert_eq!(payload["attemptId"], attempt_id);
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(
+            payload["cancellation"]["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(payload["cancellation"]["scope"], "run");
+        assert_eq!(
+            payload["cancellation"]["reason"],
+            "operator requested shutdown"
+        );
+        assert!(payload["cancellation"]["requestedAt"].is_string());
+        assert!(payload["cancellation"]["acknowledgedAt"].is_string());
+        assert!(payload["cancellation"]["reconciledAt"].is_string());
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &current_timestamp(),
+            )?,
+            "a completion observed after cancellation must not rewrite its terminal session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?,
+            crate::automations::runner::SettlementReport::default(),
+            "a losing completion observation must not settle the cancelled run again"
+        );
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        let history: Value = serde_json::from_str(&history.body)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "cancelled");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "cancelled");
+        assert_eq!(run["attempts"][0]["failureClass"], "cancelled");
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_a_definition_stops_planning_without_rewriting_its_active_run() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let disable_body = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": "adopt:disable:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "operator disabled future runs"
+        })
+        .to_string();
+
+        let disabled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable_body),
+        )?;
+        assert_eq!(disabled.status, 200, "{}", disabled.body);
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        let history: Value = serde_json::from_str(&history.body)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let report =
+            crate::automations::occurrences::tick(&conn, Utc::now() + chrono::Duration::days(2))?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a disabled definition must not plan or claim future work: {report:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn control_action_rejects_stale_automation_revision_without_mutation() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;

@@ -681,6 +681,36 @@ mod tests {
         }
     }
 
+    struct NotifyingRunningRuntime {
+        started: SyncSender<()>,
+    }
+
+    impl crate::api::SessionRuntime for NotifyingRunningRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> Result<()> {
+            unreachable!("automation dispatch uses the contained adopted launch path")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &crate::api::SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            ownership_established()?;
+            self.started
+                .send(())
+                .context("failed to report running automation launch")
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     fn set_created_at(conn: &rusqlite::Connection, id: &str, created_at: &str) {
         conn.execute(
             "UPDATE automation_definitions
@@ -1001,6 +1031,59 @@ mod tests {
             .unwrap();
         assert_eq!(run_count, 0);
         assert_eq!(session_count, 0);
+    }
+
+    #[test]
+    fn shutdown_marks_active_attempts_for_restart_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("shutdown-reconciliation")).unwrap();
+        set_created_at(&conn, "shutdown-reconciliation", "2020-01-01T08:00:00.000Z");
+        drop(conn);
+
+        let (started_tx, started_rx) = sync_channel(1);
+        let handle = start_automations_scheduler(
+            home,
+            Arc::new(NotifyingRunningRuntime {
+                started: started_tx,
+            }),
+        )
+        .unwrap();
+        // Hang guard only: the channel proves durable ownership before shutdown.
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup pass should establish runtime ownership");
+
+        handle.request_shutdown();
+        handle.shutdown().unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let lifecycle: (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT o.state, a.state_reason, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE o.automation_id = 'shutdown-reconciliation'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(lifecycle.0, "recovery_required");
+        assert!(
+            lifecycle
+                .1
+                .as_deref()
+                .is_some_and(|reason| reason.contains("restart reconciliation")),
+            "shutdown must durably explain why the active attempt requires reconciliation"
+        );
+        assert_eq!(
+            lifecycle.2, "running",
+            "scheduler shutdown must not assume the runtime stopped"
+        );
     }
 
     #[test]
