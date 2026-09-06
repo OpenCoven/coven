@@ -1,3 +1,13 @@
+---
+summary: "Run the real-daemon Threads E2E harness and inspect its sanitized evidence."
+read_when:
+  - Testing the Coven daemon against coven-threads-core
+  - Diagnosing a Threads E2E journey failure
+title: "Threads real-daemon E2E"
+description: "Source-adjacent reference for the real-daemon Threads integration harness, local dependency override proof, and sanitized failure artifacts."
+source_adjacent_reason: "Tracks the real daemon test fixture and evidence contract implemented in this repository."
+---
+
 # Threads real-daemon E2E
 
 The `threads_e2e` integration target exercises the Ward/Threads boundary
@@ -42,7 +52,10 @@ target/e2e-artifacts/<run-id>/junit.xml
 ```
 
 On failure, the same directory also contains the synthetic request and
-response, exact Coven and Threads revisions, daemon recovery log, Ward audit
-rows, hashed pending/workspace inventories, and SQLite schema. The fixtures use
-only synthetic identities and content; evidence never reads a developer's real
-Coven home.
+response, daemon recovery log, Ward audit rows, hashed pending/workspace
+inventories, and SQLite schema. Setup failures emit the same paths with explicit
+unavailable markers. Once dependency preflight completes, `manifest.json`
+includes exact Coven and Threads revisions and
+`local_threads_override_active`; earlier failures record those fields as null.
+The fixtures use only synthetic identities and content; evidence never reads a
+developer's real Coven home.

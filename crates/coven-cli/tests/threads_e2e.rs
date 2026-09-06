@@ -8,7 +8,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::Shutdown;
-use std::os::unix::{ffi::OsStrExt, net::UnixStream};
+use std::os::unix::{
+    ffi::OsStrExt,
+    net::{UnixListener, UnixStream},
+};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -207,6 +210,32 @@ fn smoke_out_of_band_drift_stages_without_execution() -> Result<()> {
         );
         Ok(())
     })
+}
+
+#[test]
+fn http_client_rejects_truncated_response_body() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let listener = UnixListener::bind(temp.path().join("coven.sock"))?;
+    let server = thread::spawn(move || -> std::io::Result<()> {
+        let (mut stream, _) = listener.accept()?;
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request)?;
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{}")?;
+        Ok(())
+    });
+
+    let error = unix_http_request(temp.path(), "GET", "/health", None)
+        .expect_err("truncated response must fail closed");
+    server
+        .join()
+        .map_err(|_| anyhow::anyhow!("HTTP fixture thread panicked"))??;
+    anyhow::ensure!(
+        error
+            .to_string()
+            .contains("before the declared 8-byte body"),
+        "unexpected truncated-response error: {error:#}"
+    );
+    Ok(())
 }
 
 fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>) -> Result<()> {
@@ -531,6 +560,10 @@ impl EvidenceContext {
 
     fn write_setup_failure(&self, error: &anyhow::Error) -> Result<()> {
         fs::create_dir_all(&self.artifact_dir)?;
+        let logs = self.artifact_dir.join("logs");
+        let state = self.artifact_dir.join("state");
+        fs::create_dir_all(&logs)?;
+        fs::create_dir_all(&state)?;
         let sanitized = sanitize_for_artifact(&format!("{error:#}"));
         let failure = format!(
             "<failure message=\"{}\">{}</failure>",
@@ -555,11 +588,29 @@ impl EvidenceContext {
                 "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
                 "platform": std::env::consts::OS,
                 "setup_completed": false,
+                "coven_commit": Value::Null,
+                "threads_commit": Value::Null,
+                "local_threads_override_active": Value::Null,
                 "failure": sanitized,
             }))?,
         )?;
         fs::write(self.artifact_dir.join("request.json"), b"null\n")?;
         fs::write(self.artifact_dir.join("response.json"), b"null\n")?;
+        fs::write(
+            logs.join("daemon.log"),
+            "<daemon unavailable: fixture setup did not complete>\n",
+        )?;
+        for name in [
+            "ward-audit.jsonl",
+            "pending-tree.txt",
+            "workspace-tree.txt",
+            "sqlite-schema.txt",
+        ] {
+            fs::write(
+                state.join(name),
+                "<unavailable: fixture setup did not complete>\n",
+            )?;
+        }
         Ok(())
     }
 }
@@ -571,9 +622,14 @@ struct GitState {
 }
 
 fn threads_dependency(workspace_root: &Path) -> Result<ThreadsDependency> {
+    let workspace_root = fs::canonicalize(workspace_root)
+        .context("canonicalizing the Coven workspace for dependency proof")?;
+    let coven_cli_manifest =
+        fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+            .context("canonicalizing the coven-cli manifest path")?;
     let output = Command::new("cargo")
         .args(["metadata", "--format-version", "1", "--locked"])
-        .current_dir(workspace_root)
+        .current_dir(&workspace_root)
         .output()
         .context("running cargo metadata for the Threads override proof")?;
     anyhow::ensure!(
@@ -589,13 +645,11 @@ fn threads_dependency(workspace_root: &Path) -> Result<ThreadsDependency> {
         .iter()
         .find(|package| {
             package["name"] == "coven-cli"
-                && package["manifest_path"].as_str()
-                    == Some(
-                        Path::new(env!("CARGO_MANIFEST_DIR"))
-                            .join("Cargo.toml")
-                            .to_string_lossy()
-                            .as_ref(),
-                    )
+                && package["manifest_path"]
+                    .as_str()
+                    .and_then(|path| fs::canonicalize(path).ok())
+                    .as_ref()
+                    == Some(&coven_cli_manifest)
         })
         .context("cargo metadata did not contain this coven-cli package")?;
     let coven_cli_id = coven_cli["id"]
@@ -624,6 +678,12 @@ fn threads_dependency(workspace_root: &Path) -> Result<ThreadsDependency> {
             .as_str()
             .context("Threads package is missing manifest_path")?,
     );
+    let manifest_path = fs::canonicalize(&manifest_path).with_context(|| {
+        format!(
+            "canonicalizing resolved Threads manifest {}",
+            manifest_path.display()
+        )
+    })?;
     let local_override_active =
         package["source"].is_null() && !manifest_path.starts_with(workspace_root.join("crates"));
     Ok(ThreadsDependency {
@@ -753,10 +813,18 @@ fn unix_http_request(
 
     let mut response = Vec::new();
     let mut buffer = [0_u8; 8192];
-    let mut expected_len = None;
+    let mut expected_len: Option<(usize, usize)> = None;
     loop {
         let read = stream.read(&mut buffer)?;
         if read == 0 {
+            let (body_start, content_length) =
+                expected_len.context("daemon response ended before complete HTTP headers")?;
+            anyhow::ensure!(
+                response.len() >= body_start.saturating_add(content_length),
+                "daemon response ended after {} bytes, before the declared {}-byte body completed",
+                response.len().saturating_sub(body_start),
+                content_length
+            );
             break;
         }
         response.extend_from_slice(&buffer[..read]);
@@ -785,17 +853,23 @@ fn unix_http_request(
             break;
         }
     }
-    let response = String::from_utf8(response)?;
-    let status = response
+    let (body_start, content_length) =
+        expected_len.context("daemon response is missing complete HTTP framing")?;
+    let body_end = body_start
+        .checked_add(content_length)
+        .context("daemon Content-Length overflowed the response budget")?;
+    anyhow::ensure!(
+        response.len() >= body_end,
+        "daemon response body is shorter than Content-Length"
+    );
+    let headers = std::str::from_utf8(&response[..body_start - 4])?;
+    let status = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|status| status.parse::<u16>().ok())
-        .with_context(|| format!("invalid HTTP response: {response}"))?;
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_owned())
-        .unwrap_or_default();
+        .with_context(|| format!("invalid HTTP response headers: {headers}"))?;
+    let body = String::from_utf8(response[body_start..body_end].to_vec())?;
     Ok((status, body))
 }
 
