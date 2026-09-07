@@ -1947,24 +1947,246 @@ pub fn enforce_run_timeouts(
     let mut failures = Vec::new();
     for (run_id, session_id, definition_name) in candidates {
         if let Err(error) = runtime.kill_session(&session_id) {
+            mark_unconfirmed_stop_for_recovery(
+                conn,
+                &run_id,
+                "timeout stop was not confirmed",
+                now,
+            )?;
             failures.push(format!(
                 "automation `{definition_name}` run `{run_id}` exceeded its timeout, but session `{session_id}` termination is unproven: {error:#}"
             ));
             continue;
         }
-        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        crate::store::update_session_terminal_if_active(
-            conn,
-            &session_id,
-            "killed",
-            None,
-            &now_iso,
-        )
-        .map_err(|error| {
-            format!("failed to persist timeout for session `{session_id}`: {error:#}")
-        })?;
+        settle_confirmed_stop(conn, &run_id, &session_id, ConfirmedStop::TimedOut, now)?;
     }
     Ok(failures)
+}
+
+pub(crate) enum ConfirmedStop {
+    Cancelled,
+    TimedOut,
+}
+
+pub(crate) fn settle_confirmed_stop(
+    conn: &Connection,
+    run_id: &str,
+    session_id: &str,
+    disposition: ConfirmedStop,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let (session_status, terminal_state, failure_class, state_reason, exit_code) = match disposition
+    {
+        ConfirmedStop::Cancelled => (
+            "cancelled",
+            "cancelled",
+            "cancelled",
+            "automation run cancelled by operator",
+            None,
+        ),
+        ConfirmedStop::TimedOut => (
+            "killed",
+            "timed_out",
+            "timeout",
+            "automation run timed out",
+            None,
+        ),
+    };
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin automation stop settlement: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if !crate::store::update_session_terminal_if_active(
+        &transaction,
+        session_id,
+        session_status,
+        exit_code.and_then(|code| i32::try_from(code).ok()),
+        &now_iso,
+    )
+    .map_err(|error| format!("failed to settle automation session `{session_id}`: {error:#}"))?
+    {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back losing stop settlement: {error}"))?;
+        return Ok(false);
+    }
+
+    let attempt_changed = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state = ?2,
+                 failure_class = ?3,
+                 state_reason = ?4,
+                 settled_at = ?5
+             WHERE run_id = ?1
+               AND session_id = ?6
+               AND state IN ('dispatching', 'started', 'observing')",
+            rusqlite::params![
+                run_id,
+                terminal_state,
+                failure_class,
+                state_reason,
+                now_iso,
+                session_id
+            ],
+        )
+        .map_err(|error| format!("failed to settle stopped automation attempt: {error}"))?;
+    if attempt_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete stop settlement: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has exactly one active attempt for session `{session_id}`"
+        ));
+    }
+
+    if !record_run_finish(
+        &transaction,
+        run_id,
+        RunFinish {
+            status: terminal_state,
+            exit_code,
+            session_id: Some(session_id.to_string()),
+            log_json: None,
+            output_commit: None,
+        },
+        now,
+    )
+    .map_err(|error| format!("failed to settle stopped automation run: {error:#}"))?
+    {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete run stop: {error}"))?;
+        return Ok(false);
+    }
+    let occurrence_id: String = transaction
+        .query_row(
+            "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to resolve stopped run occurrence: {error}"))?;
+    if !settle_occurrence(
+        &transaction,
+        &occurrence_id,
+        terminal_state,
+        Some(state_reason),
+        now,
+    )? {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete occurrence stop: {error}"))?;
+        return Err(format!(
+            "automation occurrence `{occurrence_id}` was no longer active during stop settlement"
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit automation stop settlement: {error}"))?;
+    Ok(true)
+}
+
+pub(crate) fn mark_unconfirmed_stop_for_recovery(
+    conn: &Connection,
+    run_id: &str,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin ambiguous stop settlement: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let attempt_changed = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state = 'ambiguous',
+                 failure_class = 'ambiguous_evidence',
+                 state_reason = ?2,
+                 settled_at = ?3
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing')",
+            rusqlite::params![run_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to mark ambiguous automation attempt: {error}"))?;
+    if attempt_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back ambiguous stop settlement: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has exactly one active attempt"
+        ));
+    }
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = (
+                 SELECT occurrence_id FROM automation_runs WHERE id = ?1
+             )
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![run_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to mark recovery-required occurrence: {error}"))?;
+    if occurrence_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back ambiguous occurrence stop: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has an active occurrence"
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit ambiguous stop settlement: {error}"))
+}
+
+pub fn mark_active_attempts_for_restart_reconciliation(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin shutdown reconciliation: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let reason = "daemon shutdown requires restart reconciliation";
+    let attempts = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state_reason = ?1
+             WHERE state IN ('dispatching', 'started', 'observing')
+               AND run_id IN (
+                   SELECT id FROM automation_runs WHERE status = 'running'
+               )",
+            rusqlite::params![reason],
+        )
+        .map_err(|error| format!("failed to mark active attempts for reconciliation: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?1,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?2
+             WHERE state IN ('claimed', 'running')
+               AND id IN (
+                   SELECT occurrence_id
+                   FROM automation_runs
+                   WHERE status = 'running'
+               )",
+            rusqlite::params![reason, now_iso],
+        )
+        .map_err(|error| {
+            format!("failed to mark active occurrences for restart reconciliation: {error}")
+        })?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit shutdown reconciliation: {error}"))?;
+    Ok(attempts)
 }
 
 /// Reconciles nonterminal automation rows against the authoritative session
@@ -2042,6 +2264,9 @@ pub fn settle_finished_runs(
         terminal_at,
     ) in rows
     {
+        if occurrence_state.as_deref() == Some("recovery_required") {
+            continue;
+        }
         let terminal_session = session_status.as_deref().is_some_and(|status| {
             matches!(
                 status,
@@ -4782,7 +5007,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_kills_session_before_settling_failure() {
+    fn timeout_kills_session_and_settles_once() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
         routine.timeout_minutes = 1;
@@ -4809,11 +5034,15 @@ mod tests {
         assert_eq!(session.status, "killed");
 
         let report = settle_finished_runs(&conn, timed_out_at).unwrap();
-        assert_eq!(report.failed, 1);
+        assert_eq!(
+            report,
+            SettlementReport::default(),
+            "the timeout path must own the only terminal settlement"
+        );
         let run = super::super::runs::list_runs(&conn, "daily", 10)
             .unwrap()
             .remove(0);
-        assert_eq!(run.status, "failed");
+        assert_eq!(run.status, "timed_out");
     }
 
     #[test]
@@ -5091,7 +5320,7 @@ mod tests {
             retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
         };
         insert_definition(&conn, &routine).unwrap();
-        let launched_at = Utc.with_ymd_and_hms(2026, 9, 5, 9, 0, 0).unwrap();
+        let launched_at = Utc::now();
         let outcome = run_routine_now(
             &conn,
             &crate::api::NoopSessionRuntime,
@@ -5161,7 +5390,7 @@ mod tests {
             retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
         };
         insert_definition(&conn, &routine).unwrap();
-        let launched_at = Utc.with_ymd_and_hms(2026, 9, 5, 9, 0, 0).unwrap();
+        let launched_at = Utc::now();
         let outcome = run_routine_now(
             &conn,
             &crate::api::NoopSessionRuntime,
@@ -5224,6 +5453,99 @@ mod tests {
         assert_eq!(
             attempts, 1,
             "a timeout must remain a timeout unless persisted policy explicitly permits retry"
+        );
+    }
+
+    #[test]
+    fn completion_wins_over_late_timeout_without_rewriting_terminal_state() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("completion-timeout-race");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let completed_at = launched_at + chrono::Duration::seconds(30);
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+        assert!(
+            completed_at < timed_out_at,
+            "the completion observation must win before the later timeout pass"
+        );
+        assert!(crate::store::update_session_terminal_if_active(
+            &conn,
+            outcome.session_id.as_deref().expect("linked session"),
+            "completed",
+            Some(0),
+            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        let settlement = settle_finished_runs(&conn, completed_at).unwrap();
+        assert_eq!(settlement.succeeded, 1);
+        assert_eq!(settlement.failed, 0);
+
+        assert!(
+            enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
+                .unwrap()
+                .is_empty(),
+            "a later timeout observation must lose to the completed terminal state"
+        );
+        assert_eq!(
+            settle_finished_runs(&conn, timed_out_at).unwrap(),
+            SettlementReport::default(),
+            "the losing timeout observation must not settle a second terminal result"
+        );
+        let lifecycle: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                None,
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "the losing timeout must not open an automatic retry after completion"
+        );
+        assert!(
+            !crate::store::update_session_terminal_if_active(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+                "killed",
+                None,
+                &timed_out_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .unwrap(),
+            "a timeout observed after completion must not rewrite the session terminal state"
         );
     }
 

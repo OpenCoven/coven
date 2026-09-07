@@ -10,6 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 
 const SCHEDULER_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
@@ -324,7 +325,22 @@ fn run_automations_scheduler(
     let startup_cutoff = clock.now_utc();
     process_automations_pass(coven_home, runtime, clock, wake, Some(startup_cutoff))?;
     run_automations_scheduler_after_startup(coven_home, runtime, clock, wake, observed_generation);
+    record_shutdown_reconciliation(coven_home, clock.now_utc());
     Ok(())
+}
+
+fn record_shutdown_reconciliation(coven_home: &Path, now: DateTime<Utc>) {
+    let result = crate::store::open_store(&crate::api::store_path(coven_home)).and_then(|conn| {
+        super::runner::mark_active_attempts_for_restart_reconciliation(&conn, now)
+            .map(|_| ())
+            .map_err(anyhow::Error::msg)
+    });
+    if let Err(error) = result {
+        crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("automations shutdown reconciliation failed: {error:#}"),
+        );
+    }
 }
 
 fn run_automations_scheduler_after_startup(
@@ -391,16 +407,16 @@ pub fn start_automations_scheduler(
                     &format!("automations startup tick failed: {error:#}"),
                 );
             }
-            if thread_wake.is_shutdown() {
-                return;
+            if !thread_wake.is_shutdown() {
+                run_automations_scheduler_after_startup(
+                    &home,
+                    runtime.as_ref(),
+                    clock.as_ref(),
+                    thread_wake.as_ref(),
+                    observed_generation,
+                );
             }
-            run_automations_scheduler_after_startup(
-                &home,
-                runtime.as_ref(),
-                clock.as_ref(),
-                thread_wake.as_ref(),
-                observed_generation,
-            );
+            record_shutdown_reconciliation(&home, clock.now_utc());
         })
         .context("failed to spawn automations scheduler")?;
     Ok(AutomationSchedulerHandle {
@@ -416,7 +432,7 @@ mod tests {
     use crate::automations::store::insert_definition;
     use chrono::{TimeZone, Utc};
     use serde_json::json;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
     use std::sync::{Arc, Mutex};
@@ -682,7 +698,7 @@ mod tests {
     }
 
     struct NotifyingRunningRuntime {
-        started: SyncSender<()>,
+        started: SyncSender<String>,
     }
 
     impl crate::api::SessionRuntime for NotifyingRunningRuntime {
@@ -692,13 +708,13 @@ mod tests {
 
         fn launch_contained_adopted_session(
             &self,
-            _launch: &crate::api::SessionLaunch,
+            launch: &crate::api::SessionLaunch,
             _writer: Option<crate::maintenance_gate::WriterLease>,
             ownership_established: &mut dyn FnMut() -> Result<()>,
         ) -> Result<()> {
             ownership_established()?;
             self.started
-                .send(())
+                .send(launch.id.clone())
                 .context("failed to report running automation launch")
         }
 
@@ -752,7 +768,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(state, "running");
+        assert_eq!(
+            state, "recovery_required",
+            "shutdown must preserve the launched work for restart reconciliation"
+        );
     }
 
     #[test]
@@ -866,7 +885,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(state, "running", "{failure_reason:?}");
+        assert_eq!(state, "recovery_required", "{failure_reason:?}");
+        assert!(failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("restart reconciliation")));
     }
 
     #[test]
@@ -1034,16 +1056,23 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_marks_active_attempts_for_restart_reconciliation() {
+    fn bounded_shutdown_drain_marks_every_active_attempt_for_restart_reconciliation() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
         crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
-        insert_definition(&conn, &definition("shutdown-reconciliation")).unwrap();
-        set_created_at(&conn, "shutdown-reconciliation", "2020-01-01T08:00:00.000Z");
+        let automation_ids = [
+            "shutdown-reconciliation-one",
+            "shutdown-reconciliation-two",
+            "shutdown-reconciliation-three",
+        ];
+        for automation_id in automation_ids {
+            insert_definition(&conn, &definition(automation_id)).unwrap();
+            set_created_at(&conn, automation_id, "2020-01-01T08:00:00.000Z");
+        }
         drop(conn);
 
-        let (started_tx, started_rx) = sync_channel(1);
+        let (started_tx, started_rx) = sync_channel(automation_ids.len());
         let handle = start_automations_scheduler(
             home,
             Arc::new(NotifyingRunningRuntime {
@@ -1051,39 +1080,71 @@ mod tests {
             }),
         )
         .unwrap();
-        // Hang guard only: the channel proves durable ownership before shutdown.
-        started_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("startup pass should establish runtime ownership");
+        // Hang guard only: the channel proves every runtime ownership record
+        // exists before the bounded drain begins.
+        let started_sessions: BTreeSet<String> = (0..automation_ids.len())
+            .map(|_| {
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("startup pass should establish every runtime ownership")
+            })
+            .collect();
+        assert_eq!(started_sessions.len(), automation_ids.len());
 
         handle.request_shutdown();
         handle.shutdown().unwrap();
 
         let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
-        let lifecycle: (String, Option<String>, String) = conn
-            .query_row(
-                "SELECT o.state, a.state_reason, s.status
+        let lifecycle: Vec<(String, String, String, Option<String>, String, String)> = conn
+            .prepare(
+                "SELECT o.automation_id, o.state, a.state, a.state_reason, r.status, s.status
                  FROM automation_occurrences AS o
                  JOIN automation_runs AS r ON r.occurrence_id = o.id
                  JOIN automation_attempts AS a ON a.run_id = r.id
                  JOIN sessions AS s ON s.id = r.session_id
-                 WHERE o.automation_id = 'shutdown-reconciliation'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                 WHERE o.automation_id IN (
+                    'shutdown-reconciliation-one',
+                    'shutdown-reconciliation-two',
+                    'shutdown-reconciliation-three'
+                 )
+                 ORDER BY o.automation_id",
             )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(lifecycle.0, "recovery_required");
-        assert!(
-            lifecycle
-                .1
-                .as_deref()
-                .is_some_and(|reason| reason.contains("restart reconciliation")),
-            "shutdown must durably explain why the active attempt requires reconciliation"
-        );
         assert_eq!(
-            lifecycle.2, "running",
-            "scheduler shutdown must not assume the runtime stopped"
+            lifecycle.len(),
+            automation_ids.len(),
+            "the bounded drain must record every active attempt for restart reconciliation"
         );
+        for (automation_id, occurrence_state, attempt_state, reason, run_state, session_state) in
+            lifecycle
+        {
+            assert_eq!(occurrence_state, "recovery_required", "{automation_id}");
+            assert_eq!(attempt_state, "started", "{automation_id}");
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("restart reconciliation")),
+                "shutdown must durably explain why `{automation_id}` requires reconciliation"
+            );
+            assert_eq!(run_state, "running", "{automation_id}");
+            assert_eq!(
+                session_state, "running",
+                "scheduler shutdown must not assume `{automation_id}` stopped"
+            );
+        }
     }
 
     #[test]

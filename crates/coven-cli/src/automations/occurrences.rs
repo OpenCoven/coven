@@ -124,7 +124,7 @@ pub struct TickReport {
     pub failed: Vec<String>,
 }
 
-const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
+const OCCURRENCE_TERMINAL_STATES: [&str; 4] = ["succeeded", "failed", "cancelled", "timed_out"];
 
 /// Claims the earliest due PLANNED occurrence for a routine with a bounded
 /// lease. Returns the claimed occurrence id, or `None` when nothing is due.

@@ -771,6 +771,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                         | "coven.automations.definition.create.v1"
                         | "coven.automations.definition.revise.v1"
                         | "coven.automations.definition.tombstone.v1"
+                        | "coven.automations.run.cancel.v1"
                         | "coven.automations.run"
                         | "coven.automations.unquarantine"
                 )
@@ -14913,12 +14914,17 @@ pub(crate) mod tests {
                 "schemaVersion": 1,
                 "id": "cancellation-target",
                 "name": "Cancellation target",
-                "status": "PAUSED",
+                "status": "ACTIVE",
                 "rrule": "FREQ=DAILY;BYHOUR=9",
                 "timezone": "utc",
                 "misfire": "latest",
                 "overlap": "forbid",
                 "timeoutMinutes": 30,
+                "retry": {
+                    "maxAttempts": 2,
+                    "backoffPolicy": "none",
+                    "retryableClasses": ["runtime_unavailable"]
+                },
                 "runtime": "coven-code",
                 "cwd": "/work/project",
                 "familiarId": "charm",
@@ -14979,33 +14985,42 @@ pub(crate) mod tests {
         Ok((temp_dir, run_id, attempt_id, session_id))
     }
 
-    #[test]
-    fn cancellation_rejects_a_stale_attempt_or_runtime_correlation() -> anyhow::Result<()> {
-        let (temp_dir, run_id, _attempt_id, session_id) =
-            start_running_automation_for_cancellation()?;
-        let cancel_body = json!({
+    fn cancellation_body(
+        adoption_key: &str,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> String {
+        json!({
             "action": "coven.automations.run.cancel.v1",
-            "adoptionKey": "adopt:cancel:cancellation-target:stale",
+            "adoptionKey": adoption_key,
             "runId": run_id,
-            "attemptId": "attempt-stale",
-            "runtimeCorrelation": { "sessionId": "session-stale" },
+            "attemptId": attempt_id,
+            "runtimeCorrelation": { "sessionId": session_id },
             "scope": "run",
-            "reason": "stale operator request",
+            "reason": reason,
             "requestedBy": { "principalId": "operator:aria" }
         })
-        .to_string();
+        .to_string()
+    }
 
-        let rejected = handle_request_with_body(
+    fn post_cancellation(
+        coven_home: &std::path::Path,
+        body: &str,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_runtime(
             "POST",
             "/api/v1/actions",
-            temp_dir.path(),
+            coven_home,
             None,
-            Some(&cancel_body),
-        )?;
-        assert_eq!(rejected.status, 409, "{}", rejected.body);
-        let rejected: Value = serde_json::from_str(&rejected.body)?;
-        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+            Some(body),
+            runtime,
+        )
+    }
 
+    fn cancellation_history(coven_home: &std::path::Path) -> anyhow::Result<Value> {
         let history_body = json!({
             "action": "coven.automations.runs",
             "id": "cancellation-target"
@@ -15014,22 +15029,103 @@ pub(crate) mod tests {
         let history = handle_request_with_body(
             "POST",
             "/api/v1/actions",
-            temp_dir.path(),
+            coven_home,
             None,
             Some(&history_body),
         )?;
-        let history: Value = serde_json::from_str(&history.body)?;
-        assert_eq!(history["event"]["payload"]["runs"][0]["id"], run_id);
+        assert_eq!(history.status, 200, "{}", history.body);
+        Ok(serde_json::from_str(&history.body)?)
+    }
+
+    fn assert_rejected_cancellation_preserves_live_attempt(
+        coven_home: &std::path::Path,
+        rejected: ApiResponse,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
         assert_eq!(
-            history["event"]["payload"]["runs"][0]["sessionId"],
-            session_id
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
         );
-        assert_eq!(history["event"]["payload"]["runs"][0]["status"], "running");
-        assert_eq!(
-            history["event"]["payload"]["runs"][0]["attempts"][0]["state"],
-            "started"
-        );
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+
+        let history = cancellation_history(coven_home)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
         Ok(())
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_attempt_without_corrupting_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-attempt",
+            &run_id,
+            "attempt-stale",
+            &session_id,
+            "stale attempt",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_runtime_correlation_without_corrupting_attempt(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-runtime",
+            &run_id,
+            &attempt_id,
+            "session-stale",
+            "stale runtime correlation",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_run_without_corrupting_attempt_or_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-run",
+            "run-stale",
+            &attempt_id,
+            &session_id,
+            "stale run",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
     }
 
     #[test]
@@ -15053,17 +15149,13 @@ pub(crate) mod tests {
         )?;
         assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
 
-        let cancel_body = json!({
-            "action": "coven.automations.run.cancel.v1",
-            "adoptionKey": "adopt:cancel:cancellation-target:0003",
-            "runId": run_id,
-            "attemptId": attempt_id,
-            "runtimeCorrelation": { "sessionId": session_id },
-            "scope": "run",
-            "reason": "operator requested shutdown",
-            "requestedBy": { "principalId": "operator:aria" }
-        })
-        .to_string();
+        let cancel_body = cancellation_body(
+            "adopt:cancel:cancellation-target:0003",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
         let cancelled = handle_request_with_body(
             "POST",
             "/api/v1/actions",
@@ -15089,8 +15181,84 @@ pub(crate) mod tests {
         assert!(payload["cancellation"]["requestedAt"].is_string());
         assert!(payload["cancellation"]["acknowledgedAt"].is_string());
         assert!(payload["cancellation"]["reconciledAt"].is_string());
+        let requested_at = payload["cancellation"]["requestedAt"]
+            .as_str()
+            .context("cancellation must persist requestedAt")?;
+        let acknowledged_at = payload["cancellation"]["acknowledgedAt"]
+            .as_str()
+            .context("cancellation must persist acknowledgedAt")?;
+        let reconciled_at = payload["cancellation"]["reconciledAt"]
+            .as_str()
+            .context("cancellation must persist reconciledAt")?;
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(requested_at)?
+                <= chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                && chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                    <= chrono::DateTime::parse_from_rfc3339(reconciled_at)?,
+            "cancellation lifecycle timestamps must be persisted in requested → acknowledged → reconciled order"
+        );
+
+        let replayed = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(replayed.status, 200, "{}", replayed.body);
+        let replayed: Value = serde_json::from_str(&replayed.body)?;
+        let replayed_cancellation = &replayed["event"]["payload"]["cancellation"];
+        assert_eq!(replayed_cancellation["requestedAt"], requested_at);
+        assert_eq!(replayed_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(replayed_cancellation["reconciledAt"], reconciled_at);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let persisted_history = &history["event"]["payload"]["runs"][0]["cancellation"];
+        assert_eq!(persisted_history["status"], "cancelled");
+        assert_eq!(persisted_history["scope"], "run");
+        assert_eq!(
+            persisted_history["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_history["reason"], "operator requested shutdown");
+        assert_eq!(persisted_history["requestedAt"], requested_at);
+        assert_eq!(persisted_history["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_history["reconciledAt"], reconciled_at);
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let persisted_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'
+               AND command = 'run.cancel.v1'
+               AND automation_id = ?1
+               AND outcome = 'committed'",
+            ["cancellation-target"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            persisted_adoptions, 1,
+            "the cancellation request must have exactly one durable adopted lifecycle record"
+        );
+        let persisted_response: String = conn.query_row(
+            "SELECT response_json FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'",
+            [],
+            |row| row.get(0),
+        )?;
+        let persisted_response: Value = serde_json::from_str(&persisted_response)?;
+        let persisted_cancellation = &persisted_response["result"]["cancellation"];
+        assert_eq!(persisted_cancellation["requestedAt"], requested_at);
+        assert_eq!(persisted_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_cancellation["reconciledAt"], reconciled_at);
+        assert_eq!(
+            persisted_cancellation["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_cancellation["scope"], "run");
+        assert_eq!(
+            persisted_cancellation["reason"],
+            "operator requested shutdown"
+        );
         assert!(
             !store::update_session_terminal_if_active(
                 &conn,
@@ -15128,6 +15296,193 @@ pub(crate) mod tests {
         assert_eq!(run["attempts"][0]["id"], attempt_id);
         assert_eq!(run["attempts"][0]["state"], "cancelled");
         assert_eq!(run["attempts"][0]["failureClass"], "cancelled");
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_runs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_runs
+             WHERE id = ?1
+               AND status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions
+             WHERE id = ?1
+               AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')",
+            [&session_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_attempts, 1, "exactly one attempt may terminalize");
+        assert_eq!(terminal_runs, 1, "exactly one run may terminalize");
+        assert_eq!(
+            terminal_sessions, 1,
+            "exactly one session terminal evidence is allowed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_wins_over_late_cancellation_without_rewriting_terminal_evidence(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let completed_at = current_timestamp();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(
+            store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &completed_at,
+            )?,
+            "the first completion observation must terminalize the running session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .succeeded,
+            1
+        );
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-won",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
+        );
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "succeeded");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "succeeded");
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_attempts, 1,
+            "a losing cancel observation must not create another terminal attempt"
+        );
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "cancelled",
+                None,
+                &current_timestamp(),
+            )?,
+            "a later cancellation observation must not rewrite completion"
+        );
+        Ok(())
+    }
+
+    struct UnconfirmedCancellationStopRuntime;
+
+    impl SessionRuntime for UnconfirmedCancellationStopRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("the cancellation test starts its run with the noop runtime")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("synthetic runtime did not confirm cancellation")
+        }
+    }
+
+    #[test]
+    fn cancellation_with_unconfirmed_runtime_stop_enters_recovery_without_retry(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:unconfirmed-stop",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "runtime has stopped responding",
+        );
+        let response =
+            post_cancellation(temp_dir.path(), &body, &UnconfirmedCancellationStopRuntime)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            response["event"]["payload"]["status"], "recovery_required",
+            "an unconfirmed stop must remain explainably recoverable, not be reported cancelled"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT o.state, a.state, a.failure_class, a.state_reason, r.status, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+            [&run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(lifecycle.0, "recovery_required");
+        assert_eq!(lifecycle.1, "ambiguous");
+        assert_eq!(lifecycle.2.as_deref(), Some("ambiguous_evidence"));
+        assert_eq!(
+            lifecycle.3.as_deref(),
+            Some("cancellation stop was not confirmed")
+        );
+        assert_eq!(lifecycle.4, "running");
+        assert_eq!(lifecycle.5, "running");
+        let attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            attempts, 1,
+            "unconfirmed cancellation must not schedule an automatic retry even when retry is configured"
+        );
         Ok(())
     }
 
@@ -15136,6 +15491,30 @@ pub(crate) mod tests {
     {
         let (temp_dir, run_id, attempt_id, session_id) =
             start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            definition_status, "ACTIVE",
+            "the fixture must start active so its planning assertion is non-vacuous"
+        );
+        let before_disable = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_disable.planned.is_empty(),
+            "the active definition must plan a future occurrence before disable"
+        );
+        let planned_before_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
         let disable_body = json!({
             "action": "coven.automations.definition.disable.v1",
             "adoptionKey": "adopt:disable:cancellation-target:0002",
@@ -15154,19 +15533,7 @@ pub(crate) mod tests {
         )?;
         assert_eq!(disabled.status, 200, "{}", disabled.body);
 
-        let history_body = json!({
-            "action": "coven.automations.runs",
-            "id": "cancellation-target"
-        })
-        .to_string();
-        let history = handle_request_with_body(
-            "POST",
-            "/api/v1/actions",
-            temp_dir.path(),
-            None,
-            Some(&history_body),
-        )?;
-        let history: Value = serde_json::from_str(&history.body)?;
+        let history = cancellation_history(temp_dir.path())?;
         let run = &history["event"]["payload"]["runs"][0];
         assert_eq!(run["id"], run_id);
         assert_eq!(run["sessionId"], session_id);
@@ -15175,11 +15542,95 @@ pub(crate) mod tests {
         assert_eq!(run["attempts"][0]["state"], "started");
 
         let conn = store::open_store(&store_path(temp_dir.path()))?;
-        let report =
-            crate::automations::occurrences::tick(&conn, Utc::now() + chrono::Duration::days(2))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_status, "DISABLED");
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
         assert!(
             report.planned.is_empty() && report.claimed.is_empty(),
             "a disabled definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_disable, planned_before_disable,
+            "disable must prevent future planning without rewriting the existing run"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn tombstoning_an_active_definition_stops_future_planning_without_rewriting_its_run(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let before_tombstone = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_tombstone.planned.is_empty(),
+            "the active definition must plan before its tombstone is applied"
+        );
+        let planned_before_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:planning",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a tombstoned definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_tombstone, planned_before_tombstone,
+            "tombstoning must retain in-flight history without creating future occurrences"
         );
         Ok(())
     }

@@ -120,6 +120,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
                     "coven.automations.definition.tombstone.v1",
+                    "coven.automations.run.cancel.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -414,6 +415,49 @@ pub fn route_action(
                     )
                 }
                 Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.run.cancel.v1" => {
+            match crate::automations::cancellation::execute_run_cancellation(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::cancellation::CancellationExecution::Success(success)) => {
+                    let event = ControlEvent {
+                        kind: "automations.run.cancellation",
+                        action: action.to_string(),
+                        origin,
+                        intent_id,
+                        payload: success.payload.clone(),
+                    };
+                    (
+                        200,
+                        ControlActionResponse {
+                            ok: true,
+                            accepted: true,
+                            action: action.to_string(),
+                            status: ActionStatus::Completed,
+                            reason: success
+                                .replayed
+                                .then(|| "replayed previously adopted cancellation".to_string()),
+                            error: None,
+                            result: Some(success.payload),
+                            event: Some(event),
+                        },
+                    )
+                }
+                Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
             }
         }
         "coven.automations.events.read.v1" => {
@@ -1068,6 +1112,8 @@ fn automation_runs_payload(
             }
             let mut runs = Vec::with_capacity(records.len());
             for record in &records {
+                let cancellation =
+                    crate::automations::cancellation::cancellation_for_run(conn, &record.id)?;
                 let attempts = attempts_by_run
                     .remove(&record.id)
                     .unwrap_or_default()
@@ -1094,7 +1140,7 @@ fn automation_runs_payload(
                         })
                     })
                     .collect::<Vec<_>>();
-                runs.push(json!({
+                let mut run = json!({
                     "id": record.id,
                     "automationId": record.automation_id,
                     "occurrenceId": record.occurrence_id,
@@ -1108,7 +1154,11 @@ fn automation_runs_payload(
                     "startedAt": record.started_at,
                     "finishedAt": record.finished_at,
                     "attempts": attempts,
-                }));
+                });
+                if let Some(cancellation) = cancellation {
+                    run["cancellation"] = cancellation;
+                }
+                runs.push(run);
             }
             Ok(json!({ "runs": runs }))
         }
