@@ -6,6 +6,10 @@ Tracks: OpenCoven/coven#855 (this specification), OpenCoven/coven#854 (parent pr
 
 Machine-readable artifacts: [`spec/coven-automations/v1/`](../../spec/coven-automations/v1/) — JSON Schemas, state machines, capability negotiation, compatibility matrix, golden vectors, and a pinned TypeScript projection.
 
+Current source-pinned implementation status for terminal receipt production,
+delivery, SDK verification, and Cave presentation is tracked in the
+[Automation receipt delivery map](coven-automations-receipt-delivery.md).
+
 ## Normative language
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be interpreted as normative requirements.
