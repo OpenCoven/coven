@@ -12306,7 +12306,8 @@ fn append_proposal_decision_audit_with_probe_summary(
             }
             Some(serde_json::to_string(&detail)?)
         }
-        coven_threads_core::AuditEventType::ProposalVetoed => {
+        coven_threads_core::AuditEventType::ProposalRejected
+        | coven_threads_core::AuditEventType::ProposalVetoed => {
             audit.window_close.map(serde_json::to_string).transpose()?
         }
         _ => None,
@@ -27909,8 +27910,9 @@ tier = 0
         let (pending, proposal_id) = stage_scheduled_reviewed_edit(
             home,
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
-            time::OffsetDateTime::now_utc() - time::Duration::minutes(10),
+            time::OffsetDateTime::now_utc(),
         )?;
+        assert_eq!(process_due_threads_proposals(home)?, 0);
         let ward_path = home.join("familiars/sage/ward.toml");
         let ward = std::fs::read_to_string(&ward_path)?
             .replace(
@@ -27930,13 +27932,41 @@ tier = 0
             "before"
         );
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
-        let decision: String = conn.query_row(
-            "SELECT decision FROM ward_audit
+        let (decision, detail): (String, String) = conn.query_row(
+            "SELECT decision, detail FROM ward_audit
              WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(decision, "protected-target-not-proposable");
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed
+        );
+        assert_eq!(close.replay_hash_matched, Some(false));
+        assert_eq!(
+            close.rationale.as_deref(),
+            Some("protected-target-not-proposable")
+        );
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
             [&proposal_id],
             |row| row.get(0),
         )?;
-        assert_eq!(decision, "protected-target-not-proposable");
+        assert_eq!(terminal_count, 1);
         Ok(())
     }
 
