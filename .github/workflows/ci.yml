@@ -626,7 +626,10 @@ jobs:
 
   pr-gate:
     name: PR gate
-    if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}
+    # Keep the branch-protection context stable while also producing an
+    # exact-commit acceptance result for main that release publication can
+    # verify independently.
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs:

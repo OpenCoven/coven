@@ -51,10 +51,13 @@ jobs:
     name: Verify signed release tag
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       contents: read
     outputs:
       release_tag: ${{ steps.release-context.outputs.release_tag }}
       npm_version: ${{ steps.release-context.outputs.npm_version }}
+      head_sha: ${{ steps.tag-verification.outputs.head_sha }}
+      tag_object_sha: ${{ steps.tag-verification.outputs.tag_object_sha }}
       native_package_set: post-intel
       platform_matrix: ${{ steps.platform-matrix.outputs.platform_matrix }}
     steps:
@@ -65,6 +68,7 @@ jobs:
         id: release-context
         run: node scripts/release-npm-context.mjs "$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
       - name: Confirm tag is annotated and signer-authorized
+        id: tag-verification
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           NPM_RELEASE_ALLOWED_SIGNERS: ${{ vars.NPM_RELEASE_ALLOWED_SIGNERS }}
@@ -145,6 +149,28 @@ jobs:
             echo "::error::Refusing release: tagged commit $TAGGED_COMMIT_SHA is not contained in origin/main."
             exit 1
           fi
+          echo "head_sha=$TAGGED_COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "tag_object_sha=$TAG_OBJECT_SHA" >> "$GITHUB_OUTPUT"
+      - name: Require exact-source CI acceptance
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release-context.outputs.release_tag }}
+          HEAD_SHA: ${{ steps.tag-verification.outputs.head_sha }}
+          TAG_OBJECT_SHA: ${{ steps.tag-verification.outputs.tag_object_sha }}
+        run: |
+          set -euo pipefail
+          node scripts/package-github-release.mjs verify-source-acceptance \
+            --repository "$GITHUB_REPOSITORY" \
+            --release-tag "$RELEASE_TAG" \
+            --head-sha "$HEAD_SHA" \
+            --tag-object-sha "$TAG_OBJECT_SHA" \
+            --output release-source-acceptance.json
+      - name: Retain exact-source acceptance receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: coven-release-source-acceptance-${{ steps.release-context.outputs.release_tag }}
+          path: release-source-acceptance.json
+          if-no-files-found: error
       - name: Derive release platform matrix
         id: platform-matrix
         env:

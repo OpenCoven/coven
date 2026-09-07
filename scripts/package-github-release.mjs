@@ -14,6 +14,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..');
 const WORKFLOW_NAME = 'Release npm packages';
 const WORKFLOW_PATH = '.github/workflows/release-npm.yml';
+const CI_WORKFLOW_NAME = 'CI';
+const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
+const CI_WORKFLOW_FILE = 'ci.yml';
+const DEFAULT_BRANCH = 'main';
+const REQUIRED_SOURCE_CHECKS = ['PR gate'];
 const REPOSITORY_URL = 'https://github.com/OpenCoven/coven';
 const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
 const TRUSTED_PUBLISHER_PREDICATE =
@@ -89,12 +94,24 @@ async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command) {
     throw new Error(
-      'Usage: package-github-release.mjs <verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
+      'Usage: package-github-release.mjs <verify-source-acceptance|verify-source-run|verify-source-run-attempt|verify-npm-provenance|verify-npm-signatures|package|sync-release> [--option value ...]'
     );
   }
 
   const options = parseOptions(args);
   switch (command) {
+    case 'verify-source-acceptance': {
+      const result = await resolveReleaseSourceAcceptance({
+        repository: requiredOption(options, 'repository'),
+        releaseTag: requiredOption(options, 'release-tag'),
+        headSha: requiredOption(options, 'head-sha'),
+        tagObjectSha: requiredOption(options, 'tag-object-sha')
+      });
+      const outputPath = path.resolve(requiredOption(options, 'output'));
+      mkdirSync(path.dirname(outputPath), { recursive: true });
+      writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`);
+      return;
+    }
     case 'verify-source-run': {
       const result = await resolveReleaseSource({
         repository: requiredOption(options, 'repository'),
@@ -409,6 +426,150 @@ export function assertRemoteTagMatchesVerifiedContext({
     );
   }
   return remoteTagContext;
+}
+
+export function verifySourceAcceptanceWorkflowRun(
+  workflowRuns,
+  { headSha, defaultBranch = DEFAULT_BRANCH } = {}
+) {
+  if (!isSha(headSha)) {
+    throw new Error(
+      `Refusing release: exact source commit must be a 40-character Git SHA, got ${JSON.stringify(headSha)}.`
+    );
+  }
+  const runs = workflowRuns?.workflow_runs;
+  if (!Array.isArray(runs)) {
+    throw new Error('Refusing release: GitHub CI workflow response is missing workflow_runs.');
+  }
+  const exactRuns = runs.filter(
+    (run) =>
+      run?.name === CI_WORKFLOW_NAME &&
+      run?.path === CI_WORKFLOW_PATH &&
+      run?.event === 'push' &&
+      run?.head_branch === defaultBranch &&
+      run?.head_sha === headSha
+  );
+  if (exactRuns.length === 0) {
+    throw new Error(
+      `Refusing release: ${CI_WORKFLOW_NAME} has no push run on ${defaultBranch} for exact source commit ${headSha}.`
+    );
+  }
+  if (exactRuns.length !== 1) {
+    throw new Error(
+      `Refusing release: ${CI_WORKFLOW_NAME} returned ${exactRuns.length} push runs on ${defaultBranch} for exact source commit ${headSha}; source acceptance is ambiguous.`
+    );
+  }
+  const run = exactRuns[0];
+  const runId = toPositiveIntegerString(run.id, 'CI workflow run id');
+  const runAttempt = toPositiveInteger(run.run_attempt, 'CI workflow run attempt');
+  if (run.status !== 'completed' || run.conclusion !== 'success') {
+    throw new Error(
+      `Refusing release: exact-source ${CI_WORKFLOW_NAME} run ${runId} must have completed successfully, got status=${JSON.stringify(run.status)} conclusion=${JSON.stringify(run.conclusion)}.`
+    );
+  }
+  return {
+    name: CI_WORKFLOW_NAME,
+    path: CI_WORKFLOW_PATH,
+    runId,
+    runAttempt,
+    event: run.event,
+    headBranch: run.head_branch,
+    headSha: run.head_sha,
+    status: run.status,
+    conclusion: run.conclusion,
+    htmlUrl: String(run.html_url ?? '')
+  };
+}
+
+export function verifySourceAcceptanceJobs(
+  jobsPayload,
+  { runId, requiredCheckNames = REQUIRED_SOURCE_CHECKS } = {}
+) {
+  const normalizedRunId = toPositiveIntegerString(runId, 'CI workflow run id');
+  const jobs = jobsPayload?.jobs;
+  if (!Array.isArray(jobs)) {
+    throw new Error(
+      `Refusing release: exact-source CI run ${normalizedRunId} response is missing jobs.`
+    );
+  }
+  return requiredCheckNames.map((checkName) => {
+    const matchingJobs = jobs.filter((job) => job?.name === checkName);
+    if (matchingJobs.length === 0) {
+      throw new Error(
+        `Refusing release: exact-source CI run ${normalizedRunId} is missing required check ${JSON.stringify(checkName)}.`
+      );
+    }
+    if (matchingJobs.length !== 1) {
+      throw new Error(
+        `Refusing release: exact-source CI run ${normalizedRunId} has ${matchingJobs.length} jobs named ${JSON.stringify(checkName)}; required-check identity is ambiguous.`
+      );
+    }
+    const job = matchingJobs[0];
+    const jobId = toPositiveIntegerString(job.id, `${checkName} job id`);
+    if (job.status !== 'completed' || job.conclusion !== 'success') {
+      throw new Error(
+        `Refusing release: required check ${checkName} in exact-source CI run ${normalizedRunId} must have completed successfully, got status=${JSON.stringify(job.status)} conclusion=${JSON.stringify(job.conclusion)}.`
+      );
+    }
+    return {
+      name: checkName,
+      jobId,
+      status: job.status,
+      conclusion: job.conclusion,
+      htmlUrl: String(job.html_url ?? '')
+    };
+  });
+}
+
+export async function resolveReleaseSourceAcceptance({
+  repository,
+  releaseTag,
+  headSha,
+  tagObjectSha,
+  ghApi = ghApiJson,
+  now = () => new Date()
+}) {
+  const normalizedRepository = String(repository ?? '').trim();
+  if (!normalizedRepository) {
+    throw new Error('Refusing release: repository is required for exact-source acceptance.');
+  }
+  parseReleaseTag(releaseTag);
+  if (!isSha(headSha)) {
+    throw new Error(
+      `Refusing release: exact source commit must be a 40-character Git SHA, got ${JSON.stringify(headSha)}.`
+    );
+  }
+  if (!isSha(tagObjectSha)) {
+    throw new Error(
+      `Refusing release: verified tag object must be a 40-character Git SHA, got ${JSON.stringify(tagObjectSha)}.`
+    );
+  }
+  const workflowRuns = await ghApi(
+    `/repos/${normalizedRepository}/actions/workflows/${CI_WORKFLOW_FILE}/runs?branch=${DEFAULT_BRANCH}&event=push&head_sha=${encodeURIComponent(headSha)}&per_page=100`
+  );
+  const workflow = verifySourceAcceptanceWorkflowRun(workflowRuns, { headSha });
+  const jobsPayload = await ghApi(
+    `/repos/${normalizedRepository}/actions/runs/${workflow.runId}/attempts/${workflow.runAttempt}/jobs?per_page=100`
+  );
+  const requiredChecks = verifySourceAcceptanceJobs(jobsPayload, {
+    runId: workflow.runId
+  });
+  const observedAt = now();
+  if (!(observedAt instanceof Date) || Number.isNaN(observedAt.getTime())) {
+    throw new Error('Refusing release: source acceptance observation time is invalid.');
+  }
+  return {
+    schemaVersion: 1,
+    kind: 'coven.release-source-acceptance',
+    repository: normalizedRepository,
+    releaseTag,
+    tagObjectSha: tagObjectSha.toLowerCase(),
+    candidateSha: headSha.toLowerCase(),
+    defaultBranch: DEFAULT_BRANCH,
+    workflow,
+    requiredChecks,
+    observedAt: observedAt.toISOString()
+  };
 }
 
 function assertLatestSourceRunAttempt(latestSourceRun, {

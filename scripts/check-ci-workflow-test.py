@@ -23,7 +23,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n  pr-gate:\n", CI_TEXT)
         self.assertIn("name: PR gate", CI_TEXT)
         self.assertIn(
-            "if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}",
+            "if: ${{ always() && !cancelled() }}",
             CI_TEXT,
         )
 
@@ -111,6 +111,24 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_release_includes_performance_baseline_dependency(self) -> None:
         self.assertIn('performance-baseline', RELEASE_TEXT)
         self.assertIn('needs: [build-platform, npm-dry-run, performance-baseline, verify-tag]', RELEASE_TEXT)
+
+    def test_release_requires_exact_source_acceptance_before_dependents_run(self) -> None:
+        verify_tag = RELEASE_TEXT.split("\n  verify-tag:\n", 1)[1].split(
+            "\n  performance-baseline:\n", 1
+        )[0]
+        self.assertIn("actions: read", verify_tag)
+        self.assertIn("id: tag-verification", verify_tag)
+        self.assertIn('echo "head_sha=$TAGGED_COMMIT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertIn('echo "tag_object_sha=$TAG_OBJECT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertIn("package-github-release.mjs verify-source-acceptance", verify_tag)
+        self.assertIn('--head-sha "$HEAD_SHA"', verify_tag)
+        self.assertIn('--tag-object-sha "$TAG_OBJECT_SHA"', verify_tag)
+        self.assertIn("--output release-source-acceptance.json", verify_tag)
+        self.assertIn(
+            "name: coven-release-source-acceptance-${{ steps.release-context.outputs.release_tag }}",
+            verify_tag,
+        )
+        self.assertIn("path: release-source-acceptance.json", verify_tag)
 
     def test_release_stress_workflow_is_bounded_and_uploads_failure_evidence(self) -> None:
         stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
