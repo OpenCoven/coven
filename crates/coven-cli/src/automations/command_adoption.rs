@@ -63,6 +63,11 @@ pub enum DefinitionCommand {
         definition: Value,
         expected_revision: Option<u64>,
     },
+    Disable {
+        automation_id: String,
+        expected_revision: Option<u64>,
+        reason: Option<String>,
+    },
     Delete {
         automation_id: String,
         expected_revision: Option<u64>,
@@ -262,6 +267,16 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
             "expectedRevision": expected_revision,
             "definition": adoption_definition_preimage(definition)?,
         }),
+        DefinitionCommand::Disable {
+            automation_id,
+            expected_revision,
+            reason,
+        } => json!({
+            "command": "definition.disable.v1",
+            "automationId": automation_id,
+            "expectedRevision": expected_revision,
+            "reason": reason,
+        }),
         DefinitionCommand::Delete {
             automation_id,
             expected_revision,
@@ -333,6 +348,7 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
             match command.as_str() {
                 "definition.create.v1" => "definition.create.v1",
                 "definition.revise.v1" => "definition.revise.v1",
+                "definition.disable.v1" => "definition.disable.v1",
                 "definition.tombstone.v1" => "definition.tombstone.v1",
                 _ => "definition.invalid.v1",
             },
@@ -373,6 +389,9 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
         ),
+        DefinitionCommand::Disable { automation_id, .. } => {
+            ("definition.disable.v1", Some(automation_id.clone()))
+        }
         DefinitionCommand::Delete { automation_id, .. } => {
             ("definition.tombstone.v1", Some(automation_id.clone()))
         }
@@ -519,6 +538,17 @@ fn apply_command(
             definition,
             expected_revision,
         } => apply_revise(conn, &definition, expected_revision, adopted_at),
+        DefinitionCommand::Disable {
+            automation_id,
+            expected_revision,
+            reason,
+        } => apply_disable(
+            conn,
+            &automation_id,
+            expected_revision,
+            reason.as_deref(),
+            adopted_at,
+        ),
         DefinitionCommand::Delete {
             automation_id,
             expected_revision,
@@ -883,6 +913,75 @@ fn apply_revise(
     ))
 }
 
+fn apply_disable(
+    conn: &Connection,
+    automation_id: &str,
+    expected_revision: Option<u64>,
+    reason: Option<&str>,
+    adopted_at: &str,
+) -> Result<DefinitionCommandResponse> {
+    let Some(current) = current_definition_state(conn, automation_id)? else {
+        return Ok(rejected(
+            ErrorCode::NotFound,
+            format!("no routine with id `{automation_id}`"),
+            None,
+        ));
+    };
+    if current.tombstoned {
+        return Ok(rejected(
+            ErrorCode::GoneTombstoned,
+            format!("routine `{automation_id}` is tombstoned"),
+            Some(current.revision),
+        ));
+    }
+    if expected_revision.is_some_and(|expected| current.revision != expected) {
+        return Ok(revision_conflict(current.revision));
+    }
+    let record = super::store::get_definition(conn, automation_id)?
+        .with_context(|| format!("automation definition `{automation_id}` disappeared"))?;
+    let mut definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
+        .context("failed to parse automation definition for disable")?;
+    definition.status = super::definition::RoutineStatus::Disabled;
+    let definition_json =
+        serde_json::to_string(&definition).context("failed to serialize disabled definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let next_revision = next_revision(current.revision)?;
+    let changed = conn
+        .execute(
+            "UPDATE automation_definitions
+             SET status = 'DISABLED',
+                 definition_json = ?3,
+                 definition_digest = ?4,
+                 lifecycle_state = 'disabled',
+                 revision = ?5,
+                 authority_version = 1,
+                 updated_at = ?6
+             WHERE id = ?1 AND revision = ?2 AND tombstoned_at IS NULL",
+            params![
+                automation_id,
+                sqlite_revision(current.revision)?,
+                definition_json,
+                definition_digest,
+                sqlite_revision(next_revision)?,
+                adopted_at,
+            ],
+        )
+        .context("failed to disable adopted automation definition")?;
+    anyhow::ensure!(
+        changed == 1,
+        "automation definition revision changed inside disable transaction"
+    );
+    Ok(committed(
+        next_revision,
+        json!({
+            "disabled": true,
+            "id": automation_id,
+            "revision": next_revision,
+            "reason": reason,
+        }),
+    ))
+}
+
 fn apply_delete(
     conn: &Connection,
     automation_id: &str,
@@ -1047,6 +1146,7 @@ fn status_text(status: super::definition::RoutineStatus) -> &'static str {
     match status {
         super::definition::RoutineStatus::Active => "ACTIVE",
         super::definition::RoutineStatus::Paused => "PAUSED",
+        super::definition::RoutineStatus::Disabled => "DISABLED",
     }
 }
 

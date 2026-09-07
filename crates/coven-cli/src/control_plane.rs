@@ -119,6 +119,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.get.v1",
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
+                    "coven.automations.definition.disable.v1",
                     "coven.automations.definition.tombstone.v1",
                     "coven.automations.run.cancel.v1",
                     "coven.automations.events.read.v1",
@@ -397,6 +398,47 @@ pub fn route_action(
                                 request: command_request_fields(
                                     &payload,
                                     &["id", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.definition.disable.v1" => {
+            let id = required_id_field(&payload, action);
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            let reason = optional_reason(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (id, expected_revision, reason) {
+                        (Ok(id), Ok(expected_revision), Ok(reason)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Disable {
+                                automation_id: id,
+                                expected_revision: Some(expected_revision),
+                                reason,
+                            }
+                        }
+                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.disable.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["id", "expectedRevision", "reason"],
                                 ),
                                 message: error,
                             }
@@ -891,6 +933,18 @@ fn required_expected_revision(payload: &Value, action: &str) -> Result<u64, Stri
         .and_then(Value::as_u64)
         .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
         .ok_or_else(|| format!("{action} requires positive safe-integer field `expectedRevision`"))
+}
+
+fn optional_reason(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("reason") {
+        None => Ok(None),
+        Some(Value::String(reason)) if !reason.trim().is_empty() && reason.len() <= 500 => {
+            Ok(Some(reason.trim().to_owned()))
+        }
+        Some(_) => Err(format!(
+            "{action} field `reason` must be a non-empty string of at most 500 bytes"
+        )),
+    }
 }
 
 fn forbidden_expected_revision(payload: &Value, action: &str) -> Result<(), String> {
