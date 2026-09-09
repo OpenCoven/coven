@@ -1015,6 +1015,15 @@ pub(crate) enum ApprovedApplyMode {
     Recovery,
 }
 
+pub(crate) type ApprovedCommitCheck<'a> = Option<&'a mut dyn FnMut() -> Result<()>>;
+
+fn run_approved_commit_check(check: &mut ApprovedCommitCheck<'_>) -> Result<()> {
+    if let Some(check) = check.as_deref_mut() {
+        check()?;
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct ApprovedApplyError {
     failure: ApprovedApplyFailure,
@@ -1649,6 +1658,25 @@ impl Ward {
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
     ) -> Result<ApplyReport> {
+        self.apply_after_threads_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_threads_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Vec<u8>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
+    ) -> Result<ApplyReport> {
         (|| -> Result<()> {
             let mut budget = validate_file_edit_budget(edits)?;
             WardEditBudget::for_edit_count(expected_before.len())?;
@@ -1704,6 +1732,7 @@ impl Ward {
             outcome.decisions,
             &expected_before,
             mode,
+            final_authority_check,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1723,6 +1752,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_coherence_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_coherence_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -1769,6 +1817,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            final_authority_check,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1785,6 +1834,25 @@ impl Ward {
         expected_before: &BTreeMap<String, Option<Vec<u8>>>,
         expected_resolved: &BTreeMap<String, String>,
         mode: ApprovedApplyMode,
+    ) -> Result<ApplyReport> {
+        self.apply_after_scheduled_approval_with_commit_check(
+            edits,
+            authorization,
+            expected_before,
+            expected_resolved,
+            mode,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_after_scheduled_approval_with_commit_check(
+        &self,
+        edits: &[FileEdit],
+        authorization: &Authorization,
+        expected_before: &BTreeMap<String, Option<Vec<u8>>>,
+        expected_resolved: &BTreeMap<String, String>,
+        mode: ApprovedApplyMode,
+        final_authority_check: ApprovedCommitCheck<'_>,
     ) -> Result<ApplyReport> {
         validate_approved_edit_budget(edits, expected_before)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -1826,6 +1894,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            final_authority_check,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -2676,6 +2745,7 @@ fn write_atomically_if_unchanged(
     decisions: Vec<Decision>,
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
+    mut final_authority_check: ApprovedCommitCheck<'_>,
 ) -> Result<Vec<AppliedChange>> {
     validate_approved_edit_budget(edits, expected_before)
         .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -2763,6 +2833,9 @@ fn write_atomically_if_unchanged(
     }
 
     let mut swapped = Vec::new();
+    if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+        return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
     for index in 0..prepared.len() {
         if prepared[index].already_applied {
             continue;
@@ -2774,6 +2847,9 @@ fn write_atomically_if_unchanged(
                 .as_ref()
                 .context("prepared approved write has no staging paths")?;
             if let Err(error) = maybe_run_conditional_write_hook(&write.path) {
+                return fail_after_conditional_rollback(&prepared, &swapped, error);
+            }
+            if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
                 return fail_after_conditional_rollback(&prepared, &swapped, error);
             }
             if write.expected_before.is_some() {
@@ -2871,6 +2947,9 @@ fn write_atomically_if_unchanged(
         if let Err(error) = verification {
             return fail_after_conditional_rollback(&prepared, &swapped, error);
         }
+        if let Err(error) = run_approved_commit_check(&mut final_authority_check) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
     }
 
     let final_verification = (|| -> Result<()> {
@@ -2920,6 +2999,7 @@ fn write_atomically_if_unchanged(
                 &changed,
             )?;
         }
+        run_approved_commit_check(&mut final_authority_check)?;
         Ok(())
     })();
     if let Err(error) = final_verification {
@@ -8321,6 +8401,7 @@ tier = 1
             vec![decision],
             &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
             ApprovedApplyMode::Initial,
+            None,
         );
 
         #[cfg(not(windows))]

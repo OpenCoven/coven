@@ -9558,6 +9558,8 @@ fn proposal_recovery_is_proven_unapplied(
             familiar_id: &familiar_id,
             targets: &targets,
             authorization: &authorization_from_writer(&pending.writer),
+            identity_context: None,
+            require_bound_identity_context: false,
         },
     ) else {
         return false;
@@ -10494,6 +10496,8 @@ fn decide_threads_proposal_inner(
                 familiar_id: &familiar_id,
                 targets: &targets,
                 authorization: &authorization,
+                identity_context: None,
+                require_bound_identity_context: false,
             },
         )?;
         if applying.recovery_commitment != recovery_commitment {
@@ -10971,42 +10975,90 @@ fn decide_threads_proposal_inner(
             audit_reservation.preserve()?;
             return Err(error);
         }
-        let (report, apply_cleanup_error) = match apply_after_review_approval(
-            &ward,
-            review_kind,
-            &edits,
-            &recovery_authorization,
-            ApprovedApplyContext {
-                scheduled,
-                expected_before: &expected_before,
-                expected_resolved: &expected_resolved,
-            },
-            ward::ApprovedApplyMode::Recovery,
-        ) {
-            Ok(report) => (report, None),
-            Err(error) => {
-                if let Some(limit) = ward::ward_edit_budget_failure(&error) {
-                    return ward_apply_too_large_response(limit);
-                }
-                match ward::approved_apply_failure(&error).cloned() {
-                    Some(ward::ApprovedApplyFailure::Applied(report)) => {
-                        (report, Some(format!("{error:#}")))
+        let (report, apply_cleanup_error) = {
+            let mut final_authority_check = || {
+                ensure_proposal_final_authority_unchanged(
+                    &conn,
+                    &config,
+                    &document,
+                    ProposalRecoveryContext {
+                        coven_home,
+                        workspace: &workspace,
+                        familiar_id: &familiar_id,
+                        targets: &targets,
+                        authorization: &authorization,
+                        identity_context: None,
+                        require_bound_identity_context: false,
+                    },
+                    &applying.recovery_commitment,
+                )
+            };
+            match apply_after_review_approval(
+                &ward,
+                review_kind,
+                &edits,
+                &recovery_authorization,
+                ApprovedApplyContext {
+                    scheduled,
+                    expected_before: &expected_before,
+                    expected_resolved: &expected_resolved,
+                },
+                ward::ApprovedApplyMode::Recovery,
+                Some(&mut final_authority_check),
+            ) {
+                Ok(report) => (report, None),
+                Err(error) => {
+                    if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                        return ward_apply_too_large_response(limit);
                     }
-                    Some(
-                        failure @ (ward::ApprovedApplyFailure::RolledBack
-                        | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
-                    ) => {
-                        claim.restore_pending(&document)?;
-                        audit_reservation.finish()?;
-                        return approved_apply_failed_response(proposal_id, &error, &failure, true);
+                    match ward::approved_apply_failure(&error).cloned() {
+                        Some(ward::ApprovedApplyFailure::Applied(report)) => {
+                            (report, Some(format!("{error:#}")))
+                        }
+                        Some(
+                            ward::ApprovedApplyFailure::NoWrite
+                            | ward::ApprovedApplyFailure::RolledBack,
+                        ) if is_final_authority_drift(&error) => {
+                            claim.preserve();
+                            audit_reservation.preserve()?;
+                            return json_response(
+                                409,
+                                &json!({
+                                    "blocked": true,
+                                    "why": "proposal-recovery-evidence-diverged",
+                                    "proposalId": proposal_id,
+                                    "terminal": false,
+                                }),
+                            );
+                        }
+                        Some(
+                            failure @ (ward::ApprovedApplyFailure::RolledBack
+                            | ward::ApprovedApplyFailure::RolledBackCleanupFailed {
+                                ..
+                            }),
+                        ) => {
+                            claim.restore_pending(&document)?;
+                            audit_reservation.finish()?;
+                            return approved_apply_failed_response(
+                                proposal_id,
+                                &error,
+                                &failure,
+                                true,
+                            );
+                        }
+                        Some(failure @ ward::ApprovedApplyFailure::NoWrite)
+                        | Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
+                            claim.preserve();
+                            audit_reservation.preserve()?;
+                            return approved_apply_failed_response(
+                                proposal_id,
+                                &error,
+                                &failure,
+                                true,
+                            );
+                        }
+                        None => return Err(error),
                     }
-                    Some(failure @ ward::ApprovedApplyFailure::NoWrite)
-                    | Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
-                        claim.preserve();
-                        audit_reservation.preserve()?;
-                        return approved_apply_failed_response(proposal_id, &error, &failure, true);
-                    }
-                    None => return Err(error),
                 }
             }
         };
@@ -11024,6 +11076,7 @@ fn decide_threads_proposal_inner(
                     expected_resolved: &expected_resolved,
                 },
                 ward::ApprovedApplyMode::Recovery,
+                None,
             )?;
             if rollback.is_refused() {
                 anyhow::bail!(
@@ -11225,20 +11278,23 @@ fn decide_threads_proposal_inner(
             );
         }
     }
+    let recovery_commitment = proposal_recovery_commitment(
+        &conn,
+        &config,
+        &document,
+        ProposalRecoveryContext {
+            coven_home,
+            workspace: &workspace,
+            familiar_id: &familiar_id,
+            targets: &targets,
+            authorization: &authorization,
+            identity_context: identity_context.as_ref(),
+            require_bound_identity_context: true,
+        },
+    )?;
     let applying = ProposalApplyingState {
         decision: "approve".to_string(),
-        recovery_commitment: proposal_recovery_commitment(
-            &conn,
-            &config,
-            &document,
-            ProposalRecoveryContext {
-                coven_home,
-                workspace: &workspace,
-                familiar_id: &familiar_id,
-                targets: &targets,
-                authorization: &authorization,
-            },
-        )?,
+        recovery_commitment,
         weave_hash: state.weave.weave_hash().to_vec(),
         before_images,
         rationale: note.clone(),
@@ -11294,44 +11350,123 @@ fn decide_threads_proposal_inner(
         return Err(error);
     }
     let expected_before = proposal_expected_before(&applying)?;
-    let (report, apply_cleanup_error) = match apply_after_review_approval(
-        &ward,
-        review_kind,
-        &edits,
-        &authorization,
-        ApprovedApplyContext {
-            scheduled,
-            expected_before: &expected_before,
-            expected_resolved: &expected_resolved,
-        },
-        ward::ApprovedApplyMode::Initial,
-    ) {
-        Ok(report) => (report, None),
-        Err(error) => {
-            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
-                claim.restore_pending(&document)?;
-                audit_reservation.finish()?;
-                return ward_apply_too_large_response(limit);
-            }
-            match ward::approved_apply_failure(&error).cloned() {
-                Some(ward::ApprovedApplyFailure::Applied(report)) => {
-                    (report, Some(format!("{error:#}")))
-                }
-                Some(
-                    failure @ (ward::ApprovedApplyFailure::NoWrite
-                    | ward::ApprovedApplyFailure::RolledBack
-                    | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
-                ) => {
+    let (report, apply_cleanup_error) = {
+        let mut final_authority_check = || {
+            ensure_proposal_final_authority_unchanged(
+                &conn,
+                &config,
+                &document,
+                ProposalRecoveryContext {
+                    coven_home,
+                    workspace: &workspace,
+                    familiar_id: &familiar_id,
+                    targets: &targets,
+                    authorization: &authorization,
+                    identity_context: None,
+                    require_bound_identity_context: false,
+                },
+                &applying.recovery_commitment,
+            )
+        };
+        match apply_after_review_approval(
+            &ward,
+            review_kind,
+            &edits,
+            &authorization,
+            ApprovedApplyContext {
+                scheduled,
+                expected_before: &expected_before,
+                expected_resolved: &expected_resolved,
+            },
+            ward::ApprovedApplyMode::Initial,
+            Some(&mut final_authority_check),
+        ) {
+            Ok(report) => (report, None),
+            Err(error) => {
+                if let Some(limit) = ward::ward_edit_budget_failure(&error) {
                     claim.restore_pending(&document)?;
                     audit_reservation.finish()?;
-                    return approved_apply_failed_response(proposal_id, &error, &failure, false);
+                    return ward_apply_too_large_response(limit);
                 }
-                Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
-                    claim.preserve();
-                    audit_reservation.preserve()?;
-                    return approved_apply_failed_response(proposal_id, &error, &failure, false);
+                match ward::approved_apply_failure(&error).cloned() {
+                    Some(ward::ApprovedApplyFailure::Applied(report)) => {
+                        (report, Some(format!("{error:#}")))
+                    }
+                    Some(
+                        ward::ApprovedApplyFailure::NoWrite
+                        | ward::ApprovedApplyFailure::RolledBack,
+                    ) if is_final_authority_drift(&error) => {
+                        if let Some(opened) = opened_window.as_ref() {
+                            claim.preserve();
+                            append_open_window_revalidation_failure(
+                                &conn,
+                                proposal_id,
+                                pending,
+                                opened,
+                                &decision_semantics.approval_path_label,
+                                note.as_deref(),
+                                decision_now,
+                            )?;
+                            audit_reservation.finish()?;
+                            claim.consume()?;
+                            return json_response(
+                                409,
+                                &json!({
+                                    "blocked": true,
+                                    "why": "proposal-revalidation-failed",
+                                    "proposalId": proposal_id,
+                                    "terminal": true,
+                                }),
+                            );
+                        }
+                        append_proposal_refusal_audit(
+                            &conn,
+                            proposal_id,
+                            &familiar_id,
+                            state.weave.weave_hash(),
+                            &pending.writer,
+                            &targets,
+                            pending.channel,
+                            decision_now,
+                        )?;
+                        claim.restore_pending(&document)?;
+                        audit_reservation.finish()?;
+                        return json_response(
+                            409,
+                            &json!({
+                                "blocked": true,
+                                "why": "proposal-revalidation-failed",
+                                "proposalId": proposal_id,
+                                "terminal": false,
+                            }),
+                        );
+                    }
+                    Some(
+                        failure @ (ward::ApprovedApplyFailure::NoWrite
+                        | ward::ApprovedApplyFailure::RolledBack
+                        | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
+                    ) => {
+                        claim.restore_pending(&document)?;
+                        audit_reservation.finish()?;
+                        return approved_apply_failed_response(
+                            proposal_id,
+                            &error,
+                            &failure,
+                            false,
+                        );
+                    }
+                    Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
+                        claim.preserve();
+                        audit_reservation.preserve()?;
+                        return approved_apply_failed_response(
+                            proposal_id,
+                            &error,
+                            &failure,
+                            false,
+                        );
+                    }
+                    None => return Err(error),
                 }
-                None => return Err(error),
             }
         }
     };
@@ -12415,6 +12550,8 @@ struct ProposalRecoveryContext<'a> {
     familiar_id: &'a str,
     targets: &'a [String],
     authorization: &'a ward::Authorization,
+    identity_context: Option<&'a coven_threads_core::CandidateIdentityContext>,
+    require_bound_identity_context: bool,
 }
 
 fn proposal_recovery_commitment(
@@ -12429,6 +12566,8 @@ fn proposal_recovery_commitment(
         familiar_id,
         targets,
         authorization,
+        identity_context,
+        require_bound_identity_context,
     } = context;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"coven:proposal-decision-recovery:v2");
@@ -12456,20 +12595,91 @@ fn proposal_recovery_commitment(
         };
     }
     if config.identity_invariant_set()?.is_some() {
-        let identity_context = crate::ward_identity::candidate_identity_context(
-            coven_home,
-            familiar_id,
-            workspace,
-            config,
-            &staged_edits_to_ward_edits(document.pending())?,
-            authorization,
-            None,
-        )
-        .expect("validated identity invariants always materialize a context");
+        let live_identity_context;
+        let identity_context = match identity_context {
+            Some(identity_context) => identity_context,
+            None if require_bound_identity_context => {
+                anyhow::bail!("validated candidate identity context is required")
+            }
+            None => {
+                live_identity_context = crate::ward_identity::candidate_identity_context(
+                    coven_home,
+                    familiar_id,
+                    workspace,
+                    config,
+                    &staged_edits_to_ward_edits(document.pending())?,
+                    authorization,
+                    None,
+                )
+                .context("candidate identity evidence is unavailable")?;
+                &live_identity_context
+            }
+        };
         hasher.update(b"identity-candidate-commitment");
         hasher.update(&identity_context.candidate_commitment);
     }
     Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+#[derive(Debug)]
+struct ProposalFinalAuthorityDrift {
+    reason: &'static str,
+    source: Option<anyhow::Error>,
+}
+
+impl std::fmt::Display for ProposalFinalAuthorityDrift {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            Some(source) => write!(
+                formatter,
+                "proposal final authority evidence changed before approved commit: {}: {source:#}",
+                self.reason
+            ),
+            None => write!(
+                formatter,
+                "proposal final authority evidence changed before approved commit: {}",
+                self.reason
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProposalFinalAuthorityDrift {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source.as_ref())
+    }
+}
+
+fn final_authority_drift(reason: &'static str, source: Option<anyhow::Error>) -> anyhow::Error {
+    ProposalFinalAuthorityDrift { reason, source }.into()
+}
+
+fn is_final_authority_drift(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<ProposalFinalAuthorityDrift>()
+            .is_some()
+    })
+}
+
+fn ensure_proposal_final_authority_unchanged(
+    conn: &rusqlite::Connection,
+    config: &ward::WardConfig,
+    document: &ProposalEnvelopeDocument,
+    context: ProposalRecoveryContext<'_>,
+    expected_recovery_commitment: &[u8],
+) -> Result<()> {
+    if !ward_config_is_unchanged(context.workspace, config)
+        .map_err(|error| final_authority_drift("ward-config-unavailable", Some(error)))?
+    {
+        return Err(final_authority_drift("ward-config-changed", None));
+    }
+    let current = proposal_recovery_commitment(conn, config, document, context)
+        .map_err(|error| final_authority_drift("authority-evidence-unavailable", Some(error)))?;
+    if current != expected_recovery_commitment {
+        return Err(final_authority_drift("authority-evidence-changed", None));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "threads-test-clock")]
@@ -12628,14 +12838,16 @@ fn apply_after_review_approval(
     authorization: &ward::Authorization,
     context: ApprovedApplyContext<'_>,
     mode: ward::ApprovedApplyMode,
+    final_authority_check: ward::ApprovedCommitCheck<'_>,
 ) -> Result<ward::ApplyReport> {
     if context.scheduled.is_some() {
-        return ward.apply_after_scheduled_approval(
+        return ward.apply_after_scheduled_approval_with_commit_check(
             edits,
             authorization,
             context.expected_before,
             context.expected_resolved,
             mode,
+            final_authority_check,
         );
     }
     match review_kind {
@@ -12652,20 +12864,22 @@ fn apply_after_review_approval(
                     ))
                 })
                 .collect::<Result<BTreeMap<_, _>>>()?;
-            ward.apply_after_threads_approval(
+            ward.apply_after_threads_approval_with_commit_check(
                 edits,
                 authorization,
                 &required,
                 context.expected_resolved,
                 mode,
+                final_authority_check,
             )
         }
-        PendingReviewKind::Coherence => ward.apply_after_coherence_approval(
+        PendingReviewKind::Coherence => ward.apply_after_coherence_approval_with_commit_check(
             edits,
             authorization,
             context.expected_before,
             context.expected_resolved,
             mode,
+            final_authority_check,
         ),
     }
 }
