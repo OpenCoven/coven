@@ -8,6 +8,69 @@ use super::contract::error::{ErrorCode, ErrorEnvelope};
 use super::contract::types::AdoptionKey;
 use crate::api::SessionRuntime;
 
+#[cfg(test)]
+type StopFenceClockHook = Box<dyn FnOnce() -> DateTime<Utc>>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_STOP_FENCE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static AFTER_STOP_FENCE_TEST_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+    static STOP_FENCE_CLOCK_TEST_HOOK:
+        std::cell::RefCell<Option<StopFenceClockHook>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_stop_fence_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    BEFORE_STOP_FENCE_TEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_after_stop_fence_test_hook(hook: Option<Box<dyn FnOnce()>>) {
+    AFTER_STOP_FENCE_TEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+pub(crate) fn set_stop_fence_clock_test_hook(hook: Option<StopFenceClockHook>) {
+    STOP_FENCE_CLOCK_TEST_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn before_stop_fence_test_hook() {
+    let hook = BEFORE_STOP_FENCE_TEST_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn before_stop_fence_test_hook() {}
+
+#[cfg(test)]
+fn after_stop_fence_test_hook() {
+    let hook = AFTER_STOP_FENCE_TEST_HOOK.with(|cell| cell.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_stop_fence_test_hook() {}
+
+#[cfg(test)]
+fn stop_fence_clock() -> DateTime<Utc> {
+    STOP_FENCE_CLOCK_TEST_HOOK
+        .with(|cell| cell.borrow_mut().take())
+        .map(|hook| hook())
+        .unwrap_or_else(Utc::now)
+}
+
+#[cfg(not(test))]
+fn stop_fence_clock() -> DateTime<Utc> {
+    Utc::now()
+}
+
 pub const AUTOMATION_CANCELLATIONS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_cancellations (
         adoption_key TEXT PRIMARY KEY NOT NULL,
@@ -40,7 +103,8 @@ pub const AUTOMATION_CANCELLATIONS_SCHEMA_SQL: &str = "
 
 pub(crate) fn ensure_cancellation_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("SAVEPOINT automation_cancellation_schema")?;
-    let result = ensure_cancellation_schema_inner(conn);
+    let result = ensure_cancellation_schema_inner(conn)
+        .and_then(|()| reconcile_cancellation_adoption_ledger(conn));
     match result {
         Ok(()) => {
             conn.execute_batch("RELEASE SAVEPOINT automation_cancellation_schema")?;
@@ -69,7 +133,7 @@ fn ensure_cancellation_schema_inner(conn: &Connection) -> anyhow::Result<()> {
     if legacy_exists {
         conn.execute_batch(AUTOMATION_CANCELLATIONS_SCHEMA_SQL)?;
         conn.execute(
-            "INSERT OR IGNORE INTO automation_cancellations (
+            "INSERT INTO automation_cancellations (
                 adoption_key, request_digest, automation_id, run_id, attempt_id,
                 session_id, scope, requested_by_json, reason, state, requested_at,
                 execution_expires_at, acknowledged_at, reconciled_at, result_json
@@ -81,7 +145,6 @@ fn ensure_cancellation_schema_inner(conn: &Connection) -> anyhow::Result<()> {
              FROM automation_cancellations_legacy",
             [],
         )?;
-        backfill_legacy_cancellation_reservations(conn)?;
         conn.execute_batch("DROP TABLE automation_cancellations_legacy;")?;
         return Ok(());
     }
@@ -124,18 +187,171 @@ fn ensure_cancellation_schema_inner(conn: &Connection) -> anyhow::Result<()> {
     ensure_cancellation_schema_inner(conn)
 }
 
-fn backfill_legacy_cancellation_reservations(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO automation_command_reservations (
-            adoption_key, request_digest, command, reserved_at
-         )
-         SELECT c.adoption_key, c.request_digest, 'run.cancel.v1', c.requested_at
-         FROM automation_cancellations AS c
-         LEFT JOIN automation_command_adoptions AS a
-           ON a.adoption_key = c.adoption_key
-         WHERE c.state = 'stopping' AND a.adoption_key IS NULL",
-        [],
-    )?;
+fn reconcile_cancellation_adoption_ledger(conn: &Connection) -> anyhow::Result<()> {
+    type CancellationLedgerRow = (
+        String,
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let rows: Vec<CancellationLedgerRow> = {
+        let mut statement = conn.prepare(
+            "SELECT adoption_key, request_digest, state, automation_id,
+                    requested_at, acknowledged_at, reconciled_at, result_json
+             FROM automation_cancellations
+             ORDER BY adoption_key",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    for (
+        adoption_key,
+        request_digest,
+        state,
+        automation_id,
+        requested_at,
+        acknowledged_at,
+        reconciled_at,
+        result_json,
+    ) in rows
+    {
+        let reservation = conn
+            .query_row(
+                "SELECT command, request_digest
+                 FROM automation_command_reservations
+                 WHERE adoption_key = ?1",
+                [&adoption_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let adoption = conn
+            .query_row(
+                "SELECT command, request_digest, outcome, response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&adoption_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if matches!(state.as_str(), "requested" | "stopping") {
+            anyhow::ensure!(
+                adoption.is_none(),
+                "active cancellation adoption key `{adoption_key}` already has a terminal command adoption"
+            );
+            match reservation {
+                Some((command, digest))
+                    if command == "run.cancel.v1" && digest == request_digest => {}
+                Some(_) => anyhow::bail!(
+                    "active cancellation adoption key `{adoption_key}` conflicts with another command reservation"
+                ),
+                None => {
+                    conn.execute(
+                        "INSERT INTO automation_command_reservations (
+                             adoption_key, request_digest, command, reserved_at
+                         ) VALUES (?1, ?2, 'run.cancel.v1', ?3)",
+                        params![adoption_key, request_digest, requested_at],
+                    )?;
+                }
+            }
+            continue;
+        }
+
+        anyhow::ensure!(
+            reservation.is_none(),
+            "terminal cancellation adoption key `{adoption_key}` still has a command reservation"
+        );
+        let result: Value = serde_json::from_str(result_json.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "terminal cancellation adoption key `{adoption_key}` has no durable result"
+            )
+        })?)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "terminal cancellation adoption key `{adoption_key}` has an invalid durable result: {error}"
+            )
+        })?;
+        let (outcome, response) = if state == "rejected" {
+            let error = result.get("error").cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "rejected cancellation adoption key `{adoption_key}` has no durable error"
+                )
+            })?;
+            ("rejected", json!({"outcome": "rejected", "error": error}))
+        } else {
+            anyhow::ensure!(
+                matches!(state.as_str(), "cancelled" | "recovery_required"),
+                "cancellation adoption key `{adoption_key}` has unsupported terminal state `{state}`"
+            );
+            (
+                "committed",
+                json!({"outcome": "committed", "result": result}),
+            )
+        };
+        let response_json = serde_json::to_string(&response)?;
+        match adoption {
+            Some((command, digest, stored_outcome, stored_response)) => {
+                let stored_response: Value =
+                    serde_json::from_str(&stored_response).map_err(|error| {
+                        anyhow::anyhow!(
+                            "cancellation adoption key `{adoption_key}` has an invalid stored response: {error}"
+                        )
+                    })?;
+                anyhow::ensure!(
+                    command == "run.cancel.v1"
+                        && digest == request_digest
+                        && stored_outcome == outcome
+                        && stored_response == response,
+                    "terminal cancellation adoption key `{adoption_key}` conflicts with another command adoption"
+                );
+            }
+            None => {
+                let adopted_at = reconciled_at
+                    .as_deref()
+                    .or(acknowledged_at.as_deref())
+                    .unwrap_or(&requested_at);
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                         adoption_key, request_digest, command, automation_id,
+                         outcome, revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, 'run.cancel.v1', ?3, ?4, NULL, ?5, ?6)",
+                    params![
+                        adoption_key,
+                        request_digest,
+                        automation_id,
+                        outcome,
+                        response_json,
+                        adopted_at
+                    ],
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -265,7 +481,17 @@ fn recover_settled_result(
             ErrorCode::IllegalTransition,
             "automation completion already won the cancellation race",
         );
-        finalize_rejection(conn, reservation, &error, now)?;
+        if !finalize_rejection(conn, reservation, &error, now)? {
+            if let Some(replay) =
+                load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?
+            {
+                return Ok(Some(replay));
+            }
+            return Ok(Some(CancellationExecution::Rejected(typed_error(
+                ErrorCode::CancelPending,
+                "the cancellation request is already being reconciled",
+            ))));
+        }
         return Ok(Some(CancellationExecution::Rejected(error)));
     }
     Ok(None)
@@ -362,8 +588,17 @@ struct ReservedCancellation {
     digest: String,
     automation_id: String,
     requested_at: String,
+    execution_expires_at: String,
     owns_execution: bool,
     recover_unknown_stop: bool,
+}
+
+enum CancellationReservation {
+    Reserved(ReservedCancellation),
+    DeadlineExpired {
+        run_id: String,
+        reservation: Option<ReservedCancellation>,
+    },
 }
 
 pub fn execute_run_cancellation(
@@ -408,7 +643,34 @@ pub fn execute_run_cancellation(
     }
 
     let reservation = match reserve_cancellation(conn, request, digest.clone(), now)? {
-        Ok(reservation) => reservation,
+        Ok(CancellationReservation::Reserved(reservation)) => reservation,
+        Ok(CancellationReservation::DeadlineExpired {
+            run_id,
+            reservation,
+        }) => {
+            let error = illegal_transition_error(
+                "the targeted automation run reached its timeout before cancellation",
+            );
+            if let Some(reservation) = reservation.as_ref() {
+                if !finalize_rejection(conn, reservation, &error, now)? {
+                    if let Some(replay) =
+                        load_adopted_response(conn, &reservation.request.adoption_key, &digest)?
+                    {
+                        return Ok(replay);
+                    }
+                    return Ok(CancellationExecution::Rejected(typed_error(
+                        ErrorCode::CancelPending,
+                        "the cancellation request is already being reconciled",
+                    )));
+                }
+            } else if let Some(conflict) =
+                persist_rejection(conn, &body, &digest, adoption_key.as_deref(), &error, now)?
+            {
+                return Ok(CancellationExecution::Rejected(conflict));
+            }
+            super::runner::enforce_run_timeout(conn, runtime, &run_id, now)?;
+            return Ok(CancellationExecution::Rejected(error));
+        }
         Err(error) => {
             if error.code() != ErrorCode::AdoptionReplayMismatch {
                 if let Some(conflict) =
@@ -465,31 +727,67 @@ fn execute_reserved_cancellation(
             replayed: true,
         }));
     }
-    match super::runner::claim_stop_fence(
+    before_stop_fence_test_hook();
+    let claim_now = stop_fence_clock();
+    if reserved_deadline_expired(conn, &reservation, claim_now)? {
+        let error = illegal_transition_error(
+            "the targeted automation run reached its timeout before cancellation",
+        );
+        if !finalize_rejection(conn, &reservation, &error, claim_now)? {
+            if let Some(replay) =
+                load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?
+            {
+                return Ok(replay);
+            }
+            return Ok(CancellationExecution::Rejected(typed_error(
+                ErrorCode::CancelPending,
+                "the cancellation request is already being reconciled",
+            )));
+        }
+        super::runner::enforce_run_timeout(conn, runtime, &reservation.request.run_id, claim_now)?;
+        return Ok(CancellationExecution::Rejected(error));
+    }
+    let stop_claim = super::runner::claim_stop_fence(
         conn,
         &reservation.request.run_id,
         &reservation.request.runtime_correlation.session_id,
         "cancellation",
         Some(&reservation.request.adoption_key),
-        now,
-    )? {
-        super::runner::StopFenceClaim::Acquired
-        | super::runner::StopFenceClaim::InProgress
-        | super::runner::StopFenceClaim::UnknownOutcome => {}
+        Some(&reservation.execution_expires_at),
+        claim_now,
+    )?;
+    match stop_claim {
+        super::runner::StopFenceClaim::Acquired => after_stop_fence_test_hook(),
+        super::runner::StopFenceClaim::InProgress => {}
+        super::runner::StopFenceClaim::UnknownOutcome => {
+            super::runner::mark_unconfirmed_stop_for_recovery(
+                conn,
+                &reservation.request.run_id,
+                "cancellation stop outcome was not durably recorded",
+                now,
+            )?;
+            let payload = cancellation_payload(&reservation, "recovery_required", None, None);
+            finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
+            return Ok(CancellationExecution::Success(CancellationSuccess {
+                payload,
+                replayed: true,
+            }));
+        }
         super::runner::StopFenceClaim::Conflict => {
+            if let Some(replay) =
+                load_adopted_response(conn, &reservation.request.adoption_key, &reservation.digest)?
+            {
+                return Ok(replay);
+            }
+            if let Some(execution) = recover_settled_result(conn, &reservation, now, false)? {
+                return Ok(execution);
+            }
             let error = typed_error(
                 ErrorCode::CancelPending,
                 "another stop operation already owns the automation run",
             );
-            finalize_rejection(conn, &reservation, &error, now)?;
             return Ok(CancellationExecution::Rejected(error));
         }
-    }
-    if let Err(mark_error) = mark_stop_dispatched(conn, &reservation) {
-        if let Some(execution) = recover_settled_result(conn, &reservation, now, false)? {
-            return Ok(execution);
-        }
-        return Err(mark_error);
     }
 
     match runtime.kill_session(&reservation.request.runtime_correlation.session_id) {
@@ -506,7 +804,19 @@ fn execute_reserved_cancellation(
                     ErrorCode::IllegalTransition,
                     "automation completion already won the cancellation race",
                 );
-                finalize_rejection(conn, &reservation, &error, now)?;
+                if !finalize_rejection(conn, &reservation, &error, now)? {
+                    if let Some(replay) = load_adopted_response(
+                        conn,
+                        &reservation.request.adoption_key,
+                        &reservation.digest,
+                    )? {
+                        return Ok(replay);
+                    }
+                    return Ok(CancellationExecution::Rejected(typed_error(
+                        ErrorCode::CancelPending,
+                        "the cancellation request is already being reconciled",
+                    )));
+                }
                 return Ok(CancellationExecution::Rejected(error));
             }
             let timestamp = iso(now);
@@ -605,7 +915,22 @@ pub(crate) fn reconcile_expired_cancellations(
     ) in candidates
     {
         let next_expiry = iso(now + chrono::Duration::seconds(30));
-        let claimed = conn
+        let transaction =
+            rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(
+                |error| format!("failed to begin cancellation reconciliation claim: {error}"),
+            )?;
+        let timeout_at = transaction
+            .query_row(
+                "SELECT timeout_at FROM automation_runs WHERE id = ?1",
+                [&run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| {
+                format!("failed to inspect cancellation reconciliation deadline: {error}")
+            })?
+            .flatten();
+        let claimed = transaction
             .execute(
                 "UPDATE automation_cancellations
                  SET execution_expires_at = ?2
@@ -615,6 +940,9 @@ pub(crate) fn reconcile_expired_cancellations(
                 params![adoption_key, next_expiry, state, execution_expires_at],
             )
             .map_err(|error| format!("failed to claim cancellation reconciliation: {error}"))?;
+        transaction.commit().map_err(|error| {
+            format!("failed to commit cancellation reconciliation claim: {error}")
+        })?;
         if claimed != 1 {
             continue;
         }
@@ -634,9 +962,37 @@ pub(crate) fn reconcile_expired_cancellations(
             digest,
             automation_id,
             requested_at,
+            execution_expires_at: next_expiry,
             owns_execution: state == "requested",
             recover_unknown_stop: state == "stopping",
         };
+        let deadline_expired = timeout_at
+            .map(|timeout_at| {
+                DateTime::parse_from_rfc3339(&timeout_at)
+                    .map(|timeout_at| timeout_at.with_timezone(&Utc) <= now)
+                    .map_err(|error| {
+                        format!(
+                            "stored cancellation target timeout is invalid during reconciliation: {error}"
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        if state == "requested" && deadline_expired {
+            let error = illegal_transition_error(
+                "the targeted automation run reached its timeout before cancellation",
+            );
+            if finalize_rejection(conn, &reservation, &error, now)? {
+                super::runner::enforce_run_timeout(
+                    conn,
+                    runtime,
+                    &reservation.request.run_id,
+                    now,
+                )?;
+            }
+            reconciled += 1;
+            continue;
+        }
         execute_reserved_cancellation(conn, runtime, reservation, now, true)?;
         reconciled += 1;
     }
@@ -666,12 +1022,48 @@ fn validate_request(request: &CancellationRequest) -> Result<(), String> {
     Ok(())
 }
 
+fn reserved_deadline_expired(
+    conn: &Connection,
+    reservation: &ReservedCancellation,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let timeout_at = conn
+        .query_row(
+            "SELECT r.timeout_at
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             WHERE c.adoption_key = ?1
+               AND c.run_id = ?2
+               AND c.session_id = ?3
+               AND c.state = 'requested'
+               AND c.execution_expires_at = ?4",
+            params![
+                reservation.request.adoption_key,
+                reservation.request.run_id,
+                reservation.request.runtime_correlation.session_id,
+                reservation.execution_expires_at
+            ],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect cancellation claim deadline: {error}"))?
+        .flatten();
+    timeout_at
+        .map(|timeout_at| {
+            DateTime::parse_from_rfc3339(&timeout_at)
+                .map(|timeout_at| timeout_at.with_timezone(&Utc) <= now)
+                .map_err(|error| format!("stored cancellation target timeout is invalid: {error}"))
+        })
+        .transpose()
+        .map(|expired| expired.unwrap_or(false))
+}
+
 fn reserve_cancellation(
     conn: &Connection,
     request: CancellationRequest,
     digest: String,
     now: DateTime<Utc>,
-) -> Result<Result<ReservedCancellation, ErrorEnvelope>, String> {
+) -> Result<Result<CancellationReservation, ErrorEnvelope>, String> {
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|error| format!("failed to begin cancellation reservation: {error}"))?;
     let existing = transaction
@@ -742,7 +1134,8 @@ fn reserve_cancellation(
         let expires_at = DateTime::parse_from_rfc3339(&execution_expires_at)
             .map_err(|error| format!("stored cancellation lease is invalid: {error}"))?
             .with_timezone(&Utc);
-        let (owns_execution, recover_unknown_stop) =
+        let next_expiry = iso(now + chrono::Duration::seconds(30));
+        let (owns_execution, recover_unknown_stop, owned_expiry) =
             if matches!(state.as_str(), "requested" | "stopping") && expires_at <= now {
                 let changed = transaction
                     .execute(
@@ -754,7 +1147,7 @@ fn reserve_cancellation(
                    AND execution_expires_at = ?4",
                         params![
                             request.adoption_key,
-                            iso(now + chrono::Duration::seconds(30)),
+                            next_expiry,
                             digest,
                             execution_expires_at,
                             state
@@ -766,21 +1159,61 @@ fn reserve_cancellation(
                 (
                     changed == 1 && state == "requested",
                     changed == 1 && state == "stopping",
+                    if changed == 1 {
+                        next_expiry.clone()
+                    } else {
+                        execution_expires_at.clone()
+                    },
                 )
             } else {
-                (false, false)
+                (false, false, execution_expires_at.clone())
             };
-        transaction.commit().map_err(|error| {
-            format!("failed to commit cancellation replay reservation: {error}")
-        })?;
-        return Ok(Ok(ReservedCancellation {
+        let reservation = ReservedCancellation {
             request,
             digest,
             automation_id,
             requested_at,
+            execution_expires_at: owned_expiry,
             owns_execution,
             recover_unknown_stop,
-        }));
+        };
+        if reservation.owns_execution {
+            let timeout_at = transaction
+                .query_row(
+                    "SELECT timeout_at FROM automation_runs WHERE id = ?1",
+                    [&reservation.request.run_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(|error| {
+                    format!("failed to inspect reclaimed cancellation deadline: {error}")
+                })?
+                .flatten();
+            let deadline_expired = timeout_at
+                .map(|timeout_at| {
+                    DateTime::parse_from_rfc3339(&timeout_at)
+                        .map(|timeout_at| timeout_at.with_timezone(&Utc) <= now)
+                        .map_err(|error| {
+                            format!("stored cancellation target timeout is invalid: {error}")
+                        })
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if deadline_expired {
+                let run_id = reservation.request.run_id.clone();
+                transaction.commit().map_err(|error| {
+                    format!("failed to commit expired cancellation reclaim: {error}")
+                })?;
+                return Ok(Ok(CancellationReservation::DeadlineExpired {
+                    run_id,
+                    reservation: Some(reservation),
+                }));
+            }
+        }
+        transaction.commit().map_err(|error| {
+            format!("failed to commit cancellation replay reservation: {error}")
+        })?;
+        return Ok(Ok(CancellationReservation::Reserved(reservation)));
     }
     let conflicting_reservation = transaction
         .query_row(
@@ -796,6 +1229,14 @@ fn reserve_cancellation(
         transaction
             .rollback()
             .map_err(|error| format!("failed to close conflicting reservation: {error}"))?;
+        return Ok(Err(replay_mismatch_error()));
+    }
+    if super::command_adoption::attempt_adoption_key_exists(&transaction, &request.adoption_key)
+        .map_err(|error| format!("failed to inspect attempt adoption key: {error:#}"))?
+    {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to close conflicting attempt key: {error}"))?;
         return Ok(Err(replay_mismatch_error()));
     }
     let conflicting_adoption = transaction
@@ -836,7 +1277,7 @@ fn reserve_cancellation(
 
     let live = transaction
         .query_row(
-            "SELECT r.automation_id, r.status, a.state, s.status
+            "SELECT r.automation_id, r.status, a.state, s.status, r.timeout_at
              FROM automation_runs AS r
              JOIN automation_attempts AS a ON a.run_id = r.id
              JOIN sessions AS s ON s.id = a.session_id
@@ -854,12 +1295,13 @@ fn reserve_cancellation(
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(|error| format!("failed to resolve cancellation target: {error}"))?;
-    let Some((automation_id, run_state, attempt_state, session_state)) = live else {
+    let Some((automation_id, run_state, attempt_state, session_state, timeout_at)) = live else {
         transaction
             .rollback()
             .map_err(|error| format!("failed to close stale cancellation lookup: {error}"))?;
@@ -881,8 +1323,23 @@ fn reserve_cancellation(
             "the targeted automation attempt is no longer cancellable",
         )));
     }
+    if let Some(timeout_at) = timeout_at {
+        let timeout_at = DateTime::parse_from_rfc3339(&timeout_at)
+            .map_err(|error| format!("stored cancellation target timeout is invalid: {error}"))?
+            .with_timezone(&Utc);
+        if timeout_at <= now {
+            transaction.rollback().map_err(|error| {
+                format!("failed to close expired cancellation reservation: {error}")
+            })?;
+            return Ok(Ok(CancellationReservation::DeadlineExpired {
+                run_id: request.run_id,
+                reservation: None,
+            }));
+        }
+    }
 
     let requested_at = iso(now);
+    let execution_expires_at = iso(now + chrono::Duration::seconds(30));
     transaction
         .execute(
             "INSERT INTO automation_command_reservations (
@@ -911,7 +1368,7 @@ fn reserve_cancellation(
                 .map_err(|error| format!("failed to serialize cancellation requester: {error}"))?,
                 request.reason,
                 requested_at,
-                iso(now + chrono::Duration::seconds(30)),
+                execution_expires_at,
             ],
         )
         .map_err(|error| format!("failed to reserve automation cancellation: {error}"))?;
@@ -919,34 +1376,17 @@ fn reserve_cancellation(
         format!("failed to commit automation cancellation reservation: {error}")
     })?;
 
-    Ok(Ok(ReservedCancellation {
-        request,
-        digest,
-        automation_id,
-        requested_at,
-        owns_execution: true,
-        recover_unknown_stop: false,
-    }))
-}
-
-fn mark_stop_dispatched(
-    conn: &Connection,
-    reservation: &ReservedCancellation,
-) -> Result<(), String> {
-    let changed = conn
-        .execute(
-            "UPDATE automation_cancellations
-             SET state = 'stopping'
-             WHERE adoption_key = ?1
-               AND request_digest = ?2
-               AND state = 'requested'",
-            params![reservation.request.adoption_key, reservation.digest],
-        )
-        .map_err(|error| format!("failed to persist cancellation stop dispatch: {error}"))?;
-    if changed != 1 {
-        return Err("cancellation execution ownership changed before runtime stop".to_string());
-    }
-    Ok(())
+    Ok(Ok(CancellationReservation::Reserved(
+        ReservedCancellation {
+            request,
+            digest,
+            automation_id,
+            requested_at,
+            execution_expires_at,
+            owns_execution: true,
+            recover_unknown_stop: false,
+        },
+    )))
 }
 
 fn load_adopted_response(
@@ -1069,7 +1509,7 @@ fn finalize_rejection(
     reservation: &ReservedCancellation,
     error: &ErrorEnvelope,
     now: DateTime<Utc>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to begin cancellation rejection: {error}"))?;
@@ -1079,17 +1519,23 @@ fn finalize_rejection(
              SET state = 'rejected',
                  reconciled_at = ?2,
                  result_json = ?3
-             WHERE adoption_key = ?1 AND state IN ('requested', 'stopping')",
+             WHERE adoption_key = ?1
+               AND state IN ('requested', 'stopping')
+               AND execution_expires_at = ?4",
             params![
                 reservation.request.adoption_key,
                 iso(now),
                 serde_json::to_string(&json!({"error": error}))
-                    .map_err(|error| format!("failed to serialize cancellation error: {error}"))?
+                    .map_err(|error| format!("failed to serialize cancellation error: {error}"))?,
+                reservation.execution_expires_at
             ],
         )
         .map_err(|error| format!("failed to finalize cancellation rejection: {error}"))?;
     if changed != 1 {
-        return Err("cancellation rejection was already finalized".to_string());
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to close stale cancellation rejection: {error}"))?;
+        return Ok(false);
     }
     transaction
         .execute(
@@ -1123,7 +1569,8 @@ fn finalize_rejection(
     )?;
     transaction
         .commit()
-        .map_err(|error| format!("failed to commit cancellation rejection: {error}"))
+        .map_err(|error| format!("failed to commit cancellation rejection: {error}"))?;
+    Ok(true)
 }
 
 fn persist_rejection(
@@ -1159,6 +1606,14 @@ fn persist_rejection(
         return Ok(
             (command != "run.cancel.v1" || existing_digest != digest).then(replay_mismatch_error)
         );
+    }
+    if super::command_adoption::attempt_adoption_key_exists(&transaction, adoption_key).map_err(
+        |query_error| format!("failed to inspect rejected attempt adoption key: {query_error:#}"),
+    )? {
+        transaction.rollback().map_err(|rollback_error| {
+            format!("failed to close rejected attempt adoption conflict: {rollback_error}")
+        })?;
+        return Ok(Some(replay_mismatch_error()));
     }
     let reserved = transaction
         .query_row(
@@ -1356,8 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_preserves_terminal_legacy_cancellations_without_reserving_them(
-    ) -> anyhow::Result<()> {
+    fn migration_backfills_terminal_legacy_cancellation_adoptions() -> anyhow::Result<()> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(
             super::super::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
@@ -1389,6 +1843,53 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(reservations, 0);
+        let adoption: (String, String, String) = conn.query_row(
+            "SELECT command, request_digest, response_json
+             FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:legacy:0002'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(adoption.0, "run.cancel.v1");
+        assert_eq!(adoption.1, "digest");
+        assert_eq!(
+            serde_json::from_str::<Value>(&adoption.2)?,
+            json!({"outcome": "committed", "result": {}})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_rejects_conflicting_cancellation_adoption_keys() -> anyhow::Result<()> {
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(
+            super::super::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
+        )?;
+        conn.execute_batch(LEGACY_SCHEMA)?;
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, 'other-digest', 'definition.create.v1', ?2)",
+            params!["adopt:cancel:legacy:conflict", "2026-01-01T00:00:00.000Z"],
+        )?;
+        conn.execute(
+            "INSERT INTO automation_cancellations (
+                adoption_key, request_digest, automation_id, run_id, attempt_id,
+                session_id, scope, requested_by_json, reason, state, requested_at
+             ) VALUES (?1, 'digest', 'automation', 'run', 'attempt', 'session',
+                       'run', '{\"principalId\":\"operator\"}', 'reason',
+                       'requested', ?2)",
+            params!["adopt:cancel:legacy:conflict", "2026-01-01T00:00:00.000Z"],
+        )?;
+
+        let error = ensure_cancellation_schema(&conn)
+            .expect_err("migration must reject a command-owned cancellation adoption key");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicts with another command reservation"),
+            "{error:#}"
+        );
         Ok(())
     }
 

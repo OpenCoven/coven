@@ -12823,15 +12823,17 @@ pub(crate) mod tests {
         Ok(())
     }
 
-    #[test]
-    fn cancellation_defers_to_an_in_flight_timeout_stop() -> anyhow::Result<()> {
-        struct BlockingTimeoutRuntime {
-            calls: std::sync::atomic::AtomicUsize,
-            started: std::sync::mpsc::SyncSender<()>,
-            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        }
+    struct BlockingTimeoutRuntime {
+        calls: std::sync::atomic::AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
 
-        impl SessionRuntime for BlockingTimeoutRuntime {
+    #[test]
+    fn cancellation_after_the_run_deadline_settles_as_timeout() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
             fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
                 Ok(())
             }
@@ -12841,16 +12843,303 @@ pub(crate) mod tests {
             }
 
             fn kill_session(&self, _: &str) -> Result<()> {
-                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                self.started.send(())?;
-                self.release
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
-                    .recv()?;
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             }
         }
 
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+            ],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:past-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the overdue request must route through the timeout stop"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (String, String, String, Option<String>) = conn.query_row(
+            "SELECT r.status, o.state, a.state, a.failure_class
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     JOIN automation_attempts AS a ON a.run_id = r.id
+                     WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            lifecycle,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "timed_out".to_string(),
+                Some("timeout".to_string()),
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crash_after_stop_fence_never_reissues_cancellation_kill() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:fence-crash",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop fence")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+                     SET execution_expires_at = ?2
+                     WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+                     SET execution_expires_at = ?2
+                     WHERE operation_key = ?1",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired stop fence is an unknown external outcome"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_between_reconciliation_and_stop_fence_wins() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let hook_home = temp_dir.path().to_path_buf();
+        let hook_session = session_id.clone();
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+            move || {
+                let conn = store::open_store(&store_path(&hook_home)).unwrap();
+                let completed_at = current_timestamp();
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &hook_session,
+                    "completed",
+                    Some(0),
+                    &completed_at,
+                )
+                .unwrap());
+                assert_eq!(
+                    crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                        .unwrap()
+                        .succeeded,
+                    1
+                );
+            },
+        )));
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-before-fence",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        let history = cancellation_history(temp_dir.path())?;
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_adoption_keys_cannot_alias_attempt_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let attempt_key: String = conn.query_row(
+            "SELECT adoption_key FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let cancel_body = cancellation_body(
+            &attempt_key,
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "must not alias attempt adoption",
+        );
+        let cancellation = post_cancellation(temp_dir.path(), &cancel_body, &NoopSessionRuntime)?;
+        assert_eq!(cancellation.status, 409, "{}", cancellation.body);
+        assert!(
+            cancellation
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            cancellation.body
+        );
+
+        let disable = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": attempt_key,
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "must not alias attempt adoption"
+        })
+        .to_string();
+        let definition = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable),
+        )?;
+        assert_eq!(definition.status, 409, "{}", definition.body);
+        assert!(
+            definition
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            definition.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_adoption_keys_cannot_alias_command_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, _session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let occurrence_id: String = conn.query_row(
+            "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        let command_key = "adopt:cancel:cancellation-target:command-owned";
+        let now = current_timestamp();
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![command_key, "digest", "cancel", now],
+        )?;
+
+        let error = conn
+            .execute(
+                "INSERT INTO automation_attempts (
+                     id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, dispatch_generation, state,
+                     prior_attempt_number, prior_disposition, retry_classification,
+                     not_before, opened_at
+                 ) VALUES (?1, ?2, ?3, 2, ?4, 1, 0, 'adopted',
+                           1, 'failed', 'operator_retry', ?5, ?5)",
+                rusqlite::params![
+                    "attempt-command-key-alias",
+                    run_id,
+                    occurrence_id,
+                    command_key,
+                    now
+                ],
+            )
+            .expect_err("attempt insert must reject a command-owned adoption key");
+        assert!(
+            error
+                .to_string()
+                .contains("automation adoption key is already used by a command"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    impl SessionRuntime for BlockingTimeoutRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.send(())?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
+                .recv()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_defers_to_an_in_flight_timeout_stop() -> anyhow::Result<()> {
         let (temp_dir, run_id, attempt_id, session_id) =
             start_running_automation_for_cancellation()?;
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
@@ -13026,6 +13315,385 @@ pub(crate) mod tests {
             runtime.0.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "an expired stopping lease represents an unknown outcome and must never repeat kill"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:requested-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(
+            crashed.is_err(),
+            "the fixture must leave a requested cancellation for recovery"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:requested-timeout",
+                expired
+            ],
+        )?;
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only timeout authority may stop the expired run"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:requested-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        drop(conn);
+
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(runtime.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:replay-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }))
+        .is_err());
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:replay-timeout", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the replay must route the stop through timeout authority"
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:replay-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cancellation_executor_cannot_fence_timeout_recovery() -> anyhow::Result<()> {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-executor",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let executor_body = body.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_stop_fence_clock_test_hook(Some(Box::new(
+                || Utc::now() + chrono::Duration::seconds(31),
+            )));
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &executor_body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:stale-executor", expired],
+        )?;
+        let timeout_runtime = CountingKillRuntime(calls.clone());
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &timeout_runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        resume_tx.send(())?;
+        let stale_response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("stale cancellation executor panicked"))??;
+        assert_eq!(stale_response.status, 422, "{}", stale_response.body);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale cancellation executor must not issue a second stop"
+        );
+        let cancellation_fences: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_stop_fences
+             WHERE run_id = ?1 AND owner = 'cancellation'",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cancellation_fences, 0);
+        let states: (String, String) = conn.query_row(
+            "SELECT r.status, a.state
+             FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(states, ("failed".into(), "timed_out".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_cancellation_executor_rechecks_deadline_before_stop_ownership() -> anyhow::Result<()>
+    {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:paused-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        resume_tx.send(())?;
+        let response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("paused cancellation executor panicked"))??;
+        assert_eq!(response.status, 422, "{}", response.body);
+        assert!(
+            response.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resumed executor must route the stop through timeout authority"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:paused-deadline"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
         );
         Ok(())
     }
@@ -15899,25 +16567,34 @@ pub(crate) mod tests {
         )?);
         let settlement = crate::automations::runner::settle_finished_runs(&conn, Utc::now())
             .map_err(anyhow::Error::msg)?;
-        assert_eq!(
-            settlement.succeeded, 1,
-            "later authoritative terminal evidence must resolve aggregate recovery state"
-        );
-        let reconciled: (String, String, String) = conn.query_row(
-            "SELECT o.state, a.state, r.status
+        assert_eq!(settlement.failed, 1);
+        let reconciled: (String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT o.state, a.state, r.status, a.settled_at, r.finished_at
              FROM automation_occurrences AS o
              JOIN automation_runs AS r ON r.occurrence_id = o.id
              JOIN automation_attempts AS a ON a.run_id = r.id
              WHERE r.id = ?1",
             [&run_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )?;
-        assert_eq!(reconciled.0, "succeeded");
+        assert_eq!(reconciled.0, "failed");
         assert_eq!(
             reconciled.1, "ambiguous",
             "later evidence must not rewrite the immutable ambiguous attempt"
         );
-        assert_eq!(reconciled.2, "succeeded");
+        assert_eq!(reconciled.2, "failed");
+        assert_eq!(
+            reconciled.3, reconciled.4,
+            "ambiguous receipt correlation requires one terminal settlement timestamp"
+        );
         Ok(())
     }
 

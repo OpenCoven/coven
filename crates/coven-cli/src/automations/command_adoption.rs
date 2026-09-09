@@ -47,6 +47,96 @@ pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
     END;
 ";
 
+const GLOBAL_ADOPTION_KEY_GUARDS_SQL: &str = "
+    CREATE TRIGGER IF NOT EXISTS automation_attempt_adoption_key_global_insert
+    BEFORE INSERT ON automation_attempts
+    WHEN EXISTS (
+        SELECT 1 FROM automation_command_reservations
+        WHERE adoption_key = NEW.adoption_key
+    ) OR EXISTS (
+        SELECT 1 FROM automation_command_adoptions
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by a command');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_reservation_key_global_insert
+    BEFORE INSERT ON automation_command_reservations
+    WHEN EXISTS (
+        SELECT 1 FROM automation_attempts
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by an attempt');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoption_key_global_insert
+    BEFORE INSERT ON automation_command_adoptions
+    WHEN EXISTS (
+        SELECT 1 FROM automation_attempts
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by an attempt');
+    END;
+";
+
+pub(crate) fn ensure_global_adoption_key_guards(conn: &Connection) -> Result<()> {
+    let command_collision: Option<String> = conn
+        .query_row(
+            "SELECT reservation.adoption_key
+             FROM automation_command_reservations AS reservation
+             JOIN automation_command_adoptions AS adoption
+               ON adoption.adoption_key = reservation.adoption_key
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect automation command adoption ownership")?;
+    anyhow::ensure!(
+        command_collision.is_none(),
+        "automation adoption key `{}` is both reserved and adopted",
+        command_collision.as_deref().unwrap_or_default()
+    );
+    let collision: Option<String> = conn
+        .query_row(
+            "SELECT attempt.adoption_key
+             FROM automation_attempts AS attempt
+             WHERE EXISTS (
+                 SELECT 1 FROM automation_command_reservations AS reservation
+                 WHERE reservation.adoption_key = attempt.adoption_key
+             ) OR EXISTS (
+                 SELECT 1 FROM automation_command_adoptions AS adoption
+                 WHERE adoption.adoption_key = attempt.adoption_key
+             )
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect global automation adoption keys")?;
+    anyhow::ensure!(
+        collision.is_none(),
+        "automation adoption key `{}` is already shared by an attempt and command",
+        collision.as_deref().unwrap_or_default()
+    );
+    conn.execute_batch(GLOBAL_ADOPTION_KEY_GUARDS_SQL)
+        .context("failed to initialize global automation adoption-key guards")
+}
+
+pub(crate) fn attempt_adoption_key_exists(conn: &Connection, adoption_key: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM automation_attempts WHERE adoption_key = ?1",
+        [adoption_key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .context("failed to inspect automation attempt adoption key")
+}
+
 #[derive(Debug, Clone)]
 pub enum DefinitionCommand {
     Invalid {
@@ -152,6 +242,17 @@ pub fn execute_definition_command(
     );
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin automation command adoption transaction")?;
+
+    if attempt_adoption_key_exists(&transaction, adoption_key.as_str())? {
+        transaction
+            .rollback()
+            .context("failed to close conflicting attempt adoption transaction")?;
+        return Ok(rejected(
+            ErrorCode::AdoptionReplayMismatch,
+            "adoption key was already used by an automation attempt",
+            None,
+        ));
+    }
 
     if let Some((reserved_command, reserved_digest)) = transaction
         .query_row(
@@ -1324,6 +1425,41 @@ mod tests {
             )
             .is_err());
         assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[test]
+    fn startup_rejects_keys_that_are_both_reserved_and_adopted() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, 'digest', 'definition.create.v1', ?2)",
+            params![
+                "adopt:create:reservation-adoption-collision",
+                "2026-09-03T09:00:00.000Z"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_command_adoptions (
+                 adoption_key, request_digest, command, automation_id, outcome,
+                 revision, response_json, adopted_at
+             ) VALUES (?1, 'digest', 'definition.create.v1', NULL, 'rejected',
+                       NULL, ?2, ?3)",
+            params![
+                "adopt:create:reservation-adoption-collision",
+                r#"{"outcome":"rejected","error":{"code":"VALIDATION_FAILED","message":"invalid","retryable":false}}"#,
+                "2026-09-03T09:00:00.000Z"
+            ],
+        )
+        .unwrap();
+
+        let error = ensure_global_adoption_key_guards(&conn)
+            .expect_err("startup must reject split command adoption ownership");
+        assert!(
+            error.to_string().contains("is both reserved and adopted"),
+            "{error:#}"
+        );
     }
 
     #[test]
