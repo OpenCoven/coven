@@ -773,6 +773,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                         | "coven.automations.definition.tombstone.v1"
                         | "coven.automations.run.cancel.v1"
                         | "coven.automations.run"
+                        | "coven.automations.tick"
                         | "coven.automations.unquarantine"
                 )
             {

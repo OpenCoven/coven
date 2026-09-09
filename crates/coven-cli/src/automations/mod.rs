@@ -13,6 +13,7 @@ pub mod daemon_tick;
 pub mod definition;
 pub mod health;
 pub mod import_legacy;
+pub mod leadership;
 pub mod occurrences;
 pub mod receipts;
 pub mod rrule;

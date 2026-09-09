@@ -1050,13 +1050,13 @@ fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, String> {
-    match crate::automations::occurrences::tick(conn, now) {
+    match crate::automations::occurrences::tick_planning(conn, now) {
         Ok(report) => Ok(json!({
             "planned": report.planned,
             "alreadyFenced": report.already_fenced,
             "pausedSkipped": report.paused_skipped,
-            "recovered": report.recovered,
-            "claimed": report.claimed,
+            "recovered": 0,
+            "claimed": [],
             "failed": report.failed,
         })),
         Err(error) => Err(format!("{error:#}")),
@@ -1317,10 +1317,70 @@ pub fn rejected_action(
 mod tests {
     use super::*;
     use crate::api::{SessionLaunch, SessionRuntime};
+    use chrono::Timelike;
 
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
     struct RetryableRejectedRuntime;
+
+    #[test]
+    fn tick_action_plans_but_does_not_claim_without_scheduler_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let now = chrono::Utc::now();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "tick-authority",
+            "name": "Tick authority",
+            "status": "ACTIVE",
+            "rrule": format!("FREQ=DAILY;BYHOUR={}", now.hour()),
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                definition.id
+            ],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.tick"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert_eq!(
+            response.event.as_ref().unwrap().payload["claimed"],
+            json!([])
+        );
+        let occurrence_state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE automation_id = ?1",
+                [&definition.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "planned");
+    }
 
     impl SessionRuntime for OwnershipThenErrorRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
