@@ -214,6 +214,15 @@ committed write; they are not a claim that the ledger append succeeded.
 Clients must retain/escalate that response and reconcile the ledger rather
 than replaying the file edit.
 
+When a reviewed write lands under retired-Ward `editable.harness_blocks` +
+`approval_tiers` metadata and every touched surface binds to the daemon's typed
+region predicates, the `202` response includes `scheduledProposal` with the
+canonical `phase5_v1` envelope (`classification`, `materialized_diff`,
+`region_evidence`, `lifecycle`, deadlines) and omits `reviewKind`. Unsupported
+or weaker-than-region approval metadata fails closed with `409
+scheduled_publication_invalid`. Legacy reviewed holds without approval metadata
+continue to stage the additive `reviewKind: "coherence"` envelope.
+
 Every submitted Ward request accepts at most 32 edits, including Tier-0/Tier-1
 edits that will be held or staged and Tier-2/Tier-3 edits eligible for direct
 apply. Proposed contents may total at most 16 MiB (16,777,216 bytes). During
@@ -282,9 +291,18 @@ that exceeded the reported limit.
 
 ## Ward proposals (threads)
 
-Held Ward writes stage at `~/.coven/pending/` for the principal —
-Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
-`reviewKind` (`authority` / `coherence`). See
+Held Ward writes stage at `~/.coven/pending/` for the principal. Tier-0
+authority degradations remain legacy pending proposals distinguished by
+`reviewKind: "authority"`. Tier-1 reviewed holds either keep the legacy
+`reviewKind: "coherence"` shape or, when retired-Ward approval metadata binds
+the diff to typed regions, stage as canonical `phase5_v1` scheduled proposals
+whose authority lives in `classification.approval_path`, not in `reviewKind`.
+Approval metadata that declares `human_veto_window_hours` must also declare an
+explicit `min_visible_seconds` value; Coven validates both through the
+scheduled-publication veto-window contract and does not infer a default minimum
+from example fixtures. `min_visible_seconds` is invalid without a veto window
+and on human approval paths.
+See
 [cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
 
 | Method | Path | Purpose | Success | Errors |

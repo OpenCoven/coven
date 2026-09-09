@@ -125,12 +125,22 @@ not that POSIX primitive gap.
 
 ## Pending proposals
 
-Pending records distinguish two lanes with `reviewKind`:
+Pending records include:
 
 - `authority`: historical authority proposals and daemon-owned scheduled
   records. Public intake no longer stages Tier-0 writes.
 - `coherence`: a Tier-1 (reviewed) write held for Gate-3 coherence review
   (`docs/design/ward-gate3-coherence.md`).
+- canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
+  declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
+  binds entirely to the daemon's typed region predicates. These carry
+  `classification.approval_path`, `materialized_diff`, `region_evidence`, and
+  derived lifecycle/deadline fields; `reviewKind` is intentionally absent.
+
+If approval metadata is present but cannot produce authoritative typed evidence
+for the staged diff, the daemon fails closed with `409
+scheduled_publication_invalid` instead of falling back to a weaker legacy
+proposal.
 
 The active queue accepts at most **64 proposals** and **64 MiB
 (67,108,864 bytes)** of exact serialized pending/decision-claim data. Coven
@@ -320,7 +330,12 @@ fail with `familiar_not_found`.
 `coven ward migrate` inspects (and with `--apply`, rewrites) v0.1
 `ward.toml` files into the Phase-2 `WardConfig` dialect. Use `--familiar
 <ID>` to scope to one familiar and `--fingerprint <FPR>` to set the
-principal binding. Exits non-zero if any migration fails.
+principal binding. Veto-bearing approval metadata must explicitly declare both
+`human_veto_window_hours` and `min_visible_seconds`; migration preserves those
+values verbatim and refuses ambiguous historical declarations instead of
+guessing a minimum-visibility default or writing a backup. `min_visible_seconds`
+is invalid when no veto window is configured and on human approval paths. Exits
+non-zero if any migration fails.
 
 Accepted retired invariants become active `[[identity_invariant]]` entries,
 not backup-only annotations. You keep the original configuration in
