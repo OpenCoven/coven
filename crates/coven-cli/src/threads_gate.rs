@@ -221,8 +221,8 @@ pub struct GateRequest<'a> {
     pub edits: &'a [ward::FileEdit],
     /// Gate-2 *resolved* home-relative paths of the proposal's unblocked
     /// Tier-0 targets. Blocked targets are already refused by the Ward
-    /// downstream. Empty means no protected target: the gate is a no-op
-    /// `Permitted` — editable-tier writes are the Ward tiers' lane.
+    /// downstream. Empty skips protected-surface authority checks, but configured
+    /// identity predicates still apply to the complete candidate.
     pub gated_targets: &'a [String],
     /// The proposal's authorization.
     pub authorization: &'a ward::Authorization,
@@ -246,7 +246,8 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         authorization,
     } = *req;
     ward::validate_file_edit_budget(edits)?;
-    if gated_targets.is_empty() {
+    let invariants = config.identity_invariant_set()?;
+    if gated_targets.is_empty() && invariants.is_none() {
         return Ok(GateReport {
             verdicts: Vec::new(),
             outcome: GateOutcome::Permitted,
@@ -264,7 +265,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         workspace,
         config,
         gated_targets,
-        true,
+        !gated_targets.is_empty(),
         now,
     )?;
     let familiar_uuid = state.familiar_uuid;
@@ -278,6 +279,45 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         authorization,
         None,
     );
+    if let Some(invariants) = invariants {
+        let context = identity_context
+            .as_ref()
+            .context("configured identity predicates require candidate identity evidence")?;
+        let coherence = invariants.evaluate(context.candidate_commitment, Some(&context.facts));
+        let failure = match coherence {
+            threads::WeaveCoherence::Coherent => None,
+            threads::WeaveCoherence::Broken { reason }
+            | threads::WeaveCoherence::Degraded { reason, .. } => Some(reason),
+        };
+        if let Some(reason) = failure {
+            let verdict = threads::Verdict::Reject {
+                reason: threads::RejectReason::WeaveBroken { reason },
+            };
+            let mut verdicts = Vec::with_capacity(edits.len());
+            for edit in edits {
+                let request = threads::MutationRequest {
+                    surface: threads::SurfaceId::new(edit.target.clone()),
+                    writer: request_writer.clone(),
+                    channel: threads::Channel::Mutation,
+                    identity_context: identity_context.clone(),
+                };
+                append_audit_row(
+                    conn,
+                    familiar_id,
+                    &familiar_uuid,
+                    weave.weave_hash(),
+                    &request,
+                    &verdict,
+                    now,
+                )?;
+                verdicts.push((edit.target.clone(), verdict.clone()));
+            }
+            return Ok(GateReport {
+                verdicts,
+                outcome: GateOutcome::Rejected,
+            });
+        }
+    }
 
     // Validate every gated target; audit every verdict (RFC-0001 §5.6).
     let mut verdicts = Vec::with_capacity(gated_targets.len());

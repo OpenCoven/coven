@@ -279,9 +279,10 @@ that exceeded the reported limit.
 
 ## Ward proposals (threads)
 
-Held Ward writes stage at `~/.coven/pending/` for the principal. Tier-0
-authority degradations remain legacy pending proposals distinguished by
-`reviewKind: "authority"`. Tier-1 reviewed holds either keep the legacy
+Eligible held Ward writes stage at `~/.coven/pending/` for the principal.
+Tier-0 targets are refused with `protected_proposal_forbidden`; neither new
+intake nor historical authority-proposal records grant protected-write
+permission. Tier-1 reviewed holds either keep the legacy
 `reviewKind: "coherence"` shape or, when retired-Ward approval metadata binds
 the diff to typed regions, stage as canonical `phase5_v1` scheduled proposals
 whose authority lives in `classification.approval_path`, not in `reviewKind`.
@@ -290,8 +291,11 @@ explicit `min_visible_seconds` value; Coven validates both through the
 scheduled-publication veto-window contract and does not infer a default minimum
 from example fixtures. `min_visible_seconds` is invalid without a veto window
 and on human approval paths.
-See
-[cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
+Replay compares the committed regional approval path with the live compiled
+policy. Changed, removed, or unbound approval policy rejects the proposal;
+an opened window closes once with `revalidation_failed`. Existing unclassified
+envelopes without regional policy retain their legacy handling.
+See [cli-ward](cli-ward.md) and `docs/design/ward-gate3-coherence.md`.
 
 | Method | Path | Purpose | Success | Errors |
 |---|---|---|---|---|

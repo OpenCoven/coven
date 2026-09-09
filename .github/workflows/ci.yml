@@ -246,6 +246,8 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
+      - name: Exercise real-daemon Threads journeys
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock
 
   rust-test-windows:
     name: Rust tests (Windows)
@@ -296,6 +298,8 @@ jobs:
       - run: cargo test --workspace --locked
       - name: Exercise isolated Threads clock feature
         run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
+      - name: Exercise real-daemon Threads journeys
+        run: cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock
 
   afs-mount-linux:
     name: AFS mount backend (Linux)

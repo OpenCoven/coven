@@ -7512,6 +7512,32 @@ fn scheduled_rejection_window_close(
         })
 }
 
+fn scheduled_approval_policy_matches(
+    config: &ward::WardConfig,
+    scheduled: &crate::proposal_scheduler::ScheduledProposal,
+) -> Result<bool> {
+    let regions = &scheduled.classification().affected_regions;
+    let bindings = config.compiled_approval_tiers()?;
+    if regions.is_empty() {
+        // Legacy unclassified envelopes predate explicit regional policy.
+        return Ok(bindings.is_none());
+    }
+    let Some(bindings) = bindings else {
+        return Ok(false);
+    };
+    let mut live_path: Option<coven_threads_core::ApprovalPath> = None;
+    for region in regions {
+        let Some(path) = bindings.approval_path_for(region) else {
+            return Ok(false);
+        };
+        live_path = Some(match live_path {
+            Some(existing) => existing.highest(path.clone()),
+            None => path.clone(),
+        });
+    }
+    Ok(live_path.as_ref() == Some(&scheduled.classification().approval_path))
+}
+
 fn revalidate_scheduled_materialized_before(
     workspace: &Path,
     scheduled: &crate::proposal_scheduler::ScheduledProposal,
@@ -10817,8 +10843,14 @@ fn decide_threads_proposal_inner(
             });
             let rejection = if live_tier_escalated {
                 Some("proposal-live-tier-escalated")
+            } else if let Err(reason) =
+                revalidate_scheduled_materialized_before(&workspace, scheduled)
+            {
+                Some(reason)
+            } else if !scheduled_approval_policy_matches(&config, scheduled)? {
+                Some("proposal-approval-policy-changed")
             } else {
-                revalidate_scheduled_materialized_before(&workspace, scheduled).err()
+                None
             };
             if let Some(reason) = rejection {
                 claim.preserve();
@@ -29855,6 +29887,48 @@ tier = 0
     }
 
     #[test]
+    fn identity_predicate_intake_rejects_reviewed_and_logged_candidates() -> Result<()> {
+        for (logged, missing) in [(false, false), (false, true), (true, false), (true, true)] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_identity_predicate_familiar(home)?;
+            if logged {
+                let path = workspace.join("ward.toml");
+                let config = std::fs::read_to_string(&path)?.replace("tier = 1", "tier = 2");
+                std::fs::write(path, config)?;
+            }
+            let identity = workspace.join("IDENTITY.md");
+            if missing {
+                std::fs::remove_file(identity)?;
+            } else {
+                std::fs::write(identity, "# IDENTITY.md - Synthetic-other\n")?;
+            }
+            let refused = post_edits(
+                home,
+                r#"{"edits":[{"target":"TOOLS.md","contents":"Synthetic candidate"}],"principalKeyFingerprint":"fpr-val"}"#,
+            )?;
+            assert_eq!(refused.status, 403, "{}", refused.body);
+            let body: Value = serde_json::from_str(&refused.body)?;
+            assert_eq!(body["error"]["code"], "ward_refused");
+            assert!(!body.to_string().contains("Synthetic-other"));
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+                "Synthetic tools before\n"
+            );
+            assert!(!home.join("pending").exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let rejected: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'validation_verdict'
+                 AND decision LIKE 'reject:%'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(rejected, 1);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn identity_predicate_approve_revalidates_authoritative_sources() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -36006,6 +36080,56 @@ tier = 0
             "tweak"
         );
         assert!(!pending_path.exists(), "approved proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_replay_rejects_changed_live_approval_policy() -> Result<()> {
+        for removed in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+            migrate_retired_ward(home)?;
+            let response = post_edits(
+                home,
+                r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+            )?;
+            assert_eq!(response.status, 202, "{}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            let pending = Path::new(body["pendingPath"].as_str().context("pending path")?);
+            let id = body["proposalId"].as_str().context("proposal id")?;
+            retime_scheduled_proposal(
+                pending,
+                time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+            )?;
+            let path = workspace.join("ward.toml");
+            let mut config: toml::Value = toml::from_str(&std::fs::read_to_string(&path)?)?;
+            if removed {
+                let table = config.as_table_mut().context("Ward table")?;
+                table.remove("editable");
+                table.remove("approval_tiers");
+            } else {
+                config["approval_tiers"]["familiar_review"]["human_veto_window_hours"] =
+                    toml::Value::Integer(2);
+            }
+            std::fs::write(path, toml::to_string(&config)?)?;
+            assert_eq!(process_due_threads_proposals(home)?, 1);
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(!pending.exists());
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+                "before tools\n"
+            );
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let (count, decision): (i64, String) = conn.query_row(
+                "SELECT COUNT(*), decision FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(count, 1);
+            assert_eq!(decision, "revalidation_failed");
+        }
         Ok(())
     }
 

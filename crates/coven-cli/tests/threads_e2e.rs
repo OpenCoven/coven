@@ -404,6 +404,168 @@ fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result
 
 #[test]
 #[cfg(feature = "threads-test-clock")]
+fn invalid_identity_at_reviewed_intake_cannot_stage_or_apply() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    for missing in [false, true] {
+        run_clocked_journey(
+            if missing {
+                "identity-intake-missing"
+            } else {
+                "identity-intake-changed"
+            },
+            |home, workspace| seed_retired_review_case(home, workspace, case),
+            |fixture, _| {
+                let identity = fixture.workspace.join("IDENTITY.md");
+                if missing {
+                    fs::remove_file(&identity)?;
+                } else {
+                    fs::write(
+                        &identity,
+                        "# IDENTITY.md - Synthetic-unbound\n- **Pronouns:** they/them\n",
+                    )?;
+                }
+                let response = fixture.request(
+                    "POST",
+                    "/api/v1/familiars/sage/edits",
+                    Some(&json!({
+                        "edits": [{"target": "TOOLS.md", "contents": "Synthetic candidate"}],
+                        "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                    })),
+                )?;
+                anyhow::ensure!(
+                    response.status == 403 && response.body["error"]["code"] == "ward_refused",
+                    "invalid identity entered reviewed intake: {response:?}"
+                );
+                let listed = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+                anyhow::ensure!(
+                    listed.body["proposals"] == json!([]),
+                    "invalid identity was staged"
+                );
+                assert_corpus_bytes(fixture, case, "before")?;
+                let rejected: i64 = fixture.store()?.query_row(
+                    "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'validation_verdict'
+                     AND decision LIKE 'reject:%'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    rejected == 1,
+                    "identity refusal lacks its authoritative verdict"
+                );
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
+fn unsupported_corpus_duplicate_surface_is_refused_at_intake() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    let unsupported = corpus["unsupported_cases"]
+        .as_array()
+        .context("unsupported cases")?
+        .iter()
+        .find(|case| case["id"] == "duplicate-materialized-surface")
+        .context("canonical duplicate-surface case")?;
+    run_clocked_journey(
+        "unsupported-corpus-duplicate-surface",
+        |home, workspace| seed_retired_review_case(home, workspace, case),
+        |fixture, _| {
+            let edits: Vec<Value> = unsupported["surfaces"]
+                .as_array()
+                .context("unsupported surfaces")?
+                .iter()
+                .map(|surface| json!({"target": surface["path"], "contents": surface["after"]}))
+                .collect();
+            let response = fixture.request(
+                "POST",
+                "/api/v1/familiars/sage/edits",
+                Some(&json!({"edits": edits, "principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+            )?;
+            anyhow::ensure!(
+                response.status == 400 && response.body["error"]["code"] == "invalid_request",
+                "unsupported corpus input was not refused: {response:?}"
+            );
+            assert_corpus_bytes(fixture, case, "before")?;
+            let listed = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+            anyhow::ensure!(
+                listed.body["proposals"] == json!([]),
+                "unsupported input was staged"
+            );
+            let applied: i64 = fixture.store()?.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type IN ('apply_audit', 'proposal_approved')",
+                [], |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                applied == 0,
+                "unsupported input produced applied-write evidence"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
+fn changed_human_path_cannot_erase_a_real_opened_window() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    run_clocked_journey(
+        "changed-human-path-opened-window",
+        |home, workspace| seed_retired_review_case(home, workspace, case),
+        |fixture, capability| {
+            let staged = submit_retired_case(fixture, case)?;
+            let id = staged["proposalId"].as_str().context("proposal id")?;
+            tick_scheduler(fixture, capability)?;
+            fixture.stop_daemon()?;
+            let path = Path::new(staged["pendingPath"].as_str().context("pending path")?);
+            let mut altered: Value = serde_json::from_slice(&fs::read(path)?)?;
+            altered["classification"]["approval_path"] = json!({"kind": "human_approval"});
+            altered["lifecycle"] = json!({"state": "awaiting_human_approval"});
+            altered["veto_deadline"] = Value::Null;
+            altered["earliest_close"] = Value::Null;
+            fs::write(path, serde_json::to_vec(&altered)?)?;
+            fixture.start_daemon()?;
+            let payload =
+                proposal_decision_payload(fixture, id, "Synthetic contradictory history")?;
+            let refused = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&payload),
+            )?;
+            anyhow::ensure!(
+                refused.status == 409
+                    && refused.body["why"] == "proposal-window-state-inconsistent",
+                "changed proposal bytes bypassed opened-window history: {refused:?}"
+            );
+            assert_window_terminal(
+                fixture,
+                id,
+                "proposal_rejected",
+                "revalidation_failed",
+                json!(false),
+            )?;
+            assert_corpus_bytes(fixture, case, "before")?;
+            fixture.restart_daemon()?;
+            tick_scheduler(fixture, capability)?;
+            assert_window_terminal(
+                fixture,
+                id,
+                "proposal_rejected",
+                "revalidation_failed",
+                json!(false),
+            )?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
 fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<()> {
     let corpus = retired_ward_corpus()?;
     let case = retired_review_case(&corpus)?;
@@ -414,6 +576,8 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
         "identity-changed",
         "identity-unavailable",
         "binding-revoked",
+        "approval-policy-changed",
+        "approval-policy-removed",
     ] {
         run_clocked_journey(
             &format!("scheduled-window-{scenario}"),
@@ -447,6 +611,21 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
                             path,
                             ward.replace(PRINCIPAL_FINGERPRINT, "fpr-synthetic-revoked"),
                         )?;
+                    }
+                    "approval-policy-changed" => {
+                        let path = fixture.workspace.join("ward.toml");
+                        let mut ward: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+                        ward["approval_tiers"]["familiar_review"]["human_veto_window_hours"] =
+                            toml::Value::Integer(3);
+                        fs::write(path, toml::to_string(&ward)?)?;
+                    }
+                    "approval-policy-removed" => {
+                        let path = fixture.workspace.join("ward.toml");
+                        let mut ward: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+                        let table = ward.as_table_mut().context("Ward table")?;
+                        table.remove("editable");
+                        table.remove("approval_tiers");
+                        fs::write(path, toml::to_string(&ward)?)?;
                     }
                     "vetoed" => {}
                     _ => unreachable!("scenarios are enumerated above"),

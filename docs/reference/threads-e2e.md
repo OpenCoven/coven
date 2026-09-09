@@ -15,16 +15,33 @@ through a real `coven daemon` process and its local IPC transport. Each test
 uses a unique temporary `COVEN_HOME`, familiar workspace, SQLite store, pending
 directory, and daemon socket.
 
-Run the advisory smoke journeys from a Coven checkout:
+Run the complete available Unix daemon journeys from a Coven checkout:
 
 ```sh
-cargo test --locked -p coven-cli --test threads_e2e -- --nocapture
+cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture
 ```
 
-The initial target covers the bounded permit/apply, unsigned protected
-rejection, and out-of-band drift/staging paths. These are process-boundary
-smoke tests, not closure evidence for all eight journeys in
+The feature-enabled target covers bounded human approval with validation and
+write receipts, protected-route refusal, reviewed drift, canonical retired-Ward
+migration and intake, exact visibility/deadline boundaries, all five typed
+window terminals, and no-window human approval. It also covers restart with
+changed or unavailable identity, principal binding, materialized surfaces,
+regional approval policy, and inconsistent human-path/opened-window history.
+Unsupported corpus input and invalid identity are exercised at intake.
+
+These tests use owner-local IPC, the strongest current supported authorization
+path. A supplied fingerprint does not grant protected-write authority. The
+suite does not certify a signed principal-authorization profile, changed runtime
+bindings, multi-file atomic visibility, or Cave acceptance. It is bounded
+process-boundary evidence, not complete closure of every assertion in
 [OpenCoven/coven#884](https://github.com/OpenCoven/coven/issues/884).
+
+The clock feature is disabled in production builds. It uses a capability-gated
+fixture in each disposable home and explicit real-scheduler ticks, not sleeps
+or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
+Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
+executes the feature-enabled target on Linux and on the existing macOS push
+lane; this Unix-socket harness does not provide Windows daemon-journey proof.
 
 ## Testing a local Threads checkout
 
@@ -35,7 +52,7 @@ active:
 
 ```sh
 COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE=1 \
-  cargo test --locked -p coven-cli --test threads_e2e -- --nocapture
+  cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture
 ```
 
 The downstream job remains responsible for applying its ephemeral Cargo patch

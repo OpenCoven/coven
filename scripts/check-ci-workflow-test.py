@@ -80,6 +80,19 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
+    def test_unix_jobs_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
+        command = "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock"
+        for job, next_job in [
+            ("rust-test-linux", "rust-test-windows"),
+            ("rust-test-macos", "afs-mount-linux"),
+        ]:
+            block = CI_TEXT.split(f"\n  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
+            self.assertIn(command, block)
+        windows = CI_TEXT.split("\n  rust-test-windows:\n", 1)[1].split(
+            "\n  rust-test-macos:\n", 1
+        )[0]
+        self.assertNotIn(command, windows)
+
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
         for workflow_text in [CI_TEXT, RELEASE_TEXT, release_stress_text]:

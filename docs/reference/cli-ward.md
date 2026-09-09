@@ -369,7 +369,9 @@ declaration sets fail configuration loading.
 Coven extracts facts from the complete candidate `SOUL.md`, `IDENTITY.md`,
 and matching `[[familiar]]` roster entry, including unchanged identity files.
 It does not use the invariant's expected value as evidence. Missing,
-unparseable, or conflicting facts fail the predicate closed. Candidate source
+unparseable, or conflicting facts fail the predicate closed. Configured
+predicates run before either staging or applying a candidate, including reviewed
+and logged targets that do not edit an identity file. Candidate source
 commitments also participate in approval recovery, so changed identity
 evidence cannot reuse an earlier recovery decision.
 
