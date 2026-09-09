@@ -10963,6 +10963,19 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             }
         };
         if !protected_targets.is_empty() {
+            if let Some(proposal) = document.scheduled() {
+                if let Err(error) = ensure_proposal_window_opened_audit(coven_home, proposal) {
+                    crate::daemon::append_daemon_recovery_log(
+                        coven_home,
+                        &format!(
+                            "threads scheduler: protected proposal window audit failed for {}: \
+                             {error:#}; retained for retry",
+                            path.display()
+                        ),
+                    );
+                    continue;
+                }
+            }
             let proposal_id = document.pending().id.0.to_string();
             match decide_threads_proposal_automatic(coven_home, &proposal_id, "reject", None) {
                 Ok(response) if response.status == 200 => completed += 1,
@@ -27971,6 +27984,79 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduler_first_pass_protected_rejection_records_window_close_detail() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let ward_path = home.join("familiars/sage/ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "protected_surface = [\"SOUL.md\"]",
+                "protected_surface = [\"SOUL.md\", \"reviewed/skill.md\"]",
+            )
+            .replace(
+                "path = \"reviewed/\"\ntier = 1",
+                "path = \"reviewed/skill.md\"\ntier = 0",
+            );
+        std::fs::write(&ward_path, ward)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let opened_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            opened_count, 1,
+            "scheduled protected rejection must retain window-open audit"
+        );
+        let (decision, detail): (String, String) = conn.query_row(
+            "SELECT decision, detail FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(decision, "protected-target-not-proposable");
+        let close: coven_threads_core::ProposalWindowCloseAuditDetail =
+            serde_json::from_str(&detail)?;
+        assert_eq!(
+            close.reason,
+            coven_threads_core::WindowCloseReason::RevalidationFailed
+        );
+        assert_eq!(close.replay_hash_matched, Some(false));
+        assert_eq!(
+            close.rationale.as_deref(),
+            Some("protected-target-not-proposable")
+        );
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 1);
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduled_recovery_reparses_authority_envelope() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -29017,17 +29103,21 @@ tier = 0
         assert!(!pending.exists(), "protected proposal must be terminalized");
 
         let conn = store::open_store(&home.join("coven.sqlite3"))?;
-        let (event_type, decision): (String, String) = conn.query_row(
-            "SELECT event_type, decision
+        let (event_type, decision, detail): (String, String, Option<String>) = conn.query_row(
+            "SELECT event_type, decision, detail
              FROM ward_audit
              WHERE proposal_id = ?1
              ORDER BY id DESC
              LIMIT 1",
             [&proposal_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(event_type, "proposal_rejected");
         assert_eq!(decision, "protected-target-not-proposable");
+        assert_eq!(
+            detail, None,
+            "no-window rejection must not synthesize close detail"
+        );
 
         let store_path = home.join("coven.sqlite3");
         let required = store::ward_audit_reservation_bytes(&conn, 1, 0)?;
@@ -29163,6 +29253,18 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(reservations, 0);
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "quarantine must preserve interrupted recovery evidence"
+        );
         Ok(())
     }
 
@@ -29542,6 +29644,73 @@ tier = 0
         assert!(
             claim.exists(),
             "recovery claim must not downgrade to pending"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "missing Ward must not invent a terminal decision"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approve_recovery_preserves_claim_if_familiar_disappears() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a recovery claim");
+        std::fs::remove_file(home.join("familiars.toml"))?;
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["why"], "proposal-familiar-missing");
+        assert!(
+            claim.exists(),
+            "missing familiar must leave the recovery claim intact"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "missing familiar must not invent a terminal decision"
         );
         Ok(())
     }
