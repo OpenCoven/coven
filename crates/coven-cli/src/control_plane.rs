@@ -124,6 +124,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
+                    "coven.automations.receipt.get.v1",
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
@@ -140,6 +141,24 @@ pub fn capabilities() -> CapabilityCatalog {
             },
         ],
     }
+}
+
+pub(crate) fn automation_receipt_transport_rejection(
+    payload: &Value,
+    authority: crate::request_authority::RequestAuthority,
+) -> Option<(u16, ControlActionResponse)> {
+    let action = payload.get("action")?.as_str()?.trim();
+    if action != "coven.automations.receipt.get.v1" || authority.allows_automation_receipt_access()
+    {
+        return None;
+    }
+    Some(typed_rejection(
+        action,
+        automation_error(
+            crate::automations::contract::error::ErrorCode::AuthorityRequired,
+            "Automation receipt reads require owner-local IPC.",
+        ),
+    ))
 }
 
 pub fn route_action(
@@ -507,6 +526,7 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.receipt.get.v1" => automation_receipt_result(conn, action, &payload),
         "coven.automations.health" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -578,6 +598,84 @@ fn automation_event(
             payload,
         }),
     }
+}
+
+fn automation_receipt_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    payload: &Value,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    use crate::automations::contract::types::{PrivacyClassification, ReceiptId};
+
+    let id = match required_id_field(payload, action)
+        .and_then(|id| ReceiptId::new(id).map_err(|_| "receipt id is invalid".to_owned()))
+    {
+        Ok(id) => id,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let receipt = match crate::automations::receipts::read_receipt(conn, id.as_str()) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return typed_rejection(
+                action,
+                automation_error(ErrorCode::NotFound, "Automation receipt is unavailable."),
+            );
+        }
+        Err(_) => {
+            return typed_rejection(
+                action,
+                automation_error(
+                    ErrorCode::Internal,
+                    "Stored automation receipt evidence could not be validated.",
+                ),
+            );
+        }
+    };
+    if !matches!(
+        receipt.privacy.classification,
+        PrivacyClassification::Public | PrivacyClassification::Operational
+    ) {
+        return typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::AuthorityRequired,
+                "Receipt privacy requires a principal-aware read policy that is unavailable.",
+            ),
+        );
+    }
+    (
+        200,
+        ControlActionResponse {
+            ok: true,
+            accepted: true,
+            action: action.to_owned(),
+            status: ActionStatus::Completed,
+            reason: None,
+            error: None,
+            result: Some(json!({
+                "receipt": receipt,
+                "verification": {
+                    "status": "unverifiable",
+                    "integrity": "valid",
+                    "correlation": "valid",
+                    "receiptAuthentication": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "runtimeAuthority": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "reasons": [
+                        "PRODUCER_AUTHENTICATION_UNVERIFIED",
+                        "RUNTIME_AUTHORITY_UNVERIFIED"
+                    ]
+                }
+            })),
+            event: None,
+        },
+    )
 }
 
 fn automation_result(
@@ -1107,6 +1205,7 @@ fn automation_runs_payload(
                     "outputCommit": record.output_commit,
                     "startedAt": record.started_at,
                     "finishedAt": record.finished_at,
+                    "receiptId": record.receipt_id,
                     "attempts": attempts,
                 }));
             }

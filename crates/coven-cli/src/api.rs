@@ -748,6 +748,11 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
+            if let Some(rejection) =
+                control_plane::automation_receipt_transport_rejection(&payload, authority)
+            {
+                return json_response(rejection.0, &rejection.1);
+            }
             let conn = match store::open_store(&store_path(coven_home)) {
                 Ok(conn) => conn,
                 Err(error) => {
