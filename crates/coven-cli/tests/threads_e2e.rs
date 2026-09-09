@@ -1,9 +1,8 @@
 #![cfg(unix)]
 
-//! Advisory real-daemon smoke coverage for the first three Threads journeys,
-//! plus same-home daemon lifecycle scaffolding for future restart/replay work.
-//! Full closure still requires the remaining journeys and their stronger
-//! authentication, terminal-audit, deterministic-time, and restart assertions.
+//! Real-daemon Threads boundary journeys with isolated state and provenance.
+//! Controlled replay coverage requires `threads-test-clock`. This suite does
+//! not certify the pending signed-authorization profile or human freeze gates.
 
 use std::ffi::OsString;
 use std::fs;
@@ -594,32 +593,12 @@ fn explicit_supersession_closes_only_the_replaced_window() -> Result<()> {
 
 #[test]
 #[cfg(feature = "threads-test-clock")]
-fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
+fn reviewed_human_approval_validates_and_audits_without_veto_window() -> Result<()> {
     let corpus = retired_ward_corpus()?;
     let case = retired_review_case(&corpus)?;
     run_clocked_journey(
         "reviewed-human-no-window",
-        |home, workspace| {
-            seed_retired_review_case(home, workspace, case)?;
-            let path = workspace.join("ward.toml");
-            let mut ward: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
-            let tiers = ward["approval_tiers"]
-                .as_table_mut()
-                .context("approval tiers")?;
-            let mut human = tiers
-                .remove("familiar_review")
-                .context("review declaration")?;
-            let declaration = human.as_table_mut().context("review declaration table")?;
-            declaration.insert(
-                "gate".to_owned(),
-                toml::Value::String("human_approval".to_owned()),
-            );
-            declaration.remove("human_veto_window_hours");
-            declaration.remove("min_visible_seconds");
-            tiers.insert("human_review".to_owned(), human);
-            fs::write(path, toml::to_string(&ward)?)?;
-            Ok(())
-        },
+        |home, workspace| seed_reviewed_human_case(home, workspace, case),
         |fixture, capability| {
             let staged = submit_retired_case(fixture, case)?;
             let id = staged["proposalId"].as_str().context("proposal id")?;
@@ -637,7 +616,7 @@ fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
                 Some(&payload),
             )?;
             anyhow::ensure!(
-                approved.status == 200,
+                approved.status == 200 && approved.body["decision"] == "approved",
                 "human approval failed: {approved:?}"
             );
             assert_corpus_bytes(fixture, case, "after")?;
@@ -659,101 +638,121 @@ fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
                 opened == 0 && approved == 1,
                 "human no-window history is inconsistent"
             );
+            let validated: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'validation_verdict'
+                 AND familiar_id = ?1 AND decision = 'permit'",
+                [FAMILIAR_ID],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                validated > 0,
+                "bounded approval bypassed authoritative validation"
+            );
+            let (next, detail, touched): (Vec<u8>, String, String) = conn.query_row(
+                "SELECT diff_hash, detail, files_touched FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            let detail: Value = serde_json::from_str(&detail)?;
+            let before = case["surfaces"][1]["before"]
+                .as_str()
+                .context("logged before")?;
+            let after = case["surfaces"][1]["after"]
+                .as_str()
+                .context("logged after")?;
+            anyhow::ensure!(
+                next == Sha256::digest(after.as_bytes()).to_vec()
+                    && detail["prev_sha256"] == hex_bytes(&Sha256::digest(before.as_bytes()))
+                    && detail["bytes_written"] == after.len()
+                    && serde_json::from_str::<Value>(&touched)? == json!(["HEARTBEAT.md"]),
+                "applied-write receipt does not bind exact before/after bytes"
+            );
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(count == 1, "logged write was applied more than once");
+            drop(conn);
+            let remaining = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+            anyhow::ensure!(
+                remaining.body["proposals"] == json!([]),
+                "applied write remains pending"
+            );
             Ok(())
         },
     )
 }
 
 #[test]
-fn smoke_out_of_band_drift_stages_without_execution() -> Result<()> {
-    run_journey("smoke-out-of-band-drift", |fixture| {
-        let baseline_request = json!({
-            "edits": [{
-                "target": "SOUL.md",
-                "contents": "# Authorized identity\n"
-            }],
-            "principalKeyFingerprint": PRINCIPAL_FINGERPRINT
-        });
-        let baseline = fixture.request(
-            "POST",
-            "/api/v1/familiars/sage/edits",
-            Some(&baseline_request),
-        )?;
-        anyhow::ensure!(
-            baseline.status == 202 && baseline.body["disposition"] == "held",
-            "protected baseline request was not held: {baseline:?}"
-        );
-
-        fs::write(fixture.workspace.join("SOUL.md"), "# Out-of-band drift\n")?;
-
-        let request = json!({
-            "edits": [{
-                "target": "SOUL.md",
-                "contents": "# Conflicting proposal\n"
-            }],
-            "principalKeyFingerprint": PRINCIPAL_FINGERPRINT
-        });
-        let response = fixture.request("POST", "/api/v1/familiars/sage/edits", Some(&request))?;
-
-        anyhow::ensure!(response.status == 202, "unexpected response: {response:?}");
-        anyhow::ensure!(
-            response.body["disposition"] == "staged"
-                && response.body["threadsGate"]["outcome"]["kind"] == "staged",
-            "drift did not produce an explicit staged disposition: {}",
-            response.body
-        );
-        anyhow::ensure!(
-            fs::read_to_string(fixture.workspace.join("SOUL.md"))? == "# Out-of-band drift\n",
-            "staged proposal overwrote drifted bytes"
-        );
-
-        let pending_path = response.body["threadsGate"]["outcome"]["pendingPath"]
-            .as_str()
-            .context("staged response is missing pendingPath")?;
-        let pending_path = PathBuf::from(pending_path);
-        let expected_pending = fixture.coven_home.join("pending").canonicalize()?;
-        let actual_pending = pending_path.canonicalize()?;
-        anyhow::ensure!(
-            actual_pending.parent() == Some(expected_pending.as_path()),
-            "staged proposal escaped the isolated pending directory: {}",
-            actual_pending.display()
-        );
-        let pending: Value = serde_json::from_slice(&fs::read(&actual_pending)?)?;
-        let proposal_id = response.body["threadsGate"]["outcome"]["proposalId"]
-            .as_str()
-            .context("staged response is missing proposalId")?;
-        anyhow::ensure!(
-            pending["id"] == proposal_id,
-            "response and pending artifact identify different proposals"
-        );
-        anyhow::ensure!(
-            pending["edits"][0]["surface"] == "SOUL.md",
-            "pending proposal targets the wrong surface"
-        );
-        anyhow::ensure!(
-            pending["edits"][0]["contents"]["encoding"] == "utf8"
-                && pending["edits"][0]["contents"]["data"] == "# Conflicting proposal\n",
-            "pending proposal does not retain the exact proposed bytes"
-        );
-
-        let conn = fixture.store()?;
-        let audit: (String, String) = conn.query_row(
-            "SELECT decision, files_touched FROM ward_audit
-             WHERE familiar_id = ?1 ORDER BY id DESC LIMIT 1",
-            [FAMILIAR_ID],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        anyhow::ensure!(
-            audit.0 == "degrade_to_proposal",
-            "unexpected terminal audit decision: {}",
-            audit.0
-        );
-        anyhow::ensure!(
-            serde_json::from_str::<Value>(&audit.1)? == json!(["SOUL.md"]),
-            "drift audit does not identify the staged surface"
-        );
-        Ok(())
-    })
+#[cfg(feature = "threads-test-clock")]
+fn out_of_band_reviewed_drift_is_refused_without_execution() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    run_clocked_journey(
+        "out-of-band-reviewed-drift",
+        |home, workspace| seed_reviewed_human_case(home, workspace, case),
+        |fixture, _| {
+            let protected_before = fs::read(fixture.workspace.join("SOUL.md"))?;
+            let original = submit_retired_case(fixture, case)?;
+            let id = original["proposalId"].as_str().context("proposal id")?;
+            let payload = proposal_decision_payload(fixture, id, "Synthetic conflicting approval")?;
+            let drift = "Synthetic out-of-band tool contents";
+            fs::write(fixture.workspace.join("TOOLS.md"), drift)?;
+            let refused = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&payload),
+            )?;
+            anyhow::ensure!(
+                refused.status == 409 && refused.body["why"] == "proposal-evidence-diverged",
+                "materialized drift was not detected: {refused:?}"
+            );
+            let conflicting = submit_retired_case(fixture, case)?;
+            let pending: Value = serde_json::from_slice(&fs::read(
+                conflicting["pendingPath"]
+                    .as_str()
+                    .context("pending path")?,
+            )?)?;
+            let materialized = pending["materialized_diff"]["surfaces"]
+                .as_array()
+                .context("materialized surfaces")?;
+            let tools = materialized
+                .iter()
+                .find(|surface| surface["surface"] == "TOOLS.md")
+                .context("materialized tool surface")?;
+            let before: Vec<u8> = serde_json::from_value(tools["before"].clone())?;
+            anyhow::ensure!(
+                before == drift.as_bytes(),
+                "staging used stale before-image bytes"
+            );
+            let detail: String = fixture.store()?.query_row(
+                "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+                [conflicting["proposalId"].as_str().context("conflicting proposal id")?],
+                |row| row.get(0),
+            )?;
+            let detail: Value = serde_json::from_str(&detail)?;
+            anyhow::ensure!(
+                pending["classification"] == conflicting["scheduledProposal"]["classification"]
+                    && detail["classification"] == pending["classification"],
+                "pending, response, and audit disagree on the conflicting diff"
+            );
+            anyhow::ensure!(
+                fs::read_to_string(fixture.workspace.join("TOOLS.md"))? == drift
+                    && fs::read(fixture.workspace.join("SOUL.md"))? == protected_before,
+                "a non-executed proposal overwrote governed bytes"
+            );
+            let applied: i64 = fixture.store()?.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE event_type IN ('apply_audit', 'proposal_approved')",
+                [], |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                applied == 0,
+                "drift rejection produced applied-write evidence"
+            );
+            Ok(())
+        },
+    )
 }
 
 #[test]
@@ -1092,6 +1091,34 @@ fn seed_retired_review_case(home: &Path, workspace: &Path, case: &Value) -> Resu
         fs::read_to_string(workspace.join("ward.toml.v01.bak"))? == legacy,
         "migration did not preserve the exact original declaration"
     );
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn seed_reviewed_human_case(home: &Path, workspace: &Path, case: &Value) -> Result<()> {
+    seed_retired_review_case(home, workspace, case)?;
+    let path = workspace.join("ward.toml");
+    let mut ward: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+    let tiers = ward["approval_tiers"]
+        .as_table_mut()
+        .context("approval tiers")?;
+    let mut human = tiers
+        .remove("familiar_review")
+        .context("review declaration")?;
+    let declaration = human.as_table_mut().context("review declaration table")?;
+    declaration.insert(
+        "gate".to_owned(),
+        toml::Value::String("human_approval".to_owned()),
+    );
+    declaration.remove("human_veto_window_hours");
+    declaration.remove("min_visible_seconds");
+    tiers.insert("human_review".to_owned(), human);
+    for surface in ward["surface"].as_array_mut().context("Ward surfaces")? {
+        if surface["path"].as_str() == Some("HEARTBEAT.md") {
+            surface["tier"] = toml::Value::Integer(2);
+        }
+    }
+    fs::write(path, toml::to_string(&ward)?)?;
     Ok(())
 }
 
