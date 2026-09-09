@@ -1193,6 +1193,8 @@ fn automation_scheduler_status_payload(
                         "running": status.queue.running,
                         "recoveryRequired": status.queue.recovery_required,
                         "batchLimit": status.queue.batch_limit,
+                        "planningBatchLimit": status.queue.planning_batch_limit,
+                        "planningAfterDefinitionId": status.queue.planning_after_definition_id,
                         "oldestEligibleAt": status.queue.oldest_eligible_at,
                         "oldestEligibleAgeMs": status.queue.oldest_eligible_age_ms,
                     }
@@ -1625,6 +1627,8 @@ mod tests {
                 "running": 0,
                 "recoveryRequired": 0,
                 "batchLimit": 64,
+                "planningBatchLimit": 64,
+                "planningAfterDefinitionId": null,
                 "oldestEligibleAt": null,
                 "oldestEligibleAgeMs": null,
             })
