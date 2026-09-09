@@ -129,6 +129,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
+                    "coven.automations.scheduler.status.v1",
                     "coven.automations.unquarantine",
                 ],
             },
@@ -606,6 +607,12 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.scheduler.status.v1" => automation_result(
+            action,
+            origin,
+            intent_id,
+            automation_scheduler_status_payload(conn, chrono::Utc::now()),
+        ),
         "coven.automations.unquarantine" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -1093,6 +1100,49 @@ fn automation_health_payload(
     }
 }
 
+fn automation_scheduler_status_payload(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    crate::automations::diagnostics::scheduler_status(conn, now)
+        .map(|status| {
+            let last_pass = status.last_pass.map(|pass| {
+                json!({
+                    "generation": pass.generation,
+                    "trigger": pass.trigger,
+                    "scheduledAt": pass.scheduled_at,
+                    "startedAt": pass.started_at,
+                    "finishedAt": pass.finished_at,
+                    "durationMs": pass.duration_ms,
+                    "status": pass.status,
+                    "errorClass": pass.error_class,
+                    "planned": pass.planned,
+                    "recovered": pass.recovered,
+                    "claimed": pass.claimed,
+                    "dispatched": pass.dispatched,
+                    "failures": pass.failures,
+                })
+            });
+            json!({
+                "scheduler": {
+                    "authorityAssigned": status.authority_assigned,
+                    "generation": status.generation,
+                    "ownerId": status.owner_id,
+                    "acquiredAt": status.acquired_at,
+                    "lastPass": last_pass,
+                    "queue": {
+                        "planned": status.queue.planned,
+                        "claimed": status.queue.claimed,
+                        "running": status.queue.running,
+                        "recoveryRequired": status.queue.recovery_required,
+                        "oldestEligibleAt": status.queue.oldest_eligible_at,
+                    }
+                }
+            })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
 fn automation_unquarantine_payload(
     conn: &rusqlite::Connection,
     id: &str,
@@ -1317,7 +1367,7 @@ pub fn rejected_action(
 mod tests {
     use super::*;
     use crate::api::{SessionLaunch, SessionRuntime};
-    use chrono::Timelike;
+    use chrono::{TimeZone, Timelike};
 
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
@@ -1380,6 +1430,287 @@ mod tests {
             )
             .unwrap();
         assert_eq!(occurrence_state, "planned");
+    }
+
+    #[test]
+    fn scheduler_status_action_exposes_idle_authority_and_queue_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.scheduler.status.v1"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        let scheduler = &response.event.as_ref().unwrap().payload["scheduler"];
+        assert!(scheduler["active"].is_null());
+        assert_eq!(scheduler["authorityAssigned"], false);
+        assert_eq!(scheduler["generation"], 0);
+        assert!(scheduler["ownerId"].is_null());
+        assert!(scheduler["acquiredAt"].is_null());
+        assert!(scheduler["lastPass"].is_null());
+        assert_eq!(
+            scheduler["queue"],
+            json!({
+                "planned": 0,
+                "claimed": 0,
+                "running": 0,
+                "recoveryRequired": 0,
+                "oldestEligibleAt": null,
+            })
+        );
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.scheduler.status.v1"));
+    }
+
+    #[test]
+    fn scheduler_status_reports_the_oldest_actually_eligible_occurrence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for (id, status) in [("paused-oldest", "PAUSED"), ("active-next", "ACTIVE")] {
+            let definition = crate::automations::RoutineDefinition::from_json(&json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": id,
+                "status": status,
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "prompt": "Do the thing."
+            }))
+            .unwrap();
+            crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'paused-occurrence', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'paused-oldest';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'active-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'active-next';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'active-superseded-occurrence', id, revision, definition_digest,
+                    '2026-09-01T08:30:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:30:00.000Z', '2026-09-01T08:30:00.000Z'
+             FROM automation_definitions WHERE id = 'active-next';",
+        )
+        .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["scheduler"]["queue"]["planned"], 3);
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAt"],
+            "2026-09-01T09:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn scheduler_status_keeps_a_ready_retry_eligible_while_paused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "paused-retry",
+            "name": "paused-retry",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        let (run_status, run_response) = route_action(
+            json!({"action": "coven.automations.run", "id": "paused-retry"}),
+            &conn,
+            &RetryableRejectedRuntime,
+        );
+        assert_eq!(run_status, 200);
+        assert_eq!(
+            run_response.event.as_ref().unwrap().payload["status"],
+            "retry_scheduled"
+        );
+        conn.execute(
+            "UPDATE automation_definitions
+             SET status = 'PAUSED'
+             WHERE id = 'paused-retry'",
+            [],
+        )
+        .unwrap();
+        let scheduled_for: String = conn
+            .query_row(
+                "SELECT scheduled_for
+                 FROM automation_occurrences
+                 WHERE automation_id = 'paused-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc::now() + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAt"],
+            scheduled_for
+        );
+    }
+
+    #[test]
+    fn scheduler_status_excludes_invalid_active_definitions_from_eligibility() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "invalid-active",
+            "name": "invalid-active",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET definition_json = '{}', lifecycle_state = 'invalid'
+             WHERE id = 'invalid-active'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'invalid-active-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'invalid-active'",
+            [],
+        )
+        .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert!(payload["scheduler"]["queue"]["oldestEligibleAt"].is_null());
+    }
+
+    #[test]
+    fn scheduler_status_action_exposes_the_last_completed_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let path = home.join("coven.sqlite3");
+        crate::store::initialize_store(&path).unwrap();
+        let handle = crate::automations::daemon_tick::start_automations_scheduler(
+            home,
+            std::sync::Arc::new(crate::api::NoopSessionRuntime),
+        )
+        .unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let started = std::time::Instant::now();
+        let last_pass = loop {
+            let (status, response) = route_action(
+                json!({"action": "coven.automations.scheduler.status.v1"}),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+            assert_eq!(status, 200);
+            let last_pass =
+                response.event.as_ref().unwrap().payload["scheduler"]["lastPass"].clone();
+            if last_pass.is_object() {
+                break last_pass;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "scheduler pass status was not published after {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(last_pass["generation"], 1);
+        assert_eq!(last_pass["trigger"], "startup");
+        assert!(last_pass["scheduledAt"].is_string());
+        assert!(last_pass["startedAt"].is_string());
+        assert!(last_pass["finishedAt"].is_string());
+        assert!(last_pass["durationMs"].as_u64().is_some());
+        assert_eq!(last_pass["status"], "succeeded");
+        assert!(last_pass["errorClass"].is_null());
+        assert_eq!(last_pass["planned"], 0);
+        assert_eq!(last_pass["recovered"], 0);
+        assert_eq!(last_pass["claimed"], 0);
+        assert_eq!(last_pass["dispatched"], 0);
+        assert_eq!(last_pass["failures"], 0);
+        let (_, active_response) = route_action(
+            json!({"action": "coven.automations.scheduler.status.v1"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(
+            active_response.event.as_ref().unwrap().payload["scheduler"]["authorityAssigned"],
+            true
+        );
+
+        handle.request_shutdown();
+        handle
+            .finish_shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
     }
 
     impl SessionRuntime for OwnershipThenErrorRuntime {

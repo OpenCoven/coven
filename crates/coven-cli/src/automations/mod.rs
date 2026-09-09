@@ -11,6 +11,7 @@ pub mod command_adoption;
 pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
+pub mod diagnostics;
 pub mod health;
 pub mod import_legacy;
 pub mod leadership;
