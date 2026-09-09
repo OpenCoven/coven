@@ -29,8 +29,12 @@
     "index.ts",
     "openclaw.plugin.json",
     "src/**/*.ts",
+    "src/**/*.d.ts",
     "!src/**/*.test.ts"
   ],
+  "dependencies": {
+    "zod": "4.4.3"
+  },
   "peerDependencies": {
     "openclaw": ">=2026.4.26"
   },
