@@ -510,6 +510,90 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
 
 #[test]
 #[cfg(feature = "threads-test-clock")]
+fn explicit_supersession_closes_only_the_replaced_window() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    let mut replacement_case = case.clone();
+    replacement_case["id"] = json!("synthetic-replacement");
+    for surface in replacement_case["surfaces"]
+        .as_array_mut()
+        .context("replacement surfaces")?
+    {
+        surface["after"] = json!(format!(
+            "{} replacement",
+            surface["after"].as_str().context("replacement contents")?
+        ));
+    }
+    run_clocked_journey(
+        "explicit-supersession",
+        |home, workspace| seed_retired_review_case(home, workspace, case),
+        |fixture, capability| {
+            let original = submit_retired_case(fixture, case)?;
+            let original_id = original["proposalId"].as_str().context("original id")?;
+            tick_scheduler(fixture, capability)?;
+            advance_clock_to_offset(fixture, capability, 1)?;
+            let replacement = submit_retired_case(fixture, &replacement_case)?;
+            let replacement_id = replacement["proposalId"]
+                .as_str()
+                .context("replacement id")?;
+            let replacement_payload = proposal_decision_payload(fixture, replacement_id, "")?;
+            let mut payload =
+                proposal_decision_payload(fixture, original_id, "Synthetic explicit replacement")?;
+            payload["replacementProposalId"] = json!(replacement_id);
+            payload["replacementProposalRevision"] =
+                replacement_payload["expectedRevision"].clone();
+            let superseded = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{original_id}/reject"),
+                Some(&payload),
+            )?;
+            anyhow::ensure!(
+                superseded.status == 200,
+                "explicit replacement failed: {superseded:?}"
+            );
+            assert_window_terminal(
+                fixture,
+                original_id,
+                "proposal_rejected",
+                "superseded",
+                Value::Null,
+            )?;
+            assert_corpus_bytes(fixture, case, "before")?;
+            fixture.restart_daemon()?;
+            tick_scheduler(fixture, capability)?;
+            let repeated = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{original_id}/reject"),
+                Some(&payload),
+            )?;
+            anyhow::ensure!(
+                repeated.status == 200 && repeated.body["idempotent"] == true,
+                "supersession retry lost its durable terminal receipt: {repeated:?}"
+            );
+            assert_window_terminal(
+                fixture,
+                original_id,
+                "proposal_rejected",
+                "superseded",
+                Value::Null,
+            )?;
+            advance_clock_to_offset(fixture, capability, 7202)?;
+            tick_scheduler(fixture, capability)?;
+            assert_corpus_bytes(fixture, &replacement_case, "after")?;
+            assert_window_terminal(
+                fixture,
+                replacement_id,
+                "proposal_approved",
+                "applied",
+                json!(true),
+            )?;
+            Ok(())
+        },
+    )
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
 fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
     let corpus = retired_ward_corpus()?;
     let case = retired_review_case(&corpus)?;
