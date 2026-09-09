@@ -32,6 +32,9 @@ pub struct PendingPairing {
     pub host_confirmed: bool,
     pub device_confirmed: bool,
     pub consumed: bool,
+    pub cancelled: bool,
+    pub expired: bool,
+    pub cancellation_audited: bool,
     pub completed: Option<MobilePairedDevice>,
 }
 
@@ -65,6 +68,59 @@ pub enum PairingProgress {
         device: MobilePairedDevice,
         replayed: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingLifecycleState {
+    WaitingForDevice,
+    WaitingForConfirmation,
+    Completed,
+    Cancelled,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingStatus {
+    pub state: PairingLifecycleState,
+    pub phrase: Option<[String; 6]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingCancellation {
+    Cancelled {
+        replayed: bool,
+        audit_required: bool,
+    },
+    Completed,
+    Expired,
+}
+
+impl PairingCancellation {
+    pub const fn state(self) -> PairingLifecycleState {
+        match self {
+            Self::Cancelled { .. } => PairingLifecycleState::Cancelled,
+            Self::Completed => PairingLifecycleState::Completed,
+            Self::Expired => PairingLifecycleState::Expired,
+        }
+    }
+
+    pub const fn replayed(self) -> bool {
+        match self {
+            Self::Cancelled { replayed, .. } => replayed,
+            Self::Completed | Self::Expired => true,
+        }
+    }
+
+    pub const fn audit_required(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled {
+                audit_required: true,
+                ..
+            }
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,6 +193,9 @@ impl PairingManager {
             host_confirmed: false,
             device_confirmed: false,
             consumed: false,
+            cancelled: false,
+            expired: false,
+            cancellation_audited: false,
             completed: None,
         };
         let mut pending = self
@@ -197,10 +256,10 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            pairing.expire_pending_material();
             return Err(PairingError::PairingExpired);
         }
-        if pairing.consumed {
+        if pairing.cancelled || pairing.expired || pairing.consumed {
             return Err(PairingError::PairingConsumed);
         }
         pairing.consumed = true;
@@ -280,20 +339,81 @@ impl PairingManager {
         self.confirm(pairing_id, phrase, now, false)
     }
 
+    pub fn status(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PairingStatus, PairingError> {
+        let mut pending = self.lock_pending(now, pairing_id)?;
+        let pairing = pending
+            .get_mut(&pairing_id)
+            .ok_or(PairingError::PairingConsumed)?;
+        if now >= pairing.expires_at
+            && pairing.completed.is_none()
+            && !pairing.cancelled
+            && !pairing.expired
+        {
+            pairing.expire_pending_material();
+        }
+        let state = pairing.lifecycle_state();
+        Ok(PairingStatus {
+            state,
+            phrase: (state == PairingLifecycleState::WaitingForConfirmation)
+                .then(|| phrase_for_hash(pairing.transcript_hash.expect("state has transcript"))),
+        })
+    }
+
     pub fn phrase(
         &self,
         pairing_id: Uuid,
         now: DateTime<Utc>,
     ) -> Result<Option<[String; 6]>, PairingError> {
+        Ok(self.status(pairing_id, now)?.phrase)
+    }
+
+    pub fn cancel(
+        &self,
+        pairing_id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<PairingCancellation, PairingError> {
         let mut pending = self.lock_pending(now, pairing_id)?;
-        let pairing = pending
-            .get(&pairing_id)
-            .ok_or(PairingError::PairingConsumed)?;
-        if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
-            return Err(PairingError::PairingExpired);
+        let Some(pairing) = pending.get_mut(&pairing_id) else {
+            return Ok(PairingCancellation::Expired);
+        };
+        if pairing.completed.is_some() {
+            return Ok(PairingCancellation::Completed);
         }
-        Ok(pairing.transcript_hash.map(phrase_for_hash))
+        if pairing.cancelled {
+            return Ok(PairingCancellation::Cancelled {
+                replayed: true,
+                audit_required: !pairing.cancellation_audited,
+            });
+        }
+        if pairing.expired || now >= pairing.expires_at {
+            pairing.expire_pending_material();
+            return Ok(PairingCancellation::Expired);
+        }
+        pairing.clear_pending_material();
+        pairing.cancelled = true;
+        Ok(PairingCancellation::Cancelled {
+            replayed: false,
+            audit_required: true,
+        })
+    }
+
+    pub fn mark_cancellation_audited(&self, pairing_id: Uuid) -> Result<(), PairingError> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| PairingError::InvalidRequest)?;
+        let pairing = pending
+            .get_mut(&pairing_id)
+            .ok_or(PairingError::PairingConsumed)?;
+        if !pairing.cancelled {
+            return Err(PairingError::InvalidRequest);
+        }
+        pairing.cancellation_audited = true;
+        Ok(())
     }
 
     fn confirm(
@@ -308,8 +428,13 @@ impl PairingManager {
             .get_mut(&pairing_id)
             .ok_or(PairingError::PairingConsumed)?;
         if now >= pairing.expires_at {
-            pending.remove(&pairing_id);
+            if pairing.completed.is_none() {
+                pairing.expire_pending_material();
+            }
             return Err(PairingError::PairingExpired);
+        }
+        if pairing.cancelled || pairing.expired {
+            return Err(PairingError::PairingConsumed);
         }
         let transcript_hash = pairing
             .transcript_hash
@@ -369,6 +494,36 @@ impl PairingManager {
             device: completed,
             replayed: false,
         })
+    }
+}
+
+impl PendingPairing {
+    fn lifecycle_state(&self) -> PairingLifecycleState {
+        if self.completed.is_some() {
+            PairingLifecycleState::Completed
+        } else if self.cancelled {
+            PairingLifecycleState::Cancelled
+        } else if self.expired {
+            PairingLifecycleState::Expired
+        } else if self.transcript_hash.is_some() {
+            PairingLifecycleState::WaitingForConfirmation
+        } else {
+            PairingLifecycleState::WaitingForDevice
+        }
+    }
+
+    fn clear_pending_material(&mut self) {
+        self.nonce_hash = [0; 32];
+        self.transcript_hash = None;
+        self.device = None;
+        self.host_confirmed = false;
+        self.device_confirmed = false;
+        self.consumed = true;
+    }
+
+    fn expire_pending_material(&mut self) {
+        self.clear_pending_material();
+        self.expired = true;
     }
 }
 
@@ -801,6 +956,164 @@ mod tests {
         );
         let device = assert_complete(harness.confirm_host(&pending.phrase), false);
         assert_eq!(device.scopes, [MobileDeviceScope::MemoryRead]);
+    }
+
+    #[test]
+    fn cancellation_before_enrollment_is_idempotent_and_erases_invitation_material() {
+        let harness = PairingHarness::new();
+
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled {
+                replayed: false,
+                audit_required: true,
+            }
+        );
+        harness
+            .manager
+            .mark_cancellation_audited(harness.pairing_id)
+            .unwrap();
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Cancelled {
+                replayed: true,
+                audit_required: false,
+            }
+        );
+        assert_eq!(
+            harness
+                .manager
+                .cancel(Uuid::from_u128(99), harness.now)
+                .unwrap(),
+            PairingCancellation::Expired
+        );
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingStatus {
+                state: PairingLifecycleState::Cancelled,
+                phrase: None,
+            }
+        );
+        let pending = harness.manager.pending.lock().unwrap();
+        let cancelled = pending.get(&harness.pairing_id).unwrap();
+        assert_eq!(cancelled.nonce_hash, [0; 32]);
+        assert!(cancelled.transcript_hash.is_none());
+        assert!(cancelled.device.is_none());
+        drop(pending);
+        assert_eq!(
+            harness
+                .enroll_with_nonce(harness.pairing_nonce)
+                .unwrap_err(),
+            PairingError::PairingConsumed
+        );
+        assert!(harness.devices().is_empty());
+    }
+
+    #[test]
+    fn cancellation_after_enrollment_or_one_confirmation_never_registers_a_device() {
+        for confirmation in [None, Some(true), Some(false)] {
+            let harness = PairingHarness::new();
+            let enrolled = harness.enroll();
+            match confirmation {
+                Some(true) => assert_eq!(
+                    harness.confirm_host(&enrolled.phrase),
+                    PairingProgress::Pending
+                ),
+                Some(false) => assert_eq!(
+                    harness.confirm_device(&enrolled.phrase),
+                    PairingProgress::Pending
+                ),
+                None => {}
+            }
+
+            assert_eq!(
+                harness
+                    .manager
+                    .cancel(harness.pairing_id, harness.now)
+                    .unwrap(),
+                PairingCancellation::Cancelled {
+                    replayed: false,
+                    audit_required: true,
+                }
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .confirm_host(harness.pairing_id, &enrolled.phrase, harness.now)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert_eq!(
+                harness
+                    .manager
+                    .confirm_device(harness.pairing_id, &enrolled.phrase, harness.now)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert!(harness.devices().is_empty());
+        }
+    }
+
+    #[test]
+    fn cancellation_after_completion_preserves_the_registered_device() {
+        let harness = PairingHarness::new();
+        let enrolled = harness.enroll();
+        assert_eq!(
+            harness.confirm_host(&enrolled.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(harness.confirm_device(&enrolled.phrase), false);
+
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingCancellation::Completed
+        );
+        assert_eq!(
+            harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap(),
+            PairingStatus {
+                state: PairingLifecycleState::Completed,
+                phrase: None,
+            }
+        );
+        assert_eq!(
+            assert_complete(harness.confirm_host(&enrolled.phrase), true),
+            device
+        );
+        assert_eq!(harness.devices().len(), 1);
+    }
+
+    #[test]
+    fn expired_pairing_status_erases_pending_material_without_becoming_cancelled() {
+        let harness = PairingHarness::new();
+        let status = harness
+            .manager
+            .status(harness.pairing_id, harness.now + Duration::minutes(6))
+            .unwrap();
+        assert_eq!(status.state, PairingLifecycleState::Expired);
+        assert!(status.phrase.is_none());
+        assert_eq!(
+            harness
+                .manager
+                .cancel(harness.pairing_id, harness.now + Duration::minutes(6),)
+                .unwrap(),
+            PairingCancellation::Expired
+        );
+        assert!(harness.devices().is_empty());
     }
 
     #[test]

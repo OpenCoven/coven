@@ -117,6 +117,25 @@ The first 66 bits of the transcript digest select six words from the existing fi
 - A wrong phrase after completion does not create another device and does not erase the bounded idempotent retry result.
 - Expired pairings are pruned opportunistically and never register a device.
 
+## Cancellation and owner status
+
+- The owner-only local daemon control reports `waiting_for_device`,
+  `waiting_for_confirmation`, `completed`, `cancelled`, or `expired`. Only the
+  confirmation phase includes the six-word phrase.
+- Explicit cancellation is idempotent until the invitation is pruned. It
+  immediately erases the nonce hash, transcript hash, pending device metadata,
+  and partial-confirmation flags.
+- Cancellation before completion prevents later enrollment or confirmation
+  from registering a device. Cancellation after completion reports the
+  completed terminal state and never revokes the enrolled device.
+- The terminal pairing command attempts cancellation on host decline,
+  interruption, expiry, and other pre-confirmation exits. Once host
+  confirmation is accepted, the device retains the rest of the original
+  invitation window to finish.
+- Remote callers receive the same unavailable response for expired, consumed,
+  and locally cancelled invitations. Only the owner-only local control exposes
+  the more precise terminal state.
+
 ## Security properties
 
 1. Modifying any offer security field changes `offerDigest` and the six-word phrase.
@@ -125,6 +144,9 @@ The first 66 bits of the transcript digest select six words from the existing fi
 4. A relay or network observer cannot substitute a host without the private key corresponding to the QR-pinned P-256 public key.
 5. Successful pairing creates a key-bound scoped grant, not a reusable bearer credential.
 6. Biometric authorization is outside this transcript: the mobile operating system may gate use of the enrolled private key, while only signatures and assurance evidence reach Coven.
+7. Cancelling an incomplete pairing destroys its pending secrets and cannot be
+   distinguished from an unavailable invitation through the remote pairing
+   API.
 
 ## Portable vector
 

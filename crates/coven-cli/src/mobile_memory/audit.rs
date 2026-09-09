@@ -20,6 +20,7 @@ pub enum MobileAuditEvent {
     GatewayStarted,
     GatewayStopped,
     PairingCreated,
+    PairingCancelled,
     PairingCompleted,
     PairingRejected,
     DeviceRevoked,
