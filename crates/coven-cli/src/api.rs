@@ -27369,7 +27369,7 @@ owner = "sage"
 [protected]
 files = ["SOUL.md"]
 invariants = [
-  "familiar.name == 'Sage'",
+  "familiar.name == 'Synthetic-identity'",
   "familiar.person == 'Example principal'",
 ]
 
