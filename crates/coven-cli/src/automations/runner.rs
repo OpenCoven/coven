@@ -1807,9 +1807,9 @@ pub struct DispatchReport {
     pub failed: Vec<String>,
 }
 
-/// Dispatches every claimed occurrence through the same durable launch
-/// primitive as manual runs. Successful launch acknowledgements remain
-/// nonterminal until session evidence is reconciled.
+/// Dispatches the oldest bounded batch of claimed occurrences through the same
+/// durable launch primitive as manual runs. Successful launch acknowledgements
+/// remain nonterminal until session evidence is reconciled.
 #[cfg(test)]
 fn dispatch_claimed_occurrences(
     conn: &Connection,
@@ -1874,6 +1874,10 @@ fn dispatch_claimed_occurrences_inner(
         }
     }
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let batch_limit =
+        i64::try_from(super::occurrences::SCHEDULER_PASS_BATCH_LIMIT).map_err(|error| {
+            format!("automation dispatch batch limit exceeds SQLite range: {error}")
+        })?;
 
     let claimed: Vec<(String, String)> = {
         let mut statement = conn
@@ -1899,12 +1903,17 @@ fn dispatch_claimed_occurrences_inner(
                              AND a.not_before <= ?1
                        )
                    )
-                 ORDER BY o.scheduled_for ASC",
+                 ORDER BY o.scheduled_for ASC
+                 LIMIT ?3",
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
             .query_map(
-                rusqlite::params![now_iso, scheduler_fence.map(|fence| fence.generation())],
+                rusqlite::params![
+                    now_iso,
+                    scheduler_fence.map(|fence| fence.generation()),
+                    batch_limit
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
@@ -7874,6 +7883,52 @@ mod tests {
                 "succeeded".to_string(),
                 "succeeded".to_string(),
             )
+        );
+    }
+
+    #[test]
+    fn dispatches_only_the_oldest_bounded_claim_batch() {
+        let (_temp, conn) = temp_store();
+        let now = Utc::now();
+        for index in 0..65 {
+            let automation_id = format!("dispatch-load-{index:02}");
+            let mut routine = definition(&automation_id);
+            routine.status = RoutineStatus::Active;
+            insert_definition(&conn, &routine).unwrap();
+            let occurrence_id = format!("dispatch-occurrence-{index:02}");
+            let scheduled_for = now - chrono::Duration::seconds(65 - i64::from(index));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, lease_owner, lease_expires_at, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'claimed', 1, 'daemon', ?3, ?4, ?4
+                 FROM automation_definitions
+                 WHERE id = ?5",
+                rusqlite::params![
+                    occurrence_id,
+                    scheduled_for.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    (now + chrono::Duration::minutes(60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    automation_id,
+                ],
+            )
+            .unwrap();
+        }
+
+        let report =
+            dispatch_claimed_occurrences(&conn, &crate::api::NoopSessionRuntime, now).unwrap();
+
+        assert_eq!(report.dispatched.len(), 64);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM automation_occurrences WHERE state = 'claimed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "dispatch-occurrence-64"
         );
     }
 

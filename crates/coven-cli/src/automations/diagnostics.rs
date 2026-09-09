@@ -39,7 +39,9 @@ pub struct SchedulerQueueStatus {
     pub claimed: i64,
     pub running: i64,
     pub recovery_required: i64,
+    pub batch_limit: usize,
     pub oldest_eligible_at: Option<String>,
+    pub oldest_eligible_age_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,7 @@ pub struct SchedulerPassStatus {
     pub trigger: String,
     pub scheduled_at: String,
     pub started_at: String,
+    pub start_lag_ms: i64,
     pub finished_at: String,
     pub duration_ms: i64,
     pub status: String,
@@ -173,14 +176,28 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
         .into_iter()
         .next()
         .map(|occurrence| occurrence.scheduled_for);
+    let oldest_eligible_age_ms = oldest_eligible_at
+        .as_deref()
+        .map(|scheduled_for| -> Result<i64> {
+            let scheduled_for = DateTime::parse_from_rfc3339(scheduled_for)
+                .context("oldest eligible occurrence has invalid scheduled_for")?
+                .with_timezone(&Utc);
+            Ok(now
+                .signed_duration_since(scheduled_for)
+                .num_milliseconds()
+                .max(0))
+        })
+        .transpose()?;
     let queue = SchedulerQueueStatus {
         planned,
         claimed,
         running,
         recovery_required,
+        batch_limit: super::occurrences::SCHEDULER_PASS_BATCH_LIMIT,
         oldest_eligible_at,
+        oldest_eligible_age_ms,
     };
-    let last_pass = transaction
+    let mut last_pass = transaction
         .query_row(
             "SELECT scheduler_generation, trigger, scheduled_at, started_at, finished_at,
                     duration_ms, status, error_class, planned, recovered, claimed, dispatched,
@@ -194,6 +211,7 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
                     trigger: row.get(1)?,
                     scheduled_at: row.get(2)?,
                     started_at: row.get(3)?,
+                    start_lag_ms: 0,
                     finished_at: row.get(4)?,
                     duration_ms: row.get(5)?,
                     status: row.get(6)?,
@@ -208,6 +226,16 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
         )
         .optional()
         .context("failed to read the last automations scheduler pass")?;
+    if let Some(pass) = last_pass.as_mut() {
+        let scheduled_at = DateTime::parse_from_rfc3339(&pass.scheduled_at)
+            .context("scheduler pass has invalid scheduled_at")?;
+        let started_at = DateTime::parse_from_rfc3339(&pass.started_at)
+            .context("scheduler pass has invalid started_at")?;
+        pass.start_lag_ms = started_at
+            .signed_duration_since(scheduled_at)
+            .num_milliseconds()
+            .max(0);
+    }
     transaction
         .commit()
         .context("failed to commit automations scheduler status snapshot")?;
@@ -244,7 +272,7 @@ mod tests {
         SchedulerPassRecord {
             trigger,
             scheduled_at,
-            started_at: scheduled_at,
+            started_at: scheduled_at + chrono::Duration::milliseconds(10),
             finished_at: scheduled_at + chrono::Duration::milliseconds(25),
             duration_ms: 25,
             status: "succeeded",
@@ -298,5 +326,6 @@ mod tests {
         let last_pass = status.last_pass.unwrap();
         assert_eq!(last_pass.generation, second.fence().generation());
         assert_eq!(last_pass.trigger, "wake");
+        assert_eq!(last_pass.start_lag_ms, 10);
     }
 }

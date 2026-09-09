@@ -1168,6 +1168,7 @@ fn automation_scheduler_status_payload(
                     "trigger": pass.trigger,
                     "scheduledAt": pass.scheduled_at,
                     "startedAt": pass.started_at,
+                    "startLagMs": pass.start_lag_ms,
                     "finishedAt": pass.finished_at,
                     "durationMs": pass.duration_ms,
                     "status": pass.status,
@@ -1191,7 +1192,9 @@ fn automation_scheduler_status_payload(
                         "claimed": status.queue.claimed,
                         "running": status.queue.running,
                         "recoveryRequired": status.queue.recovery_required,
+                        "batchLimit": status.queue.batch_limit,
                         "oldestEligibleAt": status.queue.oldest_eligible_at,
+                        "oldestEligibleAgeMs": status.queue.oldest_eligible_age_ms,
                     }
                 }
             })
@@ -1621,7 +1624,9 @@ mod tests {
                 "claimed": 0,
                 "running": 0,
                 "recoveryRequired": 0,
+                "batchLimit": 64,
                 "oldestEligibleAt": null,
+                "oldestEligibleAgeMs": null,
             })
         );
         assert!(capabilities()
@@ -2247,6 +2252,10 @@ mod tests {
             payload["scheduler"]["queue"]["oldestEligibleAt"],
             "2026-09-01T09:00:00.000Z"
         );
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAgeMs"],
+            3_600_000
+        );
     }
 
     #[test]
@@ -2402,6 +2411,7 @@ mod tests {
         assert_eq!(last_pass["trigger"], "startup");
         assert!(last_pass["scheduledAt"].is_string());
         assert!(last_pass["startedAt"].is_string());
+        assert!(last_pass["startLagMs"].as_u64().is_some());
         assert!(last_pass["finishedAt"].is_string());
         assert!(last_pass["durationMs"].as_u64().is_some());
         assert_eq!(last_pass["status"], "succeeded");
