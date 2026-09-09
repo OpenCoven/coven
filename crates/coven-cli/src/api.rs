@@ -5972,16 +5972,24 @@ fn apply_familiar_edits(
             )
         });
         if coherence_only {
+            let staged_edits: Vec<ward::FileEdit> = report
+                .changes
+                .iter()
+                .zip(edits.iter())
+                .map(|(change, edit)| {
+                    ward::FileEdit::new(change.decision.resolved.clone(), edit.new_contents.clone())
+                })
+                .collect();
             let staged = crate::threads_gate::stage_coherence_proposal(
                 audit_reservation.connection(),
                 coven_home,
                 familiar_id,
                 &workspace,
                 &config,
-                &edits,
+                &staged_edits,
                 &authorization,
             );
-            let (pending_path, proposal_id) = match staged {
+            let staged = match staged {
                 Ok(staged) => staged,
                 Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
                     let limit = crate::proposal_store::quota_failure(&error)
@@ -5989,21 +5997,45 @@ fn apply_familiar_edits(
                     audit_reservation.release_if_unneeded()?;
                     return proposal_quota_exceeded_response(limit);
                 }
+                Err(error) if ward::ward_edit_budget_failure(&error).is_some() => {
+                    let limit = ward::ward_edit_budget_failure(&error)
+                        .expect("guard established a typed Ward budget failure");
+                    audit_reservation.release_if_unneeded()?;
+                    return ward_apply_too_large_response(limit);
+                }
+                Err(error)
+                    if crate::threads_gate::scheduled_publication_failure(&error).is_some() =>
+                {
+                    let failure = crate::threads_gate::scheduled_publication_failure(&error)
+                        .expect("guard established a typed scheduled publication failure");
+                    audit_reservation.finish()?;
+                    return api_error(
+                        409,
+                        "scheduled_publication_invalid",
+                        "Ward approval metadata could not produce authoritative scheduled-publication evidence for this request.",
+                        Some(failure.details()),
+                    );
+                }
                 Err(error) => return Err(error),
             };
             audit_reservation.finish()?;
-            return json_response(
-                202,
-                &json!({
-                    "ok": true,
-                    "disposition": "staged",
-                    "reviewKind": "coherence",
-                    "proposalId": proposal_id,
-                    "pendingPath": pending_path.display().to_string(),
-                    "changes": changes,
-                    "threadsGate": threads_gate_json,
-                }),
-            );
+            let mut body = json!({
+                "ok": true,
+                "disposition": "staged",
+                "proposalId": staged.proposal_id,
+                "pendingPath": staged.pending_path.display().to_string(),
+                "changes": changes,
+                "threadsGate": threads_gate_json,
+            });
+            let object = body
+                .as_object_mut()
+                .expect("staged proposal response is an object");
+            if let Some(scheduled) = staged.scheduled.as_ref() {
+                object.insert("scheduledProposal".to_string(), json!(scheduled));
+            } else {
+                object.insert("reviewKind".to_string(), json!("coherence"));
+            }
+            return json_response(202, &body);
         }
         audit_reservation.finish()?;
         return json_response(
@@ -6198,6 +6230,8 @@ fn familiar_ward_response(coven_home: &Path, familiar_id: &str) -> Result<ApiRes
                 "defaultTier": config.default_tier,
                 "surface": config.surface,
                 "protectedSurface": config.protected_surface,
+                "editable": config.editable,
+                "approvalTiers": config.approval_tiers,
                 "probes": config.probe,
             },
         }),
@@ -7354,13 +7388,27 @@ fn revalidate_scheduled_materialized_before(
     scheduled: &crate::proposal_scheduler::ScheduledProposal,
 ) -> std::result::Result<(), &'static str> {
     for surface in scheduled.materialized_diff().surfaces() {
-        let Some(expected_before) = surface.before.as_deref() else {
-            return Err("proposal-atomic-create-unsupported");
-        };
-        let current = crate::threads_gate::read_surface(workspace, surface.surface.as_str())
-            .map_err(|_| "proposal-evidence-replay-failed")?;
-        if current != expected_before {
-            return Err("proposal-evidence-diverged");
+        match surface.before.as_deref() {
+            Some(expected_before) => {
+                let current = crate::threads_gate::read_surface_if_exists(
+                    workspace,
+                    surface.surface.as_str(),
+                )
+                .map_err(|_| "proposal-evidence-replay-failed")?;
+                if current.as_deref() != Some(expected_before) {
+                    return Err("proposal-evidence-diverged");
+                }
+            }
+            None => {
+                let current = crate::threads_gate::read_surface_if_exists(
+                    workspace,
+                    surface.surface.as_str(),
+                )
+                .map_err(|_| "proposal-evidence-replay-failed")?;
+                if current.is_some() {
+                    return Err("proposal-evidence-diverged");
+                }
+            }
         }
     }
     Ok(())
@@ -9074,7 +9122,7 @@ fn validate_proposal_envelope_preflight_with_limits(
     Ok(budget)
 }
 
-fn validate_proposal_envelope_preflight(raw: &[u8]) -> Result<ward::WardEditBudget> {
+pub(crate) fn validate_proposal_envelope_preflight(raw: &[u8]) -> Result<ward::WardEditBudget> {
     validate_proposal_envelope_preflight_with_limits(raw, WARD_PROPOSAL_ENVELOPE_LIMITS)
 }
 
@@ -10020,12 +10068,13 @@ fn decide_threads_proposal_inner(
             .decisions
             .iter()
             .filter(|d| {
-                !d.verdict.is_blocked() && (scheduled.is_some() || d.tier == ward::Tier::Protected)
+                !d.verdict.is_blocked()
+                    && matches!(d.tier, ward::Tier::Protected | ward::Tier::Reviewed)
             })
             .map(|d| d.resolved.clone())
             .collect()
     };
-    let state = if review_kind == PendingReviewKind::Coherence {
+    let state = if review_kind == PendingReviewKind::Coherence || gated_targets.is_empty() {
         crate::threads_gate::build_weave_state(
             &conn,
             &familiar_id,
@@ -10057,6 +10106,7 @@ fn decide_threads_proposal_inner(
     if decision == "approve"
         && review_kind == PendingReviewKind::Authority
         && gated_targets.is_empty()
+        && scheduled.is_none()
     {
         append_proposal_refusal_audit(
             &conn,
@@ -10221,8 +10271,11 @@ fn decide_threads_proposal_inner(
             review_kind,
             &edits,
             &recovery_authorization,
-            &expected_before,
-            &expected_resolved,
+            ApprovedApplyContext {
+                scheduled,
+                expected_before: &expected_before,
+                expected_resolved: &expected_resolved,
+            },
             ward::ApprovedApplyMode::Recovery,
         ) {
             Ok(report) => (report, None),
@@ -10260,8 +10313,11 @@ fn decide_threads_proposal_inner(
                 review_kind,
                 &rollback_edits,
                 &authorization,
-                &expected_after,
-                &expected_resolved,
+                ApprovedApplyContext {
+                    scheduled,
+                    expected_before: &expected_after,
+                    expected_resolved: &expected_resolved,
+                },
                 ward::ApprovedApplyMode::Recovery,
             )?;
             if rollback.is_refused() {
@@ -10500,8 +10556,11 @@ fn decide_threads_proposal_inner(
         review_kind,
         &edits,
         &authorization,
-        &expected_before,
-        &expected_resolved,
+        ApprovedApplyContext {
+            scheduled,
+            expected_before: &expected_before,
+            expected_resolved: &expected_resolved,
+        },
         ward::ApprovedApplyMode::Initial,
     ) {
         Ok(report) => (report, None),
@@ -11447,19 +11506,18 @@ fn proposal_before_images(
         .map(|decision| {
             let target = &decision.target;
             let contents = if let Some(scheduled) = scheduled {
-                let before = scheduled
+                let surface = scheduled
                     .materialized_diff()
                     .for_surface(&coven_threads_core::SurfaceId::new(target))
                     .with_context(|| {
                         format!("scheduled materialized diff is missing target {target}")
-                    })?
-                    .before
-                    .as_deref()
-                    .with_context(|| {
-                        format!("scheduled target {target} has no approved before-image")
                     })?;
-                budget.reserve_proposed_content(before)?;
-                Some(before.to_vec())
+                if let Some(before) = surface.before.as_deref() {
+                    budget.reserve_proposed_content(before)?;
+                    Some(before.to_vec())
+                } else {
+                    None
+                }
             } else if review_kind == PendingReviewKind::Coherence {
                 let report = coherence_reports
                     .context("coherence before-images require current probe reports")?
@@ -11567,18 +11625,34 @@ fn proposal_expected_after(edits: &[ward::FileEdit]) -> BTreeMap<String, Option<
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct ApprovedApplyContext<'a> {
+    scheduled: Option<&'a crate::proposal_scheduler::ScheduledProposal>,
+    expected_before: &'a BTreeMap<String, Option<Vec<u8>>>,
+    expected_resolved: &'a BTreeMap<String, String>,
+}
+
 fn apply_after_review_approval(
     ward: &ward::Ward,
     review_kind: PendingReviewKind,
     edits: &[ward::FileEdit],
     authorization: &ward::Authorization,
-    expected_before: &BTreeMap<String, Option<Vec<u8>>>,
-    expected_resolved: &BTreeMap<String, String>,
+    context: ApprovedApplyContext<'_>,
     mode: ward::ApprovedApplyMode,
 ) -> Result<ward::ApplyReport> {
+    if context.scheduled.is_some() {
+        return ward.apply_after_scheduled_approval(
+            edits,
+            authorization,
+            context.expected_before,
+            context.expected_resolved,
+            mode,
+        );
+    }
     match review_kind {
         PendingReviewKind::Authority => {
-            let required = expected_before
+            let required = context
+                .expected_before
                 .iter()
                 .map(|(target, contents)| {
                     Ok((
@@ -11593,15 +11667,15 @@ fn apply_after_review_approval(
                 edits,
                 authorization,
                 &required,
-                expected_resolved,
+                context.expected_resolved,
                 mode,
             )
         }
         PendingReviewKind::Coherence => ward.apply_after_coherence_approval(
             edits,
             authorization,
-            expected_before,
-            expected_resolved,
+            context.expected_before,
+            context.expected_resolved,
             mode,
         ),
     }
@@ -24910,17 +24984,27 @@ icon = "ph:leaf-fill"
             workspace.join("ward.toml"),
             r#"principal_key_fingerprint = "SHA256:principal-key"
 protected_surface = ["SOUL.md"]
+default_tier = 2
+
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
 
 [[surface]]
 path = "SOUL.md"
 tier = 0
 
 [[surface]]
-path = "memory/"
-tier = 2
+path = "TOOLS.md"
+tier = 1
 
 [[probe]]
-surface = "memory/**"
+surface = "TOOLS.md"
 id = "size-delta"
 "#,
         )?;
@@ -24937,10 +25021,22 @@ id = "size-delta"
         assert_eq!(body["ward"]["defaultTier"], 2);
         assert_eq!(body["ward"]["surface"][0]["path"], "SOUL.md");
         assert_eq!(body["ward"]["surface"][0]["tier"], 0);
-        assert_eq!(body["ward"]["surface"][1]["path"], "memory/");
-        assert_eq!(body["ward"]["surface"][1]["tier"], 2);
+        assert_eq!(body["ward"]["surface"][1]["path"], "TOOLS.md");
+        assert_eq!(body["ward"]["surface"][1]["tier"], 1);
         assert_eq!(body["ward"]["protectedSurface"][0], "SOUL.md");
-        assert_eq!(body["ward"]["probes"][0]["surface"], "memory/**");
+        assert_eq!(
+            body["ward"]["editable"]["harness_blocks"][0],
+            "tool_defaults"
+        );
+        assert_eq!(
+            body["ward"]["approvalTiers"]["familiar_review"]["gate"],
+            "familiar_coherence_check"
+        );
+        assert_eq!(
+            body["ward"]["approvalTiers"]["familiar_review"]["min_visible_seconds"],
+            900
+        );
+        assert_eq!(body["ward"]["probes"][0]["surface"], "TOOLS.md");
         assert_eq!(body["ward"]["probes"][0]["id"], "size-delta");
         Ok(())
     }
@@ -25782,6 +25878,148 @@ forbidden = ["(?i)ignore previous"]
 "#,
         )?;
         Ok(workspace)
+    }
+
+    fn seed_retired_ward_familiar(home: &Path, ward_toml: &str) -> Result<std::path::PathBuf> {
+        seed_familiars_toml(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        std::fs::write(workspace.join("TOOLS.md"), "before tools\n")?;
+        std::fs::write(workspace.join("HEARTBEAT.md"), "before heartbeat\n")?;
+        std::fs::write(workspace.join("AGENTS.md"), "before agents\n")?;
+        std::fs::write(workspace.join("ward.toml"), ward_toml)?;
+        Ok(workspace)
+    }
+
+    fn migrate_retired_ward(home: &Path) -> Result<()> {
+        let report = crate::ward_migrate::run_migration(
+            home,
+            crate::ward_migrate::WardMigrateOptions {
+                familiar: Some("sage".to_string()),
+                fingerprint: "fpr-val".to_string(),
+                apply: true,
+            },
+        )?;
+        anyhow::ensure!(
+            !report.has_errors(),
+            "retired Ward migration failed: {report:#?}"
+        );
+        Ok(())
+    }
+
+    fn accepted_retired_ward() -> &'static str {
+        r#"[meta]
+version = "0.1.0"
+owner = "sage"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+  "familiar.name == 'Sage'",
+  "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["TOOLS.md", "HEARTBEAT.md"]
+harness_blocks = ["tool_defaults", "heartbeat_behavior"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults", "heartbeat_behavior"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+"#
+    }
+
+    fn unknown_region_retired_ward() -> &'static str {
+        r#"[meta]
+version = "0.1.0"
+owner = "sage"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+  "familiar.name == 'Sage'",
+  "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["reviewed/"]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.familiar_review]
+blocks = ["tool_defaults"]
+gate = "familiar_coherence_check"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+"#
+    }
+
+    fn inconsistent_region_retired_ward() -> &'static str {
+        r#"[meta]
+version = "0.1.0"
+owner = "sage"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+  "familiar.name == 'Sage'",
+  "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["TOOLS.md"]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.auto]
+blocks = ["tool_defaults"]
+gate = "regression_suite"
+human_veto_window_hours = 1
+min_visible_seconds = 900
+"#
+    }
+
+    fn protected_region_retired_ward() -> &'static str {
+        r#"[meta]
+version = "0.1.0"
+owner = "sage"
+
+[protected]
+files = ["SOUL.md"]
+invariants = [
+  "familiar.name == 'Sage'",
+  "familiar.person == 'Example principal'",
+]
+
+[editable]
+paths = ["AGENTS.md"]
+harness_blocks = ["execution_prompt"]
+
+[approval_tiers.human_review]
+blocks = ["execution_prompt"]
+gate = "human_approval"
+"#
+    }
+
+    fn retime_scheduled_proposal(path: &Path, staged_at: time::OffsetDateTime) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let previous_staged_at: time::OffsetDateTime =
+            serde_json::from_value(value["staged_at"].clone())?;
+        let previous_deadline: time::OffsetDateTime =
+            serde_json::from_value(value["veto_deadline"].clone())?;
+        let previous_earliest_close: time::OffsetDateTime =
+            serde_json::from_value(value["earliest_close"].clone())?;
+        let deadline_offset = previous_deadline - previous_staged_at;
+        let earliest_close_offset = previous_earliest_close - previous_staged_at;
+
+        value["pending"]["staged_at"] = serde_json::to_value(staged_at)?;
+        value["classification"]["classified_at"] = serde_json::to_value(staged_at)?;
+        value["staged_at"] = serde_json::to_value(staged_at)?;
+        value["veto_deadline"] = serde_json::to_value(staged_at + deadline_offset)?;
+        value["earliest_close"] = serde_json::to_value(staged_at + earliest_close_offset)?;
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(())
     }
 
     pub(crate) fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
@@ -29083,13 +29321,16 @@ tier = 0
         staged_at: time::OffsetDateTime,
         channel: coven_threads_core::Channel,
     ) -> Result<(std::path::PathBuf, String)> {
-        stage_scheduled_edit(
+        stage_scheduled_edit_with_images(
             home,
-            "reviewed/skill.md",
-            1,
+            ScheduledEditFixture {
+                target: "reviewed/skill.md",
+                path_tier_floor: 1,
+                channel,
+                before: Some(b"before".as_slice()),
+            },
             approval_path,
             staged_at,
-            channel,
         )
     }
 
@@ -29101,23 +29342,76 @@ tier = 0
         staged_at: time::OffsetDateTime,
         channel: coven_threads_core::Channel,
     ) -> Result<(std::path::PathBuf, String)> {
+        stage_scheduled_edit_with_images(
+            home,
+            ScheduledEditFixture {
+                target,
+                path_tier_floor,
+                channel,
+                before: Some(b"before".as_slice()),
+            },
+            approval_path,
+            staged_at,
+        )
+    }
+
+    fn stage_scheduled_created_edit(
+        home: &Path,
+        target: &str,
+        path_tier_floor: u8,
+        approval_path: coven_threads_core::ApprovalPath,
+        staged_at: time::OffsetDateTime,
+        channel: coven_threads_core::Channel,
+    ) -> Result<(std::path::PathBuf, String)> {
+        stage_scheduled_edit_with_images(
+            home,
+            ScheduledEditFixture {
+                target,
+                path_tier_floor,
+                channel,
+                before: None,
+            },
+            approval_path,
+            staged_at,
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    struct ScheduledEditFixture<'a> {
+        target: &'a str,
+        path_tier_floor: u8,
+        channel: coven_threads_core::Channel,
+        before: Option<&'a [u8]>,
+    }
+
+    fn stage_scheduled_edit_with_images(
+        home: &Path,
+        fixture: ScheduledEditFixture<'_>,
+        approval_path: coven_threads_core::ApprovalPath,
+        staged_at: time::OffsetDateTime,
+    ) -> Result<(std::path::PathBuf, String)> {
         let workspace = seed_warded_familiar(home)?;
-        if let Some(parent) = workspace.join(target).parent() {
+        if let Some(parent) = workspace.join(fixture.target).parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(workspace.join(target), b"before")?;
+        let target_path = workspace.join(fixture.target);
+        if let Some(before) = fixture.before {
+            std::fs::write(&target_path, before)?;
+        } else if target_path.exists() {
+            std::fs::remove_file(&target_path)?;
+        }
         let proposal_id = coven_threads_core::ProposalId::new();
         let familiar_id = crate::threads_gate::familiar_weave_id("sage");
-        let surface = coven_threads_core::SurfaceId::new(target);
+        let surface = coven_threads_core::SurfaceId::new(fixture.target);
         let pending = coven_threads_core::PendingProposal {
             id: proposal_id,
             familiar_id,
             writer: coven_threads_core::WriterId::new("principal:fpr-val"),
-            channel,
+            channel: fixture.channel,
             thread_id: coven_threads_core::ThreadId::new(),
             fray: coven_threads_core::FrayOrSnap::Frayed {
                 strand: None,
-                channel,
+                channel: fixture.channel,
                 reason: coven_threads_core::FrayReason::Other("phase-5 decision".to_string()),
             },
             edits: vec![coven_threads_core::StagedEdit {
@@ -29129,7 +29423,7 @@ tier = 0
         let diff =
             coven_threads_core::MaterializedDiff::try_new(vec![coven_threads_core::SurfaceDiff {
                 surface: surface.clone(),
-                before: Some(b"before".to_vec()),
+                before: fixture.before.map(ToOwned::to_owned),
                 after: Some(b"after".to_vec()),
             }])
             .map_err(anyhow::Error::msg)?;
@@ -29138,10 +29432,10 @@ tier = 0
         let classification = coven_threads_core::ProposalClassification {
             proposal_id,
             familiar_id,
-            channel,
+            channel: fixture.channel,
             affected_surfaces: vec![surface],
             affected_regions: evidence.iter().map(|item| item.region_id.clone()).collect(),
-            path_tier_floor,
+            path_tier_floor: fixture.path_tier_floor,
             approval_path,
             evidence_replay_hash: coven_threads_core::evidence_replay_hash(&diff, &evidence),
             classified_at: staged_at,
@@ -29544,6 +29838,106 @@ tier = 0
     }
 
     #[test]
+    fn scheduled_apply_intent_keeps_committed_absent_before_image() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, _) = stage_scheduled_created_edit(
+            home,
+            "reviewed/new-skill.md",
+            1,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        let scheduled: crate::proposal_scheduler::ScheduledProposal =
+            serde_json::from_slice(&std::fs::read(pending)?)?;
+        let workspace = home.join("familiars/sage");
+        let config = ward::WardConfig::load(&workspace)?.context("Ward config exists")?;
+        let adjudication = ward::Ward::new(&workspace, config)?.evaluate(&ward::Proposal {
+            targets: vec!["reviewed/new-skill.md".to_string()],
+            authorization: authorization_from_writer(&scheduled.pending().writer),
+        });
+        let mut budget = ward::validate_staged_edit_budget(&scheduled.pending().edits)?;
+
+        let before_images = proposal_before_images(
+            &workspace,
+            &adjudication.decisions,
+            Some(&scheduled),
+            PendingReviewKind::Authority,
+            None,
+            &mut budget,
+        )?;
+
+        assert!(
+            before_images[0].contents.is_none(),
+            "scheduled creates must retain reviewed absence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_approval_applies_created_reviewed_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let target = home.join("familiars/sage/reviewed/new-skill.md");
+        let (pending, proposal_id) = stage_scheduled_created_edit(
+            home,
+            "reviewed/new-skill.md",
+            1,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        assert!(!target.exists(), "fixture must stage a create");
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+
+        let approved = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(approved.status, 200, "got {}", approved.body);
+        assert_eq!(std::fs::read_to_string(target)?, "after");
+        assert!(!pending.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_approval_rejects_created_surface_that_now_exists() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let target = home.join("familiars/sage/reviewed/new-skill.md");
+        let (pending, proposal_id) = stage_scheduled_created_edit(
+            home,
+            "reviewed/new-skill.md",
+            1,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        std::fs::write(&target, "concurrent")?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-evidence-diverged");
+        assert_eq!(std::fs::read_to_string(target)?, "concurrent");
+        assert!(!pending.exists(), "failed replay is terminal");
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduled_veto_window_delays_apply_and_records_veto() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -29699,6 +30093,41 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(event, "proposal_rejected");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_deadline_rejects_deleted_empty_before_image() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_edit_with_images(
+            home,
+            ScheduledEditFixture {
+                target: "reviewed/empty.md",
+                path_tier_floor: 1,
+                channel: coven_threads_core::Channel::Mutation,
+                before: Some(b""),
+            },
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let target = home.join("familiars/sage/reviewed/empty.md");
+        std::fs::remove_file(&target)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-evidence-diverged");
+        assert!(!target.exists());
+        assert!(!pending.exists(), "failed replay is terminal");
         Ok(())
     }
 
@@ -31907,6 +32336,261 @@ tier = 0
             "tweak"
         );
         assert!(!pending_path.exists(), "approved proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_stages_scheduled_publication_from_retired_ward_intake() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"TOOLS.md","contents":"after tools\n"},
+                {"target":"HEARTBEAT.md","contents":"after heartbeat\n"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "staged");
+        assert!(body.get("reviewKind").is_none());
+        assert_eq!(
+            body["scheduledProposal"]["classification"]["approval_path"]["kind"],
+            "familiar_coherence"
+        );
+        assert_eq!(
+            body["scheduledProposal"]["lifecycle"]["state"],
+            "veto_window_open"
+        );
+        assert_eq!(
+            body["scheduledProposal"]["region_evidence"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(2)
+        );
+
+        let pending_path =
+            std::path::PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+        let raw = std::fs::read_to_string(&pending_path)?;
+        let staged: Value = serde_json::from_str(&raw)?;
+        assert_eq!(staged["schema"], "phase5_v1");
+        assert!(staged.get("reviewKind").is_none());
+        assert_eq!(
+            staged["classification"]["affected_regions"][0],
+            "tool_defaults"
+        );
+        assert_eq!(
+            staged["classification"]["affected_regions"][1],
+            "heartbeat_behavior"
+        );
+        let document = ProposalEnvelopeDocument::parse_preflighted(raw.as_bytes())?;
+        let scheduled = document
+            .scheduled()
+            .context("supported intake must stage a scheduled proposal")?;
+        assert_eq!(scheduled.pending().edits.len(), 2);
+        assert_eq!(scheduled.pending().edits[0].surface.as_str(), "TOOLS.md");
+        assert_eq!(
+            scheduled.pending().edits[1].surface.as_str(),
+            "HEARTBEAT.md"
+        );
+        assert_eq!(
+            scheduled.materialized_diff().surfaces()[0]
+                .before
+                .as_deref(),
+            Some("before tools\n".as_bytes())
+        );
+        assert_eq!(
+            scheduled.materialized_diff().surfaces()[1]
+                .before
+                .as_deref(),
+            Some("before heartbeat\n".as_bytes())
+        );
+
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let submitted_detail: String = conn.query_row(
+            "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        let submitted_detail: Value = serde_json::from_str(&submitted_detail)?;
+        assert_eq!(submitted_detail["classification"], staged["classification"]);
+        assert_eq!(submitted_detail["earliest_close"], staged["earliest_close"]);
+        assert_eq!(submitted_detail["veto_deadline"], staged["veto_deadline"]);
+        let premature = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&scheduled_decision_body(home, proposal_id, None)?),
+        )?;
+        assert_eq!(premature.status, 409, "got {}", premature.body);
+        let premature_body: Value = serde_json::from_str(&premature.body)?;
+        assert_eq!(premature_body["why"], "proposal-minimum-visibility-open");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("HEARTBEAT.md"))?,
+            "before heartbeat\n"
+        );
+
+        retime_scheduled_proposal(
+            &pending_path,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        )?;
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "after tools\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("HEARTBEAT.md"))?,
+            "after heartbeat\n"
+        );
+        assert!(!pending_path.exists(), "replayed proposal must be consumed");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_oversized_scheduled_before_image_before_staging() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let oversized_before = 10 * 1024 * 1024_u64;
+        std::fs::File::create(workspace.join("TOOLS.md"))?.set_len(oversized_before)?;
+        std::fs::File::create(workspace.join("HEARTBEAT.md"))?.set_len(oversized_before)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"TOOLS.md","contents":"after tools\n"},
+                {"target":"HEARTBEAT.md","contents":"after heartbeat\n"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(
+            body["error"]["details"]["limit"],
+            "directBatchRetainedBytes"
+        );
+        assert_eq!(
+            body["error"]["details"]["maxBytes"],
+            ward::WARD_RETAINED_CONTENT_MAX_BYTES
+        );
+        assert!(body["error"]["details"]["attemptedBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > ward::WARD_RETAINED_CONTENT_MAX_BYTES));
+        let pending_entries = home
+            .join("pending")
+            .read_dir()
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(
+            pending_entries, 0,
+            "rejected staging must not publish a proposal"
+        );
+        assert_eq!(
+            std::fs::metadata(workspace.join("TOOLS.md"))?.len(),
+            oversized_before
+        );
+        assert_eq!(
+            std::fs::metadata(workspace.join("HEARTBEAT.md"))?.len(),
+            oversized_before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_unknown_scheduled_region_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, unknown_region_retired_ward())?;
+        migrate_retired_ward(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"tweak"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "scheduled_publication_invalid");
+        assert_eq!(
+            body["error"]["details"]["why"],
+            "proposal-region-evidence-missing"
+        );
+        assert!(!home.join("pending").exists());
+        assert!(!workspace.join("reviewed/skill.md").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_inconsistent_scheduled_region_evidence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, inconsistent_region_retired_ward())?;
+        migrate_retired_ward(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "scheduled_publication_invalid");
+        assert_eq!(
+            body["error"]["details"]["why"],
+            "proposal-classification-invalid"
+        );
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            "reviewed tier requires familiar review or a stronger approval path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_protected_region_schedule() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, protected_region_retired_ward())?;
+        migrate_retired_ward(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"AGENTS.md","contents":"after agents\n"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "scheduled_publication_invalid");
+        assert_eq!(
+            body["error"]["details"]["why"],
+            "proposal-classification-invalid"
+        );
+        assert_eq!(
+            body["error"]["details"]["reason"],
+            "protected surfaces are not schedulable through ApprovalPath"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("AGENTS.md"))?,
+            "before agents\n"
+        );
         Ok(())
     }
 
