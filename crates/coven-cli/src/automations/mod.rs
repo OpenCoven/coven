@@ -14,6 +14,7 @@ pub mod definition;
 pub mod diagnostics;
 pub mod health;
 pub mod import_legacy;
+pub mod inspection;
 pub mod leadership;
 pub mod occurrences;
 pub mod receipts;

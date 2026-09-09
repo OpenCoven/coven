@@ -158,8 +158,6 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .context("failed to read automations scheduler authority")?;
-    let active_definition_ids = super::occurrences::active_definition_ids(&transaction)?;
-    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let (planned, claimed, running, recovery_required) = transaction
         .query_row(
             "SELECT
@@ -171,95 +169,16 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .context("failed to read automations scheduler queue counts")?;
-    let eligible_candidates: Vec<(String, String, bool)> = {
-        let mut statement = transaction
-            .prepare(
-                "SELECT occurrence.automation_id,
-                        occurrence.scheduled_for,
-                        EXISTS (
-                            SELECT 1
-                            FROM automation_runs AS retry_run
-                            JOIN automation_attempts AS retry_attempt
-                              ON retry_attempt.run_id = retry_run.id
-                            WHERE retry_run.occurrence_id = occurrence.id
-                              AND retry_run.status = 'running'
-                              AND retry_attempt.state = 'adopted'
-                              AND retry_attempt.not_before <= ?1
-                              AND retry_run.timeout_at > ?1
-                        )
-                 FROM automation_occurrences AS occurrence
-                 WHERE occurrence.state = 'planned'
-                   AND occurrence.scheduled_for <= ?1
-                   AND occurrence.scheduled_for = (
-                       SELECT MAX(candidate.scheduled_for)
-                       FROM automation_occurrences AS candidate
-                       WHERE candidate.automation_id = occurrence.automation_id
-                         AND candidate.state = 'planned'
-                         AND candidate.scheduled_for <= ?1
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_retry_state
-                       WHERE automation_id = occurrence.automation_id
-                         AND quarantined_at IS NOT NULL
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_occurrences AS active_occurrence
-                       WHERE active_occurrence.automation_id = occurrence.automation_id
-                         AND active_occurrence.state IN ('claimed', 'running')
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_runs AS active_run
-                       WHERE active_run.automation_id = occurrence.automation_id
-                         AND active_run.status = 'running'
-                         AND active_run.occurrence_id IS NOT occurrence.id
-                   )
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM automation_runs AS retry_run
-                       JOIN automation_attempts AS retry_attempt
-                         ON retry_attempt.run_id = retry_run.id
-                       WHERE retry_run.occurrence_id = occurrence.id
-                         AND retry_run.status = 'running'
-                         AND retry_attempt.state = 'adopted'
-                         AND (
-                             retry_attempt.not_before > ?1
-                             OR retry_run.timeout_at <= ?1
-                         )
-                   )
-                 ORDER BY occurrence.scheduled_for ASC",
-            )
-            .context("failed to prepare automations eligible queue query")?;
-        let rows = statement
-            .query_map([&now_iso], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .context("failed to query automations eligible queue")?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to read automations eligible queue")?
-    };
-    let mut oldest_eligible: Option<(chrono::DateTime<chrono::FixedOffset>, String)> = None;
-    for (automation_id, scheduled_for, retry_ready) in eligible_candidates {
-        if !retry_ready && !active_definition_ids.contains(&automation_id) {
-            continue;
-        }
-        let parsed = chrono::DateTime::parse_from_rfc3339(&scheduled_for)
-            .with_context(|| format!("invalid scheduled occurrence timestamp `{scheduled_for}`"))?;
-        if oldest_eligible
-            .as_ref()
-            .is_none_or(|(oldest, _)| parsed < *oldest)
-        {
-            oldest_eligible = Some((parsed, scheduled_for));
-        }
-    }
+    let oldest_eligible_at = super::occurrences::eligible_occurrences(&transaction, now, 1)?
+        .into_iter()
+        .next()
+        .map(|occurrence| occurrence.scheduled_for);
     let queue = SchedulerQueueStatus {
         planned,
         claimed,
         running,
         recovery_required,
-        oldest_eligible_at: oldest_eligible.map(|(_, scheduled_for)| scheduled_for),
+        oldest_eligible_at,
     };
     let last_pass = transaction
         .query_row(
