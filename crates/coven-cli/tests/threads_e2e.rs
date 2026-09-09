@@ -299,6 +299,103 @@ fn clock_control_and_audit_time_survive_real_daemon_restart() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "threads-test-clock")]
+fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = corpus["valid_cases"]
+        .as_array()
+        .context("corpus valid cases")?
+        .iter()
+        .find(|case| case["id"] == "familiar-review")
+        .context("canonical familiar-review case")?;
+    run_clocked_journey(
+        "retired-corpus-scheduled-restart",
+        |home, workspace| seed_retired_review_case(home, workspace, case),
+        |fixture, capability| {
+            fs::create_dir_all(&fixture.artifact_dir)?;
+            fs::write(
+                fixture.artifact_dir.join("corpus.json"),
+                serde_json::to_vec_pretty(&corpus)?,
+            )?;
+            let protected_before = fs::read(fixture.workspace.join("SOUL.md"))?;
+            let staged = submit_retired_case(fixture, case)?;
+            let id = staged["proposalId"]
+                .as_str()
+                .context("scheduled proposal id")?;
+            let pending: Value = serde_json::from_slice(&fs::read(
+                staged["pendingPath"].as_str().context("pending path")?,
+            )?)?;
+            anyhow::ensure!(
+                pending["schema"] == "phase5_v1"
+                    && pending["pending"]["id"] == id
+                    && pending["classification"] == staged["scheduledProposal"]["classification"]
+                    && pending["region_evidence"] == staged["scheduledProposal"]["region_evidence"],
+                "response and durable canonical evidence disagree"
+            );
+            let minimum = case["approval"]["veto"]["min_visible_seconds"]
+                .as_i64()
+                .context("corpus minimum visibility")?;
+            let duration = case["approval"]["veto"]["duration_seconds"]
+                .as_i64()
+                .context("corpus veto duration")?;
+            let minimum_at: time::OffsetDateTime =
+                serde_json::from_value(pending["earliest_close"].clone())?;
+            let deadline: time::OffsetDateTime =
+                serde_json::from_value(pending["veto_deadline"].clone())?;
+            anyhow::ensure!(
+                minimum_at == fixture_time(minimum)? && deadline == fixture_time(duration)?,
+                "intake changed corpus scheduling policy"
+            );
+            tick_scheduler(fixture, capability)?;
+            advance_clock_to_offset(fixture, capability, minimum - 1)?;
+            tick_scheduler(fixture, capability)?;
+            assert_corpus_bytes(fixture, case, "before")?;
+            fixture.restart_daemon()?;
+            advance_clock_to_offset(fixture, capability, minimum)?;
+            tick_scheduler(fixture, capability)?;
+            assert_corpus_bytes(fixture, case, "before")?;
+            let pending_list = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+            anyhow::ensure!(
+                pending_list.status == 200
+                    && pending_list.body["proposals"]
+                        .as_array()
+                        .is_some_and(|proposals| proposals
+                            .iter()
+                            .any(|proposal| proposal["id"] == id)),
+                "restart lost the visible pending interval: {pending_list:?}"
+            );
+            advance_clock_to_offset(fixture, capability, duration + 1)?;
+            tick_scheduler(fixture, capability)?;
+            assert_corpus_bytes(fixture, case, "after")?;
+            assert_window_terminal(fixture, id, "proposal_approved", "applied", json!(true))?;
+            fixture.restart_daemon()?;
+            tick_scheduler(fixture, capability)?;
+            let repeated = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&json!({"principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+            )?;
+            anyhow::ensure!(
+                matches!(repeated.status, 404 | 409),
+                "terminal proposal was approved twice: {repeated:?}"
+            );
+            assert_corpus_bytes(fixture, case, "after")?;
+            assert_window_terminal(fixture, id, "proposal_approved", "applied", json!(true))?;
+            anyhow::ensure!(
+                fs::read(fixture.workspace.join("SOUL.md"))? == protected_before,
+                "scheduled reviewed writes changed protected identity"
+            );
+            let remaining = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+            anyhow::ensure!(
+                remaining.status == 200 && remaining.body["proposals"] == json!([]),
+                "terminal proposal remains pending: {remaining:?}"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn smoke_out_of_band_drift_stages_without_execution() -> Result<()> {
     run_journey("smoke-out-of-band-drift", |fixture| {
         let baseline_request = json!({
@@ -586,6 +683,249 @@ fn advance_clock(fixture: &mut ThreadsFixture, capability: &str, now: &str) -> R
             && response.body["now"] == now
             && response.body["source"] == "deterministic_fixture",
         "clock advance failed: {response:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn retired_ward_corpus() -> Result<Value> {
+    let dependency = threads_dependency(&workspace_root())?;
+    let output = Command::new("cargo")
+        .args(["run", "--quiet", "--locked", "--manifest-path"])
+        .arg(&dependency.manifest_path)
+        .args([
+            "--example",
+            "generate_phase5_retired_ward_corpus",
+            "--target-dir",
+        ])
+        .arg(workspace_root().join("target/threads-corpus-generator"))
+        .env("CARGO_INCREMENTAL", "0")
+        .output()
+        .context("generating corpus from the resolved Threads checkout")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "canonical corpus generator failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let corpus: Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(
+        corpus["schema_version"] == "phase5-retired-ward-synthetic-v1"
+            && corpus["provenance"]["kind"] == "synthetic"
+            && corpus["provenance"]["historical_data_used"] == false,
+        "fixture is not the repository-owned synthetic corpus"
+    );
+    Ok(corpus)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn seed_retired_review_case(home: &Path, workspace: &Path, case: &Value) -> Result<()> {
+    let facts = case["candidate_facts"]
+        .as_array()
+        .context("candidate facts")?;
+    let fact = |name: &str| -> Result<&str> {
+        facts
+            .iter()
+            .find(|fact| fact["fact"] == name)
+            .and_then(|fact| fact["value"].as_str())
+            .with_context(|| format!("missing corpus fact {name}"))
+    };
+    let name = fact("name")?;
+    fs::write(
+        home.join("familiars.toml"),
+        format!(
+            "[[familiar]]\nid = \"{FAMILIAR_ID}\"\ndisplay_name = {}\nname = {}\n\
+             person = {}\npronouns = {}\ncoven = {}\nrole = \"Synthetic fixture\"\n\
+             description = \"Repository-authored synthetic corpus fixture.\"\n",
+            serde_json::to_string(name)?,
+            serde_json::to_string(name)?,
+            serde_json::to_string(fact("person")?)?,
+            serde_json::to_string(fact("pronouns")?)?,
+            serde_json::to_string(fact("coven")?)?,
+        ),
+    )?;
+    fs::write(
+        workspace.join("SOUL.md"),
+        format!("# I am {name}\nMy purpose is {}\n", fact("purpose")?),
+    )?;
+    fs::write(
+        workspace.join("IDENTITY.md"),
+        format!(
+            "# IDENTITY.md - {name}\n- **Pronouns:** {}\n",
+            fact("pronouns")?
+        ),
+    )?;
+    let surfaces = case["surfaces"].as_array().context("corpus surfaces")?;
+    let mut paths = Vec::new();
+    for surface in surfaces {
+        let path = surface["path"].as_str().context("corpus surface path")?;
+        anyhow::ensure!(
+            matches!(path, "TOOLS.md" | "HEARTBEAT.md"),
+            "review fixture contains an unsupported surface"
+        );
+        paths.push(path);
+        fs::write(
+            workspace.join(path),
+            surface["before"].as_str().context("before image")?,
+        )?;
+    }
+    let duration = case["approval"]["veto"]["duration_seconds"]
+        .as_u64()
+        .context("corpus veto duration")?;
+    let minimum = case["approval"]["veto"]["min_visible_seconds"]
+        .as_u64()
+        .context("corpus minimum visibility")?;
+    anyhow::ensure!(duration % 3600 == 0, "retired Ward requires whole hours");
+    let legacy = format!(
+        "[meta]\nversion = \"0.1.0\"\nowner = \"{FAMILIAR_ID}\"\n\
+         [protected]\nfiles = [\"SOUL.md\", \"IDENTITY.md\"]\ninvariants = {}\n\
+         [editable]\npaths = {}\nharness_blocks = {}\n\
+         [approval_tiers.familiar_review]\nblocks = {}\n\
+         gate = \"familiar_coherence_check\"\nhuman_veto_window_hours = {}\n\
+         min_visible_seconds = {minimum}\n",
+        case["declarations"],
+        serde_json::to_string(&paths)?,
+        case["expected"]["regions"],
+        case["expected"]["regions"],
+        duration / 3600,
+    );
+    fs::write(workspace.join("ward.toml"), &legacy)?;
+    let migrated = run_coven(
+        Path::new(env!("CARGO_BIN_EXE_coven")),
+        home,
+        &std::env::var_os("PATH").unwrap_or_default(),
+        &[
+            "ward",
+            "migrate",
+            "--familiar",
+            FAMILIAR_ID,
+            "--fingerprint",
+            PRINCIPAL_FINGERPRINT,
+            "--apply",
+        ],
+    )?;
+    anyhow::ensure!(
+        migrated.status.success(),
+        "real migration rejected the corpus: {} {}",
+        String::from_utf8_lossy(&migrated.stdout),
+        String::from_utf8_lossy(&migrated.stderr)
+    );
+    anyhow::ensure!(
+        fs::read_to_string(workspace.join("ward.toml.v01.bak"))? == legacy,
+        "migration did not preserve the exact original declaration"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn submit_retired_case(fixture: &mut ThreadsFixture, case: &Value) -> Result<Value> {
+    let edits: Vec<Value> = case["surfaces"]
+        .as_array()
+        .context("corpus surfaces")?
+        .iter()
+        .map(|surface| json!({"target": surface["path"], "contents": surface["after"]}))
+        .collect();
+    let response = fixture.request(
+        "POST",
+        "/api/v1/familiars/sage/edits",
+        Some(&json!({"edits": edits, "principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+    )?;
+    anyhow::ensure!(
+        response.status == 202
+            && response.body["disposition"] == "staged"
+            && response.body["scheduledProposal"]["schema"] == "phase5_v1",
+        "supported intake did not publish canonical scheduled evidence: {response:?}"
+    );
+    Ok(response.body)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn fixture_time(seconds: i64) -> Result<time::OffsetDateTime> {
+    Ok(time::OffsetDateTime::parse(
+        "2099-01-01T00:00:00Z",
+        &time::format_description::well_known::Rfc3339,
+    )? + time::Duration::seconds(seconds))
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn advance_clock_to_offset(
+    fixture: &mut ThreadsFixture,
+    capability: &str,
+    seconds: i64,
+) -> Result<()> {
+    advance_clock(
+        fixture,
+        capability,
+        &fixture_time(seconds)?.format(&time::format_description::well_known::Rfc3339)?,
+    )
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn tick_scheduler(fixture: &mut ThreadsFixture, capability: &str) -> Result<()> {
+    let response = fixture.request(
+        "POST",
+        "/api/v1/internal/threads/test-clock/tick",
+        Some(&json!({"capability": capability})),
+    )?;
+    anyhow::ensure!(
+        response.status == 200 && response.body["source"] == "deterministic_fixture",
+        "controlled scheduler failed: {response:?}"
+    );
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn assert_corpus_bytes(fixture: &ThreadsFixture, case: &Value, image: &str) -> Result<()> {
+    for surface in case["surfaces"].as_array().context("corpus surfaces")? {
+        anyhow::ensure!(
+            fs::read_to_string(
+                fixture
+                    .workspace
+                    .join(surface["path"].as_str().context("surface")?)
+            )? == surface[image].as_str().context("corpus image")?,
+            "corpus bytes differ from the required {image} image"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn assert_window_terminal(
+    fixture: &ThreadsFixture,
+    id: &str,
+    event: &str,
+    reason: &str,
+    replay_matched: Value,
+) -> Result<()> {
+    let conn = fixture.store()?;
+    let opened: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+        [id],
+        |row| row.get(0),
+    )?;
+    let mut statement = conn.prepare(
+        "SELECT event_type, detail FROM ward_audit WHERE proposal_id = ?1
+         AND event_type IN ('proposal_approved', 'proposal_vetoed', 'proposal_rejected')",
+    )?;
+    let rows = statement
+        .query_map([id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        opened == 1 && rows.len() == 1,
+        "window/terminal multiplicity mismatch: {opened}, {rows:?}"
+    );
+    let detail: Value = serde_json::from_str(&rows[0].1)?;
+    let close = if event == "proposal_approved" {
+        &detail["window_close"]
+    } else {
+        &detail
+    };
+    anyhow::ensure!(
+        rows[0].0 == event
+            && close["reason"] == reason
+            && close["replay_hash_matched"] == replay_matched,
+        "wrong typed terminal family: {rows:?}"
     );
     Ok(())
 }
