@@ -1003,6 +1003,10 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         crate::automations::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
     )
     .context("failed to initialize automation command adoption schema")?;
+    crate::automations::cancellation::ensure_cancellation_schema(conn)
+        .context("failed to initialize automation cancellation schema")?;
+    conn.execute_batch(crate::automations::leadership::AUTOMATION_SCHEDULER_AUTHORITY_SCHEMA_SQL)
+        .context("failed to initialize automation scheduler authority schema")?;
     conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
         .context("failed to initialize automation_occurrences schema")?;
     crate::automations::occurrences::ensure_occurrence_kind(conn)?;
@@ -1011,9 +1015,13 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     crate::automations::runs::ensure_timeout_column(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
+    crate::automations::command_adoption::ensure_global_adoption_key_guards(conn)?;
+    crate::automations::runs::ensure_authority_columns(conn)?;
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
     conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
         .context("failed to initialize automation events schema")?;
+    conn.execute_batch(crate::automations::receipts::AUTOMATION_RECEIPTS_SCHEMA_SQL)
+        .context("failed to initialize automation receipts schema")?;
     crate::automations::contract::events::backfill_definition_event_baselines(conn)
         .context("failed to backfill automation definition event baselines")?;
     crate::automations::store::migrate_durable_local_timezones(conn)?;
