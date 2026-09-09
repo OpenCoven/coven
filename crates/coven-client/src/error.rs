@@ -6,7 +6,8 @@ use thiserror::Error;
 pub(crate) const UNIX_CONNECT_OPERATION: &str = "failed to connect to Coven daemon socket";
 pub(crate) const UNIX_CONFIGURE_WRITES_OPERATION: &str =
     "failed to configure nonblocking Coven daemon socket writes";
-pub(crate) const WINDOWS_CONNECT_OPERATION: &str = "failed to connect to Coven daemon pipe";
+#[doc(hidden)]
+pub const WINDOWS_CONNECT_OPERATION: &str = "failed to connect to Coven daemon pipe";
 pub(crate) const WINDOWS_CONFIGURE_WRITES_OPERATION: &str =
     "failed to configure nonblocking Coven daemon pipe writes";
 #[doc(hidden)]
