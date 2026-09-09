@@ -1054,7 +1054,7 @@ test('resolveReleaseSourceAcceptance reads the selected rerun attempt instead of
       headSha: HEAD_SHA,
       tagObjectSha: '1'.repeat(40),
       ghApi: async (endpoint) => {
-        if (endpoint.includes('/workflows/ci.yml/runs?')) {
+        if (endpoint.includes('/actions/runs?')) {
           return { workflow_runs: [{ ...baseValidCiWorkflowRun(), run_attempt: selectedAttempt }] };
         }
         assert.equal(
@@ -1081,7 +1081,7 @@ test('resolveReleaseSourceAcceptance records exact workflow and required-check e
       calls.push(endpoint);
       if (
         endpoint ===
-        `/repos/${repository}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`
+        `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`
       ) {
         return { workflow_runs: [baseValidCiWorkflowRun()] };
       }
@@ -1127,7 +1127,7 @@ test('resolveReleaseSourceAcceptance records exact workflow and required-check e
     observedAt: '2026-09-07T00:00:00.000Z'
   });
   assert.deepEqual(calls, [
-    `/repos/${repository}/actions/workflows/ci.yml/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`,
+    `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`,
     `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100`
   ]);
 });

@@ -545,7 +545,7 @@ export async function resolveReleaseSourceAcceptance({
     );
   }
   const workflowRuns = await ghApi(
-    `/repos/${normalizedRepository}/actions/workflows/${CI_WORKFLOW_FILE}/runs?branch=${DEFAULT_BRANCH}&event=push&head_sha=${encodeURIComponent(headSha)}&per_page=100`
+    `/repos/${normalizedRepository}/actions/runs?branch=${DEFAULT_BRANCH}&event=push&head_sha=${encodeURIComponent(headSha)}&per_page=100`
   );
   const workflow = verifySourceAcceptanceWorkflowRun(workflowRuns, { headSha });
   const jobsPayload = await ghApi(
