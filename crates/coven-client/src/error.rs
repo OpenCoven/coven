@@ -9,6 +9,8 @@ pub(crate) const UNIX_CONFIGURE_WRITES_OPERATION: &str =
 pub(crate) const WINDOWS_CONNECT_OPERATION: &str = "failed to connect to Coven daemon pipe";
 pub(crate) const WINDOWS_CONFIGURE_WRITES_OPERATION: &str =
     "failed to configure nonblocking Coven daemon pipe writes";
+#[doc(hidden)]
+pub const EMPTY_RESPONSE_TIMEOUT_MESSAGE: &str = "no response bytes arrived before the deadline";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DaemonError {
