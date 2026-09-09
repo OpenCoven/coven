@@ -96,7 +96,7 @@ fn smoke_unsigned_protected_rejection_over_real_daemon() -> Result<()> {
 
         anyhow::ensure!(response.status == 403, "unexpected response: {response:?}");
         anyhow::ensure!(
-            response.body["error"]["code"] == "ward_refused",
+            response.body["error"]["code"] == "protected_proposal_forbidden",
             "unexpected refusal: {}",
             response.body
         );
@@ -117,6 +117,89 @@ fn smoke_unsigned_protected_rejection_over_real_daemon() -> Result<()> {
             |row| row.get(0),
         )?;
         anyhow::ensure!(apply_rows == 0, "refused request appended an apply audit");
+        Ok(())
+    })
+}
+
+#[test]
+fn protected_proposal_routes_never_gain_write_authority() -> Result<()> {
+    run_journey("protected-proposal-route-prohibition", |fixture| {
+        let contents = "# Synthetic forbidden replacement\n";
+        for fingerprint in [json!(PRINCIPAL_FINGERPRINT), Value::Null] {
+            let request = json!({
+                "edits": [{"target": "SOUL.md", "contents": contents}],
+                "principalKeyFingerprint": fingerprint,
+                "approvalId": Uuid::new_v4().to_string(),
+            });
+            let response =
+                fixture.request("POST", "/api/v1/familiars/sage/edits", Some(&request))?;
+            anyhow::ensure!(
+                response.status == 403
+                    && response.body["error"]["code"] == "protected_proposal_forbidden",
+                "protected proposal endpoint accepted a claimed authority: {response:?}"
+            );
+            anyhow::ensure!(
+                !response.body.to_string().contains(contents),
+                "protected rejection echoed proposed content"
+            );
+        }
+        let proposals = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+        anyhow::ensure!(
+            proposals.status == 200 && proposals.body["proposals"] == json!([]),
+            "protected intake created proposal authority: {proposals:?}"
+        );
+        let invented_id = Uuid::new_v4();
+        let approval = fixture.request(
+            "POST",
+            &format!("/api/v1/threads/proposals/{invented_id}/approve"),
+            Some(&json!({"principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+        )?;
+        anyhow::ensure!(
+            approval.status == 404,
+            "invented approval id was not refused: {approval:?}"
+        );
+        fixture.restart_daemon()?;
+        anyhow::ensure!(
+            fs::read_to_string(fixture.workspace.join("SOUL.md"))? == "# Sage\n",
+            "a proposal or restart changed protected bytes"
+        );
+        let conn = fixture.store()?;
+        let applied: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE event_type IN ('apply_audit', 'proposal_approved')",
+            [],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(applied == 0, "forbidden proposal produced apply evidence");
+        Ok(())
+    })
+}
+
+#[test]
+fn protected_rejection_has_durable_non_authorizing_audit() -> Result<()> {
+    run_journey("protected-rejection-audit", |fixture| {
+        let response = fixture.request(
+            "POST",
+            "/api/v1/familiars/sage/edits",
+            Some(&json!({"edits": [{"target": "SOUL.md", "contents": "denied"}]})),
+        )?;
+        anyhow::ensure!(response.status == 403, "unexpected response: {response:?}");
+        let conn = fixture.store()?;
+        let rows: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE familiar_id = ?1 AND event_type = 'validation_verdict'
+               AND decision = 'protected-proposal-forbidden' AND proposal_id IS NULL",
+            [FAMILIAR_ID],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            rows == 1,
+            "protected admission refusal must have exactly one non-authorizing audit row, got {rows}"
+        );
+        anyhow::ensure!(
+            fs::read_to_string(fixture.workspace.join("SOUL.md"))? == "# Sage\n",
+            "audited rejection changed protected bytes"
+        );
         Ok(())
     })
 }
