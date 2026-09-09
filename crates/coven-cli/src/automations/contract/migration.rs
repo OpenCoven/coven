@@ -32,6 +32,7 @@ pub fn lifecycle_state(status: &str) -> &'static str {
     match status {
         "ACTIVE" => "active",
         "PAUSED" => "paused",
+        "DISABLED" => "disabled",
         _ => "draft",
     }
 }
@@ -51,6 +52,13 @@ pub fn migrate_legacy_contract_metadata(conn: &Connection) -> Result<()> {
          ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'draft'
          CHECK (lifecycle_state IN ('draft', 'paused', 'active', 'disabled', 'invalid'))",
     )?;
+    conn.execute(
+        "UPDATE automation_definitions
+         SET lifecycle_state = 'disabled'
+         WHERE status = 'DISABLED' AND lifecycle_state <> 'disabled'",
+        [],
+    )
+    .context("failed to normalize disabled automation lifecycle state")?;
     ensure_column(
         conn,
         "automation_occurrences",
