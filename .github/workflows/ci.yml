@@ -243,6 +243,8 @@ jobs:
       - name: Install native link dependencies
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   rust-test-windows:
     name: Rust tests (Windows)
@@ -263,6 +265,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   # macOS runners bill at roughly ten times the Linux rate, so this follows the
   # npm-onboarding split: a cheap matrix on pull requests, the full one on main.
@@ -289,6 +293,8 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - run: cargo test --workspace --locked
+      - name: Exercise isolated Threads clock feature
+        run: cargo test --locked -p coven-cli --bin coven --features threads-test-clock threads_
 
   afs-mount-linux:
     name: AFS mount backend (Linux)
