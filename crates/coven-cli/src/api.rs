@@ -791,7 +791,9 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                         | "coven.automations.definition.create.v1"
                         | "coven.automations.definition.revise.v1"
                         | "coven.automations.definition.tombstone.v1"
+                        | "coven.automations.run.cancel.v1"
                         | "coven.automations.run"
+                        | "coven.automations.tick"
                         | "coven.automations.unquarantine"
                 )
             {
@@ -12723,6 +12725,1001 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cancellation_replay_is_pending_while_the_first_runtime_stop_is_in_flight(
+    ) -> anyhow::Result<()> {
+        struct BlockingKillRuntime {
+            calls: std::sync::atomic::AtomicUsize,
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+
+        impl SessionRuntime for BlockingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    self.started.send(())?;
+                    self.release
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
+                        .recv()?;
+                    Ok(())
+                } else {
+                    anyhow::bail!("duplicate runtime stop")
+                }
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:concurrent",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = std::sync::Arc::new(BlockingKillRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let first_home = temp_dir.path().to_path_buf();
+        let first_body = body.clone();
+        let first_runtime = std::sync::Arc::clone(&runtime);
+        let first = std::thread::spawn(move || {
+            post_cancellation(&first_home, &first_body, first_runtime.as_ref())
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+
+        let pending = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(pending.status, 409, "{}", pending.body);
+        let pending: Value = serde_json::from_str(&pending.body)?;
+        assert_eq!(pending["error"]["code"], "CANCEL_PENDING");
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a concurrent replay must not issue a second runtime stop"
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let timeout_failures = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            runtime.as_ref(),
+            Utc::now() + chrono::Duration::minutes(31),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(
+            timeout_failures.is_empty(),
+            "timeout enforcement must defer to the cancellation stop owner"
+        );
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "timeout enforcement must not issue a second runtime stop"
+        );
+        let definition = crate::automations::store::get_definition(&conn, "cancellation-target")?
+            .context("fixture definition must exist")?;
+        let definition: Value = serde_json::from_str(&definition.definition_json)?;
+        drop(conn);
+        let conflicting_command = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:cancel:cancellation-target:concurrent",
+            "expectedRevision": 1,
+            "definition": definition
+        })
+        .to_string();
+        let conflict = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&conflicting_command),
+        )?;
+        assert_eq!(conflict.status, 409, "{}", conflict.body);
+        assert!(
+            conflict
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            conflict.body
+        );
+
+        release_tx.send(())?;
+        let completed = first
+            .join()
+            .map_err(|_| anyhow::anyhow!("first cancellation request panicked"))??;
+        assert_eq!(completed.status, 200, "{}", completed.body);
+        let replayed = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(replayed.status, 200, "{}", replayed.body);
+        assert_eq!(runtime.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    struct BlockingTimeoutRuntime {
+        calls: std::sync::atomic::AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    #[test]
+    fn cancellation_after_the_run_deadline_settles_as_timeout() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+            ],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:past-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the overdue request must route through the timeout stop"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (String, String, String, Option<String>) = conn.query_row(
+            "SELECT r.status, o.state, a.state, a.failure_class
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     JOIN automation_attempts AS a ON a.run_id = r.id
+                     WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            lifecycle,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "timed_out".to_string(),
+                Some("timeout".to_string()),
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn crash_after_stop_fence_never_reissues_cancellation_kill() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:fence-crash",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop fence")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+                     SET execution_expires_at = ?2
+                     WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+                     SET execution_expires_at = ?2
+                     WHERE operation_key = ?1",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired stop fence is an unknown external outcome"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_between_reconciliation_and_stop_fence_wins() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let hook_home = temp_dir.path().to_path_buf();
+        let hook_session = session_id.clone();
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+            move || {
+                let conn = store::open_store(&store_path(&hook_home)).unwrap();
+                let completed_at = current_timestamp();
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &hook_session,
+                    "completed",
+                    Some(0),
+                    &completed_at,
+                )
+                .unwrap());
+                assert_eq!(
+                    crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                        .unwrap()
+                        .succeeded,
+                    1
+                );
+            },
+        )));
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-before-fence",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        let history = cancellation_history(temp_dir.path())?;
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_adoption_keys_cannot_alias_attempt_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let attempt_key: String = conn.query_row(
+            "SELECT adoption_key FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let cancel_body = cancellation_body(
+            &attempt_key,
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "must not alias attempt adoption",
+        );
+        let cancellation = post_cancellation(temp_dir.path(), &cancel_body, &NoopSessionRuntime)?;
+        assert_eq!(cancellation.status, 409, "{}", cancellation.body);
+        assert!(
+            cancellation
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            cancellation.body
+        );
+
+        let disable = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": attempt_key,
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "must not alias attempt adoption"
+        })
+        .to_string();
+        let definition = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable),
+        )?;
+        assert_eq!(definition.status, 409, "{}", definition.body);
+        assert!(
+            definition
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            definition.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_adoption_keys_cannot_alias_command_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, _session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let occurrence_id: String = conn.query_row(
+            "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        let command_key = "adopt:cancel:cancellation-target:command-owned";
+        let now = current_timestamp();
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![command_key, "digest", "cancel", now],
+        )?;
+
+        let error = conn
+            .execute(
+                "INSERT INTO automation_attempts (
+                     id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, dispatch_generation, state,
+                     prior_attempt_number, prior_disposition, retry_classification,
+                     not_before, opened_at
+                 ) VALUES (?1, ?2, ?3, 2, ?4, 1, 0, 'adopted',
+                           1, 'failed', 'operator_retry', ?5, ?5)",
+                rusqlite::params![
+                    "attempt-command-key-alias",
+                    run_id,
+                    occurrence_id,
+                    command_key,
+                    now
+                ],
+            )
+            .expect_err("attempt insert must reject a command-owned adoption key");
+        assert!(
+            error
+                .to_string()
+                .contains("automation adoption key is already used by a command"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    impl SessionRuntime for BlockingTimeoutRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.send(())?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
+                .recv()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_defers_to_an_in_flight_timeout_stop() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = std::sync::Arc::new(BlockingTimeoutRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let timeout_home = temp_dir.path().to_path_buf();
+        let timeout_runtime = std::sync::Arc::clone(&runtime);
+        let timeout = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
+            let conn = store::open_store(&store_path(&timeout_home))?;
+            crate::automations::runner::enforce_run_timeouts(
+                &conn,
+                timeout_runtime.as_ref(),
+                Utc::now() + chrono::Duration::minutes(31),
+            )
+            .map_err(anyhow::Error::msg)
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:timeout-owned",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(rejected.status, 409, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"CANCEL_PENDING""#),
+            "{}",
+            rejected.body
+        );
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation must not issue a second runtime stop"
+        );
+
+        release_tx.send(())?;
+        let failures = timeout
+            .join()
+            .map_err(|_| anyhow::anyhow!("timeout enforcement panicked"))??;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(runtime.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cancellation_consumes_a_valid_adoption_key() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let mut invalid: Value = serde_json::from_str(&cancellation_body(
+            "adopt:cancel:cancellation-target:invalid",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        ))?;
+        invalid["scope"] = json!("attempt");
+        let invalid_body = serde_json::to_string(&invalid)?;
+        let rejected = post_cancellation(temp_dir.path(), &invalid_body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+
+        invalid["scope"] = json!("run");
+        let corrected_body = serde_json::to_string(&invalid)?;
+        let replay_mismatch =
+            post_cancellation(temp_dir.path(), &corrected_body, &NoopSessionRuntime)?;
+        assert_eq!(replay_mismatch.status, 409, "{}", replay_mismatch.body);
+        let replay_mismatch: Value = serde_json::from_str(&replay_mismatch.body)?;
+        assert_eq!(replay_mismatch["error"]["code"], "ADOPTION_REPLAY_MISMATCH");
+        Ok(())
+    }
+
+    #[test]
+    fn expired_stopping_cancellation_never_reissues_the_runtime_stop() -> anyhow::Result<()> {
+        struct PanicKillRuntime {
+            home: std::path::PathBuf,
+            session_id: String,
+        }
+
+        impl SessionRuntime for PanicKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let conn = store::open_store(&store_path(&self.home))?;
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &self.session_id,
+                    "failed",
+                    Some(1),
+                    &current_timestamp(),
+                )?);
+                panic!("synthetic crash after the durable stopping transition")
+            }
+        }
+
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:crash-window",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let crashing_runtime = PanicKillRuntime {
+            home: temp_dir.path().to_path_buf(),
+            session_id: session_id.clone(),
+        };
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &crashing_runtime)
+        }));
+        assert!(
+            crashed.is_err(),
+            "the fixture must simulate a process crash"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:crash-window",
+                (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+            ],
+        )?;
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let reconciled = crate::automations::cancellation::reconcile_expired_cancellations(
+            &conn,
+            &runtime,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            reconciled, 1,
+            "daemon reconciliation must consume the expired cancellation without client replay"
+        );
+        drop(conn);
+        let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired stopping lease represents an unknown outcome and must never repeat kill"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:requested-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(
+            crashed.is_err(),
+            "the fixture must leave a requested cancellation for recovery"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:requested-timeout",
+                expired
+            ],
+        )?;
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only timeout authority may stop the expired run"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:requested-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        drop(conn);
+
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(runtime.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:replay-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }))
+        .is_err());
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:replay-timeout", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the replay must route the stop through timeout authority"
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:replay-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cancellation_executor_cannot_fence_timeout_recovery() -> anyhow::Result<()> {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-executor",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let executor_body = body.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_stop_fence_clock_test_hook(Some(Box::new(
+                || Utc::now() + chrono::Duration::seconds(31),
+            )));
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &executor_body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:stale-executor", expired],
+        )?;
+        let timeout_runtime = CountingKillRuntime(calls.clone());
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &timeout_runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        resume_tx.send(())?;
+        let stale_response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("stale cancellation executor panicked"))??;
+        assert_eq!(stale_response.status, 422, "{}", stale_response.body);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale cancellation executor must not issue a second stop"
+        );
+        let cancellation_fences: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_stop_fences
+             WHERE run_id = ?1 AND owner = 'cancellation'",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cancellation_fences, 0);
+        let states: (String, String) = conn.query_row(
+            "SELECT r.status, a.state
+             FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(states, ("failed".into(), "timed_out".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_cancellation_executor_rechecks_deadline_before_stop_ownership() -> anyhow::Result<()>
+    {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:paused-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        resume_tx.send(())?;
+        let response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("paused cancellation executor panicked"))??;
+        assert_eq!(response.status, 422, "{}", response.body);
+        assert!(
+            response.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resumed executor must route the stop through timeout authority"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:paused-deadline"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
     fn afs_session_create_get_and_list_round_trip() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let root = afs_project(temp.path());
@@ -14919,6 +15916,992 @@ pub(crate) mod tests {
             response.body.contains(r#""status":"running""#),
             "{}",
             response.body
+        );
+        Ok(())
+    }
+
+    fn start_running_automation_for_cancellation(
+    ) -> anyhow::Result<(tempfile::TempDir, String, String, String)> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:cancellation-target:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "cancellation-target",
+                "name": "Cancellation target",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "retry": {
+                    "maxAttempts": 2,
+                    "backoffPolicy": "none",
+                    "retryableClasses": ["runtime_unavailable"]
+                },
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "familiarId": "charm",
+                "prompt": "Wait for cancellation."
+            }
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let started = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&run_body),
+        )?;
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: Value = serde_json::from_str(&started.body)?;
+        let run_id = started["event"]["payload"]["runId"]
+            .as_str()
+            .context("run action must return a run id")?
+            .to_string();
+        let session_id = started["event"]["payload"]["sessionId"]
+            .as_str()
+            .context("run action must return a runtime correlation")?
+            .to_string();
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        assert_eq!(history.status, 200, "{}", history.body);
+        let history: Value = serde_json::from_str(&history.body)?;
+        let attempt_id = history["event"]["payload"]["runs"][0]["attempts"][0]["id"]
+            .as_str()
+            .context("running automation must expose its current attempt")?
+            .to_string();
+        Ok((temp_dir, run_id, attempt_id, session_id))
+    }
+
+    fn cancellation_body(
+        adoption_key: &str,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> String {
+        json!({
+            "action": "coven.automations.run.cancel.v1",
+            "adoptionKey": adoption_key,
+            "runId": run_id,
+            "attemptId": attempt_id,
+            "runtimeCorrelation": { "sessionId": session_id },
+            "scope": "run",
+            "reason": reason,
+            "requestedBy": { "principalId": "operator:aria" }
+        })
+        .to_string()
+    }
+
+    fn post_cancellation(
+        coven_home: &std::path::Path,
+        body: &str,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_runtime(
+            "POST",
+            "/api/v1/actions",
+            coven_home,
+            None,
+            Some(body),
+            runtime,
+        )
+    }
+
+    fn cancellation_history(coven_home: &std::path::Path) -> anyhow::Result<Value> {
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            coven_home,
+            None,
+            Some(&history_body),
+        )?;
+        assert_eq!(history.status, 200, "{}", history.body);
+        Ok(serde_json::from_str(&history.body)?)
+    }
+
+    fn assert_rejected_cancellation_preserves_live_attempt(
+        coven_home: &std::path::Path,
+        rejected: ApiResponse,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
+        );
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+
+        let history = cancellation_history(coven_home)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_attempt_without_corrupting_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-attempt",
+            &run_id,
+            "attempt-stale",
+            &session_id,
+            "stale attempt",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_runtime_correlation_without_corrupting_attempt(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-runtime",
+            &run_id,
+            &attempt_id,
+            "session-stale",
+            "stale runtime correlation",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_run_without_corrupting_attempt_or_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-run",
+            "run-stale",
+            &attempt_id,
+            &session_id,
+            "stale run",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_persists_its_lifecycle_and_survives_definition_tombstone() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let cancel_body = cancellation_body(
+            "adopt:cancel:cancellation-target:0003",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let cancelled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.body);
+        let cancelled: Value = serde_json::from_str(&cancelled.body)?;
+        let payload = &cancelled["event"]["payload"];
+        assert_eq!(payload["runId"], run_id);
+        assert_eq!(payload["attemptId"], attempt_id);
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(
+            payload["cancellation"]["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(payload["cancellation"]["scope"], "run");
+        assert_eq!(
+            payload["cancellation"]["reason"],
+            "operator requested shutdown"
+        );
+        assert!(payload["cancellation"]["requestedAt"].is_string());
+        assert!(payload["cancellation"]["acknowledgedAt"].is_string());
+        assert!(payload["cancellation"]["reconciledAt"].is_string());
+        let requested_at = payload["cancellation"]["requestedAt"]
+            .as_str()
+            .context("cancellation must persist requestedAt")?;
+        let acknowledged_at = payload["cancellation"]["acknowledgedAt"]
+            .as_str()
+            .context("cancellation must persist acknowledgedAt")?;
+        let reconciled_at = payload["cancellation"]["reconciledAt"]
+            .as_str()
+            .context("cancellation must persist reconciledAt")?;
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(requested_at)?
+                <= chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                && chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                    <= chrono::DateTime::parse_from_rfc3339(reconciled_at)?,
+            "cancellation lifecycle timestamps must be persisted in requested → acknowledged → reconciled order"
+        );
+
+        let replayed = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(replayed.status, 200, "{}", replayed.body);
+        let replayed: Value = serde_json::from_str(&replayed.body)?;
+        let replayed_cancellation = &replayed["event"]["payload"]["cancellation"];
+        assert_eq!(replayed_cancellation["requestedAt"], requested_at);
+        assert_eq!(replayed_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(replayed_cancellation["reconciledAt"], reconciled_at);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let persisted_history = &history["event"]["payload"]["runs"][0]["cancellation"];
+        assert_eq!(persisted_history["status"], "cancelled");
+        assert_eq!(persisted_history["scope"], "run");
+        assert_eq!(
+            persisted_history["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_history["reason"], "operator requested shutdown");
+        assert_eq!(persisted_history["requestedAt"], requested_at);
+        assert_eq!(persisted_history["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_history["reconciledAt"], reconciled_at);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let persisted_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'
+               AND command = 'run.cancel.v1'
+               AND automation_id = ?1
+               AND outcome = 'committed'",
+            ["cancellation-target"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            persisted_adoptions, 1,
+            "the cancellation request must have exactly one durable adopted lifecycle record"
+        );
+        let persisted_response: String = conn.query_row(
+            "SELECT response_json FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'",
+            [],
+            |row| row.get(0),
+        )?;
+        let persisted_response: Value = serde_json::from_str(&persisted_response)?;
+        let persisted_cancellation = &persisted_response["result"]["cancellation"];
+        assert_eq!(persisted_cancellation["requestedAt"], requested_at);
+        assert_eq!(persisted_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_cancellation["reconciledAt"], reconciled_at);
+        assert_eq!(
+            persisted_cancellation["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_cancellation["scope"], "run");
+        assert_eq!(
+            persisted_cancellation["reason"],
+            "operator requested shutdown"
+        );
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &current_timestamp(),
+            )?,
+            "a completion observed after cancellation must not rewrite its terminal session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?,
+            crate::automations::runner::SettlementReport::default(),
+            "a losing completion observation must not settle the cancelled run again"
+        );
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        let history: Value = serde_json::from_str(&history.body)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "cancelled");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "cancelled");
+        assert_eq!(run["attempts"][0]["failureClass"], "cancelled");
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_runs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_runs
+             WHERE id = ?1
+               AND status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions
+             WHERE id = ?1
+               AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')",
+            [&session_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_attempts, 1, "exactly one attempt may terminalize");
+        assert_eq!(terminal_runs, 1, "exactly one run may terminalize");
+        assert_eq!(
+            terminal_sessions, 1,
+            "exactly one session terminal evidence is allowed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_wins_over_late_cancellation_without_rewriting_terminal_evidence(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let completed_at = current_timestamp();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(
+            store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &completed_at,
+            )?,
+            "the first completion observation must terminalize the running session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .succeeded,
+            1
+        );
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-won",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
+        );
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "succeeded");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "succeeded");
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_attempts, 1,
+            "a losing cancel observation must not create another terminal attempt"
+        );
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "cancelled",
+                None,
+                &current_timestamp(),
+            )?,
+            "a later cancellation observation must not rewrite completion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_during_an_unconfirmed_stop_rejects_and_releases_the_cancellation(
+    ) -> anyhow::Result<()> {
+        struct CompletingKillRuntime {
+            home: std::path::PathBuf,
+            session_id: String,
+        }
+
+        impl SessionRuntime for CompletingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let conn = store::open_store(&store_path(&self.home))?;
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &self.session_id,
+                    "completed",
+                    Some(0),
+                    &current_timestamp(),
+                )?);
+                anyhow::bail!("runtime stop lost to terminal completion")
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-during-stop",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let runtime = CompletingKillRuntime {
+            home: temp_dir.path().to_path_buf(),
+            session_id,
+        };
+        let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        let replayed = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(replayed.status, 422, "{}", replayed.body);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let state: String = conn.query_row(
+            "SELECT state FROM automation_cancellations WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(state, "rejected");
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_reservations
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:completion-during-stop'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    struct UnconfirmedCancellationStopRuntime;
+
+    impl SessionRuntime for UnconfirmedCancellationStopRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("the cancellation test starts its run with the noop runtime")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("synthetic runtime did not confirm cancellation")
+        }
+    }
+
+    #[test]
+    fn cancellation_with_unconfirmed_runtime_stop_enters_recovery_without_retry(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:unconfirmed-stop",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "runtime has stopped responding",
+        );
+        let response =
+            post_cancellation(temp_dir.path(), &body, &UnconfirmedCancellationStopRuntime)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            response["event"]["payload"]["status"], "recovery_required",
+            "an unconfirmed stop must remain explainably recoverable, not be reported cancelled"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT o.state, a.state, a.failure_class, a.state_reason, r.status, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+            [&run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(lifecycle.0, "recovery_required");
+        assert_eq!(lifecycle.1, "ambiguous");
+        assert_eq!(lifecycle.2.as_deref(), Some("ambiguous_evidence"));
+        assert_eq!(
+            lifecycle.3.as_deref(),
+            Some("cancellation stop was not confirmed")
+        );
+        assert_eq!(lifecycle.4, "running");
+        assert_eq!(lifecycle.5, "running");
+        let attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            attempts, 1,
+            "unconfirmed cancellation must not schedule an automatic retry even when retry is configured"
+        );
+        let timeout_failures = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            &NoopSessionRuntime,
+            Utc::now() + chrono::Duration::minutes(31),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(
+            timeout_failures.is_empty(),
+            "recovery-required work must not be stopped again by timeout enforcement"
+        );
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        let settlement = crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(settlement.failed, 1);
+        let reconciled: (String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT o.state, a.state, r.status, a.settled_at, r.finished_at
+             FROM automation_occurrences AS o
+             JOIN automation_runs AS r ON r.occurrence_id = o.id
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [&run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(reconciled.0, "failed");
+        assert_eq!(
+            reconciled.1, "ambiguous",
+            "later evidence must not rewrite the immutable ambiguous attempt"
+        );
+        assert_eq!(reconciled.2, "failed");
+        assert_eq!(
+            reconciled.3, reconciled.4,
+            "ambiguous receipt correlation requires one terminal settlement timestamp"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_a_definition_stops_planning_without_rewriting_its_active_run() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            definition_status, "ACTIVE",
+            "the fixture must start active so its planning assertion is non-vacuous"
+        );
+        let before_disable = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_disable.planned.is_empty(),
+            "the active definition must plan a future occurrence before disable"
+        );
+        let planned_before_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let disable_body = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": "adopt:disable:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "operator disabled future runs"
+        })
+        .to_string();
+
+        let disabled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable_body),
+        )?;
+        assert_eq!(disabled.status, 200, "{}", disabled.body);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let record = crate::automations::store::get_definition(&conn, "cancellation-target")?
+            .context("disabled definition must remain readable")?;
+        let mut revised_definition: Value = serde_json::from_str(&record.definition_json)?;
+        revised_definition["status"] = json!("ACTIVE");
+        drop(conn);
+        let revise_body = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:cancellation-target:disabled",
+            "expectedRevision": 2,
+            "definition": revised_definition
+        })
+        .to_string();
+        let rejected_reactivation = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&revise_body),
+        )?;
+        assert_eq!(
+            rejected_reactivation.status, 422,
+            "{}",
+            rejected_reactivation.body
+        );
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_status, "DISABLED");
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a disabled definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_disable, planned_before_disable,
+            "disable must prevent future planning without rewriting the existing run"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_definitions_cannot_bypass_explicit_lifecycle_commands() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let definition = |id: &str, status: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Lifecycle guard",
+                "status": status,
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Preserve explicit lifecycle authority."
+            })
+        };
+        let legacy_create = json!({
+            "action": "coven.automations.create",
+            "definition": definition("legacy-lifecycle-guard", "ACTIVE")
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_create),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let disable = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": "adopt:disable:legacy-lifecycle-guard:0001",
+            "expectedRevision": 1,
+            "id": "legacy-lifecycle-guard"
+        })
+        .to_string();
+        let disabled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable),
+        )?;
+        assert_eq!(disabled.status, 200, "{}", disabled.body);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_definitions
+             SET lifecycle_state = 'draft'
+             WHERE id = 'legacy-lifecycle-guard' AND status = 'DISABLED'",
+            [],
+        )?;
+        drop(conn);
+
+        let legacy_reactivation = json!({
+            "action": "coven.automations.update",
+            "definition": definition("legacy-lifecycle-guard", "ACTIVE")
+        })
+        .to_string();
+        let rejected = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_reactivation),
+        )?;
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+
+        for (action, adoption_key, id, expected_status) in [
+            (
+                "coven.automations.create",
+                None,
+                "legacy-created-disabled",
+                400,
+            ),
+            (
+                "coven.automations.definition.create.v1",
+                Some("adopt:create:disabled-lifecycle-guard:0001"),
+                "v1-created-disabled",
+                422,
+            ),
+        ] {
+            let mut request = json!({
+                "action": action,
+                "definition": definition(id, "DISABLED")
+            });
+            if let Some(adoption_key) = adoption_key {
+                request["adoptionKey"] = json!(adoption_key);
+            }
+            let rejected = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&request.to_string()),
+            )?;
+            assert_eq!(rejected.status, expected_status, "{}", rejected.body);
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let status: String = conn.query_row(
+            "SELECT status FROM automation_definitions
+             WHERE id = 'legacy-lifecycle-guard'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "DISABLED");
+        Ok(())
+    }
+
+    #[test]
+    fn tombstoning_an_active_definition_stops_future_planning_without_rewriting_its_run(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let before_tombstone = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_tombstone.planned.is_empty(),
+            "the active definition must plan before its tombstone is applied"
+        );
+        let planned_before_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:planning",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a tombstoned definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_tombstone, planned_before_tombstone,
+            "tombstoning must retain in-flight history without creating future occurrences"
         );
         Ok(())
     }
