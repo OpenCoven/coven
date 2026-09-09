@@ -392,7 +392,7 @@ pub fn settle_occurrence(
                  lease_owner = NULL,
                  lease_expires_at = NULL,
                  updated_at = ?4
-             WHERE id = ?1 AND state IN ('claimed', 'running')",
+             WHERE id = ?1 AND state IN ('claimed', 'running', 'recovery_required')",
             params![occurrence_id, terminal_state, failure_reason, now_iso],
         )
         .map_err(|error| format!("failed to settle occurrence: {error}"))?;
