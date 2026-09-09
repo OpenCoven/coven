@@ -1,6 +1,7 @@
 # Mobile Device Trust Architecture
 
 **Status:** accepted architecture for the `#784`–`#788` mobile connection track  
+**Implementation:** `#786` self-hosted Rust authority and CLI lifecycle complete; native platform key generation remains a client contract
 **Authority owner:** Coven daemon / Rust authority layer  
 **Applies to:** Coven CLI/TUI, Cave and other native clients, rendezvous/relay services, and future recovery providers
 
@@ -194,6 +195,81 @@ The first capability taxonomy must distinguish at least:
 
 Unknown scopes fail closed. Scope ordering and encoding are canonical. Grants are audience-bound, cannot widen themselves, and are re-evaluated on session resumption.
 
+### Self-hosted device administration
+
+The Rust authority exposes device management without moving policy decisions
+into clap handlers:
+
+```text
+coven device list [--json]
+coven device inspect <device> [--json]
+coven device rename <device> <name>
+coven device revoke <device> [--reason ordinary|lost|suspected-compromise|retired]
+coven device grant reissue <device> \
+  --scope <scope>[,<scope>...] \
+  --minimum-assurance <level> \
+  [--require-fresh-user-verification-for <scope>[,<scope>...]] \
+  --expires-in-days <1..365> \
+  [--direct-only]
+coven device rotate <old-device> <replacement-device>
+```
+
+`<device>` is an exact UUID or exact display name; ambiguous names fail closed.
+CLI scope input is sorted before submission, duplicates are rejected, and the
+authority independently requires canonical sorted unique scopes and
+restrictions. Every edit is a reissue: it creates a fresh grant id, advances
+the revocation epoch, and therefore invalidates outstanding sessions and
+assurance challenges. Reissued grants require an absolute expiry no more than
+365 days after issuance. Existing protocol-v1 grants remain readable and
+revocable without being widened, and all legacy
+`coven memory mobile ...` commands remain supported.
+
+Grant reissue and device rotation both persist their authority mutation and a
+redacted audit transition in the same atomic `devices.json` replacement. Audit
+delivery uses one process lock plus one interprocess `.audit.lock` for ordinary
+appends and transition read-modify-replace writes. A successful durable write
+returns an internal delivery receipt; only that receipt can acknowledge the
+registry outbox. Retries deliver or deduplicate the pending event and return
+the already-issued grant instead of advancing its id or epoch again when the
+canonical requested-policy digest matches. The digest covers sorted scopes,
+restrictions, minimum assurance, and requested lifetime. If a different policy
+arrives while audit delivery is pending, the authority first delivers and
+acknowledges the prior event, then creates and audits a new grant revision for
+the new policy; it never reports the new request as successful while retaining
+the prior policy.
+
+Transition audit recovery treats a complete JSON record at EOF as evidence
+even when its trailing newline was not persisted, adding only the separator
+needed for the next record. An incomplete or corrupt final suffix is removed
+atomically, while corruption before later complete evidence remains a
+fail-closed error.
+
+List and inspect projections omit possession and authorization public keys,
+subject-key hashes, signatures, nonces, and challenge material. They expose
+only operational identifiers and policy state: device/grant status, scopes,
+transport restriction, minimum assurance, per-scope fresh-verification
+requirements, expiry, revocation epoch, and authorization-key class/status.
+
+Key replacement never accepts a raw private credential. The replacement device
+first completes normal pairing with its own public key and proof of possession.
+`coven device rotate` then revokes the old device before reissuing its policy
+against the already-enrolled replacement key. The replacement grant gets a
+fresh identity and advanced revocation epoch; a legacy unbounded source policy
+is narrowed to the maximum 365-day window. Rotation reloads and conditionally
+checks both grant revisions under one device-registry lock, verifies that the
+replacement's transcript-enrolled authorization-key class can satisfy the
+transferred assurance policy, and atomically writes source revocation,
+replacement reissue, and a durable two-device audit transition. The registry
+lock is then released before revoking the source authorization key. A registry
+write failure therefore leaves both device and authorization-key state
+unchanged; an authorization-key cleanup failure leaves the source device
+durably denied and the transition retryable. Pending-transition retry completes
+that cleanup from the committed source device id and revocation state without
+depending on the replacement's current grant. A later replacement reissue or
+revocation is preserved and cannot strand cleanup or cause the historical
+policy to be applied again. Audit append and outbox acknowledgement also occur
+without nesting registry and audit locks.
+
 ## Biometrics and step-up authorization
 
 OpenCoven never receives a face image, fingerprint template, biometric hash, or platform biometric identifier.
@@ -321,7 +397,7 @@ The migration is additive and staged:
 
 - `#784` — this architecture, threat model, authority boundary, and migration contract.
 - `#785` — versioned pairing offer, transcript hardening, portable test vectors, and E2EE rendezvous handshake.
-- `#786` — generalized grants, assurance policy, exact-action authorization, device management, and registry migration.
+- `#786` — implemented: generalized grants, assurance policy, exact-action authorization, privacy-safe device management, bounded grant reissue, safe device re-enrollment, and registry migration.
 - `#787` — relay-first reconnect, local discovery fast path, session resumption, and push-as-wakeup semantics.
 - `#788` — trusted-device introduction, passkey/recovery contracts, threshold policy, and optional attestation.
 
