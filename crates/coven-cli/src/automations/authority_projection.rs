@@ -19,7 +19,7 @@ use super::contract::authority::{
     AuthorityProfile, AuthorityRisk, AuthorityRuntimeBinding, AuthorityTimestamp,
     AutomationAuthorityExtension, AutomationExecutionBinding,
 };
-use super::contract::types::{DigestValue, PrincipalId};
+use super::contract::types::{AttemptId, DigestValue, OccurrenceId, PrincipalId, RunId};
 
 /// Bounded, immutable authority evidence suitable for an external execution
 /// consumer or reconciliation surface.
@@ -40,6 +40,10 @@ pub struct AutomationAuthorityConsumerProjection {
     pub profile: AuthorityProfile,
     pub binding_id: AuthorityOpaqueIdentifier,
     pub binding_digest: DigestValue,
+    pub occurrence_id: OccurrenceId,
+    pub run_id: RunId,
+    pub attempt_id: AttemptId,
+    pub authorization_valid_until: AuthorityTimestamp,
     pub principal_id: PrincipalId,
     pub familiar_root_id: AuthorityOpaqueIdentifier,
     pub identity_revision_id: AuthorityOpaqueIdentifier,
@@ -69,6 +73,10 @@ impl AutomationAuthorityConsumerProjection {
             profile: binding.profile,
             binding_id: binding.binding_id.clone(),
             binding_digest: binding.integrity.clone(),
+            occurrence_id: binding.base.occurrence_id.clone(),
+            run_id: binding.base.run_id.clone(),
+            attempt_id: binding.base.attempt_id.clone(),
+            authorization_valid_until: binding.authorization.valid_until.clone(),
             principal_id: binding.principal.principal_id.clone(),
             familiar_root_id: binding.familiar.familiar_root_id.clone(),
             identity_revision_id: binding.familiar.identity_revision_id.clone(),

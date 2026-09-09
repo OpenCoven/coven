@@ -3737,7 +3737,7 @@ mod tests {
                     "consumer projection exposed `{omitted}`"
                 );
             }
-            let (profile, extension): (Option<String>, Option<String>) = self.conn.query_row(
+            let (profile, extension): (Option<String>, String) = self.conn.query_row(
                 "SELECT r.authority_profile, a.authority_extension_json
                  FROM automation_runs AS r
                  JOIN automation_attempts AS a ON a.run_id = r.id
@@ -3749,9 +3749,14 @@ mod tests {
                 profile.as_deref() == Some("coven.automations.authority.v1"),
                 "runtime launch observed an unpinned authority profile"
             );
-            anyhow::ensure!(
-                extension.is_some(),
-                "runtime launch observed an unpinned authority extension"
+            let extension: serde_json::Value = serde_json::from_str(&extension)?;
+            let binding = &extension["executionBinding"];
+            assert_eq!(projected["occurrenceId"], binding["base"]["occurrenceId"]);
+            assert_eq!(projected["runId"], binding["base"]["runId"]);
+            assert_eq!(projected["attemptId"], binding["base"]["attemptId"]);
+            assert_eq!(
+                projected["authorizationValidUntil"],
+                binding["authorization"]["validUntil"]
             );
             ownership_established()
         }
@@ -4559,6 +4564,7 @@ mod tests {
             clock: &mut clock,
             cancelled: &cancelled,
             authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
         };
 
         let dispatch = dispatch_occurrence_with_clock(
