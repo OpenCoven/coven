@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
-//! Advisory real-daemon smoke coverage for the first three Threads journeys.
+//! Advisory real-daemon smoke coverage for the first three Threads journeys,
+//! plus same-home daemon lifecycle scaffolding for future restart/replay work.
 //! Full closure still requires the remaining journeys and their stronger
 //! authentication, terminal-audit, deterministic-time, and restart assertions.
 
@@ -238,6 +239,99 @@ fn http_client_rejects_truncated_response_body() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> {
+    let evidence = EvidenceContext::new("same-home-daemon-lifecycle");
+    let mut fixture = ThreadsFixture::start(&evidence)?;
+    let journey_result = (|| {
+        fixture.restart_daemon()?;
+        let restarted = fixture.request("GET", "/health", None)?;
+        anyhow::ensure!(
+            restarted.status == 200 && restarted.body["ok"] == true,
+            "daemon was not healthy after same-home restart: {restarted:?}"
+        );
+
+        fixture.stop_daemon()?;
+        fixture.start_daemon()?;
+        let restarted_after_stop = fixture.request("GET", "/health", None)?;
+        anyhow::ensure!(
+            restarted_after_stop.status == 200 && restarted_after_stop.body["ok"] == true,
+            "daemon was not healthy after same-home stop/start: {restarted_after_stop:?}"
+        );
+
+        fixture.stop_daemon()?;
+        fixture.restart_daemon()?;
+        let restarted_from_stopped = fixture.request("GET", "/health", None)?;
+        anyhow::ensure!(
+            restarted_from_stopped.status == 200 && restarted_from_stopped.body["ok"] == true,
+            "daemon was not healthy after restart from stopped: {restarted_from_stopped:?}"
+        );
+
+        fixture.crash_daemon()?;
+        fixture.start_daemon()?;
+        let restarted_after_crash = fixture.request("GET", "/health", None)?;
+        anyhow::ensure!(
+            restarted_after_crash.status == 200 && restarted_after_crash.body["ok"] == true,
+            "daemon was not healthy after crash recovery start: {restarted_after_crash:?}"
+        );
+        Ok(())
+    })();
+    finalize_journey_with_artifact_check(&mut fixture, journey_result, |fixture| {
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(fixture.artifact_dir.join("manifest.json"))?)?;
+        anyhow::ensure!(
+            manifest["result"] == "passed",
+            "successful lifecycle run did not persist passed provenance: {manifest}"
+        );
+        let lifecycle = manifest["daemon_lifecycle"]
+            .as_array()
+            .context("success manifest is missing daemon_lifecycle")?;
+        let operations = lifecycle
+            .iter()
+            .map(|event| {
+                event["operation"]
+                    .as_str()
+                    .context("daemon lifecycle entry is missing operation")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        anyhow::ensure!(
+            operations
+                == [
+                    "daemon start",
+                    "daemon restart",
+                    "daemon stop",
+                    "daemon start",
+                    "daemon stop",
+                    "daemon restart",
+                    "daemon crash",
+                    "daemon start",
+                    "daemon stop",
+                ],
+            "unexpected lifecycle sequence in success provenance: {operations:?}"
+        );
+
+        let daemon_log = fs::read_to_string(fixture.artifact_dir.join("logs/daemon.log"))?;
+        anyhow::ensure!(
+            !daemon_log.contains(&fixture.coven_home.display().to_string())
+                && !daemon_log.contains(&fixture.workspace.display().to_string()),
+            "success daemon log leaked unsanitized fixture paths:\n{daemon_log}"
+        );
+        anyhow::ensure!(
+            daemon_log.contains("socket <coven-home>/coven.sock")
+                && !daemon_log.contains("/private<coven-home>"),
+            "success daemon log did not retain the sanitized socket placeholder:\n{daemon_log}"
+        );
+
+        let response: Value =
+            serde_json::from_slice(&fs::read(fixture.artifact_dir.join("response.json"))?)?;
+        anyhow::ensure!(
+            response["body"]["daemon"]["socket"] == "<coven-home>/coven.sock",
+            "success response provenance did not sanitize the socket path: {response}"
+        );
+        Ok(())
+    })
+}
+
 fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>) -> Result<()> {
     let evidence = EvidenceContext::new(name);
     let mut fixture = match ThreadsFixture::start(&evidence) {
@@ -248,8 +342,20 @@ fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<(
         }
     };
     let journey_result = journey(&mut fixture);
+    finalize_journey(&mut fixture, journey_result)
+}
+
+fn finalize_journey(fixture: &mut ThreadsFixture, journey_result: Result<()>) -> Result<()> {
+    finalize_journey_with_artifact_check(fixture, journey_result, |_| Ok(()))
+}
+
+fn finalize_journey_with_artifact_check(
+    fixture: &mut ThreadsFixture,
+    journey_result: Result<()>,
+    verify_artifacts: impl FnOnce(&ThreadsFixture) -> Result<()>,
+) -> Result<()> {
     let shutdown_result = fixture.shutdown();
-    let result = match (journey_result, shutdown_result) {
+    let mut result = match (journey_result, shutdown_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) => Err(error),
         (Ok(()), Err(error)) => Err(error.context("journey passed but daemon shutdown failed")),
@@ -258,8 +364,16 @@ fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<(
         ))),
     };
     fixture.write_junit(result.as_ref().err())?;
-    if let Err(error) = &result {
-        fixture.write_failure_evidence(error)?;
+    fixture.write_run_provenance(result.as_ref().err())?;
+    if result.is_ok() {
+        if let Err(error) = verify_artifacts(fixture) {
+            result = Err(error);
+            fixture.write_junit(result.as_ref().err())?;
+            fixture.write_run_provenance(result.as_ref().err())?;
+        }
+    }
+    if result.is_err() {
+        fixture.write_failure_evidence()?;
     }
     result
 }
@@ -268,6 +382,90 @@ fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<(
 struct HttpResponse {
     status: u16,
     body: Value,
+}
+
+#[derive(Debug)]
+struct DaemonLifecycleEvent {
+    operation: &'static str,
+    pid_before: Option<u32>,
+    pid_after: Option<u32>,
+    command_status: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    note: Option<String>,
+}
+
+impl DaemonLifecycleEvent {
+    fn from_output(
+        operation: &'static str,
+        pid_before: Option<u32>,
+        pid_after: Option<u32>,
+        output: &Output,
+        note: Option<String>,
+    ) -> Self {
+        Self {
+            operation,
+            pid_before,
+            pid_after,
+            command_status: output.status.code(),
+            stdout: Some(String::from_utf8_lossy(&output.stdout).into_owned()),
+            stderr: Some(String::from_utf8_lossy(&output.stderr).into_owned()),
+            note,
+        }
+    }
+
+    fn note(operation: &'static str, pid_before: Option<u32>, note: impl Into<String>) -> Self {
+        Self {
+            operation,
+            pid_before,
+            pid_after: None,
+            command_status: None,
+            stdout: None,
+            stderr: None,
+            note: Some(note.into()),
+        }
+    }
+
+    fn as_json(&self) -> Value {
+        json!({
+            "operation": self.operation,
+            "pid_before": self.pid_before,
+            "pid_after": self.pid_after,
+            "command_status": self.command_status,
+            "note": self.note,
+        })
+    }
+
+    fn render_log(&self) -> String {
+        let mut output = format!("event: {}\n", self.operation);
+        if let Some(pid_before) = self.pid_before {
+            output.push_str(&format!("pid_before: {pid_before}\n"));
+        }
+        if let Some(pid_after) = self.pid_after {
+            output.push_str(&format!("pid_after: {pid_after}\n"));
+        }
+        if let Some(command_status) = self.command_status {
+            output.push_str(&format!("command_status: {command_status}\n"));
+        }
+        if let Some(note) = &self.note {
+            output.push_str(&format!("note: {note}\n"));
+        }
+        if let Some(stdout) = &self.stdout {
+            output.push_str("stdout:\n");
+            output.push_str(stdout);
+            if !stdout.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        if let Some(stderr) = &self.stderr {
+            output.push_str("stderr:\n");
+            output.push_str(stderr);
+            if !stderr.ends_with('\n') {
+                output.push('\n');
+            }
+        }
+        output
+    }
 }
 
 struct ThreadsFixture {
@@ -287,8 +485,8 @@ struct ThreadsFixture {
     local_threads_override_active: bool,
     last_request: Option<Value>,
     last_response: Option<Value>,
-    daemon_start: Output,
-    daemon_pid: u32,
+    daemon_events: Vec<DaemonLifecycleEvent>,
+    daemon_pid: Option<u32>,
     stopped: bool,
 }
 
@@ -324,15 +522,7 @@ impl ThreadsFixture {
 
         let coven = PathBuf::from(env!("CARGO_BIN_EXE_coven"));
         let path = std::env::var_os("PATH").unwrap_or_default();
-        let daemon_start = run_coven(&coven, &coven_home, &path, &["daemon", "start"])?;
-        anyhow::ensure!(
-            daemon_start.status.success(),
-            "daemon start failed\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&daemon_start.stdout),
-            String::from_utf8_lossy(&daemon_start.stderr)
-        );
-        let daemon_pid = daemon_pid(&coven_home)?;
-        let fixture = Self {
+        let mut fixture = Self {
             _temp: temp,
             coven,
             coven_home,
@@ -349,11 +539,11 @@ impl ThreadsFixture {
             local_threads_override_active,
             last_request: None,
             last_response: None,
-            daemon_start,
-            daemon_pid,
+            daemon_events: Vec::new(),
+            daemon_pid: None,
             stopped: false,
         };
-        wait_for_daemon_health(&fixture.coven_home)?;
+        fixture.start_daemon()?;
         Ok(fixture)
     }
 
@@ -383,22 +573,133 @@ impl ThreadsFixture {
         Connection::open(self.coven_home.join("coven.sqlite3")).map_err(Into::into)
     }
 
-    fn shutdown(&mut self) -> Result<()> {
-        let output = run_coven(
-            &self.coven,
-            &self.coven_home,
-            &self.path,
-            &["daemon", "stop"],
-        )?;
+    fn current_daemon_pid(&self) -> Option<u32> {
+        self.daemon_pid
+            .filter(|pid| pid_is_alive(*pid))
+            .or_else(|| {
+                daemon_pid(&self.coven_home)
+                    .ok()
+                    .filter(|pid| pid_is_alive(*pid))
+            })
+    }
+
+    fn daemon_command(&self, args: &[&str]) -> Result<Output> {
+        run_coven(&self.coven, &self.coven_home, &self.path, args)
+    }
+
+    fn start_daemon(&mut self) -> Result<()> {
+        let pid_before = self.current_daemon_pid();
+        self.stopped = false;
+        let output = self.daemon_command(&["daemon", "start"])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "daemon start failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let health_result = wait_for_daemon_health(&self.coven_home);
+        let pid_after = daemon_pid(&self.coven_home).ok();
+        self.daemon_events.push(DaemonLifecycleEvent::from_output(
+            "daemon start",
+            pid_before,
+            pid_after,
+            &output,
+            health_result
+                .as_ref()
+                .err()
+                .map(|error| format!("daemon health check failed after start: {error:#}")),
+        ));
+        health_result?;
+
+        let pid_after = pid_after.context("daemon status is missing pid after start")?;
+        self.daemon_pid = Some(pid_after);
+        Ok(())
+    }
+
+    fn stop_daemon(&mut self) -> Result<()> {
+        if self.stopped {
+            return Ok(());
+        }
+        let pid_before = self.current_daemon_pid();
+        let output = self.daemon_command(&["daemon", "stop"])?;
+        self.daemon_events.push(DaemonLifecycleEvent::from_output(
+            "daemon stop",
+            pid_before,
+            None,
+            &output,
+            None,
+        ));
         anyhow::ensure!(
             output.status.success(),
             "daemon stop failed\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        wait_for_daemon_exit(&self.coven_home, self.daemon_pid)?;
+        wait_for_daemon_shutdown(&self.coven_home, pid_before)?;
+        self.daemon_pid = None;
         self.stopped = true;
         Ok(())
+    }
+
+    fn restart_daemon(&mut self) -> Result<()> {
+        let pid_before = self.current_daemon_pid();
+        self.stopped = false;
+        let output = self.daemon_command(&["daemon", "restart"])?;
+        anyhow::ensure!(
+            output.status.success(),
+            "daemon restart failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let health_result = wait_for_daemon_health(&self.coven_home);
+        let pid_after = daemon_pid(&self.coven_home).ok();
+        self.daemon_events.push(DaemonLifecycleEvent::from_output(
+            "daemon restart",
+            pid_before,
+            pid_after,
+            &output,
+            health_result
+                .as_ref()
+                .err()
+                .map(|error| format!("daemon health check failed after restart: {error:#}")),
+        ));
+        health_result?;
+
+        let pid_after = pid_after.context("daemon status is missing pid after restart")?;
+        self.daemon_pid = Some(pid_after);
+        anyhow::ensure!(
+            pid_before != Some(pid_after),
+            "daemon restart did not replace the running process {pid_after}"
+        );
+        Ok(())
+    }
+
+    fn crash_daemon(&mut self) -> Result<()> {
+        let pid = self
+            .current_daemon_pid()
+            .context("daemon crash requires a running daemon")?;
+        let status = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
+            .context("sending SIGKILL to the daemon")?;
+        anyhow::ensure!(
+            status.success(),
+            "SIGKILL did not terminate daemon pid {pid}"
+        );
+        wait_for_process_exit(pid, "crashed daemon", Duration::from_secs(3))?;
+        self.daemon_events.push(DaemonLifecycleEvent::note(
+            "daemon crash",
+            Some(pid),
+            format!("sent SIGKILL to daemon pid {pid}"),
+        ));
+        self.daemon_pid = None;
+        self.stopped = false;
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<()> {
+        self.stop_daemon()
     }
 
     fn write_junit(&self, error: Option<&anyhow::Error>) -> Result<()> {
@@ -427,11 +728,10 @@ impl ThreadsFixture {
         Ok(())
     }
 
-    fn write_failure_evidence(&self, error: &anyhow::Error) -> Result<()> {
+    fn write_run_provenance(&self, error: Option<&anyhow::Error>) -> Result<()> {
+        fs::create_dir_all(&self.artifact_dir)?;
         let logs = self.artifact_dir.join("logs");
-        let state = self.artifact_dir.join("state");
         fs::create_dir_all(&logs)?;
-        fs::create_dir_all(&state)?;
         fs::write(
             self.artifact_dir.join("manifest.json"),
             serde_json::to_vec_pretty(&json!({
@@ -439,6 +739,8 @@ impl ThreadsFixture {
                 "scenario": self.scenario,
                 "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
                 "platform": std::env::consts::OS,
+                "setup_completed": true,
+                "result": if error.is_some() { "failed" } else { "passed" },
                 "coven_commit": self.coven_state.commit,
                 "coven_dirty": self.coven_state.dirty,
                 "coven_state_sha256": self.coven_state.state_sha256,
@@ -450,7 +752,8 @@ impl ThreadsFixture {
                 "threads_manifest_sha256": self.threads_manifest_sha256,
                 "local_threads_override_active": self.local_threads_override_active,
                 "authorization_limitation": "synthetic principal fingerprint uses the strongest current daemon-owned Ward path; signed principal proof is not yet available",
-                "failure": sanitize_for_artifact(&format!("{error:#}")),
+                "daemon_lifecycle": self.daemon_events.iter().map(DaemonLifecycleEvent::as_json).collect::<Vec<_>>(),
+                "failure": error.map(|error| sanitize_for_artifact(&format!("{error:#}"))),
             }))?,
         )?;
         fs::write(
@@ -464,16 +767,27 @@ impl ThreadsFixture {
 
         let recovery_log = fs::read(self.coven_home.join("daemon-recovery.log"))
             .unwrap_or_else(|_| b"<no daemon recovery log>\n".to_vec());
-        let daemon_log = self.sanitize_fixture_text(&format!(
-            "daemon start stdout:\n{}\n\
-             daemon start stderr:\n{}\n\
-             daemon recovery log:\n{}",
-            String::from_utf8_lossy(&self.daemon_start.stdout),
-            String::from_utf8_lossy(&self.daemon_start.stderr),
-            String::from_utf8_lossy(&recovery_log)
-        ));
-        fs::write(logs.join("daemon.log"), daemon_log)?;
+        let mut daemon_log = String::new();
+        if self.daemon_events.is_empty() {
+            daemon_log.push_str("<no daemon lifecycle events recorded>\n");
+        } else {
+            for event in &self.daemon_events {
+                daemon_log.push_str(&event.render_log());
+                daemon_log.push('\n');
+            }
+        }
+        daemon_log.push_str("daemon recovery log:\n");
+        daemon_log.push_str(&String::from_utf8_lossy(&recovery_log));
+        fs::write(
+            logs.join("daemon.log"),
+            self.sanitize_fixture_text(&daemon_log),
+        )?;
+        Ok(())
+    }
 
+    fn write_failure_evidence(&self) -> Result<()> {
+        let state = self.artifact_dir.join("state");
+        fs::create_dir_all(&state)?;
         fs::write(
             state.join("ward-audit.jsonl"),
             ward_audit_jsonl(&self.coven_home.join("coven.sqlite3"))?,
@@ -500,12 +814,15 @@ impl ThreadsFixture {
     }
 
     fn sanitize_fixture_text(&self, value: &str) -> String {
-        sanitize_for_artifact(value)
-            .replace(
-                &self.workspace.display().to_string(),
+        replace_sanitized_path(
+            replace_sanitized_path(
+                sanitize_for_artifact(value),
+                &self.workspace,
                 "<familiar-workspace>",
-            )
-            .replace(&self.coven_home.display().to_string(), "<coven-home>")
+            ),
+            &self.coven_home,
+            "<coven-home>",
+        )
     }
 }
 
@@ -514,20 +831,19 @@ impl Drop for ThreadsFixture {
         if self.stopped {
             return;
         }
-        let stopped = run_coven(
-            &self.coven,
-            &self.coven_home,
-            &self.path,
-            &["daemon", "stop"],
-        )
-        .is_ok_and(|output| output.status.success());
-        if pid_is_alive(self.daemon_pid) {
+        let pid = self.current_daemon_pid();
+        let stopped = self
+            .daemon_command(&["daemon", "stop"])
+            .is_ok_and(|output| {
+                output.status.success() && wait_for_daemon_shutdown(&self.coven_home, pid).is_ok()
+            });
+        if let Some(pid) = pid.filter(|pid| pid_is_alive(*pid)) {
             eprintln!(
                 "threads E2E fallback is terminating daemon pid {} after graceful stop success={stopped}",
-                self.daemon_pid,
+                pid,
             );
             let _ = Command::new("kill")
-                .args(["-KILL", &self.daemon_pid.to_string()])
+                .args(["-KILL", &pid.to_string()])
                 .status();
         }
     }
@@ -767,11 +1083,26 @@ fn daemon_pid(coven_home: &Path) -> Result<u32> {
     u32::try_from(pid).context("daemon pid does not fit u32")
 }
 
-fn wait_for_daemon_exit(coven_home: &Path, pid: u32) -> Result<()> {
+fn wait_for_process_exit(pid: u32, label: &str, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_alive(pid) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    anyhow::bail!(
+        "{label} pid {pid} remained observable for {:?}",
+        started.elapsed()
+    )
+}
+
+fn wait_for_daemon_shutdown(coven_home: &Path, pid: Option<u32>) -> Result<()> {
     let started = Instant::now();
     let deadline = started + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if !pid_is_alive(pid)
+        if pid.map(|pid| !pid_is_alive(pid)).unwrap_or(true)
             && !coven_home.join("daemon.json").exists()
             && !coven_home.join("coven.sock").exists()
         {
@@ -779,8 +1110,14 @@ fn wait_for_daemon_exit(coven_home: &Path, pid: u32) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(25));
     }
+    if let Some(pid) = pid.filter(|pid| pid_is_alive(*pid)) {
+        anyhow::bail!(
+            "daemon pid {pid} remained observable after checked stop for {:?}",
+            started.elapsed()
+        );
+    }
     anyhow::bail!(
-        "daemon pid {pid} remained observable after checked stop for {:?}",
+        "daemon status artifacts remained observable after checked stop for {:?}",
         started.elapsed()
     )
 }
@@ -1074,6 +1411,20 @@ fn sanitize_for_artifact(value: &str) -> String {
         sanitized = sanitized.replace(&PathBuf::from(home).display().to_string(), "<home>");
     }
     sanitized
+}
+
+fn replace_sanitized_path(value: String, path: &Path, placeholder: &str) -> String {
+    let display = path.display().to_string();
+    let with_private = if display.starts_with("/private/") {
+        value
+    } else {
+        value.replace(&format!("/private{display}"), placeholder)
+    };
+    let with_direct = with_private.replace(&display, placeholder);
+    if display.starts_with("/private/") {
+        return with_direct;
+    }
+    with_direct
 }
 
 fn sanitize_json_strings(value: &Value, sanitize: &impl Fn(&str) -> String) -> Value {
