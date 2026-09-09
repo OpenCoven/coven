@@ -381,8 +381,11 @@ fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result
                 Some(&json!({"principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
             )?;
             anyhow::ensure!(
-                matches!(repeated.status, 404 | 409),
-                "terminal proposal was approved twice: {repeated:?}"
+                matches!(repeated.status, 404 | 409)
+                    || (repeated.status == 200
+                        && repeated.body["idempotent"] == true
+                        && repeated.body["decision"] == "approved"),
+                "terminal proposal did not return its existing receipt: {repeated:?}"
             );
             assert_corpus_bytes(fixture, case, "after")?;
             assert_window_terminal(fixture, id, "proposal_approved", "applied", json!(true))?;

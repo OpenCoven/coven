@@ -116,12 +116,20 @@ not that POSIX primitive gap.
 
 ## Pending proposals
 
-The queue distinguishes envelopes by `reviewKind`:
+The queue accepts two envelope kinds:
 
-- `authority`: a validation-backed proposal, including legacy records that
-  must be revalidated rather than trusted because of their label.
-- `coherence`: a Tier-1 (reviewed) write held for Gate-3 coherence review
-  (`docs/design/ward-gate3-coherence.md`).
+- legacy proposals distinguished by `reviewKind`:
+  `authority` records require live authority revalidation, and `coherence`
+  records hold Tier-1 reviewed writes without retired-Ward approval metadata.
+- canonical `phase5_v1` scheduled proposals for reviewed writes whose Ward
+  declares `editable.harness_blocks` + `approval_tiers` and whose staged diff
+  binds entirely to the daemon's typed region predicates. These carry
+  `classification.approval_path`, `materialized_diff`, `region_evidence`, and
+  derived lifecycle/deadline fields; `reviewKind` is intentionally absent.
+
+If approval metadata cannot produce authoritative typed evidence for the staged
+diff, the daemon returns `409 scheduled_publication_invalid` instead of falling
+back to a weaker legacy proposal.
 
 Neither label grants protected-write authority. Tier-0 intake returns
 `protected_proposal_forbidden`, even with a supplied fingerprint or approval
@@ -326,7 +334,11 @@ fail with `familiar_not_found`.
 `coven ward migrate` inspects (and with `--apply`, rewrites) v0.1
 `ward.toml` files into the Phase-2 `WardConfig` dialect. Use `--familiar
 <ID>` to scope to one familiar and `--fingerprint <FPR>` to set the
-principal binding. Exits non-zero if any migration fails.
+principal binding. Veto-bearing approval metadata must explicitly declare both
+`human_veto_window_hours` and `min_visible_seconds`. Migration preserves these
+values and refuses ambiguous declarations without rewriting the source or
+creating a backup. A minimum is invalid without a veto window and on human
+approval paths. The command exits non-zero if any migration fails.
 
 Accepted retired invariants become active `[[identity_invariant]]` entries,
 not backup-only annotations. You keep the original configuration in
