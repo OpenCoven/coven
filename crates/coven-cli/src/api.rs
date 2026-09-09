@@ -10966,6 +10966,11 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
+        if let Err(error) = pause_threads_final_commit_fixture(coven_home) {
+            claim.preserve();
+            audit_reservation.preserve()?;
+            return Err(error);
+        }
         let (report, apply_cleanup_error) = match apply_after_review_approval(
             &ward,
             review_kind,
@@ -11282,6 +11287,11 @@ fn decide_threads_proposal_inner(
             audit_reservation.finish()?;
             return Err(error);
         }
+    }
+    if let Err(error) = pause_threads_final_commit_fixture(coven_home) {
+        claim.restore_pending(&document)?;
+        audit_reservation.finish()?;
+        return Err(error);
     }
     let expected_before = proposal_expected_before(&applying)?;
     let (report, apply_cleanup_error) = match apply_after_review_approval(
@@ -12460,6 +12470,16 @@ fn proposal_recovery_commitment(
         hasher.update(&identity_context.candidate_commitment);
     }
     Ok(hasher.finalize().as_bytes().to_vec())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn pause_threads_final_commit_fixture(coven_home: &Path) -> Result<()> {
+    crate::threads_clock::pause_final_commit_if_requested(coven_home)
+}
+
+#[cfg(not(feature = "threads-test-clock"))]
+fn pause_threads_final_commit_fixture(_coven_home: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn proposal_before_images(
@@ -29985,6 +30005,54 @@ tier = 0
             std::fs::read_to_string(workspace.join("TOOLS.md"))?,
             "Synthetic tools before\n"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_approve_refuses_identity_drift_at_final_commit() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        let identity_path = workspace.canonicalize()?.join("IDENTITY.md");
+        crate::ward::set_conditional_write_actions(
+            workspace.canonicalize()?.join("TOOLS.md"),
+            vec![(
+                identity_path,
+                b"# IDENTITY.md - Synthetic-other\n- **Name:** Synthetic-other\n- **Pronouns:** they/them\n"
+                    .to_vec(),
+            )],
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert!(pending.exists(), "failed approval must stay pending");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("IDENTITY.md"))?,
+            "# IDENTITY.md - Synthetic-other\n- **Name:** Synthetic-other\n- **Pronouns:** they/them\n"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
         Ok(())
     }
 

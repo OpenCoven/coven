@@ -4582,7 +4582,7 @@ pub(crate) fn set_conditional_write_hook(path: PathBuf, replacement: Vec<u8>) {
 }
 
 #[cfg(test)]
-fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
+pub(crate) fn set_conditional_write_actions(trigger: PathBuf, actions: Vec<(PathBuf, Vec<u8>)>) {
     set_conditional_write_test_actions(
         trigger,
         actions
