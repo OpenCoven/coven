@@ -75,9 +75,9 @@
 //! without following reparse points, and moves exact source handles with
 //! `SetFileInformationByHandle`; the stable absolute destination spelling is
 //! safe because the retained handles prevent ancestor renames. Windows cleanup
-//! retains file identities without write sharing, then validates and disposes
-//! the captured object through one non-share-delete handle. Concurrent writers
-//! or deleters therefore block cleanup instead of changing what it removes.
+//! validates and disposes the captured object through one handle that excludes
+//! write and delete sharing. Concurrent writers or deleters therefore block
+//! cleanup instead of changing what it removes.
 //! Linux and macOS exchange the staged and target entries. Windows moves the
 //! target to a randomized backup and installs the staged entry with no-replace
 //! semantics.
@@ -2979,7 +2979,7 @@ fn remove_verified_owned_regular_artifact(
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
     };
 
     const DELETE_ACCESS: u32 = 0x0001_0000;
@@ -2989,7 +2989,7 @@ fn remove_verified_owned_regular_artifact(
     let mut options = CapOpenOptions::new();
     options
         .access_mode(GENERIC_READ_ACCESS | DELETE_ACCESS)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .share_mode(FILE_SHARE_READ)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .follow(FollowSymlinks::No);
     let mut current = path
@@ -3168,7 +3168,7 @@ fn open_regular_file_without_following_links_with_policy(
     path: &AnchoredEntry,
     policy: RegularFileReadPolicy<'_>,
 ) -> Result<Option<OpenRegularFile>> {
-    let Some(mut file) = open_retained_regular_file_handle_without_following_links(path)? else {
+    let Some(mut file) = open_regular_file_handle_without_following_links(path)? else {
         return Ok(None);
     };
     let metadata_len = file
@@ -3289,36 +3289,17 @@ fn open_regular_file_handle_portable(path: &AnchoredEntry) -> Result<Option<std:
 fn open_regular_file_handle_without_following_links(
     path: &AnchoredEntry,
 ) -> Result<Option<std::fs::File>> {
-    open_windows_regular_file_handle_without_following_links(path, false)
-}
-
-#[cfg(windows)]
-fn open_retained_regular_file_handle_without_following_links(
-    path: &AnchoredEntry,
-) -> Result<Option<std::fs::File>> {
-    open_windows_regular_file_handle_without_following_links(path, true)
-}
-
-#[cfg(windows)]
-fn open_windows_regular_file_handle_without_following_links(
-    path: &AnchoredEntry,
-    deny_write_sharing: bool,
-) -> Result<Option<std::fs::File>> {
     use cap_std::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
 
     reject_known_non_regular_entry(path)?;
-    let mut share_mode = FILE_SHARE_READ | FILE_SHARE_DELETE;
-    if !deny_write_sharing {
-        share_mode |= FILE_SHARE_WRITE;
-    }
     let mut options = CapOpenOptions::new();
     options
         .read(true)
         .follow(FollowSymlinks::No)
-        .share_mode(share_mode)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     let file = match path.parent.open_with(&path.name, &options) {
         Ok(file) => file.into_std(),
@@ -3334,13 +3315,6 @@ fn open_windows_regular_file_handle_without_following_links(
         bail!("direct target {} is not a regular file", path.display());
     }
     Ok(Some(file))
-}
-
-#[cfg(not(windows))]
-fn open_retained_regular_file_handle_without_following_links(
-    path: &AnchoredEntry,
-) -> Result<Option<std::fs::File>> {
-    open_regular_file_handle_without_following_links(path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -3795,7 +3769,7 @@ fn stage_contents(
         Ok(())
     })();
     if let Err(error) = result {
-        let cleanup = remove_owned_regular_artifact(&staged, &file, None, "failed staging write");
+        let cleanup = remove_staging_artifact(&staged, file, None, "failed staging write");
         return match cleanup {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(staging_cleanup_error(
@@ -3804,6 +3778,16 @@ fn stage_contents(
             )),
         };
     }
+    #[cfg(windows)]
+    let file = into_staged_read_identity(&staged, file).map_err(|error| {
+        staging_cleanup_error(
+            path,
+            error.context(format!(
+                "staging write remains preserved at {}",
+                staged.display()
+            )),
+        )
+    })?;
     match ApprovedWritePaths::new(path, staged.clone()) {
         Ok(paths) => Ok((paths, file)),
         Err(error) => {
@@ -3823,6 +3807,42 @@ fn stage_contents(
                 )),
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn into_staged_read_identity(
+    staged: &AnchoredEntry,
+    writer: std::fs::File,
+) -> Result<std::fs::File> {
+    let retained = open_regular_file_handle_without_following_links(staged)?
+        .with_context(|| format!("staged write {} unexpectedly disappeared", staged.display()))?;
+    if windows_file_identity_from_open_file(&writer)?
+        != windows_file_identity_from_open_file(&retained)?
+    {
+        bail!(
+            "staged write identity changed before retaining {}",
+            staged.display()
+        );
+    }
+    drop(writer);
+    Ok(retained)
+}
+
+fn remove_staging_artifact(
+    staged: &AnchoredEntry,
+    writer: std::fs::File,
+    expected_contents: Option<&[u8]>,
+    description: &str,
+) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let retained = into_staged_read_identity(staged, writer)?;
+        remove_owned_regular_artifact(staged, &retained, expected_contents, description)
+    }
+    #[cfg(not(windows))]
+    {
+        remove_owned_regular_artifact(staged, &writer, expected_contents, description)
     }
 }
 
