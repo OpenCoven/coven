@@ -13,6 +13,13 @@ use super::contract::types::{AdoptionKey, PositiveInteger};
 use super::definition::RoutineDefinition;
 
 pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS automation_command_reservations (
+        adoption_key TEXT PRIMARY KEY NOT NULL,
+        request_digest TEXT NOT NULL,
+        command TEXT NOT NULL,
+        reserved_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS automation_command_adoptions (
         adoption_key TEXT PRIMARY KEY NOT NULL,
         request_digest TEXT NOT NULL,
@@ -40,6 +47,96 @@ pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
     END;
 ";
 
+const GLOBAL_ADOPTION_KEY_GUARDS_SQL: &str = "
+    CREATE TRIGGER IF NOT EXISTS automation_attempt_adoption_key_global_insert
+    BEFORE INSERT ON automation_attempts
+    WHEN EXISTS (
+        SELECT 1 FROM automation_command_reservations
+        WHERE adoption_key = NEW.adoption_key
+    ) OR EXISTS (
+        SELECT 1 FROM automation_command_adoptions
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by a command');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_reservation_key_global_insert
+    BEFORE INSERT ON automation_command_reservations
+    WHEN EXISTS (
+        SELECT 1 FROM automation_attempts
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by an attempt');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoption_key_global_insert
+    BEFORE INSERT ON automation_command_adoptions
+    WHEN EXISTS (
+        SELECT 1 FROM automation_attempts
+        WHERE adoption_key = NEW.adoption_key
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation adoption key is already used by an attempt');
+    END;
+";
+
+pub(crate) fn ensure_global_adoption_key_guards(conn: &Connection) -> Result<()> {
+    let command_collision: Option<String> = conn
+        .query_row(
+            "SELECT reservation.adoption_key
+             FROM automation_command_reservations AS reservation
+             JOIN automation_command_adoptions AS adoption
+               ON adoption.adoption_key = reservation.adoption_key
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect automation command adoption ownership")?;
+    anyhow::ensure!(
+        command_collision.is_none(),
+        "automation adoption key `{}` is both reserved and adopted",
+        command_collision.as_deref().unwrap_or_default()
+    );
+    let collision: Option<String> = conn
+        .query_row(
+            "SELECT attempt.adoption_key
+             FROM automation_attempts AS attempt
+             WHERE EXISTS (
+                 SELECT 1 FROM automation_command_reservations AS reservation
+                 WHERE reservation.adoption_key = attempt.adoption_key
+             ) OR EXISTS (
+                 SELECT 1 FROM automation_command_adoptions AS adoption
+                 WHERE adoption.adoption_key = attempt.adoption_key
+             )
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect global automation adoption keys")?;
+    anyhow::ensure!(
+        collision.is_none(),
+        "automation adoption key `{}` is already shared by an attempt and command",
+        collision.as_deref().unwrap_or_default()
+    );
+    conn.execute_batch(GLOBAL_ADOPTION_KEY_GUARDS_SQL)
+        .context("failed to initialize global automation adoption-key guards")
+}
+
+pub(crate) fn attempt_adoption_key_exists(conn: &Connection, adoption_key: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM automation_attempts WHERE adoption_key = ?1",
+        [adoption_key],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .context("failed to inspect automation attempt adoption key")
+}
+
 #[derive(Debug, Clone)]
 pub enum DefinitionCommand {
     Invalid {
@@ -62,6 +159,11 @@ pub enum DefinitionCommand {
     Revise {
         definition: Value,
         expected_revision: Option<u64>,
+    },
+    Disable {
+        automation_id: String,
+        expected_revision: Option<u64>,
+        reason: Option<String>,
     },
     Delete {
         automation_id: String,
@@ -114,6 +216,7 @@ struct DefinitionState {
     revision: u64,
     tombstoned: bool,
     authority_version: u8,
+    lifecycle_state: String,
 }
 
 pub fn execute_definition_command(
@@ -139,6 +242,49 @@ pub fn execute_definition_command(
     );
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin automation command adoption transaction")?;
+
+    if attempt_adoption_key_exists(&transaction, adoption_key.as_str())? {
+        transaction
+            .rollback()
+            .context("failed to close conflicting attempt adoption transaction")?;
+        return Ok(rejected(
+            ErrorCode::AdoptionReplayMismatch,
+            "adoption key was already used by an automation attempt",
+            None,
+        ));
+    }
+
+    if let Some((reserved_command, reserved_digest)) = transaction
+        .query_row(
+            "SELECT command, request_digest
+             FROM automation_command_reservations
+             WHERE adoption_key = ?1",
+            [adoption_key.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .context("failed to inspect automation command reservation")?
+    {
+        let response = if reserved_command == command_identity(&command).0
+            && reserved_digest == request_digest
+        {
+            rejected(
+                ErrorCode::CancelPending,
+                "automation command adoption is still in progress",
+                None,
+            )
+        } else {
+            rejected(
+                ErrorCode::AdoptionReplayMismatch,
+                "adoption key is reserved for a different automation command",
+                None,
+            )
+        };
+        transaction
+            .rollback()
+            .context("failed to close reserved automation command transaction")?;
+        return Ok(response);
+    }
 
     if let Some(stored) = load_adoption(&transaction, adoption_key.as_str())? {
         let response = if stored.request_digest == request_digest {
@@ -262,6 +408,16 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
             "expectedRevision": expected_revision,
             "definition": adoption_definition_preimage(definition)?,
         }),
+        DefinitionCommand::Disable {
+            automation_id,
+            expected_revision,
+            reason,
+        } => json!({
+            "command": "definition.disable.v1",
+            "automationId": automation_id,
+            "expectedRevision": expected_revision,
+            "reason": reason,
+        }),
         DefinitionCommand::Delete {
             automation_id,
             expected_revision,
@@ -333,6 +489,7 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
             match command.as_str() {
                 "definition.create.v1" => "definition.create.v1",
                 "definition.revise.v1" => "definition.revise.v1",
+                "definition.disable.v1" => "definition.disable.v1",
                 "definition.tombstone.v1" => "definition.tombstone.v1",
                 _ => "definition.invalid.v1",
             },
@@ -373,6 +530,9 @@ fn command_identity(command: &DefinitionCommand) -> (&'static str, Option<String
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
         ),
+        DefinitionCommand::Disable { automation_id, .. } => {
+            ("definition.disable.v1", Some(automation_id.clone()))
+        }
         DefinitionCommand::Delete { automation_id, .. } => {
             ("definition.tombstone.v1", Some(automation_id.clone()))
         }
@@ -519,6 +679,17 @@ fn apply_command(
             definition,
             expected_revision,
         } => apply_revise(conn, &definition, expected_revision, adopted_at),
+        DefinitionCommand::Disable {
+            automation_id,
+            expected_revision,
+            reason,
+        } => apply_disable(
+            conn,
+            &automation_id,
+            expected_revision,
+            reason.as_deref(),
+            adopted_at,
+        ),
         DefinitionCommand::Delete {
             automation_id,
             expected_revision,
@@ -539,6 +710,13 @@ fn apply_legacy_create(
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
         }
     };
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy create cannot create a disabled definition",
+            None,
+        ));
+    }
     if let Some(current) = current_definition_state(conn, &definition.id)? {
         if current.tombstoned && current.authority_version == 0 {
             let next_revision = next_revision(current.revision)?;
@@ -656,6 +834,20 @@ fn apply_legacy_revise(
             Some(current.revision),
         ));
     }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy update cannot reactivate a disabled definition",
+            Some(current.revision),
+        ));
+    }
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy update cannot disable a definition",
+            Some(current.revision),
+        ));
+    }
     if current.authority_version == 1 {
         return Ok(rejected(
             ErrorCode::IllegalTransition,
@@ -766,6 +958,13 @@ fn apply_create(
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
         }
     };
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "definition.create.v1 cannot create a disabled definition",
+            None,
+        ));
+    }
     if let Some(current) = current_definition_state(conn, &definition.id)? {
         if current.tombstoned {
             return Ok(rejected(
@@ -837,6 +1036,20 @@ fn apply_revise(
     if expected_revision.is_some_and(|expected| current.revision != expected) {
         return Ok(revision_conflict(current.revision));
     }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "disabled definitions must use an explicit lifecycle transition",
+            Some(current.revision),
+        ));
+    }
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "definition.revise.v1 cannot disable a definition",
+            Some(current.revision),
+        ));
+    }
     let next_revision = next_revision(current.revision)?;
     let next_revision_sql = sqlite_revision(next_revision)?;
     let current_revision_sql = sqlite_revision(current.revision)?;
@@ -879,6 +1092,82 @@ fn apply_revise(
         json!({
             "routine": definition,
             "revision": next_revision,
+        }),
+    ))
+}
+
+fn apply_disable(
+    conn: &Connection,
+    automation_id: &str,
+    expected_revision: Option<u64>,
+    reason: Option<&str>,
+    adopted_at: &str,
+) -> Result<DefinitionCommandResponse> {
+    let Some(current) = current_definition_state(conn, automation_id)? else {
+        return Ok(rejected(
+            ErrorCode::NotFound,
+            format!("no routine with id `{automation_id}`"),
+            None,
+        ));
+    };
+    if current.tombstoned {
+        return Ok(rejected(
+            ErrorCode::GoneTombstoned,
+            format!("routine `{automation_id}` is tombstoned"),
+            Some(current.revision),
+        ));
+    }
+    if expected_revision.is_some_and(|expected| current.revision != expected) {
+        return Ok(revision_conflict(current.revision));
+    }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "automation definition is already disabled",
+            Some(current.revision),
+        ));
+    }
+    let record = super::store::get_definition(conn, automation_id)?
+        .with_context(|| format!("automation definition `{automation_id}` disappeared"))?;
+    let mut definition: RoutineDefinition = serde_json::from_str(&record.definition_json)
+        .context("failed to parse automation definition for disable")?;
+    definition.status = super::definition::RoutineStatus::Disabled;
+    let definition_json =
+        serde_json::to_string(&definition).context("failed to serialize disabled definition")?;
+    let definition_digest = super::contract::migration::definition_digest(&definition_json)?;
+    let next_revision = next_revision(current.revision)?;
+    let changed = conn
+        .execute(
+            "UPDATE automation_definitions
+             SET status = 'DISABLED',
+                 definition_json = ?3,
+                 definition_digest = ?4,
+                 lifecycle_state = 'disabled',
+                 revision = ?5,
+                 authority_version = 1,
+                 updated_at = ?6
+             WHERE id = ?1 AND revision = ?2 AND tombstoned_at IS NULL",
+            params![
+                automation_id,
+                sqlite_revision(current.revision)?,
+                definition_json,
+                definition_digest,
+                sqlite_revision(next_revision)?,
+                adopted_at,
+            ],
+        )
+        .context("failed to disable adopted automation definition")?;
+    anyhow::ensure!(
+        changed == 1,
+        "automation definition revision changed inside disable transaction"
+    );
+    Ok(committed(
+        next_revision,
+        json!({
+            "disabled": true,
+            "id": automation_id,
+            "revision": next_revision,
+            "reason": reason,
         }),
     ))
 }
@@ -944,7 +1233,7 @@ fn current_definition_state(
 ) -> Result<Option<DefinitionState>> {
     let state = conn
         .query_row(
-            "SELECT revision, tombstoned_at IS NOT NULL, authority_version
+            "SELECT revision, tombstoned_at IS NOT NULL, authority_version, lifecycle_state
              FROM automation_definitions
              WHERE id = ?1",
             [automation_id],
@@ -953,20 +1242,24 @@ fn current_definition_state(
                     row.get::<_, i64>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, u8>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .context("failed to load automation definition state")?;
     state
-        .map(|(revision, tombstoned, authority_version)| {
-            Ok(DefinitionState {
-                revision: u64::try_from(revision)
-                    .context("automation definition revision must be non-negative")?,
-                tombstoned,
-                authority_version,
-            })
-        })
+        .map(
+            |(revision, tombstoned, authority_version, lifecycle_state)| {
+                Ok(DefinitionState {
+                    revision: u64::try_from(revision)
+                        .context("automation definition revision must be non-negative")?,
+                    tombstoned,
+                    authority_version,
+                    lifecycle_state,
+                })
+            },
+        )
         .transpose()
 }
 
@@ -1047,6 +1340,7 @@ fn status_text(status: super::definition::RoutineStatus) -> &'static str {
     match status {
         super::definition::RoutineStatus::Active => "ACTIVE",
         super::definition::RoutineStatus::Paused => "PAUSED",
+        super::definition::RoutineStatus::Disabled => "DISABLED",
     }
 }
 
@@ -1131,6 +1425,41 @@ mod tests {
             )
             .is_err());
         assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[test]
+    fn startup_rejects_keys_that_are_both_reserved_and_adopted() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, 'digest', 'definition.create.v1', ?2)",
+            params![
+                "adopt:create:reservation-adoption-collision",
+                "2026-09-03T09:00:00.000Z"
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_command_adoptions (
+                 adoption_key, request_digest, command, automation_id, outcome,
+                 revision, response_json, adopted_at
+             ) VALUES (?1, 'digest', 'definition.create.v1', NULL, 'rejected',
+                       NULL, ?2, ?3)",
+            params![
+                "adopt:create:reservation-adoption-collision",
+                r#"{"outcome":"rejected","error":{"code":"VALIDATION_FAILED","message":"invalid","retryable":false}}"#,
+                "2026-09-03T09:00:00.000Z"
+            ],
+        )
+        .unwrap();
+
+        let error = ensure_global_adoption_key_guards(&conn)
+            .expect_err("startup must reject split command adoption ownership");
+        assert!(
+            error.to_string().contains("is both reserved and adopted"),
+            "{error:#}"
+        );
     }
 
     #[test]

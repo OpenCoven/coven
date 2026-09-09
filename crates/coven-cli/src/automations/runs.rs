@@ -324,9 +324,9 @@ pub fn record_run_finish(
         log_json,
         output_commit,
     } = finish;
-    if status != "succeeded" && status != "failed" && status != "cancelled" {
+    if !matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
         return Err(anyhow::anyhow!(
-            "run status must be succeeded, failed, or cancelled"
+            "run status must be succeeded, failed, cancelled, or timed_out"
         ));
     }
     let bounded_log = log_json
@@ -962,7 +962,7 @@ mod tests {
             start,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("succeeded, failed, or cancelled"));
+        assert!(format!("{error:#}").contains("succeeded, failed, cancelled, or timed_out"));
     }
 
     #[test]
