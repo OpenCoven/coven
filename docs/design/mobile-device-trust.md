@@ -238,6 +238,12 @@ acknowledges the prior event, then creates and audits a new grant revision for
 the new policy; it never reports the new request as successful while retaining
 the prior policy.
 
+Transition audit recovery treats a complete JSON record at EOF as evidence
+even when its trailing newline was not persisted, adding only the separator
+needed for the next record. An incomplete or corrupt final suffix is removed
+atomically, while corruption before later complete evidence remains a
+fail-closed error.
+
 List and inspect projections omit possession and authorization public keys,
 subject-key hashes, signatures, nonces, and challenge material. They expose
 only operational identifiers and policy state: device/grant status, scopes,
@@ -253,9 +259,16 @@ is narrowed to the maximum 365-day window. Rotation reloads and conditionally
 checks both grant revisions under one device-registry lock, verifies that the
 replacement's transcript-enrolled authorization-key class can satisfy the
 transferred assurance policy, and atomically writes source revocation,
-replacement reissue, and a durable two-device audit transition. Audit append
-and outbox acknowledgement occur after releasing device and authorization-key
-locks; retries are idempotent and cannot rotate twice.
+replacement reissue, and a durable two-device audit transition. The registry
+lock is then released before revoking the source authorization key. A registry
+write failure therefore leaves both device and authorization-key state
+unchanged; an authorization-key cleanup failure leaves the source device
+durably denied and the transition retryable. Pending-transition retry completes
+that cleanup from the committed source device id and revocation state without
+depending on the replacement's current grant. A later replacement reissue or
+revocation is preserved and cannot strand cleanup or cause the historical
+policy to be applied again. Audit append and outbox acknowledgement also occur
+without nesting registry and audit locks.
 
 ## Biometrics and step-up authorization
 

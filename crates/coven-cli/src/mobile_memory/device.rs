@@ -1168,6 +1168,178 @@ mod tests {
     }
 
     #[test]
+    fn pending_rotation_retry_completes_authorization_key_cleanup_after_secondary_store_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_788_950_400, 0).unwrap();
+        let source_id = Uuid::from_u128(1);
+        let replacement_id = Uuid::from_u128(2);
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        register_device(&registry, device(source_id, "Old phone", 1, now), Some(3));
+        register_device(
+            &registry,
+            device(replacement_id, "Replacement phone", 2, now),
+            None,
+        );
+        let authority = DeviceAuthority::load(temp.path()).unwrap();
+        let authorization_path = temp
+            .path()
+            .join("mobile")
+            .join(crate::mobile_memory::assurance::AUTHORIZATION_KEYS_FILE);
+        let authorization_bytes = fs::read(&authorization_path).unwrap();
+        fs::remove_file(&authorization_path).unwrap();
+        fs::create_dir(&authorization_path).unwrap();
+
+        assert!(authority
+            .rotate_device("Old phone", "Replacement phone", now)
+            .is_err());
+
+        let source = authority
+            .registry
+            .authorization_record(source_id)
+            .unwrap()
+            .unwrap();
+        assert!(source.device.revoked_at.is_some());
+        let replacement_after_first = authority
+            .registry
+            .authorization_record(replacement_id)
+            .unwrap()
+            .unwrap()
+            .grant;
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("mobile/devices.json")).unwrap())
+                .unwrap();
+        assert!(stored["rotationTransitions"][0]["auditedAt"].is_null());
+
+        fs::remove_dir(&authorization_path).unwrap();
+        atomic_replace_private(&authorization_path, &authorization_bytes).unwrap();
+        let retried = authority
+            .rotate_device("Old phone", "Replacement phone", now)
+            .unwrap();
+
+        assert_eq!(retried.grant_id, replacement_after_first.id);
+        assert_eq!(
+            retried.revocation_epoch,
+            replacement_after_first.revocation_epoch
+        );
+        assert!(authority
+            .registry
+            .authorization_key(source_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pending_rotation_cleanup_survives_later_replacement_reissue_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_788_950_400, 0).unwrap();
+        let source_id = Uuid::from_u128(1);
+        let replacement_id = Uuid::from_u128(2);
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        register_device(&registry, device(source_id, "Old phone", 1, now), Some(3));
+        register_device(
+            &registry,
+            device(replacement_id, "Replacement phone", 2, now),
+            None,
+        );
+        let authority = DeviceAuthority::load(temp.path()).unwrap();
+        let authorization_path = temp
+            .path()
+            .join("mobile")
+            .join(crate::mobile_memory::assurance::AUTHORIZATION_KEYS_FILE);
+        let authorization_bytes = fs::read(&authorization_path).unwrap();
+        fs::remove_file(&authorization_path).unwrap();
+        fs::create_dir(&authorization_path).unwrap();
+        assert!(authority
+            .rotate_device("Old phone", "Replacement phone", now)
+            .is_err());
+        fs::remove_dir(&authorization_path).unwrap();
+        atomic_replace_private(&authorization_path, &authorization_bytes).unwrap();
+
+        let reissued = authority
+            .reissue_grant(
+                "Replacement phone",
+                DeviceGrantPolicy {
+                    scopes: vec![DeviceScope::MemoryRead],
+                    restrictions: DeviceGrantRestrictions::default(),
+                    minimum_assurance: AssuranceLevel::Possession,
+                    expires_at: now + Duration::days(7),
+                },
+                now + Duration::seconds(1),
+            )
+            .unwrap();
+        let retried = authority
+            .rotate_device("Old phone", "Replacement phone", now + Duration::seconds(2))
+            .unwrap();
+
+        assert_eq!(retried.grant_id, reissued.grant_id);
+        assert_eq!(retried.revocation_epoch, reissued.revocation_epoch);
+        assert_eq!(retried.scopes, reissued.scopes);
+        assert!(authority
+            .registry
+            .authorization_key(source_id)
+            .unwrap()
+            .is_none());
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("mobile/devices.json")).unwrap())
+                .unwrap();
+        assert_eq!(stored["rotationTransitions"].as_array().unwrap().len(), 1);
+        assert!(stored["rotationTransitions"][0]["authorizationKeyCleanupCompletedAt"].is_string());
+    }
+
+    #[test]
+    fn pending_rotation_cleanup_survives_later_replacement_revocation_without_overwrite() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_788_950_400, 0).unwrap();
+        let source_id = Uuid::from_u128(1);
+        let replacement_id = Uuid::from_u128(2);
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        register_device(&registry, device(source_id, "Old phone", 1, now), Some(3));
+        register_device(
+            &registry,
+            device(replacement_id, "Replacement phone", 2, now),
+            None,
+        );
+        let authority = DeviceAuthority::load(temp.path()).unwrap();
+        let authorization_path = temp
+            .path()
+            .join("mobile")
+            .join(crate::mobile_memory::assurance::AUTHORIZATION_KEYS_FILE);
+        let authorization_bytes = fs::read(&authorization_path).unwrap();
+        fs::remove_file(&authorization_path).unwrap();
+        fs::create_dir(&authorization_path).unwrap();
+        assert!(authority
+            .rotate_device("Old phone", "Replacement phone", now)
+            .is_err());
+        fs::remove_dir(&authorization_path).unwrap();
+        atomic_replace_private(&authorization_path, &authorization_bytes).unwrap();
+
+        let revoked = authority
+            .revoke(
+                "Replacement phone",
+                DeviceRevocationReason::Retired,
+                now + Duration::seconds(1),
+            )
+            .unwrap();
+        let retried = authority
+            .rotate_device("Old phone", "Replacement phone", now + Duration::seconds(2))
+            .unwrap();
+
+        assert_eq!(retried.grant_id, revoked.grant_id);
+        assert_eq!(retried.revocation_epoch, revoked.revocation_epoch);
+        assert_eq!(retried.status, DeviceLifecycleStatus::Revoked);
+        assert!(authority
+            .registry
+            .authorization_key(source_id)
+            .unwrap()
+            .is_none());
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(temp.path().join("mobile/devices.json")).unwrap())
+                .unwrap();
+        assert_eq!(stored["rotationTransitions"].as_array().unwrap().len(), 1);
+        assert!(stored["rotationTransitions"][0]["authorizationKeyCleanupCompletedAt"].is_string());
+    }
+
+    #[test]
     fn rotation_audit_failure_is_durable_and_retry_converges_without_rotating_twice() {
         let temp = tempfile::tempdir().unwrap();
         let now = DateTime::from_timestamp(1_788_950_400, 0).unwrap();

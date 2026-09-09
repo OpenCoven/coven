@@ -76,6 +76,8 @@ pub struct DeviceRotationAuditTransition {
     pub replacement_revocation_epoch: u64,
     pub occurred_at: DateTime<Utc>,
     pub audited_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub authorization_key_cleanup_completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,14 +191,17 @@ fn append_transition_record_locked(
         if existing.len() as u64 >= MAX_AUDIT_BYTES {
             existing.clear();
         }
-        let text = std::str::from_utf8(&existing)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        for line in text.lines() {
-            let record: MobileAuditRecord = serde_json::from_str(line)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            if record.transition_id == Some(transition_id) {
-                return Ok(AuditDeliveryReceipt { transition_id });
+        let (found_transition, recovered_suffix) =
+            audit_prefix_contains_transition_or_recovers_suffix(
+                &mut existing,
+                transition_id,
+                &path,
+            )?;
+        if found_transition {
+            if recovered_suffix {
+                atomic_replace_private(&path, &existing)?;
             }
+            return Ok(AuditDeliveryReceipt { transition_id });
         }
     }
     serde_json::to_writer(&mut existing, record)
@@ -204,6 +209,51 @@ fn append_transition_record_locked(
     existing.push(b'\n');
     atomic_replace_private(&path, &existing)?;
     Ok(AuditDeliveryReceipt { transition_id })
+}
+
+fn audit_prefix_contains_transition_or_recovers_suffix(
+    bytes: &mut Vec<u8>,
+    transition_id: Uuid,
+    path: &Path,
+) -> Result<(bool, bool)> {
+    let mut cursor = 0;
+    let mut found_transition = false;
+    while cursor < bytes.len() {
+        let Some(relative_newline) = bytes[cursor..].iter().position(|byte| *byte == b'\n') else {
+            match serde_json::from_slice::<MobileAuditRecord>(&bytes[cursor..]) {
+                Ok(record) => {
+                    if record.transition_id == Some(transition_id) {
+                        found_transition = true;
+                    }
+                    bytes.push(b'\n');
+                }
+                Err(_) => bytes.truncate(cursor),
+            }
+            return Ok((found_transition, true));
+        };
+        let line_end = cursor + relative_newline;
+        match serde_json::from_slice::<MobileAuditRecord>(&bytes[cursor..line_end]) {
+            Ok(record) => {
+                if record.transition_id == Some(transition_id) {
+                    found_transition = true;
+                }
+                cursor = line_end + 1;
+            }
+            Err(_) if line_end + 1 == bytes.len() => {
+                bytes.truncate(cursor);
+                return Ok((found_transition, true));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to parse complete audit record before later evidence in {}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok((found_transition, false))
 }
 
 fn append_record_locked(coven_home: &Path, record: &MobileAuditRecord) -> Result<()> {
@@ -315,6 +365,7 @@ mod tests {
             replacement_revocation_epoch: 1,
             occurred_at: now,
             audited_at: None,
+            authorization_key_cleanup_completed_at: None,
         };
         let second = DeviceRotationAuditTransition {
             transition_id: Uuid::from_u128(20),
@@ -326,6 +377,7 @@ mod tests {
             replacement_revocation_epoch: 1,
             occurred_at: now,
             audited_at: None,
+            authorization_key_cleanup_completed_at: None,
         };
         let ordinary_home = temp.path().to_path_buf();
         let ordinary = thread::spawn(move || {
@@ -356,5 +408,149 @@ mod tests {
         assert!(audit.contains("\"event\":\"device_renamed\""));
         assert!(audit.contains(&Uuid::from_u128(10).to_string()));
         assert!(audit.contains(&Uuid::from_u128(20).to_string()));
+    }
+
+    #[test]
+    fn transition_retry_discards_only_a_truncated_final_audit_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_785_326_400, 0).unwrap();
+        append_event(
+            temp.path(),
+            now,
+            MobileAuditEvent::DeviceRenamed,
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+        let path = temp.path().join("mobile").join(AUDIT_FILE);
+        let transition = DeviceRotationAuditTransition {
+            transition_id: Uuid::from_u128(10),
+            source_device_id: Uuid::from_u128(2),
+            replacement_device_id: Uuid::from_u128(3),
+            source_grant_id: Uuid::from_u128(11),
+            source_revocation_epoch: 1,
+            replacement_grant_id: Uuid::from_u128(12),
+            replacement_revocation_epoch: 1,
+            occurred_at: now,
+            audited_at: None,
+            authorization_key_cleanup_completed_at: None,
+        };
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(
+            format!(
+                "{{\"timestamp\":\"2026-01-01T00:00:00Z\",\"event\":\"device_authorization_reenrolled\",\"transitionId\":\"{}",
+                transition.transition_id
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        file.sync_data().unwrap();
+
+        append_rotation_event(temp.path(), &transition).unwrap();
+        append_rotation_event(temp.path(), &transition).unwrap();
+
+        let audit = fs::read_to_string(path).unwrap();
+        assert_eq!(audit.lines().count(), 2);
+        assert!(audit.contains("\"event\":\"device_renamed\""));
+        assert_eq!(
+            audit
+                .matches("\"event\":\"device_authorization_reenrolled\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            audit.matches(&transition.transition_id.to_string()).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn transition_retry_preserves_and_deduplicates_valid_final_record_without_newline() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_785_326_400, 0).unwrap();
+        let path = ensure_private_mobile_dir(temp.path())
+            .unwrap()
+            .join(AUDIT_FILE);
+        let ordinary = serde_json::to_vec(&MobileAuditRecord {
+            timestamp: now,
+            event: MobileAuditEvent::DeviceRenamed,
+            device_id: Some(Uuid::from_u128(1)),
+            transition_id: None,
+            source_device_id: None,
+            replacement_device_id: None,
+        })
+        .unwrap();
+        atomic_replace_private(&path, &ordinary).unwrap();
+        let transition = DeviceRotationAuditTransition {
+            transition_id: Uuid::from_u128(10),
+            source_device_id: Uuid::from_u128(2),
+            replacement_device_id: Uuid::from_u128(3),
+            source_grant_id: Uuid::from_u128(11),
+            source_revocation_epoch: 1,
+            replacement_grant_id: Uuid::from_u128(12),
+            replacement_revocation_epoch: 1,
+            occurred_at: now,
+            audited_at: None,
+            authorization_key_cleanup_completed_at: None,
+        };
+
+        append_rotation_event(temp.path(), &transition).unwrap();
+        let mut without_final_newline = fs::read(&path).unwrap();
+        assert_eq!(without_final_newline.pop(), Some(b'\n'));
+        atomic_replace_private(&path, &without_final_newline).unwrap();
+        append_rotation_event(temp.path(), &transition).unwrap();
+
+        let audit = fs::read_to_string(path).unwrap();
+        assert_eq!(audit.lines().count(), 2);
+        assert!(audit.contains("\"event\":\"device_renamed\""));
+        assert_eq!(
+            audit
+                .matches("\"event\":\"device_authorization_reenrolled\"")
+                .count(),
+            1
+        );
+        assert!(audit.ends_with('\n'));
+    }
+
+    #[test]
+    fn transition_retry_fails_closed_on_middle_corruption_and_preserves_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = DateTime::from_timestamp(1_785_326_400, 0).unwrap();
+        append_event(
+            temp.path(),
+            now,
+            MobileAuditEvent::DeviceRenamed,
+            Some(Uuid::from_u128(1)),
+        )
+        .unwrap();
+        let path = temp.path().join("mobile").join(AUDIT_FILE);
+        let valid_tail = serde_json::to_string(&MobileAuditRecord {
+            timestamp: now,
+            event: MobileAuditEvent::DeviceRevoked,
+            device_id: Some(Uuid::from_u128(4)),
+            transition_id: None,
+            source_device_id: None,
+            replacement_device_id: None,
+        })
+        .unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(file, "{{truncated").unwrap();
+        writeln!(file, "{valid_tail}").unwrap();
+        file.sync_data().unwrap();
+        let before = fs::read(&path).unwrap();
+        let transition = DeviceRotationAuditTransition {
+            transition_id: Uuid::from_u128(10),
+            source_device_id: Uuid::from_u128(2),
+            replacement_device_id: Uuid::from_u128(3),
+            source_grant_id: Uuid::from_u128(11),
+            source_revocation_epoch: 1,
+            replacement_grant_id: Uuid::from_u128(12),
+            replacement_revocation_epoch: 1,
+            occurred_at: now,
+            audited_at: None,
+            authorization_key_cleanup_completed_at: None,
+        };
+
+        assert!(append_rotation_event(temp.path(), &transition).is_err());
+        assert_eq!(fs::read(path).unwrap(), before);
     }
 }
