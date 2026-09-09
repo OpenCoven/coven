@@ -11235,8 +11235,21 @@ fn quarantine_proposal_recovery_claim(
 fn read_pending_proposal_document(path: &Path) -> Result<ProposalEnvelopeDocument> {
     let raw = read_pending_proposal_file(path)
         .with_context(|| format!("reading scheduled proposal {}", path.display()))?;
-    ProposalEnvelopeDocument::parse_preflighted(&raw)
-        .with_context(|| format!("parsing scheduled proposal {}", path.display()))
+    let document = ProposalEnvelopeDocument::parse_preflighted(&raw)
+        .with_context(|| format!("parsing scheduled proposal {}", path.display()))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("proposal filename is not UTF-8")?;
+    let pending_name = name
+        .strip_suffix(".approve.deciding")
+        .or_else(|| name.strip_suffix(".reject.deciding"))
+        .unwrap_or(name);
+    anyhow::ensure!(
+        pending_name.ends_with(&format!("{}.json", document.pending().id.0)),
+        "proposal filename does not match its internal id"
+    );
+    Ok(document)
 }
 
 fn parse_scheduler_authority_document(
@@ -32422,6 +32435,39 @@ tier = 0
                 "{source}"
             );
             assert_eq!(close.replay_hash_matched, Some(false), "{source}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_mismatched_ids_without_deciding_another_proposal() -> Result<()>
+    {
+        for suffix in ["json", "json.approve.deciding", "json.reject.deciding"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let mismatched = home
+                .join("pending")
+                .join(format!("{}.{}", Uuid::new_v4(), suffix));
+            std::fs::copy(&pending, &mismatched)?;
+
+            assert_eq!(process_due_threads_proposals(home)?, 0, "{suffix}");
+            assert!(!mismatched.exists(), "{suffix}");
+            assert!(pending.exists(), "{suffix}");
+            assert_eq!(
+                std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                "before",
+                "{suffix}"
+            );
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            assert!(
+                proposal_terminal_event(&conn, &proposal_id)?.is_none(),
+                "{suffix}"
+            );
         }
         Ok(())
     }
