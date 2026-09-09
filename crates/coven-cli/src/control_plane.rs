@@ -119,7 +119,9 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.definition.get.v1",
                     "coven.automations.definition.create.v1",
                     "coven.automations.definition.revise.v1",
+                    "coven.automations.definition.disable.v1",
                     "coven.automations.definition.tombstone.v1",
+                    "coven.automations.run.cancel.v1",
                     "coven.automations.events.read.v1",
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
@@ -414,6 +416,90 @@ pub fn route_action(
                     )
                 }
                 Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.definition.disable.v1" => {
+            let id = required_id_field(&payload, action);
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            let reason = optional_reason(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (id, expected_revision, reason) {
+                        (Ok(id), Ok(expected_revision), Ok(reason)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Disable {
+                                automation_id: id,
+                                expected_revision: Some(expected_revision),
+                                reason,
+                            }
+                        }
+                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.disable.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["id", "expectedRevision", "reason"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.run.cancel.v1" => {
+            match crate::automations::cancellation::execute_run_cancellation(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::cancellation::CancellationExecution::Success(success)) => {
+                    let event = ControlEvent {
+                        kind: "automations.run.cancellation",
+                        action: action.to_string(),
+                        origin,
+                        intent_id,
+                        payload: success.payload.clone(),
+                    };
+                    (
+                        200,
+                        ControlActionResponse {
+                            ok: true,
+                            accepted: true,
+                            action: action.to_string(),
+                            status: ActionStatus::Completed,
+                            reason: success
+                                .replayed
+                                .then(|| "replayed previously adopted cancellation".to_string()),
+                            error: None,
+                            result: Some(success.payload),
+                            event: Some(event),
+                        },
+                    )
+                }
+                Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
             }
         }
         "coven.automations.events.read.v1" => {
@@ -849,6 +935,18 @@ fn required_expected_revision(payload: &Value, action: &str) -> Result<u64, Stri
         .ok_or_else(|| format!("{action} requires positive safe-integer field `expectedRevision`"))
 }
 
+fn optional_reason(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("reason") {
+        None => Ok(None),
+        Some(Value::String(reason)) if !reason.trim().is_empty() && reason.len() <= 500 => {
+            Ok(Some(reason.trim().to_owned()))
+        }
+        Some(_) => Err(format!(
+            "{action} field `reason` must be a non-empty string of at most 500 bytes"
+        )),
+    }
+}
+
 fn forbidden_expected_revision(payload: &Value, action: &str) -> Result<(), String> {
     if payload.get("expectedRevision").is_some() {
         Err(format!("{action} forbids field `expectedRevision`"))
@@ -952,13 +1050,13 @@ fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, String> {
-    match crate::automations::occurrences::tick(conn, now) {
+    match crate::automations::occurrences::tick_planning(conn, now) {
         Ok(report) => Ok(json!({
             "planned": report.planned,
             "alreadyFenced": report.already_fenced,
             "pausedSkipped": report.paused_skipped,
-            "recovered": report.recovered,
-            "claimed": report.claimed,
+            "recovered": 0,
+            "claimed": [],
             "failed": report.failed,
         })),
         Err(error) => Err(format!("{error:#}")),
@@ -1068,6 +1166,8 @@ fn automation_runs_payload(
             }
             let mut runs = Vec::with_capacity(records.len());
             for record in &records {
+                let cancellation =
+                    crate::automations::cancellation::cancellation_for_run(conn, &record.id)?;
                 let attempts = attempts_by_run
                     .remove(&record.id)
                     .unwrap_or_default()
@@ -1094,7 +1194,7 @@ fn automation_runs_payload(
                         })
                     })
                     .collect::<Vec<_>>();
-                runs.push(json!({
+                let mut run = json!({
                     "id": record.id,
                     "automationId": record.automation_id,
                     "occurrenceId": record.occurrence_id,
@@ -1108,7 +1208,11 @@ fn automation_runs_payload(
                     "startedAt": record.started_at,
                     "finishedAt": record.finished_at,
                     "attempts": attempts,
-                }));
+                });
+                if let Some(cancellation) = cancellation {
+                    run["cancellation"] = cancellation;
+                }
+                runs.push(run);
             }
             Ok(json!({ "runs": runs }))
         }
@@ -1213,10 +1317,70 @@ pub fn rejected_action(
 mod tests {
     use super::*;
     use crate::api::{SessionLaunch, SessionRuntime};
+    use chrono::Timelike;
 
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
     struct RetryableRejectedRuntime;
+
+    #[test]
+    fn tick_action_plans_but_does_not_claim_without_scheduler_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let now = chrono::Utc::now();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "tick-authority",
+            "name": "Tick authority",
+            "status": "ACTIVE",
+            "rrule": format!("FREQ=DAILY;BYHOUR={}", now.hour()),
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                definition.id
+            ],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.tick"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert_eq!(
+            response.event.as_ref().unwrap().payload["claimed"],
+            json!([])
+        );
+        let occurrence_state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE automation_id = ?1",
+                [&definition.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "planned");
+    }
 
     impl SessionRuntime for OwnershipThenErrorRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
