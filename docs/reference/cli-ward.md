@@ -10,10 +10,9 @@ description: "Reference for coven ward: inspect, approve, or reject pending Ward
 source_adjacent_reason: "Tracks the Ward CLI and security contracts implemented in this repository."
 ---
 
-`coven ward` groups the Ward's principal-facing lifecycle verbs. Held writes
-into a familiar home never dead-end: the daemon stages them at
-`~/.coven/pending/` for the principal's decision, and `coven ward pending`
-is the supported way to see what is waiting.
+`coven ward` groups the Ward's principal-facing lifecycle verbs. Eligible held
+writes enter `~/.coven/pending/`, and `coven ward pending` shows what is
+waiting. Tier-0 protected writes cannot enter this proposal pipeline.
 
 ```sh
 coven ward pending             # bounded table of staged proposals
@@ -28,8 +27,8 @@ coven ward migrate --apply     # migrate v0.1 ward.toml files to Phase-2
 ## Ward apply resource limits
 
 Every submitted Ward request accepts at most 32 edits. The cap includes
-Tier-0/Tier-1 edits that will be held or staged as well as Tier-2/Tier-3 edits
-eligible for direct apply. It runs on the borrowed request array before content
+Tier-0 submissions that will be refused, Tier-1 edits that may be held or
+staged, and Tier-2/Tier-3 edits eligible for direct apply. It runs on the borrowed request array before content
 cloning, Ward/Gate-2 evaluation, probe execution, target preparation, proposal
 staging, or mutation. Each existing edit can retain three file descriptors
 through finalization: its before-image, installed staging inode, and displaced
@@ -117,12 +116,20 @@ not that POSIX primitive gap.
 
 ## Pending proposals
 
-Two lanes stage here, distinguished by `reviewKind`:
+The queue distinguishes envelopes by `reviewKind`:
 
-- `authority` — a Tier-0 (protected) write whose thread frayed
-  (`DegradeToProposal`, coven-threads §5).
-- `coherence` — a Tier-1 (reviewed) write held for Gate-3 coherence review
+- `authority`: a validation-backed proposal, including legacy records that
+  must be revalidated rather than trusted because of their label.
+- `coherence`: a Tier-1 (reviewed) write held for Gate-3 coherence review
   (`docs/design/ward-gate3-coherence.md`).
+
+Neither label grants protected-write authority. Tier-0 intake returns
+`protected_proposal_forbidden`, even with a supplied fingerprint or approval
+identifier, and appends a non-authorizing rejection receipt. A queued target
+that becomes protected is refused on decision or scheduler revalidation.
+If an interrupted apply may already have changed its bytes, Coven preserves
+the recovery evidence in quarantine instead of inventing an unapplied
+rejection.
 
 The active queue accepts at most **64 proposals** and **64 MiB
 (67,108,864 bytes)** of exact serialized pending/decision-claim data. Coven
@@ -153,9 +160,16 @@ consult the daemon recovery log, preserve any needed evidence, and delete old
 quarantine artifacts under the normal retention policy. Unknown ids fail with
 `proposal_not_found`.
 
-Proposals older than 30 days are terminally rejected by the scheduler with
-audit decision `expired`; target files are never applied. Interrupted expiry
-uses the same durable decision-request recovery path as principal decisions.
+No-window proposals older than 30 days are terminally rejected with audit
+decision `expired`; their target files are not applied. An opened veto window
+does not expire through this retention shortcut. Its deadline triggers replay
+and one typed terminal close. Interrupted decisions use the same durable
+decision-request recovery path as principal decisions.
+
+Quarantine is not a terminal close. When a previous apply is unresolved, its
+audit capacity reservation stays attached to the preserved recovery evidence.
+Resolve that state explicitly rather than deleting the evidence or claiming
+that the proposal was never applied.
 
 Every newly staged proposal carries deterministic, offline probe evidence.
 The list prints its aggregate `passed`, `failed`, or `unscored` status;

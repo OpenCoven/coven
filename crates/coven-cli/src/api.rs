@@ -29229,6 +29229,7 @@ tier = 0
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
         std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
         std::fs::write(
             workspace.join("IDENTITY.md"),
@@ -29240,7 +29241,7 @@ tier = 0
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
 
         assert_eq!(response.status, 409, "got {}", response.body);
@@ -29263,6 +29264,7 @@ tier = 0
         let temp = tempfile::tempdir()?;
         let home = temp.path();
         let (_pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
         std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
         set_proposal_decision_failpoint(Some((
             ProposalDecisionFailpoint::ApplyBeforeAudit,
@@ -29274,7 +29276,7 @@ tier = 0
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         );
         assert!(interrupted.is_err());
 
@@ -29290,7 +29292,7 @@ tier = 0
             &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
             home,
             None,
-            Some("{}"),
+            Some(&decision_body),
         )?;
 
         assert_eq!(retry.status, 409, "got {}", retry.body);

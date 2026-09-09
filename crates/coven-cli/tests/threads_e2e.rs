@@ -302,12 +302,7 @@ fn clock_control_and_audit_time_survive_real_daemon_restart() -> Result<()> {
 #[cfg(feature = "threads-test-clock")]
 fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result<()> {
     let corpus = retired_ward_corpus()?;
-    let case = corpus["valid_cases"]
-        .as_array()
-        .context("corpus valid cases")?
-        .iter()
-        .find(|case| case["id"] == "familiar-review")
-        .context("canonical familiar-review case")?;
+    let case = retired_review_case(&corpus)?;
     run_clocked_journey(
         "retired-corpus-scheduled-restart",
         |home, workspace| seed_retired_review_case(home, workspace, case),
@@ -331,6 +326,16 @@ fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result
                     && pending["classification"] == staged["scheduledProposal"]["classification"]
                     && pending["region_evidence"] == staged["scheduledProposal"]["region_evidence"],
                 "response and durable canonical evidence disagree"
+            );
+            let submitted_detail: String = fixture.store()?.query_row(
+                "SELECT detail FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'",
+                [id],
+                |row| row.get(0),
+            )?;
+            let submitted_detail: Value = serde_json::from_str(&submitted_detail)?;
+            anyhow::ensure!(
+                submitted_detail["classification"] == pending["classification"],
+                "submission audit does not bind the classified diff and replay evidence"
             );
             let minimum = case["approval"]["veto"]["min_visible_seconds"]
                 .as_i64()
@@ -361,7 +366,7 @@ fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result
                         .as_array()
                         .is_some_and(|proposals| proposals
                             .iter()
-                            .any(|proposal| proposal["id"] == id)),
+                            .any(|proposal| proposal["proposalId"] == id)),
                 "restart lost the visible pending interval: {pending_list:?}"
             );
             advance_clock_to_offset(fixture, capability, duration + 1)?;
@@ -446,13 +451,12 @@ fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<(
                 }
                 fixture.start_daemon()?;
                 let (event, reason, replay) = if scenario == "vetoed" {
+                    let payload =
+                        proposal_decision_payload(fixture, id, "Synthetic principal veto")?;
                     let rejected = fixture.request(
                         "POST",
                         &format!("/api/v1/threads/proposals/{id}/reject"),
-                        Some(&json!({
-                            "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
-                            "rationale": "Synthetic principal veto",
-                        })),
+                        Some(&payload),
                     )?;
                     anyhow::ensure!(
                         rejected.status == 200,
@@ -539,13 +543,11 @@ fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
             );
             tick_scheduler(fixture, capability)?;
             assert_corpus_bytes(fixture, case, "before")?;
+            let payload = proposal_decision_payload(fixture, id, "Synthetic human approval")?;
             let approved = fixture.request(
                 "POST",
                 &format!("/api/v1/threads/proposals/{id}/approve"),
-                Some(&json!({
-                    "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
-                    "rationale": "Synthetic human approval",
-                })),
+                Some(&payload),
             )?;
             anyhow::ensure!(
                 approved.status == 200,
@@ -1026,6 +1028,29 @@ fn submit_retired_case(fixture: &mut ThreadsFixture, case: &Value) -> Result<Val
         "supported intake did not publish canonical scheduled evidence: {response:?}"
     );
     Ok(response.body)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn proposal_decision_payload(fixture: &mut ThreadsFixture, id: &str, note: &str) -> Result<Value> {
+    let listed = fixture.request("GET", "/api/v1/threads/proposals", None)?;
+    anyhow::ensure!(
+        listed.status == 200,
+        "proposal inspection failed: {listed:?}"
+    );
+    let proposal = listed.body["proposals"]
+        .as_array()
+        .context("listed proposals")?
+        .iter()
+        .find(|proposal| proposal["proposalId"] == id)
+        .context("proposal is not pending")?;
+    let revision = proposal["proposalRevision"]
+        .as_str()
+        .context("proposal revision")?;
+    Ok(json!({
+        "expectedRevision": revision,
+        "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+        "note": note,
+    }))
 }
 
 #[cfg(feature = "threads-test-clock")]
