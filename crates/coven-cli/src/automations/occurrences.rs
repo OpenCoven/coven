@@ -461,8 +461,10 @@ pub(crate) fn recover_expired_leases_with_scheduler_fence(
                  lease_expires_at = NULL,
                  updated_at = ?1
              WHERE state = 'claimed'
-               AND lease_owner = 'daemon'
-               AND scheduler_generation = ?2
+               AND (
+                   (lease_owner = 'daemon' AND scheduler_generation = ?2)
+                   OR (kind = 'manual' AND scheduler_generation IS NULL)
+               )
                AND lease_expires_at IS NOT NULL
                AND lease_expires_at <= ?1
                AND EXISTS (
@@ -1245,6 +1247,41 @@ mod tests {
             .unwrap();
         assert_eq!(state, "claimed");
         assert_eq!(generation, second.fence().generation());
+    }
+
+    #[test]
+    fn elected_scheduler_recovers_an_expired_manual_claim() {
+        let (temp, conn) = temp_store();
+        let routine = definition("expired-manual", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "expired-manual-occurrence",
+            &routine.id,
+            "manual",
+            60,
+            now - chrono::Duration::minutes(61),
+        )
+        .unwrap());
+        let leader =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+
+        assert_eq!(
+            recover_expired_leases_with_scheduler_fence(&conn, now, &leader.fence()).unwrap(),
+            1
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE id = 'expired-manual-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
     }
 
     #[test]
