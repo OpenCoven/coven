@@ -1807,9 +1807,9 @@ pub struct DispatchReport {
     pub failed: Vec<String>,
 }
 
-/// Dispatches every claimed occurrence through the same durable launch
-/// primitive as manual runs. Successful launch acknowledgements remain
-/// nonterminal until session evidence is reconciled.
+/// Dispatches the oldest bounded batch of claimed occurrences through the same
+/// durable launch primitive as manual runs. Successful launch acknowledgements
+/// remain nonterminal until session evidence is reconciled.
 #[cfg(test)]
 fn dispatch_claimed_occurrences(
     conn: &Connection,
@@ -1874,6 +1874,10 @@ fn dispatch_claimed_occurrences_inner(
         }
     }
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let batch_limit =
+        i64::try_from(super::occurrences::SCHEDULER_PASS_BATCH_LIMIT).map_err(|error| {
+            format!("automation dispatch batch limit exceeds SQLite range: {error}")
+        })?;
 
     let claimed: Vec<(String, String)> = {
         let mut statement = conn
@@ -1899,12 +1903,17 @@ fn dispatch_claimed_occurrences_inner(
                              AND a.not_before <= ?1
                        )
                    )
-                 ORDER BY o.scheduled_for ASC",
+                 ORDER BY o.scheduled_for ASC
+                 LIMIT ?3",
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
             .query_map(
-                rusqlite::params![now_iso, scheduler_fence.map(|fence| fence.generation())],
+                rusqlite::params![
+                    now_iso,
+                    scheduler_fence.map(|fence| fence.generation()),
+                    batch_limit
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
@@ -7733,6 +7742,193 @@ mod tests {
             )
             .unwrap(),
             "a timeout observed after completion must not rewrite the session terminal state"
+        );
+    }
+
+    #[test]
+    fn durable_launch_failure_rolls_back_session_run_and_attempt() {
+        let (temp, conn) = temp_store();
+        let routine = definition("launch-crash");
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_launch_crash
+             BEFORE INSERT ON automation_attempts
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic launch crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, Utc::now())
+            .unwrap_err();
+
+        assert!(error.contains("synthetic launch crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let (sessions, runs, attempts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sessions),
+                    (SELECT COUNT(*) FROM automation_runs),
+                    (SELECT COUNT(*) FROM automation_attempts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((sessions, runs, attempts), (0, 0, 0));
+        let (state, reason): (String, String) = conn
+            .query_row(
+                "SELECT state, failure_reason
+                 FROM automation_occurrences
+                 WHERE automation_id = 'launch-crash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(reason.contains("synthetic launch crash"), "{reason}");
+    }
+
+    #[test]
+    fn terminal_settlement_failure_rolls_back_and_retries_from_session_evidence() {
+        let (temp, conn) = temp_store();
+        let routine = definition("settlement-crash");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let finished_at = launched_at + chrono::Duration::seconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_settlement_crash
+             BEFORE UPDATE OF status ON automation_runs
+             WHEN NEW.status != 'running'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic settlement crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = settle_finished_runs(&conn, finished_at).unwrap_err();
+
+        assert!(error.contains("synthetic settlement crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "running".to_string(),
+                "running".to_string(),
+                "started".to_string(),
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status, exit_code FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i32>>(1)?)),
+            )
+            .unwrap(),
+            ("completed".to_string(), Some(0))
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_settlement_crash")
+            .unwrap();
+        assert_eq!(
+            settle_finished_runs(&conn, finished_at).unwrap(),
+            SettlementReport {
+                succeeded: 1,
+                ..SettlementReport::default()
+            }
+        );
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn dispatches_only_the_oldest_bounded_claim_batch() {
+        let (_temp, conn) = temp_store();
+        let now = Utc::now();
+        for index in 0..65 {
+            let automation_id = format!("dispatch-load-{index:02}");
+            let mut routine = definition(&automation_id);
+            routine.status = RoutineStatus::Active;
+            insert_definition(&conn, &routine).unwrap();
+            let occurrence_id = format!("dispatch-occurrence-{index:02}");
+            let scheduled_for = now - chrono::Duration::seconds(65 - i64::from(index));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, lease_owner, lease_expires_at, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'claimed', 1, 'daemon', ?3, ?4, ?4
+                 FROM automation_definitions
+                 WHERE id = ?5",
+                rusqlite::params![
+                    occurrence_id,
+                    scheduled_for.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    (now + chrono::Duration::minutes(60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    automation_id,
+                ],
+            )
+            .unwrap();
+        }
+
+        let report =
+            dispatch_claimed_occurrences(&conn, &crate::api::NoopSessionRuntime, now).unwrap();
+
+        assert_eq!(report.dispatched.len(), 64);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM automation_occurrences WHERE state = 'claimed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "dispatch-occurrence-64"
         );
     }
 
