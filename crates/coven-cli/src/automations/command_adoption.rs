@@ -13,6 +13,13 @@ use super::contract::types::{AdoptionKey, PositiveInteger};
 use super::definition::RoutineDefinition;
 
 pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS automation_command_reservations (
+        adoption_key TEXT PRIMARY KEY NOT NULL,
+        request_digest TEXT NOT NULL,
+        command TEXT NOT NULL,
+        reserved_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS automation_command_adoptions (
         adoption_key TEXT PRIMARY KEY NOT NULL,
         request_digest TEXT NOT NULL,
@@ -119,6 +126,7 @@ struct DefinitionState {
     revision: u64,
     tombstoned: bool,
     authority_version: u8,
+    lifecycle_state: String,
 }
 
 pub fn execute_definition_command(
@@ -144,6 +152,38 @@ pub fn execute_definition_command(
     );
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin automation command adoption transaction")?;
+
+    if let Some((reserved_command, reserved_digest)) = transaction
+        .query_row(
+            "SELECT command, request_digest
+             FROM automation_command_reservations
+             WHERE adoption_key = ?1",
+            [adoption_key.as_str()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .context("failed to inspect automation command reservation")?
+    {
+        let response = if reserved_command == command_identity(&command).0
+            && reserved_digest == request_digest
+        {
+            rejected(
+                ErrorCode::CancelPending,
+                "automation command adoption is still in progress",
+                None,
+            )
+        } else {
+            rejected(
+                ErrorCode::AdoptionReplayMismatch,
+                "adoption key is reserved for a different automation command",
+                None,
+            )
+        };
+        transaction
+            .rollback()
+            .context("failed to close reserved automation command transaction")?;
+        return Ok(response);
+    }
 
     if let Some(stored) = load_adoption(&transaction, adoption_key.as_str())? {
         let response = if stored.request_digest == request_digest {
@@ -569,6 +609,13 @@ fn apply_legacy_create(
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
         }
     };
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy create cannot create a disabled definition",
+            None,
+        ));
+    }
     if let Some(current) = current_definition_state(conn, &definition.id)? {
         if current.tombstoned && current.authority_version == 0 {
             let next_revision = next_revision(current.revision)?;
@@ -686,6 +733,20 @@ fn apply_legacy_revise(
             Some(current.revision),
         ));
     }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy update cannot reactivate a disabled definition",
+            Some(current.revision),
+        ));
+    }
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "legacy update cannot disable a definition",
+            Some(current.revision),
+        ));
+    }
     if current.authority_version == 1 {
         return Ok(rejected(
             ErrorCode::IllegalTransition,
@@ -796,6 +857,13 @@ fn apply_create(
             return Ok(rejected(ErrorCode::ValidationFailed, error, None));
         }
     };
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "definition.create.v1 cannot create a disabled definition",
+            None,
+        ));
+    }
     if let Some(current) = current_definition_state(conn, &definition.id)? {
         if current.tombstoned {
             return Ok(rejected(
@@ -867,6 +935,20 @@ fn apply_revise(
     if expected_revision.is_some_and(|expected| current.revision != expected) {
         return Ok(revision_conflict(current.revision));
     }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "disabled definitions must use an explicit lifecycle transition",
+            Some(current.revision),
+        ));
+    }
+    if definition.status == super::definition::RoutineStatus::Disabled {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "definition.revise.v1 cannot disable a definition",
+            Some(current.revision),
+        ));
+    }
     let next_revision = next_revision(current.revision)?;
     let next_revision_sql = sqlite_revision(next_revision)?;
     let current_revision_sql = sqlite_revision(current.revision)?;
@@ -936,6 +1018,13 @@ fn apply_disable(
     }
     if expected_revision.is_some_and(|expected| current.revision != expected) {
         return Ok(revision_conflict(current.revision));
+    }
+    if current.lifecycle_state == "disabled" {
+        return Ok(rejected(
+            ErrorCode::IllegalTransition,
+            "automation definition is already disabled",
+            Some(current.revision),
+        ));
     }
     let record = super::store::get_definition(conn, automation_id)?
         .with_context(|| format!("automation definition `{automation_id}` disappeared"))?;
@@ -1043,7 +1132,7 @@ fn current_definition_state(
 ) -> Result<Option<DefinitionState>> {
     let state = conn
         .query_row(
-            "SELECT revision, tombstoned_at IS NOT NULL, authority_version
+            "SELECT revision, tombstoned_at IS NOT NULL, authority_version, lifecycle_state
              FROM automation_definitions
              WHERE id = ?1",
             [automation_id],
@@ -1052,20 +1141,24 @@ fn current_definition_state(
                     row.get::<_, i64>(0)?,
                     row.get::<_, bool>(1)?,
                     row.get::<_, u8>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             },
         )
         .optional()
         .context("failed to load automation definition state")?;
     state
-        .map(|(revision, tombstoned, authority_version)| {
-            Ok(DefinitionState {
-                revision: u64::try_from(revision)
-                    .context("automation definition revision must be non-negative")?,
-                tombstoned,
-                authority_version,
-            })
-        })
+        .map(
+            |(revision, tombstoned, authority_version, lifecycle_state)| {
+                Ok(DefinitionState {
+                    revision: u64::try_from(revision)
+                        .context("automation definition revision must be non-negative")?,
+                    tombstoned,
+                    authority_version,
+                    lifecycle_state,
+                })
+            },
+        )
         .transpose()
 }
 

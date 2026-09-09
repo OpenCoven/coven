@@ -255,6 +255,8 @@ fn reconcile_automation_runs(
 ) -> Result<()> {
     super::runner::recover_restart_containment(coven_home, conn, now, startup_cutoff)
         .map_err(anyhow::Error::msg)?;
+    super::cancellation::reconcile_expired_cancellations(conn, runtime, now)
+        .map_err(anyhow::Error::msg)?;
     for failure in
         super::runner::recover_abandoned_launches(conn, runtime, now).map_err(anyhow::Error::msg)?
     {

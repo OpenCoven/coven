@@ -1003,7 +1003,7 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         crate::automations::command_adoption::AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL,
     )
     .context("failed to initialize automation command adoption schema")?;
-    conn.execute_batch(crate::automations::cancellation::AUTOMATION_CANCELLATIONS_SCHEMA_SQL)
+    crate::automations::cancellation::ensure_cancellation_schema(conn)
         .context("failed to initialize automation cancellation schema")?;
     conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
         .context("failed to initialize automation_occurrences schema")?;
