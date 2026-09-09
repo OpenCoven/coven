@@ -17,6 +17,10 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         definition_digest TEXT,
         definition_json TEXT,
         occurrence_id TEXT,
+        authority_profile TEXT CHECK (
+            authority_profile IS NULL
+            OR authority_profile = 'coven.automations.authority.v1'
+        ),
         receipt_id TEXT,
         session_id TEXT,
         familiar_id TEXT,
@@ -72,6 +76,7 @@ pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
                 'initial', 'automatic_retry', 'operator_retry', 'operator_recovery'
             )
         ),
+        authority_extension_json TEXT,
         not_before TEXT NOT NULL,
         session_id TEXT UNIQUE,
         state_reason TEXT,
@@ -180,6 +185,7 @@ pub struct AttemptRecord {
 pub struct RunStart<'a> {
     pub automation_id: &'a str,
     pub occurrence_id: Option<&'a str>,
+    pub authority_profile: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub familiar_id: Option<&'a str>,
     pub runtime: &'a str,
@@ -196,9 +202,10 @@ pub fn record_run_start(
         definition_pin(conn, start.automation_id, start.occurrence_id)?;
     conn.execute(
         "INSERT INTO automation_runs
-            (id, automation_id, automation_revision, definition_digest, definition_json, occurrence_id,
-             session_id, familiar_id, runtime, status, started_at, timeout_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'running', ?10, ?11)",
+            (id, automation_id, automation_revision, definition_digest, definition_json,
+             occurrence_id, authority_profile, session_id, familiar_id, runtime, status,
+             started_at, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', ?11, ?12)",
         params![
             run_id,
             start.automation_id,
@@ -207,6 +214,7 @@ pub fn record_run_start(
             definition_digest,
             definition_json,
             start.occurrence_id,
+            start.authority_profile,
             start.session_id,
             start.familiar_id,
             start.runtime,
@@ -316,9 +324,9 @@ pub fn record_run_finish(
         log_json,
         output_commit,
     } = finish;
-    if status != "succeeded" && status != "failed" && status != "cancelled" {
+    if !matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
         return Err(anyhow::anyhow!(
-            "run status must be succeeded, failed, or cancelled"
+            "run status must be succeeded, failed, cancelled, or timed_out"
         ));
     }
     let bounded_log = log_json
@@ -561,6 +569,84 @@ pub fn ensure_timeout_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn ensure_authority_columns(conn: &Connection) -> Result<()> {
+    let run_columns = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .context("failed to inspect automation_runs authority columns")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to query automation_runs authority columns")?;
+        let mut names = Vec::new();
+        for column in columns {
+            names.push(column.context("failed to read automation_runs authority column")?);
+        }
+        names
+    };
+    if !run_columns
+        .iter()
+        .any(|column| column == "authority_profile")
+    {
+        conn.execute_batch(
+            "ALTER TABLE automation_runs
+             ADD COLUMN authority_profile TEXT CHECK (
+                 authority_profile IS NULL
+                 OR authority_profile = 'coven.automations.authority.v1'
+             )",
+        )
+        .context("failed to add automation_runs.authority_profile")?;
+    }
+
+    let attempt_columns = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(automation_attempts)")
+            .context("failed to inspect automation_attempts authority columns")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to query automation_attempts authority columns")?;
+        let mut names = Vec::new();
+        for column in columns {
+            names.push(column.context("failed to read automation_attempts authority column")?);
+        }
+        names
+    };
+    if !attempt_columns
+        .iter()
+        .any(|column| column == "authority_extension_json")
+    {
+        conn.execute_batch(
+            "ALTER TABLE automation_attempts
+             ADD COLUMN authority_extension_json TEXT",
+        )
+        .context("failed to add automation_attempts.authority_extension_json")?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS automation_run_authority_profile_immutable
+         BEFORE UPDATE OF authority_profile ON automation_runs
+         WHEN OLD.authority_profile IS NOT NEW.authority_profile
+         BEGIN
+             SELECT RAISE(ABORT, 'automation run authority profile is immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS automation_attempt_authority_immutable
+         BEFORE UPDATE OF authority_extension_json ON automation_attempts
+         WHEN OLD.authority_extension_json IS NOT NULL
+              AND OLD.authority_extension_json IS NOT NEW.authority_extension_json
+         BEGIN
+             SELECT RAISE(ABORT, 'automation attempt authority is immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS automation_attempt_authority_delete_refused
+         BEFORE DELETE ON automation_attempts
+         WHEN OLD.authority_extension_json IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'authority-bound automation attempt cannot be deleted');
+         END;",
+    )
+    .context("failed to install automation authority immutability guards")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,6 +690,79 @@ mod tests {
     }
 
     #[test]
+    fn initialized_store_pins_authority_profile_and_attempt_extension() {
+        let (_temp, conn) = temp_store();
+        let run_columns = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let attempt_columns = conn
+            .prepare("PRAGMA table_info(automation_attempts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(run_columns
+            .iter()
+            .any(|column| column == "authority_profile"));
+        assert!(attempt_columns
+            .iter()
+            .any(|column| column == "authority_extension_json"));
+    }
+
+    #[test]
+    fn authority_column_migration_installs_immutability_guards() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE automation_attempts (
+                id TEXT PRIMARY KEY NOT NULL,
+                run_id TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        ensure_authority_columns(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs (id, authority_profile)
+             VALUES ('run-1', 'coven.automations.authority.v1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (id, run_id, authority_extension_json)
+             VALUES ('attempt-1', 'run-1', '{\"profile\":\"coven.automations.authority.v1\"}')",
+            [],
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE automation_runs SET authority_profile = NULL WHERE id = 'run-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET authority_extension_json = '{}'
+                 WHERE id = 'attempt-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM automation_attempts WHERE id = 'attempt-1'", [],)
+            .is_err());
+    }
+
+    #[test]
     fn run_lifecycle_round_trip() {
         let (_temp, conn) = temp_store();
         let start = utc(2026, 8, 28, 9, 0);
@@ -621,6 +780,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: Some("occ-1"),
+                authority_profile: None,
                 session_id: None,
                 familiar_id: Some("charm"),
                 runtime: "coven-code",
@@ -679,6 +839,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: Some("occ-pinned"),
+                authority_profile: None,
                 session_id: None,
                 familiar_id: Some("cody"),
                 runtime: "coven-code",
@@ -705,6 +866,7 @@ mod tests {
             RunStart {
                 automation_id: "other",
                 occurrence_id: Some("occ-pinned"),
+                authority_profile: None,
                 session_id: None,
                 familiar_id: Some("cody"),
                 runtime: "coven-code",
@@ -726,6 +888,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: None,
+                authority_profile: None,
                 session_id: None,
                 familiar_id: None,
                 runtime: "coven-code",
@@ -777,6 +940,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: None,
+                authority_profile: None,
                 session_id: None,
                 familiar_id: None,
                 runtime: "coven-code",
@@ -798,7 +962,7 @@ mod tests {
             start,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("succeeded, failed, or cancelled"));
+        assert!(format!("{error:#}").contains("succeeded, failed, cancelled, or timed_out"));
     }
 
     #[test]
