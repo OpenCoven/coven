@@ -14,6 +14,7 @@ pub mod definition;
 pub mod health;
 pub mod import_legacy;
 pub mod occurrences;
+pub mod receipts;
 pub mod rrule;
 pub mod runner;
 pub mod runs;
