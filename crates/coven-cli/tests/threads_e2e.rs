@@ -187,14 +187,43 @@ fn protected_rejection_has_durable_non_authorizing_audit() -> Result<()> {
         let conn = fixture.store()?;
         let rows: i64 = conn.query_row(
             "SELECT COUNT(*) FROM ward_audit
-             WHERE familiar_id = ?1 AND event_type = 'validation_verdict'
-               AND decision = 'protected-proposal-forbidden' AND proposal_id IS NULL",
+             WHERE familiar_id = ?1 AND event_type = 'proposal_rejected'
+               AND decision = 'protected-target-not-proposable' AND detail IS NULL",
             [FAMILIAR_ID],
             |row| row.get(0),
         )?;
         anyhow::ensure!(
             rows == 1,
             "protected admission refusal must have exactly one non-authorizing audit row, got {rows}"
+        );
+        let rejection_id: String = conn.query_row(
+            "SELECT proposal_id FROM ward_audit
+             WHERE familiar_id = ?1 AND event_type = 'proposal_rejected'
+               AND decision = 'protected-target-not-proposable'",
+            [FAMILIAR_ID],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+        fixture.restart_daemon()?;
+        let retry = fixture.request(
+            "POST",
+            &format!("/api/v1/threads/proposals/{rejection_id}/approve"),
+            Some(&json!({"principalKeyFingerprint": PRINCIPAL_FINGERPRINT})),
+        )?;
+        anyhow::ensure!(
+            matches!(retry.status, 404 | 409),
+            "refusal audit id became approval authority after restart: {retry:?}"
+        );
+        let conn = fixture.store()?;
+        let terminals: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+             AND event_type IN ('proposal_rejected', 'proposal_approved', 'proposal_vetoed')",
+            [&rejection_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(
+            terminals == 1,
+            "refused intake acquired another terminal row"
         );
         anyhow::ensure!(
             fs::read_to_string(fixture.workspace.join("SOUL.md"))? == "# Sage\n",
