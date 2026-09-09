@@ -5776,6 +5776,58 @@ fn apply_familiar_edits(
     });
     let protected_targets = protected_proposal_targets(&adjudication);
     if !protected_targets.is_empty() {
+        let store_path = store_path(coven_home);
+        let conn = store::open_store(&store_path)?;
+        let state = crate::threads_gate::build_weave_state(
+            &conn,
+            familiar_id,
+            &workspace,
+            &config,
+            &protected_targets,
+            false,
+        )?;
+        let proposal_id = Uuid::new_v4().to_string();
+        let payload_bytes = serde_json::to_vec(&protected_targets)?
+            .len()
+            .checked_add(familiar_id.len())
+            .context("protected refusal audit payload overflowed")?;
+        let required_bytes = store::ward_audit_reservation_bytes(
+            &conn,
+            1,
+            u64::try_from(payload_bytes).context("protected refusal audit payload overflowed")?,
+        )?;
+        let reservation = match store::WardAuditReservation::acquire(
+            &conn,
+            &store_path,
+            format!("protected-refusal:{proposal_id}"),
+            "protected-proposal-refusal",
+            required_bytes,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) if store::ward_audit_capacity_failure(&error).is_some() => {
+                let limit = store::ward_audit_capacity_failure(&error)
+                    .expect("guard established a typed Ward audit capacity failure");
+                return ward_audit_capacity_exceeded_response(limit, Some(false));
+            }
+            Err(error) => return Err(error),
+        };
+        append_proposal_decision_audit(
+            &conn,
+            ProposalDecisionAudit {
+                event_type: coven_threads_core::AuditEventType::ProposalRejected,
+                proposal_id: &proposal_id,
+                familiar_id,
+                weave_hash: state.weave.weave_hash(),
+                approver: None,
+                files_touched: &protected_targets,
+                decision: "protected-target-not-proposable",
+                approval_rationale: None,
+                approval_path_label: "human_review",
+                window_close: None,
+                channel: coven_threads_core::Channel::Mutation,
+            },
+        )?;
+        reservation.finish()?;
         return api_error(
             403,
             "protected_proposal_forbidden",
@@ -27989,6 +28041,26 @@ forbidden = ["(?i)ignore previous"]
             std::fs::read_to_string(workspace.join("SOUL.md"))?,
             "# Sage\n"
         );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let rejection_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE event_type = 'proposal_rejected'
+               AND decision = 'protected-target-not-proposable'
+               AND approver IS NULL AND detail IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rejection_count, 1);
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            reservations, 0,
+            "completed refusal must release its reservation"
+        );
+        assert!(!home.join("pending").exists());
         Ok(())
     }
 
@@ -28013,6 +28085,42 @@ forbidden = ["(?i)ignore previous"]
             "# Sage\n"
         );
         assert!(!home.join("pending").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_protected_refusal_fails_closed_when_audit_is_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        saturate_ward_audit_capacity(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"SOUL.md","contents":"forbidden replacement"}],
+                "principalKeyFingerprint":"fpr-val"}"#,
+        )?;
+
+        assert_eq!(response.status, 507, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_audit_capacity_exceeded");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "# Sage\n"
+        );
+        assert!(!home.join("pending").exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE event_type IN ('proposal_rejected', 'proposal_approved', 'proposal_vetoed')",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_count, 0,
+            "audit exhaustion must not invent an outcome"
+        );
         Ok(())
     }
 
