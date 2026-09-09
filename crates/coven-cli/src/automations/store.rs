@@ -535,6 +535,7 @@ fn status_text(status: super::definition::RoutineStatus) -> &'static str {
     match status {
         super::definition::RoutineStatus::Active => "ACTIVE",
         super::definition::RoutineStatus::Paused => "PAUSED",
+        super::definition::RoutineStatus::Disabled => "DISABLED",
     }
 }
 
