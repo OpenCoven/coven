@@ -281,7 +281,7 @@ Tier-0 authority degradations and Tier-1 coherence holds, distinguished by
 | GET | `/api/v1/threads/proposals` | Owner-local cursor-paginated pending proposals with compact `probeSummary` evidence. `limit` defaults to and is capped at 64; pass the opaque `nextCursor` as `cursor`. Invalid files are reported once as `degraded` and quarantined. | `{ proposals, limit, hasMore, nextCursor }` | `400 invalid_request`, `403 transport_forbidden` |
 | GET | `/api/v1/threads/proposals/:id` | Owner-local detail for one pending proposal with `probeSummary` and full per-surface `probes`. | `{ proposal }` | `400 invalid_request`, `403 transport_forbidden`, `404 proposal_not_found` |
 | POST | `/api/v1/threads/proposals/:id/approve` | Re-validate and atomically apply a staged authority or coherence proposal. Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. `HumanApprovalWithRationale` paths require a non-empty `note`. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `413 ward_apply_too_large`, `413 proposal_quota_exceeded`, `507 ward_audit_capacity_exceeded` |
-| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
+| POST | `/api/v1/threads/proposals/:id/reject` | Reject/veto and remove a staged proposal (audited). Pending decisions require `{ expectedRevision, note? }`; take the exact revision from the GET detail response. To explicitly supersede this proposal with a newer matching pending replacement, also pass `{ replacementProposalId, replacementProposalRevision }` from that replacement proposal's detail/list response. Owner-local IPC only. | decision report | `400`, `403 transport_forbidden`, `404`, `409`, `507 ward_audit_capacity_exceeded` |
 
 Proposal metadata includes familiar identity, target paths, writer
 fingerprints, hashes, and probe diagnostics, so reads and mutations both
@@ -292,6 +292,20 @@ request under `/api/v1/threads/proposals` fails with stable
 creation, target access, or audit append. The response includes
 `details: { requiredAuthority: "owner_local_ipc", writeApplied: false }`.
 Host/Origin allowlists do not elevate TCP authority.
+
+Explicit supersession stays opt-in: ordinary proposal submission does not
+cancel earlier proposals. On `POST /api/v1/threads/proposals/:id/reject`, Coven
+derives supersession only after it revalidates a newer durable pending
+replacement with matching familiar, writer/approval lane, channel, and exact
+affected-surface scope. Veto-window proposals audit that outcome as
+`proposal_rejected` with `detail.reason = "superseded"` and
+`detail.replay_hash_matched = null`; human approval paths remain ordinary
+`proposal_rejected` rows with no close detail.
+
+Coven persists replacement intent in the decision claim and revalidates it
+after restart. Incomplete or invalid persisted intent is rejected, not
+reinterpreted as an ordinary veto. Preserve in-flight claims when rolling back:
+a daemon predating this extension cannot recover their added fields.
 
 ### Pending-proposal capacity and bounded maintenance
 
