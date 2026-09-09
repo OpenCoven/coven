@@ -1961,6 +1961,7 @@ pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
 pub struct SettlementReport {
     pub succeeded: usize,
     pub failed: usize,
+    pub cancelled: usize,
 }
 
 /// Requests strict termination for an abandoned pre-publication launch once
@@ -2232,8 +2233,9 @@ pub fn enforce_run_timeouts(
 }
 
 /// Reconciles nonterminal automation rows against the authoritative session
-/// ledger. Only a completed session with an explicit zero exit code can
-/// produce success; every other terminal session disposition is a failure.
+/// ledger. A completed session with an explicit zero exit code produces
+/// success, acknowledged cancellation remains distinct, and every other
+/// terminal session disposition is a failure.
 pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -2316,25 +2318,40 @@ pub fn settle_finished_runs(
             continue;
         }
 
-        let completed_after_timeout = match (timeout_at.as_deref(), terminal_at.as_deref()) {
+        let timed_out = match (timeout_at.as_deref(), terminal_at.as_deref()) {
             (Some(timeout_at), Some(terminal_at)) => {
                 let timeout_at = DateTime::parse_from_rfc3339(timeout_at)
                     .map_err(|error| format!("run `{run_id}` has invalid timeout_at: {error}"))?;
                 let terminal_at = DateTime::parse_from_rfc3339(terminal_at).map_err(|error| {
                     format!("session for run `{run_id}` has invalid terminal timestamp: {error}")
                 })?;
-                terminal_at > timeout_at
+                terminal_at >= timeout_at
             }
             _ => false,
         };
-        let succeeded = session_status.as_deref() == Some("completed")
-            && exit_code == Some(0)
-            && !completed_after_timeout;
-        let status = if succeeded { "succeeded" } else { "failed" };
+        let succeeded =
+            session_status.as_deref() == Some("completed") && exit_code == Some(0) && !timed_out;
+        let cancelled = session_status.as_deref() == Some("cancelled") && !timed_out;
+        let status = if succeeded {
+            "succeeded"
+        } else if cancelled {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let attempt_status = if timed_out { "timed_out" } else { status };
         let reason = if succeeded {
             None
-        } else if completed_after_timeout {
-            Some("session completed after automation timeout".to_string())
+        } else if timed_out {
+            Some(match session_status.as_deref() {
+                Some("completed") => "session completed after automation timeout".to_string(),
+                Some(session_status) => {
+                    format!("session {session_status} at or after automation timeout")
+                }
+                None => unreachable!("terminal_session requires a session status"),
+            })
+        } else if cancelled {
+            Some("session cancellation acknowledged".to_string())
         } else {
             Some(match (&session_status, exit_code) {
                 (Some(session_status), Some(exit_code)) => {
@@ -2354,7 +2371,10 @@ pub fn settle_finished_runs(
             ));
         };
         if occurrence_state.as_deref() != Some(status) {
-            if matches!(occurrence_state.as_deref(), Some("succeeded" | "failed")) {
+            if matches!(
+                occurrence_state.as_deref(),
+                Some("succeeded" | "failed" | "cancelled")
+            ) {
                 return Err(format!(
                     "automation occurrence `{occurrence_id}` is already `{}` but terminal session evidence requires `{status}`",
                     occurrence_state.as_deref().unwrap_or("missing")
@@ -2371,12 +2391,17 @@ pub fn settle_finished_runs(
                 "UPDATE automation_attempts
                  SET state = ?2,
                      state_reason = ?3,
-                     settled_at = ?4
+                     settled_at = ?4,
+                     failure_class = CASE
+                         WHEN ?2 = 'cancelled' THEN 'cancelled'
+                         WHEN ?2 = 'timed_out' THEN 'timeout'
+                         ELSE failure_class
+                     END
                  WHERE run_id = ?1
                    AND state IN ('dispatching', 'started', 'observing')",
                 rusqlite::params![
                     run_id,
-                    status,
+                    attempt_status,
                     reason,
                     now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 ],
@@ -2419,6 +2444,8 @@ pub fn settle_finished_runs(
             .map_err(|error| format!("failed to commit automation settlement: {error}"))?;
         if succeeded {
             report.succeeded += 1;
+        } else if cancelled {
+            report.cancelled += 1;
         } else {
             report.failed += 1;
         }
@@ -4557,14 +4584,20 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(run.status, "failed");
-        let reason: String = conn
+        let (reason, attempt_state, failure_class): (String, String, Option<String>) = conn
             .query_row(
-                "SELECT failure_reason FROM automation_occurrences WHERE automation_id = 'daily'",
+                "SELECT o.failure_reason, a.state, a.failure_class
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE o.automation_id = 'daily'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(reason, "session completed after automation timeout");
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -4656,6 +4689,160 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn cancelled_session_evidence_settles_automation_as_cancelled() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily")).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("daily"),
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let cancelled_at = launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "cancelled",
+            None,
+            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, cancelled_at).unwrap();
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.cancelled, 1);
+
+        let run = super::super::runs::list_runs(&conn, "daily", 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(run.exit_code, None);
+
+        let (occurrence_state, attempt_state, failure_class): (String, String, Option<String>) =
+            conn.query_row(
+                "SELECT o.state, a.state, a.failure_class
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "cancelled");
+        assert_eq!(attempt_state, "cancelled");
+        assert_eq!(failure_class.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn completion_recorded_before_cancellation_remains_successful() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily")).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("daily"),
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let completed_at = launched_at + chrono::Duration::seconds(4);
+        assert!(crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        assert!(!crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "cancelled",
+            None,
+            &(completed_at + chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+
+        let report = settle_finished_runs(&conn, completed_at).unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.cancelled, 0);
+
+        let (run_status, occurrence_state, attempt_state): (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "succeeded");
+        assert_eq!(occurrence_state, "succeeded");
+        assert_eq!(attempt_state, "succeeded");
+    }
+
+    #[test]
+    fn cancellation_after_deadline_preserves_timeout_disposition() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("daily");
+        routine.timeout_minutes = 1;
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let cancelled_at = persisted_timeout_at(&conn, "daily") + chrono::Duration::milliseconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            outcome.session_id.as_deref().unwrap(),
+            "cancelled",
+            None,
+            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, cancelled_at).unwrap();
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.cancelled, 0);
+
+        let (run_status, occurrence_state, attempt_state, failure_class): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(occurrence_state, "failed");
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -5627,6 +5814,17 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(run.status, "failed");
+        let (attempt_state, failure_class): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_class
+                 FROM automation_attempts
+                 WHERE run_id = ?1",
+                [run.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
     }
 
     #[test]
