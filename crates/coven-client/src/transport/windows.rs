@@ -19,6 +19,7 @@ const TRAILING_RESPONSE_BYTES: &str =
     "daemon sent bytes beyond its declared response Content-Length";
 #[cfg(windows)]
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const READ_RESPONSE_TIMEOUT_MESSAGE: &str = "timed out reading Coven daemon response";
 #[cfg(any(windows, test))]
 const fn windows_pipe_client_flags() -> u32 {
     // SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION. Passing zero asks
@@ -1001,9 +1002,7 @@ fn read_framed_response<R: Read>(
             )));
         }
         if Instant::now() >= deadline {
-            return Err(ClientError::InvalidHttpResponse(
-                "timed out reading Coven daemon response".to_owned(),
-            ));
+            return Err(read_response_timeout_error(response.is_empty()));
         }
         match reader.read(&mut chunk) {
             Ok(0) => {
@@ -1024,9 +1023,7 @@ fn read_framed_response<R: Read>(
                 if error.kind() != std::io::ErrorKind::Interrupted {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
-                        return Err(ClientError::InvalidHttpResponse(
-                            "timed out reading Coven daemon response".to_owned(),
-                        ));
+                        return Err(read_response_timeout_error(response.is_empty()));
                     }
                     std::thread::sleep(remaining.min(Duration::from_millis(10)));
                 }
@@ -1039,6 +1036,17 @@ fn read_framed_response<R: Read>(
             }
         }
     }
+}
+
+fn read_response_timeout_error(empty_response: bool) -> ClientError {
+    ClientError::InvalidHttpResponse(
+        if empty_response {
+            crate::EMPTY_RESPONSE_TIMEOUT_MESSAGE
+        } else {
+            READ_RESPONSE_TIMEOUT_MESSAGE
+        }
+        .to_owned(),
+    )
 }
 
 fn ensure_no_immediately_available_response_bytes<R: Read>(
@@ -1130,8 +1138,11 @@ mod tests {
         windows_pipe_client_flags, windows_pipe_connection_is_unavailable,
         windows_stop_identity_from_health, windows_stop_pipe_preflight,
         write_windows_pipe_with_deadline, MAX_RESPONSE_HEADERS_BYTES,
+        READ_RESPONSE_TIMEOUT_MESSAGE,
     };
-    use crate::{discovery::supported_windows_pipe_names, ClientError};
+    use crate::{
+        discovery::supported_windows_pipe_names, ClientError, EMPTY_RESPONSE_TIMEOUT_MESSAGE,
+    };
     use std::{
         collections::VecDeque,
         io::{Cursor, Read, Write},
@@ -1314,7 +1325,7 @@ mod tests {
     }
 
     #[test]
-    fn live_empty_pipe_polling_sleeps_and_obeys_the_absolute_deadline() {
+    fn live_empty_pipe_polling_reports_response_pending_at_the_absolute_deadline() {
         let mut reader = AlwaysNoDataReader { reads: 0 };
         let started = Instant::now();
         let error =
@@ -1323,17 +1334,59 @@ mod tests {
                 Err(error) => error,
             };
 
-        assert!(
-            error
-                .to_string()
-                .contains("timed out reading Coven daemon response"),
-            "unexpected error: {error}"
-        );
+        assert!(matches!(
+            error,
+            ClientError::InvalidHttpResponse(message)
+                if message == EMPTY_RESPONSE_TIMEOUT_MESSAGE
+        ));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(
             reader.reads <= 5,
             "empty pipe polling spun {} times",
             reader.reads
+        );
+    }
+
+    struct BytesThenNoDataReader {
+        first_chunk: Option<&'static [u8]>,
+        reads_after_bytes: usize,
+    }
+
+    impl Read for BytesThenNoDataReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(chunk) = self.first_chunk.take() {
+                buffer[..chunk.len()].copy_from_slice(chunk);
+                return Ok(chunk.len());
+            }
+            self.reads_after_bytes += 1;
+            Err(std::io::Error::from_raw_os_error(232))
+        }
+    }
+
+    #[test]
+    fn partial_response_timeout_stays_an_invalid_http_response() {
+        let mut reader = BytesThenNoDataReader {
+            first_chunk: Some(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbo"),
+            reads_after_bytes: 0,
+        };
+
+        let error = match read_framed_response(
+            &mut reader,
+            Instant::now() + Duration::from_millis(25),
+            1024,
+        ) {
+            Ok(_) => panic!("a stalled partial response must fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ClientError::InvalidHttpResponse(message)
+                if message == READ_RESPONSE_TIMEOUT_MESSAGE
+        ));
+        assert!(
+            reader.reads_after_bytes > 0,
+            "the reader must continue polling after partial bytes arrive"
         );
     }
 
