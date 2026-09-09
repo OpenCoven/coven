@@ -160,14 +160,7 @@ fn claim_due_occurrence_with_scheduler_fence(
     now: DateTime<Utc>,
     fence: &super::leadership::SchedulerFence,
 ) -> Result<Option<String>, String> {
-    claim_due_occurrence_inner(
-        conn,
-        automation_id,
-        owner,
-        lease_minutes,
-        now,
-        Some(fence.generation()),
-    )
+    claim_due_occurrence_inner(conn, automation_id, owner, lease_minutes, now, Some(fence))
 }
 
 fn claim_due_occurrence_inner(
@@ -176,7 +169,7 @@ fn claim_due_occurrence_inner(
     owner: &str,
     lease_minutes: i64,
     now: DateTime<Utc>,
-    scheduler_generation: Option<i64>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
 ) -> Result<Option<String>, String> {
     if lease_minutes <= 0 || lease_minutes > 24 * 60 {
         return Err("lease minutes must be 1..=1440".to_string());
@@ -196,6 +189,14 @@ fn claim_due_occurrence_inner(
              WHERE automation_id = ?1
                AND state = 'planned'
                AND scheduled_for <= ?2
+               AND (
+                   ?3 IS NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM automation_scheduler_authority
+                       WHERE id = 1 AND owner_id = ?4 AND generation = ?3
+                   )
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs
                    WHERE automation_runs.occurrence_id = automation_occurrences.id
@@ -208,7 +209,12 @@ fn claim_due_occurrence_inner(
                      AND state = 'planned'
                      AND scheduled_for <= ?2
                )",
-            params![automation_id, now_iso],
+            params![
+                automation_id,
+                now_iso,
+                scheduler_fence.map(|fence| fence.generation()),
+                scheduler_fence.map(|fence| fence.owner_id()),
+            ],
         )
         .map_err(|error| format!("failed to supersede stale occurrence fences: {error}"))?;
     let changed = transaction
@@ -223,6 +229,14 @@ fn claim_due_occurrence_inner(
              WHERE automation_id = ?1
                AND state = 'planned'
                AND scheduled_for <= ?2
+               AND (
+                   ?5 IS NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM automation_scheduler_authority
+                       WHERE id = 1 AND owner_id = ?6 AND generation = ?5
+                   )
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM automation_occurrences
                    WHERE automation_id = ?1 AND state IN ('claimed', 'running')
@@ -279,11 +293,30 @@ fn claim_due_occurrence_inner(
                 now_iso,
                 owner,
                 expires_iso,
-                scheduler_generation
+                scheduler_fence.map(|fence| fence.generation()),
+                scheduler_fence.map(|fence| fence.owner_id()),
             ],
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
+        if let Some(fence) = scheduler_fence {
+            let current: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM automation_scheduler_authority
+                        WHERE id = 1 AND owner_id = ?1 AND generation = ?2
+                    )",
+                    params![fence.owner_id(), fence.generation()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    format!("failed to verify automations scheduler fence: {error}")
+                })?;
+            if !current {
+                return Err("automations scheduler fence is stale".to_string());
+            }
+        }
         transaction
             .commit()
             .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
@@ -413,6 +446,48 @@ pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<u
     Ok(changed)
 }
 
+pub(crate) fn recover_expired_leases_with_scheduler_fence(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<usize, String> {
+    let now_iso = iso(now);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = 'lease expired',
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?1
+             WHERE state = 'claimed'
+               AND lease_owner = 'daemon'
+               AND scheduler_generation = ?2
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at <= ?1
+               AND EXISTS (
+                   SELECT 1
+                   FROM automation_scheduler_authority
+                   WHERE id = 1 AND owner_id = ?3 AND generation = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_runs.occurrence_id = automation_occurrences.id
+                     AND automation_runs.status = 'running'
+               )",
+            params![now_iso, fence.generation(), fence.owner_id()],
+        )
+        .map_err(|error| format!("failed to recover expired scheduler leases: {error}"))?;
+    if changed == 0
+        && !fence
+            .is_current(conn)
+            .map_err(|error| format!("failed to verify automations scheduler fence: {error:#}"))?
+    {
+        return Err("automations scheduler fence is stale".to_string());
+    }
+    Ok(changed)
+}
+
 /// Finalizes an occurrence into a terminal state. Releasing a PLANNED
 /// occurrence is refused — only claimed work can settle.
 #[allow(dead_code)]
@@ -476,17 +551,18 @@ pub(crate) fn tick_with_scheduler_fence(
     if !fence.is_current(conn)? {
         anyhow::bail!("automations scheduler fence is stale");
     }
-    recover_stale_scheduler_claims(conn, fence.generation(), now)?;
+    recover_stale_scheduler_claims(conn, fence, now)?;
     tick_inner(conn, now, Some(fence))
 }
 
 fn recover_stale_scheduler_claims(
     conn: &Connection,
-    generation: i64,
+    fence: &super::leadership::SchedulerFence,
     now: DateTime<Utc>,
 ) -> Result<usize> {
-    conn.execute(
-        "UPDATE automation_occurrences
+    let recovered = conn
+        .execute(
+            "UPDATE automation_occurrences
          SET state = 'planned',
              lease_owner = NULL,
              lease_expires_at = NULL,
@@ -496,13 +572,22 @@ fn recover_stale_scheduler_claims(
          WHERE state = 'claimed'
            AND lease_owner = 'daemon'
            AND scheduler_generation IS NOT ?1
+           AND EXISTS (
+               SELECT 1
+               FROM automation_scheduler_authority
+               WHERE id = 1 AND owner_id = ?3 AND generation = ?1
+           )
            AND NOT EXISTS (
                SELECT 1 FROM automation_runs
                WHERE automation_runs.occurrence_id = automation_occurrences.id
            )",
-        params![generation, iso(now)],
-    )
-    .context("failed to recover stale scheduler claims")
+            params![fence.generation(), iso(now), fence.owner_id()],
+        )
+        .context("failed to recover stale scheduler claims")?;
+    if recovered == 0 && !fence.is_current(conn)? {
+        anyhow::bail!("automations scheduler fence is stale");
+    }
+    Ok(recovered)
 }
 
 fn tick_inner(
@@ -528,7 +613,11 @@ fn tick_inner(
         }
     }
 
-    report.recovered = recover_expired_leases(conn, now).unwrap_or(0);
+    report.recovered = match scheduler_fence {
+        Some(fence) => recover_expired_leases_with_scheduler_fence(conn, now, fence)
+            .map_err(anyhow::Error::msg)?,
+        None => recover_expired_leases(conn, now).unwrap_or(0),
+    };
 
     for definition in &definitions {
         let claimed = match scheduler_fence {
@@ -1054,6 +1143,108 @@ mod tests {
             error.to_string().contains("scheduler fence is stale"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn stale_scheduler_fence_cannot_claim_without_the_tick_guard() {
+        let (temp, conn) = temp_store();
+        let routine = definition("stale-direct-claim", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest,
+                 scheduled_for, kind, state, attempt, created_at, updated_at)
+             SELECT 'stale-direct-claim-occurrence', id, revision, definition_digest,
+                    ?1, 'scheduled', 'planned', 0, ?1, ?1
+             FROM automation_definitions
+             WHERE id = ?2",
+            rusqlite::params![iso(now), routine.id],
+        )
+        .unwrap();
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let _second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        let error = claim_due_occurrence_with_scheduler_fence(
+            &conn,
+            &routine.id,
+            "daemon",
+            60,
+            now + chrono::Duration::seconds(1),
+            &stale_fence,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE id = 'stale-direct-claim-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+    }
+
+    #[test]
+    fn stale_scheduler_fence_cannot_recover_a_successor_claim() {
+        let (temp, conn) = temp_store();
+        let routine = definition("successor-claim", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(now - chrono::Duration::days(1)), routine.id],
+        )
+        .unwrap();
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        let report =
+            tick_with_scheduler_fence(&conn, now + chrono::Duration::seconds(1), &second.fence())
+                .unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+
+        let error =
+            recover_stale_scheduler_claims(&conn, &stale_fence, now + chrono::Duration::seconds(2))
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("scheduler fence is stale"),
+            "{error:#}"
+        );
+        let (state, generation): (String, i64) = conn
+            .query_row(
+                "SELECT state, scheduler_generation
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+        assert_eq!(generation, second.fence().generation());
     }
 
     #[test]
