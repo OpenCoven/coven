@@ -234,6 +234,71 @@ fn protected_rejection_has_durable_non_authorizing_audit() -> Result<()> {
 }
 
 #[test]
+#[cfg(feature = "threads-test-clock")]
+fn clock_control_and_audit_time_survive_real_daemon_restart() -> Result<()> {
+    run_clocked_journey(
+        "deterministic-clock-restart",
+        |_, _| Ok(()),
+        |fixture, capability| {
+            let advanced = "2099-01-01T00:01:00Z";
+            advance_clock(fixture, capability, advanced)?;
+            let refusal = fixture.request(
+                "POST",
+                "/api/v1/familiars/sage/edits",
+                Some(&json!({
+                    "edits": [{"target": "SOUL.md", "contents": "# Forbidden fixture\n"}],
+                })),
+            )?;
+            anyhow::ensure!(refusal.status == 403, "unexpected refusal: {refusal:?}");
+            let decided_at: String = fixture.store()?.query_row(
+                "SELECT decided_at FROM ward_audit
+                 WHERE event_type = 'proposal_rejected'",
+                [],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                decided_at == advanced,
+                "audit escaped the logical clock: {decided_at}"
+            );
+            fixture.restart_daemon()?;
+            let tick = fixture.request(
+                "POST",
+                "/api/v1/internal/threads/test-clock/tick",
+                Some(&json!({"capability": capability})),
+            )?;
+            anyhow::ensure!(
+                tick.status == 200
+                    && tick.body["source"] == "deterministic_fixture"
+                    && tick.body["now"] == advanced
+                    && tick.body["processed"] == 0,
+                "restart lost controlled scheduler time: {tick:?}"
+            );
+            let backwards = fixture.request(
+                "POST",
+                "/api/v1/internal/threads/test-clock",
+                Some(&json!({
+                    "capability": capability,
+                    "now": "2099-01-01T00:00:59Z",
+                })),
+            )?;
+            anyhow::ensure!(
+                backwards.status == 409,
+                "restart allowed time to move backwards: {backwards:?}"
+            );
+            anyhow::ensure!(
+                fixture
+                    .last_request
+                    .as_ref()
+                    .context("clock request recorded")?["body"]["capability"]
+                    == "<fixture-capability>",
+                "artifact request retained the fixture capability"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn smoke_out_of_band_drift_stages_without_execution() -> Result<()> {
     run_journey("smoke-out-of-band-drift", |fixture| {
         let baseline_request = json!({
@@ -445,8 +510,16 @@ fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> 
 }
 
 fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>) -> Result<()> {
+    run_fixture_journey(name, ThreadsFixture::start, journey)
+}
+
+fn run_fixture_journey(
+    name: &str,
+    initialize: impl FnOnce(&EvidenceContext) -> Result<ThreadsFixture>,
+    journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>,
+) -> Result<()> {
     let evidence = EvidenceContext::new(name);
-    let mut fixture = match ThreadsFixture::start(&evidence) {
+    let mut fixture = match initialize(&evidence) {
         Ok(fixture) => fixture,
         Err(error) => {
             evidence.write_setup_failure(&error)?;
@@ -455,6 +528,66 @@ fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<(
     };
     let journey_result = journey(&mut fixture);
     finalize_journey(&mut fixture, journey_result)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn run_clocked_journey(
+    name: &str,
+    prepare: impl FnOnce(&Path, &Path) -> Result<()>,
+    journey: impl FnOnce(&mut ThreadsFixture, &str) -> Result<()>,
+) -> Result<()> {
+    let capability = Uuid::new_v4().to_string();
+    run_fixture_journey(
+        name,
+        |evidence| {
+            ThreadsFixture::start_with_setup(evidence, |home, workspace| {
+                seed_clock(home, &capability)?;
+                prepare(home, workspace)
+            })
+        },
+        |fixture| journey(fixture, &capability),
+    )
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn seed_clock(coven_home: &Path, capability: &str) -> Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let root = coven_home.join("test-fixtures");
+    let directory = root.join("threads-deterministic-clock");
+    fs::create_dir_all(&directory)?;
+    for path in [&root, &directory] {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    for (name, contents) in [
+        ("enabled", "threads_test_clock_v1\n"),
+        ("capability", capability),
+        ("state.json", r#"{"now":"2099-01-01T00:00:00Z"}"#),
+    ] {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(directory.join(name))?
+            .write_all(contents.as_bytes())?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn advance_clock(fixture: &mut ThreadsFixture, capability: &str, now: &str) -> Result<()> {
+    let response = fixture.request(
+        "POST",
+        "/api/v1/internal/threads/test-clock",
+        Some(&json!({"capability": capability, "now": now})),
+    )?;
+    anyhow::ensure!(
+        response.status == 200
+            && response.body["now"] == now
+            && response.body["source"] == "deterministic_fixture",
+        "clock advance failed: {response:?}"
+    );
+    Ok(())
 }
 
 fn finalize_journey(fixture: &mut ThreadsFixture, journey_result: Result<()>) -> Result<()> {
@@ -604,6 +737,13 @@ struct ThreadsFixture {
 
 impl ThreadsFixture {
     fn start(evidence: &EvidenceContext) -> Result<Self> {
+        Self::start_with_setup(evidence, |_, _| Ok(()))
+    }
+
+    fn start_with_setup(
+        evidence: &EvidenceContext,
+        prepare: impl FnOnce(&Path, &Path) -> Result<()>,
+    ) -> Result<Self> {
         let workspace_root = workspace_root();
         let dependency = threads_dependency(&workspace_root)?;
         if std::env::var_os(REQUIRE_OVERRIDE_ENV).is_some() {
@@ -631,6 +771,7 @@ impl ThreadsFixture {
         let workspace = coven_home.join("familiars").join(FAMILIAR_ID);
         fs::create_dir_all(&workspace)?;
         seed_familiar(&coven_home, &workspace)?;
+        prepare(&coven_home, &workspace)?;
 
         let coven = PathBuf::from(env!("CARGO_BIN_EXE_coven"));
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -660,7 +801,10 @@ impl ThreadsFixture {
     }
 
     fn request(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<HttpResponse> {
-        let request = body.cloned().unwrap_or(Value::Null);
+        let mut request = body.cloned().unwrap_or(Value::Null);
+        if let Some(capability) = request.get_mut("capability") {
+            *capability = json!("<fixture-capability>");
+        }
         self.last_request = Some(json!({
             "method": method,
             "path": path,

@@ -3872,6 +3872,9 @@ fn rotate_recovery_log(path: &Path, incoming_bytes: u64, max_bytes: u64, backups
 }
 
 fn start_threads_proposal_scheduler(coven_home: &Path) -> Result<()> {
+    if crate::threads_clock::fixture_mode_enabled(coven_home)? {
+        return Ok(());
+    }
     if let Err(error) = crate::api::process_due_threads_proposals(coven_home) {
         append_daemon_recovery_log(
             coven_home,
