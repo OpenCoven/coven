@@ -899,7 +899,7 @@ dependencies = [
 [[package]]
 name = "coven-threads-core"
 version = "0.2.0"
-source = "git+https://github.com/OpenCoven/coven-threads?rev=c102844#c102844e998778a7dbd92652711edc816ef42bc7"
+source = "git+https://github.com/OpenCoven/coven-threads?rev=c3bd46bcadb6396db8436c47411a4d0eac17192b#c3bd46bcadb6396db8436c47411a4d0eac17192b"
 dependencies = [
  "blake3",
  "serde",
@@ -4750,7 +4750,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.2",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

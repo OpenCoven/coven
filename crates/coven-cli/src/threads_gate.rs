@@ -188,6 +188,15 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
     let state = build_weave_state(conn, familiar_id, workspace, config, gated_targets, true)?;
     let familiar_uuid = state.familiar_uuid;
     let weave = state.weave;
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        familiar_id,
+        workspace,
+        config,
+        edits,
+        authorization,
+        None,
+    );
 
     // Validate every gated target; audit every verdict (RFC-0001 §5.6).
     let mut verdicts = Vec::with_capacity(gated_targets.len());
@@ -198,7 +207,7 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
             surface: threads::SurfaceId::new(target.clone()),
             writer: request_writer.clone(),
             channel: threads::Channel::Mutation,
-            identity_context: None,
+            identity_context: identity_context.clone(),
         };
         let verdict = threads::validate_fail_closed(&weave, &request);
         append_audit_row(
@@ -389,7 +398,7 @@ pub(crate) fn build_weave_state_for_writer(
         woven.push(thread);
     }
 
-    let pattern = threads::AllSurfacesHoldOnChannels {
+    let structural = threads::AllSurfacesHoldOnChannels {
         name: format!("{familiar_id}-protected-surface"),
         surfaces: surfaces
             .iter()
@@ -397,14 +406,17 @@ pub(crate) fn build_weave_state_for_writer(
             .collect(),
         channels: PROTECTED_CHANNELS.to_vec(),
     };
-    let weave = threads::Weave::new(
-        threads::WeaveId::new(),
-        familiar_uuid,
-        woven,
-        Box::new(pattern),
-        None,
-    )
-    .context("weaving protected surfaces")?;
+    let pattern: Box<dyn threads::PatternPredicate + Send + Sync> =
+        if let Some(invariants) = config.identity_invariant_set()? {
+            Box::new(threads::IdentityAwarePattern {
+                structural: Box::new(structural),
+                invariants,
+            })
+        } else {
+            Box::new(structural)
+        };
+    let weave = threads::Weave::new(threads::WeaveId::new(), familiar_uuid, woven, pattern, None)
+        .context("weaving protected surfaces")?;
 
     Ok(WeaveState {
         familiar_uuid,
@@ -1121,6 +1133,120 @@ tier = 2
         ward::Authorization::signed_by("fp-val-1")
     }
 
+    fn identity_config() -> ward::WardConfig {
+        ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[identity_invariant]]
+fact = "pronouns"
+operator = "equals"
+expected = "she/her"
+
+[[identity_invariant]]
+fact = "purpose"
+operator = "includes"
+expected = "research"
+
+[[identity_invariant]]
+fact = "coven"
+operator = "equals"
+expected = "OpenCoven"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+"#,
+        )
+        .expect("identity config parses")
+    }
+
+    fn minimal_identity_config() -> ward::WardConfig {
+        ward::WardConfig::from_toml_str(
+            r#"
+principal_key_fingerprint = "fp-val-1"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+"#,
+        )
+        .expect("minimal identity config parses")
+    }
+
+    fn canonical_soul(name: &str, purpose: &str) -> String {
+        format!("# SOUL\n## I am {name}\nMy purpose is {purpose}.\n")
+    }
+
+    fn canonical_identity(name: &str, pronouns: &str) -> String {
+        format!("# IDENTITY.md - {name}\n- **Name:** {name}\n- **Pronouns:** {pronouns}\n")
+    }
+
+    fn configure_identity_sources(f: &Fixture) {
+        std::fs::write(
+            f.coven_home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "research"),
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("IDENTITY.md"),
+            canonical_identity("Sage", "she/her"),
+        )
+        .unwrap();
+        std::fs::write(f.workspace.join("MEMORY.md"), "facts stay local\n").unwrap();
+    }
+
     #[test]
     fn hex_to_bytes_rejects_non_ascii_without_panicking() {
         let error = hex_to_bytes("0éx").expect_err("non-ASCII hex must be rejected");
@@ -1527,6 +1653,184 @@ tier = 0
         )
         .expect_err("absolute declaration must refuse");
         assert!(format!("{err:#}").contains("workspace-relative"));
+    }
+
+    #[test]
+    fn identity_predicate_rejects_failed_candidate_fact() {
+        let f = fixture();
+        configure_identity_sources(&f);
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "sabotage"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("Purpose identity invariant did not hold"));
+    }
+
+    #[test]
+    fn identity_predicate_fails_closed_when_authoritative_source_is_missing() {
+        let f = fixture();
+        configure_identity_sources(&f);
+        std::fs::remove_file(f.workspace.join("IDENTITY.md")).unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &minimal_identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "research"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("identity fact unavailable"));
+    }
+
+    #[test]
+    fn identity_predicate_fails_closed_on_ambiguous_roster_sources() {
+        let f = fixture();
+        std::fs::write(
+            f.coven_home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+
+[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Conflicting duplicate."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "research"),
+        )
+        .unwrap();
+        std::fs::write(
+            f.workspace.join("IDENTITY.md"),
+            canonical_identity("Sage", "she/her"),
+        )
+        .unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &minimal_identity_config(),
+                edits: &[ward::FileEdit::new(
+                    "SOUL.md",
+                    canonical_soul("Sage", "research"),
+                )],
+                gated_targets: &["SOUL.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("identity fact unavailable"));
+    }
+
+    #[test]
+    fn identity_predicate_reads_complete_candidate_for_unrelated_targets() {
+        let f = fixture();
+        configure_identity_sources(&f);
+        std::fs::write(
+            f.workspace.join("SOUL.md"),
+            canonical_soul("Sage", "sabotage"),
+        )
+        .unwrap();
+
+        let report = gate_protected_edits(
+            &f.conn,
+            &GateRequest {
+                coven_home: &f.coven_home,
+                familiar_id: "sage",
+                workspace: &f.workspace,
+                config: &identity_config(),
+                edits: &[ward::FileEdit::new("MEMORY.md", "refined notes\n")],
+                gated_targets: &["MEMORY.md".to_string()],
+                authorization: &signed(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(report.outcome, GateOutcome::Rejected),
+            "{report:?}"
+        );
+        let threads::Verdict::Reject {
+            reason: threads::RejectReason::WeaveBroken { reason },
+            ..
+        } = &report.verdicts[0].1
+        else {
+            panic!("expected weave-broken reject, got {report:?}");
+        };
+        assert!(reason.contains("Purpose identity invariant did not hold"));
     }
 
     #[cfg(unix)]

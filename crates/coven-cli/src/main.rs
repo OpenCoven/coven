@@ -79,6 +79,7 @@ mod stream_json;
 mod theme;
 mod tui;
 mod verification;
+mod ward_identity;
 mod ward_probes;
 // Wired into the daemon router via `POST /familiars/{id}/edits` (api.rs);
 // Gate 3 staging, deterministic probes, read surfaces, and explicit
