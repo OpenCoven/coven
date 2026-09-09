@@ -2323,6 +2323,147 @@ mod tests {
     }
 
     #[test]
+    fn claim_failure_rolls_back_superseded_misfire_rows() {
+        let (temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'older-due', id, revision, definition_digest,
+                    '2026-08-28T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-08-28T08:00:00.000Z', '2026-08-28T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'daily';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'latest-due', id, revision, definition_digest,
+                    '2026-08-28T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'daily';
+             CREATE TRIGGER synthetic_claim_crash
+             BEFORE UPDATE OF state ON automation_occurrences
+             WHEN NEW.state = 'claimed'
+              AND EXISTS (
+                  SELECT 1
+                  FROM automation_occurrences
+                  WHERE id = 'older-due' AND state = 'skipped'
+              )
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic claim crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = claim_due_occurrence(
+            &conn,
+            "daily",
+            "daemon-a",
+            60,
+            Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("synthetic claim crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let rows = conn
+            .prepare(
+                "SELECT id, state, lease_owner, attempt
+                 FROM automation_occurrences
+                 ORDER BY scheduled_for ASC",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("older-due".to_string(), "planned".to_string(), None, 0),
+                ("latest-due".to_string(), "planned".to_string(), None, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn planning_failure_restarts_without_duplicate_or_missed_fences() {
+        let (temp, conn) = temp_store();
+        for id in ["a-planning", "b-planning"] {
+            insert_definition(&conn, &definition(id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let now = real_now();
+        let created_at =
+            (now - chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id IN ('a-planning', 'b-planning')",
+            [&created_at],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_planning_crash
+             BEFORE INSERT ON automation_occurrences
+             WHEN NEW.automation_id = 'a-planning'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic planning crash');
+             END;",
+        )
+        .unwrap();
+
+        let interrupted = tick_planning(&conn, now).unwrap();
+
+        assert_eq!(interrupted.planned.len(), 1);
+        assert_eq!(interrupted.failed.len(), 1);
+        assert!(interrupted.failed[0].contains("synthetic planning crash"));
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT automation_id FROM automation_occurrences",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "b-planning"
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_planning_crash")
+            .unwrap();
+        let restarted = tick_planning(&conn, now).unwrap();
+        assert_eq!(restarted.planned.len(), 1);
+        assert_eq!(restarted.already_fenced, 1);
+        assert!(restarted.failed.is_empty());
+        let counts = conn
+            .prepare(
+                "SELECT automation_id, COUNT(*)
+                 FROM automation_occurrences
+                 GROUP BY automation_id
+                 ORDER BY automation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            counts,
+            vec![("a-planning".to_string(), 1), ("b-planning".to_string(), 1),]
+        );
+    }
+
+    #[test]
     fn settles_claimed_work_but_never_planned() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();

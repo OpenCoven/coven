@@ -7737,6 +7737,147 @@ mod tests {
     }
 
     #[test]
+    fn durable_launch_failure_rolls_back_session_run_and_attempt() {
+        let (temp, conn) = temp_store();
+        let routine = definition("launch-crash");
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_launch_crash
+             BEFORE INSERT ON automation_attempts
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic launch crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, Utc::now())
+            .unwrap_err();
+
+        assert!(error.contains("synthetic launch crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let (sessions, runs, attempts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sessions),
+                    (SELECT COUNT(*) FROM automation_runs),
+                    (SELECT COUNT(*) FROM automation_attempts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((sessions, runs, attempts), (0, 0, 0));
+        let (state, reason): (String, String) = conn
+            .query_row(
+                "SELECT state, failure_reason
+                 FROM automation_occurrences
+                 WHERE automation_id = 'launch-crash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(reason.contains("synthetic launch crash"), "{reason}");
+    }
+
+    #[test]
+    fn terminal_settlement_failure_rolls_back_and_retries_from_session_evidence() {
+        let (temp, conn) = temp_store();
+        let routine = definition("settlement-crash");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let finished_at = launched_at + chrono::Duration::seconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_settlement_crash
+             BEFORE UPDATE OF status ON automation_runs
+             WHEN NEW.status != 'running'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic settlement crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = settle_finished_runs(&conn, finished_at).unwrap_err();
+
+        assert!(error.contains("synthetic settlement crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "running".to_string(),
+                "running".to_string(),
+                "started".to_string(),
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status, exit_code FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i32>>(1)?)),
+            )
+            .unwrap(),
+            ("completed".to_string(), Some(0))
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_settlement_crash")
+            .unwrap();
+        assert_eq!(
+            settle_finished_runs(&conn, finished_at).unwrap(),
+            SettlementReport {
+                succeeded: 1,
+                ..SettlementReport::default()
+            }
+        );
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+            )
+        );
+    }
+
+    #[test]
     fn missing_cwd_fails_without_launching() {
         let (_temp, conn) = temp_store();
         let mut definition = definition("nocwd");
