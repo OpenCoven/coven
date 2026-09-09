@@ -14,7 +14,8 @@ use chrono::{DateTime, Utc};
 
 const SCHEDULER_INTERVAL: Duration = Duration::from_secs(60);
 #[cfg(test)]
-const SCHEDULER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_millis(250);
+// This is only a hang guard; shutdown promptness is proven by wake-signal tests.
+const SCHEDULER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct MonotonicInstant(Duration);
