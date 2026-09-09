@@ -109,6 +109,8 @@ class ClassifyTest(unittest.TestCase):
             'scripts/check-workflows.sh',
             'scripts/check-workflows-test.py',
             'scripts/check-ci-workflow-test.py',
+            'scripts/install-native-link-dependencies.sh',
+            'scripts/install-native-link-dependencies-test.py',
         ):
             with self.subTest(path=path):
                 result = self.classify(path)
