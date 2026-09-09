@@ -573,6 +573,26 @@ pub trait SessionRuntime {
     ) -> Result<()> {
         self.launch_adopted_session(launch, writer, ownership_established)
     }
+    /// Launches an automation session with the bounded authority evidence that
+    /// the execution consumer is permitted to observe.
+    ///
+    /// Runtimes must explicitly opt in before accepting authority-bound work.
+    /// This keeps a newly activated Runtime Authority adapter from silently
+    /// dropping the projection and launching with ambient authority.
+    fn launch_authorized_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        authority: Option<
+            &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+        >,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if authority.is_some() {
+            anyhow::bail!("runtime does not accept automation authority projections");
+        }
+        self.launch_contained_adopted_session(launch, writer, ownership_established)
+    }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
 
