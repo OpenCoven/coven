@@ -45,6 +45,7 @@ const PUBLIC_COMMANDS: &[&str] = &[
     "claim",
     "maintenance",
     "hooks",
+    "device",
     "logs",
     "vacuum",
     "reset",
@@ -410,6 +411,11 @@ fn full_help_json_has_stable_schema_routes_and_no_ansi() -> anyhow::Result<()> {
     assert_eq!(
         memory["docsUrl"],
         "https://docs.opencoven.ai/docs/memory-models"
+    );
+    let device = command_from_json(&json, "device").expect("device command");
+    assert_eq!(
+        device["docsUrl"],
+        "https://docs.opencoven.ai/docs/cli/device"
     );
     let patch = command_from_json(&json, "patch").expect("patch command");
     assert_eq!(

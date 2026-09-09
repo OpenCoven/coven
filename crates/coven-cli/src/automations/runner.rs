@@ -11,13 +11,20 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
-use super::contract::types::{BackoffPolicy, RetryableClass};
+use super::contract::authority::{
+    validate_authority_profile, AuthorityConsumerClass, AuthorityEvidenceVerifier,
+    AuthorityProfileDisposition, AuthorityProfileError, AuthorityProfileErrorCode,
+    AuthorityValidationPhase, AutomationAuthorityExtension, AUTHORITY_PROFILE,
+    RUNTIME_AUTHORITY_CAPABILITY,
+};
+use super::contract::types::{BackoffPolicy, ExtensionBag, RetryableClass};
 use super::definition::{RoutineDefinition, RoutineRetryPolicy};
 use super::occurrences::{
-    insert_claimed_occurrence, mark_occurrence_running, recover_expired_leases, settle_occurrence,
+    insert_claimed_occurrence, mark_occurrence_running, recover_expired_leases,
+    recover_expired_leases_with_scheduler_fence, settle_occurrence,
 };
 use super::runs::{
     is_retry_quarantined, record_retry_exhaustion, record_run_finish, record_run_start, RunFinish,
@@ -195,19 +202,126 @@ fn fresh_id(prefix: &str) -> String {
     format!("{prefix}-{}", Uuid::new_v4().simple())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutomationAuthorityRequest {
+    pub automation_id: String,
+    pub automation_revision: u64,
+    pub definition_digest: String,
+    pub occurrence_id: String,
+    pub occurrence_key: String,
+    pub occurrence_fence_generation: u64,
+    pub run_id: String,
+    pub attempt_id: String,
+    pub attempt_number: u64,
+    pub adoption_key: String,
+    pub runtime_id: String,
+}
+
+pub(crate) trait AutomationDispatchAuthority: AuthorityEvidenceVerifier {
+    fn resolve(
+        &self,
+        request: &AutomationAuthorityRequest,
+    ) -> Result<ExtensionBag, AuthorityProfileError>;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum AutomationAuthorityMode<'a> {
+    BaseV1,
+    // Production construction remains blocked until the trusted-state adapter lands.
+    #[allow(dead_code)]
+    RuntimeAuthority(&'a dyn AutomationDispatchAuthority),
+}
+
+impl AutomationAuthorityMode<'_> {
+    fn profile(self) -> Option<&'static str> {
+        match self {
+            Self::BaseV1 => None,
+            Self::RuntimeAuthority(_) => Some(AUTHORITY_PROFILE),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PersistLaunchContext<'a> {
+    not_before: DateTime<Utc>,
+    authority: AutomationAuthorityMode<'a>,
+    scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
+}
+
+fn authority_refusal(error: &AuthorityProfileError) -> String {
+    format!(
+        "automation authority refused dispatch: {}",
+        error.code().as_str()
+    )
+}
+
+fn authority_binding_matches_request(
+    extension: &AutomationAuthorityExtension,
+    request: &AutomationAuthorityRequest,
+) -> bool {
+    let base = &extension.execution_binding.base;
+    base.automation_id.as_str() == request.automation_id
+        && base.automation_revision.get() == request.automation_revision
+        && base.definition_digest.value.as_str() == request.definition_digest
+        && base.occurrence_id.as_str() == request.occurrence_id
+        && base.occurrence_key.as_str() == request.occurrence_key
+        && base.occurrence_fence_generation.get() == request.occurrence_fence_generation
+        && base.run_id.as_str() == request.run_id
+        && base.attempt_id.as_str() == request.attempt_id
+        && base.attempt_number.get() == request.attempt_number
+        && base.adoption_key.as_str() == request.adoption_key
+        && extension.execution_binding.runtime.runtime_id.as_str() == request.runtime_id
+}
+
+fn resolve_authority_extension(
+    authority: AutomationAuthorityMode<'_>,
+    request: &AutomationAuthorityRequest,
+) -> Result<Option<String>, String> {
+    let AutomationAuthorityMode::RuntimeAuthority(authority) = authority else {
+        return Ok(None);
+    };
+    let extensions = authority
+        .resolve(request)
+        .map_err(|error| authority_refusal(&error))?;
+    let disposition = validate_authority_profile(
+        &extensions,
+        AuthorityConsumerClass::RuntimeAuthorityV1,
+        &["coven.automations.v1", AUTHORITY_PROFILE],
+        &[RUNTIME_AUTHORITY_CAPABILITY],
+        AuthorityValidationPhase::PreDispatch,
+        Some(authority),
+    )
+    .map_err(|error| authority_refusal(&error))?;
+    let AuthorityProfileDisposition::Validated(extension) = disposition else {
+        return Err(authority_refusal(&AuthorityProfileError::new(
+            AuthorityProfileErrorCode::ProfileRequired,
+            "Runtime Authority validation did not produce a validated extension",
+        )));
+    };
+    if !authority_binding_matches_request(&extension, request) {
+        return Err(authority_refusal(&AuthorityProfileError::new(
+            AuthorityProfileErrorCode::BindingMismatch,
+            "authority binding does not match the claimed automation attempt",
+        )));
+    }
+    serde_json::to_string(extension.as_ref())
+        .map(Some)
+        .map_err(|_| "failed to serialize validated automation authority binding".to_string())
+}
+
 fn persist_launch_with_clock(
     conn: &Connection,
     run_id: &str,
     occurrence_id: &str,
     definition: &RoutineDefinition,
     launch: &SessionLaunch,
-    not_before: DateTime<Utc>,
+    context: PersistLaunchContext<'_>,
     clock: impl FnOnce() -> DateTime<Utc>,
 ) -> Result<PersistLaunch, String> {
     let transaction =
         rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to begin durable automation launch: {error}"))?;
-    let now = clock().max(not_before);
+    let now = clock().max(context.not_before);
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let existing_run: bool = transaction
         .query_row(
@@ -225,18 +339,42 @@ fn persist_launch_with_clock(
     let claim_is_current: bool = transaction
         .query_row(
             "SELECT EXISTS(
-                SELECT 1 FROM automation_occurrences
-                WHERE id = ?1
-                  AND state = 'claimed'
-                  AND lease_owner IS NOT NULL
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at > ?2
+                SELECT 1
+                FROM automation_occurrences AS occurrence
+                WHERE occurrence.id = ?1
+                  AND occurrence.state = 'claimed'
+                  AND occurrence.lease_owner IS NOT NULL
+                  AND occurrence.lease_expires_at IS NOT NULL
+                  AND occurrence.lease_expires_at > ?2
+                  AND (
+                      ?3 IS NULL
+                      OR (
+                          occurrence.scheduler_generation = ?3
+                          AND EXISTS (
+                              SELECT 1
+                              FROM automation_scheduler_authority AS authority
+                              WHERE authority.id = 1
+                                AND authority.owner_id = ?4
+                                AND authority.generation = ?3
+                          )
+                      )
+                  )
             )",
-            rusqlite::params![occurrence_id, now_iso],
+            rusqlite::params![
+                occurrence_id,
+                now_iso,
+                context.scheduler_fence.map(|fence| fence.generation()),
+                context.scheduler_fence.map(|fence| fence.owner_id()),
+            ],
             |row| row.get(0),
         )
         .map_err(|error| format!("failed to verify durable automation claim: {error}"))?;
     if !claim_is_current {
+        if context.scheduler_fence.is_some() {
+            return Err(
+                "automations scheduler fence is stale or the occurrence claim changed".to_string(),
+            );
+        }
         if existing_run {
             let restored = transaction
                 .execute(
@@ -343,6 +481,7 @@ fn persist_launch_with_clock(
             RunStart {
                 automation_id: &definition.id,
                 occurrence_id: Some(occurrence_id),
+                authority_profile: context.authority.profile(),
                 session_id: Some(&launch.id),
                 familiar_id: definition.familiar_id.as_deref(),
                 runtime: &definition.runtime,
@@ -372,21 +511,104 @@ fn persist_launch_with_clock(
             .map_err(|error| format!("failed to record initial automation attempt: {error}"))?;
         1
     };
+    let stored_profile: Option<String> = transaction
+        .query_row(
+            "SELECT authority_profile FROM automation_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read automation authority profile: {error}"))?;
+    if stored_profile.as_deref() != context.authority.profile() {
+        return Err(
+            "automation authority profile changed across attempts; refusing downgrade".to_string(),
+        );
+    }
+    let request = transaction
+        .query_row(
+            "SELECT r.automation_revision, r.definition_digest, o.scheduled_for, o.kind,
+                    a.id, a.adoption_key, a.occurrence_fence_generation
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1
+                   AND a.attempt_number = ?2
+                   AND a.state = 'adopted'",
+            rusqlite::params![run_id, i64::from(attempt_number)],
+            |row| {
+                let revision: i64 = row.get(0)?;
+                let scheduled_for: String = row.get(2)?;
+                let occurrence_kind: String = row.get(3)?;
+                let attempt_id: String = row.get(4)?;
+                let adoption_key: String = row.get(5)?;
+                let fence: i64 = row.get(6)?;
+                let occurrence_key = match occurrence_kind.as_str() {
+                    "scheduled" => format!("{}@{scheduled_for}", definition.id),
+                    "manual" => format!("{}@manual-{adoption_key}", definition.id),
+                    _ => {
+                        return Err(rusqlite::Error::InvalidColumnType(
+                            3,
+                            "kind".to_string(),
+                            rusqlite::types::Type::Text,
+                        ));
+                    }
+                };
+                Ok(AutomationAuthorityRequest {
+                    automation_id: definition.id.clone(),
+                    automation_revision: u64::try_from(revision).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    definition_digest: row.get::<_, Option<String>>(1)?.ok_or_else(|| {
+                        rusqlite::Error::InvalidColumnType(
+                            1,
+                            "definition_digest".to_string(),
+                            rusqlite::types::Type::Null,
+                        )
+                    })?,
+                    occurrence_id: occurrence_id.to_string(),
+                    occurrence_key,
+                    occurrence_fence_generation: u64::try_from(fence).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            6,
+                            rusqlite::types::Type::Integer,
+                            Box::new(error),
+                        )
+                    })?,
+                    run_id: run_id.to_string(),
+                    attempt_id,
+                    attempt_number: u64::from(attempt_number),
+                    adoption_key,
+                    runtime_id: launch.harness.clone(),
+                })
+            },
+        )
+        .map_err(|error| format!("failed to construct automation authority request: {error}"))?;
+    let authority_extension_json = resolve_authority_extension(context.authority, &request)?;
     let dispatched = transaction
         .execute(
             "UPDATE automation_attempts
-             SET state = 'dispatching',
-                 dispatch_generation = dispatch_generation + 1
-             WHERE run_id = ?1
-               AND attempt_number = ?2
-               AND state = 'adopted'
-               AND not_before <= ?3
-               AND occurrence_fence_generation = (
-                   SELECT attempt
-                   FROM automation_occurrences
-                   WHERE id = automation_attempts.occurrence_id
-               )",
-            rusqlite::params![run_id, i64::from(attempt_number), now_iso],
+                 SET state = 'dispatching',
+                     dispatch_generation = dispatch_generation + 1,
+                     authority_extension_json = ?4
+                 WHERE run_id = ?1
+                   AND attempt_number = ?2
+                   AND state = 'adopted'
+                   AND not_before <= ?3
+                   AND authority_extension_json IS NULL
+                   AND occurrence_fence_generation = (
+                       SELECT attempt
+                       FROM automation_occurrences
+                       WHERE id = automation_attempts.occurrence_id
+                   )",
+            rusqlite::params![
+                run_id,
+                i64::from(attempt_number),
+                now_iso,
+                authority_extension_json,
+            ],
         )
         .map_err(|error| format!("failed to dispatch automation attempt: {error}"))?;
     if dispatched != 1 {
@@ -421,8 +643,14 @@ fn publish_runtime_ownership(
     attempt_number: u8,
     session_id: &str,
     now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
 ) -> anyhow::Result<()> {
-    let transaction = conn.unchecked_transaction()?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if let Some(fence) = scheduler_fence {
+        require_current_scheduler_fence(&transaction, occurrence_id, fence)
+            .map_err(anyhow::Error::msg)?;
+    }
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let ownership_published = crate::store::update_session_status_if_current(
         &transaction,
@@ -500,6 +728,7 @@ struct RejectedLaunch<'a> {
     definition: &'a RoutineDefinition,
     failure: PreownershipFailure,
     reason: &'a str,
+    scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
 }
 
 fn settle_rejected_launch(
@@ -515,10 +744,14 @@ fn settle_rejected_launch(
         definition,
         failure,
         reason,
+        scheduler_fence,
     } = rejected;
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("failed to begin launch rejection settlement: {error}"))?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin launch rejection settlement: {error}"))?;
+    if let Some(fence) = scheduler_fence {
+        require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
+    }
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     crate::store::update_session_terminal_if_active(
         &transaction,
@@ -674,6 +907,8 @@ fn dispatch_occurrence(
     let mut control = DispatchControl {
         clock: &mut clock,
         cancelled: &cancelled,
+        authority: AutomationAuthorityMode::BaseV1,
+        scheduler_fence: None,
     };
     match dispatch_occurrence_with_clock(
         conn,
@@ -711,6 +946,8 @@ struct AttemptDispatch {
 struct DispatchControl<'a> {
     clock: &'a mut dyn FnMut() -> DateTime<Utc>,
     cancelled: &'a dyn Fn() -> bool,
+    authority: AutomationAuthorityMode<'a>,
+    scheduler_fence: Option<&'a super::leadership::SchedulerFence>,
 }
 
 fn dispatch_occurrence_with_clock(
@@ -731,7 +968,11 @@ fn dispatch_occurrence_with_clock(
         occurrence_id,
         definition,
         &launch,
-        now,
+        PersistLaunchContext {
+            not_before: now,
+            authority: control.authority,
+            scheduler_fence: control.scheduler_fence,
+        },
         &mut control.clock,
     )? {
         PersistLaunch::Ready(attempt) => attempt,
@@ -755,6 +996,7 @@ fn dispatch_occurrence_with_clock(
         attempt.attempt_number,
         &launch.id,
         now,
+        control.scheduler_fence,
     ) {
         Ok(()) => {
             ownership_published.set(true);
@@ -767,7 +1009,17 @@ fn dispatch_occurrence_with_clock(
             ))
         }
     };
-    match runtime.launch_contained_adopted_session(&launch, None, &mut ownership_established) {
+    let launch_result =
+        runtime.launch_contained_adopted_session(&launch, None, &mut ownership_established);
+    if let Some(fence) = control.scheduler_fence {
+        if !fence
+            .is_current(conn)
+            .map_err(|error| format!("failed to verify automations scheduler fence: {error:#}"))?
+        {
+            return Err("automations scheduler fence is stale".to_string());
+        }
+    }
+    match launch_result {
         Ok(()) if ownership_published.get() => Ok(DispatchAttempt::Completed(RunOutcome {
             run_id,
             status: "running".to_string(),
@@ -796,6 +1048,7 @@ fn dispatch_occurrence_with_clock(
                 attempt.attempt_number,
                 &launch.id,
                 now,
+                control.scheduler_fence,
             )
             .err();
             Ok(DispatchAttempt::Completed(RunOutcome {
@@ -824,6 +1077,7 @@ fn dispatch_occurrence_with_clock(
                 attempt.attempt_number,
                 &launch.id,
                 now,
+                control.scheduler_fence,
             )
             .err();
             let callback_error = ownership_publication_error.borrow().clone();
@@ -850,7 +1104,42 @@ fn dispatch_occurrence_with_clock(
                     .downcast_ref::<crate::api::RuntimeLaunchAdmissionClosedError>()
                     .is_some() =>
         {
-            restore_preownership_launch_for_retry(conn, occurrence_id, &run_id, &launch.id, now)?;
+            if attempt_has_authority(conn, &run_id, attempt.attempt_number)? {
+                let reason =
+                    "runtime admission closed after authority consumption; no process started";
+                let retry_scheduled = settle_rejected_launch(
+                    conn,
+                    RejectedLaunch {
+                        occurrence_id,
+                        run_id: &run_id,
+                        attempt_number: attempt.attempt_number,
+                        session_id: &launch.id,
+                        definition,
+                        failure: PreownershipFailure::Retryable(RetryableClass::TransientDispatch),
+                        reason,
+                        scheduler_fence: control.scheduler_fence,
+                    },
+                    now,
+                )?;
+                return Ok(DispatchAttempt::Completed(RunOutcome {
+                    run_id,
+                    status: if retry_scheduled {
+                        "retry_scheduled".to_string()
+                    } else {
+                        "failed".to_string()
+                    },
+                    session_id: None,
+                    error: Some(reason.to_string()),
+                }));
+            }
+            restore_preownership_launch_for_retry(
+                conn,
+                occurrence_id,
+                &run_id,
+                &launch.id,
+                now,
+                control.scheduler_fence,
+            )?;
             Ok(DispatchAttempt::Deferred)
         }
         Err(error) => {
@@ -867,6 +1156,7 @@ fn dispatch_occurrence_with_clock(
                     definition,
                     failure: failure_class,
                     reason: &reason,
+                    scheduler_fence: control.scheduler_fence,
                 },
                 failure_at,
             )?;
@@ -943,6 +1233,21 @@ fn failure_class_name(failure: PreownershipFailure) -> &'static str {
     }
 }
 
+fn attempt_has_authority(
+    conn: &Connection,
+    run_id: &str,
+    attempt_number: u8,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT authority_extension_json IS NOT NULL
+         FROM automation_attempts
+         WHERE run_id = ?1 AND attempt_number = ?2",
+        rusqlite::params![run_id, i64::from(attempt_number)],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("failed to inspect automation attempt authority: {error}"))
+}
+
 fn retry_delay_seconds(policy: &RoutineRetryPolicy, run_id: &str, next_attempt_number: u8) -> u32 {
     match policy.backoff_policy {
         BackoffPolicy::None => 0,
@@ -969,10 +1274,14 @@ fn restore_preownership_launch_for_retry(
     run_id: &str,
     session_id: &str,
     now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
 ) -> Result<(), String> {
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("failed to begin cancelled launch restoration: {error}"))?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin cancelled launch restoration: {error}"))?;
+    if let Some(fence) = scheduler_fence {
+        require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
+    }
     restore_preownership_launch_for_retry_in(&transaction, occurrence_id, run_id, session_id, now)?;
     transaction
         .commit()
@@ -1166,7 +1475,21 @@ fn retry_proven_preownership_lease_expiry_in(
     else {
         return Ok(false);
     };
-    if !definition.retry.retries(RetryableClass::LeaseExpired) {
+    let retries_lease_expiry = definition.retry.retries(RetryableClass::LeaseExpired);
+    let authority_bound: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_attempts
+                WHERE run_id = ?1
+                  AND state = 'dispatching'
+                  AND authority_extension_json IS NOT NULL
+            )",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to inspect recovered attempt authority: {error}"))?;
+    if !retries_lease_expiry && !authority_bound {
         return Ok(false);
     }
     let attempt_number: i64 = conn
@@ -1201,7 +1524,7 @@ fn retry_proven_preownership_lease_expiry_in(
     if settled != 1 {
         return Err("expired automation attempt changed during recovery".to_string());
     }
-    if attempt_number < definition.retry.max_attempts {
+    if retries_lease_expiry && attempt_number < definition.retry.max_attempts {
         let next_attempt_number = attempt_number + 1;
         let retry_at = now
             + chrono::Duration::seconds(i64::from(retry_delay_seconds(
@@ -1255,9 +1578,15 @@ fn retry_proven_preownership_lease_expiry_in(
         return Ok(true);
     }
 
-    let reason = "claim lease expired after all retry attempts were exhausted";
-    record_retry_exhaustion(conn, automation_id, "lease_expired", reason, now)
-        .map_err(|error| format!("failed to record lease retry exhaustion: {error:#}"))?;
+    let reason = if retries_lease_expiry {
+        "claim lease expired after all retry attempts were exhausted"
+    } else {
+        "claim lease expired after authority consumption with proof that no process started"
+    };
+    if retries_lease_expiry {
+        record_retry_exhaustion(conn, automation_id, "lease_expired", reason, now)
+            .map_err(|error| format!("failed to record lease retry exhaustion: {error:#}"))?;
+    }
     if !settle_occurrence(conn, occurrence_id, "failed", Some(reason), now)? {
         return Err("failed to settle lease-exhausted occurrence".to_string());
     }
@@ -1478,9 +1807,9 @@ pub struct DispatchReport {
     pub failed: Vec<String>,
 }
 
-/// Dispatches every claimed occurrence through the same durable launch
-/// primitive as manual runs. Successful launch acknowledgements remain
-/// nonterminal until session evidence is reconciled.
+/// Dispatches the oldest bounded batch of claimed occurrences through the same
+/// durable launch primitive as manual runs. Successful launch acknowledgements
+/// remain nonterminal until session evidence is reconciled.
 #[cfg(test)]
 fn dispatch_claimed_occurrences(
     conn: &Connection,
@@ -1504,12 +1833,51 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
     conn: &Connection,
     runtime: &dyn SessionRuntime,
     now: DateTime<Utc>,
-    mut clock: impl FnMut() -> DateTime<Utc>,
+    clock: impl FnMut() -> DateTime<Utc>,
     cancelled: impl Fn() -> bool,
 ) -> Result<DispatchReport, String> {
+    dispatch_claimed_occurrences_inner(conn, runtime, now, clock, cancelled, None)
+}
+
+pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+    clock: impl FnMut() -> DateTime<Utc>,
+    cancelled: impl Fn() -> bool,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<DispatchReport, String> {
+    if !fence
+        .is_current(conn)
+        .map_err(|error| format!("failed to verify automations scheduler fence: {error:#}"))?
+    {
+        return Err("automations scheduler fence is stale".to_string());
+    }
+    dispatch_claimed_occurrences_inner(conn, runtime, now, clock, cancelled, Some(fence))
+}
+
+fn dispatch_claimed_occurrences_inner(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    now: DateTime<Utc>,
+    mut clock: impl FnMut() -> DateTime<Utc>,
+    cancelled: impl Fn() -> bool,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<DispatchReport, String> {
     let mut report = DispatchReport::default();
-    recover_expired_leases(conn, now)?;
+    match scheduler_fence {
+        Some(fence) => {
+            recover_expired_leases_with_scheduler_fence(conn, now, fence)?;
+        }
+        None => {
+            recover_expired_leases(conn, now)?;
+        }
+    }
     let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let batch_limit =
+        i64::try_from(super::occurrences::SCHEDULER_PASS_BATCH_LIMIT).map_err(|error| {
+            format!("automation dispatch batch limit exceeds SQLite range: {error}")
+        })?;
 
     let claimed: Vec<(String, String)> = {
         let mut statement = conn
@@ -1519,6 +1887,7 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
                    AND o.lease_owner = 'daemon'
                    AND o.lease_expires_at IS NOT NULL
                    AND o.lease_expires_at > ?1
+                   AND (?2 IS NULL OR o.scheduler_generation = ?2)
                    AND (
                        NOT EXISTS (
                            SELECT 1 FROM automation_runs AS r
@@ -1534,13 +1903,19 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
                              AND a.not_before <= ?1
                        )
                    )
-                 ORDER BY o.scheduled_for ASC",
+                 ORDER BY o.scheduled_for ASC
+                 LIMIT ?3",
             )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let rows = statement
-            .query_map(rusqlite::params![now_iso], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
+            .query_map(
+                rusqlite::params![
+                    now_iso,
+                    scheduler_fence.map(|fence| fence.generation()),
+                    batch_limit
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
             .map_err(|error| format!("failed to list claimed occurrences: {error}"))?;
         let mut out = Vec::new();
         for row in rows {
@@ -1551,24 +1926,51 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
 
     for (occurrence_id, automation_id) in claimed {
         if cancelled() {
-            restore_unlaunched_daemon_claims_for_retry(conn, clock().max(now))?;
+            restore_unlaunched_daemon_claims_for_retry_inner(
+                conn,
+                clock().max(now),
+                scheduler_fence,
+            )?;
             break;
         }
         let check_now = clock().max(now);
-        recover_expired_leases(conn, check_now)?;
+        match scheduler_fence {
+            Some(fence) => {
+                recover_expired_leases_with_scheduler_fence(conn, check_now, fence)?;
+            }
+            None => {
+                recover_expired_leases(conn, check_now)?;
+            }
+        }
         let dispatchable: bool = conn
             .query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM automation_occurrences
-                    WHERE id = ?1
-                      AND state = 'claimed'
-                      AND lease_owner = 'daemon'
-                      AND lease_expires_at IS NOT NULL
-                      AND lease_expires_at > ?2
+                    SELECT 1
+                    FROM automation_occurrences AS occurrence
+                    WHERE occurrence.id = ?1
+                      AND occurrence.state = 'claimed'
+                      AND occurrence.lease_owner = 'daemon'
+                      AND occurrence.lease_expires_at IS NOT NULL
+                      AND occurrence.lease_expires_at > ?2
+                      AND (
+                          ?3 IS NULL
+                          OR (
+                              occurrence.scheduler_generation = ?3
+                              AND EXISTS (
+                                  SELECT 1
+                                  FROM automation_scheduler_authority
+                                  WHERE id = 1
+                                    AND owner_id = ?4
+                                    AND generation = ?3
+                              )
+                          )
+                      )
                 )",
                 rusqlite::params![
                     occurrence_id,
-                    check_now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                    check_now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    scheduler_fence.map(|fence| fence.generation()),
+                    scheduler_fence.map(|fence| fence.owner_id()),
                 ],
                 |row| row.get(0),
             )
@@ -1581,12 +1983,24 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
                 Ok(Some(definition)) => definition,
                 Ok(None) => {
                     let reason = format!("routine `{automation_id}` vanished during dispatch");
-                    settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        check_now,
+                        scheduler_fence,
+                    )?;
                     report.failed.push(reason);
                     continue;
                 }
                 Err(reason) => {
-                    settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
+                    settle_dispatch_occurrence(
+                        conn,
+                        &occurrence_id,
+                        Some(&reason),
+                        check_now,
+                        scheduler_fence,
+                    )?;
                     report.failed.push(reason);
                     continue;
                 }
@@ -1599,14 +2013,26 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
             .filter(|cwd| !cwd.is_empty())
         else {
             let reason = format!("{automation_id}: routine has no cwd; add a cwd before running");
-            settle_occurrence(conn, &occurrence_id, "failed", Some(&reason), check_now)?;
+            settle_dispatch_occurrence(
+                conn,
+                &occurrence_id,
+                Some(&reason),
+                check_now,
+                scheduler_fence,
+            )?;
             report.failed.push(reason);
             continue;
         };
 
         let dispatch_now = clock().max(check_now);
         if let Some(run_id) = expired_waiting_retry_run(conn, &occurrence_id, dispatch_now)? {
-            settle_waiting_retry_timeout(conn, &run_id, &occurrence_id, dispatch_now)?;
+            settle_waiting_retry_timeout(
+                conn,
+                &run_id,
+                &occurrence_id,
+                dispatch_now,
+                scheduler_fence,
+            )?;
             report.failed.push(format!(
                 "{automation_id}: automation retry wait exceeded run timeout"
             ));
@@ -1615,6 +2041,8 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
         let mut control = DispatchControl {
             clock: &mut clock,
             cancelled: &cancelled,
+            authority: AutomationAuthorityMode::BaseV1,
+            scheduler_fence,
         };
         match dispatch_occurrence_with_clock(
             conn,
@@ -1638,16 +2066,20 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
                 ));
             }
             Ok(DispatchAttempt::Deferred) => {
-                restore_unlaunched_daemon_claims_for_retry(conn, clock().max(dispatch_now))?;
+                restore_unlaunched_daemon_claims_for_retry_inner(
+                    conn,
+                    clock().max(dispatch_now),
+                    scheduler_fence,
+                )?;
                 break;
             }
             Err(reason) => {
-                settle_occurrence(
+                settle_dispatch_occurrence(
                     conn,
                     &occurrence_id,
-                    "failed",
                     Some("dispatch failed before runtime ownership"),
                     dispatch_now,
+                    scheduler_fence,
                 )?;
                 report.failed.push(format!("{automation_id}: {reason}"));
             }
@@ -1657,9 +2089,65 @@ pub(crate) fn dispatch_claimed_occurrences_with_clock_and_cancel(
     Ok(report)
 }
 
+fn settle_dispatch_occurrence(
+    conn: &Connection,
+    occurrence_id: &str,
+    failure_reason: Option<&str>,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<bool, String> {
+    let Some(fence) = scheduler_fence else {
+        return settle_occurrence(conn, occurrence_id, "failed", failure_reason, now);
+    };
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin fenced occurrence settlement: {error}"))?;
+    require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
+    let settled = settle_occurrence(&transaction, occurrence_id, "failed", failure_reason, now)?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit fenced occurrence settlement: {error}"))?;
+    Ok(settled)
+}
+
+fn require_current_scheduler_fence(
+    conn: &Connection,
+    occurrence_id: &str,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<(), String> {
+    let current: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_scheduler_authority AS authority
+                JOIN automation_occurrences AS occurrence
+                  ON occurrence.id = ?3
+                WHERE authority.id = 1
+                  AND authority.owner_id = ?1
+                  AND authority.generation = ?2
+                  AND occurrence.scheduler_generation = ?2
+            )",
+            rusqlite::params![fence.owner_id(), fence.generation(), occurrence_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to verify automations scheduler fence: {error}"))?;
+    if !current {
+        return Err("automations scheduler fence is stale".to_string());
+    }
+    Ok(())
+}
+
 pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
     conn: &Connection,
     now: DateTime<Utc>,
+) -> Result<usize, String> {
+    restore_unlaunched_daemon_claims_for_retry_inner(conn, now, None)
+}
+
+fn restore_unlaunched_daemon_claims_for_retry_inner(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
 ) -> Result<usize, String> {
     let restored = conn
         .execute(
@@ -1671,6 +2159,17 @@ pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
              updated_at = ?1
          WHERE state = 'claimed'
            AND lease_owner = 'daemon'
+           AND (
+               ?2 IS NULL
+               OR (
+                   scheduler_generation = ?2
+                   AND EXISTS (
+                       SELECT 1
+                       FROM automation_scheduler_authority
+                       WHERE id = 1 AND owner_id = ?3 AND generation = ?2
+                   )
+               )
+           )
            AND (
                NOT EXISTS (
                    SELECT 1 FROM automation_runs
@@ -1687,9 +2186,22 @@ pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
                      AND retry_attempt.state = 'adopted'
                )
            )",
-            [now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)],
+            rusqlite::params![
+                now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                scheduler_fence.map(|fence| fence.generation()),
+                scheduler_fence.map(|fence| fence.owner_id()),
+            ],
         )
         .map_err(|error| format!("failed to restore unlaunched daemon claims: {error}"))?;
+    if restored == 0 {
+        if let Some(fence) = scheduler_fence {
+            if !fence.is_current(conn).map_err(|error| {
+                format!("failed to verify automations scheduler fence: {error:#}")
+            })? {
+                return Err("automations scheduler fence is stale".to_string());
+            }
+        }
+    }
     Ok(restored)
 }
 
@@ -1697,6 +2209,7 @@ pub(crate) fn restore_unlaunched_daemon_claims_for_retry(
 pub struct SettlementReport {
     pub succeeded: usize,
     pub failed: usize,
+    pub cancelled: usize,
 }
 
 /// Requests strict termination for an abandoned pre-publication launch once
@@ -1738,7 +2251,29 @@ pub fn recover_abandoned_launches(
 
     let mut failures = Vec::new();
     for (run_id, session_id) in candidates {
+        match claim_stop_fence(conn, &run_id, &session_id, "recovery", None, None, now)? {
+            StopFenceClaim::Acquired => {}
+            StopFenceClaim::InProgress | StopFenceClaim::Conflict => continue,
+            StopFenceClaim::UnknownOutcome => {
+                mark_unconfirmed_stop_for_recovery(
+                    conn,
+                    &run_id,
+                    "abandoned launch stop outcome was not durably recorded",
+                    now,
+                )?;
+                failures.push(format!(
+                    "abandoned automation run `{run_id}` has an unknown prior stop outcome for session `{session_id}`"
+                ));
+                continue;
+            }
+        }
         if let Err(error) = runtime.kill_session(&session_id) {
+            mark_unconfirmed_stop_for_recovery(
+                conn,
+                &run_id,
+                "abandoned launch stop was not confirmed",
+                now,
+            )?;
             failures.push(format!(
                 "abandoned automation run `{run_id}` has unproven session `{session_id}` termination: {error:#}"
             ));
@@ -1754,6 +2289,12 @@ pub fn recover_abandoned_launches(
         .map_err(|error| {
             format!("failed to persist abandoned session `{session_id}` termination: {error:#}")
         })?;
+        conn.execute(
+            "DELETE FROM automation_stop_fences
+             WHERE run_id = ?1 AND session_id = ?2 AND owner = 'recovery'",
+            rusqlite::params![run_id, session_id],
+        )
+        .map_err(|error| format!("failed to release abandoned launch stop ownership: {error}"))?;
     }
     Ok(failures)
 }
@@ -1795,10 +2336,14 @@ fn settle_waiting_retry_timeout(
     run_id: &str,
     occurrence_id: &str,
     now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
 ) -> Result<(), String> {
-    let transaction = conn
-        .unchecked_transaction()
-        .map_err(|error| format!("failed to begin retry timeout settlement: {error}"))?;
+    let transaction =
+        rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to begin retry timeout settlement: {error}"))?;
+    if let Some(fence) = scheduler_fence {
+        require_current_scheduler_fence(&transaction, occurrence_id, fence)?;
+    }
     settle_waiting_retry_timeout_in(&transaction, run_id, occurrence_id, now)?;
     transaction
         .commit()
@@ -1907,7 +2452,7 @@ pub fn enforce_run_timeouts(
         candidates
     };
     for (run_id, occurrence_id) in waiting_candidates {
-        settle_waiting_retry_timeout(conn, &run_id, &occurrence_id, now)?;
+        settle_waiting_retry_timeout(conn, &run_id, &occurrence_id, now, None)?;
     }
 
     let candidates: Vec<(String, String, String)> = {
@@ -1916,8 +2461,17 @@ pub fn enforce_run_timeouts(
                 "SELECT r.id, r.session_id, r.timeout_at, r.automation_id
                  FROM automation_runs AS r
                  JOIN sessions AS s ON s.id = r.session_id
+                 JOIN automation_attempts AS a
+                   ON a.run_id = r.id
+                  AND (
+                      a.session_id = r.session_id
+                      OR (a.state = 'dispatching' AND a.session_id IS NULL)
+                  )
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
                  WHERE r.status = 'running'
                    AND s.status IN ('created', 'running', 'orphaned')
+                   AND a.state IN ('dispatching', 'started', 'observing')
+                   AND o.state IN ('claimed', 'running')
                    AND r.timeout_at IS NOT NULL",
             )
             .map_err(|error| format!("failed to prepare automation timeout query: {error}"))?;
@@ -1946,30 +2500,605 @@ pub fn enforce_run_timeouts(
 
     let mut failures = Vec::new();
     for (run_id, session_id, definition_name) in candidates {
-        if let Err(error) = runtime.kill_session(&session_id) {
-            failures.push(format!(
-                "automation `{definition_name}` run `{run_id}` exceeded its timeout, but session `{session_id}` termination is unproven: {error:#}"
-            ));
-            continue;
+        if let Some(failure) =
+            enforce_timeout_candidate(conn, runtime, &run_id, &session_id, &definition_name, now)?
+        {
+            failures.push(failure);
         }
-        let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-        crate::store::update_session_terminal_if_active(
-            conn,
-            &session_id,
-            "killed",
-            None,
-            &now_iso,
-        )
-        .map_err(|error| {
-            format!("failed to persist timeout for session `{session_id}`: {error:#}")
-        })?;
     }
     Ok(failures)
 }
 
+pub(crate) fn enforce_run_timeout(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    run_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    let candidate = conn
+        .query_row(
+            "SELECT r.session_id, r.timeout_at, r.automation_id
+             FROM automation_runs AS r
+             JOIN sessions AS s ON s.id = r.session_id
+             JOIN automation_attempts AS a
+               ON a.run_id = r.id
+              AND (
+                  a.session_id = r.session_id
+                  OR (a.state = 'dispatching' AND a.session_id IS NULL)
+              )
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             WHERE r.id = ?1
+               AND r.status = 'running'
+               AND s.status IN ('created', 'running', 'orphaned')
+               AND a.state IN ('dispatching', 'started', 'observing')
+               AND o.state IN ('claimed', 'running')
+               AND r.timeout_at IS NOT NULL",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("failed to query exact automation timeout: {error}"))?;
+    let Some((session_id, timeout_at, automation_id)) = candidate else {
+        return Ok(None);
+    };
+    let timeout_at = DateTime::parse_from_rfc3339(&timeout_at)
+        .map_err(|error| format!("run `{run_id}` has invalid timeout_at: {error}"))?
+        .with_timezone(&Utc);
+    if timeout_at > now {
+        return Ok(None);
+    }
+    enforce_timeout_candidate(conn, runtime, run_id, &session_id, &automation_id, now)
+}
+
+fn enforce_timeout_candidate(
+    conn: &Connection,
+    runtime: &dyn SessionRuntime,
+    run_id: &str,
+    session_id: &str,
+    automation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, String> {
+    match claim_stop_fence(conn, run_id, session_id, "timeout", None, None, now)? {
+        StopFenceClaim::Acquired => {}
+        StopFenceClaim::InProgress | StopFenceClaim::Conflict => return Ok(None),
+        StopFenceClaim::UnknownOutcome => {
+            mark_unconfirmed_stop_for_recovery(
+                conn,
+                run_id,
+                "prior timeout stop outcome was not durably recorded",
+                now,
+            )?;
+            return Ok(Some(format!(
+                "automation `{automation_id}` run `{run_id}` has an unknown prior timeout stop outcome for session `{session_id}`"
+            )));
+        }
+    }
+    if let Err(error) = runtime.kill_session(session_id) {
+        mark_unconfirmed_stop_for_recovery(conn, run_id, "timeout stop was not confirmed", now)?;
+        return Ok(Some(format!(
+            "automation `{automation_id}` run `{run_id}` exceeded its timeout, but session `{session_id}` termination is unproven: {error:#}"
+        )));
+    }
+    settle_confirmed_stop(conn, run_id, session_id, ConfirmedStop::TimedOut, now)?;
+    Ok(None)
+}
+
+pub(crate) enum ConfirmedStop {
+    Cancelled,
+    TimedOut,
+}
+
+pub(crate) enum StopFenceClaim {
+    Acquired,
+    InProgress,
+    UnknownOutcome,
+    Conflict,
+}
+
+pub(crate) fn claim_stop_fence(
+    conn: &Connection,
+    run_id: &str,
+    session_id: &str,
+    owner: &str,
+    operation_key: Option<&str>,
+    cancellation_execution_expires_at: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<StopFenceClaim, String> {
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("failed to begin automation stop reservation: {error}"))?;
+    let acquired_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let execution_expires_at =
+        (now + chrono::Duration::seconds(30)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let inserted = transaction
+        .execute(
+            "INSERT INTO automation_stop_fences (
+                run_id, session_id, owner, operation_key, acquired_at, execution_expires_at
+             )
+             SELECT r.id, r.session_id, ?3, ?4, ?5, ?6
+             FROM automation_runs AS r
+             JOIN sessions AS s ON s.id = r.session_id
+             JOIN automation_attempts AS a
+               ON a.run_id = r.id
+              AND (
+                  a.session_id = r.session_id
+                  OR (a.state = 'dispatching' AND a.session_id IS NULL)
+              )
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             WHERE r.id = ?1
+               AND r.session_id = ?2
+               AND r.status = 'running'
+               AND s.status IN ('created', 'running', 'orphaned')
+               AND a.state IN ('dispatching', 'started', 'observing')
+               AND o.state IN ('claimed', 'running')
+               AND (
+                   (
+                       ?3 = 'cancellation'
+                       AND EXISTS (
+                           SELECT 1
+                           FROM automation_cancellations AS c
+                           WHERE c.run_id = r.id
+                             AND c.session_id = r.session_id
+                             AND c.adoption_key = ?4
+                             AND c.state = 'requested'
+                             AND c.execution_expires_at = ?7
+                             AND c.execution_expires_at > ?8
+                             AND (r.timeout_at IS NULL OR r.timeout_at > ?8)
+                       )
+                   )
+                   OR (
+                       ?3 != 'cancellation'
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM automation_cancellations AS c
+                           WHERE c.run_id = r.id
+                             AND c.state IN ('requested', 'stopping')
+                       )
+                   )
+               )
+             ON CONFLICT(run_id) DO NOTHING",
+            rusqlite::params![
+                run_id,
+                session_id,
+                owner,
+                operation_key,
+                acquired_at,
+                execution_expires_at,
+                cancellation_execution_expires_at,
+                acquired_at,
+            ],
+        )
+        .map_err(|error| format!("failed to reserve automation stop ownership: {error}"))?;
+    if inserted == 1 {
+        if owner == "cancellation" {
+            let transitioned = transaction
+                .execute(
+                    "UPDATE automation_cancellations
+                     SET state = 'stopping'
+                     WHERE adoption_key = ?1
+                       AND run_id = ?2
+                       AND session_id = ?3
+                       AND state = 'requested'
+                       AND execution_expires_at = ?4
+                       AND execution_expires_at > ?5",
+                    rusqlite::params![
+                        operation_key,
+                        run_id,
+                        session_id,
+                        cancellation_execution_expires_at,
+                        acquired_at
+                    ],
+                )
+                .map_err(|error| {
+                    format!("failed to persist cancellation stop ownership: {error}")
+                })?;
+            if transitioned != 1 {
+                transaction.rollback().map_err(|error| {
+                    format!("failed to roll back stale cancellation stop ownership: {error}")
+                })?;
+                return Ok(StopFenceClaim::Conflict);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit automation stop ownership: {error}"))?;
+        return Ok(StopFenceClaim::Acquired);
+    }
+
+    let existing = transaction
+        .query_row(
+            "SELECT session_id, owner, operation_key, execution_expires_at
+             FROM automation_stop_fences WHERE run_id = ?1",
+            [run_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("failed to inspect automation stop ownership: {error}"))?;
+    let Some((existing_session, existing_owner, existing_key, expires_at)) = existing else {
+        transaction.commit().map_err(|error| {
+            format!("failed to close automation stop ownership lookup: {error}")
+        })?;
+        return Ok(StopFenceClaim::Conflict);
+    };
+    if existing_session != session_id
+        || existing_owner != owner
+        || existing_key.as_deref() != operation_key
+    {
+        transaction.commit().map_err(|error| {
+            format!("failed to close automation stop ownership conflict: {error}")
+        })?;
+        return Ok(StopFenceClaim::Conflict);
+    }
+    let parsed_expires_at = DateTime::parse_from_rfc3339(&expires_at)
+        .map_err(|error| format!("stored automation stop lease is invalid: {error}"))?
+        .with_timezone(&Utc);
+    if parsed_expires_at <= now {
+        let reclaimed = transaction
+            .execute(
+                "UPDATE automation_stop_fences
+                 SET execution_expires_at = ?2
+                 WHERE run_id = ?1 AND execution_expires_at = ?3",
+                rusqlite::params![run_id, execution_expires_at, expires_at],
+            )
+            .map_err(|error| format!("failed to reclaim automation stop recovery: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit automation stop recovery: {error}"))?;
+        if reclaimed == 1 {
+            Ok(StopFenceClaim::UnknownOutcome)
+        } else {
+            Ok(StopFenceClaim::InProgress)
+        }
+    } else {
+        transaction.commit().map_err(|error| {
+            format!("failed to close automation stop ownership lookup: {error}")
+        })?;
+        Ok(StopFenceClaim::InProgress)
+    }
+}
+
+pub(crate) fn settle_confirmed_stop(
+    conn: &Connection,
+    run_id: &str,
+    session_id: &str,
+    disposition: ConfirmedStop,
+    now: DateTime<Utc>,
+) -> Result<bool, String> {
+    let (session_status, aggregate_state, attempt_state, failure_class, state_reason, exit_code) =
+        match disposition {
+            ConfirmedStop::Cancelled => (
+                "cancelled",
+                "cancelled",
+                "cancelled",
+                "cancelled",
+                "automation run cancelled by operator",
+                None,
+            ),
+            ConfirmedStop::TimedOut => (
+                "killed",
+                "failed",
+                "timed_out",
+                "timeout",
+                "automation run timed out",
+                None,
+            ),
+        };
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin automation stop settlement: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if !crate::store::update_session_terminal_if_active(
+        &transaction,
+        session_id,
+        session_status,
+        exit_code.and_then(|code| i32::try_from(code).ok()),
+        &now_iso,
+    )
+    .map_err(|error| format!("failed to settle automation session `{session_id}`: {error:#}"))?
+    {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back losing stop settlement: {error}"))?;
+        return Ok(false);
+    }
+
+    let attempt_changed = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state = ?2,
+                 failure_class = ?3,
+                 state_reason = ?4,
+                 settled_at = ?5,
+                 session_id = COALESCE(session_id, ?6)
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing')
+               AND (
+                   session_id = ?6
+                   OR (state = 'dispatching' AND session_id IS NULL)
+               )",
+            rusqlite::params![
+                run_id,
+                attempt_state,
+                failure_class,
+                state_reason,
+                now_iso,
+                session_id
+            ],
+        )
+        .map_err(|error| format!("failed to settle stopped automation attempt: {error}"))?;
+    if attempt_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete stop settlement: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has exactly one active attempt for session `{session_id}`"
+        ));
+    }
+
+    if !record_run_finish(
+        &transaction,
+        run_id,
+        RunFinish {
+            status: aggregate_state,
+            exit_code,
+            session_id: Some(session_id.to_string()),
+            log_json: None,
+            output_commit: None,
+        },
+        now,
+    )
+    .map_err(|error| format!("failed to settle stopped automation run: {error:#}"))?
+    {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete run stop: {error}"))?;
+        return Ok(false);
+    }
+    let occurrence_id: String = transaction
+        .query_row(
+            "SELECT occurrence_id FROM automation_runs WHERE id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to resolve stopped run occurrence: {error}"))?;
+    if !settle_occurrence(
+        &transaction,
+        &occurrence_id,
+        aggregate_state,
+        Some(state_reason),
+        now,
+    )? {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back incomplete occurrence stop: {error}"))?;
+        return Err(format!(
+            "automation occurrence `{occurrence_id}` was no longer active during stop settlement"
+        ));
+    }
+    transaction
+        .execute(
+            "DELETE FROM automation_stop_fences
+             WHERE run_id = ?1 AND session_id = ?2",
+            rusqlite::params![run_id, session_id],
+        )
+        .map_err(|error| format!("failed to release automation stop ownership: {error}"))?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit automation stop settlement: {error}"))?;
+    Ok(true)
+}
+
+pub(crate) fn mark_unconfirmed_stop_for_recovery(
+    conn: &Connection,
+    run_id: &str,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin ambiguous stop settlement: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let attempt_changed = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state = 'ambiguous',
+                 failure_class = 'ambiguous_evidence',
+                 state_reason = ?2,
+                 settled_at = ?3
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing')
+               AND (
+                   session_id = (
+                       SELECT r.session_id
+                       FROM automation_runs AS r
+                       JOIN sessions AS s ON s.id = r.session_id
+                       WHERE r.id = ?1
+                         AND r.status = 'running'
+                         AND s.status IN ('created', 'running', 'orphaned')
+                   )
+                   OR (
+                       state = 'dispatching'
+                       AND session_id IS NULL
+                       AND EXISTS (
+                           SELECT 1
+                           FROM automation_runs AS r
+                           JOIN sessions AS s ON s.id = r.session_id
+                           WHERE r.id = ?1
+                             AND r.status = 'running'
+                             AND s.status IN ('created', 'running', 'orphaned')
+                       )
+                   )
+               )",
+            rusqlite::params![run_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to mark ambiguous automation attempt: {error}"))?;
+    if attempt_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back ambiguous stop settlement: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has exactly one active attempt"
+        ));
+    }
+
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = (
+                 SELECT occurrence_id FROM automation_runs WHERE id = ?1
+             )
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![run_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to mark recovery-required occurrence: {error}"))?;
+    if occurrence_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back ambiguous occurrence stop: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has an active occurrence"
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit ambiguous stop settlement: {error}"))
+}
+
+pub(crate) fn mark_terminal_stop_for_recovery(
+    conn: &Connection,
+    run_id: &str,
+    session_id: &str,
+    state_reason: &str,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin terminal stop recovery: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let attempt_changed = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state = 'ambiguous',
+                 failure_class = 'ambiguous_evidence',
+                 state_reason = ?3,
+                 settled_at = ?4
+             WHERE run_id = ?1
+               AND state IN ('dispatching', 'started', 'observing')
+               AND (
+                   session_id = ?2
+                   OR (state = 'dispatching' AND session_id IS NULL)
+               )
+               AND EXISTS (
+                   SELECT 1
+                   FROM sessions
+                   WHERE id = ?2
+                     AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')
+               )",
+            rusqlite::params![run_id, session_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to preserve ambiguous terminal attempt: {error}"))?;
+    if attempt_changed != 1 {
+        transaction
+            .rollback()
+            .map_err(|error| format!("failed to roll back terminal stop recovery: {error}"))?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has one active terminally observed attempt"
+        ));
+    }
+    let occurrence_changed = transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?2,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?3
+             WHERE id = (
+                 SELECT occurrence_id FROM automation_runs WHERE id = ?1
+             )
+               AND state IN ('claimed', 'running')",
+            rusqlite::params![run_id, state_reason, now_iso],
+        )
+        .map_err(|error| format!("failed to preserve terminal recovery occurrence: {error}"))?;
+    if occurrence_changed != 1 {
+        transaction.rollback().map_err(|error| {
+            format!("failed to roll back terminal recovery occurrence: {error}")
+        })?;
+        return Err(format!(
+            "automation run `{run_id}` no longer has an active occurrence for terminal recovery"
+        ));
+    }
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit terminal stop recovery: {error}"))
+}
+
+pub fn mark_active_attempts_for_restart_reconciliation(
+    conn: &Connection,
+    now: DateTime<Utc>,
+) -> Result<usize, String> {
+    let transaction = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("failed to begin shutdown reconciliation: {error}"))?;
+    let now_iso = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let reason = "daemon shutdown requires restart reconciliation";
+    let attempts = transaction
+        .execute(
+            "UPDATE automation_attempts
+             SET state_reason = ?1
+             WHERE state IN ('dispatching', 'started', 'observing')
+               AND run_id IN (
+                   SELECT id FROM automation_runs WHERE status = 'running'
+               )",
+            rusqlite::params![reason],
+        )
+        .map_err(|error| format!("failed to mark active attempts for reconciliation: {error}"))?;
+    transaction
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'recovery_required',
+                 failure_reason = ?1,
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?2
+             WHERE state IN ('claimed', 'running')
+               AND id IN (
+                   SELECT occurrence_id
+                   FROM automation_runs
+                   WHERE status = 'running'
+               )",
+            rusqlite::params![reason, now_iso],
+        )
+        .map_err(|error| {
+            format!("failed to mark active occurrences for restart reconciliation: {error}")
+        })?;
+    transaction
+        .commit()
+        .map_err(|error| format!("failed to commit shutdown reconciliation: {error}"))?;
+    Ok(attempts)
+}
+
 /// Reconciles nonterminal automation rows against the authoritative session
-/// ledger. Only a completed session with an explicit zero exit code can
-/// produce success; every other terminal session disposition is a failure.
+/// ledger. A completed session with an explicit zero exit code produces
+/// success, acknowledged cancellation remains distinct, and every other
+/// terminal session disposition is a failure.
 pub fn settle_finished_runs(
     conn: &Connection,
     now: DateTime<Utc>,
@@ -1980,6 +3109,8 @@ pub fn settle_finished_runs(
         Option<String>,
         Option<String>,
         Option<i64>,
+        Option<String>,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -1999,6 +3130,20 @@ pub fn settle_finished_runs(
                                 LIMIT 1
                             ),
                             s.updated_at
+                        ),
+                        (
+                            SELECT a.state
+                            FROM automation_attempts AS a
+                            WHERE a.run_id = r.id
+                            ORDER BY a.attempt_number DESC
+                            LIMIT 1
+                        ),
+                        (
+                            SELECT a.settled_at
+                            FROM automation_attempts AS a
+                            WHERE a.run_id = r.id
+                            ORDER BY a.attempt_number DESC
+                            LIMIT 1
                         )
                  FROM automation_runs AS r
                  LEFT JOIN sessions AS s ON s.id = r.session_id
@@ -2018,6 +3163,8 @@ pub fn settle_finished_runs(
                     row.get(5)?,
                     row.get(6)?,
                     row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
                 ))
             })
             .map_err(|error| format!("failed to query automation reconciliation: {error}"))?;
@@ -2040,6 +3187,8 @@ pub fn settle_finished_runs(
         occurrence_state,
         timeout_at,
         terminal_at,
+        attempt_state,
+        attempt_settled_at,
     ) in rows
     {
         let terminal_session = session_status.as_deref().is_some_and(|status| {
@@ -2052,25 +3201,47 @@ pub fn settle_finished_runs(
             continue;
         }
 
-        let completed_after_timeout = match (timeout_at.as_deref(), terminal_at.as_deref()) {
-            (Some(timeout_at), Some(terminal_at)) => {
-                let timeout_at = DateTime::parse_from_rfc3339(timeout_at)
-                    .map_err(|error| format!("run `{run_id}` has invalid timeout_at: {error}"))?;
-                let terminal_at = DateTime::parse_from_rfc3339(terminal_at).map_err(|error| {
+        let ambiguous = attempt_state.as_deref() == Some("ambiguous");
+        let timed_out = !ambiguous
+            && match (timeout_at.as_deref(), terminal_at.as_deref()) {
+                (Some(timeout_at), Some(terminal_at)) => {
+                    let timeout_at = DateTime::parse_from_rfc3339(timeout_at).map_err(|error| {
+                        format!("run `{run_id}` has invalid timeout_at: {error}")
+                    })?;
+                    let terminal_at = DateTime::parse_from_rfc3339(terminal_at).map_err(|error| {
                     format!("session for run `{run_id}` has invalid terminal timestamp: {error}")
                 })?;
-                terminal_at > timeout_at
-            }
-            _ => false,
-        };
-        let succeeded = session_status.as_deref() == Some("completed")
+                    terminal_at >= timeout_at
+                }
+                _ => false,
+            };
+        let succeeded = !ambiguous
+            && session_status.as_deref() == Some("completed")
             && exit_code == Some(0)
-            && !completed_after_timeout;
-        let status = if succeeded { "succeeded" } else { "failed" };
-        let reason = if succeeded {
+            && !timed_out;
+        let cancelled = !ambiguous && session_status.as_deref() == Some("cancelled") && !timed_out;
+        let status = if succeeded {
+            "succeeded"
+        } else if cancelled {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let attempt_status = if timed_out { "timed_out" } else { status };
+        let reason = if ambiguous {
+            Some("terminal session evidence observed after an ambiguous stop outcome".to_string())
+        } else if succeeded {
             None
-        } else if completed_after_timeout {
-            Some("session completed after automation timeout".to_string())
+        } else if timed_out {
+            Some(match session_status.as_deref() {
+                Some("completed") => "session completed after automation timeout".to_string(),
+                Some(session_status) => {
+                    format!("session {session_status} at or after automation timeout")
+                }
+                None => unreachable!("terminal_session requires a session status"),
+            })
+        } else if cancelled {
+            Some("session cancellation acknowledged".to_string())
         } else {
             Some(match (&session_status, exit_code) {
                 (Some(session_status), Some(exit_code)) => {
@@ -2079,6 +3250,18 @@ pub fn settle_finished_runs(
                 (Some(session_status), None) => format!("session {session_status}"),
                 (None, _) => unreachable!("terminal_session requires a session status"),
             })
+        };
+        let settlement_time = if ambiguous {
+            let settled_at = attempt_settled_at.as_deref().ok_or_else(|| {
+                format!("ambiguous attempt for run `{run_id}` has no settlement timestamp")
+            })?;
+            DateTime::parse_from_rfc3339(settled_at)
+                .map_err(|error| {
+                    format!("ambiguous attempt for run `{run_id}` has invalid settled_at: {error}")
+                })?
+                .with_timezone(&Utc)
+        } else {
+            now
         };
 
         let transaction = conn
@@ -2090,36 +3273,54 @@ pub fn settle_finished_runs(
             ));
         };
         if occurrence_state.as_deref() != Some(status) {
-            if matches!(occurrence_state.as_deref(), Some("succeeded" | "failed")) {
+            if matches!(
+                occurrence_state.as_deref(),
+                Some("succeeded" | "failed" | "cancelled")
+            ) {
                 return Err(format!(
                     "automation occurrence `{occurrence_id}` is already `{}` but terminal session evidence requires `{status}`",
                     occurrence_state.as_deref().unwrap_or("missing")
                 ));
             }
-            if !settle_occurrence(&transaction, occurrence_id, status, reason.as_deref(), now)? {
+            if !settle_occurrence(
+                &transaction,
+                occurrence_id,
+                status,
+                reason.as_deref(),
+                settlement_time,
+            )? {
                 return Err(format!(
                     "automation occurrence `{occurrence_id}` changed during settlement"
                 ));
             }
         }
-        let attempt_settled = transaction
-            .execute(
-                "UPDATE automation_attempts
+        let attempt_settled = if attempt_state.as_deref() == Some("ambiguous") {
+            1
+        } else {
+            transaction
+                .execute(
+                    "UPDATE automation_attempts
                  SET state = ?2,
                      state_reason = ?3,
-                     settled_at = ?4
+                     settled_at = ?4,
+                     failure_class = CASE
+                         WHEN ?2 = 'cancelled' THEN 'cancelled'
+                         WHEN ?2 = 'timed_out' THEN 'timeout'
+                         ELSE failure_class
+                     END
                  WHERE run_id = ?1
                    AND state IN ('dispatching', 'started', 'observing')",
-                rusqlite::params![
-                    run_id,
-                    status,
-                    reason,
-                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                ],
-            )
-            .map_err(|error| {
-                format!("failed to settle current attempt for run `{run_id}`: {error}")
-            })?;
+                    rusqlite::params![
+                        run_id,
+                        attempt_status,
+                        reason,
+                        settlement_time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    ],
+                )
+                .map_err(|error| {
+                    format!("failed to settle current attempt for run `{run_id}`: {error}")
+                })?
+        };
         let attempt_count: i64 = transaction
             .query_row(
                 "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
@@ -2142,7 +3343,7 @@ pub fn settle_finished_runs(
                 log_json: None,
                 output_commit: None,
             },
-            now,
+            settlement_time,
         )
         .map_err(|error| format!("failed to settle automation run `{run_id}`: {error:#}"))?
         {
@@ -2155,6 +3356,8 @@ pub fn settle_finished_runs(
             .map_err(|error| format!("failed to commit automation settlement: {error}"))?;
         if succeeded {
             report.succeeded += 1;
+        } else if cancelled {
+            report.cancelled += 1;
         } else {
             report.failed += 1;
         }
@@ -2263,12 +3466,17 @@ fn load_definition_for_occurrence_dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::automations::contract::authority::{
+        AuthorityEvidenceVerifier, AuthorityProfileError, AuthorityProfileErrorCode,
+        AuthorityValidationPhase, AutomationAuthorityExtension, AUTHORITY_EXTENSION_KEY,
+    };
     use crate::automations::contract::types::{BackoffPolicy, RetryableClass};
     use crate::automations::definition::{RoutineDefinition, RoutineRetryPolicy, RoutineStatus};
     use crate::automations::store::insert_definition;
     use crate::store::initialize_store;
     use chrono::TimeZone;
     use serde_json::json;
+    use sha2::{Digest as _, Sha256};
     use std::collections::BTreeSet;
 
     struct RejectingRuntime;
@@ -2453,6 +3661,266 @@ mod tests {
         }
 
         fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct AuthorityObservingRuntime<'a> {
+        conn: &'a Connection,
+    }
+
+    impl SessionRuntime for AuthorityObservingRuntime<'_> {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use strict containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            let (profile, extension): (Option<String>, Option<String>) = self.conn.query_row(
+                "SELECT r.authority_profile, a.authority_extension_json
+                 FROM automation_runs AS r
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.session_id = ?1 AND a.state = 'dispatching'",
+                [&launch.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            anyhow::ensure!(
+                profile.as_deref() == Some("coven.automations.authority.v1"),
+                "runtime launch observed an unpinned authority profile"
+            );
+            anyhow::ensure!(
+                extension.is_some(),
+                "runtime launch observed an unpinned authority extension"
+            );
+            ownership_established()
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SupersedingPublishingRuntime<'a> {
+        conn: &'a Connection,
+    }
+
+    impl SessionRuntime for SupersedingPublishingRuntime<'_> {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use strict containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.conn.execute(
+                "UPDATE automation_scheduler_authority
+                 SET owner_id = 'replacement-scheduler',
+                     generation = generation + 1
+                 WHERE id = 1",
+                [],
+            )?;
+            ownership_established()
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct SupersedingRejectingRuntime<'a> {
+        conn: &'a Connection,
+    }
+
+    impl SessionRuntime for SupersedingRejectingRuntime<'_> {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch must use strict containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            self.conn.execute(
+                "UPDATE automation_scheduler_authority
+                 SET owner_id = 'replacement-scheduler',
+                     generation = generation + 1
+                 WHERE id = 1",
+                [],
+            )?;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "synthetic runtime unavailable",
+            )
+            .into())
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct VectorAuthority;
+
+    impl AutomationDispatchAuthority for VectorAuthority {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            assert_eq!(
+                request.occurrence_key,
+                format!("{}@manual-{}", request.automation_id, request.adoption_key)
+            );
+            const VECTORS: &str =
+                include_str!("../../../../spec/coven-automations/authority/v1/test-vectors.json");
+            let vectors: serde_json::Value =
+                serde_json::from_str(VECTORS).expect("authority vectors");
+            let mut binding = vectors["fixtures"]["binding"].clone();
+            binding["base"]["automationId"] = json!(request.automation_id);
+            binding["base"]["automationRevision"] = json!(request.automation_revision);
+            binding["base"]["definitionDigest"]["value"] = json!(request.definition_digest);
+            binding["base"]["occurrenceId"] = json!(request.occurrence_id);
+            binding["base"]["occurrenceKey"] = json!(request.occurrence_key);
+            binding["base"]["occurrenceFenceGeneration"] =
+                json!(request.occurrence_fence_generation);
+            binding["base"]["runId"] = json!(request.run_id);
+            binding["base"]["attemptId"] = json!(request.attempt_id);
+            binding["base"]["attemptNumber"] = json!(request.attempt_number);
+            binding["base"]["adoptionKey"] = json!(request.adoption_key);
+            binding["runtime"]["runtimeId"] = json!(request.runtime_id);
+            binding["approval"]["use"]["occurrencePrefix"] = json!("occurrence.");
+            binding["approval"]["consumption"]["occurrenceId"] = json!(request.occurrence_id);
+            binding["approval"]["consumption"]["runId"] = json!(request.run_id);
+            binding["approval"]["consumption"]["attemptNumber"] = json!(request.attempt_number);
+            binding["approval"]["consumption"]["fenceGeneration"] =
+                json!(request.occurrence_fence_generation);
+
+            let mut body = binding.clone();
+            let object = body.as_object_mut().expect("binding object");
+            object.remove("integrity");
+            object.remove("authentication");
+            let canonical = serde_jcs::to_vec(&body).expect("canonical authority binding");
+            let mut hasher = Sha256::new();
+            hasher.update(b"opencoven:coven-automations-authority-binding:v1");
+            hasher.update([0]);
+            hasher.update(canonical);
+            let digest = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            binding["integrity"]["value"] = json!(digest);
+            binding["authentication"]["signedDigest"] = json!(digest);
+
+            serde_json::from_value(json!({
+                AUTHORITY_EXTENSION_KEY: {
+                    "profile": "coven.automations.authority.v1",
+                    "kind": "AutomationAuthorityExtension",
+                    "executionBinding": binding,
+                    "receiptEvidence": null
+                }
+            }))
+            .map_err(|error| {
+                AuthorityProfileError::new(
+                    AuthorityProfileErrorCode::SchemaInvalid,
+                    error.to_string(),
+                )
+            })
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for VectorAuthority {
+        fn verify(
+            &self,
+            _extension: &AutomationAuthorityExtension,
+            phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            assert_eq!(phase, AuthorityValidationPhase::PreDispatch);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StaleAuthority;
+
+    impl AutomationDispatchAuthority for StaleAuthority {
+        fn resolve(
+            &self,
+            _request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            Err(AuthorityProfileError::new(
+                AuthorityProfileErrorCode::Stale,
+                "synthetic trusted-state detail that must not escape",
+            ))
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for StaleAuthority {
+        fn verify(
+            &self,
+            _extension: &AutomationAuthorityExtension,
+            _phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            unreachable!("stale authority resolution must refuse before verification")
+        }
+    }
+
+    #[derive(Debug)]
+    struct MismatchedAuthority;
+
+    impl AutomationDispatchAuthority for MismatchedAuthority {
+        fn resolve(
+            &self,
+            request: &AutomationAuthorityRequest,
+        ) -> Result<crate::automations::contract::types::ExtensionBag, AuthorityProfileError>
+        {
+            let mut mismatched = request.clone();
+            mismatched.runtime_id = "different-runtime".to_string();
+            VectorAuthority.resolve(&mismatched)
+        }
+    }
+
+    impl AuthorityEvidenceVerifier for MismatchedAuthority {
+        fn verify(
+            &self,
+            _extension: &AutomationAuthorityExtension,
+            _phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
             Ok(())
         }
     }
@@ -2668,6 +4136,270 @@ mod tests {
         (temp, conn)
     }
 
+    #[test]
+    fn stale_scheduler_generation_cannot_dispatch_after_takeover() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("stale-scheduler-dispatch");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let first = super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+            .unwrap();
+        super::super::occurrences::tick_with_scheduler_fence(&conn, now, &first.fence()).unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let _second = super::super::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        let error = dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            now + chrono::Duration::seconds(1),
+            || now + chrono::Duration::seconds(1),
+            || false,
+            &stale_fence,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(session_count, 0);
+    }
+
+    #[test]
+    fn superseded_scheduler_cannot_publish_runtime_ownership() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("stale-scheduler-publication");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let leadership =
+            super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        super::super::occurrences::tick_with_scheduler_fence(&conn, now, &leadership.fence())
+            .unwrap();
+
+        let error = dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
+            &conn,
+            &SupersedingPublishingRuntime { conn: &conn },
+            now,
+            || now,
+            || false,
+            &leadership.fence(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let (occurrence_state, attempt_state, session_status): (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, a.state, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE o.automation_id = ?1",
+                [&routine.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                occurrence_state.as_str(),
+                attempt_state.as_str(),
+                session_status.as_str()
+            ),
+            ("claimed", "dispatching", "created")
+        );
+    }
+
+    #[test]
+    fn superseded_scheduler_cannot_settle_a_rejected_launch() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("stale-scheduler-settlement");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let leadership =
+            super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        super::super::occurrences::tick_with_scheduler_fence(&conn, now, &leadership.fence())
+            .unwrap();
+
+        let error = dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
+            &conn,
+            &SupersedingRejectingRuntime { conn: &conn },
+            now,
+            || now,
+            || false,
+            &leadership.fence(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let (occurrence_state, attempt_state, session_status): (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, a.state, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE o.automation_id = ?1",
+                [&routine.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                occurrence_state.as_str(),
+                attempt_state.as_str(),
+                session_status.as_str()
+            ),
+            ("claimed", "dispatching", "created")
+        );
+    }
+
+    #[test]
+    fn rejected_launch_settlement_rechecks_the_scheduler_fence_in_transaction() {
+        let (temp, conn) = temp_store();
+        let mut routine = definition("atomic-stale-settlement");
+        routine.status = RoutineStatus::Active;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                routine.id,
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+            ],
+        )
+        .unwrap();
+        let leadership =
+            super::super::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let report =
+            super::super::occurrences::tick_with_scheduler_fence(&conn, now, &leadership.fence())
+                .unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        let PersistLaunch::Ready(attempt) = persist_launch_with_clock(
+            &conn,
+            "atomic-stale-settlement-run",
+            occurrence_id,
+            &routine,
+            &launch,
+            PersistLaunchContext {
+                not_before: now,
+                authority: AutomationAuthorityMode::BaseV1,
+                scheduler_fence: Some(&leadership.fence()),
+            },
+            || now,
+        )
+        .unwrap() else {
+            panic!("scheduler claim should persist a dispatching attempt");
+        };
+        conn.execute(
+            "UPDATE automation_scheduler_authority
+             SET owner_id = 'replacement-scheduler',
+                 generation = generation + 1
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+        let error = settle_rejected_launch(
+            &conn,
+            RejectedLaunch {
+                occurrence_id,
+                run_id: &attempt.run_id,
+                attempt_number: attempt.attempt_number,
+                session_id: &launch.id,
+                definition: &routine,
+                failure: PreownershipFailure::LaunchRefused,
+                reason: "synthetic refusal",
+                scheduler_fence: Some(&leadership.fence()),
+            },
+            now,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let restore_error = restore_preownership_launch_for_retry(
+            &conn,
+            occurrence_id,
+            &attempt.run_id,
+            &launch.id,
+            now,
+            Some(&leadership.fence()),
+        )
+        .unwrap_err();
+        assert!(
+            restore_error.contains("scheduler fence is stale"),
+            "{restore_error}"
+        );
+        let (occurrence_state, attempt_state, session_status): (String, String, String) = conn
+            .query_row(
+                "SELECT o.state, a.state, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+                [&attempt.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                occurrence_state.as_str(),
+                attempt_state.as_str(),
+                session_status.as_str()
+            ),
+            ("claimed", "dispatching", "created")
+        );
+    }
+
     fn persisted_timeout_at(conn: &Connection, automation_id: &str) -> DateTime<Utc> {
         let timeout_at = super::super::runs::list_runs(conn, automation_id, 1)
             .unwrap()
@@ -2687,8 +4419,379 @@ mod tests {
         launch: &SessionLaunch,
         now: DateTime<Utc>,
     ) -> Result<(), String> {
-        persist_launch_with_clock(conn, run_id, occurrence_id, definition, launch, now, || now)
-            .map(|_| ())
+        persist_launch_with_clock(
+            conn,
+            run_id,
+            occurrence_id,
+            definition,
+            launch,
+            PersistLaunchContext {
+                not_before: now,
+                authority: AutomationAuthorityMode::BaseV1,
+                scheduler_fence: None,
+            },
+            || now,
+        )
+        .map(|_| ())
+    }
+
+    #[test]
+    fn runtime_authority_is_pinned_before_runtime_launch() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-20260903";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let runtime = AuthorityObservingRuntime { conn: &conn };
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("authority-bound dispatch must not be deferred");
+        };
+
+        assert_eq!(outcome.status, "running");
+        let (profile, extension): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT r.authority_profile, a.authority_extension_json
+                 FROM automation_runs AS r
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(profile.as_deref(), Some("coven.automations.authority.v1"));
+        assert!(extension.is_some());
+    }
+
+    #[test]
+    fn invalid_runtime_authority_rolls_back_before_launch() {
+        for (authority, expected_code) in [
+            (
+                &StaleAuthority as &dyn AutomationDispatchAuthority,
+                "AUTHORITY_STALE",
+            ),
+            (
+                &MismatchedAuthority as &dyn AutomationDispatchAuthority,
+                "AUTHORITY_BINDING_MISMATCH",
+            ),
+        ] {
+            let (_temp, conn) = temp_store();
+            let routine = definition("daily-notes");
+            insert_definition(&conn, &routine).unwrap();
+            let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+            let occurrence_id = "occurrence.daily-notes-refused";
+            assert!(insert_claimed_occurrence(
+                &conn,
+                occurrence_id,
+                &routine.id,
+                "daemon",
+                60,
+                now,
+            )
+            .unwrap());
+            let mut clock = || now;
+            let cancelled = || false;
+            let mut control = DispatchControl {
+                clock: &mut clock,
+                cancelled: &cancelled,
+                authority: AutomationAuthorityMode::RuntimeAuthority(authority),
+                scheduler_fence: None,
+            };
+
+            let result = dispatch_occurrence_with_clock(
+                &conn,
+                &ContainedRuntime,
+                &routine,
+                occurrence_id,
+                routine.cwd.as_deref().unwrap(),
+                now,
+                &mut control,
+            );
+            let error = match result {
+                Ok(_) => panic!("invalid Runtime Authority must fail closed"),
+                Err(error) => error,
+            };
+
+            assert!(error.contains(expected_code), "{error}");
+            assert!(
+                !error.contains("synthetic trusted-state detail"),
+                "authority errors must not disclose provider details"
+            );
+            let counts: (i64, i64, i64) = conn
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM automation_runs),
+                        (SELECT COUNT(*) FROM automation_attempts),
+                        (SELECT COUNT(*) FROM sessions)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(counts, (0, 0, 0));
+        }
+    }
+
+    #[test]
+    fn pinned_runtime_authority_cannot_be_rewritten_or_deleted() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-immutable";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let runtime = AuthorityObservingRuntime { conn: &conn };
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &runtime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("authority-bound dispatch must not be deferred");
+        };
+
+        let rewrite = conn.execute(
+            "UPDATE automation_attempts
+             SET authority_extension_json = '{}'
+             WHERE run_id = ?1",
+            [&outcome.run_id],
+        );
+        assert!(rewrite.is_err(), "pinned authority must be immutable");
+        let delete = conn.execute(
+            "DELETE FROM automation_attempts WHERE run_id = ?1",
+            [&outcome.run_id],
+        );
+        assert!(
+            delete.is_err(),
+            "authority-bound attempts must remain auditable"
+        );
+        let downgrade = conn.execute(
+            "UPDATE automation_runs SET authority_profile = NULL WHERE id = ?1",
+            [&outcome.run_id],
+        );
+        assert!(
+            downgrade.is_err(),
+            "a run cannot drop its pinned authority profile"
+        );
+    }
+
+    #[test]
+    fn no_process_recovery_preserves_consumed_runtime_authority() {
+        let (temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-no-process";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        persist_launch_with_clock(
+            &conn,
+            "run.daily-notes-no-process",
+            occurrence_id,
+            &routine,
+            &launch,
+            PersistLaunchContext {
+                not_before: now,
+                authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+                scheduler_fence: None,
+            },
+            || now,
+        )
+        .unwrap();
+        let receipt = containment_receipt_path(temp.path(), &launch.id);
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        crate::pty_runner::write_containment_receipt(
+            &receipt,
+            crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_no_process_preownership_launches(temp.path(), &conn, now).unwrap(),
+            1
+        );
+        let (run_status, attempt_state, authority, occurrence_state): (
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT r.status, a.state, a.authority_extension_json, o.state
+                 FROM automation_runs AS r
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 WHERE r.id = 'run.daily-notes-no-process'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(attempt_state, "failed");
+        assert!(authority.is_some());
+        assert_eq!(occurrence_state, "failed");
+    }
+
+    #[test]
+    fn shutdown_admission_refusal_preserves_consumed_runtime_authority() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-shutdown";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || true;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &AdmissionClosedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("consumed authority cannot restore the same attempt for replay");
+        };
+
+        assert_eq!(outcome.status, "failed");
+        let (run_status, attempt_state, authority, occurrence_state): (
+            String,
+            String,
+            Option<String>,
+            String,
+        ) = conn
+            .query_row(
+                "SELECT r.status, a.state, a.authority_extension_json, o.state
+                 FROM automation_runs AS r
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(attempt_state, "failed");
+        assert!(authority.is_some());
+        assert_eq!(occurrence_state, "failed");
+    }
+
+    #[test]
+    fn shutdown_admission_retry_uses_a_fresh_authority_attempt() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("daily-notes");
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::TransientDispatch]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-shutdown-retry";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || true;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &AdmissionClosedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("consumed authority must settle before retry");
+        };
+
+        assert_eq!(outcome.status, "retry_scheduled");
+        let attempts: Vec<(i64, String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT attempt_number, adoption_key, state, authority_extension_json
+                 FROM automation_attempts
+                 WHERE run_id = ?1
+                 ORDER BY attempt_number",
+            )
+            .unwrap()
+            .query_map([&outcome.run_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].0, 1);
+        assert_eq!(attempts[0].2, "failed");
+        assert!(attempts[0].3.is_some());
+        assert_eq!(attempts[1].0, 2);
+        assert_ne!(attempts[0].1, attempts[1].1);
+        assert_eq!(attempts[1].2, "adopted");
+        assert!(attempts[1].3.is_none());
     }
 
     #[test]
@@ -3744,14 +5847,20 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(run.status, "failed");
-        let reason: String = conn
+        let (reason, attempt_state, failure_class): (String, String, Option<String>) = conn
             .query_row(
-                "SELECT failure_reason FROM automation_occurrences WHERE automation_id = 'daily'",
+                "SELECT o.failure_reason, a.state, a.failure_class
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE o.automation_id = 'daily'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(reason, "session completed after automation timeout");
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -3843,6 +5952,160 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "failed");
+    }
+
+    #[test]
+    fn cancelled_session_evidence_settles_automation_as_cancelled() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily")).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("daily"),
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let cancelled_at = launched_at + chrono::Duration::seconds(5);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "cancelled",
+            None,
+            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, cancelled_at).unwrap();
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.cancelled, 1);
+
+        let run = super::super::runs::list_runs(&conn, "daily", 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(run.exit_code, None);
+
+        let (occurrence_state, attempt_state, failure_class): (String, String, Option<String>) =
+            conn.query_row(
+                "SELECT o.state, a.state, a.failure_class
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "cancelled");
+        assert_eq!(attempt_state, "cancelled");
+        assert_eq!(failure_class.as_deref(), Some("cancelled"));
+    }
+
+    #[test]
+    fn completion_recorded_before_cancellation_remains_successful() {
+        let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily")).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &definition("daily"),
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let completed_at = launched_at + chrono::Duration::seconds(4);
+        assert!(crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        assert!(!crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "cancelled",
+            None,
+            &(completed_at + chrono::Duration::seconds(1))
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+
+        let report = settle_finished_runs(&conn, completed_at).unwrap();
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.cancelled, 0);
+
+        let (run_status, occurrence_state, attempt_state): (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "succeeded");
+        assert_eq!(occurrence_state, "succeeded");
+        assert_eq!(attempt_state, "succeeded");
+    }
+
+    #[test]
+    fn cancellation_after_deadline_preserves_timeout_disposition() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("daily");
+        routine.timeout_minutes = 1;
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let cancelled_at = persisted_timeout_at(&conn, "daily") + chrono::Duration::milliseconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            outcome.session_id.as_deref().unwrap(),
+            "cancelled",
+            None,
+            &cancelled_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+
+        let report = settle_finished_runs(&conn, cancelled_at).unwrap();
+        assert_eq!(report.succeeded, 0);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.cancelled, 0);
+
+        let (run_status, occurrence_state, attempt_state, failure_class): (
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "failed");
+        assert_eq!(occurrence_state, "failed");
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
     }
 
     #[test]
@@ -4665,7 +6928,7 @@ mod tests {
     }
 
     #[test]
-    fn expired_preownership_launch_recovers_run_and_occurrence_together() {
+    fn unproven_preownership_stop_enters_recovery_without_a_second_kill() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
         routine.timeout_minutes = 120;
@@ -4718,24 +6981,120 @@ mod tests {
                 .is_empty()
         );
         let report = settle_finished_runs(&conn, now).unwrap();
-        assert_eq!(report.failed, 1);
+        assert_eq!(report.failed, 0);
 
         let run = super::super::runs::list_runs(&conn, "daily", 10)
             .unwrap()
             .remove(0);
-        assert_eq!(run.status, "failed");
+        assert_eq!(run.status, "running");
         let session = crate::store::get_session(&conn, session_id)
             .unwrap()
             .unwrap();
-        assert_eq!(session.status, "killed");
-        let occurrence_state: String = conn
+        assert_eq!(session.status, "created");
+        let recovery_state: (String, String) = conn
             .query_row(
-                "SELECT state FROM automation_occurrences WHERE id = ?1",
+                "SELECT o.state, a.state
+                 FROM automation_occurrences AS o
+                 JOIN automation_attempts AS a ON a.occurrence_id = o.id
+                 WHERE o.id = ?1",
                 rusqlite::params![occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(recovery_state.0, "recovery_required");
+        assert_eq!(recovery_state.1, "ambiguous");
+    }
+
+    #[test]
+    fn abandoned_launch_recovery_defers_to_a_cancellation_stop_owner() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("daily");
+        routine.timeout_minutes = 120;
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc::now();
+        let launched_at = now - chrono::Duration::minutes(61);
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "fenced-abandoned-occurrence",
+            &routine.id,
+            "daemon",
+            60,
+            launched_at,
+        )
+        .unwrap());
+        let mut launch = build_session_launch(&routine, routine.cwd.as_deref().unwrap()).unwrap();
+        launch.id = "fenced-abandoned-session".to_string();
+        persist_launch_at(
+            &conn,
+            "fenced-abandoned-run",
+            "fenced-abandoned-occurrence",
+            &routine,
+            &launch,
+            launched_at,
+        )
+        .unwrap();
+        let attempt_id: String = conn
+            .query_row(
+                "SELECT id FROM automation_attempts WHERE run_id = 'fenced-abandoned-run'",
+                [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(occurrence_state, "failed");
+        let adoption_key = "adopt:cancel:fenced-abandoned:0001";
+        let execution_expires_at = (now + chrono::Duration::seconds(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, 'digest', 'run.cancel.v1', ?2)",
+            rusqlite::params![adoption_key, launched_at.to_rfc3339()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_cancellations (
+                 adoption_key, request_digest, automation_id, run_id, attempt_id,
+                 session_id, scope, requested_by_json, reason, state, requested_at,
+                 execution_expires_at
+             ) VALUES (?1, 'digest', ?2, ?3, ?4, ?5, 'run',
+                       '{\"principalId\":\"operator\"}', 'reason', 'requested',
+                       ?6, ?7)",
+            rusqlite::params![
+                adoption_key,
+                routine.id,
+                "fenced-abandoned-run",
+                attempt_id,
+                "fenced-abandoned-session",
+                launched_at.to_rfc3339(),
+                execution_expires_at
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            claim_stop_fence(
+                &conn,
+                "fenced-abandoned-run",
+                "fenced-abandoned-session",
+                "cancellation",
+                Some(adoption_key),
+                Some(&execution_expires_at),
+                now,
+            )
+            .unwrap(),
+            StopFenceClaim::Acquired
+        ));
+
+        assert!(
+            recover_abandoned_launches(&conn, &crate::api::NoopSessionRuntime, now)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            crate::store::get_session(&conn, "fenced-abandoned-session")
+                .unwrap()
+                .unwrap()
+                .status,
+            "created"
+        );
     }
 
     #[test]
@@ -4782,7 +7141,7 @@ mod tests {
     }
 
     #[test]
-    fn timeout_kills_session_before_settling_failure() {
+    fn timeout_kills_session_and_settles_once() {
         let (_temp, conn) = temp_store();
         let mut routine = definition("daily");
         routine.timeout_minutes = 1;
@@ -4809,11 +7168,77 @@ mod tests {
         assert_eq!(session.status, "killed");
 
         let report = settle_finished_runs(&conn, timed_out_at).unwrap();
-        assert_eq!(report.failed, 1);
+        assert_eq!(
+            report,
+            SettlementReport::default(),
+            "the timeout path must own the only terminal settlement"
+        );
         let run = super::super::runs::list_runs(&conn, "daily", 10)
             .unwrap()
             .remove(0);
         assert_eq!(run.status, "failed");
+        let (attempt_state, failure_class): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_class
+                 FROM automation_attempts
+                 WHERE run_id = ?1",
+                [run.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "timed_out");
+        assert_eq!(failure_class.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn timeout_settles_dispatching_attempt_before_session_ownership_publication() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("dispatching-timeout");
+        routine.timeout_minutes = 1;
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().expect("linked session");
+        conn.execute(
+            "UPDATE automation_attempts
+             SET state = 'dispatching', session_id = NULL
+             WHERE run_id = ?1",
+            [&outcome.run_id],
+        )
+        .unwrap();
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+
+        assert!(
+            enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
+                .unwrap()
+                .is_empty()
+        );
+        let state: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.session_id
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            state,
+            (
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into(),
+                Some(session_id.to_string())
+            )
+        );
     }
 
     #[test]
@@ -5077,6 +7502,434 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(run.status, "running");
+    }
+
+    #[test]
+    fn unproven_timeout_stop_enters_recovery_without_automatic_retry() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("timeout-recovery");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+
+        let failures = enforce_run_timeouts(&conn, &FailedKillRuntime, timed_out_at).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("termination is unproven"));
+
+        let lifecycle: (String, String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT o.state, a.state, a.failure_class, a.state_reason
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "recovery_required".to_string(),
+                "ambiguous".to_string(),
+                Some("ambiguous_evidence".to_string()),
+                Some("timeout stop was not confirmed".to_string()),
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "an unconfirmed timeout stop must not become an automatic retry"
+        );
+        assert_eq!(
+            crate::store::get_session(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+            )
+            .unwrap()
+            .expect("persisted session")
+            .status,
+            "running",
+            "an unconfirmed stop must not be represented as a stopped session"
+        );
+    }
+
+    #[test]
+    fn timeout_wins_over_late_completion_without_opening_a_retry() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("timeout-race");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+
+        assert!(
+            enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !crate::store::update_session_terminal_if_active(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+                "completed",
+                Some(0),
+                &(timed_out_at + chrono::Duration::milliseconds(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .unwrap(),
+            "a late completion must lose to the already-recorded timeout stop"
+        );
+        assert_eq!(
+            settle_finished_runs(&conn, timed_out_at).unwrap(),
+            SettlementReport::default(),
+            "a losing completion observation must not produce a second settlement"
+        );
+
+        let lifecycle: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "timed_out".to_string(),
+                Some("timeout".to_string()),
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "a timeout must remain a timeout unless persisted policy explicitly permits retry"
+        );
+    }
+
+    #[test]
+    fn completion_wins_over_late_timeout_without_rewriting_terminal_state() {
+        let (_temp, conn) = temp_store();
+        let mut routine = definition("completion-timeout-race");
+        routine.timeout_minutes = 1;
+        routine.retry = RoutineRetryPolicy {
+            max_attempts: 2,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::from([RetryableClass::RuntimeUnavailable]),
+        };
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let completed_at = launched_at + chrono::Duration::seconds(30);
+        let timed_out_at = persisted_timeout_at(&conn, &routine.id);
+        assert!(
+            completed_at < timed_out_at,
+            "the completion observation must win before the later timeout pass"
+        );
+        assert!(crate::store::update_session_terminal_if_active(
+            &conn,
+            outcome.session_id.as_deref().expect("linked session"),
+            "completed",
+            Some(0),
+            &completed_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap());
+        let settlement = settle_finished_runs(&conn, completed_at).unwrap();
+        assert_eq!(settlement.succeeded, 1);
+        assert_eq!(settlement.failed, 0);
+
+        assert!(
+            enforce_run_timeouts(&conn, &crate::api::NoopSessionRuntime, timed_out_at)
+                .unwrap()
+                .is_empty(),
+            "a later timeout observation must lose to the completed terminal state"
+        );
+        assert_eq!(
+            settle_finished_runs(&conn, timed_out_at).unwrap(),
+            SettlementReport::default(),
+            "the losing timeout observation must not settle a second terminal result"
+        );
+        let lifecycle: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state, a.failure_class
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                None,
+            )
+        );
+        let attempts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+                [&outcome.run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            attempts, 1,
+            "the losing timeout must not open an automatic retry after completion"
+        );
+        assert!(
+            !crate::store::update_session_terminal_if_active(
+                &conn,
+                outcome.session_id.as_deref().expect("linked session"),
+                "killed",
+                None,
+                &timed_out_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .unwrap(),
+            "a timeout observed after completion must not rewrite the session terminal state"
+        );
+    }
+
+    #[test]
+    fn durable_launch_failure_rolls_back_session_run_and_attempt() {
+        let (temp, conn) = temp_store();
+        let routine = definition("launch-crash");
+        insert_definition(&conn, &routine).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_launch_crash
+             BEFORE INSERT ON automation_attempts
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic launch crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = run_routine_now(&conn, &crate::api::NoopSessionRuntime, &routine, Utc::now())
+            .unwrap_err();
+
+        assert!(error.contains("synthetic launch crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let (sessions, runs, attempts): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sessions),
+                    (SELECT COUNT(*) FROM automation_runs),
+                    (SELECT COUNT(*) FROM automation_attempts)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((sessions, runs, attempts), (0, 0, 0));
+        let (state, reason): (String, String) = conn
+            .query_row(
+                "SELECT state, failure_reason
+                 FROM automation_occurrences
+                 WHERE automation_id = 'launch-crash'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
+        assert!(reason.contains("synthetic launch crash"), "{reason}");
+    }
+
+    #[test]
+    fn terminal_settlement_failure_rolls_back_and_retries_from_session_evidence() {
+        let (temp, conn) = temp_store();
+        let routine = definition("settlement-crash");
+        insert_definition(&conn, &routine).unwrap();
+        let launched_at = Utc::now();
+        let outcome = run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            launched_at,
+        )
+        .unwrap();
+        let session_id = outcome.session_id.as_deref().unwrap();
+        let finished_at = launched_at + chrono::Duration::seconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            session_id,
+            "completed",
+            Some(0),
+            &finished_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_settlement_crash
+             BEFORE UPDATE OF status ON automation_runs
+             WHEN NEW.status != 'running'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic settlement crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = settle_finished_runs(&conn, finished_at).unwrap_err();
+
+        assert!(error.contains("synthetic settlement crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "running".to_string(),
+                "running".to_string(),
+                "started".to_string(),
+            )
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT status, exit_code FROM sessions WHERE id = ?1",
+                [session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i32>>(1)?)),
+            )
+            .unwrap(),
+            ("completed".to_string(), Some(0))
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_settlement_crash")
+            .unwrap();
+        assert_eq!(
+            settle_finished_runs(&conn, finished_at).unwrap(),
+            SettlementReport {
+                succeeded: 1,
+                ..SettlementReport::default()
+            }
+        );
+        let lifecycle: (String, String, String) = conn
+            .query_row(
+                "SELECT r.status, o.state, a.state
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+            )
+        );
+    }
+
+    #[test]
+    fn dispatches_only_the_oldest_bounded_claim_batch() {
+        let (_temp, conn) = temp_store();
+        let now = Utc::now();
+        for index in 0..65 {
+            let automation_id = format!("dispatch-load-{index:02}");
+            let mut routine = definition(&automation_id);
+            routine.status = RoutineStatus::Active;
+            insert_definition(&conn, &routine).unwrap();
+            let occurrence_id = format!("dispatch-occurrence-{index:02}");
+            let scheduled_for = now - chrono::Duration::seconds(65 - i64::from(index));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, lease_owner, lease_expires_at, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'claimed', 1, 'daemon', ?3, ?4, ?4
+                 FROM automation_definitions
+                 WHERE id = ?5",
+                rusqlite::params![
+                    occurrence_id,
+                    scheduled_for.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    (now + chrono::Duration::minutes(60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    automation_id,
+                ],
+            )
+            .unwrap();
+        }
+
+        let report =
+            dispatch_claimed_occurrences(&conn, &crate::api::NoopSessionRuntime, now).unwrap();
+
+        assert_eq!(report.dispatched.len(), 64);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM automation_occurrences WHERE state = 'claimed'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "dispatch-occurrence-64"
+        );
     }
 
     #[test]
