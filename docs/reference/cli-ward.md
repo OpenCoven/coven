@@ -313,3 +313,49 @@ fail with `familiar_not_found`.
 `ward.toml` files into the Phase-2 `WardConfig` dialect. Use `--familiar
 <ID>` to scope to one familiar and `--fingerprint <FPR>` to set the
 principal binding. Exits non-zero if any migration fails.
+
+Accepted retired invariants become active `[[identity_invariant]]` entries,
+not backup-only annotations. You keep the original configuration in
+`ward.toml.v01.bak`.
+
+## Active identity invariants
+
+Declare deterministic identity requirements in `ward.toml` to enforce them
+through the identity-aware Threads predicate:
+
+```toml
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Fixture Familiar"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Fixture Principal"
+```
+
+Both `name` and `person` are mandatory when you configure invariants. Supported
+facts are `name`, `person`, `pronouns`, `purpose`, and `coven`; supported
+operators are `equals` and `includes`. Unsupported, duplicate, or incomplete
+declaration sets fail configuration loading.
+
+Coven extracts facts from the complete candidate `SOUL.md`, `IDENTITY.md`,
+and matching `[[familiar]]` roster entry, including unchanged identity files.
+It does not use the invariant's expected value as evidence. Missing,
+unparseable, or conflicting facts fail the predicate closed. Candidate source
+commitments also participate in approval recovery, so changed identity
+evidence cannot reuse an earlier recovery decision.
+
+The current deterministic adapter recognizes `# I am ...` or `## I am ...`
+in `SOUL.md`, `My purpose is ...` or a `## Purpose` section, and
+`# IDENTITY.md - ...`, `- **Name:** ...`, and `- **Pronouns:** ...` in
+`IDENTITY.md`. The roster supplies the name, principal binding (`person`),
+pronouns, and Coven membership. Other prose is not an alternative authority.
+
+Existing configurations without invariants retain their previous behavior.
+A retired `[protected].invariants` block in an active Phase-2 file, or
+compilable invariants stranded only in its backup, fails loading rather than
+silently dropping protection. Preserve the backup and review the active
+declarations before restarting. These predicates do not grant a proposal
+route permission to write protected content.

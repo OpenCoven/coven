@@ -9395,9 +9395,18 @@ fn proposal_recovery_is_proven_unapplied(
         .iter()
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
-    let Ok(commitment) =
-        proposal_recovery_commitment(conn, &config, document, &familiar_id, &targets)
-    else {
+    let Ok(commitment) = proposal_recovery_commitment(
+        conn,
+        &config,
+        document,
+        ProposalRecoveryContext {
+            coven_home,
+            workspace: &workspace,
+            familiar_id: &familiar_id,
+            targets: &targets,
+            authorization: &authorization_from_writer(&pending.writer),
+        },
+    ) else {
         return false;
     };
     if commitment != applying.recovery_commitment {
@@ -10219,8 +10228,18 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let recovery_commitment =
-            proposal_recovery_commitment(&conn, &config, &document, &familiar_id, &targets)?;
+        let recovery_commitment = proposal_recovery_commitment(
+            &conn,
+            &config,
+            &document,
+            ProposalRecoveryContext {
+                coven_home,
+                workspace: &workspace,
+                familiar_id: &familiar_id,
+                targets: &targets,
+                authorization: &authorization,
+            },
+        )?;
         if applying.recovery_commitment != recovery_commitment {
             return json_response(
                 409,
@@ -10477,6 +10496,15 @@ fn decide_threads_proposal_inner(
         }
         Err(error) => return Err(error),
     };
+    let identity_context = crate::ward_identity::candidate_identity_context(
+        coven_home,
+        &familiar_id,
+        &workspace,
+        &config,
+        &edits,
+        &authorization,
+        Some(&adjudication.decisions),
+    );
     if decision == "approve"
         && review_kind == PendingReviewKind::Authority
         && gated_targets.is_empty()
@@ -10782,7 +10810,7 @@ fn decide_threads_proposal_inner(
                 surface: coven_threads_core::SurfaceId::new(target.clone()),
                 writer: pending.writer.clone(),
                 channel: pending.channel,
-                identity_context: None,
+                identity_context: identity_context.clone(),
             };
             let verdict = coven_threads_core::validate_fail_closed(&state.weave, &request);
             crate::threads_gate::append_audit_row(
@@ -10880,8 +10908,13 @@ fn decide_threads_proposal_inner(
             &conn,
             &config,
             &document,
-            &familiar_id,
-            &targets,
+            ProposalRecoveryContext {
+                coven_home,
+                workspace: &workspace,
+                familiar_id: &familiar_id,
+                targets: &targets,
+                authorization: &authorization,
+            },
         )?,
         weave_hash: state.weave.weave_hash().to_vec(),
         before_images,
@@ -11983,13 +12016,27 @@ struct ProposalBeforeImage {
     contents: Option<coven_threads_core::StagedContents>,
 }
 
+struct ProposalRecoveryContext<'a> {
+    coven_home: &'a Path,
+    workspace: &'a Path,
+    familiar_id: &'a str,
+    targets: &'a [String],
+    authorization: &'a ward::Authorization,
+}
+
 fn proposal_recovery_commitment(
     conn: &rusqlite::Connection,
     config: &ward::WardConfig,
     document: &ProposalEnvelopeDocument,
-    familiar_id: &str,
-    targets: &[String],
+    context: ProposalRecoveryContext<'_>,
 ) -> Result<Vec<u8>> {
+    let ProposalRecoveryContext {
+        coven_home,
+        workspace,
+        familiar_id,
+        targets,
+        authorization,
+    } = context;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"coven:proposal-decision-recovery:v2");
     let config_bytes = serde_json::to_vec(config).context("serializing Ward config")?;
@@ -12014,6 +12061,20 @@ fn proposal_recovery_commitment(
                 hasher.update(&[0]);
             }
         };
+    }
+    if config.identity_invariant_set()?.is_some() {
+        let identity_context = crate::ward_identity::candidate_identity_context(
+            coven_home,
+            familiar_id,
+            workspace,
+            config,
+            &staged_edits_to_ward_edits(document.pending())?,
+            authorization,
+            None,
+        )
+        .expect("validated identity invariants always materialize a context");
+        hasher.update(b"identity-candidate-commitment");
+        hasher.update(&identity_context.candidate_commitment);
     }
     Ok(hasher.finalize().as_bytes().to_vec())
 }
@@ -26519,6 +26580,117 @@ forbidden = ["(?i)ignore previous"]
         Ok(limit)
     }
 
+    fn seed_identity_predicate_familiar(home: &Path) -> Result<std::path::PathBuf> {
+        std::fs::write(
+            home.join("familiars.toml"),
+            r#"[[familiar]]
+id = "sage"
+display_name = "Sage"
+role = "Research"
+description = "Reads and synthesizes."
+pronouns = "she/her"
+person = "Val"
+coven = "OpenCoven"
+"#,
+        )?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::create_dir_all(&workspace)?;
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            "# SOUL\n## I am Sage\nMy purpose is research.\n",
+        )?;
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** she/her\n",
+        )?;
+        std::fs::write(workspace.join("MEMORY.md"), "facts stay local\n")?;
+        std::fs::write(
+            workspace.join("ward.toml"),
+            r#"principal_key_fingerprint = "fpr-val"
+protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
+
+[[identity_invariant]]
+fact = "name"
+operator = "equals"
+expected = "Sage"
+
+[[identity_invariant]]
+fact = "person"
+operator = "equals"
+expected = "Val"
+
+[[identity_invariant]]
+fact = "pronouns"
+operator = "equals"
+expected = "she/her"
+
+[[identity_invariant]]
+fact = "purpose"
+operator = "includes"
+expected = "research"
+
+[[identity_invariant]]
+fact = "coven"
+operator = "equals"
+expected = "OpenCoven"
+
+[[surface]]
+path = "SOUL.md"
+tier = 0
+
+[[surface]]
+path = "IDENTITY.md"
+tier = 0
+
+[[surface]]
+path = "MEMORY.md"
+tier = 0
+"#,
+        )?;
+        Ok(workspace)
+    }
+
+    fn valid_identity_soul() -> &'static str {
+        "# SOUL\n## I am Sage\nMy purpose is research.\n"
+    }
+
+    fn stage_pending_identity_predicate_edit(
+        home: &Path,
+    ) -> Result<(std::path::PathBuf, String, std::path::PathBuf)> {
+        let workspace = seed_identity_predicate_familiar(home)?;
+        let baseline = post_edits(
+            home,
+            &format!(
+                r#"{{"edits":[{{"target":"SOUL.md","contents":{}}}],"principalKeyFingerprint":"fpr-val"}}"#,
+                serde_json::to_string(valid_identity_soul())?
+            ),
+        )?;
+        assert_eq!(baseline.status, 202, "got {}", baseline.body);
+        std::fs::write(
+            workspace.join("SOUL.md"),
+            "# SOUL\n## I am Mallory\nMy purpose is sabotage.\n",
+        )?;
+        let staged = post_edits(
+            home,
+            &format!(
+                r#"{{"edits":[{{"target":"SOUL.md","contents":{}}}],"principalKeyFingerprint":"fpr-val"}}"#,
+                serde_json::to_string(valid_identity_soul())?
+            ),
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let pending = std::path::PathBuf::from(
+            body["threadsGate"]["outcome"]["pendingPath"]
+                .as_str()
+                .expect("staged response carries pendingPath"),
+        );
+        let proposal_id = body["threadsGate"]["outcome"]["proposalId"]
+            .as_str()
+            .expect("staged response carries proposalId")
+            .to_string();
+        Ok((pending, proposal_id, workspace))
+    }
+
     pub(super) fn direct_ward_audit_reservation_bytes(
         home: &Path,
         body_bytes: usize,
@@ -28865,6 +29037,82 @@ tier = 0
             .expect("staged response carries proposalId")
             .to_string();
         Ok((pending, proposal_id))
+    }
+
+    #[test]
+    fn identity_predicate_approve_revalidates_authoritative_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+        )?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert!(pending.exists(), "failed approval must stay pending");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            valid_identity_soul()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_recovery_preserves_claim_if_identity_evidence_diverged() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a recovery claim");
+        std::fs::write(
+            workspace.join("IDENTITY.md"),
+            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+        )?;
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["why"], "proposal-recovery-evidence-diverged");
+        assert!(claim.exists(), "recovery claim must remain durable");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            valid_identity_soul()
+        );
+        Ok(())
     }
 
     fn stage_coherence_edit(
