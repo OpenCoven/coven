@@ -2670,10 +2670,8 @@ where
                 .checked_add(probe_timeout)
                 .context("Windows daemon startup probe deadline overflowed")?,
         };
-        // Windows binds the owner-only pipe before it enters the accept loop,
-        // so an authenticated client can hit a still-silent transport during
-        // daemon startup. Cap each probe so one such transient connection
-        // cannot consume the entire outer lifecycle deadline.
+        // Startup may precede pipe creation or the accept loop. Bound both
+        // connect and silent-response probes within the outer lifecycle deadline.
         match probe(&status.socket, probe_deadline) {
             Ok(Some(live)) => return Ok(live),
             Ok(None) => {}
@@ -2685,6 +2683,7 @@ where
     }
 }
 
+/// Retry only known startup transport timeouts, never identity or protocol errors.
 #[cfg(any(windows, test))]
 fn windows_startup_probe_is_pending(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
@@ -2695,6 +2694,11 @@ fn windows_startup_probe_is_pending(error: &anyhow::Error) -> bool {
                     error,
                     coven_client::ClientError::InvalidHttpResponse(message)
                         if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
+                ) || matches!(
+                    error,
+                    coven_client::ClientError::Io { operation, source }
+                        if *operation == coven_client::WINDOWS_CONNECT_OPERATION
+                            && source.kind() == std::io::ErrorKind::TimedOut
                 )
             })
     })
@@ -5798,6 +5802,61 @@ mod tests {
 
         assert_eq!(ready, status);
         assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_retries_pre_connect_timeout_until_health_arrives() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+
+        let ready = wait_for_windows_running_daemon_with_identity_probe_until(
+            &status,
+            LifecycleDeadline::after(Duration::from_secs(1))?,
+            |_, _| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                if next < 3 {
+                    Err(anyhow::Error::new(coven_client::ClientError::Io {
+                        operation: coven_client::WINDOWS_CONNECT_OPERATION,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timed out connecting to Coven daemon pipe",
+                        ),
+                    }))
+                } else {
+                    Ok(Some(status.clone()))
+                }
+            },
+        )?;
+
+        assert_eq!(ready, status);
+        assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_does_not_retry_unrelated_io_errors() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+
+        let result = wait_for_windows_running_daemon_with_identity_probe_until(
+            &status,
+            LifecycleDeadline::after(Duration::from_secs(1))?,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Err(anyhow::Error::new(coven_client::ClientError::Io {
+                    operation: coven_client::WINDOWS_CONNECT_OPERATION,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "access denied",
+                    ),
+                }))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
         Ok(())
     }
 
