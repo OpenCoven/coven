@@ -6,13 +6,18 @@
 //! claim/lease, and run delivery land in follow-up modules on the same
 //! seams.
 
+pub mod cancellation;
 pub mod command_adoption;
 pub mod contract;
 pub mod daemon_tick;
 pub mod definition;
+pub mod diagnostics;
 pub mod health;
 pub mod import_legacy;
+pub mod inspection;
+pub mod leadership;
 pub mod occurrences;
+pub mod receipts;
 pub mod rrule;
 pub mod runner;
 pub mod runs;
