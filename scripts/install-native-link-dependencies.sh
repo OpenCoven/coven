@@ -4,7 +4,14 @@ set -euo pipefail
 apt_etc_dir="${COVEN_APT_ETC_DIR:-/etc/apt}"
 source_file=""
 workdir="$(mktemp -d)"
-cleanup() { rm -rf "$workdir"; }
+apt_started=0
+cleanup() {
+  if ((apt_started)); then
+    sudo rm -rf -- "$workdir"
+  else
+    rm -rf -- "$workdir"
+  fi
+}
 trap cleanup EXIT
 # Apt's unprivileged downloader must be able to traverse the public metadata directory.
 chmod 755 "$workdir"
@@ -74,5 +81,6 @@ else
   packages=(libopenblas-dev)
 fi
 
+apt_started=1
 sudo apt-get "${apt_options[@]}" update
 sudo apt-get "${apt_options[@]}" install -y --no-install-recommends -- "${packages[@]}"

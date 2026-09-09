@@ -34,11 +34,18 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                     import json
                     import os
                     import pathlib
+                    import shutil
                     import sys
 
                     args = sys.argv[1:]
                     with open(os.environ["COVEN_FAKE_SUDO_LOG"], "a", encoding="utf-8") as handle:
                         handle.write(json.dumps(args) + "\\n")
+
+                    if args[:3] == ["rm", "-rf", "--"]:
+                        cleanup_root = pathlib.Path(args[3])
+                        assert cleanup_root.parent == pathlib.Path(os.environ["TMPDIR"])
+                        shutil.rmtree(cleanup_root)
+                        sys.exit(0)
 
                     for arg in args:
                         if arg.startswith("Dir::Etc::sourceparts="):
@@ -66,6 +73,7 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                     "COVEN_FAKE_SUDO_LOG": str(command_log),
                     "COVEN_FAKE_SOURCE_LOG": str(source_log),
                     "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+                    "TMPDIR": str(tempdir),
                 }
             )
             if fail_command is not None:
@@ -86,7 +94,18 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                 else []
             )
             sources = source_log.read_text(encoding="utf-8").splitlines() if source_log.exists() else []
-            return completed, calls, sources
+            apt_calls = [call for call in calls if call[0] == "apt-get"]
+            cleanup_calls = [call for call in calls if call[0] == "rm"]
+            if apt_calls:
+                source_arg = next(
+                    arg for arg in apt_calls[0] if arg.startswith("Dir::Etc::sourceparts=")
+                )
+                workdir = pathlib.Path(source_arg.split("=", 1)[1]).parent
+                self.assertEqual(cleanup_calls, [["rm", "-rf", "--", str(workdir)]])
+                self.assertFalse(workdir.exists(), "privileged apt metadata was not cleaned up")
+            else:
+                self.assertEqual(cleanup_calls, [])
+            return completed, apt_calls, sources
 
     def write_deb822_ubuntu_source(self, apt_etc_dir: pathlib.Path) -> None:
         source_dir = apt_etc_dir / "sources.list.d"
