@@ -768,6 +768,118 @@ pub(crate) fn active_definition_ids(conn: &Connection) -> Result<BTreeSet<String
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EligibleOccurrence {
+    pub id: String,
+    pub scheduled_for: String,
+}
+
+pub(crate) fn eligible_occurrences(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<EligibleOccurrence>> {
+    let active_definition_ids = active_definition_ids(conn)?;
+    let now_iso = iso(now);
+    let active_definition_ids_json = serde_json::to_string(&active_definition_ids)
+        .context("failed to encode validated automation definition ids")?;
+    let bounded = i64::try_from(limit.clamp(1, 100))
+        .context("eligible occurrence limit exceeds SQLite range")?;
+    let candidates: Vec<(String, String)> = {
+        let mut statement = conn
+            .prepare(
+                "WITH active_definition(automation_id) AS (
+                     SELECT value FROM json_each(?2)
+                 )
+                 SELECT occurrence.id,
+                        occurrence.automation_id,
+                        occurrence.scheduled_for
+                 FROM automation_occurrences AS occurrence
+                 WHERE occurrence.state = 'planned'
+                   AND occurrence.scheduled_for <= ?1
+                   AND occurrence.scheduled_for = (
+                       SELECT MAX(candidate.scheduled_for)
+                       FROM automation_occurrences AS candidate
+                       WHERE candidate.automation_id = occurrence.automation_id
+                         AND candidate.state = 'planned'
+                         AND candidate.scheduled_for <= ?1
+                   )
+                   AND (
+                       occurrence.automation_id IN (
+                           SELECT automation_id FROM active_definition
+                       )
+                       OR EXISTS (
+                            SELECT 1
+                            FROM automation_runs AS retry_run
+                            JOIN automation_attempts AS retry_attempt
+                              ON retry_attempt.run_id = retry_run.id
+                            WHERE retry_run.occurrence_id = occurrence.id
+                              AND retry_run.status = 'running'
+                              AND retry_attempt.state = 'adopted'
+                              AND retry_attempt.not_before <= ?1
+                              AND (
+                                  retry_run.timeout_at IS NULL
+                                  OR retry_run.timeout_at > ?1
+                              )
+                        )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_retry_state
+                       WHERE automation_id = occurrence.automation_id
+                         AND quarantined_at IS NOT NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_occurrences AS active_occurrence
+                       WHERE active_occurrence.automation_id = occurrence.automation_id
+                         AND active_occurrence.state IN ('claimed', 'running')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_runs AS active_run
+                       WHERE active_run.automation_id = occurrence.automation_id
+                         AND active_run.status = 'running'
+                         AND active_run.occurrence_id IS NOT occurrence.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_runs AS retry_run
+                       JOIN automation_attempts AS retry_attempt
+                         ON retry_attempt.run_id = retry_run.id
+                       WHERE retry_run.occurrence_id = occurrence.id
+                         AND retry_run.status = 'running'
+                         AND retry_attempt.state = 'adopted'
+                         AND (
+                             retry_attempt.not_before > ?1
+                             OR retry_run.timeout_at <= ?1
+                         )
+                   )
+                 ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
+                 LIMIT ?3",
+            )
+            .context("failed to prepare automations eligible queue query")?;
+        let rows = statement
+            .query_map(
+                params![now_iso, active_definition_ids_json, bounded],
+                |row| Ok((row.get(0)?, row.get(2)?)),
+            )
+            .context("failed to query automations eligible queue")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read automations eligible queue")?
+    };
+
+    candidates
+        .into_iter()
+        .map(|(id, scheduled_for)| {
+            chrono::DateTime::parse_from_rfc3339(&scheduled_for).with_context(|| {
+                format!("invalid scheduled occurrence timestamp `{scheduled_for}`")
+            })?;
+            Ok(EligibleOccurrence { id, scheduled_for })
+        })
+        .collect()
+}
+
 fn definition_created_at(conn: &Connection, id: &str) -> Result<DateTime<Utc>> {
     let created: String = conn
         .query_row(

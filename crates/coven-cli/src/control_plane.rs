@@ -130,6 +130,8 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.import",
                     "coven.automations.health",
                     "coven.automations.scheduler.status.v1",
+                    "coven.automations.occurrence.list.v1",
+                    "coven.automations.occurrence.get.v1",
                     "coven.automations.unquarantine",
                 ],
             },
@@ -613,6 +615,31 @@ pub fn route_action(
             intent_id,
             automation_scheduler_status_payload(conn, chrono::Utc::now()),
         ),
+        "coven.automations.occurrence.list.v1" => {
+            let view = required_occurrence_view(&payload, action);
+            let limit = optional_inspection_limit(&payload, action);
+            match (view, limit) {
+                (Ok(view), Ok(limit)) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_occurrence_list_payload(conn, view, limit),
+                ),
+                (Err(error), _) | (_, Err(error)) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.occurrence.get.v1" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_occurrence_get_payload(conn, &id),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
         "coven.automations.unquarantine" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -1028,6 +1055,35 @@ fn optional_event_limit(payload: &Value, action: &str) -> Result<usize, String> 
     }
 }
 
+fn required_occurrence_view(
+    payload: &Value,
+    action: &str,
+) -> Result<crate::automations::inspection::OccurrenceView, String> {
+    match payload.get("view").and_then(Value::as_str) {
+        Some("due") => Ok(crate::automations::inspection::OccurrenceView::Due),
+        Some("eligible") => Ok(crate::automations::inspection::OccurrenceView::Eligible),
+        Some("claimed") => Ok(crate::automations::inspection::OccurrenceView::Claimed),
+        Some("running") => Ok(crate::automations::inspection::OccurrenceView::Running),
+        Some("recovery_required") => {
+            Ok(crate::automations::inspection::OccurrenceView::RecoveryRequired)
+        }
+        _ => Err(format!(
+            "{action} requires field `view` equal to due, eligible, claimed, running, or recovery_required"
+        )),
+    }
+}
+
+fn optional_inspection_limit(payload: &Value, action: &str) -> Result<usize, String> {
+    match payload.get("limit") {
+        None => Ok(20),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=100).contains(value))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{action} field `limit` must be an integer from 1 to 100")),
+    }
+}
+
 fn forbidden_event_limit(payload: &Value, action: &str) -> Result<(), String> {
     if payload.get("limit").is_some() {
         Err(format!("{action} forbids field `limit`"))
@@ -1141,6 +1197,110 @@ fn automation_scheduler_status_payload(
             })
         })
         .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_list_payload(
+    conn: &rusqlite::Connection,
+    view: crate::automations::inspection::OccurrenceView,
+    limit: usize,
+) -> Result<Value, String> {
+    crate::automations::inspection::list_occurrences(conn, view, chrono::Utc::now(), limit)
+        .map(|records| {
+            let occurrences = records
+                .into_iter()
+                .map(automation_occurrence_value)
+                .collect::<Vec<_>>();
+            json!({ "occurrences": occurrences })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_get_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<Value, String> {
+    crate::automations::inspection::inspect_occurrence(conn, id)
+        .map(|inspection| {
+            let Some(inspection) = inspection else {
+                return json!({ "occurrence": null });
+            };
+            let mut occurrence = automation_occurrence_value(inspection.occurrence);
+            occurrence["runsTruncated"] = json!(inspection.runs_truncated);
+            occurrence["runs"] = Value::Array(
+                inspection
+                    .runs
+                    .into_iter()
+                    .map(|run| {
+                        let attempts = run
+                            .attempts
+                            .into_iter()
+                            .map(|attempt| {
+                                json!({
+                                    "id": attempt.id,
+                                    "runId": attempt.run_id,
+                                    "occurrenceId": attempt.occurrence_id,
+                                    "attemptNumber": attempt.attempt_number,
+                                    "adoptionKey": attempt.adoption_key,
+                                    "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+                                    "dispatchGeneration": attempt.dispatch_generation,
+                                    "state": attempt.state,
+                                    "failureClass": attempt.failure_class,
+                                    "priorAttemptNumber": attempt.prior_attempt_number,
+                                    "priorDisposition": attempt.prior_disposition,
+                                    "retryClassification": attempt.retry_classification,
+                                    "notBefore": attempt.not_before,
+                                    "sessionId": attempt.session_id,
+                                    "stateReason": attempt.state_reason,
+                                    "openedAt": attempt.opened_at,
+                                    "settledAt": attempt.settled_at,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({
+                            "id": run.id,
+                            "automationId": run.automation_id,
+                            "automationRevision": run.automation_revision,
+                            "definitionDigest": run.definition_digest,
+                            "occurrenceId": run.occurrence_id,
+                            "authorityProfile": run.authority_profile,
+                            "receiptId": run.receipt_id,
+                            "sessionId": run.session_id,
+                            "familiarId": run.familiar_id,
+                            "runtime": run.runtime,
+                            "status": run.status,
+                            "exitCode": run.exit_code,
+                            "logJson": run.log_json,
+                            "outputCommit": run.output_commit,
+                            "startedAt": run.started_at,
+                            "timeoutAt": run.timeout_at,
+                            "finishedAt": run.finished_at,
+                            "attempts": attempts,
+                        })
+                    })
+                    .collect(),
+            );
+            json!({ "occurrence": occurrence })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_value(record: crate::automations::inspection::OccurrenceRecord) -> Value {
+    json!({
+        "id": record.id,
+        "automationId": record.automation_id,
+        "automationRevision": record.automation_revision,
+        "definitionDigest": record.definition_digest,
+        "scheduledFor": record.scheduled_for,
+        "kind": record.kind,
+        "state": record.state,
+        "leaseOwner": record.lease_owner,
+        "leaseExpiresAt": record.lease_expires_at,
+        "schedulerGeneration": record.scheduler_generation,
+        "fenceGeneration": record.fence_generation,
+        "failureReason": record.failure_reason,
+        "createdAt": record.created_at,
+        "updatedAt": record.updated_at,
+    })
 }
 
 fn automation_unquarantine_payload(
@@ -1471,6 +1631,560 @@ mod tests {
             .unwrap()
             .actions
             .contains(&"coven.automations.scheduler.status.v1"));
+    }
+
+    #[test]
+    fn occurrence_list_action_distinguishes_due_from_eligible() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "inspection",
+            "name": "inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        let definition_digest: String = conn
+            .query_row(
+                "SELECT definition_digest
+                 FROM automation_definitions
+                 WHERE id = 'inspection'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'older-due', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'latest-due', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'inspection';",
+        )
+        .unwrap();
+
+        let (due_status, due_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "due"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        let (eligible_status, eligible_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(due_status, 200);
+        assert_eq!(
+            due_response.event.as_ref().unwrap().payload["occurrences"],
+            json!([
+                {
+                    "id": "older-due",
+                    "automationId": "inspection",
+                    "automationRevision": 1,
+                    "definitionDigest": definition_digest,
+                    "scheduledFor": "2026-09-01T08:00:00.000Z",
+                    "kind": "scheduled",
+                    "state": "planned",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 0,
+                    "failureReason": null,
+                    "createdAt": "2026-09-01T08:00:00.000Z",
+                    "updatedAt": "2026-09-01T08:00:00.000Z"
+                },
+                {
+                    "id": "latest-due",
+                    "automationId": "inspection",
+                    "automationRevision": 1,
+                    "definitionDigest": definition_digest,
+                    "scheduledFor": "2026-09-01T09:00:00.000Z",
+                    "kind": "scheduled",
+                    "state": "planned",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 0,
+                    "failureReason": null,
+                    "createdAt": "2026-09-01T09:00:00.000Z",
+                    "updatedAt": "2026-09-01T09:00:00.000Z"
+                }
+            ])
+        );
+        assert_eq!(eligible_status, 200);
+        assert_eq!(
+            eligible_response.event.as_ref().unwrap().payload["occurrences"],
+            json!([{
+                "id": "latest-due",
+                "automationId": "inspection",
+                "automationRevision": 1,
+                "definitionDigest": definition_digest,
+                "scheduledFor": "2026-09-01T09:00:00.000Z",
+                "kind": "scheduled",
+                "state": "planned",
+                "leaseOwner": null,
+                "leaseExpiresAt": null,
+                "schedulerGeneration": null,
+                "fenceGeneration": 0,
+                "failureReason": null,
+                "createdAt": "2026-09-01T09:00:00.000Z",
+                "updatedAt": "2026-09-01T09:00:00.000Z"
+            }])
+        );
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.occurrence.list.v1"));
+    }
+
+    #[test]
+    fn occurrence_list_action_exposes_exact_nonterminal_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "authority-inspection",
+            "name": "authority-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'claimed-inspection', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'claimed', 'daemon-a',
+                    '2026-09-01T08:05:00.000Z', 7, 2, NULL,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'running-inspection', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'manual', 'running', 'manual-owner',
+                    '2026-09-01T09:05:00.000Z', NULL, 3, NULL,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'recovery-inspection', id, revision, definition_digest,
+                    '2026-09-01T10:00:00.000Z', 'scheduled', 'recovery_required', NULL,
+                    NULL, 6, 4, 'runtime ownership is ambiguous',
+                    '2026-09-01T10:00:00.000Z', '2026-09-01T10:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';",
+        )
+        .unwrap();
+
+        for (view, expected) in [
+            (
+                "claimed",
+                json!({
+                    "id": "claimed-inspection",
+                    "state": "claimed",
+                    "leaseOwner": "daemon-a",
+                    "leaseExpiresAt": "2026-09-01T08:05:00.000Z",
+                    "schedulerGeneration": 7,
+                    "fenceGeneration": 2,
+                    "failureReason": null
+                }),
+            ),
+            (
+                "running",
+                json!({
+                    "id": "running-inspection",
+                    "state": "running",
+                    "leaseOwner": "manual-owner",
+                    "leaseExpiresAt": "2026-09-01T09:05:00.000Z",
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 3,
+                    "failureReason": null
+                }),
+            ),
+            (
+                "recovery_required",
+                json!({
+                    "id": "recovery-inspection",
+                    "state": "recovery_required",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": 6,
+                    "fenceGeneration": 4,
+                    "failureReason": "runtime ownership is ambiguous"
+                }),
+            ),
+        ] {
+            let (status, response) = route_action(
+                json!({
+                    "action": "coven.automations.occurrence.list.v1",
+                    "view": view
+                }),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+
+            assert_eq!(status, 200);
+            let occurrences = response.event.as_ref().unwrap().payload["occurrences"]
+                .as_array()
+                .unwrap();
+            assert_eq!(occurrences.len(), 1);
+            for field in [
+                "id",
+                "state",
+                "leaseOwner",
+                "leaseExpiresAt",
+                "schedulerGeneration",
+                "fenceGeneration",
+                "failureReason",
+            ] {
+                assert_eq!(occurrences[0][field], expected[field], "{view} {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn occurrence_list_keeps_ready_legacy_retry_eligible_without_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "legacy-timeout-retry",
+            "name": "legacy-timeout-retry",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'legacy-timeout-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 1,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'legacy-timeout-retry';
+             INSERT INTO automation_runs
+                (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                 runtime, status, started_at, timeout_at)
+             SELECT 'legacy-timeout-run', automation_id, automation_revision,
+                    definition_digest, id, 'coven-code', 'running',
+                    '2026-09-01T09:00:00.000Z', NULL
+             FROM automation_occurrences WHERE id = 'legacy-timeout-occurrence';
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state,
+                 retry_classification, not_before, opened_at)
+             VALUES
+                ('legacy-timeout-attempt', 'legacy-timeout-run',
+                 'legacy-timeout-occurrence', 1, 'legacy-timeout-adoption',
+                 1, 0, 'adopted', 'initial', '2026-09-01T09:00:00.000Z',
+                 '2026-09-01T09:00:00.000Z');",
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            response.event.as_ref().unwrap().payload["occurrences"][0]["id"],
+            "legacy-timeout-occurrence"
+        );
+    }
+
+    #[test]
+    fn occurrence_list_validates_only_the_bounded_eligible_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for id in ["valid-time", "invalid-time"] {
+            let definition = crate::automations::RoutineDefinition::from_json(&json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": id,
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "prompt": "Do the thing."
+            }))
+            .unwrap();
+            crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'valid-time-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'valid-time';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'invalid-time-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:30:00.000Z-bad', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:30:00.000Z', '2026-09-01T09:30:00.000Z'
+             FROM automation_definitions WHERE id = 'invalid-time';",
+        )
+        .unwrap();
+
+        let (bounded_status, bounded_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible",
+                "limit": 1
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        let (corrupt_status, corrupt_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible",
+                "limit": 2
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(bounded_status, 200);
+        assert_eq!(
+            bounded_response.event.as_ref().unwrap().payload["occurrences"][0]["id"],
+            "valid-time-occurrence"
+        );
+        assert_eq!(corrupt_status, 400);
+        assert!(corrupt_response
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("invalid scheduled occurrence timestamp"));
+    }
+
+    #[test]
+    fn occurrence_get_action_exposes_correlated_run_attempt_and_fences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "exact-inspection",
+            "name": "exact-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "familiarId": "familiar-1",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 created_at, updated_at)
+             SELECT 'exact-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'running', 'daemon-a',
+                    '2026-09-01T09:05:00.000Z', 11, 4,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             FROM automation_definitions WHERE id = 'exact-inspection';
+             INSERT INTO automation_runs
+                (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                 authority_profile, receipt_id, session_id, familiar_id, runtime, status,
+                 started_at, timeout_at)
+             SELECT 'exact-run', automation_id, automation_revision, definition_digest, id,
+                    'coven.automations.authority.v1', 'receipt-1', NULL, 'familiar-1',
+                    'coven-code', 'running', '2026-09-01T09:01:00.000Z',
+                    '2026-09-01T09:31:00.000Z'
+             FROM automation_occurrences WHERE id = 'exact-occurrence';
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state, failure_class,
+                 prior_attempt_number, prior_disposition, retry_classification, not_before,
+                 session_id, state_reason, opened_at, settled_at)
+             VALUES
+                ('exact-attempt', 'exact-run', 'exact-occurrence', 2, 'adopt-exact',
+                 4, 9, 'observing', NULL, 1, 'failed', 'automatic_retry',
+                 '2026-09-01T09:00:30.000Z', NULL, 'runtime ownership published',
+                 '2026-09-01T09:01:00.000Z', NULL);",
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": "exact-occurrence"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
+        assert_eq!(occurrence["id"], "exact-occurrence");
+        assert_eq!(occurrence["automationRevision"], 1);
+        assert_eq!(occurrence["leaseOwner"], "daemon-a");
+        assert_eq!(occurrence["leaseExpiresAt"], "2026-09-01T09:05:00.000Z");
+        assert_eq!(occurrence["schedulerGeneration"], 11);
+        assert_eq!(occurrence["fenceGeneration"], 4);
+        assert_eq!(occurrence["runs"].as_array().unwrap().len(), 1);
+        let run = &occurrence["runs"][0];
+        assert_eq!(run["id"], "exact-run");
+        assert_eq!(run["authorityProfile"], "coven.automations.authority.v1");
+        assert_eq!(run["receiptId"], "receipt-1");
+        assert_eq!(run["timeoutAt"], "2026-09-01T09:31:00.000Z");
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 1);
+        let attempt = &run["attempts"][0];
+        assert_eq!(attempt["id"], "exact-attempt");
+        assert_eq!(attempt["attemptNumber"], 2);
+        assert_eq!(attempt["adoptionKey"], "adopt-exact");
+        assert_eq!(attempt["occurrenceFenceGeneration"], 4);
+        assert_eq!(attempt["dispatchGeneration"], 9);
+        assert_eq!(attempt["state"], "observing");
+        assert_eq!(attempt["priorAttemptNumber"], 1);
+        assert_eq!(attempt["priorDisposition"], "failed");
+        assert_eq!(attempt["retryClassification"], "automatic_retry");
+        assert_eq!(attempt["stateReason"], "runtime ownership published");
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.occurrence.get.v1"));
+    }
+
+    #[test]
+    fn occurrence_get_bounds_corrupt_duplicate_run_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "bounded-inspection",
+            "name": "bounded-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'bounded-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'failed', 1,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'bounded-inspection'",
+            [],
+        )
+        .unwrap();
+        for index in 0..21 {
+            conn.execute(
+                "INSERT INTO automation_runs
+                    (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                     runtime, status, started_at, finished_at)
+                 SELECT ?1, automation_id, automation_revision, definition_digest, id,
+                        'coven-code', 'failed', ?2, ?2
+                 FROM automation_occurrences WHERE id = 'bounded-occurrence'",
+                rusqlite::params![
+                    format!("bounded-run-{index:02}"),
+                    format!("2026-09-01T09:{index:02}:00.000Z")
+                ],
+            )
+            .unwrap();
+        }
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": "bounded-occurrence"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
+        assert_eq!(occurrence["runs"].as_array().unwrap().len(), 20);
+        assert_eq!(occurrence["runsTruncated"], true);
     }
 
     #[test]
