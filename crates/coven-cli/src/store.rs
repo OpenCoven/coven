@@ -1011,9 +1011,12 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     crate::automations::runs::ensure_timeout_column(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
+    crate::automations::runs::ensure_authority_columns(conn)?;
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
     conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
         .context("failed to initialize automation events schema")?;
+    conn.execute_batch(crate::automations::receipts::AUTOMATION_RECEIPTS_SCHEMA_SQL)
+        .context("failed to initialize automation receipts schema")?;
     crate::automations::contract::events::backfill_definition_event_baselines(conn)
         .context("failed to backfill automation definition event baselines")?;
     crate::automations::store::migrate_durable_local_timezones(conn)?;
