@@ -553,8 +553,10 @@ pub(crate) fn tick_with_scheduler_fence(
     if !fence.is_current(conn)? {
         anyhow::bail!("automations scheduler fence is stale");
     }
-    recover_stale_scheduler_claims(conn, fence, now)?;
-    tick_inner(conn, now, Some(fence))
+    let stale_recovered = recover_stale_scheduler_claims(conn, fence, now)?;
+    let mut report = tick_inner(conn, now, Some(fence))?;
+    report.recovered += stale_recovered;
+    Ok(report)
 }
 
 fn recover_stale_scheduler_claims(
@@ -755,6 +757,15 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
         definitions.push(definition);
     }
     Ok((definitions, failures))
+}
+
+pub(crate) fn active_definition_ids(conn: &Connection) -> Result<BTreeSet<String>> {
+    active_definitions(conn).map(|(definitions, _)| {
+        definitions
+            .into_iter()
+            .map(|definition| definition.id)
+            .collect()
+    })
 }
 
 fn definition_created_at(conn: &Connection, id: &str) -> Result<DateTime<Utc>> {
@@ -1107,6 +1118,7 @@ mod tests {
             tick_with_scheduler_fence(&conn, now + chrono::Duration::seconds(1), &second.fence())
                 .unwrap();
 
+        assert_eq!(second_tick.recovered, 1);
         assert_eq!(second_tick.claimed, vec![occurrence_id.clone()]);
         let (generation, attempt): (i64, i64) = conn
             .query_row(
