@@ -10,9 +10,9 @@ use std::{
 use async_trait::async_trait;
 use coven_agents::{
     Agent, BoxError, ConfigError, GuardrailStage, GuardrailVerdict, Handoff, HandoffCall,
-    InMemorySession, InputGuardrail, Model, ModelAction, ModelRequest, ModelResponse,
-    OutputGuardrail, RunError, RunEvent, RunFailureKind, RunItem, RunObserver, RunOptions, Runner,
-    SessionStore, Tool, ToolCall, ToolDefinition,
+    InMemorySession, InputGuardrail, InvocationContext, InvocationId, Model, ModelAction,
+    ModelRequest, ModelResponse, OutputGuardrail, RunError, RunEvent, RunFailureKind, RunItem,
+    RunObserver, RunOptions, Runner, SessionStore, Tool, ToolCall, ToolDefinition,
 };
 use serde_json::{json, Value};
 
@@ -246,6 +246,10 @@ fn assert_paired_lifecycle(events: &[RunEvent]) {
     );
 }
 
+fn invocation_id(value: &str) -> InvocationId {
+    value.parse().expect("valid test invocation UUID")
+}
+
 struct FailingTool;
 
 #[async_trait]
@@ -353,7 +357,7 @@ async fn hands_control_to_a_registered_agent() {
     assert_eq!(result.handoffs, 1);
     assert!(observer.events().iter().any(|event| matches!(
         event,
-        RunEvent::Handoff { from, to, name }
+        RunEvent::Handoff { from, to, name, .. }
             if from.as_str() == "triage"
                 && to.as_str() == "specialist"
                 && name == "to-specialist"
@@ -676,6 +680,125 @@ async fn successful_run_reports_a_paired_run_lifecycle() {
 
     assert_eq!(result.final_output, "Done.");
     assert_paired_lifecycle(&observer.events());
+}
+
+#[tokio::test]
+async fn explicit_child_invocation_correlates_every_event_and_result() {
+    let triage_model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::Handoff(HandoffCall::new("to-worker")),
+    ])]));
+    let worker_model = Arc::new(QueueModel::new([ModelResponse::final_output("Done.")]));
+    let triage = Agent::new("triage", "Triage", "Route.", triage_model).with_handoff(Handoff::new(
+        "to-worker",
+        "Route to worker",
+        "worker",
+    ));
+    let worker = Agent::new("worker", "Worker", "Answer.", worker_model);
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([triage, worker])
+        .unwrap()
+        .with_observer(observer.clone());
+    let invocation = InvocationContext::child(
+        invocation_id("11111111-1111-4111-8111-111111111111"),
+        invocation_id("22222222-2222-4222-8222-222222222222"),
+    );
+
+    let result = runner
+        .run_with_invocation(
+            "triage",
+            "Route this.",
+            &(),
+            RunOptions::default(),
+            invocation.clone(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.invocation, invocation);
+    let events = observer.events();
+    assert_paired_lifecycle(&events);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.invocation() == &result.invocation),
+        "every event must carry the exact invocation context: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn explicit_invocation_correlates_partial_failure() {
+    let model = Arc::new(QueueModel::new([ModelResponse::actions(vec![
+        ModelAction::ToolCall(ToolCall::new("call-1", "explode", json!({}))),
+    ])]));
+    let agent =
+        Agent::new("worker", "Worker", "Use tools.", model).with_tool(Arc::new(FailingTool));
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
+    let invocation = InvocationContext::root(invocation_id("33333333-3333-4333-8333-333333333333"));
+
+    let failure = runner
+        .run_with_invocation(
+            "worker",
+            "Fail.",
+            &(),
+            RunOptions::default(),
+            invocation.clone(),
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(failure.invocation, invocation);
+    let events = observer.events();
+    assert_paired_lifecycle(&events);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.invocation() == &failure.invocation),
+        "partial failure events must retain one invocation identity: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn compatibility_run_generates_distinct_root_invocations() {
+    let model = Arc::new(QueueModel::new([
+        ModelResponse::final_output("First."),
+        ModelResponse::final_output("Second."),
+    ]));
+    let agent = Agent::new("assistant", "Assistant", "Answer.", model);
+    let observer = Arc::new(RecordingObserver::default());
+    let runner = Runner::new([agent])
+        .unwrap()
+        .with_observer(observer.clone());
+
+    let first = runner
+        .run("assistant", "First.", &(), RunOptions::default())
+        .await
+        .unwrap();
+    let second = runner
+        .run("assistant", "Second.", &(), RunOptions::default())
+        .await
+        .unwrap();
+
+    assert_ne!(first.invocation.id, second.invocation.id);
+    assert_eq!(first.invocation.parent_id, None);
+    assert_eq!(second.invocation.parent_id, None);
+    let events = observer.events();
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.invocation() == &first.invocation)
+            .count()
+            >= 3
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| event.invocation() == &second.invocation)
+            .count()
+            >= 3
+    );
 }
 
 #[tokio::test]

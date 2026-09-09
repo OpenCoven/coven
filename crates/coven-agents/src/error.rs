@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::{AgentId, RunItem};
+use crate::{AgentId, InvocationContext, RunItem};
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -107,6 +107,8 @@ pub enum RunError {
 /// transcript is a deliberate caller decision.
 #[derive(Debug)]
 pub struct RunFailure {
+    /// Stable identity shared by every event and outcome for this invocation.
+    pub invocation: InvocationContext,
     pub error: RunError,
     /// Items produced during this run before it failed, in order. Always begins
     /// with the user message that started the run.
@@ -144,6 +146,7 @@ mod tests {
     #[test]
     fn run_failure_exposes_the_wrapped_error_as_its_source() {
         let failure = RunFailure {
+            invocation: InvocationContext::root(Default::default()),
             error: RunError::SessionUnavailable,
             new_items: Vec::new(),
             turns: 0,
