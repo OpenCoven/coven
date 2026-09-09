@@ -3748,6 +3748,16 @@ fn serve_accepted_tcp_connection(
 
 #[cfg(unix)]
 pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
+    bind_api_socket_with_publisher(coven_home, |staged, target| {
+        std::fs::hard_link(staged, target)
+    })
+}
+
+#[cfg(unix)]
+fn bind_api_socket_with_publisher(
+    coven_home: &Path,
+    publish: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> Result<UnixListener> {
     ensure_private_coven_home(coven_home)?;
     let socket_path = daemon_socket_path(coven_home);
     // Fail closed if the socket path would resolve outside the trusted state
@@ -3811,9 +3821,17 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             });
         }
     }
-    let listener = UnixListener::bind(&socket_path)
+    // Keep the temporary name no longer than coven.sock, preserving Unix path limits.
+    let staged = tempfile::Builder::new()
+        .prefix(".")
+        .rand_bytes(8)
+        .tempfile_in(coven_home)
+        .context("reserving private daemon socket staging path")?
+        .into_temp_path();
+    std::fs::remove_file(&staged).context("preparing reserved daemon socket staging path")?;
+    let listener = UnixListener::bind(&staged)
         .with_context(|| format!("failed to bind Coven API socket {}", socket_path.display()))?;
-    std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).with_context(
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).with_context(
         || {
             format!(
                 "failed to set Coven API socket permissions {}",
@@ -3821,6 +3839,11 @@ pub fn bind_api_socket(coven_home: &Path) -> Result<UnixListener> {
             )
         },
     )?;
+    // A hard link publishes the already-private socket without replacing a raced entry.
+    publish(&staged, &socket_path).context("publishing private Coven API socket")?;
+    staged
+        .close()
+        .context("removing daemon socket staging path")?;
     Ok(listener)
 }
 
@@ -9571,6 +9594,42 @@ mod tests {
         assert!(socket.starts_with("coven-daemon-"), "socket={socket}");
         assert!(socket.ends_with(".sock"), "socket={socket}");
         assert_ne!(socket, daemon_socket_path(home).to_string_lossy());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_publishes_private_listener_atomically() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let listener = bind_api_socket_with_publisher(home.path(), |staged, target| {
+            assert!(!target.exists());
+            let metadata = std::fs::symlink_metadata(staged)?;
+            assert!(metadata.file_type().is_socket());
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+            assert!(staged.file_name().unwrap().len() <= target.file_name().unwrap().len());
+            std::fs::hard_link(staged, target)
+        })?;
+        let client = UnixStream::connect(daemon_socket_path(home.path()))?;
+        let (server, _) = listener.accept()?;
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
+        drop((client, server, listener));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bind_api_socket_never_clobbers_a_raced_publication_target() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let result = bind_api_socket_with_publisher(home.path(), |staged, target| {
+            std::fs::write(target, b"unrelated raced file")?;
+            std::fs::hard_link(staged, target)
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(daemon_socket_path(home.path()))?,
+            b"unrelated raced file"
+        );
+        assert_eq!(std::fs::read_dir(home.path())?.count(), 1);
         Ok(())
     }
 
