@@ -390,7 +390,7 @@ async fn blocking_input_guardrail_prevents_model_execution() {
     ));
     assert!(
         matches!(
-            failure.new_items.as_slice(),
+            failure.new_items.as_ref(),
             [RunItem::UserMessage { content }] if content == "blocked input"
         ),
         "a rejected input is still transcript, got {:?}",
@@ -749,13 +749,13 @@ async fn explicit_invocation_correlates_partial_failure() {
         .await
         .unwrap_err();
 
-    assert_eq!(failure.invocation, invocation);
+    assert_eq!(*failure.invocation, invocation);
     let events = observer.events();
     assert_paired_lifecycle(&events);
     assert!(
         events
             .iter()
-            .all(|event| event.invocation() == &failure.invocation),
+            .all(|event| event.invocation() == failure.invocation.as_ref()),
         "partial failure events must retain one invocation identity: {events:?}"
     );
 }
@@ -1219,7 +1219,7 @@ async fn handoff_target_enforces_the_same_input_policy_as_direct_entry() {
     assert_eq!(failure.turns, 1, "only the source agent's turn ran");
     assert_eq!(failure.handoffs, 1);
     assert!(matches!(
-        failure.new_items.as_slice(),
+        failure.new_items.as_ref(),
         [RunItem::UserMessage { .. }, RunItem::Handoff { to, .. }] if to.as_str() == "specialist"
     ));
     let events = observer.events();

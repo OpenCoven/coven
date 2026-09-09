@@ -108,11 +108,11 @@ pub enum RunError {
 #[derive(Debug)]
 pub struct RunFailure {
     /// Stable identity shared by every event and outcome for this invocation.
-    pub invocation: InvocationContext,
+    pub invocation: Box<InvocationContext>,
     pub error: RunError,
     /// Items produced during this run before it failed, in order. Always begins
     /// with the user message that started the run.
-    pub new_items: Vec<RunItem>,
+    pub new_items: Box<[RunItem]>,
     /// Model turns started before the failure. Zero when the run failed before
     /// the first turn.
     pub turns: usize,
@@ -146,9 +146,9 @@ mod tests {
     #[test]
     fn run_failure_exposes_the_wrapped_error_as_its_source() {
         let failure = RunFailure {
-            invocation: InvocationContext::root(Default::default()),
+            invocation: Box::new(InvocationContext::root(Default::default())),
             error: RunError::SessionUnavailable,
-            new_items: Vec::new(),
+            new_items: Vec::new().into_boxed_slice(),
             turns: 0,
             handoffs: 0,
         };
@@ -157,6 +157,16 @@ mod tests {
         assert_eq!(
             source.to_string(),
             "session id was provided but no session store is configured"
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn run_failure_stays_below_clippys_large_error_threshold() {
+        assert!(
+            std::mem::size_of::<RunFailure>() < 128,
+            "RunFailure grew to {} bytes",
+            std::mem::size_of::<RunFailure>()
         );
     }
 }

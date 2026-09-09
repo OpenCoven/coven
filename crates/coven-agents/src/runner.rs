@@ -253,9 +253,9 @@ where
         )
         .await
         .map_err(|error| RunFailure {
-            invocation: invocation.clone(),
+            invocation: Box::new(invocation.clone()),
             error,
-            new_items: progress.items,
+            new_items: progress.items.into_boxed_slice(),
             turns: progress.turns,
             handoffs: progress.handoffs,
         })
