@@ -396,6 +396,186 @@ fn retired_corpus_scheduled_intake_survives_restart_and_applies_once() -> Result
 }
 
 #[test]
+#[cfg(feature = "threads-test-clock")]
+fn scheduled_window_replay_fails_closed_across_real_daemon_restart() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    for scenario in [
+        "vetoed",
+        "surface-diverged",
+        "ward-unavailable",
+        "identity-changed",
+        "identity-unavailable",
+        "binding-revoked",
+    ] {
+        run_clocked_journey(
+            &format!("scheduled-window-{scenario}"),
+            |home, workspace| seed_retired_review_case(home, workspace, case),
+            |fixture, capability| {
+                let staged = submit_retired_case(fixture, case)?;
+                let id = staged["proposalId"].as_str().context("proposal id")?;
+                tick_scheduler(fixture, capability)?;
+                fixture.stop_daemon()?;
+                match scenario {
+                    "surface-diverged" => fs::write(
+                        fixture.workspace.join("TOOLS.md"),
+                        "Synthetic out-of-band tool change",
+                    )?,
+                    "ward-unavailable" => fs::remove_file(fixture.workspace.join("ward.toml"))?,
+                    "identity-changed" => fs::write(
+                        fixture.workspace.join("IDENTITY.md"),
+                        "# IDENTITY.md - Synthetic-other\n- **Pronouns:** they/them\n",
+                    )?,
+                    "identity-unavailable" => {
+                        fs::remove_file(fixture.workspace.join("IDENTITY.md"))?
+                    }
+                    "binding-revoked" => {
+                        let path = fixture.workspace.join("ward.toml");
+                        let ward = fs::read_to_string(&path)?;
+                        anyhow::ensure!(
+                            ward.contains(PRINCIPAL_FINGERPRINT),
+                            "fixture has no original principal binding"
+                        );
+                        fs::write(
+                            path,
+                            ward.replace(PRINCIPAL_FINGERPRINT, "fpr-synthetic-revoked"),
+                        )?;
+                    }
+                    "vetoed" => {}
+                    _ => unreachable!("scenarios are enumerated above"),
+                }
+                fixture.start_daemon()?;
+                let (event, reason, replay) = if scenario == "vetoed" {
+                    let rejected = fixture.request(
+                        "POST",
+                        &format!("/api/v1/threads/proposals/{id}/reject"),
+                        Some(&json!({
+                            "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                            "rationale": "Synthetic principal veto",
+                        })),
+                    )?;
+                    anyhow::ensure!(
+                        rejected.status == 200,
+                        "supported veto failed: {rejected:?}"
+                    );
+                    ("proposal_vetoed", "vetoed", Value::Null)
+                } else {
+                    advance_clock_to_offset(fixture, capability, 7201)?;
+                    tick_scheduler(fixture, capability)?;
+                    (
+                        "proposal_rejected",
+                        if scenario == "surface-diverged" {
+                            "evidence_diverged"
+                        } else {
+                            "revalidation_failed"
+                        },
+                        json!(false),
+                    )
+                };
+                assert_window_terminal(fixture, id, event, reason, replay.clone())?;
+                fixture.restart_daemon()?;
+                tick_scheduler(fixture, capability)?;
+                assert_window_terminal(fixture, id, event, reason, replay)?;
+                let applied: i64 = fixture.store()?.query_row(
+                    "SELECT COUNT(*) FROM ward_audit WHERE event_type IN ('proposal_approved', 'apply_audit')",
+                    [],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    applied == 0,
+                    "refused proposal produced applied-write evidence"
+                );
+                if scenario == "surface-diverged" {
+                    anyhow::ensure!(
+                        fs::read_to_string(fixture.workspace.join("TOOLS.md"))?
+                            == "Synthetic out-of-band tool change",
+                        "replay overwrote out-of-band bytes"
+                    );
+                } else {
+                    assert_corpus_bytes(fixture, case, "before")?;
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "threads-test-clock")]
+fn reviewed_human_approval_has_no_veto_window() -> Result<()> {
+    let corpus = retired_ward_corpus()?;
+    let case = retired_review_case(&corpus)?;
+    run_clocked_journey(
+        "reviewed-human-no-window",
+        |home, workspace| {
+            seed_retired_review_case(home, workspace, case)?;
+            let path = workspace.join("ward.toml");
+            let mut ward: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+            let tiers = ward["approval_tiers"]
+                .as_table_mut()
+                .context("approval tiers")?;
+            let mut human = tiers
+                .remove("familiar_review")
+                .context("review declaration")?;
+            let declaration = human.as_table_mut().context("review declaration table")?;
+            declaration.insert(
+                "gate".to_owned(),
+                toml::Value::String("human_approval".to_owned()),
+            );
+            declaration.remove("human_veto_window_hours");
+            declaration.remove("min_visible_seconds");
+            tiers.insert("human_review".to_owned(), human);
+            fs::write(path, toml::to_string(&ward)?)?;
+            Ok(())
+        },
+        |fixture, capability| {
+            let staged = submit_retired_case(fixture, case)?;
+            let id = staged["proposalId"].as_str().context("proposal id")?;
+            anyhow::ensure!(
+                staged["scheduledProposal"]["veto_deadline"].is_null()
+                    && staged["scheduledProposal"]["earliest_close"].is_null(),
+                "human path acquired a veto window"
+            );
+            tick_scheduler(fixture, capability)?;
+            assert_corpus_bytes(fixture, case, "before")?;
+            let approved = fixture.request(
+                "POST",
+                &format!("/api/v1/threads/proposals/{id}/approve"),
+                Some(&json!({
+                    "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                    "rationale": "Synthetic human approval",
+                })),
+            )?;
+            anyhow::ensure!(
+                approved.status == 200,
+                "human approval failed: {approved:?}"
+            );
+            assert_corpus_bytes(fixture, case, "after")?;
+            fixture.restart_daemon()?;
+            tick_scheduler(fixture, capability)?;
+            let conn = fixture.store()?;
+            let opened: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+                [id],
+                |row| row.get(0),
+            )?;
+            let approved: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_approved'
+                 AND (detail IS NULL OR json_extract(detail, '$.window_close') IS NULL)",
+                [id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                opened == 0 && approved == 1,
+                "human no-window history is inconsistent"
+            );
+            Ok(())
+        },
+    )
+}
+
+#[test]
 fn smoke_out_of_band_drift_stages_without_execution() -> Result<()> {
     run_journey("smoke-out-of-band-drift", |fixture| {
         let baseline_request = json!({
@@ -715,6 +895,16 @@ fn retired_ward_corpus() -> Result<Value> {
         "fixture is not the repository-owned synthetic corpus"
     );
     Ok(corpus)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn retired_review_case(corpus: &Value) -> Result<&Value> {
+    corpus["valid_cases"]
+        .as_array()
+        .context("corpus valid cases")?
+        .iter()
+        .find(|case| case["id"] == "familiar-review")
+        .context("canonical familiar-review case")
 }
 
 #[cfg(feature = "threads-test-clock")]

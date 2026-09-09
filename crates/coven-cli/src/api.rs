@@ -26775,44 +26775,49 @@ forbidden = ["(?i)ignore previous"]
             home.join("familiars.toml"),
             r#"[[familiar]]
 id = "sage"
-display_name = "Sage"
+display_name = "Synthetic-identity"
 role = "Research"
-description = "Reads and synthesizes."
-pronouns = "she/her"
-person = "Val"
-coven = "OpenCoven"
+description = "Synthetic identity predicate fixture."
+pronouns = "they/them"
+person = "Example principal"
+coven = "ExampleCoven"
 "#,
         )?;
         let workspace = home.join("familiars").join("sage");
         std::fs::create_dir_all(&workspace)?;
-        std::fs::write(
-            workspace.join("SOUL.md"),
-            "# SOUL\n## I am Sage\nMy purpose is research.\n",
-        )?;
+        std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
         std::fs::write(
             workspace.join("IDENTITY.md"),
-            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** she/her\n",
+            "# IDENTITY.md - Synthetic-identity\n- **Name:** Synthetic-identity\n- **Pronouns:** they/them\n",
         )?;
         std::fs::write(workspace.join("MEMORY.md"), "facts stay local\n")?;
+        std::fs::write(workspace.join("TOOLS.md"), "Synthetic tools before\n")?;
         std::fs::write(
             workspace.join("ward.toml"),
             r#"principal_key_fingerprint = "fpr-val"
 protected_surface = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
 
+[editable]
+harness_blocks = ["tool_defaults"]
+
+[approval_tiers.human_review]
+blocks = ["tool_defaults"]
+gate = "human_approval"
+
 [[identity_invariant]]
 fact = "name"
 operator = "equals"
-expected = "Sage"
+expected = "Synthetic-identity"
 
 [[identity_invariant]]
 fact = "person"
 operator = "equals"
-expected = "Val"
+expected = "Example principal"
 
 [[identity_invariant]]
 fact = "pronouns"
 operator = "equals"
-expected = "she/her"
+expected = "they/them"
 
 [[identity_invariant]]
 fact = "purpose"
@@ -26822,7 +26827,7 @@ expected = "research"
 [[identity_invariant]]
 fact = "coven"
 operator = "equals"
-expected = "OpenCoven"
+expected = "ExampleCoven"
 
 [[surface]]
 path = "SOUL.md"
@@ -26835,46 +26840,36 @@ tier = 0
 [[surface]]
 path = "MEMORY.md"
 tier = 0
+
+[[surface]]
+path = "TOOLS.md"
+tier = 1
 "#,
         )?;
         Ok(workspace)
     }
 
     fn valid_identity_soul() -> &'static str {
-        "# SOUL\n## I am Sage\nMy purpose is research.\n"
+        "# SOUL\n## I am Synthetic-identity\nMy purpose is research.\n"
     }
 
     fn stage_pending_identity_predicate_edit(
         home: &Path,
     ) -> Result<(std::path::PathBuf, String, std::path::PathBuf)> {
         let workspace = seed_identity_predicate_familiar(home)?;
-        let baseline = post_edits(
-            home,
-            &format!(
-                r#"{{"edits":[{{"target":"SOUL.md","contents":{}}}],"principalKeyFingerprint":"fpr-val"}}"#,
-                serde_json::to_string(valid_identity_soul())?
-            ),
-        )?;
-        assert_eq!(baseline.status, 202, "got {}", baseline.body);
-        std::fs::write(
-            workspace.join("SOUL.md"),
-            "# SOUL\n## I am Mallory\nMy purpose is sabotage.\n",
-        )?;
         let staged = post_edits(
             home,
-            &format!(
-                r#"{{"edits":[{{"target":"SOUL.md","contents":{}}}],"principalKeyFingerprint":"fpr-val"}}"#,
-                serde_json::to_string(valid_identity_soul())?
-            ),
+            r#"{"edits":[{"target":"TOOLS.md","contents":"Synthetic tools after\n"}],"principalKeyFingerprint":"fpr-val"}"#,
         )?;
         assert_eq!(staged.status, 202, "got {}", staged.body);
         let body: serde_json::Value = serde_json::from_str(&staged.body)?;
+        assert_eq!(body["scheduledProposal"]["schema"], "phase5_v1");
         let pending = std::path::PathBuf::from(
-            body["threadsGate"]["outcome"]["pendingPath"]
+            body["pendingPath"]
                 .as_str()
                 .expect("staged response carries pendingPath"),
         );
-        let proposal_id = body["threadsGate"]["outcome"]["proposalId"]
+        let proposal_id = body["proposalId"]
             .as_str()
             .expect("staged response carries proposalId")
             .to_string();
@@ -29237,7 +29232,7 @@ tier = 0
         std::fs::write(workspace.join("SOUL.md"), valid_identity_soul())?;
         std::fs::write(
             workspace.join("IDENTITY.md"),
-            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+            "# IDENTITY.md - Synthetic-identity\n- **Name:** Synthetic-identity\n- **Pronouns:** she/her\n",
         )?;
 
         let response = handle_request_with_body(
@@ -29255,6 +29250,10 @@ tier = 0
         assert_eq!(
             std::fs::read_to_string(workspace.join("SOUL.md"))?,
             valid_identity_soul()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools before\n"
         );
         Ok(())
     }
@@ -29283,7 +29282,7 @@ tier = 0
             .expect("interrupted approval leaves a recovery claim");
         std::fs::write(
             workspace.join("IDENTITY.md"),
-            "# IDENTITY.md - Sage\n- **Name:** Sage\n- **Pronouns:** they/them\n",
+            "# IDENTITY.md - Synthetic-identity\n- **Name:** Synthetic-identity\n- **Pronouns:** she/her\n",
         )?;
 
         let retry = handle_request_with_body(
@@ -29301,6 +29300,10 @@ tier = 0
         assert_eq!(
             std::fs::read_to_string(workspace.join("SOUL.md"))?,
             valid_identity_soul()
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools after\n"
         );
         Ok(())
     }
