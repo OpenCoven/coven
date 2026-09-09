@@ -77,6 +77,7 @@ mod state_lock;
 mod store;
 mod stream_json;
 mod theme;
+mod threads_clock;
 mod tui;
 mod verification;
 mod ward_probes;

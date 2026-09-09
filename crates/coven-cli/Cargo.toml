@@ -10,6 +10,10 @@ repository.workspace = true
 name = "coven"
 path = "src/main.rs"
 
+[features]
+default = []
+threads-test-clock = ["time/serde-well-known"]
+
 [dependencies]
 coven-afs = { path = "../coven-afs", version = "0.1.0" }
 coven-client = { path = "../coven-client", version = "0.1.0" }
