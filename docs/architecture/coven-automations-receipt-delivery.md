@@ -37,12 +37,13 @@ terminal session evidence
   -> status, timestamp, summary/log presentation
 ```
 
-The required v1 path remains:
+The required v1 path now has a durable commitment seam but no production
+producer:
 
 ```text
 terminal evidence
-  -> immutable base receipt + authority sidecar correlation
-  -> receipt reference on the run + receipt event
+  -> [missing producer] immutable base receipt + authority sidecar correlation
+  -> immutable receipt commitment + run reference + receipt event
   -> privacy-authorized daemon read
   -> SDK verification result
   -> Cave verified/degraded/unverifiable/invalid presentation
@@ -59,15 +60,15 @@ The first path is useful operational history. It is not an
 | Terminal session reconciliation | Existing, partial v1 projection | `settle_finished_runs` treats only `completed` plus exit code `0` before the deadline as success, settles occurrence and active attempt, finishes the run, and commits atomically. All other terminal session evidence becomes failed (`crates/coven-cli/src/automations/runner.rs:1973-2164`). |
 | Retry and timeout settlement | Existing, partial v1 projection | Rejected pre-ownership launches persist failed attempts and either schedule a new adopted attempt or finish the run (`crates/coven-cli/src/automations/runner.rs:505-662`). A waiting retry that exceeds the run deadline records an attempt as `timed_out` but finishes the run as `failed` (`runner.rs:1793-1868`). |
 | Occurrence distinctions | Existing, narrower than the v1 schema | Production occurrence rows use `planned`, `claimed`, `running`, `succeeded`, `failed`, and `skipped`; stale planned slots become `skipped` during claim (`crates/coven-cli/src/automations/occurrences.rs:127-179`), while settlement accepts only `succeeded` or `failed` (`occurrences.rs:371-413`). `skipped` is occurrence evidence, not a receipt outcome. |
-| Receipt construction | Missing | A repository-wide search at the pinned Coven revision finds the `AutomationReceipt` type declaration but no production `AutomationReceipt { ... }` constructor. No settlement branch calculates receipt integrity, producer authentication, result/delivery digests, exercised capabilities, side-effect class, or receipt privacy. |
-| Durable receipt persistence | Missing, placeholder only | `automation_runs` has nullable `receipt_id`, and `RunRecord` reads it (`crates/coven-cli/src/automations/runs.rs:12-35,137-160`). Store initialization creates definitions, command adoptions, occurrences, runs, attempts/retry state, and events, but no receipt table or blob store (`crates/coven-cli/src/store.rs:999-1018`). No production statement sets `receipt_id`. |
-| Receipt idempotency and restart recovery | Missing | Run settlement is compare-and-set and transactional, but there is no receipt write to replay. Restart can converge run state from session evidence; it cannot prove one immutable receipt per terminal attempt or detect a conflicting second receipt. |
+| Receipt construction | Missing | The contract type validates integrity, but no production settlement branch constructs an `AutomationReceipt`. Coven still lacks authoritative terminal inputs for per-action side-effect class, exercised capabilities, result/delivery digests, producer authentication, and authority receipt evidence, so the legacy run projection must not fabricate them. |
+| Durable receipt persistence | Immutable commitment seam exists; production producer missing | `automation_receipts` stores one validated receipt per run and terminal attempt. `commit_receipt` exact-correlates the typed receipt and `receipt.recorded` event to durable run/attempt state, inserts the immutable receipt, sets `automation_runs.receipt_id`, and appends the event under one savepoint (`crates/coven-cli/src/automations/receipts.rs`). Database triggers refuse receipt mutation/deletion and receipt-reference reassignment. No normal settlement path calls the seam yet. |
+| Receipt idempotency and restart recovery | Commitment replay is safe; settlement replay remains missing | Replaying the identical receipt/event returns the committed result without a second row or event. A changed body, receipt ID, run/attempt correlation, or event fails closed, and event-append failure rolls back the receipt and run reference. Restart settlement still needs a producer that deterministically reconstructs the same terminal evidence. |
 | Run/attempt correlation inputs | Existing, with immutable authority slots | Runs pin definition revision/digest, occurrence, and nullable authority profile; attempts pin run, occurrence, attempt number, adoption key, occurrence fence, dispatch generation, session, and nullable authority-extension JSON (`crates/coven-cli/src/automations/runs.rs`). Database triggers prevent a pinned run profile or attempt extension from being rewritten and prevent deletion of an authority-bound attempt. |
 | Runtime authority companion contract | Dispatch pin seam exists; production adapter missing | The profile defines the execution binding and receipt-correlated sidecar and requires terminal evidence to match the base receipt (`spec/coven-automations/authority/v1/README.md:1-41`). The runner's explicit Runtime Authority mode now resolves, validates, exactly correlates, and stores one pre-dispatch extension in the same immediate transaction that moves the attempt to `dispatching`, before runtime launch (`crates/coven-cli/src/automations/runner.rs`). Existing scheduler and manual-run entry points remain base-v1 because no trusted Familiar/Threads/approval/runtime adapter is wired and the capability is not advertised. |
 | Authority and approval outcome distinction | Contract and dispatch pin seam exist; live policy adapter is missing | The companion admits only `permit` and satisfied `requires_approval` bindings and makes `degrade_to_proposal` or `reject` non-dispatch outcomes (`spec/coven-automations/authority/v1/README.md:39-64`). Runtime Authority validation failures roll back the launch transaction and expose only stable refusal codes, but current production Automations actions still have no approval request/decision or effective-authority read action (`crates/coven-cli/src/control_plane.rs:108-131`). |
-| Receipt event/changefeed | Infrastructure exists; producer is missing | The event schema can represent receipt and transition payloads (`crates/coven-cli/src/automations/contract/types.rs:3300-3426`), and the append-only store provides ordered reads/checkpoints. Production appends are currently definition lifecycle/import events only; no run, attempt, occurrence, or receipt append call exists outside tests. |
+| Receipt event/changefeed | Atomic commitment exists; producer is missing | The event schema and append-only store support `receipt.recorded`. The receipt commitment seam writes that event atomically with the receipt and run reference, but production appends remain definition lifecycle/import events because terminal settlement does not yet construct a receipt. |
 | Daemon receipt read | Missing | `coven.automations.runs` is the only run-history action. Although `list_runs` reads `receipt_id`, `automation_runs_payload` omits it and there is no `receipt.get` action (`crates/coven-cli/src/control_plane.rs:1053-1111`). |
-| Privacy and redaction | Declarative contract only for receipts | The receipt contract defines `public`, `operational`, `sensitive`, or `restricted` classification plus retention (`crates/coven-cli/src/automations/contract/types.rs:867-895,2279-2292`). No receipt is stored, and event reads deserialize and return stored `event_json` without a principal-aware field filter (`crates/coven-cli/src/automations/contract/events.rs:577-700`). The legacy runs action also exposes `logJson`; receipt authorization/redaction must be explicit rather than inherited from that route. |
+| Privacy and redaction | Stored classification; authorized reads still missing | The receipt contract and commitment seam preserve `public`, `operational`, `sensitive`, or `restricted` classification plus retention (`crates/coven-cli/src/automations/contract/types.rs:867-895,2279-2292`). There is no receipt read API, and event reads deserialize and return stored `event_json` without a principal-aware field filter (`crates/coven-cli/src/automations/contract/events.rs:577-700`). The legacy runs action also exposes `logJson`; receipt authorization/redaction must be explicit rather than inherited from that route. |
 | Effective-authority explanation | Missing read contract | The authority profile contains requested, granted, denied, degraded, approval, risk, runtime, and policy evidence, but it is not bound at dispatch and no action projects an effective `may` / `must ask` / `cannot` explanation. Daemon health advertises generic execution/request-adoption contracts, not Automations authority profiles (`crates/coven-cli/src/api_health.rs:117-145`). |
 | Per-action evidence and daily aggregation | Unknown and therefore unsupported | The base receipt can list exercised capability keys and a maximum side-effect class, but the current runtime reports only session/run terminal evidence. There is no authoritative per-action ledger proving counts such as files changed, commands run, remote calls, or protected surfaces untouched. A daily view may later count verified receipts by outcome/side-effect class; it must not invent action counts from logs or model summaries. |
 | SDK consumer | Contract canary only | At SDK revision `160864ad61ef`, `conformance/automations-v1-artifact-lock.json:1-41` pins the immutable base artifact, and the canary checks its object manifest. No package source implements `automations.getReceipt`, `verifyReceipt`, or subscriptions. OpenCoven/sdk#80 remains the owner. |
@@ -110,12 +111,14 @@ Land the work as bounded PRs:
    and immediately before dispatch. Persist the exact binding with the run and
    pass only its bounded runtime projection to the session launch. Missing
    adapters and unavailable trusted state fail closed.
-2. Add an immutable receipt store keyed by `receipt_id`, with a unique terminal
-   attempt correlation. Construct the base receipt from pinned definition,
-   occurrence fence, run, attempt, session outcome, runtime, delivery, and
-   privacy evidence. Insert the receipt, correlate the authority sidecar, set
-   `automation_runs.receipt_id`, and append the terminal run/receipt event in
-   one transaction.
+2. The immutable receipt commitment seam is now separated from evidence
+   production. It stores one validated receipt per run and terminal attempt,
+   sets `automation_runs.receipt_id`, appends `receipt.recorded`, refuses
+   conflicting replay, and rolls all writes back together. The remaining
+   producer must construct the base receipt from pinned definition, occurrence
+   fence, run, attempt, session outcome, runtime, delivery, side-effect, and
+   privacy evidence, then correlate the authority sidecar without inventing
+   fields the runtime did not report.
 3. Make settlement replay-safe. An identical restart replay returns the
    committed receipt; a second receipt body or correlation for the same
    terminal attempt fails closed. Cover normal completion, launch refusal
