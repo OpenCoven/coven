@@ -1096,10 +1096,10 @@ mod tests {
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {
-        assert_eq!(value.len() % 2, 0);
-        value
-            .as_bytes()
-            .chunks_exact(2)
+        let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        pairs
+            .iter()
             .map(|pair| {
                 let high = char::from(pair[0]).to_digit(16).unwrap();
                 let low = char::from(pair[1]).to_digit(16).unwrap();
