@@ -18,7 +18,9 @@ pub use discovery::{
     read_windows_daemon_status_for_lifecycle, read_windows_daemon_status_for_lifecycle_until,
     supported_windows_pipe_names, validate_windows_daemon_pipe_name,
 };
-pub use error::{ClientError, DaemonError};
+pub use error::{
+    ClientError, DaemonError, EMPTY_RESPONSE_TIMEOUT_MESSAGE, WINDOWS_CONNECT_OPERATION,
+};
 pub use http::DaemonClient;
 #[cfg(unix)]
 #[doc(hidden)]
