@@ -1,0 +1,477 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/v1/conformance-result.schema.json",
+  "title": "Coven Automations v1 conformance result",
+  "description": "Portable result envelope for externally produced Coven Automations v1 conformance observations. The signed statement is separated from envelope authentication so signatures cover only the RFC 8785 statement bytes. Structural validation does not prove statement digests, signatures, profile semantics, suite execution, artifact equality, freshness, caller-pinned suite inventories, allowed environments, or release eligibility; those are verifier responsibilities.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "statement",
+    "statementDigest"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": "coven.automations.conformance-result.v1"
+    },
+    "statement": {
+      "$ref": "#/$defs/statement"
+    },
+    "statementDigest": {
+      "$ref": "common.schema.json#/$defs/digest",
+      "description": "SHA-256 over the RFC 8785 (JCS) canonical serialization of statement only."
+    },
+    "authentication": {
+      "$ref": "#/$defs/authentication"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "statement": {
+            "properties": {
+              "decisionScope": {
+                "properties": {
+                  "kind": {
+                    "const": "release_eligibility"
+                  }
+                },
+                "required": [
+                  "kind"
+                ]
+              }
+            },
+            "required": [
+              "decisionScope"
+            ]
+          }
+        },
+        "required": [
+          "statement"
+        ]
+      },
+      "then": {
+        "required": [
+          "authentication"
+        ],
+        "properties": {
+          "statement": {
+            "required": [
+              "expiresAt"
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "resultId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]*$"
+    },
+    "boundedIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]*$"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]*$"
+    },
+    "sourceCommit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "repository": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z][A-Za-z0-9+.-]*://[A-Za-z0-9!#$%&'()*+,./:;=?@_~-]+$",
+      "description": "Exact canonical source repository URI. Consumers compare the complete value and never include it in refusal text."
+    },
+    "environmentFact": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._+:-]*$",
+      "description": "Bounded platform/runtime identifier only. Paths, hostnames, command lines, and environment-variable dumps are outside this shape."
+    },
+    "suiteId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]*$"
+    },
+    "profile": {
+      "enum": [
+        "structural",
+        "scheduler_reliability",
+        "runtime_authority",
+        "continuity",
+        "privacy",
+        "interoperability",
+        "full"
+      ]
+    },
+    "status": {
+      "enum": [
+        "passed",
+        "failed",
+        "incomplete",
+        "not_applicable"
+      ]
+    },
+    "policyBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policyId",
+        "policyVersion",
+        "digest"
+      ],
+      "properties": {
+        "policyId": {
+          "$ref": "#/$defs/boundedIdentifier"
+        },
+        "policyVersion": {
+          "$ref": "#/$defs/version"
+        },
+        "digest": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "decisionScope": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "audit_only"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "policyBinding"
+          ],
+          "properties": {
+            "kind": {
+              "const": "release_eligibility"
+            },
+            "policyBinding": {
+              "$ref": "#/$defs/policyBinding"
+            }
+          }
+        }
+      ]
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "commit"
+      ],
+      "properties": {
+        "repository": {
+          "$ref": "#/$defs/repository"
+        },
+        "commit": {
+          "$ref": "#/$defs/sourceCommit"
+        }
+      }
+    },
+    "protocolArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bundleSchemaVersion",
+        "sourceCommit",
+        "bundleSha256",
+        "contractContentSha256",
+        "fileCount"
+      ],
+      "properties": {
+        "bundleSchemaVersion": {
+          "$ref": "#/$defs/version"
+        },
+        "sourceCommit": {
+          "$ref": "#/$defs/sourceCommit"
+        },
+        "bundleSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "contractContentSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "fileCount": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991,
+          "description": "Positive JCS-safe file count. JSON number forms with a mathematically integral value, including 19.0 and 1.9e1, are integers and canonicalize without a fractional part."
+        }
+      }
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "artifactSha256",
+        "vectorSetSha256"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/resultId"
+        },
+        "version": {
+          "$ref": "#/$defs/version"
+        },
+        "artifactSha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "vectorSetSha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "artifactPlatform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch"
+      ],
+      "properties": {
+        "os": {
+          "$ref": "#/$defs/environmentFact"
+        },
+        "arch": {
+          "$ref": "#/$defs/environmentFact"
+        }
+      }
+    },
+    "subjectArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId",
+        "artifactVersion",
+        "platform",
+        "sha256"
+      ],
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/resultId"
+        },
+        "artifactVersion": {
+          "$ref": "#/$defs/version"
+        },
+        "platform": {
+          "$ref": "#/$defs/artifactPlatform"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "description": "Exact implementation package, binary, archive, or image exercised by the suites. This is distinct from the protocol bundle and conformance runner artifacts."
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch",
+        "runtime"
+      ],
+      "properties": {
+        "os": {
+          "$ref": "#/$defs/environmentFact"
+        },
+        "arch": {
+          "$ref": "#/$defs/environmentFact"
+        },
+        "runtime": {
+          "$ref": "#/$defs/environmentFact"
+        }
+      }
+    },
+    "suiteResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "suiteId",
+        "status"
+      ],
+      "properties": {
+        "suiteId": {
+          "$ref": "#/$defs/suiteId"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "evidenceDigest": {
+          "$ref": "common.schema.json#/$defs/digest"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "passed"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "required": [
+              "evidenceDigest"
+            ]
+          }
+        }
+      ]
+    },
+    "profileResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "status",
+        "requiredSuites",
+        "suiteResults"
+      ],
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/profile"
+        },
+        "status": {
+          "$ref": "#/$defs/status"
+        },
+        "requiredSuites": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/suiteId"
+          }
+        },
+        "suiteResults": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "$ref": "#/$defs/suiteResult"
+          }
+        }
+      },
+      "description": "JSON Schema constrains the closed shape only. The Rust verifier enforces exact internal suite-set equality, uniqueness by suiteId, and status derivation. For release eligibility it also compares requiredSuites with the caller-pinned suite inventory for that profile."
+    },
+    "statement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contractProfile",
+        "resultId",
+        "decisionScope",
+        "source",
+        "protocolArtifact",
+        "runner",
+        "subjectArtifact",
+        "environment",
+        "observedAt",
+        "profileResults",
+        "overallStatus"
+      ],
+      "properties": {
+        "contractProfile": {
+          "const": "coven.automations.v1"
+        },
+        "resultId": {
+          "$ref": "#/$defs/resultId"
+        },
+        "decisionScope": {
+          "$ref": "#/$defs/decisionScope"
+        },
+        "source": {
+          "$ref": "#/$defs/source"
+        },
+        "protocolArtifact": {
+          "$ref": "#/$defs/protocolArtifact"
+        },
+        "runner": {
+          "$ref": "#/$defs/runner"
+        },
+        "subjectArtifact": {
+          "$ref": "#/$defs/subjectArtifact"
+        },
+        "environment": {
+          "$ref": "#/$defs/environment",
+          "description": "Informational for audit-only results. Release eligibility requires an exact match to a nonempty caller-supplied environment allowlist."
+        },
+        "observedAt": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        "expiresAt": {
+          "$ref": "common.schema.json#/$defs/timestamp"
+        },
+        "profileResults": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 7,
+          "items": {
+            "$ref": "#/$defs/profileResult"
+          }
+        },
+        "overallStatus": {
+          "$ref": "#/$defs/status"
+        }
+      }
+    },
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "keyId",
+        "signature"
+      ],
+      "properties": {
+        "method": {
+          "const": "p256-sha256"
+        },
+        "keyId": {
+          "$ref": "#/$defs/boundedIdentifier"
+        },
+        "signature": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_-]+$",
+          "description": "Unpadded canonical base64url encoding of a canonical DER P-256 ECDSA signature over the RFC 8785 statement bytes."
+        }
+      }
+    }
+  }
+}
