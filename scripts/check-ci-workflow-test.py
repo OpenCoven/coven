@@ -80,6 +80,24 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
+    def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
+        release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
+        for workflow_text in [CI_TEXT, RELEASE_TEXT, release_stress_text]:
+            self.assertNotIn("sudo apt-get update && sudo apt-get install", workflow_text)
+            self.assertNotIn(
+                "apt-get install -y --no-install-recommends libopenblas-dev",
+                workflow_text,
+            )
+
+        expected_invocations = 7 + 3 + 1
+        actual_invocations = (
+            CI_TEXT.count("bash scripts/install-native-link-dependencies.sh")
+            + RELEASE_TEXT.count("bash scripts/install-native-link-dependencies.sh")
+            + release_stress_text.count("bash scripts/install-native-link-dependencies.sh")
+        )
+        self.assertEqual(actual_invocations, expected_invocations)
+        self.assertIn("python3 scripts/install-native-link-dependencies-test.py", CI_TEXT)
+
     def test_release_github_workflow_has_expected_trigger_and_permissions(self) -> None:
         self.assertIn("workflow_run:", RELEASE_GITHUB_TEXT)
         self.assertIn("Release npm packages", RELEASE_GITHUB_TEXT)
