@@ -2,9 +2,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ClientError;
+use crate::{status_error::StatusWriteStage, ClientError};
 
-const STATUS_WRITE_OPERATION: &str = "failed to write owner-only Windows daemon status";
 const WINDOWS_OWNER_ONLY_FILE_DACL_SDDL: &str = "D:P(A;;GA;;;OW)";
 
 pub fn write_owner_only_windows_daemon_status(
@@ -18,12 +17,15 @@ pub fn write_owner_only_windows_daemon_status(
             .create_new(true)
             .write(true)
             .open(&temporary_path)
-            .map_err(status_io_error)?;
-        file.write_all(contents).map_err(status_io_error)?;
+            .map_err(|error| StatusWriteStage::CreateTemporary.io_error(error))?;
+        file.write_all(contents)
+            .map_err(|error| StatusWriteStage::WriteContents.io_error(error))?;
         if !contents.ends_with(b"\n") {
-            file.write_all(b"\n").map_err(status_io_error)?;
+            file.write_all(b"\n")
+                .map_err(|error| StatusWriteStage::WriteNewline.io_error(error))?;
         }
-        file.sync_all().map_err(status_io_error)?;
+        file.sync_all()
+            .map_err(|error| StatusWriteStage::SyncTemporary.io_error(error))?;
         drop(file);
         set_owner_only_file_security(&temporary_path)?;
         replace_status_file(&temporary_path, &status_path)
@@ -75,7 +77,7 @@ fn set_owner_only_file_security(path: &Path) -> Result<(), ClientError> {
         )
     } == 0
     {
-        return Err(status_io_error(std::io::Error::last_os_error()));
+        return Err(StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::last_os_error()));
     }
     let _descriptor = LocalAllocation(descriptor);
     let mut dacl_present = 0;
@@ -117,9 +119,8 @@ fn set_owner_only_file_security(path: &Path) -> Result<(), ClientError> {
         )
     };
     if status != 0 {
-        return Err(status_io_error(std::io::Error::from_raw_os_error(
-            status as i32,
-        )));
+        return Err(StatusWriteStage::ApplySecurity
+            .io_error(std::io::Error::from_raw_os_error(status as i32)));
     }
     Ok(())
 }
@@ -161,16 +162,9 @@ fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), 
                     || code == ERROR_SHARING_VIOLATION as i32
         ) || std::time::Instant::now() >= deadline
         {
-            return Err(status_io_error(error));
+            return Err(StatusWriteStage::ReplaceStatus.io_error(error));
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-}
-
-fn status_io_error(source: std::io::Error) -> ClientError {
-    ClientError::Io {
-        operation: STATUS_WRITE_OPERATION,
-        source,
     }
 }
 
@@ -190,7 +184,7 @@ impl CurrentWindowsUser {
 
         let mut process_token = ptr::null_mut();
         if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut process_token) } == 0 {
-            return Err(status_io_error(std::io::Error::last_os_error()));
+            return Err(StatusWriteStage::OpenToken.io_error(std::io::Error::last_os_error()));
         }
         let _token = Handle(process_token);
         let mut bytes = 0;
@@ -216,7 +210,7 @@ impl CurrentWindowsUser {
             )
         } == 0
         {
-            return Err(status_io_error(std::io::Error::last_os_error()));
+            return Err(StatusWriteStage::ReadToken.io_error(std::io::Error::last_os_error()));
         }
         if (bytes as usize) < size_of::<TOKEN_USER>()
             || bytes as usize > words.len() * size_of::<usize>()
