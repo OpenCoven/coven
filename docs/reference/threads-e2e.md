@@ -13,9 +13,9 @@ source_adjacent_reason: "Tracks the real daemon test fixture and evidence contra
 The `threads_e2e` integration target exercises the Ward/Threads boundary
 through a real `coven daemon` process and its local IPC transport. Each test
 uses a unique temporary `COVEN_HOME`, familiar workspace, SQLite store, pending
-directory, and daemon socket.
+directory, and owner-local daemon endpoint.
 
-Run the complete available Unix daemon journeys from a Coven checkout:
+Run the complete available daemon journeys from a Coven checkout:
 
 ```sh
 cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock -- --nocapture
@@ -40,8 +40,17 @@ The clock feature is disabled in production builds. It uses a capability-gated
 fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
 Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
-executes the feature-enabled target on Linux and on the existing macOS push
-lane; this Unix-socket harness does not provide Windows daemon-journey proof.
+executes the feature-enabled target on Linux, Windows, and the existing macOS
+push lane. All platforms run the same 14 daemon journeys through `coven-client`
+discovery and authenticated transport; Windows uses the owner-only named pipe.
+HTTP framing regressions belong to the shared client's tests, not a separate
+harness parser. A cross-target compilation or Windows workspace run alone is
+not evidence that these journeys executed on Windows.
+
+Lifecycle commands still use the production CLI and its existing deadlines.
+Windows crash injection binds the process handle to the authenticated pipe
+server PID and creation time before termination. Requests are never retried
+automatically; a response timeout does not prove a mutation did not commit.
 
 ## Testing a local Threads checkout
 

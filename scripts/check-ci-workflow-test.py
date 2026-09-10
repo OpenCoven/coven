@@ -80,18 +80,26 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_ci_sets_up_node_for_release_workflow_policy_tests(self) -> None:
         self.assertIn(f"actions/setup-node@{SETUP_NODE_SHA}", CI_TEXT)
 
-    def test_unix_jobs_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
+    def test_all_platforms_exercise_feature_enabled_threads_daemon_journeys(self) -> None:
         command = "cargo test --locked -p coven-cli --test threads_e2e --features threads-test-clock"
         for job, next_job in [
             ("rust-test-linux", "rust-test-windows"),
+            ("rust-test-windows", "rust-test-macos"),
             ("rust-test-macos", "afs-mount-linux"),
         ]:
             block = CI_TEXT.split(f"\n  {job}:\n", 1)[1].split(f"\n  {next_job}:\n", 1)[0]
             self.assertIn(command, block)
+        harness = CI_WORKFLOW.parents[2] / "crates/coven-cli/tests/threads_e2e.rs"
+        self.assertNotIn("#![cfg(unix)]", harness.read_text(encoding="utf-8"))
+
+    def test_windows_threads_journeys_retain_failure_evidence(self) -> None:
         windows = CI_TEXT.split("\n  rust-test-windows:\n", 1)[1].split(
             "\n  rust-test-macos:\n", 1
         )[0]
-        self.assertNotIn(command, windows)
+        self.assertIn("name: Upload Threads daemon evidence", windows)
+        self.assertIn("if: ${{ always() }}", windows)
+        self.assertIn("path: target/e2e-artifacts/", windows)
+        self.assertIn("retention-days: 14", windows)
 
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
