@@ -3,6 +3,10 @@
 // The protocol surface lands before the command router that consumes it.
 #[allow(dead_code)]
 pub mod canonical_json;
+// Conformance results are verified here; no runner or production trust root is
+// supplied by this contract slice.
+#[allow(dead_code)]
+pub mod conformance;
 // The separately advertised authority companion remains a projection and
 // validation seam until dispatch adapters land.
 #[allow(dead_code)]
@@ -31,6 +35,14 @@ pub use authority::{
 #[allow(unused_imports)]
 pub use canonical_json::{canonicalize, canonicalize_without_integrity, sha256_digest, sha256_hex};
 #[allow(unused_imports)]
+pub use conformance::{
+    verify_conformance_result, ConformanceEnvironment, ConformanceProfile,
+    ConformanceProfileRequirement, ConformanceResult, ConformanceResultError,
+    ConformanceTrustPolicy, ConformanceVerificationClass, ExpectedArtifactBinding,
+    ExpectedPolicyBinding, ExpectedProtocolArtifactBinding, ExpectedRunnerBinding,
+    ExpectedSourceBinding, VerifiedConformanceResult,
+};
+#[allow(unused_imports)]
 pub use error::{ErrorCode, ErrorEnvelope};
 #[allow(unused_imports)]
 pub use types::{
@@ -40,6 +52,9 @@ pub use types::{
 
 #[cfg(test)]
 mod authority_tests;
+
+#[cfg(test)]
+mod conformance_tests;
 
 #[cfg(test)]
 mod tests {
@@ -127,6 +142,7 @@ mod tests {
             "command-envelope.schema.json",
             "error-envelope.schema.json",
             "event-envelope.schema.json",
+            "conformance-result.schema.json",
         ] {
             let path = format!("../../../../../spec/coven-automations/v1/{artifact}");
             let schema: Value = match artifact {
@@ -156,6 +172,9 @@ mod tests {
                 )),
                 "event-envelope.schema.json" => serde_json::from_str(include_str!(
                     "../../../../../spec/coven-automations/v1/event-envelope.schema.json"
+                )),
+                "conformance-result.schema.json" => serde_json::from_str(include_str!(
+                    "../../../../../spec/coven-automations/v1/conformance-result.schema.json"
                 )),
                 _ => unreachable!("artifact list is closed"),
             }

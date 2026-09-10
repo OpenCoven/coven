@@ -550,6 +550,125 @@ export interface CommandResponse<C extends CommandName = CommandName> {
 }
 
 // ---------------------------------------------------------------------------
+// Portable conformance result
+// ---------------------------------------------------------------------------
+
+export type ConformanceResultSchemaVersion = "coven.automations.conformance-result.v1";
+
+export type ConformanceProfile =
+  | "structural"
+  | "scheduler_reliability"
+  | "runtime_authority"
+  | "continuity"
+  | "privacy"
+  | "interoperability"
+  | "full";
+
+export type ConformanceStatus = "passed" | "failed" | "incomplete" | "not_applicable";
+
+export interface ConformancePolicyBinding {
+  policyId: string;
+  policyVersion: string;
+  digest: string;
+}
+
+export type ConformanceDecisionScope =
+  | { kind: "audit_only" }
+  | {
+      kind: "release_eligibility";
+      policyBinding: ConformancePolicyBinding;
+    };
+
+export interface ConformanceSourceBinding {
+  repository: string;
+  commit: string;
+}
+
+export interface ConformanceProtocolArtifactBinding {
+  bundleSchemaVersion: string;
+  sourceCommit: string;
+  bundleSha256: string;
+  contractContentSha256: string;
+  fileCount: number;
+}
+
+export interface ConformanceRunnerBinding {
+  name: string;
+  version: string;
+  artifactSha256: string;
+  vectorSetSha256: string;
+}
+
+export interface ConformanceEnvironment {
+  os: string;
+  arch: string;
+  runtime: string;
+}
+
+export interface ConformanceSuiteResult {
+  suiteId: string;
+  status: ConformanceStatus;
+  evidenceDigest?: Digest;
+}
+
+export interface ConformanceProfileResult {
+  profile: ConformanceProfile;
+  status: ConformanceStatus;
+  requiredSuites: string[];
+  suiteResults: ConformanceSuiteResult[];
+}
+
+export interface ConformanceResultStatementBase {
+  contractProfile: SchemaVersion;
+  resultId: string;
+  source: ConformanceSourceBinding;
+  protocolArtifact: ConformanceProtocolArtifactBinding;
+  runner: ConformanceRunnerBinding;
+  environment: ConformanceEnvironment;
+  observedAt: Timestamp;
+  profileResults: ConformanceProfileResult[];
+  overallStatus: ConformanceStatus;
+}
+
+export interface ConformanceAuditOnlyStatement extends ConformanceResultStatementBase {
+  decisionScope: { kind: "audit_only" };
+  expiresAt?: Timestamp;
+}
+
+export interface ConformanceReleaseEligibilityStatement extends ConformanceResultStatementBase {
+  decisionScope: {
+    kind: "release_eligibility";
+    policyBinding: ConformancePolicyBinding;
+  };
+  expiresAt: Timestamp;
+}
+
+export type ConformanceResultStatement =
+  | ConformanceAuditOnlyStatement
+  | ConformanceReleaseEligibilityStatement;
+
+export interface ConformanceResultAuthentication {
+  method: "p256-sha256";
+  keyId: string;
+  signature: string;
+}
+
+export interface ConformanceResultEnvelopeBase {
+  schemaVersion: ConformanceResultSchemaVersion;
+  statementDigest: Digest;
+}
+
+export type ConformanceResult =
+  | (ConformanceResultEnvelopeBase & {
+      statement: ConformanceAuditOnlyStatement;
+      authentication?: ConformanceResultAuthentication;
+    })
+  | (ConformanceResultEnvelopeBase & {
+      statement: ConformanceReleaseEligibilityStatement;
+      authentication: ConformanceResultAuthentication;
+    });
+
+// ---------------------------------------------------------------------------
 // Events / changefeed
 // ---------------------------------------------------------------------------
 
