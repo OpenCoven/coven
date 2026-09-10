@@ -415,12 +415,12 @@ capability refusal. Rules:
   exact retries replay the same rejection and changed requests return
   `ADOPTION_REPLAY_MISMATCH`; rejected commands mutate no definition, revision,
   occurrence, run, or event. Legacy create/update/import behavior is unchanged.
+- Unknown values inside a supported variant are still unknown variants.
+- The negative path is also a schema property: v1 unions are closed, so an unknown variant fails schema validation before negotiation is even needed; producers that relax schema validation in future profiles still refuse at the capability layer.
 
 This slice does not implement the rich `AutomationDefinition` persistence
 boundary, the remaining normative commands, broader changefeed work, or
 cross-repository canaries required to complete #855.
-- Unknown values inside a supported variant are still unknown variants.
-- The negative path is also a schema property: v1 unions are closed, so an unknown variant fails schema validation before negotiation is even needed; producers that relax schema validation in future profiles still refuse at the capability layer.
 
 ## Canonicalization and digests
 

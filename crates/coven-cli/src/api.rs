@@ -17812,7 +17812,11 @@ pub(crate) mod tests {
                 "timeoutMinutes": 30,
                 "runtime": "coven-code",
                 "prompt": "Must not be stored.",
-                "action": {"variant": "pipeline"}
+                "action": {
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "First step"}]
+                }
             }
         });
         let response = handle_request_with_body(

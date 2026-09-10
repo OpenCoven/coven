@@ -331,19 +331,16 @@ fn trigger_hint_is_well_formed(value: &Value) -> bool {
     let Some(trigger) = value.as_object() else {
         return false;
     };
-    if !has_only_fields(trigger, &["variant", "version", "schedule"]) {
-        return false;
-    }
     let Some(variant) = trigger.get("variant").and_then(Value::as_str) else {
         return false;
     };
-    if variant.trim().is_empty()
-        || !optional_version_is_well_formed(trigger.get("version"))
-        || !optional_schedule_is_well_formed(trigger.get("schedule"))
-    {
-        return false;
+    if variant != "schedule" {
+        return unsupported_union_hint_is_well_formed(trigger);
     }
-    true
+    has_only_fields(trigger, &["variant", "version", "schedule"])
+        && !variant.trim().is_empty()
+        && optional_version_is_well_formed(trigger.get("version"))
+        && optional_schedule_is_well_formed(trigger.get("schedule"))
 }
 
 fn optional_schedule_is_well_formed(schedule: Option<&Value>) -> bool {
@@ -365,12 +362,7 @@ fn conditions_hint_is_well_formed(value: &Value) -> bool {
             let Some(condition) = condition.as_object() else {
                 return false;
             };
-            has_only_fields(condition, &["variant", "version"])
-                && condition
-                    .get("variant")
-                    .and_then(Value::as_str)
-                    .is_some_and(|variant| !variant.trim().is_empty())
-                && optional_version_is_well_formed(condition.get("version"))
+            unsupported_union_hint_is_well_formed(condition)
         })
     })
 }
@@ -379,20 +371,25 @@ fn action_hint_is_well_formed(value: &Value) -> bool {
     let Some(action) = value.as_object() else {
         return false;
     };
-    if !has_only_fields(action, &["variant", "version", "prompt", "cwd"]) {
-        return false;
-    }
     let Some(variant) = action.get("variant").and_then(Value::as_str) else {
         return false;
     };
-    if variant.trim().is_empty()
-        || !optional_version_is_well_formed(action.get("version"))
-        || !optional_string_is_well_formed(action.get("prompt"))
-        || !optional_string_is_well_formed(action.get("cwd"))
-    {
-        return false;
+    if variant != "familiarInvocation" {
+        return unsupported_union_hint_is_well_formed(action);
     }
-    true
+    has_only_fields(action, &["variant", "version", "prompt", "cwd"])
+        && !variant.trim().is_empty()
+        && optional_version_is_well_formed(action.get("version"))
+        && optional_string_is_well_formed(action.get("prompt"))
+        && optional_string_is_well_formed(action.get("cwd"))
+}
+
+fn unsupported_union_hint_is_well_formed(union: &Map<String, Value>) -> bool {
+    union
+        .get("variant")
+        .and_then(Value::as_str)
+        .is_some_and(|variant| !variant.trim().is_empty())
+        && optional_version_is_well_formed(union.get("version"))
 }
 
 fn policies_hint_is_well_formed(value: &Value) -> bool {
@@ -683,6 +680,65 @@ mod tests {
             ),
         ] {
             assert_variant(definition, expected);
+        }
+    }
+
+    #[test]
+    fn unsupported_union_payloads_do_not_require_supported_variant_fields() {
+        for (key, definition, expected) in [
+            (
+                "trigger",
+                json!({"trigger": {
+                    "variant": "webhook",
+                    "version": 1,
+                    "webhook": {"url": "https://example.invalid/hook"}
+                }}),
+                "trigger.webhook",
+            ),
+            (
+                "conditions",
+                json!({"conditions": [{
+                    "variant": "branch",
+                    "version": 1,
+                    "branch": {"expression": "result.ok"}
+                }]}),
+                "condition.branch",
+            ),
+            (
+                "action",
+                json!({"action": {
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "first"}]
+                }}),
+                "action.pipeline",
+            ),
+        ] {
+            assert_variant(definition.clone(), expected);
+            assert!(
+                rich_hint_is_well_formed(key, definition.get(key).unwrap()),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_union_hints_with_invalid_versions_remain_validation_errors() {
+        for (key, value) in [
+            (
+                "trigger",
+                json!({"variant": "webhook", "version": 2, "webhook": {}}),
+            ),
+            (
+                "conditions",
+                json!([{"variant": "branch", "version": "one", "branch": {}}]),
+            ),
+            (
+                "action",
+                json!({"variant": "pipeline", "version": false, "steps": []}),
+            ),
+        ] {
+            assert!(!rich_hint_is_well_formed(key, &value));
         }
     }
 
