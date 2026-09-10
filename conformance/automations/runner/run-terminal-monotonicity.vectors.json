@@ -1,0 +1,45 @@
+{
+  "schemaVersion": "coven.automations.run-terminal-monotonicity-vectors.v1",
+  "cases": [
+    {
+      "caseId": "succeeded-cannot-be-rewritten",
+      "firstStatus": "succeeded",
+      "replayStatus": "failed",
+      "expected": {
+        "firstCommitted": true,
+        "replayCommitted": false,
+        "finalStatus": "succeeded"
+      }
+    },
+    {
+      "caseId": "failed-cannot-be-rewritten",
+      "firstStatus": "failed",
+      "replayStatus": "succeeded",
+      "expected": {
+        "firstCommitted": true,
+        "replayCommitted": false,
+        "finalStatus": "failed"
+      }
+    },
+    {
+      "caseId": "cancelled-cannot-be-rewritten",
+      "firstStatus": "cancelled",
+      "replayStatus": "timed_out",
+      "expected": {
+        "firstCommitted": true,
+        "replayCommitted": false,
+        "finalStatus": "cancelled"
+      }
+    },
+    {
+      "caseId": "timed-out-cannot-be-rewritten",
+      "firstStatus": "timed_out",
+      "replayStatus": "succeeded",
+      "expected": {
+        "firstCommitted": true,
+        "replayCommitted": false,
+        "finalStatus": "timed_out"
+      }
+    }
+  ]
+}

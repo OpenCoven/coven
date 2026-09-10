@@ -2,13 +2,14 @@ use serde_json::{json, Value};
 
 use super::conformance_target::{
     capability, evaluate, TargetSuiteStatus, CAPABILITY_NEGOTIATION_SUITE,
+    RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
-fn request(vector: Value) -> Value {
+fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
         "schemaVersion": "coven.automations.conformance-suite-request.v1",
         "profile": "structural",
-        "suiteId": CAPABILITY_NEGOTIATION_SUITE,
+        "suiteId": suite_id,
         "protocolArtifact": {
             "bundleSchemaVersion": "coven.automations.bundle.v1",
             "sourceCommit": "1111111111111111111111111111111111111111",
@@ -29,15 +30,22 @@ fn request(vector: Value) -> Value {
     })
 }
 
+fn request(vector: Value) -> Value {
+    request_for(CAPABILITY_NEGOTIATION_SUITE, vector)
+}
+
 #[test]
-fn capability_advertises_only_the_native_structural_suite() {
+fn capability_advertises_the_native_structural_suites() {
     assert_eq!(
         serde_json::to_value(capability()).unwrap(),
         json!({
             "schemaVersion": "coven.automations.conformance-target-capability.v1",
             "profiles": [{
                 "profile": "structural",
-                "suites": [CAPABILITY_NEGOTIATION_SUITE]
+                "suites": [
+                    CAPABILITY_NEGOTIATION_SUITE,
+                    RUN_TERMINAL_MONOTONICITY_SUITE
+                ]
             }]
         })
     );
@@ -132,6 +140,67 @@ fn capability_negotiation_suite_fails_closed_on_an_expectation_mismatch() {
             }
         }]
     })))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn run_terminal_monotonicity_suite_executes_the_real_run_ledger() {
+    let response = evaluate(&request_for(
+        RUN_TERMINAL_MONOTONICITY_SUITE,
+        json!({
+            "schemaVersion": "coven.automations.run-terminal-monotonicity-vectors.v1",
+            "cases": [
+                {
+                    "caseId": "succeeded-cannot-be-rewritten",
+                    "firstStatus": "succeeded",
+                    "replayStatus": "failed",
+                    "expected": {
+                        "firstCommitted": true,
+                        "replayCommitted": false,
+                        "finalStatus": "succeeded"
+                    }
+                },
+                {
+                    "caseId": "failed-cannot-be-rewritten",
+                    "firstStatus": "failed",
+                    "replayStatus": "succeeded",
+                    "expected": {
+                        "firstCommitted": true,
+                        "replayCommitted": false,
+                        "finalStatus": "failed"
+                    }
+                }
+            ]
+        }),
+    ))
+    .unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 2);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn run_terminal_monotonicity_suite_fails_closed_on_an_expectation_mismatch() {
+    let response = evaluate(&request_for(
+        RUN_TERMINAL_MONOTONICITY_SUITE,
+        json!({
+            "schemaVersion": "coven.automations.run-terminal-monotonicity-vectors.v1",
+            "cases": [{
+                "caseId": "rewrite-wrongly-expected",
+                "firstStatus": "failed",
+                "replayStatus": "succeeded",
+                "expected": {
+                    "firstCommitted": true,
+                    "replayCommitted": true,
+                    "finalStatus": "succeeded"
+                }
+            }]
+        }),
+    ))
     .unwrap();
 
     assert_eq!(response.status, TargetSuiteStatus::Failed);
