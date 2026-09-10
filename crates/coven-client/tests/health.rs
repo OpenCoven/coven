@@ -894,6 +894,41 @@ fn discovers_only_an_owner_local_unix_socket() {
     assert!(endpoint.is_owner_local());
 }
 
+#[test]
+fn discovery_retains_published_socket_when_staging_link_is_removed() {
+    use std::{
+        io::{Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+
+    let home = TestHome::new();
+    let staged = home.path.join(".staged");
+    let published = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&staged).expect("bind staged daemon socket");
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o600)).expect("protect staged socket");
+    fs::hard_link(&staged, &published).expect("publish private daemon socket");
+
+    let endpoint = DaemonEndpoint::discover(&home.path).expect("discover published socket");
+    fs::remove_file(&staged).expect("remove staging alias after discovery");
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept through published socket");
+        let mut request = String::new();
+        stream.read_to_string(&mut request).expect("read health");
+        assert!(request.starts_with("GET /api/v1/health HTTP/1.1\r\n"));
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{HEALTH}",
+            HEALTH.len()
+        )
+        .expect("respond through published socket");
+    });
+    let mut client = DaemonClient::new(endpoint);
+    client
+        .health()
+        .expect("staging cleanup must not invalidate the selected published endpoint");
+    server.join().expect("daemon thread");
+}
+
 #[cfg(unix)]
 #[test]
 fn reads_a_framed_health_fixture_without_waiting_for_socket_close() {
