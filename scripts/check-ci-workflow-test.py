@@ -99,15 +99,27 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("name: Upload Threads daemon evidence", windows)
         self.assertIn("if: ${{ always() }}", windows)
         job_config, steps = windows.split("\n    steps:\n", 1)
+        artifact_root = "${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}"
+        initialization = steps.split(
+            "- name: Configure Threads evidence directory\n", 1
+        )[1].split("\n      - ", 1)[0]
+        self.assertIn(f"COVEN_THREADS_E2E_ARTIFACT_ROOT: {artifact_root}", initialization)
+        self.assertIn("shell: pwsh", initialization)
         self.assertIn(
-            "COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ github.workspace }}/../threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}",
-            job_config,
+            '"COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV',
+            initialization,
         )
-        self.assertNotIn("COVEN_THREADS_E2E_ARTIFACT_ROOT:", steps)
+        self.assertLess(
+            steps.index("- name: Configure Threads evidence directory"),
+            steps.index("- uses: actions/cache@"),
+        )
+        self.assertEqual(steps.count("COVEN_THREADS_E2E_ARTIFACT_ROOT:"), 1)
         self.assertNotIn("runner.", job_config)
-        self.assertIn("path: ${{ env.COVEN_THREADS_E2E_ARTIFACT_ROOT }}", steps)
+        self.assertNotIn("COVEN_THREADS_E2E_ARTIFACT_ROOT:", job_config)
+        self.assertNotIn("/../", windows)
         self.assertNotIn("path: target/e2e-artifacts/", steps)
         upload = steps.split("- name: Upload Threads daemon evidence\n", 1)[1]
+        self.assertIn(f"path: {artifact_root}", upload)
         self.assertIn("if: ${{ always() }}", upload)
         self.assertIn("if-no-files-found: error", upload)
         self.assertIn("retention-days: 14", windows)

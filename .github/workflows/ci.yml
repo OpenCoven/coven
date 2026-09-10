@@ -257,11 +257,15 @@ jobs:
     # A cold workspace run took 16 minutes; leave bounded room for the
     # separate clock-feature build and real-daemon journeys.
     timeout-minutes: 30
-    env:
-      COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ github.workspace }}/../threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
+      - name: Configure Threads evidence directory
+        shell: pwsh
+        env:
+          COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          "COVEN_THREADS_E2E_ARTIFACT_ROOT=$env:COVEN_THREADS_E2E_ARTIFACT_ROOT" >> $env:GITHUB_ENV
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -283,7 +287,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: threads-daemon-windows-${{ github.sha }}
-          path: ${{ env.COVEN_THREADS_E2E_ARTIFACT_ROOT }}
+          path: ${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 14
           if-no-files-found: error
 

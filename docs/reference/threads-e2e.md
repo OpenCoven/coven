@@ -88,12 +88,14 @@ The test-only `COVEN_THREADS_E2E_ARTIFACT_ROOT` environment variable replaces
 run directories remain underneath it. It does not change the daemon's home,
 transport, or authority configuration.
 
-The Windows CI job sets this variable for all workspace and feature invocations
-to `${{ github.workspace }}/../threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}`,
-an uncached sibling of the checkout. This uses a context supported in job-level
-environment configuration and keeps evidence outside Git provenance tracking.
-The always-run upload reads exactly that
-directory and fails if no files were produced. A canceled job cannot substitute
+The Windows CI job initializes this variable through `GITHUB_ENV` before cache
+restore and all workspace and feature invocations. Its value is
+`${{ runner.temp }}/threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}`,
+outside the checkout and build cache. The runner context is used only at step
+level, where it is supported; the path has no parent-directory traversal
+segments, which artifact upload rejects.
+The always-run upload independently selects that same run/attempt directory
+and fails if no files were produced. A canceled job cannot substitute
 historical artifacts restored from the build cache. Separate run attempts use
 different roots; multiple test invocations within an attempt share the root
 but retain unique scenario directories.
