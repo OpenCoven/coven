@@ -81,4 +81,5 @@ widestring = "1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
+jsonschema = { version = "0.56.0", default-features = false, features = ["arbitrary-precision"] }
 tempfile = "3"

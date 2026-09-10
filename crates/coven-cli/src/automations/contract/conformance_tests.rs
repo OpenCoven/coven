@@ -10,8 +10,8 @@ use serde_json::{json, Value};
 
 use super::canonical_json::{canonicalize, sha256_hex, MAX_SAFE_INTEGER};
 use super::conformance::{
-    verify_conformance_result, ConformanceEnvironment, ConformanceProfile,
-    ConformanceProfileRequirement, ConformanceResult, ConformanceResultError,
+    verify_conformance_result, ConformanceDecisionScope, ConformanceEnvironment,
+    ConformanceProfile, ConformanceProfileRequirement, ConformanceResult, ConformanceResultError,
     ConformanceTrustPolicy, ConformanceVerificationClass, ExpectedArtifactBinding,
     ExpectedPolicyBinding, ExpectedProtocolArtifactBinding, ExpectedRunnerBinding,
     ExpectedSourceBinding, ExpectedSubjectArtifactBinding,
@@ -417,6 +417,94 @@ fn checked_in_schema_vectors_manifest_and_types_are_listed() {
 }
 
 #[test]
+fn checked_in_vectors_match_the_published_json_schema() {
+    let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/coven-automations/v1");
+    let schema: Value = serde_json::from_str(
+        &fs::read_to_string(spec_dir.join("conformance-result.schema.json"))
+            .expect("checked-in conformance result schema"),
+    )
+    .expect("schema JSON");
+    let common_schema: Value = serde_json::from_str(
+        &fs::read_to_string(spec_dir.join("common.schema.json")).expect("checked-in common schema"),
+    )
+    .expect("common schema JSON");
+    let vectors: Value = serde_json::from_str(
+        &fs::read_to_string(spec_dir.join("conformance-result.vectors.json"))
+            .expect("checked-in conformance result vectors"),
+    )
+    .expect("vectors JSON");
+
+    assert!(
+        jsonschema::draft202012::meta::is_valid(&schema),
+        "conformance-result schema must be valid Draft 2020-12"
+    );
+    let common_schema_id = common_schema["$id"]
+        .as_str()
+        .expect("common schema $id")
+        .to_owned();
+    let registry = jsonschema::Registry::new()
+        .add(common_schema_id, common_schema)
+        .expect("register common schema")
+        .prepare()
+        .expect("prepare schema registry");
+    let validator = jsonschema::draft202012::options()
+        .with_registry(&registry)
+        .offline()
+        .build(&schema)
+        .expect("compile conformance-result schema");
+
+    for case in vectors["cases"].as_array().expect("vector cases") {
+        assert!(
+            validator.is_valid(&case["object"]),
+            "checked-in vector must satisfy the structural schema even when it is a semantic negative case: {}",
+            case["name"]
+        );
+    }
+
+    let mut valid_release = release_result();
+    sign_result(&mut valid_release, KEY_ID, &signing_key(7));
+    assert!(validator.is_valid(&valid_release));
+
+    let mut invalid_cases = Vec::new();
+
+    let mut missing_authentication = valid_release.clone();
+    missing_authentication
+        .as_object_mut()
+        .expect("result object")
+        .remove("authentication");
+    invalid_cases.push(("release authentication", missing_authentication));
+
+    let mut missing_expiry = valid_release.clone();
+    missing_expiry["statement"]
+        .as_object_mut()
+        .expect("statement object")
+        .remove("expiresAt");
+    invalid_cases.push(("release expiry", missing_expiry));
+
+    let mut unknown_member = valid_release.clone();
+    unknown_member["statement"]["unexpected"] = json!(true);
+    invalid_cases.push(("closed statement shape", unknown_member));
+
+    let mut fractional_file_count = valid_release.clone();
+    fractional_file_count["statement"]["protocolArtifact"]["fileCount"] = json!(19.5);
+    invalid_cases.push(("integral file count", fractional_file_count));
+
+    let mut missing_passed_evidence = valid_release;
+    profile_mut(&mut missing_passed_evidence, "full")["suiteResults"][0]
+        .as_object_mut()
+        .expect("suite result object")
+        .remove("evidenceDigest");
+    invalid_cases.push(("passed-suite evidence", missing_passed_evidence));
+
+    for (name, invalid) in invalid_cases {
+        assert!(
+            !validator.is_valid(&invalid),
+            "schema must reject invalid {name}"
+        );
+    }
+}
+
+#[test]
 fn checked_in_conformance_result_vectors_match_verifier_semantics() {
     let spec_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/coven-automations/v1");
     let vectors: Value = serde_json::from_str(
@@ -455,6 +543,54 @@ fn checked_in_conformance_result_vectors_match_verifier_semantics() {
             }
             _ => panic!("unknown checked-in expectation for {name}"),
         }
+    }
+}
+
+#[test]
+fn duplicate_json_members_are_rejected_as_schema_invalid() {
+    let encoded = serde_json::to_string(&audit_result()).expect("serialize audit fixture");
+    let cases = [
+        (
+            "top-level member",
+            encoded.replacen(
+                r#""schemaVersion":"coven.automations.conformance-result.v1""#,
+                r#""schemaVersion":"coven.automations.conformance-result.v1","schemaVersion":"coven.automations.conformance-result.v1""#,
+                1,
+            ),
+        ),
+        (
+            "escaped top-level member",
+            encoded.replacen(
+                r#""schemaVersion":"coven.automations.conformance-result.v1""#,
+                r#""schemaVersion":"coven.automations.conformance-result.v1","\u0073chemaVersion":"coven.automations.conformance-result.v1""#,
+                1,
+            ),
+        ),
+        (
+            "nested member",
+            encoded.replacen(
+                r#""resultId":"fixture-conformance-result""#,
+                r#""resultId":"fixture-conformance-result","resultId":"fixture-conformance-result""#,
+                1,
+            ),
+        ),
+    ];
+
+    for (name, bytes) in cases {
+        assert_ne!(
+            bytes, encoded,
+            "duplicate fixture replacement failed: {name}"
+        );
+        assert_eq!(
+            verify_conformance_result(
+                bytes.as_bytes(),
+                &expected_binding(),
+                now(),
+                &audit_trust_policy(),
+            ),
+            Err(ConformanceResultError::SchemaInvalid),
+            "{name}"
+        );
     }
 }
 
@@ -1147,6 +1283,14 @@ fn exact_signed_release_fixture_verifies_as_release_eligibility() {
         ConformanceVerificationClass::ReleaseEligibility
     );
     assert!(verified.authentication_verified());
+    let ConformanceDecisionScope::ReleaseEligibility { policy_binding } =
+        &verified.result().statement.decision_scope
+    else {
+        panic!("verified release result must expose its policy binding");
+    };
+    assert_eq!(policy_binding.policy_id.as_str(), POLICY_ID);
+    assert_eq!(policy_binding.policy_version.as_str(), POLICY_VERSION);
+    assert_eq!(policy_binding.digest.as_str(), POLICY_DIGEST);
 }
 
 #[test]
