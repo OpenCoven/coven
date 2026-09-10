@@ -197,8 +197,10 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
                 textwrap.dedent(
                     """\
                     deb http://archive.ubuntu.com/ubuntu noble main universe
-                    deb http://security.ubuntu.com/ubuntu noble-security main universe
+                    deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] http://security.ubuntu.com/ubuntu noble-security main universe
                     deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main
+                    deb https://evilubuntu.com/ubuntu noble main
+                    deb https://third-party.example/packages stable main # ubuntu.com/ubuntu
                     """
                 ),
                 encoding="utf-8",
@@ -212,6 +214,9 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
         self.assertIn("archive.ubuntu.com/ubuntu", source_text)
         self.assertIn("security.ubuntu.com/ubuntu", source_text)
         self.assertNotIn("dl.google.com", source_text)
+        self.assertNotIn("evilubuntu.com", source_text)
+        self.assertNotIn("third-party.example", source_text)
+        self.assertIn("signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg", source_text)
 
     def test_update_failure_propagates_without_running_install(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -223,6 +228,85 @@ class NativeLinkDependencyInstallerTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 42)
         self.assertEqual(len(calls), 1)
         self.assertIn("update", calls[0])
+
+    def test_lookalike_archive_hosts_are_never_installed(self) -> None:
+        for uri in [
+            "https://evilubuntu.com/ubuntu",
+            "https://ubuntu.com.attacker.example/ubuntu",
+            "https://attacker.example/ubuntu.com/ubuntu",
+        ]:
+            for deb822 in [False, True]:
+                with self.subTest(uri=uri, deb822=deb822), tempfile.TemporaryDirectory() as directory:
+                    apt_etc_dir = pathlib.Path(directory)
+                    if deb822:
+                        self.write_deb822_ubuntu_source(apt_etc_dir)
+                        source = apt_etc_dir / "sources.list.d/ubuntu.sources"
+                        source.write_text(
+                            f"Types: deb\nURIs: {uri}\nSuites: noble\n"
+                            "Components: main\n"
+                            "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
+                            encoding="utf-8",
+                        )
+                    else:
+                        (apt_etc_dir / "sources.list").write_text(
+                            f"deb {uri} noble main\n", encoding="utf-8"
+                        )
+                    completed, calls, _sources = self.run_installer(apt_etc_dir)
+                    self.assertEqual(completed.returncode, 1, completed.stderr)
+                    self.assertEqual(calls, [])
+
+    def test_every_deb822_stanza_requires_ubuntu_uris_and_signing_metadata(self) -> None:
+        for extra in [
+            "Types: deb\nURIs: https://third-party.example/packages\nSuites: stable\n"
+            "Components: main\nSigned-By: /usr/share/keyrings/vendor.gpg\n",
+            "Types: deb\nURIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\n"
+            "Components: main\n",
+        ]:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory:
+                apt_etc_dir = pathlib.Path(directory)
+                self.write_deb822_ubuntu_source(apt_etc_dir)
+                source = apt_etc_dir / "sources.list.d/ubuntu.sources"
+                source.write_text(source.read_text(encoding="utf-8") + "\n" + extra, encoding="utf-8")
+                completed, calls, _sources = self.run_installer(apt_etc_dir)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertEqual(calls, [])
+
+    def test_every_uri_in_a_deb822_field_or_mirror_file_must_be_ubuntu(self) -> None:
+        for mirror in [False, True]:
+            with self.subTest(mirror=mirror), tempfile.TemporaryDirectory() as directory:
+                apt_etc_dir = pathlib.Path(directory)
+                self.write_deb822_ubuntu_source(apt_etc_dir)
+                uris = "http://archive.ubuntu.com/ubuntu/\n https://third-party.example/packages"
+                if mirror:
+                    mirror_file = apt_etc_dir / "apt-mirrors.txt"
+                    mirror_file.write_text(uris + "\n", encoding="utf-8")
+                    uris = f"mirror+file:{mirror_file}"
+                source = apt_etc_dir / "sources.list.d/ubuntu.sources"
+                source.write_text(
+                    f"Types: deb\nURIs: {uris}\nSuites: noble\nComponents: main\n"
+                    "Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n",
+                    encoding="utf-8",
+                )
+                completed, calls, _sources = self.run_installer(apt_etc_dir)
+                self.assertEqual(completed.returncode, 1, completed.stderr)
+                self.assertEqual(calls, [])
+
+    def test_deb822_ubuntu_uri_continuations_preserve_the_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            apt_etc_dir = pathlib.Path(directory)
+            self.write_deb822_ubuntu_source(apt_etc_dir)
+            source = apt_etc_dir / "sources.list.d/ubuntu.sources"
+            text = source.read_text(encoding="utf-8").replace(
+                "URIs: http://azure.archive.ubuntu.com/ubuntu/",
+                "URIs: http://azure.archive.ubuntu.com/ubuntu/\n"
+                " https://archive.ubuntu.com/ubuntu/",
+            )
+            source.write_text(text, encoding="utf-8")
+            completed, calls, sources = self.run_installer(apt_etc_dir)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(calls), 2)
+            self.assertIn(text, "\n".join(sources))
+            self.assertEqual(source.read_text(encoding="utf-8"), text)
 
     def test_install_failure_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
