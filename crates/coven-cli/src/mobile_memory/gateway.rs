@@ -16,13 +16,17 @@ use rustls::{ServerConfig, ServerConnection, StreamOwned};
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::assurance::{
+    AssuranceChallengeStore, AssuranceContextMode, AssuranceProofInput, PresentedAssuranceProof,
+    RequestedAssurance,
+};
 use super::audit::{append_event, MobileAuditEvent};
-use super::auth::{MobileAuthError, MobileAuthenticator, MobileRequestAuth};
+use super::auth::{AssuranceAttempt, MobileAuthError, MobileAuthenticator, MobileRequestAuth};
 use super::config::{load_mobile_config, load_mobile_config_unvalidated, MobileGatewayConfig};
 use super::contract::{
-    MobileAttestationMetadata, MobileCapabilities, MobileContentFormat, MobileEnvelope,
-    MobileErrorCode, MobileMemoryCapabilities, MobileMemoryDetail, MobileMemoryPrivacyDetail,
-    MobileMemoryPrivacySummary, MobileMemorySource, MobileMemorySummary,
+    MobileAssuranceChallenge, MobileAttestationMetadata, MobileCapabilities, MobileContentFormat,
+    MobileEnvelope, MobileErrorCode, MobileMemoryCapabilities, MobileMemoryDetail,
+    MobileMemoryPrivacyDetail, MobileMemoryPrivacySummary, MobileMemorySource, MobileMemorySummary,
     MobileMemoryVerificationDetail, MobileMemoryVerificationSummary, MobileOverview,
     MobileOverviewTotals, MobileOverviewVerification, MobileSupersession, MobileVerificationState,
 };
@@ -45,6 +49,7 @@ pub enum MobileRoute {
     Capabilities,
     Pairings,
     PairingConfirmation,
+    AssuranceChallenge,
     MemoryOverview,
     MemoryList,
     MemoryDetail,
@@ -65,6 +70,9 @@ pub fn route_request(method: &str, path: &str) -> RouteDecision {
             return method_route(method, "GET", MobileRoute::Capabilities)
         }
         "/api/v1/mobile/pairings" => return method_route(method, "POST", MobileRoute::Pairings),
+        "/api/v1/mobile/assurance/challenge" => {
+            return method_route(method, "POST", MobileRoute::AssuranceChallenge)
+        }
         "/api/v1/mobile/memory/overview" => {
             return method_route(method, "GET", MobileRoute::MemoryOverview)
         }
@@ -345,11 +353,12 @@ fn start_mobile_gateway_with_config(
         .context("failed to configure mobile gateway listener")?;
     let local_addr = listener.local_addr()?;
     let registry = Arc::new(DeviceRegistry::load(coven_home)?);
+    let challenges = AssuranceChallengeStore::load(coven_home)?;
     let state = Arc::new(MobileGatewayState {
         coven_home: coven_home.to_path_buf(),
         host_fingerprint: identity.public_key_fingerprint,
         pairing: PairingManager::new(Arc::clone(&registry)),
-        authenticator: MobileAuthenticator::new(Arc::clone(&registry)),
+        authenticator: MobileAuthenticator::with_assurance(Arc::clone(&registry), challenges),
         registry,
         advertised_endpoint: config.advertised_endpoint.clone(),
     });
@@ -694,25 +703,58 @@ fn handle_protected_route(
             return auth_error_response(error);
         }
     };
-    let verified = match state.authenticator.verify(
+    let assurance = parse_assurance_headers(&request.headers);
+    let verified = match state.authenticator.verify_with_assurance(
         &request.method,
         &request.target,
         &request.body,
         &auth,
+        assurance,
         Utc::now(),
     ) {
         Ok(verified) => verified,
         Err(error) => {
-            let event = if error == MobileAuthError::RateLimited {
-                MobileAuditEvent::RateLimited
-            } else {
-                MobileAuditEvent::AuthenticationRejected
+            let event = match error {
+                MobileAuthError::RateLimited => MobileAuditEvent::RateLimited,
+                MobileAuthError::AssuranceRequired => MobileAuditEvent::StepUpRejected,
+                _ => MobileAuditEvent::AuthenticationRejected,
             };
             let _ = append_event(&state.coven_home, Utc::now(), event, Some(auth.device_id));
             return auth_error_response(error);
         }
     };
+    match verified.assurance_attempt {
+        AssuranceAttempt::Absent => {}
+        AssuranceAttempt::Rejected => {
+            let _ = append_event(
+                &state.coven_home,
+                Utc::now(),
+                MobileAuditEvent::StepUpRejected,
+                Some(verified.device_id),
+            );
+        }
+        AssuranceAttempt::Verified => {
+            let _ = append_event(
+                &state.coven_home,
+                Utc::now(),
+                MobileAuditEvent::StepUpVerified,
+                Some(verified.device_id),
+            );
+        }
+    }
     let result: Result<serde_json::Value> = match route {
+        MobileRoute::AssuranceChallenge => {
+            match state
+                .authenticator
+                .issue_assurance_challenge(&verified, Utc::now())
+            {
+                Ok(challenge) => json_value(MobileAssuranceChallenge {
+                    challenge: URL_SAFE_NO_PAD.encode(challenge.challenge),
+                    expires_at: challenge.expires_at,
+                }),
+                Err(error) => return auth_error_response(error),
+            }
+        }
         MobileRoute::MemoryOverview => mobile_overview(&state.coven_home).and_then(json_value),
         MobileRoute::MemoryList => mobile_list(&state.coven_home).and_then(json_value),
         MobileRoute::MemoryDetail => {
@@ -748,10 +790,10 @@ fn handle_protected_route(
         }
         _ => return error_response(404, MobileErrorCode::InvalidRequest),
     };
-    if route != MobileRoute::DeviceDelete
-        && state.authenticator.ensure_still_active(&verified).is_err()
-    {
-        return error_response(403, MobileErrorCode::DeviceRevoked);
+    if route != MobileRoute::DeviceDelete {
+        if let Err(error) = state.authenticator.ensure_still_active(&verified) {
+            return auth_error_response(error);
+        }
     }
     match result {
         Ok(value) => success_response(200, value),
@@ -929,6 +971,80 @@ fn parse_auth_headers(
     })
 }
 
+fn parse_assurance_headers(headers: &HashMap<String, String>) -> AssuranceProofInput {
+    const NAMES: [&str; 6] = [
+        "x-coven-assurance-context",
+        "x-coven-assurance-challenge",
+        "x-coven-assurance-issued-at",
+        "x-coven-assurance-expires-at",
+        "x-coven-assurance-level",
+        "x-coven-assurance-signature",
+    ];
+    let present = NAMES
+        .iter()
+        .filter(|name| headers.contains_key(**name))
+        .count();
+    if present == 0 {
+        return AssuranceProofInput::Absent;
+    }
+    if present != NAMES.len() {
+        return AssuranceProofInput::Invalid;
+    }
+    let context_mode = match headers["x-coven-assurance-context"].as_str() {
+        "request" => AssuranceContextMode::Request,
+        "action" => AssuranceContextMode::Action,
+        _ => return AssuranceProofInput::Invalid,
+    };
+    let challenge = match URL_SAFE_NO_PAD
+        .decode(&headers["x-coven-assurance-challenge"])
+        .ok()
+        .and_then(|value| <[u8; 32]>::try_from(value).ok())
+    {
+        Some(challenge)
+            if URL_SAFE_NO_PAD.encode(challenge) == headers["x-coven-assurance-challenge"] =>
+        {
+            challenge
+        }
+        _ => return AssuranceProofInput::Invalid,
+    };
+    let parse_timestamp = |name: &str| {
+        let raw = &headers[name];
+        raw.parse::<DateTime<Utc>>().ok().filter(|timestamp| {
+            timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == *raw
+        })
+    };
+    let Some(issued_at) = parse_timestamp("x-coven-assurance-issued-at") else {
+        return AssuranceProofInput::Invalid;
+    };
+    let Some(expires_at) = parse_timestamp("x-coven-assurance-expires-at") else {
+        return AssuranceProofInput::Invalid;
+    };
+    let requested_assurance = match headers["x-coven-assurance-level"].as_str() {
+        "fresh_user_verification" => RequestedAssurance::FreshUserVerification,
+        "fresh_biometric" => RequestedAssurance::FreshBiometric,
+        _ => return AssuranceProofInput::Invalid,
+    };
+    let signature = &headers["x-coven-assurance-signature"];
+    let _signature_bytes = match URL_SAFE_NO_PAD.decode(signature) {
+        Ok(signature_bytes)
+            if !signature_bytes.is_empty()
+                && signature.len() <= 128
+                && URL_SAFE_NO_PAD.encode(&signature_bytes) == *signature =>
+        {
+            signature_bytes
+        }
+        _ => return AssuranceProofInput::Invalid,
+    };
+    AssuranceProofInput::Presented(PresentedAssuranceProof {
+        context_mode,
+        challenge,
+        issued_at,
+        expires_at,
+        requested_assurance,
+        signature: signature.clone(),
+    })
+}
+
 fn success_response<T: Serialize>(status: u16, data: T) -> MobileHttpResponse {
     let envelope = MobileEnvelope::success(request_id(), data);
     let body = match serde_json::to_string(&envelope) {
@@ -965,6 +1081,7 @@ fn auth_error_response(error: MobileAuthError) -> MobileHttpResponse {
         MobileAuthError::RequestExpired => (401, MobileErrorCode::RequestExpired),
         MobileAuthError::RequestReplayed => (409, MobileErrorCode::RequestReplayed),
         MobileAuthError::RateLimited => (429, MobileErrorCode::RateLimited),
+        MobileAuthError::AssuranceRequired => (403, MobileErrorCode::AssuranceRequired),
         MobileAuthError::SignatureInvalid => (401, MobileErrorCode::SignatureInvalid),
         _ => (400, MobileErrorCode::InvalidRequest),
     };
@@ -1026,9 +1143,12 @@ mod tests {
     use super::*;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use sha2::Digest;
     use std::collections::HashMap;
     use std::net::{IpAddr, UdpSocket};
 
@@ -1059,6 +1179,169 @@ mod tests {
             route_request("PATCH", "/api/v1/mobile/device"),
             RouteDecision::MethodNotAllowed("GET, DELETE")
         );
+    }
+
+    #[test]
+    fn assurance_challenge_route_is_explicit_and_possession_protected() {
+        assert_eq!(
+            route_request("POST", "/api/v1/mobile/assurance/challenge"),
+            RouteDecision::Route(MobileRoute::AssuranceChallenge)
+        );
+        assert_eq!(
+            route_request("GET", "/api/v1/mobile/assurance/challenge"),
+            RouteDecision::MethodNotAllowed("POST")
+        );
+    }
+
+    #[test]
+    fn assurance_headers_require_a_complete_canonical_set() {
+        let mut headers = HashMap::new();
+        assert_eq!(
+            parse_assurance_headers(&headers),
+            super::super::assurance::AssuranceProofInput::Absent
+        );
+        headers.insert("x-coven-assurance-context".to_owned(), "request".to_owned());
+        assert_eq!(
+            parse_assurance_headers(&headers),
+            super::super::assurance::AssuranceProofInput::Invalid
+        );
+        headers.insert(
+            "x-coven-assurance-challenge".to_owned(),
+            URL_SAFE_NO_PAD.encode([7; 32]),
+        );
+        headers.insert(
+            "x-coven-assurance-issued-at".to_owned(),
+            "2026-07-29T12:00:00.000Z".to_owned(),
+        );
+        headers.insert(
+            "x-coven-assurance-expires-at".to_owned(),
+            "2026-07-29T12:01:00.000Z".to_owned(),
+        );
+        headers.insert(
+            "x-coven-assurance-level".to_owned(),
+            "fresh_biometric".to_owned(),
+        );
+        headers.insert(
+            "x-coven-assurance-signature".to_owned(),
+            URL_SAFE_NO_PAD.encode([8; 64]),
+        );
+        assert!(matches!(
+            parse_assurance_headers(&headers),
+            super::super::assurance::AssuranceProofInput::Presented(_)
+        ));
+
+        headers.insert(
+            "x-coven-assurance-issued-at".to_owned(),
+            "2026-07-29T07:00:00.000-05:00".to_owned(),
+        );
+        assert_eq!(
+            parse_assurance_headers(&headers),
+            super::super::assurance::AssuranceProofInput::Invalid
+        );
+    }
+
+    #[test]
+    fn challenge_endpoint_remains_possession_authenticated_for_step_up_grants() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = Arc::new(DeviceRegistry::load(temp.path()).unwrap());
+        let now = Utc::now();
+        let device_id = Uuid::from_u128(1);
+        let possession_key = SigningKey::from_slice(&[1; 32]).unwrap();
+        let authorization_key = SigningKey::from_slice(&[2; 32]).unwrap();
+        let public_key_x963 = URL_SAFE_NO_PAD.encode(
+            possession_key
+                .verifying_key()
+                .to_encoded_point(false)
+                .as_bytes(),
+        );
+        let record = super::super::registry::DeviceRecord {
+            id: device_id,
+            display_name: "Synthetic phone".to_owned(),
+            public_key_x963: public_key_x963.clone(),
+            paired_at: now,
+            revoked_at: None,
+            scopes: vec![super::super::grant::DeviceScope::MemoryRead],
+        };
+        let mut grant = super::super::grant::DeviceGrant::for_device(
+            device_id,
+            &public_key_x963,
+            record.scopes.clone(),
+            now,
+        )
+        .unwrap();
+        grant.minimum_assurance = super::super::grant::AssuranceLevel::FreshBiometric;
+        registry
+            .register_with_grant_and_authorization(
+                record,
+                grant,
+                Some(super::super::assurance::NewAuthorizationKey {
+                    public_key_x963: URL_SAFE_NO_PAD.encode(
+                        authorization_key
+                            .verifying_key()
+                            .to_encoded_point(false)
+                            .as_bytes(),
+                    ),
+                    assurance_class: super::super::assurance::AssuranceClass::BiometricOnly,
+                    enrolled_at: now,
+                }),
+            )
+            .unwrap();
+        let state = MobileGatewayState {
+            coven_home: temp.path().to_path_buf(),
+            host_fingerprint: [3; 32],
+            pairing: PairingManager::new(Arc::clone(&registry)),
+            authenticator: MobileAuthenticator::with_assurance(
+                Arc::clone(&registry),
+                AssuranceChallengeStore::load(temp.path()).unwrap(),
+            ),
+            registry,
+            advertised_endpoint: "https://192.0.2.1:7443".to_owned(),
+        };
+        let path = "/api/v1/mobile/assurance/challenge";
+        let nonce = URL_SAFE_NO_PAD.encode([7; 32]);
+        let body_digest = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest([]));
+        let canonical = super::super::auth::canonical_request(
+            "POST",
+            path,
+            now.timestamp(),
+            &nonce,
+            &body_digest,
+        )
+        .unwrap();
+        let signature: Signature = possession_key.sign(&canonical);
+        let headers = HashMap::from([
+            ("x-coven-protocol".to_owned(), "1".to_owned()),
+            ("x-coven-device".to_owned(), device_id.to_string()),
+            ("x-coven-timestamp".to_owned(), now.timestamp().to_string()),
+            ("x-coven-nonce".to_owned(), nonce),
+            ("x-coven-body-sha256".to_owned(), body_digest),
+            (
+                "x-coven-signature".to_owned(),
+                URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes()),
+            ),
+        ]);
+        let response = handle_mobile_request(
+            &state,
+            MobileHttpRequest {
+                method: "POST".to_owned(),
+                target: path.to_owned(),
+                headers,
+                body: Vec::new(),
+            },
+        );
+        assert_eq!(response.status, 200);
+        let data = envelope_data(&response.body);
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(data["challenge"].as_str().unwrap())
+                .unwrap()
+                .len(),
+            32
+        );
+        assert!(temp
+            .path()
+            .join("mobile/assurance-challenges.json")
+            .exists());
     }
 
     #[test]
@@ -1277,6 +1560,7 @@ mod tests {
                 minimum: 1,
                 maximum: 1,
             },
+            step_up_authorization: None,
         }
     }
 

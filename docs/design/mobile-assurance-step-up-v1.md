@@ -1,6 +1,6 @@
 # Mobile Step-Up Assurance Proofs (`COVEN-ASSURANCE/1`)
 
-**Status:** plan / implementation contract for [#815](https://github.com/OpenCoven/coven/issues/815)
+**Status:** implemented for [#815](https://github.com/OpenCoven/coven/issues/815)
 **Parent:** `#786` (generalized device grants) · Builds on `#791` (device grants) and `#812` (pairing v2)
 **Authority owner:** Coven daemon / Rust authority layer (`crates/coven-cli/src/mobile_memory/`)
 **Compatibility:** additive. Pairing v1/v2 requests without the extension are unchanged; devices without an enrolled authorization key keep exactly today's possession-only behavior.
@@ -28,9 +28,9 @@ the effective assurance itself, and passes that value to
 No biometric material ever leaves the device; OpenCoven receives signatures
 only.
 
-This plan is a design document, not an implementation PR: it defines the wire
-bytes, state machines, storage, platform mapping, and portable vectors an
-implementation must satisfy. No behavior change ships with this document.
+This document remains the implementation contract for the shipped Rust
+authority behavior, wire bytes, state machines, storage, platform mapping, and
+portable vectors.
 
 ## Problem statement, in current code
 
@@ -192,6 +192,10 @@ enrollment have independent lifecycles:
 - At most one active (non-revoked) key per device; `subjectKeyId` reuses the
   grant's key-id convention — base64url SHA-256 over the canonical public key
   (`grant.rs:242-250`).
+- The implemented registry is bounded to 512 retained records. Reads and
+  mutations reload validated private state under process and OS file locks
+  before atomic replacement, so revocation and rotation performed through a
+  separate CLI handle are visible to an already-running daemon.
 - The subject/possession key and its `subject_key_id` stay exactly where they
   are (`DeviceRecord`, `DeviceGrant`), satisfying "store authorization-key
   metadata separately from the device subject/possession key".
@@ -266,7 +270,9 @@ A proof MUST cover a server-issued, single-use challenge:
   carries `{ "challenge": <base64url 32B>, "expiresAt": <RFC 3339> }`.
 - **Binding.** The stored record binds `device_id`, `grant_id`,
   `revocation_epoch`, `expires_at = issued + ≤120 s`, and `spent = false`.
-  Grant rotation or revocation immediately invalidates outstanding challenges.
+  The implementation additionally binds authorization-key id and key epoch so
+  authorization-key rotation immediately invalidates outstanding challenges;
+  grant rotation or revocation remains covered by the grant fields.
 - **Consumption.** Verification atomically flips `spent` under the store lock
   before returning success (same single-winner pattern as
   `auth.rs::insert_nonce`, `auth.rs:198-217`, including the bounded-map
@@ -277,6 +283,9 @@ A proof MUST cover a server-issued, single-use challenge:
   keys `(device_id, request_nonce)` and serves `COVEN-MEMORY/1` replay
   protection. Challenge state is persisted (not just in-memory) so a daemon
   restart cannot resurrect a spent challenge inside a live proof window.
+- The implemented store is bounded to 10,000 records, uses private atomic
+  replacement, and retains spent records beyond their proof window long enough
+  for the post-response state recheck.
 - **Why a server challenge.** The threat model lists "attacker with temporary
   access to an unlocked endpoint"
   (`docs/security/mobile-device-pairing-threat-model.md`). A server challenge
@@ -374,12 +383,28 @@ Rotation and revocation of the authorization key never change familiar or root
 identity (identity separation table, `docs/design/mobile-device-trust.md`,
 "Identity and credential separation"):
 
-- **Rotate** — enroll a replacement key for the device with a new `keyEpoch`
-  (same transcript-bound ceremony as initial enrollment, plus proof of
-  possession of the *old* step-up key or fresh possession-key authentication
-  per owner policy). Exactly one active key per device; the previous record is
-  retained with `revokedAt` for audit, and outstanding challenges are
-  invalidated.
+- **Rotate one device's step-up key** — there is no production owner/registry
+  primitive that accepts a raw replacement public key and assurance class.
+  Such a primitive could bypass the transcript and
+  `COVEN-STEPUP-ENROLL/1` proof or use stale cached device state. A future
+  same-device rotation route must consume verified pairing-ceremony evidence;
+  until then it fails closed and replacement uses the already-paired workflow
+  below.
+- **Re-enroll a lost or replaced possession key** — the owner CLI never accepts
+  a raw private key or unproven public key. Pair the replacement device through
+  the normal flow first, then run
+  `coven device rotate <old-device> <replacement-device>`. The authority
+  revokes the old device first, reissues its bounded grant policy against the
+  replacement device's already-proven possession key, assigns a fresh grant
+  id, and advances the replacement revocation epoch. The device-registry
+  mutation conditionally checks both snapshotted grant ids/epochs, reloads
+  under the process and file lock, preflights the replacement authorization
+  key's assurance ceiling, and writes source revocation plus replacement grant
+  atomically. The same write persists a two-device audit transition. Audit
+  delivery is idempotent and serialized with ordinary audit appends by the
+  shared process and interprocess audit-file locks. A failed append leaves a
+  retryable outbox record; acknowledgement requires the durable audit writer's
+  receipt and occurs only after all audit locks are released.
 - **Revoke the step-up key** — device falls back to possession-only; grants
   requiring more fail closed. Does not revoke the device.
 - **Revoke the device** — `registry.revoke` (`registry.rs:235-257`) cascades:
@@ -459,7 +484,7 @@ Synthetic, no live credential — same convention as
 `crates/coven-cli/tests/fixtures/mobile-memory-v1/signature-vector.json`: every
 byte string is documented as hex (the wire encodes challenges, digests, and
 signatures as unpadded base64url; the vector stores raw bytes so any
-implementation can reproduce them). An implementation PR adds this as
+implementation can reproduce them). The implementation includes this as
 `crates/coven-cli/tests/fixtures/mobile-assurance-v1/assurance-vector.json`;
 Swift/Android implementations must reproduce `canonicalProofBytesHex` exactly.
 ECDSA P-256 signatures are randomized (`k` is per-signature; neither Secure
@@ -514,7 +539,7 @@ type AssuranceContextMode = "request" | "action";
 interface StepUpAuthorizationEnrollment {   // optional MobilePairingRequest member
   publicKey: string;          // canonical P-256 X9.63, base64url
   assuranceClass: AssuranceClass;
-  enrollmentSignature?: string; // base64url DER over "COVEN-STEPUP-ENROLL/1" || transcript hash
+  enrollmentSignature: string; // required when the extension is present; base64url DER over "COVEN-STEPUP-ENROLL/1\0" || transcript hash
 }
 
 interface AssuranceProofHeaders {
@@ -602,16 +627,21 @@ interface DeviceAuthorizationKeyRecord {
 | New audit events | `StepUpVerified` / `StepUpRejected` in `MobileAuditEvent` (`audit.rs:19-28`) | Reuse `AuthenticationRejected`: loses the distinction operators need to tune step-up friction |
 | Implementation home | `crates/coven-cli/src/mobile_memory/assurance.rs` alongside `auth.rs`/`grant.rs` | A new crate: premature until the #787 relay session work forces extraction (`docs/design/mobile-device-trust.md`, "Authority boundary") |
 
-## Implementation plan (follow-up PRs)
+## Implementation map
 
-1. `assurance.rs` — canonical bytes, challenge store, verification, effective
-   assurance; adversarial tests (tamper every field, replay, cross-device,
-   cross-grant, expired, absent-key, possession-key-as-step-up).
-2. Pairing extension + authorization-key store + cascade revocation.
-3. Gateway plumbing: headers, challenge route, error codes, audit events,
-   `ensure_still_active` effective-assurance reuse.
-4. Golden-vector fixture + conformance test; platform notes validated against
-   the iOS/Android mappings above.
+1. `assurance.rs` owns canonical bytes, effective assurance, authorization-key
+   persistence, and the persistent single-use challenge store.
+2. `pairing.rs` binds the optional key/class into pairing v2, verifies the
+   required enrollment signature, and persists the key before issuing the
+   device record/grant.
+3. `auth.rs` verifies possession first, recomputes request context, verifies and
+   atomically spends step-up proofs, and retains grant/key/challenge/assurance
+   state for the post-response recheck.
+4. `gateway.rs`, `contract.rs`, and `audit.rs` provide the possession-authenticated
+   challenge route, canonical header parsing, `assurance_required`, and coarse
+   success/rejection audit events.
+5. `tests/fixtures/mobile-assurance-v1/assurance-vector.json` is the portable
+   Swift/Android/Rust conformance vector.
 
 Every implementation PR in this track passes the repository gates (`cargo fmt
 --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

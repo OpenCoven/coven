@@ -18,6 +18,10 @@ impl RequestAuthority {
     pub(crate) fn allows_ward_proposal_access(self) -> bool {
         matches!(self, Self::OwnerLocalIpc)
     }
+
+    pub(crate) fn allows_automation_receipt_access(self) -> bool {
+        matches!(self, Self::OwnerLocalIpc)
+    }
 }
 
 #[cfg(test)]
@@ -30,5 +34,7 @@ mod tests {
         assert!(RequestAuthority::OwnerLocalIpc.allows_ward_proposal_access());
         assert!(!RequestAuthority::Tcp.allows_session_launch_policy());
         assert!(!RequestAuthority::Tcp.allows_ward_proposal_access());
+        assert!(RequestAuthority::OwnerLocalIpc.allows_automation_receipt_access());
+        assert!(!RequestAuthority::Tcp.allows_automation_receipt_access());
     }
 }

@@ -40,6 +40,8 @@ pub struct SchedulerQueueStatus {
     pub running: i64,
     pub recovery_required: i64,
     pub batch_limit: usize,
+    pub planning_batch_limit: usize,
+    pub planning_after_definition_id: Option<String>,
     pub oldest_eligible_at: Option<String>,
     pub oldest_eligible_age_ms: Option<i64>,
 }
@@ -194,6 +196,10 @@ pub fn scheduler_status(conn: &Connection, now: DateTime<Utc>) -> Result<Schedul
         running,
         recovery_required,
         batch_limit: super::occurrences::SCHEDULER_PASS_BATCH_LIMIT,
+        planning_batch_limit: super::occurrences::SCHEDULER_PASS_BATCH_LIMIT,
+        planning_after_definition_id: super::occurrences::planning_cursor_definition_id(
+            &transaction,
+        )?,
         oldest_eligible_at,
         oldest_eligible_age_ms,
     };
