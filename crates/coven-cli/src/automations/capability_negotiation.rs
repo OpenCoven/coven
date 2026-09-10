@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use super::contract::types::{
-    FamiliarInvocationAction, RetryableClass, TimeoutPolicy, Timestamp, WorkingDirectory,
+    BackoffPolicy, BackoffSeconds, ConcurrencyPolicy, DeliveryPolicy, FamiliarInvocationAction,
+    MaximumAttempts, MisfirePolicy, RetryableClass, TimeoutPolicy, Timestamp,
 };
 use super::definition::{RoutineDefinition, RoutineTimezone};
 use super::rrule::parse_rrule;
@@ -78,7 +79,7 @@ pub fn preflight_definition(definition: &Value) -> Option<UnsupportedVariant> {
     preflight_definition_with_profile(definition, capability_profile())
 }
 
-fn preflight_definition_with_profile(
+pub(super) fn preflight_definition_with_profile(
     definition: &Value,
     profile: &CapabilityProfile,
 ) -> Option<UnsupportedVariant> {
@@ -87,7 +88,12 @@ fn preflight_definition_with_profile(
     if let Some(trigger) = definition.get("trigger").and_then(Value::as_object) {
         if let Some(variant) = trigger.get("variant").and_then(Value::as_str) {
             if !supports(&profile.supported.triggers, variant) {
-                return unsupported_from_component(profile, "trigger", variant, false);
+                return unsupported_from_component(
+                    profile,
+                    "trigger",
+                    variant,
+                    UnsupportedComponentStyle::Union,
+                );
             }
             if variant == "schedule" {
                 if let Some(schedule) = trigger.get("schedule").and_then(Value::as_object) {
@@ -116,9 +122,12 @@ fn preflight_definition_with_profile(
                 .and_then(Value::as_str)
             {
                 if !supports(&profile.supported.conditions, variant) {
-                    if let Some(unsupported) =
-                        unsupported_from_component(profile, "condition", variant, false)
-                    {
+                    if let Some(unsupported) = unsupported_from_component(
+                        profile,
+                        "condition",
+                        variant,
+                        UnsupportedComponentStyle::Union,
+                    ) {
                         return Some(unsupported);
                     }
                 }
@@ -129,7 +138,12 @@ fn preflight_definition_with_profile(
     if let Some(action) = definition.get("action").and_then(Value::as_object) {
         if let Some(variant) = action.get("variant").and_then(Value::as_str) {
             if !supports(&profile.supported.actions, variant) {
-                return unsupported_from_component(profile, "action", variant, false);
+                return unsupported_from_component(
+                    profile,
+                    "action",
+                    variant,
+                    UnsupportedComponentStyle::Union,
+                );
             }
         }
     }
@@ -142,7 +156,12 @@ fn preflight_definition_with_profile(
             .and_then(Value::as_str)
         {
             if !supports_exact_value(&profile.supported.trigger_policies, "misfire", disposition) {
-                return unsupported_from_component(profile, "misfire", disposition, false);
+                return unsupported_from_component(
+                    profile,
+                    "misfire",
+                    disposition,
+                    UnsupportedComponentStyle::Policy,
+                );
             }
         }
         if let Some(overlap) = policies
@@ -152,7 +171,12 @@ fn preflight_definition_with_profile(
             .and_then(Value::as_str)
         {
             if !supports_exact_value(&profile.supported.trigger_policies, "overlap", overlap) {
-                return unsupported_from_component(profile, "overlap", overlap, false);
+                return unsupported_from_component(
+                    profile,
+                    "overlap",
+                    overlap,
+                    UnsupportedComponentStyle::Policy,
+                );
             }
         }
         if let Some(backoff) = policies
@@ -166,7 +190,12 @@ fn preflight_definition_with_profile(
                 "retry.backoff",
                 backoff,
             ) {
-                return unsupported_from_component(profile, "retry.backoff", backoff, false);
+                return unsupported_from_component(
+                    profile,
+                    "retry.backoff",
+                    backoff,
+                    UnsupportedComponentStyle::Policy,
+                );
             }
         }
         if let Some(retryable_classes) = policies
@@ -177,13 +206,8 @@ fn preflight_definition_with_profile(
             .filter(|classes| classes.iter().all(Value::is_string))
         {
             for retryable_class in retryable_classes.iter().filter_map(Value::as_str) {
-                if !retryable_class_is_supported(retryable_class) {
-                    return unsupported_from_component(
-                        profile,
-                        "retry.safe-classes",
-                        retryable_class,
-                        false,
-                    );
+                if let Some(unsupported) = unsupported_retryable_class(profile, retryable_class) {
+                    return Some(unsupported);
                 }
             }
         }
@@ -199,7 +223,12 @@ fn preflight_definition_with_profile(
                         "outputTarget",
                         mode,
                     ) {
-                        return unsupported_from_component(profile, "outputTarget", mode, false);
+                        return unsupported_from_component(
+                            profile,
+                            "outputTarget",
+                            mode,
+                            UnsupportedComponentStyle::Policy,
+                        );
                     }
                 }
             }
@@ -221,7 +250,7 @@ fn preflight_definition_with_profile(
                             profile,
                             "retention",
                             classification,
-                            false,
+                            UnsupportedComponentStyle::Policy,
                         );
                     }
                 }
@@ -231,12 +260,22 @@ fn preflight_definition_with_profile(
 
     if let Some(misfire) = definition.get("misfire").and_then(Value::as_str) {
         if !supports_exact_value(&profile.supported.trigger_policies, "misfire", misfire) {
-            return unsupported_from_component(profile, "misfire", misfire, false);
+            return unsupported_from_component(
+                profile,
+                "misfire",
+                misfire,
+                UnsupportedComponentStyle::Policy,
+            );
         }
     }
     if let Some(overlap) = definition.get("overlap").and_then(Value::as_str) {
         if !supports_exact_value(&profile.supported.trigger_policies, "overlap", overlap) {
-            return unsupported_from_component(profile, "overlap", overlap, false);
+            return unsupported_from_component(
+                profile,
+                "overlap",
+                overlap,
+                UnsupportedComponentStyle::Policy,
+            );
         }
     }
     if let Some(backoff) = definition
@@ -250,7 +289,12 @@ fn preflight_definition_with_profile(
             "retry.backoff",
             backoff,
         ) {
-            return unsupported_from_component(profile, "retry.backoff", backoff, false);
+            return unsupported_from_component(
+                profile,
+                "retry.backoff",
+                backoff,
+                UnsupportedComponentStyle::Policy,
+            );
         }
     }
     if let Some(retryable_classes) = definition
@@ -261,13 +305,8 @@ fn preflight_definition_with_profile(
         .filter(|classes| classes.iter().all(Value::is_string))
     {
         for retryable_class in retryable_classes.iter().filter_map(Value::as_str) {
-            if !retryable_class_is_supported(retryable_class) {
-                return unsupported_from_component(
-                    profile,
-                    "retry.safe-classes",
-                    retryable_class,
-                    false,
-                );
+            if let Some(unsupported) = unsupported_retryable_class(profile, retryable_class) {
+                return Some(unsupported);
             }
         }
     }
@@ -336,7 +375,7 @@ fn neutralize_flat_unsupported_values(
         .and_then(Value::as_str)
         .is_some_and(|misfire| {
             !supports_exact_value(&profile.supported.trigger_policies, "misfire", misfire)
-                && unsupported_component(misfire, false).is_some()
+                && unsupported_component(misfire, UnsupportedComponentStyle::Policy).is_some()
         })
     {
         definition.insert("misfire".to_owned(), Value::String("latest".to_owned()));
@@ -346,7 +385,7 @@ fn neutralize_flat_unsupported_values(
         .and_then(Value::as_str)
         .is_some_and(|overlap| {
             !supports_exact_value(&profile.supported.trigger_policies, "overlap", overlap)
-                && unsupported_component(overlap, false).is_some()
+                && unsupported_component(overlap, UnsupportedComponentStyle::Policy).is_some()
         })
     {
         definition.insert("overlap".to_owned(), Value::String("forbid".to_owned()));
@@ -360,7 +399,7 @@ fn neutralize_flat_unsupported_values(
                     &profile.supported.trigger_policies,
                     "retry.backoff",
                     backoff,
-                ) && unsupported_component(backoff, false).is_some()
+                ) && unsupported_component(backoff, UnsupportedComponentStyle::Policy).is_some()
             })
         {
             retry.insert("backoffPolicy".to_owned(), Value::String("none".to_owned()));
@@ -372,8 +411,7 @@ fn neutralize_flat_unsupported_values(
         {
             for retryable_class in retryable_classes {
                 let should_neutralize = retryable_class.as_str().is_some_and(|retryable_class| {
-                    !retryable_class.trim().is_empty()
-                        && !retryable_class_is_supported(retryable_class)
+                    unsupported_retryable_class(profile, retryable_class).is_some()
                 });
                 if should_neutralize {
                     *retryable_class = Value::String("transient_dispatch".to_owned());
@@ -505,7 +543,9 @@ fn unsupported_union_hint_is_well_formed(union: &Map<String, Value>) -> bool {
     union
         .get("variant")
         .and_then(Value::as_str)
-        .is_some_and(|variant| !variant.trim().is_empty())
+        .is_some_and(|variant| {
+            unsupported_component(variant, UnsupportedComponentStyle::Union).is_some()
+        })
         && union.get("version").is_some_and(is_version_one)
 }
 
@@ -528,8 +568,8 @@ fn policies_hint_is_well_formed(value: &Value) -> bool {
         && policies.iter().all(|(key, value)| match key.as_str() {
             "timeout" => timeout_hint_is_well_formed(value),
             "retry" => retry_hint_is_well_formed(value),
-            "concurrency" => single_string_field_is_well_formed(value, "overlap"),
-            "misfire" => single_string_field_is_well_formed(value, "disposition"),
+            "concurrency" => concurrency_hint_is_well_formed(value),
+            "misfire" => misfire_hint_is_well_formed(value),
             "delivery" => delivery_hint_is_well_formed(value),
             "retention" => retention_hint_is_well_formed(value),
             _ => false,
@@ -544,37 +584,44 @@ fn retry_hint_is_well_formed(value: &Value) -> bool {
     let Some(retry) = value.as_object() else {
         return false;
     };
-    if retry.is_empty()
-        || !has_only_fields(
-            retry,
-            &[
-                "maxAttempts",
-                "backoffPolicy",
-                "backoffSeconds",
-                "retryableClasses",
-            ],
-        )
-        || !retry
-            .get("maxAttempts")
-            .and_then(Value::as_u64)
-            .is_some_and(|attempts| (1..=10).contains(&attempts))
-        || retry
-            .get("backoffPolicy")
-            .and_then(Value::as_str)
-            .is_none_or(|backoff| backoff.trim().is_empty())
-        || !retry.get("backoffSeconds").is_none_or(|value| {
-            value
-                .as_u64()
-                .is_some_and(|seconds| (1..=86_400).contains(&seconds))
-        })
+    if !has_only_fields(
+        retry,
+        &[
+            "maxAttempts",
+            "backoffPolicy",
+            "backoffSeconds",
+            "retryableClasses",
+        ],
+    ) {
+        return false;
+    }
+
+    let Some(max_attempts) = retry.get("maxAttempts") else {
+        return false;
+    };
+    if serde_json::from_value::<MaximumAttempts>(max_attempts.clone()).is_err() {
+        return false;
+    }
+
+    let Some(backoff_policy) = retry.get("backoffPolicy").and_then(Value::as_str) else {
+        return false;
+    };
+    if unsupported_component(backoff_policy, UnsupportedComponentStyle::Policy).is_none() {
+        return false;
+    }
+    let parsed_backoff =
+        serde_json::from_value::<BackoffPolicy>(Value::String(backoff_policy.to_owned())).ok();
+
+    let backoff_seconds = retry.get("backoffSeconds");
+    if backoff_seconds
+        .is_some_and(|value| serde_json::from_value::<BackoffSeconds>(value.clone()).is_err())
     {
         return false;
     }
-    if retry.get("backoffPolicy").and_then(Value::as_str) == Some("fixed")
-        && retry.get("backoffSeconds").is_none()
-    {
+    if parsed_backoff == Some(BackoffPolicy::Fixed) && backoff_seconds.is_none() {
         return false;
     }
+
     let Some(retryable_classes) = retry.get("retryableClasses") else {
         return true;
     };
@@ -585,26 +632,24 @@ fn retry_hint_is_well_formed(value: &Value) -> bool {
     retryable_classes.iter().all(|value| {
         value
             .as_str()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|value| retryable_class_value_is_well_formed(value))
             .is_some_and(|value| unique.insert(value))
     })
 }
 
+fn concurrency_hint_is_well_formed(value: &Value) -> bool {
+    serde_json::from_value::<ConcurrencyPolicy>(value.clone()).is_ok()
+}
+
+fn misfire_hint_is_well_formed(value: &Value) -> bool {
+    serde_json::from_value::<MisfirePolicy>(value.clone()).is_ok()
+}
+
 fn delivery_hint_is_well_formed(value: &Value) -> bool {
-    let Some(delivery) = value.as_object() else {
+    let Ok(delivery) = serde_json::from_value::<DeliveryPolicy>(value.clone()) else {
         return false;
     };
-    if !has_only_fields(delivery, &["outputTarget", "mode"])
-        || !delivery.get("outputTarget").is_none_or(|output_target| {
-            serde_json::from_value::<WorkingDirectory>(output_target.clone()).is_ok()
-        })
-        || delivery
-            .get("mode")
-            .is_some_and(|mode| mode.as_str().is_none_or(|mode| mode.trim().is_empty()))
-    {
-        return false;
-    }
-    delivery.get("outputTarget").is_none() || delivery.get("mode").is_some()
+    delivery.output_target.is_none() || delivery.mode.is_some()
 }
 
 fn retention_hint_is_well_formed(value: &Value) -> bool {
@@ -624,23 +669,14 @@ fn retention_class_is_well_formed(value: &Value) -> bool {
         && retention_class
             .get("classification")
             .and_then(Value::as_str)
-            .is_some_and(|classification| !classification.trim().is_empty())
+            .is_some_and(|classification| {
+                unsupported_component(classification, UnsupportedComponentStyle::Policy).is_some()
+            })
         && retention_class
             .get("deleteAfter")
             .is_none_or(|delete_after| {
                 serde_json::from_value::<Timestamp>(delete_after.clone()).is_ok()
             })
-}
-
-fn single_string_field_is_well_formed(value: &Value, field: &str) -> bool {
-    let Some(object) = value.as_object() else {
-        return false;
-    };
-    has_only_fields(object, &[field])
-        && object
-            .get(field)
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
 }
 
 fn has_only_fields(object: &Map<String, Value>, allowed: &[&str]) -> bool {
@@ -651,8 +687,33 @@ fn is_version_one(value: &Value) -> bool {
     value.as_u64() == Some(1)
 }
 
-fn retryable_class_is_supported(value: &str) -> bool {
+fn retryable_class_is_supported(profile: &CapabilityProfile, value: &str) -> bool {
+    supports(&profile.supported.trigger_policies, "retry.safe-classes")
+        && serde_json::from_value::<RetryableClass>(Value::String(value.to_owned())).is_ok()
+}
+
+fn retryable_class_value_is_well_formed(value: &str) -> bool {
     serde_json::from_value::<RetryableClass>(Value::String(value.to_owned())).is_ok()
+        || unsupported_component(value, UnsupportedComponentStyle::Policy).is_some()
+}
+
+fn unsupported_retryable_class(
+    profile: &CapabilityProfile,
+    value: &str,
+) -> Option<UnsupportedVariant> {
+    if !retryable_class_value_is_well_formed(value) || retryable_class_is_supported(profile, value)
+    {
+        return None;
+    }
+    if !supports(&profile.supported.trigger_policies, "retry.safe-classes") {
+        return Some(unsupported(profile, "retry.safe-classes".to_owned()));
+    }
+    unsupported_from_component(
+        profile,
+        "retry.safe-classes",
+        value,
+        UnsupportedComponentStyle::Policy,
+    )
 }
 
 fn schedule_timezone_variant(value: &Value) -> Option<&'static str> {
@@ -670,7 +731,6 @@ fn supports(variants: &[VariantCapability], variant: &str) -> bool {
 }
 
 fn supports_exact_value(variants: &[VariantCapability], prefix: &str, value: &str) -> bool {
-    let value = value.trim();
     !value.is_empty() && supports(variants, &format!("{prefix}.{value}"))
 }
 
@@ -708,31 +768,58 @@ fn unsupported_rrule_frequency(
         profile,
         "trigger.schedule.frequency",
         unsupported_rrule_frequency_value(rrule)?,
-        true,
+        UnsupportedComponentStyle::CaseInsensitive,
     )
+}
+
+#[derive(Clone, Copy)]
+enum UnsupportedComponentStyle {
+    Policy,
+    Union,
+    CaseInsensitive,
 }
 
 fn unsupported_from_component(
     profile: &CapabilityProfile,
     prefix: &str,
     value: &str,
-    lowercase: bool,
+    style: UnsupportedComponentStyle,
 ) -> Option<UnsupportedVariant> {
-    let component = unsupported_component(value, lowercase)?;
+    let component = unsupported_component(value, style)?;
     Some(unsupported(profile, format!("{prefix}.{component}")))
 }
 
-fn unsupported_component(value: &str, lowercase: bool) -> Option<String> {
-    let value = value.trim();
+fn unsupported_component(value: &str, style: UnsupportedComponentStyle) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    let component = if value.len() <= 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        if lowercase {
+
+    let mut bytes = value.bytes();
+    let first = bytes.next()?;
+    let valid = match style {
+        UnsupportedComponentStyle::Policy => {
+            first.is_ascii_lowercase()
+                && bytes.all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'-' | b'_')
+                })
+        }
+        UnsupportedComponentStyle::Union => {
+            first.is_ascii_lowercase()
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+        UnsupportedComponentStyle::CaseInsensitive => {
+            first.is_ascii_alphabetic()
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        }
+    };
+    if !valid {
+        return None;
+    }
+
+    let component = if value.len() <= 64 {
+        if matches!(style, UnsupportedComponentStyle::CaseInsensitive) {
             value.to_ascii_lowercase()
         } else {
             value.to_owned()
@@ -973,6 +1060,52 @@ mod tests {
     }
 
     #[test]
+    fn retry_safe_classes_category_gates_known_flat_and_nested_classes() {
+        let mut profile = capability_profile().clone();
+        profile
+            .supported
+            .trigger_policies
+            .retain(|supported| supported.variant != "retry.safe-classes");
+
+        for definition in [
+            json!({"retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            }}),
+            json!({"policies": {"retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            }}}),
+        ] {
+            let unsupported = preflight_definition_with_profile(&definition, &profile)
+                .expect("withdrawn retry.safe-classes category must be refused");
+            assert_eq!(unsupported.variant, "retry.safe-classes");
+        }
+    }
+
+    #[test]
+    fn retry_safe_classes_unknown_values_remain_specific_when_category_is_supported() {
+        for definition in [
+            json!({"retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["ambiguous"]
+            }}),
+            json!({"policies": {"retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["ambiguous"]
+            }}}),
+        ] {
+            let unsupported = preflight_definition_with_profile(&definition, capability_profile())
+                .expect("unknown retry class must be refused");
+            assert_eq!(unsupported.variant, "retry.safe-classes.ambiguous");
+        }
+    }
+
+    #[test]
     fn flat_retryable_classes_are_negotiated_after_structural_validation() {
         let mut definition = complete_definition();
         definition["retry"] = json!({
@@ -1109,6 +1242,142 @@ mod tests {
                 negotiate_definition(&definition).is_err(),
                 "{case} must remain a validation failure"
             );
+        }
+    }
+
+    #[test]
+    fn capability_negotiation_does_not_classify_noncanonical_policy_values() {
+        for definition in [
+            json!({"misfire": " backfill "}),
+            json!({"misfire": "Backfill"}),
+            json!({"misfire": "123"}),
+            json!({"overlap": " parallel "}),
+            json!({"retry": {"backoffPolicy": " linear "}}),
+            json!({"retry": {"retryableClasses": [" ambiguous "]}}),
+            json!({"policies": {"misfire": {"disposition": " backfill "}}}),
+            json!({"policies": {"concurrency": {"overlap": "Parallel"}}}),
+            json!({"policies": {"delivery": {
+                "outputTarget": "result.md",
+                "mode": " stream "
+            }}}),
+            json!({"policies": {"retention": {
+                "occurrenceHistory": {"classification": " extended "}
+            }}}),
+        ] {
+            assert_eq!(
+                preflight_definition(&definition),
+                None,
+                "{definition} must remain a validation concern"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_union_hints_require_exact_identifier_discriminators() {
+        for (key, value) in [
+            (
+                "trigger",
+                json!({"variant": " webhook ", "version": 1, "webhook": {}}),
+            ),
+            (
+                "conditions",
+                json!([{"variant": "Branch", "version": 1, "branch": {}}]),
+            ),
+            (
+                "action",
+                json!({"variant": "pipe line", "version": 1, "steps": []}),
+            ),
+            (
+                "trigger",
+                json!({"variant": "9webhook", "version": 1, "webhook": {}}),
+            ),
+        ] {
+            assert!(
+                !rich_hint_is_well_formed(key, &value),
+                "{key} must preserve malformed discriminators for validation"
+            );
+        }
+    }
+
+    #[test]
+    fn rich_retry_hints_require_exact_required_fields_and_conditionals() {
+        for retry in [
+            json!({"maxAttempts": 2, "backoffPolicy": "none"}),
+            json!({
+                "maxAttempts": 2,
+                "backoffPolicy": "fixed",
+                "backoffSeconds": 5
+            }),
+            json!({"maxAttempts": 2, "backoffPolicy": "exponential"}),
+            json!({"maxAttempts": 2, "backoffPolicy": "linear"}),
+        ] {
+            assert!(retry_hint_is_well_formed(&retry), "{retry}");
+        }
+
+        for retry in [
+            json!({"backoffPolicy": "none"}),
+            json!({"maxAttempts": 2}),
+            json!({"maxAttempts": 2, "backoffPolicy": ""}),
+            json!({"maxAttempts": 2, "backoffPolicy": " fixed "}),
+            json!({"maxAttempts": 2, "backoffPolicy": "Fixed"}),
+            json!({"maxAttempts": 2, "backoffPolicy": "fixed"}),
+            json!({
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "backoffSeconds": 0
+            }),
+        ] {
+            assert!(!retry_hint_is_well_formed(&retry), "{retry}");
+        }
+    }
+
+    #[test]
+    fn rich_delivery_hints_use_the_contract_shape_and_conditional() {
+        for delivery in [
+            json!({"mode": "atomic"}),
+            json!({"outputTarget": "result.md", "mode": "atomic"}),
+        ] {
+            assert!(delivery_hint_is_well_formed(&delivery), "{delivery}");
+        }
+
+        for delivery in [
+            json!({"outputTarget": "result.md"}),
+            json!({"outputTarget": 1, "mode": "atomic"}),
+            json!({"outputTarget": "result.md", "mode": "stream"}),
+            json!({"outputTarget": "result.md", "mode": " atomic "}),
+            json!({"outputTarget": "result.md", "mode": "Atomic"}),
+        ] {
+            assert!(!delivery_hint_is_well_formed(&delivery), "{delivery}");
+        }
+    }
+
+    #[test]
+    fn supported_rich_delivery_hint_is_not_accepted_as_a_flat_definition() {
+        let mut definition = complete_definition();
+        definition["policies"] = json!({
+            "delivery": {"mode": "atomic"}
+        });
+
+        assert!(
+            negotiate_definition(&definition).is_err(),
+            "a schema-valid rich hint must not become an accepted rich definition"
+        );
+    }
+
+    #[test]
+    fn rich_misfire_and_concurrency_hints_use_contract_types() {
+        assert!(policies_hint_is_well_formed(&json!({
+            "misfire": {"disposition": "latest"},
+            "concurrency": {"overlap": "forbid"}
+        })));
+
+        for policies in [
+            json!({"misfire": {"disposition": "backfill"}}),
+            json!({"misfire": {"disposition": " latest "}}),
+            json!({"concurrency": {"overlap": "parallel"}}),
+            json!({"concurrency": {"overlap": "Forbid"}}),
+        ] {
+            assert!(!policies_hint_is_well_formed(&policies), "{policies}");
         }
     }
 

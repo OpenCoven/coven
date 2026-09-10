@@ -17620,6 +17620,81 @@ pub(crate) mod tests {
                 });
                 definition
             }),
+            ("noncanonical-flat-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["misfire"] = json!(" backfill ");
+                definition
+            }),
+            ("noncanonical-rich-union-discriminator", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": " webhook ",
+                    "version": 1,
+                    "webhook": {}
+                });
+                definition
+            }),
+            ("unsupported-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": "stream"
+                    }
+                });
+                definition
+            }),
+            ("bad-rich-delivery-target", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": 7,
+                        "mode": "atomic"
+                    }
+                });
+                definition
+            }),
+            ("rich-delivery-target-missing-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": " atomic "
+                    }
+                });
+                definition
+            }),
+            ("unsupported-rich-misfire", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "misfire": {"disposition": "backfill"}
+                });
+                definition
+            }),
+            ("unsupported-rich-concurrency", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "concurrency": {"overlap": "parallel"}
+                });
+                definition
+            }),
             ("supported-rich-action-missing-version", {
                 let mut definition = complete_definition.clone();
                 definition["outputTarget"] = json!("result.md");
@@ -17645,7 +17720,7 @@ pub(crate) mod tests {
                 definition
             }),
             ("malformed-retention", {
-                let mut definition = complete_definition;
+                let mut definition = complete_definition.clone();
                 definition["outputTarget"] = json!("result.md");
                 definition["policies"] = json!({
                     "retention": {
@@ -17682,6 +17757,167 @@ pub(crate) mod tests {
                 row.get(0)
             })?;
         assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_responses_and_adoptions_do_not_expose_secret_values(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let base_definition = |id: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Secret-free validation",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored."
+            })
+        };
+        let cases = [
+            (
+                "retryable-class",
+                "SECRET_RETRYABLE_CLASS must not escape",
+                {
+                    let mut definition = base_definition("secret-retryable-class");
+                    definition["retry"] = json!({
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["SECRET_RETRYABLE_CLASS must not escape"]
+                    });
+                    definition
+                },
+            ),
+            (
+                "union-discriminator",
+                "SECRET_UNION_DISCRIMINATOR must not escape",
+                {
+                    let mut definition = base_definition("secret-union-discriminator");
+                    definition["action"] = json!({
+                        "variant": "SECRET_UNION_DISCRIMINATOR must not escape",
+                        "version": 1
+                    });
+                    definition
+                },
+            ),
+            ("timezone", "SECRET_TIMEZONE must not escape", {
+                let mut definition = base_definition("secret-timezone");
+                definition["timezone"] = json!("SECRET_TIMEZONE must not escape");
+                definition
+            }),
+            ("rrule", "SECRET_RRULE_VALUE", {
+                let mut definition = base_definition("secret-rrule");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=SECRET_RRULE_VALUE");
+                definition
+            }),
+        ];
+
+        for (case, secret, invalid_definition) in cases {
+            for command_kind in ["create", "revise"] {
+                let target_id = format!("secret-free-{command_kind}-{case}");
+                let mut definition = invalid_definition.clone();
+                definition["id"] = json!(target_id);
+
+                if command_kind == "revise" {
+                    let setup = json!({
+                        "action": "coven.automations.definition.create.v1",
+                        "adoptionKey": format!("adopt:create:secret-free-setup-{case}:0001"),
+                        "definition": base_definition(&target_id)
+                    })
+                    .to_string();
+                    let response = handle_request_with_body(
+                        "POST",
+                        "/api/v1/actions",
+                        temp_dir.path(),
+                        None,
+                        Some(&setup),
+                    )?;
+                    assert_eq!(response.status, 200, "{case}: {}", response.body);
+                }
+
+                let adoption_key = format!("adopt:{command_kind}:secret-free-{case}:0001");
+                let mut request = json!({
+                    "action": format!(
+                        "coven.automations.definition.{command_kind}.v1"
+                    ),
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(1);
+                }
+                let request = request.to_string();
+
+                let first = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(first.status, 400, "{command_kind} {case}: {}", first.body);
+                let first_body: Value = serde_json::from_str(&first.body)?;
+                assert_eq!(
+                    first_body["error"]["code"], "VALIDATION_FAILED",
+                    "{command_kind} {case}"
+                );
+                assert_eq!(
+                    first_body["error"]["message"], "automation definition failed validation",
+                    "{command_kind} {case}"
+                );
+                assert!(
+                    !first.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+                assert!(
+                    !first.body.contains("CAPABILITY_UNSUPPORTED"),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+
+                let replay = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(replay.status, 400, "{command_kind} {case}: {}", replay.body);
+                assert_eq!(
+                    replay.body, first.body,
+                    "{command_kind} {case} replay changed"
+                );
+                assert!(
+                    !replay.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    replay.body
+                );
+
+                let conn = store::open_store(&store_path(temp_dir.path()))?;
+                let adoption_json: String = conn.query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    !adoption_json.contains(secret),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+                assert!(
+                    adoption_json.contains("automation definition failed validation"),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+            }
+        }
+
         Ok(())
     }
 

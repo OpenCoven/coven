@@ -327,7 +327,7 @@ Command catalog (all names versioned in the envelope): create, revise, activate,
 
 **Idempotency storage note for implementers:** the adoption key must be persisted in the same transaction as the state change it drives (a `command_adoption` table keyed by adoption key storing the first terminal outcome, including durable domain rejections), so replays and changed-request conflicts are answerable without recomputation. A rejected key is retained: the exact rejected request returns the stored rejection, while a corrected or otherwise changed request must use a new key or receive `ADOPTION_REPLAY_MISMATCH`.
 
-The Rust authority implements this rule in `automations/command_adoption.rs`. Valid definition create, revise, and tombstone commands are normalized before adoption; their RFC 8785 request digest covers the versioned command name, payload, and `expectedRevision` where applicable. Invalid definition payloads and malformed versioned command fields use a lossless tagged JSON fingerprint before RFC 8785 hashing, so unsafe integers, missing fields, and other non-contract values receive deterministic durable rejections instead of reusable-key failures. Only a missing or structurally invalid `adoptionKey` is rejected before adoption. The versioned control-action ids `coven.automations.definition.create.v1`, `.revise.v1`, and `.tombstone.v1` require `adoptionKey`; revise/tombstone also require `expectedRevision`. Their `.get.v1` response includes `revision` and `tombstonedAt`; `.list.v1` includes `revisionById`, and `includeTombstoned: true` exposes retained tombstones through `tombstonedAtById`. Definitions persist an internal authority version: migrated and legacy-created rows begin in legacy mode, while v1 create/revise/tombstone marks a row as v1-managed. The unversioned `coven.automations.create/update/delete/list/get` actions retain their prior permissive request parsing and wire-visible missing-delete and erase/recreate behavior for legacy-mode rows, but cannot overwrite or erase a v1-managed row. Internally, legacy delete/recreate tombstones and revives the retained row with a monotonically increasing revision, preventing stale v1 CAS requests from matching a recreated identity. Legacy mutations still execute inside the append-only transactional adoption boundary. Exact versioned replays return the stored result and original `eventRef` without a second mutation or event, changed requests under a retained key return `ADOPTION_REPLAY_MISMATCH`, stale revisions return `REVISION_CONFLICT`, and versioned tombstone requests create a new tombstone revision rather than erasing the authority row. A legacy delete that reports `deleted: false` is a committed compatibility response, not a state mutation, and therefore never fabricates a lifecycle event.
+The Rust authority implements this rule in `automations/command_adoption.rs`. Versioned create and revise commands always derive their new RFC 8785 request digest from one lossless tagged `kind: wire` representation of the submitted definition, independent of parser acceptance and the current capability profile; the digest also covers the versioned command name and `expectedRevision` where applicable. Replay matching additionally recognizes the already-shipped normalized `kind: valid` digest when the current parser accepts the same body, plus the lossless `kind: invalid` and `kind: unsupported` digests for every body. This preserves prior adoptions while ensuring new adoptions never change fingerprint form when parsing or capability support evolves. Malformed versioned command fields likewise use a lossless tagged JSON fingerprint, so unsafe integers, missing fields, and other non-contract values receive deterministic durable rejections instead of reusable-key failures. Only a missing or structurally invalid `adoptionKey` is rejected before adoption. The versioned control-action ids `coven.automations.definition.create.v1`, `.revise.v1`, and `.tombstone.v1` require `adoptionKey`; revise/tombstone also require `expectedRevision`. Their `.get.v1` response includes `revision` and `tombstonedAt`; `.list.v1` includes `revisionById`, and `includeTombstoned: true` exposes retained tombstones through `tombstonedAtById`. Definitions persist an internal authority version: migrated and legacy-created rows begin in legacy mode, while v1 create/revise/tombstone marks a row as v1-managed. The unversioned `coven.automations.create/update/delete/list/get` actions retain their prior permissive request parsing and wire-visible missing-delete and erase/recreate behavior for legacy-mode rows, but cannot overwrite or erase a v1-managed row. Internally, legacy delete/recreate tombstones and revives the retained row with a monotonically increasing revision, preventing stale v1 CAS requests from matching a recreated identity. Legacy mutations still execute inside the append-only transactional adoption boundary. Exact versioned replays return the stored result and original `eventRef` without a second mutation or event, changed requests under a retained key return `ADOPTION_REPLAY_MISMATCH`, stale revisions return `REVISION_CONFLICT`, and versioned tombstone requests create a new tombstone revision rather than erasing the authority row. A legacy delete that reports `deleted: false` is a committed compatibility response, not a state mutation, and therefore never fabricates a lifecycle event.
 
 ## Errors and status mapping
 
@@ -411,24 +411,31 @@ capability refusal. Rules:
   v1 structural requirements. The schedule and familiar-invocation unions
   require `version: 1` plus their required fields; schedule RRULEs are parsed
   after neutralizing only an unsupported `FREQ`, timezone syntax is validated
-  without resolving host `local`, retry conditionals are enforced, and
-  unsupported unions require a non-empty discriminator and `version: 1`.
-  Unknown members on an unsupported union remain opaque. A nested shape
-  composed solely of supported hints still proceeds to ordinary flat
-  definition validation and is not accepted as the normative rich object.
+  without resolving host `local`, retry conditionals are enforced, delivery,
+  misfire, and concurrency reuse the Rust contract types, and unsupported
+  unions require an exact identifier discriminator plus `version: 1`. Unknown
+  members on an unsupported union remain opaque. A nested shape composed solely
+  of supported hints still proceeds to ordinary flat definition validation and
+  is not accepted as the normative rich object.
 - Malformed types, missing required fields, and malformed syntax within a
-  supported RRULE frequency remain `VALIDATION_FAILED`. Unsupported
+  supported RRULE frequency remain `VALIDATION_FAILED`. Policy lookup uses
+  exact wire values without trimming or case normalization. Unsupported
   identifiers are bounded to identifier-like ASCII components before they are
   returned, and response messages never echo nested request values.
 - Only adopted `definition.create.v1` and `definition.revise.v1` use this
   preflight. Their rejections are stored in the existing adoption ledger, so
   exact retries replay the same rejection and changed requests return
   `ADOPTION_REPLAY_MISMATCH`; rejected commands mutate no definition, revision,
-  occurrence, run, or event. Adoption canonicalization serializes the parsed
-  unresolved compatibility definition, so `timezone: local` fingerprints do
-  not depend on the daemon host. Create/revise resolve `local` only immediately
-  before persistence; resolution failures become durable `VALIDATION_FAILED`
-  outcomes. Legacy create/update/import behavior is unchanged.
+  occurrence, run, or event. New adoption canonicalization always uses the
+  lossless `kind: wire` definition fingerprint without consulting parser or
+  capability status. Exact retries also recognize all prior definition digest
+  forms: normalized `kind: valid` when the current parser accepts the body and
+  lossless `kind: invalid` or `kind: unsupported` for every body. Create/revise
+  resolve `local` only immediately before persistence. Parser and persistence
+  validation failures become durable `VALIDATION_FAILED` outcomes with the
+  static message `automation definition failed validation`, so immediate,
+  replayed, and stored adoption responses do not echo submitted values. Legacy
+  create/update/import behavior is unchanged.
 - Unknown values inside a supported variant are still unknown variants.
 - The negative path is also a schema property: v1 unions are closed, so an unknown variant fails schema validation before negotiation is even needed; producers that relax schema validation in future profiles still refuse at the capability layer.
 
