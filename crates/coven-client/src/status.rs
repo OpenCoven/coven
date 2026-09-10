@@ -394,6 +394,100 @@ mod tests {
         assert!(!path.exists());
     }
 
+    fn trace_creation_descriptor_matrix(directory: &Path, sid: &str, context: &str) {
+        use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+            Security::{
+                Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SECURITY_ATTRIBUTES,
+            },
+            Storage::FileSystem::{
+                CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+        };
+
+        for (label, sddl, access) in [
+            ("inherited", None, GENERIC_WRITE),
+            ("owner", Some(format!("O:{sid}")), GENERIC_WRITE),
+            (
+                "ow-default",
+                Some("D:P(A;;GA;;;OW)".to_owned()),
+                GENERIC_WRITE,
+            ),
+            (
+                "ow-explicit",
+                Some(format!("O:{sid}D:P(A;;GA;;;OW)")),
+                GENERIC_WRITE,
+            ),
+            (
+                "user-default",
+                Some(format!("D:P(A;;GA;;;{sid})")),
+                GENERIC_WRITE,
+            ),
+            (
+                "user-explicit",
+                Some(format!("O:{sid}D:P(A;;GA;;;{sid})")),
+                GENERIC_WRITE,
+            ),
+            ("ow-zero-access", Some(format!("O:{sid}D:P(A;;GA;;;OW)")), 0),
+        ] {
+            let mut descriptor = ptr::null_mut();
+            if let Some(sddl) = sddl {
+                let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+                assert_ne!(
+                    unsafe {
+                        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                            encoded.as_ptr(),
+                            1,
+                            &mut descriptor,
+                            ptr::null_mut(),
+                        )
+                    },
+                    0,
+                    "convert creation probe descriptor"
+                );
+            }
+            let _descriptor = LocalAllocation(descriptor);
+            let security = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor,
+                bInheritHandle: 0,
+            };
+            let path = directory.join(format!("creation-probe-{label}.tmp"));
+            let encoded: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    encoded.as_ptr(),
+                    access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    if descriptor.is_null() {
+                        ptr::null()
+                    } else {
+                        &security
+                    },
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                )
+            };
+            let error = if handle == INVALID_HANDLE_VALUE {
+                std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
+            } else {
+                drop(unsafe { std::fs::File::from_raw_handle(handle) });
+                0
+            };
+            eprintln!("creation-probe:{context}:{label}:os={error}");
+            let exists = path.try_exists().expect("inspect creation probe existence");
+            eprintln!("creation-probe:{context}:{label}:exists={exists}");
+            if exists {
+                std::fs::remove_file(path).expect("remove creation probe file");
+            }
+        }
+    }
+
     #[test]
     fn status_replacement_succeeds_with_inherited_modify_only_owner_rights() {
         use std::os::windows::ffi::OsStrExt;
@@ -468,6 +562,21 @@ mod tests {
             0,
             "apply isolated fixture ACL"
         );
+
+        // Prove the directory still permits ordinary creation before attributing
+        // a denial to the explicit security descriptor used by the writer.
+        let control_path = home.0.join("inherited-create-control.tmp");
+        let control = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&control_path)
+            .expect("ordinary creation under inherited modify-only rights");
+        drop(control);
+        std::fs::remove_file(&control_path).expect("remove inherited creation control");
+
+        let ordinary = TestHome::new();
+        trace_creation_descriptor_matrix(&ordinary.0, &sid, "ordinary");
+        trace_creation_descriptor_matrix(&home.0, &sid, "restricted");
 
         write_owner_only_windows_daemon_status(&home.0, b"first")
             .expect("create secure status under inherited modify-only rights");
