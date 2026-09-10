@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub const DEVICE_GRANT_VERSION: u16 = 1;
 pub const DEVICE_ACTION_VERSION: u16 = 1;
+pub const MAX_DEVICE_GRANT_LIFETIME_DAYS: i64 = 365;
 const MAX_ACTION_LIFETIME_SECONDS: i64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -126,6 +127,36 @@ impl DeviceGrant {
         Ok(grant)
     }
 
+    pub fn reissue(
+        &self,
+        public_key_x963: &str,
+        scopes: Vec<DeviceScope>,
+        restrictions: DeviceGrantRestrictions,
+        minimum_assurance: AssuranceLevel,
+        issued_at: DateTime<Utc>,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Self, GrantError> {
+        let revocation_epoch = self
+            .revocation_epoch
+            .checked_add(1)
+            .ok_or(GrantError::RevocationEpochOverflow)?;
+        let grant = Self {
+            version: DEVICE_GRANT_VERSION,
+            id: Uuid::new_v4(),
+            subject_key_id: subject_key_id(public_key_x963)?,
+            audience: DeviceGrantAudience::LocalCovenAuthority,
+            scopes,
+            restrictions,
+            minimum_assurance,
+            issued_at,
+            not_before: issued_at,
+            expires_at: Some(expires_at),
+            revocation_epoch,
+        };
+        grant.validate(public_key_x963)?;
+        Ok(grant)
+    }
+
     pub fn validate(&self, public_key_x963: &str) -> Result<(), GrantError> {
         if self.version != DEVICE_GRANT_VERSION {
             return Err(GrantError::InvalidVersion);
@@ -148,6 +179,10 @@ impl DeviceGrant {
                 .expires_at
                 .as_ref()
                 .is_some_and(|expires_at| expires_at <= &self.not_before)
+            || self.expires_at.as_ref().is_some_and(|expires_at| {
+                expires_at.signed_duration_since(self.issued_at)
+                    > chrono::Duration::days(MAX_DEVICE_GRANT_LIFETIME_DAYS)
+            })
         {
             return Err(GrantError::InvalidTimeWindow);
         }
@@ -202,6 +237,7 @@ pub enum GrantError {
     InvalidScopeSet,
     InvalidRestrictions,
     InvalidTimeWindow,
+    RevocationEpochOverflow,
     Inactive,
     ScopeDenied,
     AssuranceRequired,
@@ -216,6 +252,7 @@ impl fmt::Display for GrantError {
             Self::InvalidScopeSet => "device grant scope set is not canonical",
             Self::InvalidRestrictions => "device grant restrictions are invalid",
             Self::InvalidTimeWindow => "device grant time window is invalid",
+            Self::RevocationEpochOverflow => "device grant revocation epoch overflow",
             Self::Inactive => "device grant is not active",
             Self::ScopeDenied => "device grant does not authorize this scope",
             Self::AssuranceRequired => "device grant requires stronger assurance",
