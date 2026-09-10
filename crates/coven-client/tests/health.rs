@@ -355,6 +355,258 @@ fn negotiates_the_v1_health_contract_and_structured_errors() {
     server.join().expect("server thread");
 }
 
+#[test]
+fn raw_json_request_preserves_forbidden_response_bytes() {
+    let home = TestHome::new();
+    let body = " {\"error\":{\"code\":\"forbidden\",\"message\":\"denied\"}}\n";
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".to_owned(), 200, HEALTH.to_owned()),
+            (
+                "/api/v1/familiars/sage/edits".to_owned(),
+                403,
+                body.to_owned(),
+            ),
+        ],
+    );
+    let mut client =
+        DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+    let response = client
+        .request_json(
+            "POST",
+            "/api/v1/familiars/sage/edits",
+            Some(&serde_json::json!({"edits": []})),
+        )
+        .expect("HTTP rejection is a completed response");
+    assert_eq!(response.status, 403);
+    assert_eq!(response.body, body.as_bytes());
+    server.join().expect("daemon thread");
+}
+
+#[test]
+fn raw_json_request_preserves_root_health_identity() {
+    let home = TestHome::new();
+    let body = lifecycle_health(&lifecycle_status(&home.path));
+    let server = serve_responses(
+        &home.path,
+        vec![
+            ("/api/v1/health".to_owned(), 200, HEALTH.to_owned()),
+            ("/health".to_owned(), 200, body.clone()),
+        ],
+    );
+    let mut client =
+        DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+    let response = client
+        .request_json("GET", "/health", None)
+        .expect("read raw lifecycle health after negotiation");
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, body.as_bytes());
+    server.join().expect("daemon thread");
+}
+
+#[test]
+fn raw_json_request_rejects_truncated_response_framing() {
+    use std::{
+        io::{Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+
+    for truncated in [
+        "",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n",
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 4\r\n\r\n{}",
+    ] {
+        let home = TestHome::new();
+        let socket = home.path.join("coven.sock");
+        let listener = UnixListener::bind(&socket).expect("bind daemon");
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("protect socket");
+        let server = std::thread::spawn(move || {
+            for (path, response) in [
+                (
+                    "/api/v1/health",
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{HEALTH}",
+                        HEALTH.len()
+                    ),
+                ),
+                ("/api/v1/familiars/sage/edits", truncated.to_owned()),
+            ] {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = String::new();
+                stream.read_to_string(&mut request).expect("read request");
+                assert!(request.lines().next().unwrap().contains(path));
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        let mut client =
+            DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+        let error = client
+            .request_json("POST", "/api/v1/familiars/sage/edits", None)
+            .expect_err("a truncated 403 must not become a completed raw response");
+        assert!(
+            matches!(
+                error,
+                ClientError::InvalidHttpResponse(ref message)
+                    if message == "connection closed before response completed"
+            ),
+            "unexpected error for {truncated:?}: {error}"
+        );
+        server.join().expect("daemon thread");
+    }
+}
+
+#[test]
+fn raw_json_request_sends_method_target_and_json_without_changing_typed_capabilities() {
+    use std::{
+        io::{Read, Write},
+        os::unix::{fs::PermissionsExt, net::UnixListener},
+    };
+
+    let home = TestHome::new();
+    let socket = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&socket).expect("bind daemon");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("protect socket");
+    let health = health_with_capabilities(serde_json::json!({
+        "sessions": false,
+        "structuredErrors": true
+    }));
+    let payload = serde_json::json!({"text": "quoted \" value", "edits": []});
+    let expected_body = serde_json::to_string(&payload).expect("serialize fixture");
+    let server = std::thread::spawn(move || {
+        for expected in [
+            "GET /api/v1/health HTTP/1.1\r\n",
+            "PATCH /api/v1/familiars/sage/edits?mode=review HTTP/1.1\r\n",
+            "",
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept request");
+            let mut request = String::new();
+            stream.read_to_string(&mut request).expect("read request");
+            if expected.is_empty() {
+                assert!(
+                    request.is_empty(),
+                    "typed capability rejection leaked bytes"
+                );
+                continue;
+            }
+            assert!(
+                request.starts_with(expected),
+                "unexpected request: {request}"
+            );
+            let response = if expected.starts_with("GET") {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{health}",
+                    health.len()
+                )
+            } else {
+                assert_eq!(request.split_once("\r\n\r\n").unwrap().1, expected_body);
+                assert!(
+                    request.contains(&format!("\r\nContent-Length: {}\r\n", expected_body.len()))
+                );
+                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_owned()
+            };
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        }
+    });
+    let mut client =
+        DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+    let response = client
+        .request_json(
+            "PATCH",
+            "/api/v1/familiars/sage/edits?mode=review",
+            Some(&payload),
+        )
+        .expect("send a raw route without assuming session capabilities");
+    assert_eq!(response.status, 204);
+    assert!(response.body.is_empty());
+    assert!(matches!(
+        client.get_json::<serde_json::Value>(unpaginated_sessions_read()),
+        Err(ClientError::CapabilityUnavailable {
+            capability: "sessions"
+        })
+    ));
+    server.join().expect("daemon thread");
+}
+
+#[test]
+fn raw_json_request_rejects_invalid_method_and_target_before_io() {
+    use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+
+    let home = TestHome::new();
+    let socket = home.path.join("coven.sock");
+    let listener = UnixListener::bind(&socket).expect("bind daemon");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("protect socket");
+    listener.set_nonblocking(true).expect("nonblocking accept");
+    let mut client =
+        DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+    for (method, target) in [
+        ("", "/api/v1/health"),
+        ("GET\r\nX: injected", "/api/v1/health"),
+        ("GET POST", "/api/v1/health"),
+        ("GÉT", "/api/v1/health"),
+        ("GET", "/api/v1/health\r\nX: injected"),
+        ("GET", "/api/v1/health HTTP/1.1"),
+        ("GET", "/api/v1/health\0"),
+        ("GET", "/api/v1/health#fragment"),
+        ("GET", "http://coven/api/v1/health"),
+        ("GET", "//coven/api/v1/health"),
+        ("GET", "/api/v1"),
+        ("GET", "/other"),
+        ("POST", "/health"),
+        ("GET", "/health?extra=1"),
+        ("GET", "/health/"),
+    ] {
+        assert!(
+            matches!(
+                client.request_json(method, target, None),
+                Err(ClientError::InvalidRouteParameter(_))
+            ),
+            "invalid request was not rejected: {method:?} {target:?}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "invalid request attempted transport I/O"
+        );
+    }
+}
+
+#[test]
+fn raw_json_request_binds_peer_and_renegotiates_only_on_next_call() {
+    let home = TestHome::new();
+    let original = serve_once(&home.path, 200, HEALTH.to_owned());
+    let mut client =
+        DaemonClient::new(DaemonEndpoint::discover(&home.path).expect("discover daemon"));
+    client.health().expect("negotiate original");
+    original.join().expect("original daemon");
+    let socket = home.path.join("coven.sock");
+    fs::rename(&socket, home.path.join(".retired")).expect("retire socket");
+    let replacement = serve_responses(
+        &home.path,
+        vec![
+            ("<peer-check>".to_owned(), 200, String::new()),
+            ("/api/v1/health".to_owned(), 200, HEALTH.to_owned()),
+            (
+                "/api/v1/familiars/sage/edits".to_owned(),
+                403,
+                ERROR.to_owned(),
+            ),
+        ],
+    );
+    let error = client
+        .request_json("POST", "/api/v1/familiars/sage/edits", None)
+        .expect_err("replacement must receive no request bytes");
+    assert!(matches!(error, ClientError::DaemonInstanceChanged));
+    let response = client
+        .request_json("POST", "/api/v1/familiars/sage/edits", None)
+        .expect("a separate call renegotiates");
+    assert_eq!(response.status, 403);
+    replacement.join().expect("replacement daemon");
+}
+
 #[cfg(unix)]
 #[test]
 fn missing_sessions_capability_blocks_sessions_but_not_events() {

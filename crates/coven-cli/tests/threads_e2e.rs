@@ -1,17 +1,11 @@
-#![cfg(unix)]
-
 //! Real-daemon Threads boundary journeys with isolated state and provenance.
 //! Controlled replay coverage requires `threads-test-clock`. This suite does
 //! not certify the pending signed-authorization profile or human freeze gates.
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
-use std::net::Shutdown;
-use std::os::unix::{
-    ffi::OsStrExt,
-    net::{UnixListener, UnixStream},
-};
+#[cfg(feature = "threads-test-clock")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::thread;
@@ -935,32 +929,6 @@ fn out_of_band_reviewed_drift_is_refused_without_execution() -> Result<()> {
 }
 
 #[test]
-fn http_client_rejects_truncated_response_body() -> Result<()> {
-    let temp = tempfile::tempdir()?;
-    let listener = UnixListener::bind(temp.path().join("coven.sock"))?;
-    let server = thread::spawn(move || -> std::io::Result<()> {
-        let (mut stream, _) = listener.accept()?;
-        let mut request = Vec::new();
-        stream.read_to_end(&mut request)?;
-        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n{}")?;
-        Ok(())
-    });
-
-    let error = unix_http_request(temp.path(), "GET", "/health", None)
-        .expect_err("truncated response must fail closed");
-    server
-        .join()
-        .map_err(|_| anyhow::anyhow!("HTTP fixture thread panicked"))??;
-    anyhow::ensure!(
-        error
-            .to_string()
-            .contains("before the declared 8-byte body"),
-        "unexpected truncated-response error: {error:#}"
-    );
-    Ok(())
-}
-
-#[test]
 fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> {
     let evidence = EvidenceContext::new("same-home-daemon-lifecycle");
     let mut fixture = ThreadsFixture::start(&evidence)?;
@@ -1038,7 +1006,7 @@ fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> 
             "success daemon log leaked unsanitized fixture paths:\n{daemon_log}"
         );
         anyhow::ensure!(
-            daemon_log.contains("socket <coven-home>/coven.sock")
+            daemon_log.contains(sanitized_daemon_endpoint())
                 && !daemon_log.contains("/private<coven-home>"),
             "success daemon log did not retain the sanitized socket placeholder:\n{daemon_log}"
         );
@@ -1046,7 +1014,7 @@ fn same_home_daemon_lifecycle_helpers_survive_restart_and_crash() -> Result<()> 
         let response: Value =
             serde_json::from_slice(&fs::read(fixture.artifact_dir.join("response.json"))?)?;
         anyhow::ensure!(
-            response["body"]["daemon"]["socket"] == "<coven-home>/coven.sock",
+            response["body"]["daemon"]["socket"] == sanitized_daemon_endpoint(),
             "success response provenance did not sanitize the socket path: {response}"
         );
         Ok(())
@@ -1095,23 +1063,28 @@ fn run_clocked_journey(
 
 #[cfg(feature = "threads-test-clock")]
 fn seed_clock(coven_home: &Path, capability: &str) -> Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let root = coven_home.join("test-fixtures");
     let directory = root.join("threads-deterministic-clock");
     fs::create_dir_all(&directory)?;
-    for path in [&root, &directory] {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    #[cfg(unix)]
+    {
+        for path in [&root, &directory] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
     }
     for (name, contents) in [
         ("enabled", "threads_test_clock_v1\n"),
         ("capability", capability),
         ("state.json", r#"{"now":"2099-01-01T00:00:00Z"}"#),
     ] {
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        options
             .open(directory.join(name))?
             .write_all(contents.as_bytes())?;
     }
@@ -1566,6 +1539,8 @@ struct ThreadsFixture {
     coven: PathBuf,
     coven_home: PathBuf,
     workspace: PathBuf,
+    #[cfg(windows)]
+    pipe_names: [String; 3],
     path: OsString,
     run_id: String,
     scenario: String,
@@ -1620,6 +1595,8 @@ impl ThreadsFixture {
         fs::create_dir_all(&workspace)?;
         seed_familiar(&coven_home, &workspace)?;
         prepare(&coven_home, &workspace)?;
+        #[cfg(windows)]
+        let pipe_names = coven_client::supported_windows_pipe_names(&coven_home)?;
 
         let coven = PathBuf::from(env!("CARGO_BIN_EXE_coven"));
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -1628,6 +1605,8 @@ impl ThreadsFixture {
             coven,
             coven_home,
             workspace,
+            #[cfg(windows)]
+            pipe_names,
             path,
             run_id: evidence.run_id.clone(),
             scenario: evidence.scenario.clone(),
@@ -1648,7 +1627,12 @@ impl ThreadsFixture {
         Ok(fixture)
     }
 
-    fn request(&mut self, method: &str, path: &str, body: Option<&Value>) -> Result<HttpResponse> {
+    fn request(
+        &mut self,
+        method: &'static str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<HttpResponse> {
         let mut request = body.cloned().unwrap_or(Value::Null);
         if let Some(capability) = request.get_mut("capability") {
             *capability = json!("<fixture-capability>");
@@ -1658,9 +1642,7 @@ impl ThreadsFixture {
             "path": path,
             "body": request,
         }));
-        let serialized = body.map(Value::to_string);
-        let (status, response) =
-            unix_http_request(&self.coven_home, method, path, serialized.as_deref())?;
+        let (status, response) = daemon_http_request(&self.coven_home, method, path, body)?;
         let parsed: Value = serde_json::from_str(&response)
             .with_context(|| format!("daemon returned non-JSON response: {response}"))?;
         self.last_response = Some(json!({
@@ -1783,19 +1765,12 @@ impl ThreadsFixture {
         let pid = self
             .current_daemon_pid()
             .context("daemon crash requires a running daemon")?;
-        let status = Command::new("kill")
-            .args(["-KILL", &pid.to_string()])
-            .status()
-            .context("sending SIGKILL to the daemon")?;
-        anyhow::ensure!(
-            status.success(),
-            "SIGKILL did not terminate daemon pid {pid}"
-        );
+        terminate_daemon_process(&self.coven_home, pid)?;
         wait_for_process_exit(pid, "crashed daemon", Duration::from_secs(3))?;
         self.daemon_events.push(DaemonLifecycleEvent::note(
             "daemon crash",
             Some(pid),
-            format!("sent SIGKILL to daemon pid {pid}"),
+            format!("forcibly terminated daemon pid {pid}"),
         ));
         self.daemon_pid = None;
         self.stopped = false;
@@ -1918,6 +1893,12 @@ impl ThreadsFixture {
     }
 
     fn sanitize_fixture_text(&self, value: &str) -> String {
+        #[cfg(windows)]
+        let value = self.pipe_names.iter().fold(value.to_owned(), |text, name| {
+            text.replace(name, sanitized_daemon_endpoint())
+        });
+        #[cfg(windows)]
+        let value = value.as_str();
         replace_sanitized_path(
             replace_sanitized_path(
                 sanitize_for_artifact(value),
@@ -1946,9 +1927,9 @@ impl Drop for ThreadsFixture {
                 "threads E2E fallback is terminating daemon pid {} after graceful stop success={stopped}",
                 pid,
             );
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            if let Err(error) = terminate_daemon_process(&self.coven_home, pid) {
+                eprintln!("failed terminating fixture daemon pid {pid}: {error:#}");
+            }
         }
     }
 }
@@ -2164,8 +2145,8 @@ fn wait_for_daemon_health(coven_home: &Path) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut last_error = None;
     while Instant::now() < deadline {
-        if coven_home.join("coven.sock").exists() {
-            match unix_http_request(coven_home, "GET", "/health", None) {
+        if coven_home.join("daemon.json").exists() {
+            match daemon_http_request(coven_home, "GET", "/health", None) {
                 Ok((200, body)) if body.contains(r#""ok":true"#) => return Ok(()),
                 Ok(_) => {}
                 Err(error) => last_error = Some(error),
@@ -2176,6 +2157,14 @@ fn wait_for_daemon_health(coven_home: &Path) -> Result<()> {
     match last_error {
         Some(error) => anyhow::bail!("daemon did not become ready: {error:#}"),
         None => anyhow::bail!("daemon did not become ready"),
+    }
+}
+
+fn sanitized_daemon_endpoint() -> &'static str {
+    if cfg!(windows) {
+        "<daemon-pipe>"
+    } else {
+        "<coven-home>/coven.sock"
     }
 }
 
@@ -2226,6 +2215,7 @@ fn wait_for_daemon_shutdown(coven_home: &Path, pid: Option<u32>) -> Result<()> {
     )
 }
 
+#[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
     Command::new("kill")
         .args(["-0", &pid.to_string()])
@@ -2235,89 +2225,90 @@ fn pid_is_alive(pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn unix_http_request(
-    coven_home: &Path,
-    method: &str,
-    path: &str,
-    body: Option<&str>,
-) -> Result<(u16, String)> {
-    let body = body.unwrap_or_default();
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: coven\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let mut stream = UnixStream::connect(coven_home.join("coven.sock"))?;
-    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    stream.write_all(request.as_bytes())?;
-    stream.shutdown(Shutdown::Write)?;
+#[cfg(windows)]
+fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{
+            CloseHandle, GetLastError, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
+        System::Threading::{OpenProcess, WaitForSingleObject},
+    };
 
-    let mut response = Vec::new();
-    let mut buffer = [0_u8; 8192];
-    let mut expected_len: Option<(usize, usize)> = None;
-    loop {
-        let read = stream.read(&mut buffer)?;
-        if read == 0 {
-            let (body_start, content_length) =
-                expected_len.context("daemon response ended before complete HTTP headers")?;
-            anyhow::ensure!(
-                response.len() >= body_start.saturating_add(content_length),
-                "daemon response ended after {} bytes, before the declared {}-byte body completed",
-                response.len().saturating_sub(body_start),
-                content_length
-            );
-            break;
-        }
-        response.extend_from_slice(&buffer[..read]);
-        anyhow::ensure!(
-            response.len() <= 5 * 1024 * 1024,
-            "daemon HTTP response exceeded the E2E response budget"
+    const SYNCHRONIZE_ACCESS: u32 = 0x0010_0000;
+    let handle = unsafe { OpenProcess(SYNCHRONIZE_ACCESS, 0, pid) };
+    if handle.is_null() {
+        let error = unsafe { GetLastError() };
+        assert_eq!(
+            error, ERROR_INVALID_PARAMETER,
+            "cannot establish fixture daemon pid {pid} liveness: Windows error {error}"
         );
-        if expected_len.is_none() {
-            if let Some(header_end) = find_bytes(&response, b"\r\n\r\n") {
-                let headers = std::str::from_utf8(&response[..header_end])?;
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then(|| value.trim().parse::<usize>())
-                    })
-                    .transpose()?
-                    .context("daemon response is missing Content-Length")?;
-                expected_len = Some((header_end + 4, content_length));
-            }
-        }
-        if expected_len.is_some_and(|(body_start, content_length)| {
-            response.len() >= body_start.saturating_add(content_length)
-        }) {
-            break;
-        }
+        return false;
     }
-    let (body_start, content_length) =
-        expected_len.context("daemon response is missing complete HTTP framing")?;
-    let body_end = body_start
-        .checked_add(content_length)
-        .context("daemon Content-Length overflowed the response budget")?;
-    anyhow::ensure!(
-        response.len() >= body_end,
-        "daemon response body is shorter than Content-Length"
-    );
-    let headers = std::str::from_utf8(&response[..body_start - 4])?;
-    let status = headers
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .with_context(|| format!("invalid HTTP response headers: {headers}"))?;
-    let body = String::from_utf8(response[body_start..body_end].to_vec())?;
-    Ok((status, body))
+    let result = unsafe { WaitForSingleObject(handle, 0) };
+    unsafe { CloseHandle(handle) };
+    match result {
+        WAIT_TIMEOUT => true,
+        WAIT_OBJECT_0 => false,
+        _ => panic!("cannot establish fixture daemon pid {pid} liveness: wait result {result}"),
+    }
 }
 
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+#[cfg(unix)]
+fn terminate_daemon_process(_coven_home: &Path, pid: u32) -> Result<()> {
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .context("sending SIGKILL to the fixture daemon")?;
+    anyhow::ensure!(
+        status.success(),
+        "SIGKILL failed for fixture daemon pid {pid}"
+    );
+    Ok(())
+}
+
+#[cfg(windows)]
+fn terminate_daemon_process(coven_home: &Path, pid: u32) -> Result<()> {
+    let status: Value = serde_json::from_slice(&fs::read(coven_home.join("daemon.json"))?)?;
+    let pipe = status["socket"]
+        .as_str()
+        .context("daemon status has no pipe")?;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let probe = coven_client::probe_windows_daemon_health_with_identity_until(pipe, deadline)?
+        .context("fixture daemon pipe disappeared before crash injection")?;
+    anyhow::ensure!(
+        probe.server_pid == pid,
+        "fixture daemon process changed before crash injection"
+    );
+    let process = coven_client::open_windows_daemon_process_for_stop_until(
+        pipe,
+        pid,
+        Some(probe.process_creation_time),
+        deadline,
+    )?
+    .context("fixture daemon identity could not be verified for crash injection")?;
+    anyhow::ensure!(
+        process.terminate_and_wait_until(deadline)?,
+        "verified fixture daemon pid {pid} did not exit after crash injection"
+    );
+    Ok(())
+}
+
+fn daemon_http_request(
+    coven_home: &Path,
+    method: &'static str,
+    path: &str,
+    body: Option<&Value>,
+) -> Result<(u16, String)> {
+    let endpoint = coven_client::DaemonEndpoint::discover(coven_home)
+        .context("discovering owner-local fixture daemon")?;
+    let mut client = coven_client::DaemonClient::new(endpoint);
+    let response = client
+        .request_json(method, path, body)
+        .with_context(|| format!("fixture daemon request {method} {path}"))?;
+    Ok((
+        response.status,
+        String::from_utf8(response.body).context("fixture daemon response is not UTF-8")?,
+    ))
 }
 
 fn ward_audit_jsonl(store: &Path) -> Result<String> {
@@ -2488,7 +2479,7 @@ fn git_state(path: &Path) -> Result<GitState> {
             let metadata = fs::symlink_metadata(&untracked)?;
             if metadata.file_type().is_symlink() {
                 fingerprint.update(relative.as_bytes());
-                fingerprint.update(fs::read_link(untracked)?.as_os_str().as_bytes());
+                fingerprint.update(fs::read_link(untracked)?.as_os_str().as_encoded_bytes());
             } else if metadata.is_file() {
                 fingerprint.update(relative.as_bytes());
                 fingerprint.update(fs::read(untracked)?);
@@ -2511,8 +2502,10 @@ fn file_sha256(path: &Path) -> Result<String> {
 
 fn sanitize_for_artifact(value: &str) -> String {
     let mut sanitized = value.replace(&workspace_root().display().to_string(), "<coven-workspace>");
-    if let Some(home) = std::env::var_os("HOME") {
-        sanitized = sanitized.replace(&PathBuf::from(home).display().to_string(), "<home>");
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(key) {
+            sanitized = sanitized.replace(&PathBuf::from(home).display().to_string(), "<home>");
+        }
     }
     sanitized
 }
