@@ -27,6 +27,11 @@ const FAMILIAR_ID: &str = "sage";
 const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const REQUIRE_OVERRIDE_ENV: &str = "COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE";
 
+#[cfg(feature = "threads-test-clock")]
+mod final_commit_cases {
+    include!("support/threads_final_commit_cases.rs");
+}
+
 #[test]
 fn smoke_bounded_ward_apply_over_real_daemon() -> Result<()> {
     run_journey("smoke-bounded-ward-apply", |fixture| {
