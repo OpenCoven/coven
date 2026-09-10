@@ -4,6 +4,7 @@ read_when:
   - Looking up the capabilities API
 title: "Capabilities endpoint"
 description: "Reference for the /api/v1/capabilities routes: the control-plane catalog on the bare path, the harness capability aggregate at /capabilities/harnesses, and single-harness manifests at /capabilities/:harnessId."
+source_adjacent_reason: "This page is source-adjacent API reference documenting behavior implemented in the coven-cli API handlers and contract."
 ---
 
 Coven exposes two capability concepts on adjacent paths. Do not confuse them:
