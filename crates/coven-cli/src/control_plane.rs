@@ -42,6 +42,10 @@ pub struct ControlActionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub event: Option<ControlEvent>,
 }
 
@@ -111,11 +115,25 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.create",
                     "coven.automations.update",
                     "coven.automations.delete",
+                    "coven.automations.definition.list.v1",
+                    "coven.automations.definition.get.v1",
+                    "coven.automations.definition.create.v1",
+                    "coven.automations.definition.revise.v1",
+                    "coven.automations.definition.disable.v1",
+                    "coven.automations.definition.tombstone.v1",
+                    "coven.automations.run.cancel.v1",
+                    "coven.automations.events.read.v1",
+                    "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
+                    "coven.automations.receipt.get.v1",
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
+                    "coven.automations.scheduler.status.v1",
+                    "coven.automations.occurrence.list.v1",
+                    "coven.automations.occurrence.get.v1",
+                    "coven.automations.unquarantine",
                 ],
             },
             Capability {
@@ -128,6 +146,24 @@ pub fn capabilities() -> CapabilityCatalog {
             },
         ],
     }
+}
+
+pub(crate) fn automation_receipt_transport_rejection(
+    payload: &Value,
+    authority: crate::request_authority::RequestAuthority,
+) -> Option<(u16, ControlActionResponse)> {
+    let action = payload.get("action")?.as_str()?.trim();
+    if action != "coven.automations.receipt.get.v1" || authority.allows_automation_receipt_access()
+    {
+        return None;
+    }
+    Some(typed_rejection(
+        action,
+        automation_error(
+            crate::automations::contract::error::ErrorCode::AuthorityRequired,
+            "Automation receipt reads require owner-local IPC.",
+        ),
+    ))
 }
 
 pub fn route_action(
@@ -186,14 +222,100 @@ pub fn route_action(
                     action: action.to_string(),
                     status: ActionStatus::Completed,
                     reason: None,
+                    error: None,
+                    result: None,
                     event: Some(event),
                 },
             )
         }
-        "coven.automations.list" => {
-            automation_result(action, origin, intent_id, automation_list_payload(conn))
-        }
+        "coven.automations.list" => automation_result(
+            action,
+            origin,
+            intent_id,
+            automation_list_legacy_payload(conn),
+        ),
         "coven.automations.get" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_get_legacy_payload(conn, &id),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.create" => {
+            let definition = required_definition_field(&payload, action);
+            match definition {
+                Ok(definition) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyCreate {
+                            definition,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.update" => {
+            let definition = required_definition_field(&payload, action);
+            match definition {
+                Ok(definition) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyRevise {
+                            definition,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.delete" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_legacy_command_result(
+                    action,
+                    origin,
+                    intent_id.clone(),
+                    crate::automations::command_adoption::execute_definition_command(
+                        conn,
+                        &legacy_adoption_key(action, intent_id.as_deref()),
+                        crate::automations::command_adoption::DefinitionCommand::LegacyDelete {
+                            automation_id: id,
+                        },
+                        &now_iso(),
+                    ),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.definition.list.v1" => {
+            let include_tombstoned = payload
+                .get("includeTombstoned")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            automation_result(
+                action,
+                origin,
+                intent_id,
+                automation_list_payload(conn, include_tombstoned),
+            )
+        }
+        "coven.automations.definition.get.v1" => {
             let id = required_id_field(&payload, action);
             match id {
                 Ok(id) => {
@@ -202,40 +324,273 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
-        "coven.automations.create" => {
+        "coven.automations.definition.create.v1" => {
             let definition = required_definition_field(&payload, action);
-            match definition {
-                Ok(definition) => automation_result(
-                    action,
-                    origin,
-                    intent_id,
-                    automation_create_payload(conn, &definition),
-                ),
-                Err(error) => (400, rejected_action(action, error)),
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = forbidden_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (definition, expected_revision) {
+                        (Ok(definition), Ok(())) => {
+                            crate::automations::command_adoption::DefinitionCommand::Create {
+                                definition,
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.create.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["definition", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.update" => {
+        "coven.automations.definition.revise.v1" => {
             let definition = required_definition_field(&payload, action);
-            match definition {
-                Ok(definition) => automation_result(
-                    action,
-                    origin,
-                    intent_id,
-                    automation_update_payload(conn, &definition),
-                ),
-                Err(error) => (400, rejected_action(action, error)),
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (definition, expected_revision) {
+                        (Ok(definition), Ok(expected_revision)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Revise {
+                                definition,
+                                expected_revision: Some(expected_revision),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.revise.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["definition", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
             }
         }
-        "coven.automations.delete" => {
+        "coven.automations.definition.tombstone.v1" => {
             let id = required_id_field(&payload, action);
-            match id {
-                Ok(id) => automation_result(
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (id, expected_revision) {
+                        (Ok(id), Ok(expected_revision)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Delete {
+                                automation_id: id,
+                                expected_revision: Some(expected_revision),
+                            }
+                        }
+                        (Err(error), _) | (_, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.tombstone.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["id", "expectedRevision"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.definition.disable.v1" => {
+            let id = required_id_field(&payload, action);
+            let adoption_key = required_adoption_key(&payload, action);
+            let expected_revision = required_expected_revision(&payload, action);
+            let reason = optional_reason(&payload, action);
+            match adoption_key {
+                Ok(adoption_key) => {
+                    let command = match (id, expected_revision, reason) {
+                        (Ok(id), Ok(expected_revision), Ok(reason)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Disable {
+                                automation_id: id,
+                                expected_revision: Some(expected_revision),
+                                reason,
+                            }
+                        }
+                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                            crate::automations::command_adoption::DefinitionCommand::Invalid {
+                                command: "definition.disable.v1".to_owned(),
+                                request: command_request_fields(
+                                    &payload,
+                                    &["id", "expectedRevision", "reason"],
+                                ),
+                                message: error,
+                            }
+                        }
+                    };
+                    automation_command_result(
+                        action,
+                        origin,
+                        intent_id,
+                        crate::automations::command_adoption::execute_definition_command(
+                            conn,
+                            &adoption_key,
+                            command,
+                            &now_iso(),
+                        ),
+                    )
+                }
+                Err(error) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.run.cancel.v1" => {
+            match crate::automations::cancellation::execute_run_cancellation(
+                conn,
+                runtime,
+                payload.clone(),
+                chrono::Utc::now(),
+            ) {
+                Ok(crate::automations::cancellation::CancellationExecution::Success(success)) => {
+                    let event = ControlEvent {
+                        kind: "automations.run.cancellation",
+                        action: action.to_string(),
+                        origin,
+                        intent_id,
+                        payload: success.payload.clone(),
+                    };
+                    (
+                        200,
+                        ControlActionResponse {
+                            ok: true,
+                            accepted: true,
+                            action: action.to_string(),
+                            status: ActionStatus::Completed,
+                            reason: success
+                                .replayed
+                                .then(|| "replayed previously adopted cancellation".to_string()),
+                            error: None,
+                            result: Some(success.payload),
+                            event: Some(event),
+                        },
+                    )
+                }
+                Ok(crate::automations::cancellation::CancellationExecution::Rejected(error)) => {
+                    typed_rejection(action, error)
+                }
+                Err(error) => typed_rejection(
+                    action,
+                    automation_error(
+                        crate::automations::contract::error::ErrorCode::Internal,
+                        error,
+                    ),
+                ),
+            }
+        }
+        "coven.automations.events.read.v1" => {
+            let stream = required_event_stream(&payload, action);
+            let after = optional_event_after(&payload, action);
+            let from = optional_event_from(&payload, action);
+            let limit = optional_event_limit(&payload, action);
+            match (stream, after, from, limit) {
+                (Ok((kind, id)), Ok(after), Ok(from), Ok(limit)) => automation_event_store_result(
                     action,
                     origin,
                     intent_id,
-                    automation_delete_payload(conn, &id),
+                    crate::automations::contract::events::read_events(
+                        conn,
+                        &kind,
+                        &id,
+                        after,
+                        from.as_deref(),
+                        limit,
+                        &now_iso(),
+                    ),
                 ),
-                Err(error) => (400, rejected_action(action, error)),
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => validation_rejection(action, error),
+            }
+        }
+        "coven.automations.events.subscribe.v1" => {
+            let stream = required_event_stream(&payload, action);
+            let after = optional_event_after(&payload, action);
+            let checkpoint = optional_event_checkpoint(&payload, action);
+            let limit = forbidden_event_limit(&payload, action);
+            match (stream, after, checkpoint, limit) {
+                (Ok((kind, id)), Ok(after), Ok(checkpoint), Ok(())) => {
+                    let result = if let Some(checkpoint) = checkpoint {
+                        if after.is_some() {
+                            Err(
+                                crate::automations::contract::events::EventStoreError::InvalidRead(
+                                    format!("{action} accepts `after` or `checkpoint`, not both"),
+                                ),
+                            )
+                        } else {
+                            crate::automations::contract::events::resume_events(
+                                conn,
+                                &checkpoint,
+                                &kind,
+                                &id,
+                                100,
+                                &now_iso(),
+                            )
+                        }
+                    } else {
+                        crate::automations::contract::events::read_events(
+                            conn,
+                            &kind,
+                            &id,
+                            after,
+                            None,
+                            100,
+                            &now_iso(),
+                        )
+                    };
+                    automation_event_store_result(action, origin, intent_id, result)
+                }
+                (Err(error), _, _, _)
+                | (_, Err(error), _, _)
+                | (_, _, Err(error), _)
+                | (_, _, _, Err(error)) => validation_rejection(action, error),
             }
         }
         "coven.automations.tick" => {
@@ -260,6 +615,7 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.receipt.get.v1" => automation_receipt_result(conn, action, &payload),
         "coven.automations.health" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -269,6 +625,50 @@ pub fn route_action(
                     origin,
                     intent_id,
                     automation_health_payload(conn, &id, now),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.scheduler.status.v1" => automation_result(
+            action,
+            origin,
+            intent_id,
+            automation_scheduler_status_payload(conn, chrono::Utc::now()),
+        ),
+        "coven.automations.occurrence.list.v1" => {
+            let view = required_occurrence_view(&payload, action);
+            let limit = optional_inspection_limit(&payload, action);
+            match (view, limit) {
+                (Ok(view), Ok(limit)) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_occurrence_list_payload(conn, view, limit),
+                ),
+                (Err(error), _) | (_, Err(error)) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.occurrence.get.v1" => {
+            let id = required_id_field(&payload, action);
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_occurrence_get_payload(conn, &id),
+                ),
+                Err(error) => (400, rejected_action(action, error)),
+            }
+        }
+        "coven.automations.unquarantine" => {
+            let id = required_id_field(&payload, action);
+            let now = chrono::Utc::now();
+            match id {
+                Ok(id) => automation_result(
+                    action,
+                    origin,
+                    intent_id,
+                    automation_unquarantine_payload(conn, &id, now),
                 ),
                 Err(error) => (400, rejected_action(action, error)),
             }
@@ -308,6 +708,8 @@ fn automation_event(
         action: action.to_string(),
         status: ActionStatus::Completed,
         reason: None,
+        error: None,
+        result: None,
         event: Some(ControlEvent {
             kind: "automations.changed",
             action: action.to_string(),
@@ -316,6 +718,84 @@ fn automation_event(
             payload,
         }),
     }
+}
+
+fn automation_receipt_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    payload: &Value,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    use crate::automations::contract::types::{PrivacyClassification, ReceiptId};
+
+    let id = match required_id_field(payload, action)
+        .and_then(|id| ReceiptId::new(id).map_err(|_| "receipt id is invalid".to_owned()))
+    {
+        Ok(id) => id,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let receipt = match crate::automations::receipts::read_receipt(conn, id.as_str()) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return typed_rejection(
+                action,
+                automation_error(ErrorCode::NotFound, "Automation receipt is unavailable."),
+            );
+        }
+        Err(_) => {
+            return typed_rejection(
+                action,
+                automation_error(
+                    ErrorCode::Internal,
+                    "Stored automation receipt evidence could not be validated.",
+                ),
+            );
+        }
+    };
+    if !matches!(
+        receipt.privacy.classification,
+        PrivacyClassification::Public | PrivacyClassification::Operational
+    ) {
+        return typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::AuthorityRequired,
+                "Receipt privacy requires a principal-aware read policy that is unavailable.",
+            ),
+        );
+    }
+    (
+        200,
+        ControlActionResponse {
+            ok: true,
+            accepted: true,
+            action: action.to_owned(),
+            status: ActionStatus::Completed,
+            reason: None,
+            error: None,
+            result: Some(json!({
+                "receipt": receipt,
+                "verification": {
+                    "status": "unverifiable",
+                    "integrity": "valid",
+                    "correlation": "valid",
+                    "receiptAuthentication": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "runtimeAuthority": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "reasons": [
+                        "PRODUCER_AUTHENTICATION_UNVERIFIED",
+                        "RUNTIME_AUTHORITY_UNVERIFIED"
+                    ]
+                }
+            })),
+            event: None,
+        },
+    )
 }
 
 fn automation_result(
@@ -330,6 +810,225 @@ fn automation_result(
     }
 }
 
+fn automation_legacy_command_result(
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    result: anyhow::Result<crate::automations::command_adoption::DefinitionCommandResponse>,
+) -> (u16, ControlActionResponse) {
+    match result {
+        Ok(response)
+            if matches!(
+                response.outcome,
+                crate::automations::command_adoption::DefinitionCommandOutcome::Committed
+                    | crate::automations::command_adoption::DefinitionCommandOutcome::Replayed
+            ) =>
+        {
+            (
+                200,
+                automation_event(
+                    action,
+                    origin,
+                    intent_id,
+                    response.result.unwrap_or_else(|| json!({})),
+                ),
+            )
+        }
+        Ok(response) => {
+            let reason = response
+                .error
+                .map(|error| error.message.as_str().to_owned())
+                .unwrap_or_else(|| "automation command was rejected".to_owned());
+            (400, rejected_action(action, reason))
+        }
+        Err(error) => (400, rejected_action(action, format!("{error:#}"))),
+    }
+}
+
+fn automation_command_result(
+    action: &str,
+    origin: Option<String>,
+    intent_id: Option<String>,
+    result: anyhow::Result<crate::automations::command_adoption::DefinitionCommandResponse>,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::command_adoption::DefinitionCommandOutcome;
+    use crate::automations::contract::error::ErrorCode;
+
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => {
+            let error = automation_error(ErrorCode::Internal, format!("{error:#}"));
+            return typed_rejection(action, error);
+        }
+    };
+    match response.outcome {
+        DefinitionCommandOutcome::Committed | DefinitionCommandOutcome::Replayed => {
+            let outcome = match response.outcome {
+                DefinitionCommandOutcome::Committed => "committed",
+                DefinitionCommandOutcome::Replayed => "replayed",
+                DefinitionCommandOutcome::Rejected => unreachable!(),
+            };
+            let kind = if response.outcome == DefinitionCommandOutcome::Committed {
+                "automations.changed"
+            } else {
+                "automations.replayed"
+            };
+            let mut payload = json!({
+                "outcome": outcome,
+                "revision": response.revision,
+                "result": response.result,
+            });
+            if let Some(event_ref) = response.event_ref {
+                payload["eventRef"] =
+                    serde_json::to_value(event_ref).expect("automation event reference serializes");
+            }
+            if let Some(first_committed_at) = response.replay_first_committed_at {
+                payload["replay"] = json!({
+                    "firstCommittedAt": first_committed_at,
+                });
+            }
+            let event = if response.outcome == DefinitionCommandOutcome::Committed {
+                Some(ControlEvent {
+                    kind,
+                    action: action.to_string(),
+                    origin,
+                    intent_id,
+                    payload: payload.clone(),
+                })
+            } else {
+                None
+            };
+            (
+                200,
+                ControlActionResponse {
+                    ok: true,
+                    accepted: true,
+                    action: action.to_string(),
+                    status: ActionStatus::Completed,
+                    reason: None,
+                    error: None,
+                    result: Some(payload),
+                    event,
+                },
+            )
+        }
+        DefinitionCommandOutcome::Rejected => typed_rejection(
+            action,
+            response
+                .error
+                .expect("rejected automation command carries typed error"),
+        ),
+    }
+}
+
+fn automation_event_store_result(
+    action: &str,
+    _origin: Option<String>,
+    _intent_id: Option<String>,
+    result: Result<
+        crate::automations::contract::events::EventPage,
+        crate::automations::contract::events::EventStoreError,
+    >,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    match result {
+        Ok(page) => match serde_json::to_value(page) {
+            Ok(page) => (
+                200,
+                ControlActionResponse {
+                    ok: true,
+                    accepted: true,
+                    action: action.to_owned(),
+                    status: ActionStatus::Completed,
+                    reason: None,
+                    error: None,
+                    result: Some(page),
+                    event: None,
+                },
+            ),
+            Err(error) => typed_rejection(
+                action,
+                automation_error(ErrorCode::Internal, format!("{error:#}")),
+            ),
+        },
+        Err(error) => {
+            let code = match error.code() {
+                "CURSOR_EXPIRED" => ErrorCode::CursorExpired,
+                "STREAM_OUT_OF_ORDER" => ErrorCode::StreamOutOfOrder,
+                "CHECKPOINT_NOT_FOUND" => ErrorCode::NotFound,
+                "VALIDATION_FAILED" => ErrorCode::ValidationFailed,
+                "DUPLICATE_EVENT_ID" | "INTERNAL" => ErrorCode::Internal,
+                _ => ErrorCode::Internal,
+            };
+            let mut envelope = automation_error(code, error.to_string());
+            if let Some(expired_at) = error.expired_at() {
+                envelope.details = Some(
+                    [("expiredAt".to_owned(), json!(expired_at))]
+                        .into_iter()
+                        .collect(),
+                );
+            }
+            typed_rejection(action, envelope)
+        }
+    }
+}
+
+fn validation_rejection(action: &str, reason: String) -> (u16, ControlActionResponse) {
+    let error = automation_error(
+        crate::automations::contract::error::ErrorCode::ValidationFailed,
+        reason,
+    );
+    typed_rejection(action, error)
+}
+
+fn automation_error(
+    code: crate::automations::contract::error::ErrorCode,
+    message: impl Into<String>,
+) -> crate::automations::contract::error::ErrorEnvelope {
+    let message = message.into();
+    let bounded = if message.is_empty() {
+        "automation command failed".to_owned()
+    } else {
+        message.chars().take(1_000).collect()
+    };
+    crate::automations::contract::error::ErrorEnvelope::try_new(code, bounded, false)
+        .expect("bounded non-empty automation error message is valid")
+}
+
+fn typed_rejection(
+    action: &str,
+    error: crate::automations::contract::error::ErrorEnvelope,
+) -> (u16, ControlActionResponse) {
+    let status = error.http_status();
+    let reason = error.message.as_str().to_owned();
+    let error = serde_json::to_value(error).expect("typed automation error serializes");
+    (
+        status,
+        ControlActionResponse {
+            ok: false,
+            accepted: false,
+            action: action.to_owned(),
+            status: ActionStatus::Rejected,
+            reason: Some(reason),
+            error: Some(error),
+            result: None,
+            event: None,
+        },
+    )
+}
+
+fn legacy_adoption_key(action: &str, intent_id: Option<&str>) -> String {
+    match intent_id {
+        Some(intent_id) => {
+            let digest = crate::automations::contract::sha256_hex(
+                format!("{action}\0{intent_id}").as_bytes(),
+            );
+            format!("legacy:{digest}")
+        }
+        None => format!("legacy:{}", uuid::Uuid::new_v4().simple()),
+    }
+}
+
 fn required_id_field(payload: &Value, action: &str) -> Result<String, String> {
     payload
         .get("id")
@@ -340,28 +1039,185 @@ fn required_id_field(payload: &Value, action: &str) -> Result<String, String> {
         .ok_or_else(|| format!("{action} requires string field `id`"))
 }
 
-fn required_definition_field(
-    payload: &Value,
-    action: &str,
-) -> Result<crate::automations::RoutineDefinition, String> {
+fn required_definition_field(payload: &Value, action: &str) -> Result<Value, String> {
     let Some(definition) = payload.get("definition") else {
         return Err(format!("{action} requires object field `definition`"));
     };
-    crate::automations::RoutineDefinition::from_json(definition)
-        .map_err(|error| format!("{action}: {error}"))
+    if !definition.is_object() {
+        return Err(format!("{action} requires object field `definition`"));
+    }
+    Ok(definition.clone())
+}
+
+fn required_adoption_key(payload: &Value, action: &str) -> Result<String, String> {
+    payload
+        .get("adoptionKey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| format!("{action} requires string field `adoptionKey`"))
+}
+
+fn required_expected_revision(payload: &Value, action: &str) -> Result<u64, String> {
+    payload
+        .get("expectedRevision")
+        .and_then(Value::as_u64)
+        .filter(|revision| (1..=9_007_199_254_740_991).contains(revision))
+        .ok_or_else(|| format!("{action} requires positive safe-integer field `expectedRevision`"))
+}
+
+fn optional_reason(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("reason") {
+        None => Ok(None),
+        Some(Value::String(reason)) if !reason.trim().is_empty() && reason.len() <= 500 => {
+            Ok(Some(reason.trim().to_owned()))
+        }
+        Some(_) => Err(format!(
+            "{action} field `reason` must be a non-empty string of at most 500 bytes"
+        )),
+    }
+}
+
+fn forbidden_expected_revision(payload: &Value, action: &str) -> Result<(), String> {
+    if payload.get("expectedRevision").is_some() {
+        Err(format!("{action} forbids field `expectedRevision`"))
+    } else {
+        Ok(())
+    }
+}
+
+fn required_event_stream(payload: &Value, action: &str) -> Result<(String, String), String> {
+    let stream = payload
+        .get("stream")
+        .cloned()
+        .ok_or_else(|| format!("{action} requires object field `stream`"))?;
+    let stream: crate::automations::contract::types::CommandStreamRef =
+        serde_json::from_value(stream)
+            .map_err(|error| format!("{action} has invalid stream: {error}"))?;
+    let kind = match stream.kind {
+        crate::automations::contract::types::StreamKind::Automation => "automation",
+        crate::automations::contract::types::StreamKind::Occurrence => "occurrence",
+        crate::automations::contract::types::StreamKind::Run => "run",
+        crate::automations::contract::types::StreamKind::Feed => "feed",
+    };
+    Ok((kind.to_owned(), stream.id.as_str().to_owned()))
+}
+
+fn optional_event_after(payload: &Value, action: &str) -> Result<Option<u64>, String> {
+    match payload.get("after") {
+        None => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value <= 9_007_199_254_740_991)
+            .map(Some)
+            .ok_or_else(|| format!("{action} field `after` must be a non-negative safe integer")),
+    }
+}
+
+fn optional_event_from(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("from") {
+        None => Ok(None),
+        Some(value) => {
+            serde_json::from_value::<crate::automations::contract::types::Timestamp>(value.clone())
+                .map_err(|error| format!("{action} has invalid `from` timestamp: {error}"))
+                .and_then(|timestamp| {
+                    chrono::DateTime::parse_from_rfc3339(timestamp.as_str())
+                        .map(|_| Some(timestamp.as_str().to_owned()))
+                        .map_err(|error| format!("{action} has invalid `from` timestamp: {error}"))
+                })
+        }
+    }
+}
+
+fn optional_event_checkpoint(payload: &Value, action: &str) -> Result<Option<String>, String> {
+    match payload.get("checkpoint") {
+        None => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() && value.len() <= 512 => {
+            Ok(Some(value.clone()))
+        }
+        Some(_) => Err(format!(
+            "{action} field `checkpoint` must be a non-empty string of at most 512 bytes"
+        )),
+    }
+}
+
+fn optional_event_limit(payload: &Value, action: &str) -> Result<usize, String> {
+    match payload.get("limit") {
+        None => Ok(100),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=1_000).contains(value))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{action} field `limit` must be an integer from 1 to 1000")),
+    }
+}
+
+fn required_occurrence_view(
+    payload: &Value,
+    action: &str,
+) -> Result<crate::automations::inspection::OccurrenceView, String> {
+    match payload.get("view").and_then(Value::as_str) {
+        Some("due") => Ok(crate::automations::inspection::OccurrenceView::Due),
+        Some("eligible") => Ok(crate::automations::inspection::OccurrenceView::Eligible),
+        Some("claimed") => Ok(crate::automations::inspection::OccurrenceView::Claimed),
+        Some("running") => Ok(crate::automations::inspection::OccurrenceView::Running),
+        Some("recovery_required") => {
+            Ok(crate::automations::inspection::OccurrenceView::RecoveryRequired)
+        }
+        _ => Err(format!(
+            "{action} requires field `view` equal to due, eligible, claimed, running, or recovery_required"
+        )),
+    }
+}
+
+fn optional_inspection_limit(payload: &Value, action: &str) -> Result<usize, String> {
+    match payload.get("limit") {
+        None => Ok(20),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| (1..=100).contains(value))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| format!("{action} field `limit` must be an integer from 1 to 100")),
+    }
+}
+
+fn forbidden_event_limit(payload: &Value, action: &str) -> Result<(), String> {
+    if payload.get("limit").is_some() {
+        Err(format!("{action} forbids field `limit`"))
+    } else {
+        Ok(())
+    }
+}
+
+fn command_request_fields(payload: &Value, fields: &[&str]) -> Value {
+    Value::Object(
+        fields
+            .iter()
+            .filter_map(|field| {
+                payload
+                    .get(*field)
+                    .map(|value| ((*field).to_owned(), value.clone()))
+            })
+            .collect(),
+    )
+}
+
+fn now_iso() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 fn automation_tick_payload(
     conn: &rusqlite::Connection,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Value, String> {
-    match crate::automations::occurrences::tick(conn, now) {
+    match crate::automations::occurrences::tick_planning(conn, now) {
         Ok(report) => Ok(json!({
             "planned": report.planned,
             "alreadyFenced": report.already_fenced,
             "pausedSkipped": report.paused_skipped,
-            "recovered": report.recovered,
-            "claimed": report.claimed,
+            "recovered": 0,
+            "claimed": [],
             "failed": report.failed,
         })),
         Err(error) => Err(format!("{error:#}")),
@@ -385,10 +1241,185 @@ fn automation_health_payload(
                 "leaseOwner": health.lease_owner,
                 "leaseExpiresAt": health.lease_expires_at,
                 "staleReason": health.stale_reason,
+                "currentAttempt": health.current_attempt,
+                "maxAttempts": health.max_attempts,
+                "retryNotBefore": health.retry_not_before,
+                "consecutiveExhaustions": health.consecutive_exhaustions,
+                "quarantinedAt": health.quarantined_at,
+                "quarantineFailureClass": health.quarantine_failure_class,
+                "quarantineReason": health.quarantine_reason,
             }
         })),
         Err(error) => Err(format!("{error:#}")),
     }
+}
+
+fn automation_scheduler_status_payload(
+    conn: &rusqlite::Connection,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    crate::automations::diagnostics::scheduler_status(conn, now)
+        .map(|status| {
+            let last_pass = status.last_pass.map(|pass| {
+                json!({
+                    "generation": pass.generation,
+                    "trigger": pass.trigger,
+                    "scheduledAt": pass.scheduled_at,
+                    "startedAt": pass.started_at,
+                    "startLagMs": pass.start_lag_ms,
+                    "finishedAt": pass.finished_at,
+                    "durationMs": pass.duration_ms,
+                    "status": pass.status,
+                    "errorClass": pass.error_class,
+                    "planned": pass.planned,
+                    "recovered": pass.recovered,
+                    "claimed": pass.claimed,
+                    "dispatched": pass.dispatched,
+                    "failures": pass.failures,
+                })
+            });
+            json!({
+                "scheduler": {
+                    "authorityAssigned": status.authority_assigned,
+                    "generation": status.generation,
+                    "ownerId": status.owner_id,
+                    "acquiredAt": status.acquired_at,
+                    "lastPass": last_pass,
+                    "queue": {
+                        "planned": status.queue.planned,
+                        "claimed": status.queue.claimed,
+                        "running": status.queue.running,
+                        "recoveryRequired": status.queue.recovery_required,
+                        "batchLimit": status.queue.batch_limit,
+                        "planningBatchLimit": status.queue.planning_batch_limit,
+                        "planningAfterDefinitionId": status.queue.planning_after_definition_id,
+                        "oldestEligibleAt": status.queue.oldest_eligible_at,
+                        "oldestEligibleAgeMs": status.queue.oldest_eligible_age_ms,
+                    }
+                }
+            })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_list_payload(
+    conn: &rusqlite::Connection,
+    view: crate::automations::inspection::OccurrenceView,
+    limit: usize,
+) -> Result<Value, String> {
+    crate::automations::inspection::list_occurrences(conn, view, chrono::Utc::now(), limit)
+        .map(|records| {
+            let occurrences = records
+                .into_iter()
+                .map(automation_occurrence_value)
+                .collect::<Vec<_>>();
+            json!({ "occurrences": occurrences })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_get_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<Value, String> {
+    crate::automations::inspection::inspect_occurrence(conn, id)
+        .map(|inspection| {
+            let Some(inspection) = inspection else {
+                return json!({ "occurrence": null });
+            };
+            let mut occurrence = automation_occurrence_value(inspection.occurrence);
+            occurrence["runsTruncated"] = json!(inspection.runs_truncated);
+            occurrence["runs"] = Value::Array(
+                inspection
+                    .runs
+                    .into_iter()
+                    .map(|run| {
+                        let attempts = run
+                            .attempts
+                            .into_iter()
+                            .map(|attempt| {
+                                json!({
+                                    "id": attempt.id,
+                                    "runId": attempt.run_id,
+                                    "occurrenceId": attempt.occurrence_id,
+                                    "attemptNumber": attempt.attempt_number,
+                                    "adoptionKey": attempt.adoption_key,
+                                    "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+                                    "dispatchGeneration": attempt.dispatch_generation,
+                                    "state": attempt.state,
+                                    "failureClass": attempt.failure_class,
+                                    "priorAttemptNumber": attempt.prior_attempt_number,
+                                    "priorDisposition": attempt.prior_disposition,
+                                    "retryClassification": attempt.retry_classification,
+                                    "notBefore": attempt.not_before,
+                                    "sessionId": attempt.session_id,
+                                    "stateReason": attempt.state_reason,
+                                    "openedAt": attempt.opened_at,
+                                    "settledAt": attempt.settled_at,
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        json!({
+                            "id": run.id,
+                            "automationId": run.automation_id,
+                            "automationRevision": run.automation_revision,
+                            "definitionDigest": run.definition_digest,
+                            "occurrenceId": run.occurrence_id,
+                            "authorityProfile": run.authority_profile,
+                            "receiptId": run.receipt_id,
+                            "sessionId": run.session_id,
+                            "familiarId": run.familiar_id,
+                            "runtime": run.runtime,
+                            "status": run.status,
+                            "exitCode": run.exit_code,
+                            "logJson": run.log_json,
+                            "outputCommit": run.output_commit,
+                            "startedAt": run.started_at,
+                            "timeoutAt": run.timeout_at,
+                            "finishedAt": run.finished_at,
+                            "attempts": attempts,
+                        })
+                    })
+                    .collect(),
+            );
+            json!({ "occurrence": occurrence })
+        })
+        .map_err(|error| format!("{error:#}"))
+}
+
+fn automation_occurrence_value(record: crate::automations::inspection::OccurrenceRecord) -> Value {
+    json!({
+        "id": record.id,
+        "automationId": record.automation_id,
+        "automationRevision": record.automation_revision,
+        "definitionDigest": record.definition_digest,
+        "scheduledFor": record.scheduled_for,
+        "kind": record.kind,
+        "state": record.state,
+        "leaseOwner": record.lease_owner,
+        "leaseExpiresAt": record.lease_expires_at,
+        "schedulerGeneration": record.scheduler_generation,
+        "fenceGeneration": record.fence_generation,
+        "failureReason": record.failure_reason,
+        "createdAt": record.created_at,
+        "updatedAt": record.updated_at,
+    })
+}
+
+fn automation_unquarantine_payload(
+    conn: &rusqlite::Connection,
+    id: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Value, String> {
+    if crate::automations::store::get_definition(conn, id)
+        .map_err(|error| format!("{error:#}"))?
+        .is_none()
+    {
+        return Err(format!("no routine with id `{id}`"));
+    }
+    crate::automations::runs::clear_retry_quarantine(conn, id, now)
+        .map(|released| json!({ "automationId": id, "released": released }))
+        .map_err(|error| format!("{error:#}"))
 }
 
 fn automation_import_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
@@ -411,12 +1442,14 @@ fn automation_run_payload(
     match crate::automations::runner::load_definition_for_run(conn, id) {
         Ok(Some(definition)) => {
             match crate::automations::runner::run_routine_now(conn, runtime, &definition, now) {
-                Ok(outcome) if outcome.status == "running" => Ok(json!({
+                Ok(outcome) if matches!(outcome.status.as_str(), "running" | "retry_scheduled") => {
+                    Ok(json!({
                     "runId": outcome.run_id,
                     "status": outcome.status,
                     "sessionId": outcome.session_id,
                     "error": outcome.error,
-                })),
+                    }))
+                }
                 Ok(outcome) => Err(outcome
                     .error
                     .unwrap_or_else(|| "routine run did not enter running state".to_string())),
@@ -435,32 +1468,73 @@ fn automation_runs_payload(
 ) -> Result<Value, String> {
     match crate::automations::runs::list_runs(conn, id, limit) {
         Ok(records) => {
-            let runs: Vec<Value> = records
-                .iter()
-                .map(|record| {
-                    json!({
-                        "id": record.id,
-                        "automationId": record.automation_id,
-                        "occurrenceId": record.occurrence_id,
-                        "sessionId": record.session_id,
-                        "familiarId": record.familiar_id,
-                        "runtime": record.runtime,
-                        "status": record.status,
-                        "exitCode": record.exit_code,
-                        "logJson": record.log_json,
-                        "outputCommit": record.output_commit,
-                        "startedAt": record.started_at,
-                        "finishedAt": record.finished_at,
+            let mut attempts_by_run = std::collections::HashMap::new();
+            for attempt in crate::automations::runs::list_attempts_for_automation(conn, id, limit)
+                .map_err(|error| format!("{error:#}"))?
+            {
+                attempts_by_run
+                    .entry(attempt.run_id.clone())
+                    .or_insert_with(Vec::new)
+                    .push(attempt);
+            }
+            let mut runs = Vec::with_capacity(records.len());
+            for record in &records {
+                let cancellation =
+                    crate::automations::cancellation::cancellation_for_run(conn, &record.id)?;
+                let attempts = attempts_by_run
+                    .remove(&record.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|attempt| {
+                        json!({
+                            "id": attempt.id,
+                            "runId": attempt.run_id,
+                            "occurrenceId": attempt.occurrence_id,
+                            "attemptNumber": attempt.attempt_number,
+                            "adoptionKey": attempt.adoption_key,
+                            "occurrenceFenceGeneration": attempt.occurrence_fence_generation,
+                            "dispatchGeneration": attempt.dispatch_generation,
+                            "state": attempt.state,
+                            "failureClass": attempt.failure_class,
+                            "priorAttemptNumber": attempt.prior_attempt_number,
+                            "priorDisposition": attempt.prior_disposition,
+                            "retryClassification": attempt.retry_classification,
+                            "notBefore": attempt.not_before,
+                            "sessionId": attempt.session_id,
+                            "stateReason": attempt.state_reason,
+                            "openedAt": attempt.opened_at,
+                            "settledAt": attempt.settled_at,
+                        })
                     })
-                })
-                .collect();
+                    .collect::<Vec<_>>();
+                let mut run = json!({
+                    "id": record.id,
+                    "automationId": record.automation_id,
+                    "occurrenceId": record.occurrence_id,
+                    "sessionId": record.session_id,
+                    "familiarId": record.familiar_id,
+                    "runtime": record.runtime,
+                    "status": record.status,
+                    "exitCode": record.exit_code,
+                    "logJson": record.log_json,
+                    "outputCommit": record.output_commit,
+                    "startedAt": record.started_at,
+                    "finishedAt": record.finished_at,
+                    "receiptId": record.receipt_id,
+                    "attempts": attempts,
+                });
+                if let Some(cancellation) = cancellation {
+                    run["cancellation"] = cancellation;
+                }
+                runs.push(run);
+            }
             Ok(json!({ "runs": runs }))
         }
         Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_list_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
+fn automation_list_legacy_payload(conn: &rusqlite::Connection) -> Result<Value, String> {
     let records = crate::automations::store::list_definitions(conn);
     match records {
         Ok(records) => {
@@ -478,7 +1552,7 @@ fn automation_list_payload(conn: &rusqlite::Connection) -> Result<Value, String>
     }
 }
 
-fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+fn automation_get_legacy_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
     match crate::automations::store::get_definition(conn, id) {
         Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
             Ok(routine) => Ok(json!({ "routine": routine })),
@@ -489,36 +1563,50 @@ fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value
     }
 }
 
-fn automation_create_payload(
+fn automation_list_payload(
     conn: &rusqlite::Connection,
-    definition: &crate::automations::RoutineDefinition,
+    include_tombstoned: bool,
 ) -> Result<Value, String> {
-    match crate::automations::store::insert_definition(conn, definition) {
-        Ok(record) => Ok(json!({
-            "routine": definition.to_json(),
-            "createdAt": record.created_at,
-        })),
+    let records =
+        crate::automations::store::list_definitions_with_tombstones(conn, include_tombstoned);
+    match records {
+        Ok(records) => {
+            let mut routines = Vec::with_capacity(records.len());
+            let mut revision_by_id = std::collections::BTreeMap::new();
+            let mut tombstoned_at_by_id = std::collections::BTreeMap::new();
+            for record in records {
+                let id = record.id.clone();
+                let routine =
+                    serde_json::from_str::<Value>(&record.definition_json).map_err(|error| {
+                        format!("stored routine `{}` is unreadable: {error}", record.id)
+                    })?;
+                revision_by_id.insert(id.clone(), record.revision);
+                if let Some(tombstoned_at) = record.tombstoned_at {
+                    tombstoned_at_by_id.insert(id, tombstoned_at);
+                }
+                routines.push(routine);
+            }
+            Ok(json!({
+                "routines": routines,
+                "revisionById": revision_by_id,
+                "tombstonedAtById": tombstoned_at_by_id,
+            }))
+        }
         Err(error) => Err(format!("{error:#}")),
     }
 }
 
-fn automation_update_payload(
-    conn: &rusqlite::Connection,
-    definition: &crate::automations::RoutineDefinition,
-) -> Result<Value, String> {
-    match crate::automations::store::update_definition(conn, definition) {
-        Ok(Some(record)) => Ok(json!({
-            "routine": definition.to_json(),
-            "updatedAt": record.updated_at,
-        })),
-        Ok(None) => Err(format!("no routine with id `{}`", definition.id)),
-        Err(error) => Err(format!("{error:#}")),
-    }
-}
-
-fn automation_delete_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
-    match crate::automations::store::delete_definition(conn, id) {
-        Ok(deleted) => Ok(json!({ "id": id, "deleted": deleted })),
+fn automation_get_payload(conn: &rusqlite::Connection, id: &str) -> Result<Value, String> {
+    match crate::automations::store::get_definition_with_tombstone(conn, id, true) {
+        Ok(Some(record)) => match serde_json::from_str::<Value>(&record.definition_json) {
+            Ok(routine) => Ok(json!({
+                "routine": routine,
+                "revision": record.revision,
+                "tombstonedAt": record.tombstoned_at,
+            })),
+            Err(error) => Err(format!("stored routine is unreadable: {error}")),
+        },
+        Ok(None) => Ok(json!({ "routine": Value::Null })),
         Err(error) => Err(format!("{error:#}")),
     }
 }
@@ -533,6 +1621,8 @@ pub fn rejected_action(
         action: action.into(),
         status: ActionStatus::Rejected,
         reason: Some(reason.into()),
+        error: None,
+        result: None,
         event: None,
     }
 }
@@ -541,9 +1631,914 @@ pub fn rejected_action(
 mod tests {
     use super::*;
     use crate::api::{SessionLaunch, SessionRuntime};
+    use chrono::{TimeZone, Timelike};
 
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
+    struct RetryableRejectedRuntime;
+
+    #[test]
+    fn tick_action_plans_but_does_not_claim_without_scheduler_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let now = chrono::Utc::now();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "tick-authority",
+            "name": "Tick authority",
+            "status": "ACTIVE",
+            "rrule": format!("FREQ=DAILY;BYHOUR={}", now.hour()),
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![
+                (now - chrono::Duration::days(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                definition.id
+            ],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.tick"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert_eq!(
+            response.event.as_ref().unwrap().payload["claimed"],
+            json!([])
+        );
+        let occurrence_state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE automation_id = ?1",
+                [&definition.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(occurrence_state, "planned");
+    }
+
+    #[test]
+    fn scheduler_status_action_exposes_idle_authority_and_queue_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.scheduler.status.v1"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        let scheduler = &response.event.as_ref().unwrap().payload["scheduler"];
+        assert!(scheduler["active"].is_null());
+        assert_eq!(scheduler["authorityAssigned"], false);
+        assert_eq!(scheduler["generation"], 0);
+        assert!(scheduler["ownerId"].is_null());
+        assert!(scheduler["acquiredAt"].is_null());
+        assert!(scheduler["lastPass"].is_null());
+        assert_eq!(
+            scheduler["queue"],
+            json!({
+                "planned": 0,
+                "claimed": 0,
+                "running": 0,
+                "recoveryRequired": 0,
+                "batchLimit": 64,
+                "planningBatchLimit": 64,
+                "planningAfterDefinitionId": null,
+                "oldestEligibleAt": null,
+                "oldestEligibleAgeMs": null,
+            })
+        );
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.scheduler.status.v1"));
+    }
+
+    #[test]
+    fn occurrence_list_action_distinguishes_due_from_eligible() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "inspection",
+            "name": "inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        let definition_digest: String = conn
+            .query_row(
+                "SELECT definition_digest
+                 FROM automation_definitions
+                 WHERE id = 'inspection'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'older-due', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'latest-due', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'inspection';",
+        )
+        .unwrap();
+
+        let (due_status, due_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "due"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        let (eligible_status, eligible_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(due_status, 200);
+        assert_eq!(
+            due_response.event.as_ref().unwrap().payload["occurrences"],
+            json!([
+                {
+                    "id": "older-due",
+                    "automationId": "inspection",
+                    "automationRevision": 1,
+                    "definitionDigest": definition_digest,
+                    "scheduledFor": "2026-09-01T08:00:00.000Z",
+                    "kind": "scheduled",
+                    "state": "planned",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 0,
+                    "failureReason": null,
+                    "createdAt": "2026-09-01T08:00:00.000Z",
+                    "updatedAt": "2026-09-01T08:00:00.000Z"
+                },
+                {
+                    "id": "latest-due",
+                    "automationId": "inspection",
+                    "automationRevision": 1,
+                    "definitionDigest": definition_digest,
+                    "scheduledFor": "2026-09-01T09:00:00.000Z",
+                    "kind": "scheduled",
+                    "state": "planned",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 0,
+                    "failureReason": null,
+                    "createdAt": "2026-09-01T09:00:00.000Z",
+                    "updatedAt": "2026-09-01T09:00:00.000Z"
+                }
+            ])
+        );
+        assert_eq!(eligible_status, 200);
+        assert_eq!(
+            eligible_response.event.as_ref().unwrap().payload["occurrences"],
+            json!([{
+                "id": "latest-due",
+                "automationId": "inspection",
+                "automationRevision": 1,
+                "definitionDigest": definition_digest,
+                "scheduledFor": "2026-09-01T09:00:00.000Z",
+                "kind": "scheduled",
+                "state": "planned",
+                "leaseOwner": null,
+                "leaseExpiresAt": null,
+                "schedulerGeneration": null,
+                "fenceGeneration": 0,
+                "failureReason": null,
+                "createdAt": "2026-09-01T09:00:00.000Z",
+                "updatedAt": "2026-09-01T09:00:00.000Z"
+            }])
+        );
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.occurrence.list.v1"));
+    }
+
+    #[test]
+    fn occurrence_list_action_exposes_exact_nonterminal_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "authority-inspection",
+            "name": "authority-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'claimed-inspection', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'claimed', 'daemon-a',
+                    '2026-09-01T08:05:00.000Z', 7, 2, NULL,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'running-inspection', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'manual', 'running', 'manual-owner',
+                    '2026-09-01T09:05:00.000Z', NULL, 3, NULL,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 failure_reason, created_at, updated_at)
+             SELECT 'recovery-inspection', id, revision, definition_digest,
+                    '2026-09-01T10:00:00.000Z', 'scheduled', 'recovery_required', NULL,
+                    NULL, 6, 4, 'runtime ownership is ambiguous',
+                    '2026-09-01T10:00:00.000Z', '2026-09-01T10:01:00.000Z'
+             FROM automation_definitions WHERE id = 'authority-inspection';",
+        )
+        .unwrap();
+
+        for (view, expected) in [
+            (
+                "claimed",
+                json!({
+                    "id": "claimed-inspection",
+                    "state": "claimed",
+                    "leaseOwner": "daemon-a",
+                    "leaseExpiresAt": "2026-09-01T08:05:00.000Z",
+                    "schedulerGeneration": 7,
+                    "fenceGeneration": 2,
+                    "failureReason": null
+                }),
+            ),
+            (
+                "running",
+                json!({
+                    "id": "running-inspection",
+                    "state": "running",
+                    "leaseOwner": "manual-owner",
+                    "leaseExpiresAt": "2026-09-01T09:05:00.000Z",
+                    "schedulerGeneration": null,
+                    "fenceGeneration": 3,
+                    "failureReason": null
+                }),
+            ),
+            (
+                "recovery_required",
+                json!({
+                    "id": "recovery-inspection",
+                    "state": "recovery_required",
+                    "leaseOwner": null,
+                    "leaseExpiresAt": null,
+                    "schedulerGeneration": 6,
+                    "fenceGeneration": 4,
+                    "failureReason": "runtime ownership is ambiguous"
+                }),
+            ),
+        ] {
+            let (status, response) = route_action(
+                json!({
+                    "action": "coven.automations.occurrence.list.v1",
+                    "view": view
+                }),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+
+            assert_eq!(status, 200);
+            let occurrences = response.event.as_ref().unwrap().payload["occurrences"]
+                .as_array()
+                .unwrap();
+            assert_eq!(occurrences.len(), 1);
+            for field in [
+                "id",
+                "state",
+                "leaseOwner",
+                "leaseExpiresAt",
+                "schedulerGeneration",
+                "fenceGeneration",
+                "failureReason",
+            ] {
+                assert_eq!(occurrences[0][field], expected[field], "{view} {field}");
+            }
+        }
+    }
+
+    #[test]
+    fn occurrence_list_keeps_ready_legacy_retry_eligible_without_timeout() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "legacy-timeout-retry",
+            "name": "legacy-timeout-retry",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'legacy-timeout-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 1,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'legacy-timeout-retry';
+             INSERT INTO automation_runs
+                (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                 runtime, status, started_at, timeout_at)
+             SELECT 'legacy-timeout-run', automation_id, automation_revision,
+                    definition_digest, id, 'coven-code', 'running',
+                    '2026-09-01T09:00:00.000Z', NULL
+             FROM automation_occurrences WHERE id = 'legacy-timeout-occurrence';
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state,
+                 retry_classification, not_before, opened_at)
+             VALUES
+                ('legacy-timeout-attempt', 'legacy-timeout-run',
+                 'legacy-timeout-occurrence', 1, 'legacy-timeout-adoption',
+                 1, 0, 'adopted', 'initial', '2026-09-01T09:00:00.000Z',
+                 '2026-09-01T09:00:00.000Z');",
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert_eq!(
+            response.event.as_ref().unwrap().payload["occurrences"][0]["id"],
+            "legacy-timeout-occurrence"
+        );
+    }
+
+    #[test]
+    fn occurrence_list_validates_only_the_bounded_eligible_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for id in ["valid-time", "invalid-time"] {
+            let definition = crate::automations::RoutineDefinition::from_json(&json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": id,
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "prompt": "Do the thing."
+            }))
+            .unwrap();
+            crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'valid-time-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'valid-time';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'invalid-time-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:30:00.000Z-bad', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:30:00.000Z', '2026-09-01T09:30:00.000Z'
+             FROM automation_definitions WHERE id = 'invalid-time';",
+        )
+        .unwrap();
+
+        let (bounded_status, bounded_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible",
+                "limit": 1
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        let (corrupt_status, corrupt_response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.list.v1",
+                "view": "eligible",
+                "limit": 2
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(bounded_status, 200);
+        assert_eq!(
+            bounded_response.event.as_ref().unwrap().payload["occurrences"][0]["id"],
+            "valid-time-occurrence"
+        );
+        assert_eq!(corrupt_status, 400);
+        assert!(corrupt_response
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("invalid scheduled occurrence timestamp"));
+    }
+
+    #[test]
+    fn occurrence_get_action_exposes_correlated_run_attempt_and_fences() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "exact-inspection",
+            "name": "exact-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "familiarId": "familiar-1",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, lease_owner, lease_expires_at, scheduler_generation, attempt,
+                 created_at, updated_at)
+             SELECT 'exact-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'running', 'daemon-a',
+                    '2026-09-01T09:05:00.000Z', 11, 4,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:01:00.000Z'
+             FROM automation_definitions WHERE id = 'exact-inspection';
+             INSERT INTO automation_runs
+                (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                 authority_profile, receipt_id, session_id, familiar_id, runtime, status,
+                 started_at, timeout_at)
+             SELECT 'exact-run', automation_id, automation_revision, definition_digest, id,
+                    'coven.automations.authority.v1', 'receipt-1', NULL, 'familiar-1',
+                    'coven-code', 'running', '2026-09-01T09:01:00.000Z',
+                    '2026-09-01T09:31:00.000Z'
+             FROM automation_occurrences WHERE id = 'exact-occurrence';
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, dispatch_generation, state, failure_class,
+                 prior_attempt_number, prior_disposition, retry_classification, not_before,
+                 session_id, state_reason, opened_at, settled_at)
+             VALUES
+                ('exact-attempt', 'exact-run', 'exact-occurrence', 2, 'adopt-exact',
+                 4, 9, 'observing', NULL, 1, 'failed', 'automatic_retry',
+                 '2026-09-01T09:00:30.000Z', NULL, 'runtime ownership published',
+                 '2026-09-01T09:01:00.000Z', NULL);",
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": "exact-occurrence"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
+        assert_eq!(occurrence["id"], "exact-occurrence");
+        assert_eq!(occurrence["automationRevision"], 1);
+        assert_eq!(occurrence["leaseOwner"], "daemon-a");
+        assert_eq!(occurrence["leaseExpiresAt"], "2026-09-01T09:05:00.000Z");
+        assert_eq!(occurrence["schedulerGeneration"], 11);
+        assert_eq!(occurrence["fenceGeneration"], 4);
+        assert_eq!(occurrence["runs"].as_array().unwrap().len(), 1);
+        let run = &occurrence["runs"][0];
+        assert_eq!(run["id"], "exact-run");
+        assert_eq!(run["authorityProfile"], "coven.automations.authority.v1");
+        assert_eq!(run["receiptId"], "receipt-1");
+        assert_eq!(run["timeoutAt"], "2026-09-01T09:31:00.000Z");
+        assert_eq!(run["attempts"].as_array().unwrap().len(), 1);
+        let attempt = &run["attempts"][0];
+        assert_eq!(attempt["id"], "exact-attempt");
+        assert_eq!(attempt["attemptNumber"], 2);
+        assert_eq!(attempt["adoptionKey"], "adopt-exact");
+        assert_eq!(attempt["occurrenceFenceGeneration"], 4);
+        assert_eq!(attempt["dispatchGeneration"], 9);
+        assert_eq!(attempt["state"], "observing");
+        assert_eq!(attempt["priorAttemptNumber"], 1);
+        assert_eq!(attempt["priorDisposition"], "failed");
+        assert_eq!(attempt["retryClassification"], "automatic_retry");
+        assert_eq!(attempt["stateReason"], "runtime ownership published");
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.occurrence.get.v1"));
+    }
+
+    #[test]
+    fn occurrence_get_bounds_corrupt_duplicate_run_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "bounded-inspection",
+            "name": "bounded-inspection",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'bounded-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'failed', 1,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'bounded-inspection'",
+            [],
+        )
+        .unwrap();
+        for index in 0..21 {
+            conn.execute(
+                "INSERT INTO automation_runs
+                    (id, automation_id, automation_revision, definition_digest, occurrence_id,
+                     runtime, status, started_at, finished_at)
+                 SELECT ?1, automation_id, automation_revision, definition_digest, id,
+                        'coven-code', 'failed', ?2, ?2
+                 FROM automation_occurrences WHERE id = 'bounded-occurrence'",
+                rusqlite::params![
+                    format!("bounded-run-{index:02}"),
+                    format!("2026-09-01T09:{index:02}:00.000Z")
+                ],
+            )
+            .unwrap();
+        }
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.occurrence.get.v1",
+                "id": "bounded-occurrence"
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 200);
+        let occurrence = &response.event.as_ref().unwrap().payload["occurrence"];
+        assert_eq!(occurrence["runs"].as_array().unwrap().len(), 20);
+        assert_eq!(occurrence["runsTruncated"], true);
+    }
+
+    #[test]
+    fn scheduler_status_reports_the_oldest_actually_eligible_occurrence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        for (id, status) in [("paused-oldest", "PAUSED"), ("active-next", "ACTIVE")] {
+            let definition = crate::automations::RoutineDefinition::from_json(&json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": id,
+                "status": status,
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "prompt": "Do the thing."
+            }))
+            .unwrap();
+            crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'paused-occurrence', id, revision, definition_digest,
+                    '2026-09-01T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:00:00.000Z', '2026-09-01T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'paused-oldest';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'active-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'active-next';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'active-superseded-occurrence', id, revision, definition_digest,
+                    '2026-09-01T08:30:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T08:30:00.000Z', '2026-09-01T08:30:00.000Z'
+             FROM automation_definitions WHERE id = 'active-next';",
+        )
+        .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["scheduler"]["queue"]["planned"], 3);
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAt"],
+            "2026-09-01T09:00:00.000Z"
+        );
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAgeMs"],
+            3_600_000
+        );
+    }
+
+    #[test]
+    fn scheduler_status_keeps_a_ready_retry_eligible_while_paused() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "paused-retry",
+            "name": "paused-retry",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        let (run_status, run_response) = route_action(
+            json!({"action": "coven.automations.run", "id": "paused-retry"}),
+            &conn,
+            &RetryableRejectedRuntime,
+        );
+        assert_eq!(run_status, 200);
+        assert_eq!(
+            run_response.event.as_ref().unwrap().payload["status"],
+            "retry_scheduled"
+        );
+        conn.execute(
+            "UPDATE automation_definitions
+             SET status = 'PAUSED'
+             WHERE id = 'paused-retry'",
+            [],
+        )
+        .unwrap();
+        let scheduled_for: String = conn
+            .query_row(
+                "SELECT scheduled_for
+                 FROM automation_occurrences
+                 WHERE automation_id = 'paused-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc::now() + chrono::Duration::minutes(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            payload["scheduler"]["queue"]["oldestEligibleAt"],
+            scheduled_for
+        );
+    }
+
+    #[test]
+    fn scheduler_status_excludes_invalid_active_definitions_from_eligibility() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "invalid-active",
+            "name": "invalid-active",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET definition_json = '{}', lifecycle_state = 'invalid'
+             WHERE id = 'invalid-active'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'invalid-active-occurrence', id, revision, definition_digest,
+                    '2026-09-01T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-09-01T09:00:00.000Z', '2026-09-01T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'invalid-active'",
+            [],
+        )
+        .unwrap();
+
+        let payload = automation_scheduler_status_payload(
+            &conn,
+            chrono::Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert!(payload["scheduler"]["queue"]["oldestEligibleAt"].is_null());
+    }
+
+    #[test]
+    fn scheduler_status_action_exposes_the_last_completed_pass() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let path = home.join("coven.sqlite3");
+        crate::store::initialize_store(&path).unwrap();
+        let handle = crate::automations::daemon_tick::start_automations_scheduler(
+            home,
+            std::sync::Arc::new(crate::api::NoopSessionRuntime),
+        )
+        .unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let started = std::time::Instant::now();
+        let last_pass = loop {
+            let (status, response) = route_action(
+                json!({"action": "coven.automations.scheduler.status.v1"}),
+                &conn,
+                &crate::api::NoopSessionRuntime,
+            );
+            assert_eq!(status, 200);
+            let last_pass =
+                response.event.as_ref().unwrap().payload["scheduler"]["lastPass"].clone();
+            if last_pass.is_object() {
+                break last_pass;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "scheduler pass status was not published after {:?}",
+                started.elapsed()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(last_pass["generation"], 1);
+        assert_eq!(last_pass["trigger"], "startup");
+        assert!(last_pass["scheduledAt"].is_string());
+        assert!(last_pass["startedAt"].is_string());
+        assert!(last_pass["startLagMs"].as_u64().is_some());
+        assert!(last_pass["finishedAt"].is_string());
+        assert!(last_pass["durationMs"].as_u64().is_some());
+        assert_eq!(last_pass["status"], "succeeded");
+        assert!(last_pass["errorClass"].is_null());
+        assert_eq!(last_pass["planned"], 0);
+        assert_eq!(last_pass["recovered"], 0);
+        assert_eq!(last_pass["claimed"], 0);
+        assert_eq!(last_pass["dispatched"], 0);
+        assert_eq!(last_pass["failures"], 0);
+        let (_, active_response) = route_action(
+            json!({"action": "coven.automations.scheduler.status.v1"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(
+            active_response.event.as_ref().unwrap().payload["scheduler"]["authorityAssigned"],
+            true
+        );
+
+        handle.request_shutdown();
+        handle
+            .finish_shutdown(std::time::Instant::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+    }
 
     impl SessionRuntime for OwnershipThenErrorRuntime {
         fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
@@ -585,6 +2580,36 @@ mod tests {
             _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
             anyhow::bail!("synthetic launch rejection")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SessionRuntime for RetryableRejectedRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("automation dispatch uses strict adopted containment")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            Err(
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "runtime unavailable")
+                    .into(),
+            )
         }
 
         fn send_input(
@@ -790,5 +2815,305 @@ mod tests {
             .reason
             .as_deref()
             .is_some_and(|reason| reason.contains("synthetic launch rejection")));
+    }
+
+    #[test]
+    fn retry_scheduled_manual_run_remains_an_accepted_action() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "retrying",
+            "name": "Retrying",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+
+        let (status, response) = route_action(
+            json!({"action": "coven.automations.run", "id": "retrying"}),
+            &conn,
+            &RetryableRejectedRuntime,
+        );
+
+        assert_eq!(status, 200);
+        assert!(response.ok);
+        assert!(response.accepted);
+        let payload = &response.event.as_ref().unwrap().payload;
+        assert_eq!(payload["status"], "retry_scheduled");
+        assert!(payload["runId"].as_str().is_some_and(|id| !id.is_empty()));
+        assert!(payload["sessionId"].is_null());
+        assert!(payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("runtime unavailable")));
+    }
+
+    #[test]
+    fn automation_health_exposes_quarantine_and_unquarantine_releases_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = crate::automations::RoutineDefinition::from_json(&json!({
+            "schemaVersion": 1,
+            "id": "quarantined",
+            "name": "Quarantined",
+            "status": "ACTIVE",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["runtime_unavailable"]
+            },
+            "runtime": "coven-code",
+            "cwd": "/work/project",
+            "prompt": "Do the thing."
+        }))
+        .unwrap();
+        crate::automations::store::insert_definition(&conn, &definition).unwrap();
+        conn.execute(
+            "INSERT INTO automation_retry_state
+                (automation_id, consecutive_exhaustions, quarantined_at,
+                 failure_class, reason, updated_at)
+             VALUES ('quarantined', 1, '2026-08-27T09:05:00.000Z',
+                     'runtime_unavailable', 'runtime stayed offline',
+                     '2026-08-27T09:05:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        let (health_status, health_response) = route_action(
+            json!({"action": "coven.automations.health", "id": "quarantined"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(health_status, 200);
+        let health = &health_response.event.as_ref().unwrap().payload["health"];
+        assert_eq!(health["maxAttempts"], 2);
+        assert_eq!(health["quarantineFailureClass"], "runtime_unavailable");
+        assert_eq!(health["quarantineReason"], "runtime stayed offline");
+        assert!(health["quarantinedAt"].is_string());
+
+        let (release_status, release_response) = route_action(
+            json!({"action": "coven.automations.unquarantine", "id": "quarantined"}),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(release_status, 200);
+        assert_eq!(
+            release_response.event.as_ref().unwrap().payload["released"],
+            true
+        );
+        assert!(!crate::automations::runs::is_retry_quarantined(&conn, "quarantined").unwrap());
+        assert!(capabilities()
+            .capabilities
+            .iter()
+            .find(|capability| capability.id == "coven.automations")
+            .unwrap()
+            .actions
+            .contains(&"coven.automations.unquarantine"));
+    }
+
+    #[test]
+    fn automation_events_read_and_subscribe_resume_after_exclusive_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let definition = json!({
+            "schemaVersion": 1,
+            "id": "event-control",
+            "name": "Event control",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "utc",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Do the thing."
+        });
+        let (create_status, _) = route_action(
+            json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": "adopt:create:event-control:0001",
+                "definition": definition,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(create_status, 200);
+
+        let (read_status, read_response) = route_action(
+            json!({
+                "action": "coven.automations.events.read.v1",
+                "stream": {"kind": "automation", "id": "event-control"},
+                "limit": 1,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(read_status, 200);
+        let read = read_response.result.unwrap();
+        assert_eq!(read["events"].as_array().unwrap().len(), 1);
+        assert_eq!(read["events"][0]["sequence"], 0);
+        let checkpoint = read["checkpoint"].as_str().unwrap();
+
+        let (subscribe_status, subscribe_response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "event-control"},
+                "checkpoint": checkpoint,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+        assert_eq!(subscribe_status, 200);
+        assert!(subscribe_response.result.unwrap()["events"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn automation_events_subscribe_surfaces_typed_expired_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        conn.execute(
+            "INSERT INTO automation_event_checkpoints (
+                checkpoint, stream_kind, stream_id, after_sequence, issued_at, expires_at
+             ) VALUES (
+                'ecpexpired00000000000000000001',
+                'automation',
+                'expired',
+                -1,
+                '2020-01-01T00:00:00.000Z',
+                '2020-01-02T00:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "expired"},
+                "checkpoint": "ecpexpired00000000000000000001",
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 410);
+        assert_eq!(response.error.unwrap()["code"], "CURSOR_EXPIRED");
+    }
+
+    #[test]
+    fn automation_events_subscribe_rejects_non_contract_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "limited"},
+                "limit": 10,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+    }
+
+    #[test]
+    fn cross_stream_checkpoint_rejection_does_not_create_a_checkpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+        let first = crate::automations::contract::events::read_events(
+            &conn,
+            "automation",
+            "source",
+            None,
+            None,
+            100,
+            &now_iso(),
+        )
+        .unwrap();
+        let before = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_event_checkpoints",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.subscribe.v1",
+                "stream": {"kind": "automation", "id": "different"},
+                "checkpoint": first.checkpoint,
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
+        let after = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_event_checkpoints",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn automation_events_read_rejects_calendar_invalid_from_timestamp() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        crate::store::initialize_store(&path).unwrap();
+        let conn = crate::store::open_store(&path).unwrap();
+
+        let (status, response) = route_action(
+            json!({
+                "action": "coven.automations.events.read.v1",
+                "stream": {"kind": "automation", "id": "invalid-time"},
+                "from": "2026-99-99T99:99:99.000Z",
+            }),
+            &conn,
+            &crate::api::NoopSessionRuntime,
+        );
+
+        assert_eq!(status, 400);
+        assert_eq!(response.error.unwrap()["code"], "VALIDATION_FAILED");
     }
 }

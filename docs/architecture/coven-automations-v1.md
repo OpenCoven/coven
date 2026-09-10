@@ -6,6 +6,10 @@ Tracks: OpenCoven/coven#855 (this specification), OpenCoven/coven#854 (parent pr
 
 Machine-readable artifacts: [`spec/coven-automations/v1/`](../../spec/coven-automations/v1/) — JSON Schemas, state machines, capability negotiation, compatibility matrix, golden vectors, and a pinned TypeScript projection.
 
+Current source-pinned implementation status for terminal receipt production,
+delivery, SDK verification, and Cave presentation is tracked in the
+[Automation receipt delivery map](coven-automations-receipt-delivery.md).
+
 ## Normative language
 
 The key words MUST, MUST NOT, REQUIRED, SHOULD, SHOULD NOT, and MAY are to be interpreted as normative requirements.
@@ -32,10 +36,85 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
 
 ## Contract profile and versioning
 
-- The wire contract profile is the string `coven.automations.v1`, carried as `schemaVersion` on every object (`spec/coven-automations/v1/protocol-version.json`).
+- The wire contract profile is the string `coven.automations.v1`, carried as `schemaVersion` on every object (`spec/coven-automations/v1/protocol-version.json`). While the profile remains proposed, each source-bound bundle is an immutable revision; historical bundle digests are never reused for changed content. Once the profile is marked production-ready, incompatible changes require a new major profile.
 - Contract version is separate from implementation/release version: envelopes carry the producer's `implementationVersion` alongside the contract profile, and clients MUST NOT infer semantics from release versions.
 - Unknown profiles fail closed with `SCHEMA_VERSION_UNSUPPORTED` (`coven.automations.v0` and future `coven.automations.v2` are both refusals — golden vectors pin both).
 - Additive evolution rules and per-field change classes are machine-readable in `compatibility-matrix.json`; see [Compatibility and evolution](#compatibility-and-evolution).
+
+### Runtime Authority companion profile
+
+Runtime Authority is negotiated separately as
+`coven.automations.authority.v1`; it is not implied by base-v1 support and does
+not change the base profile. Its artifacts live under
+[`spec/coven-automations/authority/v1/`](../../spec/coven-automations/authority/v1/).
+
+The companion envelope travels under the exact key
+`AutomationRun.extensions["coven.automations.authority.v1"]`. A generic
+`coven.automations.v1` consumer preserves that value as opaque JSON and never
+interprets it. A Coven deployment claiming Runtime Authority conformance must
+also advertise `automations.runtime-authority.v1`, require the companion on
+each authoritative `AutomationRun`, validate and independently verify it, and
+fail closed when it is absent, malformed, stale, replayed, mismatched, or
+unverifiable.
+
+The run projection is an immutable `AutomationExecutionBinding`; the receipt
+projection is minimized `AutomationReceiptAuthorityEvidence`. Because the
+frozen base-v1 receipt schema has no `extensions` member, receipt evidence is a
+receipt-correlated sidecar in the run's authority extension rather than a new
+field on the base receipt. The sidecar is nullable only before settlement; a
+terminal base receipt requires evidence carrying its authenticated digest and
+exactly matching the binding's authority decision. Both preserve the base
+automation/occurrence/run/attempt correlation. Neither may include raw
+credentials, prompts, memory content, familiar declaration bodies, or
+unrestricted filesystem paths. Authority semantics remain owned by Familiar
+Contract and Coven Threads; Coven binds their pinned evidence to its own
+scheduler/runtime anchors.
+
+Per-run approvals remain single-use. A bounded-recurring Threads grant instead
+pins its grant id, maximum use count, occurrence prefix, prior usage count, and
+the current dispatch consumption tuple. It may be reused only while
+`priorUses < maxUses`, only for an occurrence matching the signed prefix, and
+only with `usageNumber == priorUses + 1`; replay of the same request, decision,
+occurrence, run, attempt, and fence tuple fails closed.
+
+Capability-set fields are mathematical sets serialized as unique arrays.
+Their per-object array order remains authenticated by JCS, while semantic
+correlation between trusted state, the binding, receipt evidence, and runtime
+descriptors is order-insensitive. Approval consumption request/decision
+digests and occurrence/run/attempt/fence anchors must exact-match the signed
+authorization and base dispatch.
+
+Authority chronology is
+`issuedAt <= validFrom <= decisionTimestamp <= dispatchNow < validUntil`.
+`validUntil` is exclusive. Familiar verification must be at or before both the
+decision and dispatch, and its age at dispatch may equal but not exceed the
+signed trusted freshness bound (at most 300 seconds in this profile). The
+authority value must also be valid I-JSON: unpaired UTF-16 surrogates in any
+nested string or object key are rejected before schema validation and RFC 8785
+canonicalization.
+
+Replay state is evaluated at the relevant lifecycle boundary. Pre-dispatch
+validation rejects any nonce, adoption key, per-run approval id, or recurring
+consumption tuple already committed by a dispatch. Terminal verification does
+the inverse evidence check: each committed index must be present, and one
+unambiguous ownership record must exactly match the signed binding, occurrence,
+run, attempt, fence, nonce, adoption key, and approval consumption. This lets a
+legitimate completed run remain verifiable without allowing the same authority
+to authorize another dispatch. Exact attempt identifiers and single-use
+human/protected-owner approval identifiers are ownership keys; unrelated
+bounded-recurring history is not conflicting solely by approval identifier.
+
+The companion has two executable validation projections without dispatch
+integration. The Node conformance validator owns portable vectors and
+advertisement checks. The Rust projection under
+`automations/contract/authority.rs` parses the closed profile, verifies its JCS
+digest and receipt correlation, and requires a narrow
+`AuthorityEvidenceVerifier` for deployment-owned Familiar, Threads, replay,
+approval, runtime, and signature evidence. Runtime Authority never falls back
+to base-v1 string references: absent adapters return
+`AUTHORITY_ADAPTER_MISSING`, absent trusted state returns
+`AUTHORITY_TRUSTED_STATE_UNAVAILABLE`, and generic base consumers continue to
+preserve unknown extensions without interpretation.
 
 ## Data model
 
@@ -52,6 +131,8 @@ Specified by `automation-definition.schema.json`. Field groups (all required unl
 - `lifecycleState` — `draft | paused | active | disabled | invalid` (tombstoning is a deletion marker, not a state; see below).
 - `display` — `name` (required, 1..=160), optional `description`, `tags`.
 - `trigger` — exactly one versioned union. v1 ratifies `schedule` only (scoped RRULE per `crates/coven-cli/src/automations/rrule.rs`: `FREQ=DAILY|WEEKLY`, optional `BYHOUR`, optional `BYDAY` for weekly; anything else is refused at validation). The union admits future variants as new branches in future profiles without redefining v1 fields, and consumers reject unknown variants via capability negotiation.
+- `trigger.schedule.timezone` — canonical `utc` or an exact IANA TZID validated by the Rust authority. Legacy `local` is compatibility input only: create, revise, and import resolve it before persistence, while existing rows migrate through an explicit revision ledger and a `definition.revised` event so historical occurrence/run pins remain unchanged. On Unix, Coven preserves the effective legacy clock by honoring `TZ` only when it names `utc` or an exact IANA TZID; POSIX rules, zone-file paths, malformed values, and non-UTF-8 values fail closed instead of silently binding the unrelated host zone. Without `TZ`, the platform must prove its system IANA zone. Before mutation, every non-null stored definition digest must match the JCS digest of the exact stored JSON; mismatches fail closed rather than blessing altered history. The definition revision, ledger record, and event append commit as one full-batch transaction; standalone migration acquires `BEGIN IMMEDIATE`, while store initialization uses a savepoint inside its existing immediate transaction. If timezone proof fails, digest verification fails, or any later migration step fails, the batch rolls back explicitly. Spring-forward gaps skip nonexistent wall times; fall-back folds select the first occurrence (the earlier UTC instant).
+- Schedule revisions are future-only: the current revision's `updatedAt` is the lower planning bound. Revision writes clamp that timestamp against both the previous definition timestamp and the automation event-stream head, so a backward wall-clock jump cannot move revision or event time backward. Current-revision fences match both revision and definition digest to prevent backward-clock duplicates without attributing unverifiable reused-id history to a new definition; older-revision fences retain history and block an exact duplicate slot through the durable uniqueness fence, but do not globally advance the new revision's cursor or suppress unrelated future slots.
 - `conditions` — zero or more; v1 defines zero variants (the slot is a boolean-false schema), so any value fails validation until a future profile adds branches.
 - `action` — exactly one versioned union. v1 ratifies `familiarInvocation` (non-empty `prompt`, optional `cwd`), mirroring the #816 prompt requirement and the runner's no-cwd failure rule.
 - `binding` — `familiarBindingPolicy: "exact"` plus `familiarId` and the authority/approval policy reference. Exact binding is the only v1 policy: the familiar recorded at activation is the familiar every run binds; rebinding requires a new revision.
@@ -113,6 +194,12 @@ Specified by `automation-receipt.schema.json`. Immutable and versioned; written 
 - `integrity` — digest over the canonical receipt body plus an `authentication` marker (`none | producer-hmac | cosign`); unauthenticated receipts are integrity-checked but not provenance-proof, and consumers MUST surface the distinction.
 - `privacy` — classification and retention.
 
+When Runtime Authority is advertised, the authority extension on the
+correlated `AutomationRun` contains the separately validated receipt-evidence
+sidecar after settlement. The frozen base receipt remains unchanged. Base
+consumers still treat the run extension as opaque and do not gain Runtime
+Authority conformance merely by retaining it.
+
 ## Lifecycle semantics (state machines)
 
 Machine-readable source of truth: `spec/coven-automations/v1/state-machines.json`. Clients do not author state; transitions are committed by command handlers or the scheduler, never by arbitrary client writes.
@@ -142,6 +229,44 @@ adopted -> dispatching -> started -> observing
 ```
 
 `ambiguous` is terminal for the attempt (dispatch sent but no deterministic ack, or evidence lost). The occurrence carries the recovery; the attempt never re-opens. `dispatching -> failed` covers deterministic launch refusal; `dispatching -> ambiguous` covers unconfirmed dispatch.
+
+The native Rust runner persists this model in `automation_attempts`. The first
+dispatch opens attempt 1 before runtime side effects; retries append a new row
+with a deterministic adoption key, the prior attempt number/disposition, the
+claim fence generation, and a persisted `not_before`. A terminal attempt row
+cannot be updated or deleted. `coven.automations.runs` includes the attempt
+ledger, and `coven.automations.health` exposes the current retry wait and
+configured attempt bound. The run also stores the exact validated definition
+JSON beside its revision and digest, so restart recovery and later attempts use
+the accepted policy/binding even if the live definition is revised.
+
+Automatic retry is deliberately narrower than a generic launch error:
+
+- `runtime_unavailable` is reserved for pre-ownership I/O evidence such as a
+  missing or unreachable runtime.
+- `transient_dispatch` is reserved for pre-ownership interruption, queue
+  backpressure, or timeout evidence.
+- `lease_expired` is retried only when the containment receipt proves no
+  process started. Lease age alone is not sufficient.
+- Unknown launch failures settle as `launch_refused`. Any path that established
+  or may have retained runtime ownership remains nonterminal or ambiguous and
+  never auto-retries.
+
+Backoff is durable and restart-safe. `none` is immediately eligible, `fixed`
+uses the configured delay, and `exponential` uses deterministic full jitter
+derived from the run id and next attempt number. Delays begin when the
+pre-ownership failure is observed, not when dispatch began. The ceiling is
+capped at one day. The scheduler will not claim the retry before `not_before`,
+and overlap protection continues to block every other occurrence while the
+same run waits. The original per-run wall-clock deadline includes retry
+backoff: expiration atomically fails the occurrence and run and terminalizes
+the pending attempt without launching another runtime session.
+
+When a configured retryable class exhausts `maxAttempts`, Coven terminally
+fails the run and occurrence and records `automation_retry_state` quarantine.
+Quarantined definitions do not plan, claim, or accept manual runs. Health
+reports the exhaustion count, failure class, reason, and quarantine timestamp;
+the explicit `coven.automations.unquarantine` control action releases it.
 
 ### Run
 
@@ -200,7 +325,9 @@ Specified by `command-envelope.schema.json`. Every command is an envelope:
 
 Command catalog (all names versioned in the envelope): create, revise, activate, pause, disable, tombstone; run now; cancel occurrence/run/attempt; retry with explicit prior disposition; recover with explicit evidence determination; list/get/history/health; events read/subscribe; legacy import. The response is one of `committed`, `replayed`, `rejected` — with `result` only on committed/replayed and `error` only on rejected.
 
-**Idempotency storage note for implementers:** the adoption key must be persisted in the same transaction as the state change it drives (a `command_adoption` table keyed by adoption key storing the serialized committed response), so replays are answerable without recomputation.
+**Idempotency storage note for implementers:** the adoption key must be persisted in the same transaction as the state change it drives (a `command_adoption` table keyed by adoption key storing the first terminal outcome, including durable domain rejections), so replays and changed-request conflicts are answerable without recomputation. A rejected key is retained: the exact rejected request returns the stored rejection, while a corrected or otherwise changed request must use a new key or receive `ADOPTION_REPLAY_MISMATCH`.
+
+The Rust authority implements this rule in `automations/command_adoption.rs`. Valid definition create, revise, and tombstone commands are normalized before adoption; their RFC 8785 request digest covers the versioned command name, payload, and `expectedRevision` where applicable. Invalid definition payloads and malformed versioned command fields use a lossless tagged JSON fingerprint before RFC 8785 hashing, so unsafe integers, missing fields, and other non-contract values receive deterministic durable rejections instead of reusable-key failures. Only a missing or structurally invalid `adoptionKey` is rejected before adoption. The versioned control-action ids `coven.automations.definition.create.v1`, `.revise.v1`, and `.tombstone.v1` require `adoptionKey`; revise/tombstone also require `expectedRevision`. Their `.get.v1` response includes `revision` and `tombstonedAt`; `.list.v1` includes `revisionById`, and `includeTombstoned: true` exposes retained tombstones through `tombstonedAtById`. Definitions persist an internal authority version: migrated and legacy-created rows begin in legacy mode, while v1 create/revise/tombstone marks a row as v1-managed. The unversioned `coven.automations.create/update/delete/list/get` actions retain their prior permissive request parsing and wire-visible missing-delete and erase/recreate behavior for legacy-mode rows, but cannot overwrite or erase a v1-managed row. Internally, legacy delete/recreate tombstones and revives the retained row with a monotonically increasing revision, preventing stale v1 CAS requests from matching a recreated identity. Legacy mutations still execute inside the append-only transactional adoption boundary. Exact versioned replays return the stored result and original `eventRef` without a second mutation or event, changed requests under a retained key return `ADOPTION_REPLAY_MISMATCH`, stale revisions return `REVISION_CONFLICT`, and versioned tombstone requests create a new tombstone revision rather than erasing the authority row. A legacy delete that reports `deleted: false` is a committed compatibility response, not a state mutation, and therefore never fabricates a lifecycle event.
 
 ## Errors and status mapping
 
@@ -214,12 +341,49 @@ Control-action transport mapping: `POST /api/v1/actions` (`crates/coven-cli/src/
 
 Specified by `event-envelope.schema.json`.
 
-- **Envelope:** `schemaVersion`, `eventId` (globally unique), `stream {kind, id}`, gapless `sequence` per stream, `recordedAt`/`observedAt`, `producer`, optional `causation` (adoption key, cause event id, correlation id), object ids as applicable, `kind`, user-safe `summary` (no secrets, no prompts), typed `payload`, `privacy`, optional `integrity`.
+- **Envelope:** `schemaVersion`, `eventId` (globally unique), `stream {kind, id}`, gapless `sequence` per stream, `recordedAt`/`observedAt`, `producer`, optional `causation` (adoption key, cause event id, correlation id), object ids as applicable, `kind`, user-safe `summary` (no secrets, no prompts), typed `payload`, `privacy`, optional `integrity`. The event kind discriminates the payload: definition lifecycle kinds use definition payloads, each transition kind requires its matching entity, and misfire, receipt, and snapshot kinds use only their corresponding payload.
 - **Streams:** `automation/{id}`, `occurrence/{id}`, `run/{id}`, plus a global `feed`. Stream-local sequences are gapless and append via compare-and-set; out-of-order appends are refused (`STREAM_OUT_OF_ORDER`), never reordered.
 - **Delivery:** at-least-once. Consumers deduplicate on `eventId` and refuse regressions against their cursor (the golden vectors pin both).
 - **Read:** `events.read.v1` with `after` (exclusive sequence) or `from` (timestamp, resolved to a concrete cursor in the response); `events.subscribe.v1` with an opaque `checkpoint`. Expired checkpoints return `CURSOR_EXPIRED` (410) with the expiry instant — never a silent rewind.
 - **Rehydration:** the read model is a fold: dedupe by eventId → apply strictly-increasing sequences → final state. Reconnection and duplicates converge to the same state (vector `event-replay-rehydrates-deterministically`). Occurrence records carry `eventWindow` so a reader knows the stream bounds it read.
 - **Compaction:** `feed.snapshot` events carry `throughSequence` plus compacted state; consumers fold the snapshot and apply strictly-later events. Retention may compact streams only behind a snapshot.
+
+The Rust authority persists this contract in `automations/contract/events.rs`. Each stream has a durable next-sequence row, and append advances that head with compare-and-set inside the same SQLite transaction as the domain mutation and adoption record. A duplicate event id or unexpected sequence leaves both the event row and stream head unchanged. Definition create, revise, and tombstone commits append schema-validated lifecycle events; rejected commands and compatibility no-ops append nothing. Store upgrade adds one deterministic `definition.imported` baseline per retained definition so event consumers do not begin from an empty stream; its `recordedAt` is the migration time while `observedAt` retains the legacy row's update time. Codex TOML imports append the same typed imported lifecycle event in the transaction that inserts the definition.
+
+The control actions `coven.automations.events.read.v1` and `coven.automations.events.subscribe.v1` expose bounded pages. Reads accept either an exclusive `after` cursor or a valid UTC `from` timestamp and return the resolved concrete cursor; timestamp resolution compares normalized epoch milliseconds rather than RFC 3339 text. The `feed/all` stream pages all domain events in commit order using its own cursor while retaining each event's original domain stream envelope. Subscribe accepts either `after` or an opaque checkpoint; checkpoints are bound to one stream, expire after 24 hours, and return typed `CURSOR_EXPIRED` responses rather than rewinding. Expired checkpoint records remain available for a seven-day diagnostic grace period and are then pruned in bounded batches during later reads. Reducer conformance tests prove duplicate delivery, reconnect, sequence-regression refusal, and snapshot-plus-strictly-later-tail convergence.
+
+## Scheduler clock and wake boundary
+
+The daemon scheduler owns one injected clock/wake boundary in `automations/daemon_tick.rs`. Production wall time and monotonic time come from `SystemAutomationClock`; deterministic tests supply scripted time and wake outcomes without sleeping. Each pass reads authoritative UTC through that boundary for reconciliation, planning, claiming, and every dispatch lease check instead of mixing an injected scheduler time with direct wall-clock reads. The periodic deadline is monotonic, so wall-clock changes cannot lengthen or shorten the current wait by accident; the next pass re-reads authoritative wall time and replans from durable occurrence fences.
+
+Scheduler authority is local-first and single-writer. Before startup recovery or any scheduler pass, the process acquires the profile-local `automations-scheduler.lock` advisory lock and advances the singleton `automation_scheduler_authority` generation in SQLite. Scheduled claims pin that generation in `automation_occurrences.scheduler_generation`; planning, durable dispatch, runtime ownership publication, and rejected-launch settlement fail closed when the pinned owner/generation is no longer current. The `coven.automations.tick` control action may plan durable occurrence fences and wake the registered scheduler, but it never claims work without that authority. A clean shutdown clears only its exact owner/generation, while a crash relies on operating-system lock release and the next owner advances the durable generation before reclaiming unlaunched work. This composes with `daemon-serve.lock`: the daemon lock excludes duplicate serving processes, while the scheduler lock and SQLite generation protect directly started schedulers and reject stale persisted work after restart. This is supported only when the lock file and SQLite database share one local host filesystem. Network filesystems and multi-host leader consensus are explicitly outside the v1 authority model.
+
+The read-only `coven.automations.scheduler.status.v1` control action exposes the durable scheduler owner/generation and acquisition time, details for the last completed startup, deadline, or wake pass, and bounded queue counts. `authorityAssigned` means the SQLite authority row still names an owner; it is deliberately not a liveness claim because a crashed process releases the OS lock without rewriting SQLite. Last-pass publication records scheduled, started, and finished timestamps, monotonic duration, start lag in milliseconds, pass outcome/error class, and planning, recovery, claim, dispatch, and failure counts. A failed pass preserves counts from every completed phase and reports later-phase counts as `null` rather than inventing zero progress. Publication uses the same exact owner/generation fence in an immediate transaction, so a stale scheduler cannot overwrite its successor's diagnostics. The status response is read from one SQLite snapshot. `oldestEligibleAt` follows scheduler claim semantics: it selects the latest due fence per routine, admits only definitions that pass the scheduler's full durable validation unless a persisted retry is ready, and excludes quarantined or overlap-blocked work. `oldestEligibleAgeMs` reports its nonnegative queue age at snapshot time, `batchLimit` publishes the scheduler's fixed admission budget, and `planningBatchLimit` plus `planningAfterDefinitionId` expose the bounded planning page and its durable progress cursor.
+
+Each scheduler pass evaluates at most 64 non-tombstoned raw definition rows, claims at most 64 eligible occurrences in oldest-scheduled order, supersedes at most 64 stale misfires, and dispatches at most 64 existing claims in the same order. Definition planning uses a durable circular `(name, definition id)` keyset cursor. Paused, invalid, and quarantined rows consume the planning budget and advance the cursor, so a malformed or inactive prefix cannot starve later definitions. Occurrence fences commit independently before the cursor advances: a crash during cursor persistence repeats the same page after restart, and the unique occurrence fence makes that replay idempotent. A missing cursor row is recreated. Cursor writes compare a monotonic revision as well as the composite key, so overlapping scheduler and planning-only control passes cannot regress progress after a circular ABA; scheduler-owned advancement also verifies the exact owner/generation fence. Normal scheduled claims are admitted only for definitions successfully evaluated on the current page, while ready persisted retries remain independently eligible. A routine with more than 64 stale fences is drained across passes and its latest fence is not claimed until older rows are durably superseded. SQL applies claim and dispatch limits before occurrence materialization, so a large due or recovered backlog does not create an unbounded in-memory dispatch list. Remaining definitions, planned occurrences, and claims stay durable for later wake/deadline passes; the per-routine overlap fence remains stricter than the global batch budget.
+
+This planning bound does not yet make every scheduler definition read bounded. Eligibility and scheduler-status computation still validate the full active definition catalog before selecting a bounded occurrence page. That separate catalog-scan limit remains required before the scheduler can claim a fully bounded end-to-end definition workload.
+
+The read-only `coven.automations.occurrence.list.v1` action exposes bounded operator views over due, eligible, claimed, running, and recovery-required occurrences. `due` includes every planned row whose scheduled time has arrived, while `eligible` reuses the scheduler's exact validated-definition, latest-only, retry-readiness, quarantine, timeout, and overlap rules; the distinction makes blocked backlog visible without presenting it as claimable work. Claimed, running, and recovery-required rows include the exact lease owner/expiry, scheduler generation, occurrence fence generation, and failure reason. `coven.automations.occurrence.get.v1` reads one occurrence and its bounded correlated run and attempt records from one SQLite snapshot, including immutable revision/digest pins, authority profile and receipt references, timeout, adoption key, occurrence fence generation, and dispatch generation. The detail response returns at most 20 runs and sets `runsTruncated` when anomalous duplicate history exceeds that bound; the schema limits each run to ten attempts. Both actions are diagnostic only: they neither renew leases nor mutate lifecycle rows, and list output is capped at 100 records.
+
+Startup first recovers daemon-owned launches only when a durable containment receipt proves that runtime admission closed before any process was spawned, then restores every remaining daemon claim without a run to `planned`. A persisted `created` session without that no-process proof is ambiguous and is never replayed automatically because a harness may have received its prompt in argv before ownership publication. Safe restorations preserve the claim attempt counter so the next accepted claim receives a strictly newer fence generation. Before spawning the worker, the daemon captures a UTC startup cutoff. The immediate startup reconciliation may treat a missing receipt as previous-daemon containment only for a daemon-owned scheduled launch created before that cutoff; manual launches and launches created concurrently by the newly serving daemon still require durable containment evidence. The daemon then launches the scheduler worker before it begins serving requests, and that worker immediately runs the complete ordered reconciliation and due-work pass. Runtime dispatch cannot delay the daemon's bounded readiness handshake, while the pass still begins before transport admission. Successful definition create, revise, or tombstone actions notify only the scheduler registered for that Coven home, interrupting the periodic wait so newly active or changed definitions are replanned promptly. Shutdown sets the same wake signal before runtime admission closes and gives the scheduler a bounded join window; a worker still inside another bounded operation is detached only for the immediately following process exit. A typed pre-spawn admission rejection writes the no-process receipt before removing its provisional run and session and restoring the occurrence to `planned`; any other unlaunched daemon claims are likewise restored rather than expiring terminally. If process exit wins before that transaction commits, the receipt authorizes the same recovery before the next daemon accepts requests. Wake generations are observed across each pass, so a mutation racing with reconciliation is not lost; multiple pending notifications may coalesce because durable definitions and occurrence fences remain the authority.
+
+## Crash and restart certification
+
+Deterministic failure injection certifies the currently implemented durability boundaries. SQLite abort triggers interrupt mutations between statements and the owning transaction must roll back. The planning, claim, launch, and settlement tests additionally close and reopen the durable store; planning and settlement then repeat the interrupted pass to prove convergence from the last committed evidence without duplicate dispatch or false success.
+
+| Boundary | Certification |
+| --- | --- |
+| Definition revision commit | Definition/adoption/event rollback is covered by `event_append_failure_rolls_back_definition_and_adoption`; timezone migration also rolls back its full batch when event append fails. |
+| Occurrence planning | `planning_failure_restarts_without_duplicate_or_missed_fences` proves a partially completed pass resumes idempotently with one fence per routine. |
+| Claim commit | `claim_failure_rolls_back_superseded_misfire_rows` proves superseding old misfires and claiming the latest row are one atomic mutation. |
+| Command adoption | Definition command replay, revision conflict, and event-append rollback tests prove one adopted outcome with no fabricated event. |
+| Runtime dispatch request and session creation | `durable_launch_failure_rolls_back_session_run_and_attempt` proves failed attempt persistence leaves no orphan session, run, or attempt and terminalizes the manual occurrence with the exact refusal. |
+| First runtime ownership publication | Retained/publication-error and terminal-before-publication tests preserve nonterminal ambiguity or reconcile durable terminal session evidence without replay. |
+| Runtime terminal observation and run settlement | `terminal_settlement_failure_rolls_back_and_retries_from_session_evidence` proves occurrence, attempt, and run settlement is atomic and repeatable from the unchanged terminal session record. |
+| Delivery temp write and rename/commit | Not executable in v1: durable definitions still reject `outputTarget` until atomic delivery is certified. No release may claim these boundaries while that capability remains refused. |
+| Receipt commit | The receipt component proves atomic immutable commit, replay convergence, exact terminal correlation, and rollback on event failure. Production terminal receipt wiring remains tracked by #857 and is not implied by component tests. |
+| Event/changefeed publication | Gapless sequence, duplicate-id refusal, definition mutation rollback, and receipt rollback tests prove event publication cannot commit apart from its owning domain mutation. |
 
 ## Capability negotiation
 
@@ -238,11 +402,13 @@ Digests (definition integrity, receipts, event integrity where required) are SHA
 
 Non-destructive, no data loss, no rewritten history:
 
-1. **Definitions:** on first contract adoption, each stored `automation_definitions` row gains sidecar columns (`revision` = 1, `integrity` = digest over its existing `definition_json` bytes, lifecycle mapping `ACTIVE → active`, `PAUSED → paused`, default `draft` for import). `definition_json` bytes stay byte-identical — the digest is computed over them, not written into them — so pre-migration rows remain verifiable.
-2. **Occurrences:** every existing row pins `automationRevision: 1` plus the definition digest; `attempt` counter maps to fence `generation` (claim already increments it in `claim_due_occurrence`); state strings map 1:1 (`planned/claimed/running/succeeded/failed`) with `succeeded/failed` becoming the v1 terminals of the same names and implementation-only `skipped` migrating to v1 `superseded`.
-3. **Runs:** `automation_runs` rows map to v1 runs with `state` from `status`; the ledger's `exit_code/log_json/output_commit` columns carry into `terminalDisposition`/`delivery` without backfilling receipts — receipts exist only for runs that produce them after adoption (receipts are never fabricated for history).
+1. **Definitions:** on first contract adoption, each stored `automation_definitions` row gains sidecar columns (`revision` = 1, `integrity` = SHA-256 over the RFC 8785 canonical form of its existing `definition_json`, lifecycle mapping `ACTIVE → active`, `PAUSED → paused`, default `draft` for import). The stored `definition_json` text stays byte-identical: migration parses it only to compute the portable JCS digest and never rewrites it. Malformed retained JSON also stays byte-identical, is marked `invalid`, and is counted as unverifiable instead of blocking store startup.
+2. **Occurrences:** every existing row that can be correlated to a retained definition revision pins that exact `automationRevision` plus the definition digest. The correlation is accepted only when the retained definition's last update is no later than the occurrence, so a revision made after the occurrence is never retroactively attached. The `attempt` counter maps to fence `generation` (claim already increments it in `claim_due_occurrence`); state strings map 1:1 (`planned/claimed/running/succeeded/failed`) with `succeeded/failed` becoming the v1 terminals of the same names and implementation-only `skipped` migrating to v1 `superseded`. History older than the retained definition row (including a hard-delete followed by reuse of the same ID) remains explicitly unverifiable rather than being falsely attributed to the replacement definition.
+3. **Runs:** `automation_runs` rows inherit the exact pin from their retained occurrence and map v1 `state` from `status`; the ledger's `exit_code/log_json/output_commit` columns carry into `terminalDisposition`/`delivery` without backfilling receipts — receipts exist only for runs that produce them after adoption (receipts are never fabricated for history). A run whose occurrence reference was removed by the legacy `ON DELETE SET NULL` behavior remains unverifiable rather than borrowing the current definition's digest.
 4. **Wire compatibility:** the legacy control actions (`coven.automations.*`, `control_plane.rs`) continue to respond during migration, each response additionally carrying the contract profile; new commands are additive. `coven.automations.import` maps to `legacy.import.v1` (`source: codex-automation-toml`), keeping the non-destructive, created-PAUSED/draft semantics of `import_legacy.rs`.
-5. **Nothing is deleted:** no definitions, occurrences, or run history are erased at any step (acceptance criterion), and the migration is idempotent (re-running adopts nothing twice — the adoption table marks it).
+5. **Nothing is deleted:** no definitions, occurrences, or run history are erased at any step (acceptance criterion), and the migration is idempotent. `automation_contract_migrations` records migrated and unverifiable row counts; a second initialization performs no automation-row writes.
+
+The Rust implementation lives in `automations/contract/migration.rs` and runs inside the store initialization transaction. New definition mutations maintain the JCS digest and lifecycle sidecars, new occurrences copy the current revision/digest atomically, and runs inherit the occurrence pin. Dispatch refuses an occurrence if its pinned revision/digest no longer matches the current definition; executing a later definition body under an older historical pin is never allowed.
 
 ## Implementation boundaries
 
@@ -251,9 +417,9 @@ Non-destructive, no data loss, no rewritten history:
 - Cave, SDK, and Psyche consume the pinned artifacts (`schemas`, `test-vectors.json`, `coven.automations.v1.d.ts`) as packed/released artifacts — never source-relative imports, never hand-maintained parallel types.
 - This protocol does not move schedule authority into Psyche or authority semantics into Cave: it binds references (`principalId`, `approvalPolicyRef`, `familiarId`) and defers semantics to their canonical layers.
 
-## Corresponding Rust types (pinned mapping, implementation deferred)
+## Corresponding Rust types
 
-The Rust projection is mechanical and lands in a follow-up implementation PR (this issue specifies; it does not implement): a `contract` module with serde types renamed to camelCase (`#[serde(rename_all = "camelCase")]`, the existing wire style in `definition.rs`), where each struct maps 1:1 to a schema (`AutomationDefinition`, `AutomationOccurrence`, `AutomationRun`, `AutomationAttempt`, `AutomationReceipt`, `CommandEnvelope`, `CommandResponse`, `ErrorEnvelope`, `EventEnvelope`), `#[serde(deny_unknown_fields)]` on every v1 struct to mirror `additionalProperties: false`, `serde_json::Value` for the extension bag, and round-trip tests generated from the golden vectors. Status enums map to the schemas' enums exactly; the schema files remain the source of truth.
+The Rust projection lives under `crates/coven-cli/src/automations/contract/` with serde types renamed to camelCase (`#[serde(rename_all = "camelCase")]`, the existing wire style in `definition.rs`). Each struct maps 1:1 to a schema (`AutomationDefinition`, `AutomationOccurrence`, `AutomationRun`, `AutomationAttempt`, `AutomationReceipt`, `CommandEnvelope`, `CommandResponse`, `ErrorEnvelope`, `EventEnvelope`), uses `#[serde(deny_unknown_fields)]` on closed v1 objects to mirror `additionalProperties: false`, and uses `serde_json::Value` only for the explicitly open extension/state objects. Status enums map to the schemas' enums exactly; the schema files remain the source of truth.
 
 ## Verification matrix
 

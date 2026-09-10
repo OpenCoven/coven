@@ -230,6 +230,8 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `not_found`            | 404         | Generic route not found.                         |
 | `invalid_request`      | 400 or 404  | Malformed request, unknown harness id, missing required field, or unsupported API version. |
 | `forbidden`            | 403         | The request asks TCP to exercise an owner-local-IPC-only capability such as `launchPolicy`. |
+| `transport_forbidden`  | 403         | A proposal read or mutation was sent over optional loopback TCP instead of owner-gated local IPC. |
+| `ward_audit_capacity_exceeded` | 507 | The append-only Ward ledger or its WAL has no reserved durable capacity; no new mutation is admitted. |
 | `session_not_found`    | 404         | Session id does not exist.                       |
 | `harness_not_found`    | 404         | `GET /capabilities/:harnessId`: harness id is not a known capability scan target. |
 | `session_not_live`     | 409         | Session exists but is not running.               |

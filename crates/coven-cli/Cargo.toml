@@ -48,7 +48,8 @@ qrcode = { version = "0.14", default-features = false }
 # loading payloads. Keep SQLite bundled so the locked library version provides it.
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+serde_jcs = "0.2"
 serde_yaml_ng = "0.10"
 sha2 = "0.11"
 similar = "2"
@@ -67,6 +68,8 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm",
 unicode-width = "0.2"
 textwrap = "0.16"
 unicode-casefold = "0.2.0"
+chrono-tz = "0.10.4"
+iana-time-zone = "0.1.65"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

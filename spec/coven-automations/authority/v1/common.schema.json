@@ -1,0 +1,387 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/authority/v1/common.schema.json",
+  "title": "Coven Automations Authority v1 shared definitions",
+  "$defs": {
+    "baseAutomationId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$",
+      "description": "Stable automation identifier; charset and bound match the #816 definition validator."
+    },
+    "baseOccurrenceId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "baseRunId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "baseAttemptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "baseReceiptId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "baseAdoptionKey": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 200,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]*$",
+      "description": "Stable request/adoption (idempotency) key supplied by the caller. Replays of the same command with the same key return the first committed outcome unchanged."
+    },
+    "baseOccurrenceKey": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 320,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._@:-]*$",
+      "description": "Canonical occurrence key: `automationId@scheduledFor` for schedule slots (scheduledFor in RFC 3339 millis), `automationId@manual-<adoptionKey>` for manual requests. The store fence UNIQUE(automation_id, scheduled_for) of #816 is the implementation of this key."
+    },
+    "basePrincipalId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@-]*$",
+      "description": "Canonical principal identifier from the authority layer. This protocol binds but does not define principal semantics."
+    },
+    "baseRuntimeId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Harness/runtime identifier, for example coven-code."
+    },
+    "opaqueIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[A-Za-z][A-Za-z0-9._:@-]{0,255}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "minLength": 20,
+      "maxLength": 24,
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-(0[1-9]|1[0-2])-([0-2][0-9]|3[01])T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{3})?Z$"
+    },
+    "hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "digest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "value"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "canonicalization": { "const": "jcs-rfc8785" },
+        "value": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9.-]*$"
+    },
+    "capabilitySet": {
+      "description": "A mathematical capability set serialized as a unique array. Array order remains part of each object's authenticated JCS bytes, but correlation compares members without regard to order.",
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/capability" }
+    },
+    "projectionIds": {
+      "type": "array",
+      "maxItems": 128,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/opaqueIdentifier" }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "instanceId", "implementationVersion"],
+      "properties": {
+        "component": { "$ref": "#/$defs/opaqueIdentifier" },
+        "instanceId": { "$ref": "#/$defs/opaqueIdentifier" },
+        "implementationVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]*$"
+        }
+      }
+    },
+    "familiarValidity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notBefore", "notAfter"],
+      "properties": {
+        "notBefore": { "$ref": "#/$defs/timestamp" },
+        "notAfter": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "familiarRevocation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "checkedAt"],
+      "properties": {
+        "state": { "const": "not_revoked" },
+        "checkedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "familiarRetirement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "checkedAt"],
+      "properties": {
+        "state": { "const": "not_retired" },
+        "checkedAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "authorityPrivacy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "classification",
+        "retention",
+        "redactionStatus",
+        "sensitiveMaterialIncluded"
+      ],
+      "properties": {
+        "classification": { "enum": ["operational", "sensitive", "restricted"] },
+        "retention": {
+          "enum": ["ephemeral_24h", "authority_evidence_90d", "authority_evidence_1y"]
+        },
+        "redactionStatus": { "enum": ["not_required", "redacted", "tombstoned"] },
+        "sensitiveMaterialIncluded": { "const": false }
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonicalization", "value"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "canonicalization": { "const": "jcs-rfc8785" },
+        "value": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "authentication": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["method", "keyId", "proofRef", "signedDigest", "signature"],
+      "properties": {
+        "method": { "const": "ed25519" },
+        "keyId": { "$ref": "#/$defs/opaqueIdentifier" },
+        "proofRef": { "$ref": "#/$defs/opaqueIdentifier" },
+        "signedDigest": { "$ref": "#/$defs/hash" },
+        "signature": {
+          "type": "string",
+          "minLength": 128,
+          "maxLength": 128,
+          "pattern": "^[0-9a-f]{128}$"
+        }
+      }
+    },
+    "deniedCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability", "reasonCode"],
+      "properties": {
+        "capability": { "$ref": "#/$defs/capability" },
+        "reasonCode": { "$ref": "#/$defs/opaqueIdentifier" }
+      }
+    },
+    "deniedCapabilities": {
+      "type": "array",
+      "maxItems": 128,
+      "items": { "$ref": "#/$defs/deniedCapability" }
+    },
+    "approvalBinding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requirement", "evidence", "scopeDigest", "expiresAt", "use", "consumption"],
+          "properties": {
+            "requirement": { "const": "not_required" },
+            "evidence": { "type": "null" },
+            "scopeDigest": { "type": "null" },
+            "expiresAt": { "type": "null" },
+            "use": { "type": "null" },
+            "consumption": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state"],
+              "properties": {
+                "state": { "const": "not_required" }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requirement", "evidence", "scopeDigest", "expiresAt", "use", "consumption"],
+          "properties": {
+            "requirement": { "enum": ["human_per_run", "protected_owner_per_run"] },
+            "evidence": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["approvalId", "approvalDigest", "state"],
+              "properties": {
+                "approvalId": { "$ref": "#/$defs/opaqueIdentifier" },
+                "approvalDigest": { "$ref": "#/$defs/digest" },
+                "state": { "enum": ["approved", "revoked"] }
+              }
+            },
+            "scopeDigest": { "$ref": "#/$defs/digest" },
+            "expiresAt": { "$ref": "#/$defs/timestamp" },
+            "use": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": {
+                "kind": { "const": "single_use" }
+              }
+            },
+            "consumption": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "state",
+                "eventId",
+                "eventDigest",
+                "requestDigest",
+                "decisionDigest",
+                "occurrenceId",
+                "runId",
+                "attemptNumber",
+                "fenceGeneration"
+              ],
+              "properties": {
+                "state": { "const": "consumed_for_dispatch" },
+                "eventId": { "$ref": "#/$defs/opaqueIdentifier" },
+                "eventDigest": { "$ref": "#/$defs/digest" },
+                "requestDigest": { "$ref": "#/$defs/digest" },
+                "decisionDigest": { "$ref": "#/$defs/digest" },
+                "occurrenceId": { "$ref": "#/$defs/baseOccurrenceId" },
+                "runId": { "$ref": "#/$defs/baseRunId" },
+                "attemptNumber": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "fenceGeneration": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["requirement", "evidence", "scopeDigest", "expiresAt", "use", "consumption"],
+          "properties": {
+            "requirement": { "const": "bounded_recurring" },
+            "evidence": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["approvalId", "approvalDigest", "state"],
+              "properties": {
+                "approvalId": { "$ref": "#/$defs/opaqueIdentifier" },
+                "approvalDigest": { "$ref": "#/$defs/digest" },
+                "state": { "enum": ["approved", "revoked"] }
+              }
+            },
+            "scopeDigest": { "$ref": "#/$defs/digest" },
+            "expiresAt": { "$ref": "#/$defs/timestamp" },
+            "use": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind", "grantId", "maxUses", "occurrencePrefix", "priorUses"],
+              "properties": {
+                "kind": { "const": "recurring" },
+                "grantId": { "$ref": "#/$defs/opaqueIdentifier" },
+                "maxUses": { "type": "integer", "minimum": 1, "maximum": 366 },
+                "occurrencePrefix": {
+                  "type": "string",
+                  "minLength": 8,
+                  "maxLength": 160,
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9._@:-]*$"
+                },
+                "priorUses": { "type": "integer", "minimum": 0, "maximum": 365 }
+              }
+            },
+            "consumption": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "state",
+                "eventId",
+                "eventDigest",
+                "requestDigest",
+                "decisionDigest",
+                "occurrenceId",
+                "runId",
+                "attemptNumber",
+                "fenceGeneration",
+                "usageNumber"
+              ],
+              "properties": {
+                "state": { "const": "consumed_for_dispatch" },
+                "eventId": { "$ref": "#/$defs/opaqueIdentifier" },
+                "eventDigest": { "$ref": "#/$defs/digest" },
+                "requestDigest": { "$ref": "#/$defs/digest" },
+                "decisionDigest": { "$ref": "#/$defs/digest" },
+                "occurrenceId": { "$ref": "#/$defs/baseOccurrenceId" },
+                "runId": { "$ref": "#/$defs/baseRunId" },
+                "attemptNumber": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "fenceGeneration": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "usageNumber": { "type": "integer", "minimum": 1, "maximum": 366 }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "riskClass": {
+      "enum": ["R0", "R1", "R2", "R3", "R4"]
+    },
+    "sideEffectClass": {
+      "enum": [
+        "none",
+        "local_read",
+        "local_write",
+        "external_read",
+        "external_mutation",
+        "irreversible_external_mutation"
+      ]
+    }
+  }
+}

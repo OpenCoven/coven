@@ -1,0 +1,301 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencoven.ai/spec/coven-automations/authority/v1/automation-execution-binding.schema.json",
+  "title": "Coven AutomationExecutionBinding authority companion v1",
+  "description": "Immutable dispatch-time authority snapshot carried at extensions['coven.automations.authority.v1'] on an AutomationRun. It authorizes one exact attempt and never carries raw credentials, prompts, memory content, or unrestricted filesystem paths.",
+  "allOf": [
+    {
+      "if": {
+        "required": ["authorization"],
+        "properties": {
+          "authorization": {
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "const": "requires_approval" }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["approval"],
+        "properties": {
+          "approval": {
+            "required": ["requirement"],
+            "properties": {
+              "requirement": {
+                "enum": ["human_per_run", "protected_owner_per_run", "bounded_recurring"]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["authorization"],
+        "properties": {
+          "authorization": {
+            "required": ["outcome"],
+            "properties": {
+              "outcome": { "const": "permit" }
+            }
+          }
+        }
+      },
+      "then": {
+        "required": ["approval"],
+        "properties": {
+          "approval": {
+            "required": ["requirement"],
+            "properties": {
+              "requirement": { "const": "not_required" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "profile",
+    "kind",
+    "bindingId",
+    "base",
+    "principal",
+    "authorization",
+    "familiar",
+    "contextProjection",
+    "threads",
+    "capabilities",
+    "approval",
+    "risk",
+    "runtime",
+    "versions",
+    "decisionTimestamp",
+    "producer",
+    "privacy",
+    "integrity",
+    "authentication"
+  ],
+  "properties": {
+    "profile": { "const": "coven.automations.authority.v1" },
+    "kind": { "const": "AutomationExecutionBinding" },
+    "bindingId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+    "base": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "automationId",
+        "automationRevision",
+        "definitionDigest",
+        "occurrenceId",
+        "occurrenceKey",
+        "occurrenceFenceGeneration",
+        "runId",
+        "attemptId",
+        "attemptNumber",
+        "adoptionKey"
+      ],
+      "properties": {
+        "automationId": { "$ref": "common.schema.json#/$defs/baseAutomationId" },
+        "automationRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "definitionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "occurrenceId": { "$ref": "common.schema.json#/$defs/baseOccurrenceId" },
+        "occurrenceKey": { "$ref": "common.schema.json#/$defs/baseOccurrenceKey" },
+        "occurrenceFenceGeneration": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "runId": { "$ref": "common.schema.json#/$defs/baseRunId" },
+        "attemptId": { "$ref": "common.schema.json#/$defs/baseAttemptId" },
+        "attemptNumber": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "adoptionKey": { "$ref": "common.schema.json#/$defs/baseAdoptionKey" }
+      }
+    },
+    "principal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["principalId", "authorizationProofRef", "authenticationState"],
+      "properties": {
+        "principalId": { "$ref": "common.schema.json#/$defs/basePrincipalId" },
+        "authorizationProofRef": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "authenticationState": { "const": "authenticated" }
+      }
+    },
+    "authorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "requestId",
+        "requestDigest",
+        "decisionId",
+        "decisionDigest",
+        "nonce",
+        "issuedAt",
+        "validFrom",
+        "validUntil",
+        "replayState",
+        "consumptionSnapshotId",
+        "consumptionSnapshotDigest",
+        "consumptionStoreRevision",
+        "outcome"
+      ],
+      "properties": {
+        "operation": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "requestId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "requestDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "decisionId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "decisionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "nonce": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "issuedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "validFrom": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "validUntil": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "replayState": { "const": "fresh" },
+        "consumptionSnapshotId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "consumptionSnapshotDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "consumptionStoreRevision": { "type": "integer", "minimum": 1, "maximum": 9007199254740991 },
+        "outcome": { "enum": ["permit", "requires_approval"] }
+      }
+    },
+    "familiar": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "familiarRootId",
+        "identityRevisionId",
+        "declarationDigest",
+        "embodimentBindingId",
+        "embodimentDigest",
+        "statusAtDecision",
+        "verifiedAt",
+        "freshnessPolicyVersion",
+        "freshnessBoundSeconds",
+        "validTime",
+        "revocation",
+        "retirement"
+      ],
+      "properties": {
+        "familiarRootId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "identityRevisionId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "declarationDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "embodimentBindingId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "embodimentDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "statusAtDecision": {
+          "enum": ["active", "revoked", "retired", "stale"]
+        },
+        "verifiedAt": { "$ref": "common.schema.json#/$defs/timestamp" },
+        "freshnessPolicyVersion": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "freshnessBoundSeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 300
+        },
+        "validTime": { "$ref": "common.schema.json#/$defs/familiarValidity" },
+        "revocation": { "$ref": "common.schema.json#/$defs/familiarRevocation" },
+        "retirement": { "$ref": "common.schema.json#/$defs/familiarRetirement" }
+      }
+    },
+    "contextProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["projectId", "workspaceId", "contextProjectionIds", "memoryProjectionIds"],
+      "properties": {
+        "projectId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "workspaceId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "contextProjectionIds": { "$ref": "common.schema.json#/$defs/projectionIds" },
+        "memoryProjectionIds": { "$ref": "common.schema.json#/$defs/projectionIds" }
+      }
+    },
+    "threads": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "decisionId",
+        "decisionDigest",
+        "protectedSurfaceManifestId",
+        "protectedSurfaceManifestDigest"
+      ],
+      "properties": {
+        "decisionId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "decisionDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "protectedSurfaceManifestId": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "protectedSurfaceManifestDigest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "granted", "denied", "degraded"],
+      "properties": {
+        "requested": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "granted": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "denied": { "$ref": "common.schema.json#/$defs/deniedCapabilities" },
+        "degraded": { "$ref": "common.schema.json#/$defs/capabilitySet" }
+      }
+    },
+    "approval": { "$ref": "common.schema.json#/$defs/approvalBinding" },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["riskClass", "sideEffectClass"],
+      "properties": {
+        "riskClass": { "$ref": "common.schema.json#/$defs/riskClass" },
+        "sideEffectClass": { "$ref": "common.schema.json#/$defs/sideEffectClass" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runtimeId",
+        "descriptorVersion",
+        "descriptorDigest",
+        "capabilities",
+        "selectionRationale"
+      ],
+      "properties": {
+        "runtimeId": { "$ref": "common.schema.json#/$defs/baseRuntimeId" },
+        "descriptorVersion": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9.+_-]*$"
+        },
+        "descriptorDigest": { "$ref": "common.schema.json#/$defs/digest" },
+        "capabilities": { "$ref": "common.schema.json#/$defs/capabilitySet" },
+        "selectionRationale": {
+          "enum": [
+            "exact_requirement_match",
+            "policy_preferred",
+            "only_conformant_runtime",
+            "operator_pinned"
+          ]
+        }
+      }
+    },
+    "versions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "baseProfile",
+        "authorityProfile",
+        "familiarProfile",
+        "threadsProfile",
+        "policyVersion",
+        "policyDigest"
+      ],
+      "properties": {
+        "baseProfile": { "const": "coven.automations.v1" },
+        "authorityProfile": { "const": "coven.automations.authority.v1" },
+        "familiarProfile": { "const": "familiar.embodiment_binding.v1" },
+        "threadsProfile": { "const": "automation-authority/1.0.0" },
+        "policyVersion": { "$ref": "common.schema.json#/$defs/opaqueIdentifier" },
+        "policyDigest": { "$ref": "common.schema.json#/$defs/digest" }
+      }
+    },
+    "decisionTimestamp": { "$ref": "common.schema.json#/$defs/timestamp" },
+    "producer": { "$ref": "common.schema.json#/$defs/producer" },
+    "privacy": { "$ref": "common.schema.json#/$defs/authorityPrivacy" },
+    "integrity": { "$ref": "common.schema.json#/$defs/integrity" },
+    "authentication": { "$ref": "common.schema.json#/$defs/authentication" }
+  }
+}

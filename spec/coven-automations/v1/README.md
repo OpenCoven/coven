@@ -36,7 +36,40 @@ Cave, the SDK, Psyche adapters, runtimes, and future implementations consume the
 - Digests are SHA-256 over RFC 8785 (JCS) canonical JSON — never over ad-hoc serialization.
 - Contract profile (`coven.automations.v1`) is independent of implementation release versions.
 - Historical records pin the exact definition revision and digest they were created and executed against, and are never reinterpreted by current definitions.
+- Durable schedule timezones are canonical `utc` or validated IANA TZIDs. Legacy
+  `local` is accepted only at compatibility boundaries, resolved before
+  persistence, and recorded as an explicit definition-revision migration. On
+  Unix, an effective `TZ` override must itself name `utc` or an exact IANA TZID;
+  POSIX rules, zone-file paths, and malformed values fail closed rather than
+  silently falling back to the host zone.
+- Spring-forward gaps skip nonexistent wall times. Fall-back folds select the
+  first occurrence (the earlier UTC instant). Both rules are deterministic and
+  pinned by `test-vectors.json`.
+- Native retries preserve one run across immutable attempts. Only the protocol
+  classes `transient_dispatch`, `lease_expired`, and `runtime_unavailable` may
+  auto-retry, and only when pre-side-effect evidence proves the disposition.
+  Ownership-retained and ambiguous outcomes never auto-retry.
+- Retry eligibility is persisted as `notBefore` from the observed failure
+  time. Fixed delays are exact; exponential delays use deterministic full
+  jitter bounded to one day. Retry waiting remains inside the original run
+  timeout, and exhaustion quarantines the definition until an explicit
+  operator release.
 
 ## Conformance
 
 Required test suites and canary requirements (Coven, SDK, Cave — each against packed/released artifacts, not source-relative imports) are listed in `conformance-manifest.json`. Golden vectors are self-contained: any draft 2020-12 validator plus the digest recipe in `test-vectors.json` suffices to run them outside the Coven crate.
+
+## Immutable bundle
+
+CI packages this directory as
+`coven-automations-v1-contract-<source-commit>.tar.gz`. The archive contains
+these contract files under `coven-automations-v1/` plus `manifest.json`.
+The manifest binds the bundle to the exact source commit, records the SHA-256
+and byte size of every contract file, and publishes `contractContentSha256`
+over the lexically ordered `relative-path\0sha256\n` pairs. That content digest
+excludes the source commit and archive metadata, so consumers can distinguish
+unchanged contract bytes from a newly source-bound release bundle.
+
+SDK, Cave, and other canaries must download the exact-commit CI or release
+artifact and verify its digest and manifest. Importing this source directory
+directly is not a conformance result.
