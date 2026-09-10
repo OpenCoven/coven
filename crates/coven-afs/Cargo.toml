@@ -32,7 +32,7 @@ libc = { version = "0.2", optional = true }
 # transitive dependencies.
 hmac = { version = "0.13", optional = true }
 sha2 = { version = "0.11", optional = true }
-getrandom = { version = "0.2", optional = true }
+getrandom = { version = "0.4", optional = true }
 # Only the out-of-process export binary initializes a subscriber; the library
 # stays subscriber-agnostic and merely emits `tracing` events.
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
