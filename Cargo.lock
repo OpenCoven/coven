@@ -887,6 +887,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "coven-restricted-runtime"
+version = "0.1.0"
+
+[[package]]
 name = "coven-runtime-spec"
 version = "0.2.0"
 source = "git+https://github.com/OpenCoven/coven-runtimes?tag=v0.2.0#2f0e068027f36b1dd32d919f54a40a3baede54c2"
