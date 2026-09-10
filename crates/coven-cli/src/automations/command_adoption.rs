@@ -7,6 +7,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::capability_negotiation::{capability_profile, preflight_definition, UnsupportedVariant};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{AdoptionConflictOutcome, ErrorAdoption, ErrorCode, ErrorEnvelope};
 use super::contract::types::{AdoptionKey, PositiveInteger};
@@ -430,6 +431,12 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
 }
 
 fn adoption_definition_preimage(definition: &Value) -> Result<Value> {
+    if preflight_definition(definition).is_some() {
+        return Ok(json!({
+            "kind": "unsupported",
+            "value": lossless_json_fingerprint(definition),
+        }));
+    }
     match RoutineDefinition::from_json(definition) {
         Ok(definition) => Ok(json!({
             "kind": "valid",
@@ -950,6 +957,9 @@ fn apply_create(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
+    if let Some(unsupported) = preflight_definition(definition_value) {
+        return Ok(capability_unsupported(unsupported));
+    }
     let definition = match RoutineDefinition::from_json(definition_value)
         .and_then(RoutineDefinition::resolve_timezone_for_persistence)
     {
@@ -1011,6 +1021,9 @@ fn apply_revise(
     expected_revision: Option<u64>,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
+    if let Some(unsupported) = preflight_definition(definition_value) {
+        return Ok(capability_unsupported(unsupported));
+    }
     let definition = match RoutineDefinition::from_json(definition_value)
         .and_then(RoutineDefinition::resolve_timezone_for_persistence)
     {
@@ -1317,6 +1330,32 @@ fn rejected(
     }
 }
 
+fn capability_unsupported(unsupported: UnsupportedVariant) -> DefinitionCommandResponse {
+    let error = ErrorEnvelope::try_new(
+        ErrorCode::CapabilityUnsupported,
+        "automation definition uses a variant not supported by the negotiated contract profile",
+        false,
+    )
+    .expect("static unsupported-capability message is valid")
+    .with_details(BTreeMap::from([
+        (
+            "contractProfile".to_owned(),
+            Value::String(capability_profile().contract_profile.clone()),
+        ),
+        ("reason".to_owned(), Value::String(unsupported.reason)),
+        ("variant".to_owned(), Value::String(unsupported.variant)),
+    ]));
+    DefinitionCommandResponse {
+        outcome: DefinitionCommandOutcome::Rejected,
+        revision: None,
+        result: None,
+        error: Some(error),
+        replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: false,
+    }
+}
+
 fn protocol_error(code: ErrorCode, message: impl Into<String>) -> ErrorEnvelope {
     let message = message.into();
     let bounded = if message.is_empty() {
@@ -1394,6 +1433,176 @@ mod tests {
             |row| row.get(0),
         )
         .unwrap()
+    }
+
+    fn definition_event_count(conn: &Connection, automation_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM automation_events
+             WHERE stream_kind = 'automation' AND stream_id = ?1",
+            [automation_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn unsupported_create_is_durably_rejected_without_mutation_or_event() {
+        let (_temp, conn) = temp_store();
+        let mut unsupported = definition("unsupported-create", "Unsupported");
+        unsupported["outputTarget"] = json!("result.md");
+        let command = DefinitionCommand::Create {
+            definition: unsupported.clone(),
+        };
+
+        let first = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            command.clone(),
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        let first_error = first.error.as_ref().unwrap();
+        assert_eq!(first_error.code(), ErrorCode::CapabilityUnsupported);
+        let first_error = serde_json::to_value(first_error).unwrap();
+        assert_eq!(
+            first_error["details"],
+            json!({
+                "contractProfile": "coven.automations.v1",
+                "reason": "The wire shape is reserved, but no current implementation has a pinned-revision, crash-recoverable delivery state machine. Refuse with CAPABILITY_UNSUPPORTED.",
+                "variant": "outputTarget.atomic"
+            })
+        );
+        assert!(get_definition(&conn, "unsupported-create")
+            .unwrap()
+            .is_none());
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+        assert_eq!(adoption_count(&conn), 1);
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            command,
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            serde_json::to_value(replay.error.unwrap()).unwrap(),
+            first_error
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+
+        unsupported["outputTarget"] = json!("different.md");
+        let mismatch = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            DefinitionCommand::Create {
+                definition: unsupported,
+            },
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch.error.unwrap().code(),
+            ErrorCode::AdoptionReplayMismatch
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+    }
+
+    #[test]
+    fn unsupported_revise_is_durably_rejected_without_revision_or_event_change() {
+        let (_temp, conn) = temp_store();
+        execute_definition_command(
+            &conn,
+            "adopt:create:revise-target:0001",
+            DefinitionCommand::Create {
+                definition: definition("revise-target", "Original"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        let mut unsupported = definition("revise-target", "Must not land");
+        unsupported["misfire"] = json!("backfill");
+        let command = DefinitionCommand::Revise {
+            definition: unsupported.clone(),
+            expected_revision: Some(1),
+        };
+        let first = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            command.clone(),
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        let first_error = first.error.as_ref().unwrap();
+        assert_eq!(first_error.code(), ErrorCode::CapabilityUnsupported);
+        let first_error = serde_json::to_value(first_error).unwrap();
+        assert_eq!(first_error["details"]["variant"], "misfire.backfill");
+        assert_eq!(
+            first_error["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        let stored = get_definition(&conn, "revise-target").unwrap().unwrap();
+        assert_eq!(stored.revision, 1);
+        assert!(stored.definition_json.contains(r#""name":"Original""#));
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            command,
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            serde_json::to_value(replay.error.unwrap()).unwrap(),
+            first_error
+        );
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        unsupported["misfire"] = json!("all");
+        let mismatch = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            DefinitionCommand::Revise {
+                definition: unsupported,
+                expected_revision: Some(1),
+            },
+            "2026-09-03T09:03:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch.error.unwrap().code(),
+            ErrorCode::AdoptionReplayMismatch
+        );
+        assert_eq!(adoption_count(&conn), 2);
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+    }
+
+    #[test]
+    fn legacy_create_keeps_output_target_validation_behavior() {
+        let (_temp, conn) = temp_store();
+        let mut unsupported = definition("legacy-output", "Legacy output");
+        unsupported["outputTarget"] = json!("result.md");
+
+        let response = execute_definition_command(
+            &conn,
+            "legacy-output-target",
+            DefinitionCommand::LegacyCreate {
+                definition: unsupported,
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.error.unwrap().code(), ErrorCode::ValidationFailed);
     }
 
     #[test]

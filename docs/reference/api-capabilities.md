@@ -25,6 +25,13 @@ values, and forward-compatibility rules are pinned in the
 { "capabilities": [ { "id", "label", "adapter", "status", "policy", "actions" } ] }
 ```
 
+The `coven.automations` entry additionally includes optional
+`variantNegotiation`, exactly matching the packaged
+`spec/coven-automations/v1/capabilities.json` object. It advertises the
+contract profile and version plus supported, experimental, and refused
+trigger/action/policy variants and the negative-negotiation rules. Other
+catalog entries omit this field.
+
 To refresh it, `POST /api/v1/actions` with action id `coven.capabilities.refresh`.
 
 ## Harness capability aggregate
