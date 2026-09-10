@@ -101,6 +101,12 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("path: target/e2e-artifacts/", windows)
         self.assertIn("retention-days: 14", windows)
 
+    def test_windows_has_budget_for_both_threads_build_profiles(self) -> None:
+        windows = CI_TEXT.split("\n  rust-test-windows:\n", 1)[1].split(
+            "\n  rust-test-macos:\n", 1
+        )[0]
+        self.assertIn("\n    timeout-minutes: 30\n", windows)
+
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
         for workflow_text in [CI_TEXT, RELEASE_TEXT, release_stress_text]:
