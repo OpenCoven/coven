@@ -122,7 +122,9 @@ source metadata for the files and binary under test. `source.commit` must equal
 
 The checked-in
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json)
-contains the current nonempty vector set.
+and
+[`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
+files contain the current nonempty vector sets.
 
 ## Target protocol
 
@@ -136,7 +138,10 @@ The runner invokes the target directly without a shell.
   "profiles": [
     {
       "profile": "structural",
-      "suites": ["capability-negotiation"]
+      "suites": [
+        "capability-negotiation",
+        "run-terminal-monotonicity"
+      ]
     }
   ]
 }
@@ -148,13 +153,19 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements only the structural
-`capability-negotiation` suite. It executes the checked-in cases against Rust's
-real definition parser and capability negotiation code. The runner computes a
-JCS SHA-256 digest of returned evidence and discards the raw evidence after
-building the result envelope. Evidence is restricted to JSON values that can
-be canonicalized consistently across the JavaScript runner and Rust verifier.
-The native target rejects evaluation requests larger than one MiB before JSON
-parsing.
+The native Coven target currently implements two structural suites.
+`capability-negotiation` executes the checked-in cases against Rust's real
+definition parser and capability policy. `run-terminal-monotonicity` executes
+the checked-in settlement and replay cases against the real Rust run ledger in
+an isolated in-memory store, proving that a later terminal observation cannot
+rewrite the first committed terminal state. Each vector must use distinct first
+and replay statuses so a passing case exercises an actual conflict. It does not
+claim the complete occurrence or attempt state machines.
+
+The runner computes a JCS SHA-256 digest of returned evidence and discards the
+raw evidence after building the result envelope. Evidence is restricted to JSON
+values that can be canonicalized consistently across the JavaScript runner and
+Rust verifier. The native target rejects evaluation requests larger than one
+MiB before JSON parsing.
 Each target operation has a two-second deadline followed by process-tree
 termination; output is capped at one MiB.
