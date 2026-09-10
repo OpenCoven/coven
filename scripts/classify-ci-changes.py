@@ -77,6 +77,8 @@ def classify(paths: list[str]) -> dict[str, bool]:
             'scripts/check-workflows.sh',
             'scripts/check-workflows-test.py',
             'scripts/check-ci-workflow-test.py',
+            'scripts/install-native-link-dependencies.sh',
+            'scripts/install-native-link-dependencies-test.py',
         }
         categories['rust'] |= is_rust
         categories['afs'] |= is_afs
