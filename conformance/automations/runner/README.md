@@ -154,5 +154,7 @@ real definition parser and capability negotiation code. The runner computes a
 JCS SHA-256 digest of returned evidence and discards the raw evidence after
 building the result envelope. Evidence is restricted to JSON values that can
 be canonicalized consistently across the JavaScript runner and Rust verifier.
+The native target rejects evaluation requests larger than one MiB before JSON
+parsing.
 Each target operation has a two-second deadline followed by process-tree
 termination; output is capped at one MiB.

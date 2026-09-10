@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -3681,8 +3680,7 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
                 Ok(())
             }
             AutomationsConformanceCommand::Evaluate => {
-                let payload = io::read_to_string(io::stdin())
-                    .context("failed to read conformance request from standard input")?;
+                let payload = read_conformance_request(io::stdin().lock())?;
                 let request = serde_json::from_str(&payload)
                     .map_err(|_| anyhow!("conformance request is invalid"))?;
                 let response = automations::conformance_target::evaluate(&request)
@@ -3692,6 +3690,20 @@ fn run_automations_command(command: AutomationsCommand) -> Result<()> {
             }
         },
     }
+}
+
+const MAX_CONFORMANCE_REQUEST_BYTES: usize = 1024 * 1024;
+
+fn read_conformance_request(reader: impl Read) -> Result<String> {
+    let mut payload = Vec::new();
+    reader
+        .take((MAX_CONFORMANCE_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
+        .map_err(|_| anyhow!("conformance request is invalid"))?;
+    if payload.len() > MAX_CONFORMANCE_REQUEST_BYTES {
+        bail!("conformance request is invalid");
+    }
+    String::from_utf8(payload).map_err(|_| anyhow!("conformance request is invalid"))
 }
 
 fn run_logs_command(command: LogsCommand) -> Result<()> {
@@ -6307,6 +6319,37 @@ mod tests {
                 }
             })
         ));
+    }
+
+    #[test]
+    fn conformance_request_reader_rejects_oversized_input() {
+        let input = vec![b'x'; MAX_CONFORMANCE_REQUEST_BYTES + 1];
+
+        assert_eq!(
+            read_conformance_request(input.as_slice())
+                .unwrap_err()
+                .to_string(),
+            "conformance request is invalid"
+        );
+    }
+
+    #[test]
+    fn conformance_request_reader_accepts_bounded_input() {
+        assert_eq!(
+            read_conformance_request(br#"{"suite_id":"capability-negotiation"}"#.as_slice())
+                .unwrap(),
+            r#"{"suite_id":"capability-negotiation"}"#
+        );
+    }
+
+    #[test]
+    fn conformance_request_reader_rejects_invalid_utf8() {
+        assert_eq!(
+            read_conformance_request([0xff].as_slice())
+                .unwrap_err()
+                .to_string(),
+            "conformance request is invalid"
+        );
     }
 
     #[test]

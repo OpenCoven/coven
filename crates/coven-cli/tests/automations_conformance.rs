@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 const CAPABILITY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/capability-negotiation.vectors.json");
+const MAX_CONFORMANCE_REQUEST_BYTES: usize = 1024 * 1024;
 
 fn coven_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_coven"))
@@ -29,6 +30,22 @@ fn run_target(coven_home: &Path, operation: &str, input: Option<&Value>) -> anyh
             .expect("stdin is piped")
             .write_all(input.to_string().as_bytes())?;
     }
+    child.wait_with_output().map_err(Into::into)
+}
+
+fn run_target_bytes(coven_home: &Path, operation: &str, input: &[u8]) -> anyhow::Result<Output> {
+    let mut child = Command::new(coven_bin())
+        .args(["automations", "conformance", operation])
+        .env("COVEN_HOME", coven_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(input)?;
     child.wait_with_output().map_err(Into::into)
 }
 
@@ -102,6 +119,25 @@ fn native_target_evaluates_checked_in_capability_vectors() -> anyhow::Result<()>
     assert!(response["evidence"]["vectorDigest"]
         .as_str()
         .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_rejects_oversized_request_without_parsing_it() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let mut request = b"{}".to_vec();
+    request.resize(MAX_CONFORMANCE_REQUEST_BYTES + 1, b' ');
+
+    let output = run_target_bytes(&coven_home, "evaluate", &request)?;
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr)?,
+        "Error: conformance request is invalid\n"
+    );
     assert!(!coven_home.exists());
     Ok(())
 }
