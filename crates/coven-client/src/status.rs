@@ -305,6 +305,151 @@ mod tests {
         }
     }
 
+    fn assert_status_file_is_owner_only(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+        use windows_sys::Win32::Security::{
+            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            EqualSid, GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        };
+        use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+
+        let expected_owner = CurrentWindowsUser::read().unwrap();
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut descriptor = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                GetNamedSecurityInfoW(
+                    path.as_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                    &mut owner,
+                    ptr::null_mut(),
+                    &mut dacl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            },
+            0
+        );
+        let _descriptor = LocalAllocation(descriptor);
+        assert_ne!(unsafe { EqualSid(owner, expected_owner.sid()) }, 0);
+        let mut control = 0;
+        let mut revision = 0;
+        assert_ne!(
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
+            0
+        );
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        assert!(!dacl.is_null());
+        assert_eq!(unsafe { (*dacl).AceCount }, 1);
+        let mut entry = ptr::null_mut();
+        assert_ne!(unsafe { GetAce(dacl, 0, &mut entry) }, 0);
+        let ace = unsafe { &*entry.cast::<ACCESS_ALLOWED_ACE>() };
+        assert_eq!(ace.Header.AceType, 0); // ACCESS_ALLOWED_ACE_TYPE
+        assert_eq!(ace.Header.AceFlags, 0);
+        assert_eq!(ace.Mask, FILE_ALL_ACCESS);
+        // OWNER RIGHTS SID is S-1-3-4: revision 1, one subauthority,
+        // SECURITY_CREATOR_SID_AUTHORITY, SECURITY_CREATOR_OWNER_RIGHTS_RID.
+        let owner_rights: [u32; 3] = [0x00000101, 0x03000000, 4];
+        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        assert_ne!(
+            unsafe { EqualSid(ace_sid, owner_rights.as_ptr().cast_mut().cast()) },
+            0
+        );
+    }
+
+    #[test]
+    fn status_replacement_succeeds_with_inherited_modify_only_owner_rights() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::ptr;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SetNamedSecurityInfoW, SE_FILE_OBJECT,
+            },
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        let home = TestHome::new();
+        let owner = CurrentWindowsUser::read().expect("read fixture owner");
+        let mut sid_text = ptr::null_mut();
+        assert_ne!(
+            unsafe { ConvertSidToStringSidW(owner.sid(), &mut sid_text) },
+            0
+        );
+        let _sid_text = LocalAllocation(sid_text.cast());
+        let mut len = 0;
+        while unsafe { *sid_text.add(len) } != 0 {
+            len += 1;
+        }
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(sid_text, len) })
+            .expect("decode fixture owner");
+        // Match the isolated writer's modify grant and inherited OWNER RIGHTS
+        // restriction. No administrator ACE may mask the missing WRITE_DAC.
+        let sddl: Vec<u16> = format!("D:P(A;OICI;0x001301bf;;;{sid})(A;OICI;RC;;;OW)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _descriptor = LocalAllocation(descriptor);
+        let mut present = 0;
+        let mut defaulted = 0;
+        let mut dacl = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert_ne!(present, 0);
+        let mut path: Vec<u16> = home.0.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert_eq!(
+            unsafe {
+                SetNamedSecurityInfoW(
+                    path.as_mut_ptr(),
+                    SE_FILE_OBJECT,
+                    OWNER_SECURITY_INFORMATION
+                        | DACL_SECURITY_INFORMATION
+                        | PROTECTED_DACL_SECURITY_INFORMATION,
+                    owner.sid(),
+                    ptr::null_mut(),
+                    dacl,
+                    ptr::null_mut(),
+                )
+            },
+            0,
+            "apply isolated fixture ACL"
+        );
+
+        write_owner_only_windows_daemon_status(&home.0, b"first")
+            .expect("create secure status under inherited modify-only rights");
+        assert_status_file_is_owner_only(&home.0.join("daemon.json"));
+        write_owner_only_windows_daemon_status(&home.0, b"second")
+            .expect("replace secure status under inherited modify-only rights");
+        assert_status_file_is_owner_only(&home.0.join("daemon.json"));
+        assert_eq!(
+            std::fs::read(home.0.join("daemon.json")).unwrap(),
+            b"second\n"
+        );
+        assert_eq!(std::fs::read_dir(&home.0).unwrap().count(), 1);
+    }
+
     #[test]
     fn missing_status_home_identifies_temporary_creation_and_preserves_os_error() {
         use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
