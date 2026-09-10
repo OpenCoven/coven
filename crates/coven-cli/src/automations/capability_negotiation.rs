@@ -415,4 +415,85 @@ mod tests {
             assert_eq!(unsupported.reason, refused.reason);
         }
     }
+
+    #[test]
+    fn capability_negotiation_does_not_refuse_advertised_supported_variants() {
+        let profile = capability_profile();
+
+        for supported in &profile.supported.triggers {
+            assert_eq!(
+                preflight_definition(&json!({"trigger": {"variant": supported.variant}})),
+                None,
+                "advertised trigger `{}` was refused",
+                supported.variant
+            );
+        }
+        for supported in &profile.supported.conditions {
+            assert_eq!(
+                preflight_definition(&json!({"conditions": [{"variant": supported.variant}]})),
+                None,
+                "advertised condition `{}` was refused",
+                supported.variant
+            );
+        }
+        for supported in &profile.supported.actions {
+            assert_eq!(
+                preflight_definition(&json!({"action": {"variant": supported.variant}})),
+                None,
+                "advertised action `{}` was refused",
+                supported.variant
+            );
+        }
+        for supported in &profile.supported.trigger_policies {
+            let definition = match supported.variant.as_str() {
+                "misfire.latest" => json!({"misfire": "latest"}),
+                "overlap.forbid" => json!({"overlap": "forbid"}),
+                variant if variant.starts_with("retry.backoff.") => {
+                    let value = variant.trim_start_matches("retry.backoff.");
+                    json!({"retry": {"backoffPolicy": value}})
+                }
+                "timezone.utc" => json!({"trigger": {
+                    "variant": "schedule",
+                    "schedule": {"timezone": "utc"}
+                }}),
+                "timezone.iana" => json!({"trigger": {
+                    "variant": "schedule",
+                    "schedule": {"timezone": "America/Chicago"}
+                }}),
+                "timeout.required"
+                | "dst.gap.skip"
+                | "dst.fold.first"
+                | "retry.attempts"
+                | "retry.safe-classes"
+                | "retry.exhaustion-quarantine" => continue,
+                variant => panic!("missing preflight fixture for supported policy `{variant}`"),
+            };
+            assert_eq!(
+                preflight_definition(&definition),
+                None,
+                "advertised policy `{}` was refused",
+                supported.variant
+            );
+        }
+        for supported in &profile.supported.delivery_policies {
+            let mode = supported
+                .variant
+                .strip_prefix("outputTarget.")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "missing preflight fixture for supported delivery policy `{}`",
+                        supported.variant
+                    )
+                });
+            assert_eq!(
+                preflight_definition(&json!({"policies": {"delivery": {
+                    "outputTarget": "result.md",
+                    "mode": mode
+                }}})),
+                None,
+                "advertised delivery policy `{}` was refused",
+                supported.variant
+            );
+        }
+    }
 }
