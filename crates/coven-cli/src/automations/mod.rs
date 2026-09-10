@@ -8,6 +8,7 @@
 
 pub mod authority_projection;
 pub mod cancellation;
+pub mod capability_negotiation;
 pub mod command_adoption;
 pub mod contract;
 pub mod daemon_tick;

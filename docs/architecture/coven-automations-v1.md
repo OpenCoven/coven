@@ -31,7 +31,7 @@ The #816 foundation is a valid v1 Rust implementation, but the public contract i
 5. **No versioned event envelope or replay reducer.** `ControlEvent` (`control_plane.rs`) has `kind/action/origin/intentId/payload` but no schema version, no event id, no per-stream sequence, and no timestamps; there is no changefeed at all — Cave polls list/get endpoints.
 6. **Lifecycle semantics are stringly typed and partial.** Occurrences distinguish `scheduled` from `manual` sources, but states remain free strings (`'planned'/'claimed'/'running'/'succeeded'/'failed'/'skipped'` in `crates/coven-cli/src/automations/occurrences.rs`). Settlement terminal states are exactly `[succeeded, failed]` (`OCCURRENCE_TERMINAL_STATES`), stale planned fences collapse to `skipped`, and lease recovery maps straight to `failed` with reason `lease expired` (`recover_expired_leases`). There are no eligible/dispatching/recovering/cancelled/timed_out states, no run state machine beyond `status` strings, and no attempt object at all — only an `attempt` counter incremented by claim (`claim_due_occurrence`).
 7. **No receipts, no digests, no integrity anywhere** in the automations module; run outcomes are ledger rows (`automation_runs.log_json`, `exit_code`) with no tamper-evident summary.
-8. **No capability negotiation.** `capabilities()` (`control_plane.rs`) lists action ids, but nothing lets a client ask which trigger/action/policy variants an implementation executes, and nothing forces a definition with an unsupported variant to fail explicitly.
+8. **Capability negotiation is intentionally partial.** `capabilities()` (`control_plane.rs`) advertises the exact packaged `capabilities.json` profile on the `coven.automations` catalog entry, and adopted `definition.create.v1` / `definition.revise.v1` commands perform negative negotiation before deserializing the current definition model. The accepted control-action body is still the flat #816 `RoutineDefinition` compatibility shape; richer `AutomationDefinition` trigger/action/policy objects are inspected only far enough to return a typed unsupported-variant refusal and are not accepted or persisted by this slice.
 9. **Adoption-key gaps.** Run and occurrence ids are wall-clock derived (`fresh_id`, `crates/coven-cli/src/automations/runner.rs` — `format!("{prefix}-{millis}")`), so a retried `coven.automations.run` command can create a second occurrence/run rather than replaying the first outcome.
 
 ## Contract profile and versioning
@@ -387,12 +387,54 @@ Deterministic failure injection certifies the currently implemented durability b
 
 ## Capability negotiation
 
-`capabilities.json` lists supported v1 variants (trigger `schedule`, action `familiarInvocation`, policies `misfire.latest`, `overlap.forbid`, `timeout.required`, retention `standard`), an empty `experimental` list, and explicit `refused` entries (`trigger.webhook`, `action.pipeline`, `misfire.backfill`, `outputTarget.atomic`) with reasons. The delivery shape remains reserved in the schema and type projection, but schema validity does not override capability refusal. Rules:
+`capabilities.json` lists the complete supported, experimental, and refused
+base-v1 variant profile. The daemon deserializes those packaged bytes into a
+strong Rust projection and publishes that exact object as
+`coven.automations.variantNegotiation` in `GET /api/v1/capabilities`; unrelated
+catalog entries omit the optional field. The delivery shape remains reserved
+in the schema and type projection, but schema validity does not override
+capability refusal. Rules:
 
 - A definition referencing a variant absent from the producer's supported list MUST be refused with `CAPABILITY_UNSUPPORTED`, naming the variant. Nothing is guessed, defaulted, or silently downgraded — the same fail-closed stance as the #816 RRULE vocabulary gate (`rrule.rs` refuses unsupported frequencies instead of approximating).
 - Refusal is per-variant and additive: refusing one variant says nothing about others.
+- The current control route accepts the flat #816 `RoutineDefinition` JSON. Its
+  negative-negotiation projection maps flat `outputTarget`, `misfire`,
+  `overlap`, retry `backoffPolicy`/`retryableClasses`, exact timezones, and
+  unsupported RRULE frequencies to stable variant identifiers. Exact
+  trigger/action/condition and policy support is read from the packaged
+  capability profile; RRULE grammar and retryable failure-class vocabulary
+  remain owned by the Rust schema types. It also recognizes richer nested
+  `trigger`, `conditions`, `action`, retention, and other policy hints only to
+  classify a refusal when the surrounding flat compatibility definition is
+  otherwise valid.
+- A rich hint is removable only when every supplied subsection satisfies its
+  v1 structural requirements. The schedule and familiar-invocation unions
+  require `version: 1` plus their required fields; schedule RRULEs are parsed
+  after neutralizing only an unsupported `FREQ`, timezone syntax is validated
+  without resolving host `local`, retry conditionals are enforced, and
+  unsupported unions require a non-empty discriminator and `version: 1`.
+  Unknown members on an unsupported union remain opaque. A nested shape
+  composed solely of supported hints still proceeds to ordinary flat
+  definition validation and is not accepted as the normative rich object.
+- Malformed types, missing required fields, and malformed syntax within a
+  supported RRULE frequency remain `VALIDATION_FAILED`. Unsupported
+  identifiers are bounded to identifier-like ASCII components before they are
+  returned, and response messages never echo nested request values.
+- Only adopted `definition.create.v1` and `definition.revise.v1` use this
+  preflight. Their rejections are stored in the existing adoption ledger, so
+  exact retries replay the same rejection and changed requests return
+  `ADOPTION_REPLAY_MISMATCH`; rejected commands mutate no definition, revision,
+  occurrence, run, or event. Adoption canonicalization serializes the parsed
+  unresolved compatibility definition, so `timezone: local` fingerprints do
+  not depend on the daemon host. Create/revise resolve `local` only immediately
+  before persistence; resolution failures become durable `VALIDATION_FAILED`
+  outcomes. Legacy create/update/import behavior is unchanged.
 - Unknown values inside a supported variant are still unknown variants.
 - The negative path is also a schema property: v1 unions are closed, so an unknown variant fails schema validation before negotiation is even needed; producers that relax schema validation in future profiles still refuse at the capability layer.
+
+This slice does not implement the rich `AutomationDefinition` persistence
+boundary, the remaining normative commands, broader changefeed work, or
+cross-repository canaries required to complete #855.
 
 ## Canonicalization and digests
 
