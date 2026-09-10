@@ -117,5 +117,17 @@ revisions and `local_threads_override_active`, even if daemon startup fails;
 earlier failures can record those fields as null. Windows readiness errors
 include a bounded last-probe category and observation of the retained child
 handle, without changing the startup deadline or identity checks.
+The existing recovery log also records fixed-category remaining-budget samples
+immediately before and after the launch call, plus elapsed store-initialization
+checkpoints (connection configured, Ward complete, runtime schema complete,
+main lock acquired, main schema complete, commit complete). Remaining budgets
+saturate at zero; they do not renew the deadline. Both launch samples are
+written after launch, so their log timestamps are write times, not sample times.
+Store checkpoints share the daemon-store elapsed-time origin.
+
+These diagnostics are advisory and add I/O, including inside the main schema
+transaction. They can perturb timing; missing markers do not alone distinguish
+blocked work, failure, process exit, or a failed diagnostic write. They neither
+measure post-cleanup survival nor prove the cause of a startup timeout.
 The fixtures use only synthetic identities and content; evidence never reads a
 developer's real Coven home.

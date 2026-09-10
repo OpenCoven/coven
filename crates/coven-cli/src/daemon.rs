@@ -2414,8 +2414,13 @@ fn restart_background_server_with_controllers_until(
     let was_running =
         stop_background_server_with_controller_until(&coven_home, stop_controller, deadline)?;
     deadline.remaining("starting Coven daemon")?;
-    let launched =
-        start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+    let launched = start_with_budget_observation(
+        start_controller,
+        &coven_home,
+        current_exe,
+        started_at,
+        deadline,
+    )?;
     let Some(status) =
         start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
     else {
@@ -3249,8 +3254,13 @@ fn ensure_background_server_with_controllers_until(
         ),
         None => {
             deadline.remaining("starting Coven daemon")?;
-            let launched =
-                start_controller.start_background_server(&coven_home, current_exe, started_at)?;
+            let launched = start_with_budget_observation(
+                start_controller,
+                &coven_home,
+                current_exe,
+                started_at,
+                deadline,
+            )?;
             deadline.remaining("waiting for Coven daemon startup health")?;
             let Some(status) =
                 start_controller.wait_for_running_daemon(&coven_home, &launched, deadline)?
@@ -3264,6 +3274,53 @@ fn ensure_background_server_with_controllers_until(
             Ok(status)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum StartupSpawnPhase {
+    Before,
+    After,
+}
+
+fn format_startup_budget(
+    phase: StartupSpawnPhase,
+    deadline: LifecycleDeadline,
+    observed: Instant,
+) -> String {
+    let phase = match phase {
+        StartupSpawnPhase::Before => "before-spawn",
+        StartupSpawnPhase::After => "after-spawn",
+    };
+    format!(
+        "startup_budget phase={phase} remaining_ms={}",
+        deadline
+            .instant
+            .saturating_duration_since(observed)
+            .as_millis()
+    )
+}
+
+fn start_with_budget_observation(
+    controller: &dyn DaemonStartController,
+    coven_home: &Path,
+    current_exe: &Path,
+    started_at: String,
+    deadline: LifecycleDeadline,
+) -> Result<DaemonStatus> {
+    let before = Instant::now();
+    let result = controller.start_background_server(coven_home, current_exe, started_at);
+    let after = Instant::now();
+    // Sample around launch, then log: diagnostic I/O still consumes the original budget.
+    for (phase, observed) in [
+        (StartupSpawnPhase::Before, before),
+        (StartupSpawnPhase::After, after),
+    ] {
+        append_daemon_recovery_log(
+            coven_home,
+            &format_startup_budget(phase, deadline, observed),
+        );
+    }
+    result
 }
 
 fn is_daemon_status_parse_error(error: &anyhow::Error) -> bool {
@@ -4419,6 +4476,7 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
 
 #[derive(Clone, Copy)]
 enum StartupCheckpoint {
+    StorePhase(crate::store::StoreInitializationPhase),
     DaemonStoreBegin,
     StoreInitializeBegin,
     StoreInitializeEnd,
@@ -4430,6 +4488,20 @@ enum StartupCheckpoint {
 impl StartupCheckpoint {
     fn label(self) -> &'static str {
         match self {
+            Self::StorePhase(phase) => match phase {
+                crate::store::StoreInitializationPhase::ConnectionConfigured => {
+                    "store-connection-configured"
+                }
+                crate::store::StoreInitializationPhase::WardComplete => "store-ward-complete",
+                crate::store::StoreInitializationPhase::RuntimeComplete => "store-runtime-complete",
+                crate::store::StoreInitializationPhase::MainLockAcquired => {
+                    "store-main-lock-acquired"
+                }
+                crate::store::StoreInitializationPhase::MainSchemaComplete => {
+                    "store-main-schema-complete"
+                }
+                crate::store::StoreInitializationPhase::CommitComplete => "store-commit-complete",
+            },
             Self::DaemonStoreBegin => "daemon-store-begin",
             Self::StoreInitializeBegin => "store-initialize-begin",
             Self::StoreInitializeEnd => "store-initialize-end",
@@ -4469,7 +4541,9 @@ fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
     append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreBegin, started);
     let store_path = coven_home.join("coven.sqlite3");
     append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeBegin, started);
-    crate::store::initialize_store(&store_path)?;
+    crate::store::initialize_store_with_observer(&store_path, |phase| {
+        append_startup_checkpoint(coven_home, StartupCheckpoint::StorePhase(phase), started);
+    })?;
     append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeEnd, started);
     let conn = crate::store::open_initialized_store(&store_path)?;
     crate::hub::initialize_hub_identity(&conn)
@@ -10944,6 +11018,22 @@ mod tests {
         assert_eq!(*started.lock().unwrap(), 1);
         assert_eq!(status.pid, 54321);
         assert_eq!(read_status(temp_dir.path())?, Some(status));
+        let log = std::fs::read_to_string(daemon_recovery_log_path(temp_dir.path()))?;
+        let observations: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_budget "))
+            .map(|(_, observation)| observation)
+            .collect();
+        assert_eq!(observations.len(), 2);
+        let mut previous = DAEMON_LIFECYCLE_TIMEOUT.as_millis();
+        for (observation, phase) in observations.iter().zip(["before-spawn", "after-spawn"]) {
+            let remaining = observation
+                .strip_prefix(&format!("phase={phase} remaining_ms="))
+                .context("unexpected budget fields")?
+                .parse::<u128>()?;
+            assert!(remaining <= previous);
+            previous = remaining;
+        }
         Ok(())
     }
 
@@ -12540,6 +12630,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_budget_observation_clamps_expired_deadlines_without_waiting() {
+        let now = Instant::now();
+        let deadline = LifecycleDeadline::from_instant(now + Duration::from_millis(250));
+        assert_eq!(
+            format_startup_budget(StartupSpawnPhase::Before, deadline, now),
+            "startup_budget phase=before-spawn remaining_ms=250"
+        );
+        for observed in [
+            deadline.instant,
+            deadline.instant + Duration::from_millis(1),
+        ] {
+            assert_eq!(
+                format_startup_budget(StartupSpawnPhase::After, deadline, observed),
+                "startup_budget phase=after-spawn remaining_ms=0"
+            );
+        }
+        assert_eq!(
+            format_startup_budget(
+                StartupSpawnPhase::After,
+                deadline,
+                now + Duration::from_millis(75)
+            ),
+            "startup_budget phase=after-spawn remaining_ms=175"
+        );
+    }
+
+    #[test]
     fn startup_checkpoints_report_fixed_phases_and_monotonic_elapsed() -> Result<()> {
         let home = tempfile::tempdir()?;
         initialize_daemon_store(home.path())?;
@@ -12553,6 +12670,12 @@ mod tests {
         let phases = [
             "daemon-store-begin",
             "store-initialize-begin",
+            "store-connection-configured",
+            "store-ward-complete",
+            "store-runtime-complete",
+            "store-main-lock-acquired",
+            "store-main-schema-complete",
+            "store-commit-complete",
             "store-initialize-end",
             "daemon-store-end",
         ];
