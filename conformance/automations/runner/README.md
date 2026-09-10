@@ -1,0 +1,160 @@
+# Coven Automations audit runner
+
+This directory contains the first executable Coven Automations v1 conformance
+slice. It is deliberately limited to **audit-only** observations:
+
+- it cannot emit `release_eligibility`;
+- it cannot claim the aggregate `full` profile;
+- an unavailable target produces `not_applicable` results and a nonzero exit;
+- malformed target output produces `failed` results with static errors;
+- raw target evidence, stdout, stderr, paths, and command lines are not copied
+  into the result.
+
+The output is a
+[`coven.automations.conformance-result.v1`](../../../spec/coven-automations/v1/conformance-result.schema.json)
+envelope. Passing output is not release certification. A verifier must still
+pin the source, protocol bundle, runner, vector set, tested subject artifact,
+suite inventory, and environment. Release eligibility additionally requires
+trusted authentication and a release policy.
+
+## Run
+
+```sh
+node conformance/automations/runner/conformance.mjs \
+  --job /absolute/path/to/audit-job.json \
+  --target-command /absolute/path/to/coven
+```
+
+The target command must be the exact executable represented by
+`subjectArtifact.sha256`. Wrappers and extra target arguments are intentionally
+unsupported because they would break the binding between the reported subject
+and the implementation that actually ran. The runner reads those bytes once
+and starts every probe from a fresh private copy, so one invocation cannot
+replace the executable used by the next.
+
+Exit status `0` means every requested suite passed. Status `1` means the runner
+emitted a valid non-passing audit result. Status `2` means the job itself was
+invalid and no result was emitted.
+
+This initial standalone runner supports Linux and macOS. It fails closed on
+Windows until target processes can be contained in a kill-on-close Job Object.
+The native Coven target commands themselves remain cross-platform.
+
+## Audit job
+
+The job is a closed JSON object. Its source, protocol, runner, subject, and
+environment fields map directly into the result statement:
+
+```json
+{
+  "schemaVersion": "coven.automations.conformance-job.v1",
+  "resultId": "audit-2026-09-08T120000Z",
+  "decisionScope": { "kind": "audit_only" },
+  "source": {
+    "repository": "https://github.com/OpenCoven/coven",
+    "commit": "1111111111111111111111111111111111111111"
+  },
+  "protocolArtifact": {
+    "bundleSchemaVersion": "coven.automations.bundle.v1",
+    "sourceCommit": "1111111111111111111111111111111111111111",
+    "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "fileCount": 19
+  },
+  "runner": {
+    "name": "coven-automations-conformance-runner",
+    "version": "0.1.0",
+    "artifactSha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "vectorSetSha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "subjectArtifact": {
+    "artifactId": "coven-cli",
+    "artifactVersion": "0.1.0",
+    "platform": { "os": "linux", "arch": "x86_64" },
+    "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  },
+  "environment": {
+    "os": "linux",
+    "arch": "x86_64",
+    "runtime": "node-24"
+  },
+  "observedAt": "2026-09-08T12:00:00.000Z",
+  "suites": [
+    {
+      "profile": "structural",
+      "suiteId": "capability-negotiation",
+      "vector": {
+        "schemaVersion": "coven.automations.capability-negotiation-vectors.v1",
+        "cases": [
+          {
+            "caseId": "supported-minimal",
+            "definition": {
+              "schemaVersion": 1,
+              "id": "native-supported",
+              "name": "Native supported",
+              "status": "PAUSED",
+              "rrule": "FREQ=DAILY",
+              "timezone": "local",
+              "prompt": "Run the native conformance probe",
+              "misfire": "latest",
+              "overlap": "forbid",
+              "timeoutMinutes": 30,
+              "runtime": "coven-code"
+            },
+            "expected": {
+              "outcome": "supported"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
+```
+
+The example values are placeholders, not evidence. Use the exact SHA-256 and
+source metadata for the files and binary under test. `source.commit` must equal
+`protocolArtifact.sourceCommit`. The runner also recomputes and requires:
+
+- `runner.artifactSha256` from `conformance.mjs`;
+- `runner.vectorSetSha256` from the JCS bytes of the job's `suites` array;
+- `subjectArtifact.sha256` from `--target-command`.
+
+The checked-in
+[`capability-negotiation.vectors.json`](capability-negotiation.vectors.json)
+contains the current nonempty vector set.
+
+## Target protocol
+
+The runner invokes the target directly without a shell.
+
+`<target> automations conformance capability` returns:
+
+```json
+{
+  "schemaVersion": "coven.automations.conformance-target-capability.v1",
+  "profiles": [
+    {
+      "profile": "structural",
+      "suites": ["capability-negotiation"]
+    }
+  ]
+}
+```
+
+For each advertised suite, the runner invokes
+`<target> automations conformance evaluate`, writes one
+`coven.automations.conformance-suite-request.v1` object to standard input, and
+expects one `coven.automations.conformance-suite-result.v1` object on standard
+output.
+
+The native Coven target currently implements only the structural
+`capability-negotiation` suite. It executes the checked-in cases against Rust's
+real definition parser and capability negotiation code. The runner computes a
+JCS SHA-256 digest of returned evidence and discards the raw evidence after
+building the result envelope. Evidence is restricted to JSON values that can
+be canonicalized consistently across the JavaScript runner and Rust verifier.
+The native target rejects evaluation requests larger than one MiB before JSON
+parsing.
+Each target operation has a two-second deadline followed by process-tree
+termination; output is capped at one MiB.
