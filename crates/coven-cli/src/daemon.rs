@@ -4417,9 +4417,60 @@ pub(crate) fn acquire_serve_lock(coven_home: &Path) -> Result<std::fs::File> {
     })
 }
 
+#[derive(Clone, Copy)]
+enum StartupCheckpoint {
+    DaemonStoreBegin,
+    StoreInitializeBegin,
+    StoreInitializeEnd,
+    DaemonStoreEnd,
+    StatusPublicationBegin,
+    StatusPublicationEnd,
+}
+
+impl StartupCheckpoint {
+    fn label(self) -> &'static str {
+        match self {
+            Self::DaemonStoreBegin => "daemon-store-begin",
+            Self::StoreInitializeBegin => "store-initialize-begin",
+            Self::StoreInitializeEnd => "store-initialize-end",
+            Self::DaemonStoreEnd => "daemon-store-end",
+            Self::StatusPublicationBegin => "status-publication-begin",
+            Self::StatusPublicationEnd => "status-publication-end",
+        }
+    }
+}
+
+fn append_startup_checkpoint(coven_home: &Path, phase: StartupCheckpoint, started: Instant) {
+    // Store initialization and status publication each have their own elapsed-time origin.
+    append_daemon_recovery_log(
+        coven_home,
+        &format!(
+            "startup_checkpoint phase={} elapsed_ms={}",
+            phase.label(),
+            started.elapsed().as_millis()
+        ),
+    );
+}
+
+fn write_startup_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
+    let started = Instant::now();
+    append_startup_checkpoint(
+        coven_home,
+        StartupCheckpoint::StatusPublicationBegin,
+        started,
+    );
+    write_status(coven_home, status)?;
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StatusPublicationEnd, started);
+    Ok(())
+}
+
 fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
+    let started = Instant::now();
+    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreBegin, started);
     let store_path = coven_home.join("coven.sqlite3");
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeBegin, started);
     crate::store::initialize_store(&store_path)?;
+    append_startup_checkpoint(coven_home, StartupCheckpoint::StoreInitializeEnd, started);
     let conn = crate::store::open_initialized_store(&store_path)?;
     crate::hub::initialize_hub_identity(&conn)
         .context("failed to initialize hub identity during daemon startup")?;
@@ -4446,6 +4497,7 @@ fn initialize_daemon_store(coven_home: &Path) -> Result<()> {
             );
         }
     }
+    append_startup_checkpoint(coven_home, StartupCheckpoint::DaemonStoreEnd, started);
     Ok(())
 }
 
@@ -4503,7 +4555,7 @@ pub fn serve_forever(
     unix_listener
         .set_nonblocking(true)
         .context("failed to configure interruptible Unix API listener")?;
-    write_status(coven_home, &status)?;
+    write_startup_status(coven_home, &status)?;
     let shutdown_guard = ShutdownGuard {
         socket_path: socket_path.clone(),
         status_path: status_path.clone(),
@@ -5485,7 +5537,7 @@ fn serve_forever_with_lifetime_job_installer(
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
     initialize_daemon_store(coven_home)?;
-    write_status(coven_home, &status)?;
+    write_startup_status(coven_home, &status)?;
     recover_orphaned_sessions(coven_home, &started_at)?;
     recover_stale_created_sessions(coven_home, &started_at)?;
     recover_orphaned_afs_mounts(coven_home);
@@ -12484,6 +12536,76 @@ mod tests {
             status_path.exists(),
             "an older daemon must not remove newer daemon status on shutdown"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_report_fixed_phases_and_monotonic_elapsed() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        initialize_daemon_store(home.path())?;
+        let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+        let checkpoints: Vec<_> = log
+            .lines()
+            .filter_map(|line| line.split_once("startup_checkpoint "))
+            .map(|(_, checkpoint)| checkpoint)
+            .collect();
+        let mut previous = 0;
+        let phases = [
+            "daemon-store-begin",
+            "store-initialize-begin",
+            "store-initialize-end",
+            "daemon-store-end",
+        ];
+        assert_eq!(checkpoints.len(), phases.len());
+        for (checkpoint, phase) in checkpoints.iter().zip(phases) {
+            let elapsed = checkpoint
+                .strip_prefix(&format!("phase={phase} elapsed_ms="))
+                .context("unexpected checkpoint fields")?
+                .parse::<u128>()?;
+            assert!(elapsed >= previous);
+            previous = elapsed;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_report_status_completion_only_after_success() -> Result<()> {
+        for fail_publication in [false, true] {
+            let home = tempfile::tempdir()?;
+            let status = DaemonStatus {
+                pid: 12345,
+                started_at: "2026-04-27T10:00:00Z".to_owned(),
+                socket: test_daemon_status_socket(home.path()),
+                process_creation_time: None,
+            };
+            if fail_publication {
+                std::fs::create_dir(daemon_status_path(home.path()))?;
+            }
+            let result = write_startup_status(home.path(), &status);
+            assert_eq!(result.is_err(), fail_publication);
+            let log = std::fs::read_to_string(daemon_recovery_log_path(home.path()))?;
+            let phases = ["status-publication-begin", "status-publication-end"];
+            let entries: Vec<_> = log.lines().collect();
+            assert_eq!(entries.len(), if fail_publication { 1 } else { 2 });
+            let mut previous = 0;
+            for (entry, phase) in entries.iter().zip(phases) {
+                let (_, elapsed) = entry
+                    .split_once(&format!("startup_checkpoint phase={phase} elapsed_ms="))
+                    .context("unexpected status checkpoint")?;
+                let elapsed = elapsed.parse::<u128>()?;
+                assert!(elapsed >= previous);
+                previous = elapsed;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn startup_checkpoints_remain_advisory_when_log_cannot_be_opened() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        std::fs::create_dir(daemon_recovery_log_path(home.path()))?;
+        initialize_daemon_store(home.path())?;
+        assert!(home.path().join("coven.sqlite3").is_file());
         Ok(())
     }
 
