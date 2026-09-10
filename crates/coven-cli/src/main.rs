@@ -748,6 +748,14 @@ enum Command {
         #[command(subcommand)]
         command: SchedulerCommand,
     },
+    #[command(
+        hide = true,
+        about = "Expose machine-facing Coven Automations protocol surfaces"
+    )]
+    Automations {
+        #[command(subcommand)]
+        command: AutomationsCommand,
+    },
     #[command(about = "Inspect travel-mode handoff state (read-only)")]
     Travel {
         #[command(subcommand)]
@@ -1044,6 +1052,23 @@ enum SchedulerCommand {
         #[arg(long, help = "Print the loop state as JSON (machine-readable)")]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutomationsCommand {
+    #[command(about = "Expose the native conformance target protocol")]
+    Conformance {
+        #[command(subcommand)]
+        command: AutomationsConformanceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutomationsConformanceCommand {
+    #[command(about = "Print the native conformance suites supported by this binary")]
+    Capability,
+    #[command(about = "Evaluate one conformance suite request from standard input")]
+    Evaluate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1372,6 +1397,11 @@ fn main() -> Result<()> {
         Some(Command::Config {
             command: ConfigCommand::Paths { .. }
         })
+    ) || matches!(
+        &cli.command,
+        Some(Command::Automations {
+            command: AutomationsCommand::Conformance { .. }
+        })
     ) {
         return run_cli(cli);
     }
@@ -1646,6 +1676,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             SchedulerCommand::Decision { id, json } => observe::run_scheduler_decision(&id, json),
             SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
         },
+        Some(Command::Automations { command }) => run_automations_command(command),
         Some(Command::Travel { command }) => match command {
             TravelCommand::State {
                 client,
@@ -3637,6 +3668,30 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &current_timestamp(),
     )?;
     Ok(record.id)
+}
+
+fn run_automations_command(command: AutomationsCommand) -> Result<()> {
+    match command {
+        AutomationsCommand::Conformance { command } => match command {
+            AutomationsConformanceCommand::Capability => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&automations::conformance_target::capability())?
+                );
+                Ok(())
+            }
+            AutomationsConformanceCommand::Evaluate => {
+                let payload = io::read_to_string(io::stdin())
+                    .context("failed to read conformance request from standard input")?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                let response = automations::conformance_target::evaluate(&request)
+                    .map_err(|message| anyhow!(message))?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
+        },
+    }
 }
 
 fn run_logs_command(command: LogsCommand) -> Result<()> {
@@ -6232,6 +6287,26 @@ mod tests {
             other => panic!("expected scheduler loop command, got {other:?}"),
         }
         assert!(Cli::try_parse_from(["coven", "scheduler", "decision"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_automations_conformance_target_commands() {
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "conformance", "capability"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::Conformance {
+                    command: AutomationsConformanceCommand::Capability
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "conformance", "evaluate"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::Conformance {
+                    command: AutomationsConformanceCommand::Evaluate
+                }
+            })
+        ));
     }
 
     #[test]
