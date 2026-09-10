@@ -20,9 +20,9 @@ fn final_commit_identity_drift_closes_opened_window_without_applying() -> Result
             arm_final_commit_pause(fixture, capability)?;
 
             let tick_home = fixture.coven_home.clone();
-            let tick_body = json!({ "capability": capability }).to_string();
+            let tick_body = json!({ "capability": capability });
             let tick = thread::spawn(move || {
-                unix_http_request(
+                daemon_http_request(
                     &tick_home,
                     "POST",
                     "/api/v1/internal/threads/test-clock/tick",
@@ -129,21 +129,4 @@ fn wait_for_final_commit_pause(fixture: &ThreadsFixture) -> Result<()> {
             }
         }
     }
-}
-
-#[cfg(feature = "threads-test-clock")]
-fn write_private_fixture_file(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .with_context(|| format!("creating private fixture file {}", path.display()))?;
-    file.write_all(contents.as_bytes())
-        .with_context(|| format!("writing private fixture file {}", path.display()))?;
-    file.sync_all()
-        .with_context(|| format!("syncing private fixture file {}", path.display()))?;
-    Ok(())
 }

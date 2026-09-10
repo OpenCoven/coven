@@ -28,11 +28,14 @@ window terminals, and no-window human approval. It also covers restart with
 changed or unavailable identity, principal binding, materialized surfaces,
 regional approval policy, and inconsistent human-path/opened-window history.
 Unsupported corpus input and invalid identity are exercised at intake.
+The final-commit journey pauses after authority validation, changes the
+authoritative identity bytes, and requires a typed rejection without applying
+the candidate writes.
 
 These tests use owner-local IPC, the strongest current supported authorization
 path. A supplied fingerprint does not grant protected-write authority. The
 suite does not certify a signed principal-authorization profile, changed runtime
-bindings, multi-file atomic visibility, or Cave acceptance. It is bounded
+bindings, every commit/recovery interleaving, or Cave acceptance. It is bounded
 process-boundary evidence, not complete closure of every assertion in
 [OpenCoven/coven#884](https://github.com/OpenCoven/coven/issues/884).
 
@@ -41,7 +44,7 @@ fixture in each disposable home and explicit real-scheduler ticks, not sleeps
 or a mock scheduler. See [Threads test clock](../design/threads-test-clock.md).
 Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
-push lane. All platforms run the same 14 daemon journeys through `coven-client`
+push lane. All platforms run the same 15 daemon journeys through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is

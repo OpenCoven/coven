@@ -1069,7 +1069,7 @@ fn run_clocked_journey(
 #[cfg(feature = "threads-test-clock")]
 fn seed_clock(coven_home: &Path, capability: &str) -> Result<()> {
     #[cfg(unix)]
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
 
     let root = coven_home.join("test-fixtures");
     let directory = root.join("threads-deterministic-clock");
@@ -1085,14 +1085,27 @@ fn seed_clock(coven_home: &Path, capability: &str) -> Result<()> {
         ("capability", capability),
         ("state.json", r#"{"now":"2099-01-01T00:00:00Z"}"#),
     ] {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        options
-            .open(directory.join(name))?
-            .write_all(contents.as_bytes())?;
+        write_private_fixture_file(&directory.join(name), contents)?;
     }
+    Ok(())
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn write_private_fixture_file(path: &Path, contents: &str) -> Result<()> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("creating private fixture file {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .with_context(|| format!("writing private fixture file {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing private fixture file {}", path.display()))?;
     Ok(())
 }
 
