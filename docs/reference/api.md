@@ -37,6 +37,7 @@ All error responses use the structured envelope documented in the [API contract]
 |---|---|---|---|
 | GET | `/api/v1/api-version` | Read the legacy route-family token. | `{ apiVersion: "v1", supportedApiVersions: ["v1"] }` |
 | GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary, event-writer state, and local storage pressure. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub, eventWriter, storage }` |
+| GET | `/api/v1/session-policy` | Inert restricted-admission discovery; no runtime effects or enforcement grant. | `{ contract, enforcement: "unavailable", supportedProfiles: [], reason }` |
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
 | GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
@@ -58,11 +59,12 @@ return the stored `result` without a second event. The corresponding
 `.get.v1` and `.list.v1` actions expose authority revisions; `.list.v1` accepts
 `includeTombstoned: true` to include retained tombstones.
 
-The health `capabilities` object currently contains all 16 fields:
+The health `capabilities` object currently contains all 17 fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
 `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`,
 `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`,
-`executionBindingContracts`, and `requestAdoptionContracts`. The
+`executionBindingContracts`, `requestAdoptionContracts`, and
+`sessionPolicyContracts`. The
 `sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
 always `false` over TCP; Host and Origin allowlists do not elevate TCP
 authority. `daemon` is either `null` or
@@ -81,6 +83,15 @@ maintenanceBlocked, lastMaintenanceError? }`. `status` is `ok`, `warning`,
 before storage exhaustion rather than treating a reachable daemon as healthy.
 `writerBacklogEvents` and `writerBacklogBytes` mirror the same live queue
 snapshot reported by `eventWriter`.
+
+`sessionPolicyContracts` advertises `["coven.session-policy.v1"]` only over
+owner-local IPC (`[]` over TCP). This is a refusal-only admission contract, not
+enforcement support. `POST /api/v1/sessions/restricted` takes the closed request
+documented in the [session-policy contract](../API-CONTRACT.md#session-policy-admission-covensession-policyv1).
+It returns a correlated HTTP 409 `enforcement_unavailable` refusal for a valid
+request, or structured 400/403/409 errors, without store/familiar/runtime access.
+Top-level `sessionPolicy` on legacy `POST /api/v1/sessions` returns
+`400 invalid_request`; clients must not downgrade or automatically retry.
 
 ## Sessions and events
 

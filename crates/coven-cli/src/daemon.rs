@@ -4781,6 +4781,33 @@ where
             }
         }
     }
+    if crate::session_policy::is_restricted_route(method, path) {
+        let authority = match guard {
+            HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
+            HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
+        };
+        let response = if let Some(response) =
+            crate::session_policy::preflight(authority, headers.content_length)?
+        {
+            response
+        } else {
+            match read_http_body(&mut reader, headers.content_length) {
+                Ok(body) => crate::session_policy::restricted_response(
+                    body.as_deref().map(str::as_bytes),
+                    authority,
+                    chrono::Utc::now().timestamp_millis(),
+                )?,
+                Err(error) if error.downcast_ref::<std::string::FromUtf8Error>().is_some() => {
+                    crate::session_policy::invalid_request(
+                        "Restricted session request must be valid UTF-8 JSON.",
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        write_api_response(&mut write, &response)?;
+        return Ok(HttpStreamOutcome::Complete);
+    }
     if let Some(max) = max_body_bytes {
         if headers.content_length > max {
             write_payload_too_large(&mut write, max)?;
@@ -4843,6 +4870,15 @@ where
         };
         (response, false)
     };
+    write_api_response(&mut write, &response)?;
+    if hold_for_shutdown {
+        Ok(HttpStreamOutcome::HoldForShutdown)
+    } else {
+        Ok(HttpStreamOutcome::Complete)
+    }
+}
+
+fn write_api_response<W: Write>(write: &mut W, response: &crate::api::ApiResponse) -> Result<()> {
     let reason = http_reason_phrase(response.status);
     let http = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4855,11 +4891,7 @@ where
     write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
-    if hold_for_shutdown {
-        Ok(HttpStreamOutcome::HoldForShutdown)
-    } else {
-        Ok(HttpStreamOutcome::Complete)
-    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -8820,6 +8852,147 @@ mod tests {
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    }
+
+    struct PolicyUntouchedRuntime;
+    impl SessionRuntime for PolicyUntouchedRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            panic!("denied request launched");
+        }
+        fn send_input(&self, _: &str, _: &serde_json::Value) -> Result<()> {
+            panic!("denied request accessed runtime");
+        }
+        fn kill_session(&self, _: &str) -> Result<()> {
+            panic!("denied request accessed runtime");
+        }
+        fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+            panic!("policy request inspected runtime health");
+        }
+    }
+
+    #[test]
+    fn session_policy_http_rejects_invalid_utf8_and_oversize_before_effects() {
+        for path in [
+            "/api/v1/sessions/restricted",
+            "/sessions/restricted",
+            "/api/v1/sessions/restricted?source=wand",
+        ] {
+            for guard in [
+                HostGuard::Disabled,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            ] {
+                for (length, body) in [(1, &b"\xff"[..]), (1_048_577, &b""[..])] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let home = temp.path().join("must-not-exist");
+                    let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+                    request.extend_from_slice(body);
+                    let mut output = Vec::new();
+                    handle_http_stream(
+                        std::io::Cursor::new(request),
+                        &mut output,
+                        &home,
+                        None,
+                        &PolicyUntouchedRuntime,
+                        Some(MAX_SOCKET_BODY_BYTES),
+                        guard,
+                    )
+                    .unwrap();
+                    assert!(!home.exists(), "denied HTTP request created store/home");
+                    let output = String::from_utf8(output).unwrap();
+                    let (status, code) = match guard {
+                        HostGuard::Disabled => ("HTTP/1.1 400 Bad Request", "invalid_request"),
+                        HostGuard::Loopback { .. } => ("HTTP/1.1 403 Forbidden", "forbidden"),
+                    };
+                    assert!(output.starts_with(status), "{output}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    assert_eq!(payload["error"]["code"], code);
+                    assert!(payload.get("admission").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_policy_http_preserves_exact_refusal_digest_and_inert_discovery() -> Result<()> {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-session-policy/v1/fixtures/request.json"
+        ))?;
+        value["expiresAtUnixMs"] =
+            serde_json::json!(chrono::Utc::now().timestamp_millis() + 300_000);
+        value["launch"]["title"] = serde_json::json!("caf\u{e9}");
+        let compact = value.to_string();
+        let padded = format!(" \n{compact}\n ");
+        for body in [&compact, &padded] {
+            for guard in [
+                HostGuard::Disabled,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path().join("must-not-exist");
+                let request = format!("POST /api/v1/sessions/restricted HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let mut output = Vec::new();
+                handle_http_stream(
+                    std::io::Cursor::new(request),
+                    &mut output,
+                    &home,
+                    None,
+                    &PolicyUntouchedRuntime,
+                    Some(MAX_SOCKET_BODY_BYTES),
+                    guard,
+                )?;
+                assert!(!home.exists());
+                let output = String::from_utf8(output)?;
+                let payload: serde_json::Value =
+                    serde_json::from_str(output.split_once("\r\n\r\n").unwrap().1)?;
+                match guard {
+                    HostGuard::Disabled => {
+                        assert!(output.starts_with("HTTP/1.1 409 Conflict"), "{output}");
+                        assert_eq!(payload["admission"], "not_started");
+                        assert_eq!(
+                            payload["requestDigest"],
+                            format!(
+                                "sha256:{}",
+                                crate::automations::contract::canonical_json::sha256_hex(
+                                    body.as_bytes()
+                                )
+                            )
+                        );
+                    }
+                    HostGuard::Loopback { .. } => {
+                        assert!(output.starts_with("HTTP/1.1 403 Forbidden"), "{output}");
+                        assert_eq!(payload["error"]["code"], "forbidden");
+                    }
+                }
+            }
+        }
+        for guard in [
+            HostGuard::Disabled,
+            HostGuard::Loopback { allowed_hosts: &[] },
+        ] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path().join("must-not-exist");
+            let request = b"GET /api/v1/session-policy HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let mut output = Vec::new();
+            handle_http_stream(
+                std::io::Cursor::new(request),
+                &mut output,
+                &home,
+                None,
+                &PolicyUntouchedRuntime,
+                Some(MAX_SOCKET_BODY_BYTES),
+                guard,
+            )?;
+            assert!(!home.exists());
+            let output = String::from_utf8(output)?;
+            assert!(output.starts_with("HTTP/1.1 200 OK"), "{output}");
+            assert_eq!(
+                output.split_once("\r\n\r\n").unwrap().1,
+                include_str!("../../../spec/coven-session-policy/v1/fixtures/discovery.json")
+                    .trim_end_matches('\n')
+            );
+        }
+        Ok(())
     }
 
     #[cfg(unix)]

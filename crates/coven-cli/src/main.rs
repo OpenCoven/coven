@@ -71,6 +71,7 @@ mod repos_config;
 mod request_authority;
 mod reset;
 mod session_launch;
+mod session_policy;
 mod settings;
 pub mod setup;
 mod state_lock;

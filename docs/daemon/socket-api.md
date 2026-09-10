@@ -49,7 +49,8 @@ GET /api/v1/health
     "afsCommit": true,
     "afsCommitDryRun": true,
     "executionBindingContracts": ["psyche.execution_binding.v1"],
-    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"],
+    "sessionPolicyContracts": ["coven.session-policy.v1"]
   },
   "daemon": {
     "pid": 31415,
@@ -59,11 +60,16 @@ GET /api/v1/health
 }
 ```
 
-This example contains all 16 health capability fields: `sessions`, `events`,
+This example contains all 17 health capability fields: `sessions`, `events`,
 `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
 `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
 `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and
-`requestAdoptionContracts`.
+`requestAdoptionContracts`, and `sessionPolicyContracts`.
+
+`sessionPolicyContracts` is `["coven.session-policy.v1"]` over owner-local IPC
+and `[]` over TCP. It advertises only the refusal-only restricted admission
+contract, never a grant or positive enforcement backend. Discovery is inert;
+restricted POST validates before any store, familiar, or runtime access.
 
 `sessionLaunchPolicy` is `true` only on owner-gated local IPC. TCP health
 reports it as `false`, and TCP returns `403 forbidden` for any session request
@@ -88,6 +94,8 @@ diagnostic whose literal `v1` values are not proof of named-contract support.
 |---|---|
 | `GET /api/v1/api-version` | Read the legacy route-family token. |
 | `GET /api/v1/health` | Check daemon health and metadata. |
+| `GET /api/v1/session-policy` | Read inert refusal-only discovery: enforcement unavailable, no supported profiles. |
+| `POST /api/v1/sessions/restricted` | Owner-local-only closed request; a valid request returns a correlated HTTP 409 refusal with exact raw-body SHA-256 and `admission: "not_started"`. No positive backend exists. |
 | `GET /api/v1/capabilities` | Discover routable capabilities and owning adapters. |
 | `POST /api/v1/actions` | Send a known intent through the control plane. |
 | `GET /api/v1/sessions` | List sessions. |

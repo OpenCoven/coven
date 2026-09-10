@@ -503,7 +503,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             for path in module.SESSION_LAUNCH_POLICY_DOCS
         }
         expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
-        self.assertEqual(expected_count, 16)
+        self.assertEqual(expected_count, 17)
         for path in module.HEALTH_CAPABILITY_COUNT_DOCS:
             with self.subTest(path=path):
                 changed = dict(documents)
@@ -1449,6 +1449,28 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             '["psyche.request_adoption.v1"]',
             errors,
         )
+
+    def test_canonical_health_requires_exact_owner_local_session_policy(self) -> None:
+        for value in (self.MISSING, [], None, "coven.session-policy.v1",
+                      ["coven.session-policy.v2"]):
+            with self.subTest(value=value):
+                changed = self.o3_structure_documents()
+                self.mutate_health_capability(
+                    changed,
+                    "docs/API-CONTRACT.md",
+                    "`GET /api/v1/health`",
+                    "sessionPolicyContracts",
+                    value,
+                )
+                errors = module.validate_o3_document_structures(changed)
+                expected = (
+                    "missing sessionPolicyContracts" if value is self.MISSING
+                    else 'sessionPolicyContracts must equal ["coven.session-policy.v1"]'
+                )
+                self.assertIn(
+                    f"docs/API-CONTRACT.md: canonical health example {expected}",
+                    errors,
+                )
 
     def test_canonical_health_rejects_wrong_request_adoption_literal(self) -> None:
         changed = self.o3_structure_documents()

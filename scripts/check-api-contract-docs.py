@@ -136,6 +136,7 @@ HEALTH_CAPABILITY_FIELDS = (
     "afsCommitDryRun",
     "executionBindingContracts",
     "requestAdoptionContracts",
+    "sessionPolicyContracts",
 )
 O3_REQUIRED_LITERALS = (
     "/api/v1/adopted-sessions",
@@ -271,6 +272,7 @@ EXPECTED_HEALTH_CAPABILITIES = {
     "afsCommitDryRun": True,
     "executionBindingContracts": [EXECUTION_BINDING_CONTRACT],
     "requestAdoptionContracts": [REQUEST_ADOPTION_CONTRACT],
+    "sessionPolicyContracts": ["coven.session-policy.v1"],
 }
 EXPECTED_HEALTH_FIELDS = {
     "ok": True,
