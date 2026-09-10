@@ -586,11 +586,11 @@ pub fn initialize_store(path: &Path) -> Result<()> {
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
     configure_initializing_connection(&conn)?;
-    // The Ward audit migrator owns its own transaction because a legacy table
-    // rebuild must be atomic. Run it before our transaction for the remaining
-    // idempotent store schema work; nesting these transactions is invalid in
-    // SQLite. Its transaction also serializes concurrent Ward upgrades.
+    // Table-rebuild migrators own their transactions so they can change SQLite
+    // foreign-key mode safely and roll back atomically. Run them before the
+    // transaction for the remaining idempotent schema work.
     ensure_ward_audit_schema(&conn)?;
+    crate::automations::runs::ensure_runtime_authority_unsupported_failure_class(&conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("failed to acquire SQLite initialization transaction")?;
     let result = initialize_store_schema(&conn);
@@ -1019,8 +1019,8 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     crate::automations::runs::ensure_timeout_column(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
-    crate::automations::command_adoption::ensure_global_adoption_key_guards(conn)?;
     crate::automations::runs::ensure_authority_columns(conn)?;
+    crate::automations::command_adoption::ensure_global_adoption_key_guards(conn)?;
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
     conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
         .context("failed to initialize automation events schema")?;

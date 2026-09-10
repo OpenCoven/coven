@@ -501,6 +501,11 @@ impl Serialize for AuthorityCapabilitySet {
 
 impl AuthorityCapabilitySet {
     #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
+    #[must_use]
     pub fn as_slice(&self) -> &[AuthorityCapability] {
         &self.0
     }
