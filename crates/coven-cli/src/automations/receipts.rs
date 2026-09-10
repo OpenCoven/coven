@@ -1,27 +1,164 @@
 //! Immutable Automations v1 receipt commitment.
 
-// These internal seams remain unwired until a producer can supply terminal
-// evidence without deriving side-effect, capability, result or delivery claims.
+// Broader receipt paths remain unwired until producers can supply terminal
+// evidence without deriving unsupported result or delivery claims.
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::Value;
 
+use super::contract::authority::AutomationExecutionBinding;
 use super::contract::authority::{
     validate_authority_profile, validate_authority_profile_structure, AuthorityApprovalBinding,
     AuthorityConsumerClass, AuthorityEvidenceVerifier, AuthorityProfileDisposition,
     AuthoritySideEffectClass, AuthorityValidationPhase, AutomationAuthorityExtension,
     AUTHORITY_EXTENSION_KEY, AUTHORITY_PROFILE, BASE_PROFILE, RUNTIME_AUTHORITY_CAPABILITY,
 };
+use super::contract::canonical_json::{canonicalize_without_integrity, sha256_hex};
 use super::contract::events::append_event;
 use super::contract::types::{
-    AutomationReceipt, EventEnvelope, EventKind, EventPayload, ExtensionBag, SideEffectClass,
-    StreamKind, TerminalOutcome,
+    AutomationReceipt, Canonicalization, ComponentName, Detail, DigestAlgorithm, DigestValue,
+    EventEnvelope, EventId, EventKind, EventPayload, EventPrivacy, EventStreamId, EventSummary,
+    ExercisedCapabilities, ExtensionBag, FailureClass, FamiliarId, FamiliarRef,
+    ImplementationVersion, InstanceId, PrivacyClassification, ProducerIdentity,
+    ReceiptAuthentication, ReceiptAuthority, ReceiptId, ReceiptIntegrity, ReceiptOutcome,
+    ReceiptPayload, ReceiptPrivacy, ReceiptRecoveryDisposition, RetentionClass,
+    RetentionClassification, SafeInteger, SchemaVersion, Sha256Digest, SideEffectClass, StreamKind,
+    StreamRef, TerminalOutcome, Timestamp,
 };
+
+pub(crate) const NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL: &str =
+    crate::api::RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED;
+
+fn receipt_producer() -> Result<ProducerIdentity> {
+    Ok(ProducerIdentity {
+        component: ComponentName::new("coven-daemon".to_string())?,
+        instance_id: InstanceId::new("local-authority".to_string())?,
+        implementation_version: Some(ImplementationVersion::new(
+            env!("CARGO_PKG_VERSION").to_string(),
+        )?),
+    })
+}
+
+pub(crate) fn build_no_launch_receipt(
+    receipt_id: &str,
+    binding: &AutomationExecutionBinding,
+    familiar_id: &str,
+    produced_at: DateTime<Utc>,
+) -> Result<AutomationReceipt> {
+    let produced_at =
+        Timestamp::new(produced_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))?;
+    let mut receipt = AutomationReceipt {
+        schema_version: SchemaVersion::V1,
+        receipt_id: ReceiptId::new(receipt_id.to_string())?,
+        automation_id: binding.base.automation_id.clone(),
+        automation_revision: binding.base.automation_revision,
+        definition_digest: Some(binding.base.definition_digest.clone()),
+        occurrence_id: binding.base.occurrence_id.clone(),
+        occurrence_fence_generation: Some(binding.base.occurrence_fence_generation),
+        run_id: binding.base.run_id.clone(),
+        attempt_id: binding.base.attempt_id.clone(),
+        attempt_number: Some(binding.base.attempt_number),
+        identity: FamiliarRef {
+            familiar_id: FamiliarId::new(familiar_id.to_string())?,
+        },
+        authority: Some(ReceiptAuthority {
+            principal: super::contract::types::PrincipalRef {
+                principal_id: binding.principal.principal_id.clone(),
+                display_name: None,
+            },
+            // Runtime Authority does not carry the base contract's policy ref,
+            // so no approval reference can be copied losslessly.
+            approval: None,
+        }),
+        runtime: None,
+        delivery_digest: None,
+        result_digest: None,
+        exercised_capabilities: Some(ExercisedCapabilities::empty()),
+        side_effect_class: SideEffectClass::None,
+        outcome: ReceiptOutcome {
+            disposition: TerminalOutcome::Failed,
+            failure_class: Some(FailureClass::new(
+                "runtime_authority_unsupported".to_string(),
+            )?),
+            detail: Some(Detail::new(
+                NO_LAUNCH_AUTHORITY_UNSUPPORTED_DETAIL.to_string(),
+            )?),
+            partial_failures: None,
+            recovery_disposition: Some(ReceiptRecoveryDisposition::NotRequired),
+        },
+        produced_at,
+        producer: receipt_producer()?,
+        integrity: ReceiptIntegrity {
+            algorithm: DigestAlgorithm::Sha256,
+            canonicalization: Canonicalization::JcsRfc8785,
+            value: Sha256Digest::new("0".repeat(64))?,
+            authentication: Some(ReceiptAuthentication::None),
+        },
+        privacy: ReceiptPrivacy {
+            classification: PrivacyClassification::Operational,
+            retention: RetentionClass {
+                classification: RetentionClassification::Standard,
+                delete_after: None,
+            },
+            notes: None,
+        },
+    };
+    let value = serde_json::to_value(&receipt)?;
+    receipt.integrity.value =
+        Sha256Digest::new(sha256_hex(&canonicalize_without_integrity(&value)?))?;
+    receipt.verify_integrity()?;
+    Ok(receipt)
+}
+
+pub(crate) fn build_receipt_recorded_event(
+    event_id: &str,
+    receipt: &AutomationReceipt,
+    sequence: u64,
+) -> Result<EventEnvelope> {
+    let mut event = EventEnvelope {
+        schema_version: SchemaVersion::V1,
+        event_id: EventId::new(event_id.to_string())?,
+        stream: StreamRef {
+            kind: StreamKind::Run,
+            id: EventStreamId::new(receipt.run_id.as_str().to_string())?,
+        },
+        sequence: SafeInteger::new(sequence)?,
+        recorded_at: receipt.produced_at.clone(),
+        observed_at: receipt.produced_at.clone(),
+        producer: receipt.producer.clone(),
+        causation: None,
+        automation_id: Some(receipt.automation_id.clone()),
+        occurrence_id: Some(receipt.occurrence_id.clone()),
+        run_id: Some(receipt.run_id.clone()),
+        attempt_id: Some(receipt.attempt_id.clone()),
+        kind: EventKind::ReceiptRecorded,
+        summary: EventSummary::new("automation run receipt recorded".to_string())?,
+        payload: EventPayload::Receipt(ReceiptPayload {
+            receipt_ref: receipt.receipt_id.clone(),
+            outcome: receipt.outcome.disposition,
+            side_effect_class: Some(receipt.side_effect_class),
+        }),
+        privacy: EventPrivacy {
+            classification: receipt.privacy.classification,
+            retention: receipt.privacy.retention.clone(),
+        },
+        integrity: None,
+    };
+    let value = serde_json::to_value(&event)?;
+    event.integrity = Some(DigestValue {
+        algorithm: DigestAlgorithm::Sha256,
+        canonicalization: Canonicalization::JcsRfc8785,
+        value: Sha256Digest::new(sha256_hex(&canonicalize_without_integrity(&value)?))?,
+    });
+    event.verify_integrity()?;
+    Ok(event)
+}
 
 pub const AUTOMATION_RECEIPTS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_receipts (
@@ -1180,8 +1317,8 @@ const fn terminal_states(outcome: TerminalOutcome) -> (&'static str, &'static st
 #[cfg(test)]
 mod tests {
     use super::{
-        commit_authorized_receipt, commit_receipt, read_authorized_receipt, read_receipt,
-        ReceiptCommitOutcome,
+        build_no_launch_receipt, build_receipt_recorded_event, commit_authorized_receipt,
+        commit_receipt, read_authorized_receipt, read_receipt, ReceiptCommitOutcome,
     };
     use crate::api::{
         handle_request_with_runtime_and_authority, NoopSessionRuntime, RequestAuthority,
@@ -1492,6 +1629,100 @@ mod tests {
 
     fn terminal_authority(fixture: &Fixture, receipt: &AutomationReceipt) -> ExtensionBag {
         authority_extensions_for(&fixture.definition_digest, Some(receipt))
+    }
+
+    #[test]
+    fn no_launch_builders_emit_minimal_correlated_terminal_evidence() {
+        let fixture = authorized_fixture();
+        let extension = authority_extensions_for(&fixture.definition_digest, None);
+        let extension: AutomationAuthorityExtension = serde_json::from_value(
+            serde_json::to_value(extension).unwrap()[AUTHORITY_EXTENSION_KEY].clone(),
+        )
+        .unwrap();
+        let receipt = build_no_launch_receipt(
+            "receipt-no-launch-1",
+            &extension.execution_binding,
+            "charm",
+            fixture.produced_at,
+        )
+        .unwrap();
+        let event =
+            build_receipt_recorded_event("evt00000000000000000000000000042", &receipt, 4).unwrap();
+
+        receipt.verify_integrity().unwrap();
+        event.verify_integrity().unwrap();
+        let receipt_value = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(receipt_value["automationId"], json!("daily"));
+        assert_eq!(receipt_value["automationRevision"], json!(1));
+        assert_eq!(
+            receipt_value["definitionDigest"]["value"],
+            json!(fixture.definition_digest)
+        );
+        assert_eq!(receipt_value["occurrenceId"], json!("occurrence-daily-1"));
+        assert_eq!(receipt_value["occurrenceFenceGeneration"], json!(1));
+        assert_eq!(receipt_value["runId"], json!("run-daily-1"));
+        assert_eq!(receipt_value["attemptId"], json!("attempt-daily-1"));
+        assert_eq!(receipt_value["attemptNumber"], json!(1));
+        assert_eq!(receipt_value["identity"]["familiarId"], json!("charm"));
+        assert_eq!(
+            receipt_value["authority"]["principal"]["principalId"],
+            json!("principal:val")
+        );
+        assert!(receipt_value["authority"].get("approval").is_none());
+        assert!(receipt_value.get("runtime").is_none());
+        assert!(receipt_value.get("deliveryDigest").is_none());
+        assert!(receipt_value.get("resultDigest").is_none());
+        assert_eq!(receipt_value["exercisedCapabilities"], json!([]));
+        assert_eq!(receipt_value["sideEffectClass"], json!("none"));
+        assert_eq!(receipt_value["outcome"]["disposition"], json!("failed"));
+        assert_eq!(
+            receipt_value["outcome"]["failureClass"],
+            json!("runtime_authority_unsupported")
+        );
+        assert_eq!(
+            receipt_value["outcome"]["detail"],
+            json!("runtime does not accept automation authority projections; no process started")
+        );
+        assert_eq!(
+            receipt_value["outcome"]["recoveryDisposition"],
+            json!("not_required")
+        );
+        assert_eq!(
+            receipt_value["producedAt"],
+            json!(fixture
+                .produced_at
+                .to_rfc3339_opts(SecondsFormat::Millis, true))
+        );
+        assert_eq!(receipt_value["integrity"]["authentication"], json!("none"));
+        assert_eq!(
+            receipt_value["privacy"]["classification"],
+            json!("operational")
+        );
+
+        let event_value = serde_json::to_value(event).unwrap();
+        assert_eq!(
+            event_value["stream"],
+            json!({"kind": "run", "id": "run-daily-1"})
+        );
+        assert_eq!(event_value["sequence"], json!(4));
+        assert_eq!(event_value["recordedAt"], receipt_value["producedAt"]);
+        assert_eq!(event_value["observedAt"], receipt_value["producedAt"]);
+        assert_eq!(event_value["automationId"], receipt_value["automationId"]);
+        assert_eq!(event_value["occurrenceId"], receipt_value["occurrenceId"]);
+        assert_eq!(event_value["runId"], receipt_value["runId"]);
+        assert_eq!(event_value["attemptId"], receipt_value["attemptId"]);
+        assert_eq!(
+            event_value["payload"]["receiptRef"],
+            receipt_value["receiptId"]
+        );
+        assert_eq!(
+            event_value["payload"]["outcome"],
+            receipt_value["outcome"]["disposition"]
+        );
+        assert_eq!(
+            event_value["payload"]["sideEffectClass"],
+            receipt_value["sideEffectClass"]
+        );
     }
 
     fn mutate_authority(extensions: ExtensionBag, mutate: impl FnOnce(&mut Value)) -> ExtensionBag {
