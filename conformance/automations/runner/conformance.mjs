@@ -26,6 +26,7 @@ const CONTRACT_PROFILE = "coven.automations.v1";
 const TARGET_TIMEOUT_MS = 2_000;
 const TARGET_KILL_GRACE_MS = 100;
 const TARGET_OUTPUT_LIMIT = 1024 * 1024;
+const MAX_JCS_DEPTH = 128;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,159}$/;
 const SUITE_ID = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 const VERSION = /^[A-Za-z0-9][A-Za-z0-9._+:-]{0,95}$/;
@@ -258,6 +259,9 @@ function validateJob(job) {
     }
     suiteKeys.add(key);
   }
+  if (!isPortableJcsValue(job.suites)) {
+    throw new JobError("vector set is not portable JCS");
+  }
 }
 
 function canonicalize(value) {
@@ -278,7 +282,7 @@ function hasOnlyScalarUnicode(value) {
     const unit = value.charCodeAt(index);
     if (unit >= 0xd800 && unit <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
-      if (next < 0xdc00 || next > 0xdfff) return false;
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
       index += 1;
     } else if (unit >= 0xdc00 && unit <= 0xdfff) {
       return false;
@@ -288,20 +292,38 @@ function hasOnlyScalarUnicode(value) {
 }
 
 function isPortableJcsValue(value) {
-  if (value === null || typeof value === "boolean") return true;
-  if (typeof value === "string") return hasOnlyScalarUnicode(value);
-  if (typeof value === "number") {
-    return (
-      Number.isFinite(value) &&
-      (!Number.isInteger(value) || Number.isSafeInteger(value))
-    );
+  const pending = [{ value, depth: 0 }];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    const candidate = current.value;
+    if (candidate === null || typeof candidate === "boolean") continue;
+    if (typeof candidate === "string") {
+      if (!hasOnlyScalarUnicode(candidate)) return false;
+      continue;
+    }
+    if (typeof candidate === "number") {
+      if (
+        !Number.isFinite(candidate) ||
+        (Number.isInteger(candidate) && !Number.isSafeInteger(candidate))
+      ) {
+        return false;
+      }
+      continue;
+    }
+    if (current.depth >= MAX_JCS_DEPTH) return false;
+    if (Array.isArray(candidate)) {
+      for (const child of candidate) {
+        pending.push({ value: child, depth: current.depth + 1 });
+      }
+      continue;
+    }
+    if (!isObject(candidate)) return false;
+    for (const [key, child] of Object.entries(candidate)) {
+      if (!hasOnlyScalarUnicode(key)) return false;
+      pending.push({ value: child, depth: current.depth + 1 });
+    }
   }
-  if (Array.isArray(value)) return value.every(isPortableJcsValue);
-  if (!isObject(value)) return false;
-  return Object.entries(value).every(
-    ([key, child]) =>
-      hasOnlyScalarUnicode(key) && isPortableJcsValue(child),
-  );
+  return true;
 }
 
 function digestCanonical(value) {

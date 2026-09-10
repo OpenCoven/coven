@@ -151,6 +151,19 @@ if (mode === "invalid-utf8") {
   process.stdout.write(Buffer.concat([prefix, Buffer.from([0xff]), suffix]));
   process.exit(0);
 }
+if (mode === "deep-evidence") {
+  const depth = 20_000;
+  process.stdout.write(
+    '{"schemaVersion":"coven.automations.conformance-suite-result.v1","suiteId":"' +
+      request.suiteId +
+      '","status":"passed","evidence":' +
+      "[".repeat(depth) +
+      "0" +
+      "]".repeat(depth) +
+      "}",
+  );
+  process.exit(0);
+}
 if (mode === "unsafe-evidence") {
   process.stdout.write('{"schemaVersion":"coven.automations.conformance-suite-result.v1","suiteId":"' + request.suiteId + '","status":"passed","evidence":{"count":9007199254740993}}');
   process.exit(0);
@@ -586,6 +599,38 @@ test("rejects non-UTF-8 target output instead of replacement-decoding it", async
   assert.equal(result.status, 1);
   assert.equal(result.stderr, "conformance target response invalid\n");
   assert.equal(result.stdout.includes("\ufffd"), false);
+  const report = JSON.parse(result.stdout);
+  assert.equal(report.statement.overallStatus, "failed");
+});
+
+test("rejects vector sets that cannot be represented as portable JCS", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+  const job = validJob();
+  job.suites[0].vector.payload = "\ud800";
+  job.runner.vectorSetSha256 = sha256(canonicalize(job.suites));
+
+  const result = await runRunner({ job, targetCommand: target });
+
+  assert.equal(result.status, 2);
+  assert.equal(
+    result.stderr,
+    "invalid conformance job: vector set is not portable JCS\n",
+  );
+  assert.equal(result.stdout, "");
+});
+
+test("turns excessively deep target evidence into a failed result", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "coven-conformance-target-"));
+  const target = await writeTarget(directory);
+
+  const result = await runRunner({
+    targetCommand: target,
+    env: { COVEN_TEST_TARGET_MODE: "deep-evidence" },
+  });
+
+  assert.equal(result.status, 1);
+  assert.equal(result.stderr, "conformance target response invalid\n");
   const report = JSON.parse(result.stdout);
   assert.equal(report.statement.overallStatus, "failed");
 });
