@@ -6,6 +6,8 @@ mod lifecycle;
 mod models;
 #[cfg(windows)]
 mod status;
+#[cfg(any(windows, test))]
+mod status_error;
 mod transport;
 
 pub use discovery::DaemonEndpoint;

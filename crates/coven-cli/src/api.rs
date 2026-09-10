@@ -524,6 +524,9 @@ impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
 
 impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
 
+pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
+    "runtime does not accept automation authority projections; no process started";
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -573,6 +576,11 @@ pub trait SessionRuntime {
     ) -> Result<()> {
         self.launch_adopted_session(launch, writer, ownership_established)
     }
+    /// Reports whether this runtime accepts the bounded Runtime Authority
+    /// projection supplied to automation launches.
+    fn accepts_automation_authority_projection(&self) -> bool {
+        false
+    }
     /// Launches an automation session with the bounded authority evidence that
     /// the execution consumer is permitted to observe.
     ///
@@ -589,7 +597,7 @@ pub trait SessionRuntime {
         ownership_established: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         if authority.is_some() {
-            anyhow::bail!("runtime does not accept automation authority projections");
+            anyhow::bail!(RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED);
         }
         self.launch_contained_adopted_session(launch, writer, ownership_established)
     }
@@ -12489,6 +12497,86 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 pub(crate) mod tests {
     use super::*;
     use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
+
+    #[test]
+    fn default_authorized_launch_refuses_before_launch_or_ownership() {
+        struct CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize,
+        }
+
+        impl SessionRuntime for CountingRuntime {
+            fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+                self.launches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _session_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let extension: crate::automations::contract::authority::AutomationAuthorityExtension =
+            serde_json::from_value(
+                crate::automations::contract::authority::test_support::authority_extensions_value()
+                    [crate::automations::contract::authority::AUTHORITY_EXTENSION_KEY]
+                    .clone(),
+            )
+            .unwrap();
+        let authority =
+            crate::automations::authority_projection::AutomationAuthorityConsumerProjection::from_validated(
+                &extension,
+            );
+        let launch = SessionLaunch {
+            id: "session-authority-refusal".to_string(),
+            project_root: "/work/project".to_string(),
+            cwd: "/work/project".to_string(),
+            harness: "coven-code".to_string(),
+            model: None,
+            launch_mode: HarnessLaunchMode::NonInteractive,
+            launch_policy: None,
+            prompt: "Do the thing.".to_string(),
+            title: "authority refusal".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: Some("charm".to_string()),
+            caller_familiar_id: None,
+        };
+        let runtime = CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ownership_callbacks = std::sync::atomic::AtomicUsize::new(0);
+        let mut ownership_established = || {
+            ownership_callbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+
+        let error = runtime
+            .launch_authorized_contained_adopted_session(
+                &launch,
+                Some(&authority),
+                None,
+                &mut ownership_established,
+            )
+            .expect_err("the default runtime must reject authority projections");
+
+        assert_eq!(
+            error.to_string(),
+            "runtime does not accept automation authority projections; no process started"
+        );
+        assert_eq!(
+            runtime.launches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            ownership_callbacks.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
 
     struct TestWorker<T> {
         completion: std::sync::mpsc::Receiver<T>,
