@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use uuid::Uuid;
 
+use super::authority_projection::AutomationAuthorityConsumerProjection;
 use super::contract::authority::{
     validate_authority_profile, AuthorityConsumerClass, AuthorityEvidenceVerifier,
     AuthorityProfileDisposition, AuthorityProfileError, AuthorityProfileErrorCode,
@@ -273,10 +274,15 @@ fn authority_binding_matches_request(
         && extension.execution_binding.runtime.runtime_id.as_str() == request.runtime_id
 }
 
+struct ResolvedAuthority {
+    extension_json: String,
+    consumer_projection: AutomationAuthorityConsumerProjection,
+}
+
 fn resolve_authority_extension(
     authority: AutomationAuthorityMode<'_>,
     request: &AutomationAuthorityRequest,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ResolvedAuthority>, String> {
     let AutomationAuthorityMode::RuntimeAuthority(authority) = authority else {
         return Ok(None);
     };
@@ -304,9 +310,14 @@ fn resolve_authority_extension(
             "authority binding does not match the claimed automation attempt",
         )));
     }
-    serde_json::to_string(extension.as_ref())
-        .map(Some)
-        .map_err(|_| "failed to serialize validated automation authority binding".to_string())
+    let consumer_projection =
+        AutomationAuthorityConsumerProjection::from_validated(extension.as_ref());
+    let extension_json = serde_json::to_string(extension.as_ref())
+        .map_err(|_| "failed to serialize validated automation authority binding".to_string())?;
+    Ok(Some(ResolvedAuthority {
+        extension_json,
+        consumer_projection,
+    }))
 }
 
 fn persist_launch_with_clock(
@@ -586,7 +597,7 @@ fn persist_launch_with_clock(
             },
         )
         .map_err(|error| format!("failed to construct automation authority request: {error}"))?;
-    let authority_extension_json = resolve_authority_extension(context.authority, &request)?;
+    let authority = resolve_authority_extension(context.authority, &request)?;
     let dispatched = transaction
         .execute(
             "UPDATE automation_attempts
@@ -607,7 +618,9 @@ fn persist_launch_with_clock(
                 run_id,
                 i64::from(attempt_number),
                 now_iso,
-                authority_extension_json,
+                authority
+                    .as_ref()
+                    .map(|authority| authority.extension_json.as_str()),
             ],
         )
         .map_err(|error| format!("failed to dispatch automation attempt: {error}"))?;
@@ -633,6 +646,7 @@ fn persist_launch_with_clock(
     Ok(PersistLaunch::Ready(AttemptDispatch {
         run_id: run_id.to_string(),
         attempt_number,
+        authority: authority.map(|authority| Box::new(authority.consumer_projection)),
     }))
 }
 
@@ -941,6 +955,7 @@ enum PersistLaunch {
 struct AttemptDispatch {
     run_id: String,
     attempt_number: u8,
+    authority: Option<Box<AutomationAuthorityConsumerProjection>>,
 }
 
 struct DispatchControl<'a> {
@@ -1009,8 +1024,12 @@ fn dispatch_occurrence_with_clock(
             ))
         }
     };
-    let launch_result =
-        runtime.launch_contained_adopted_session(&launch, None, &mut ownership_established);
+    let launch_result = runtime.launch_authorized_contained_adopted_session(
+        &launch,
+        attempt.authority.as_deref(),
+        None,
+        &mut ownership_established,
+    );
     if let Some(fence) = control.scheduler_fence {
         if !fence
             .is_current(conn)
@@ -3588,6 +3607,18 @@ mod tests {
             ))
         }
 
+        fn launch_authorized_contained_adopted_session(
+            &self,
+            _launch: &SessionLaunch,
+            _authority: Option<&AutomationAuthorityConsumerProjection>,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ))
+        }
+
         fn send_input(
             &self,
             _session_id: &str,
@@ -3674,13 +3705,39 @@ mod tests {
             unreachable!("automation dispatch must use strict containment")
         }
 
-        fn launch_contained_adopted_session(
+        fn launch_authorized_contained_adopted_session(
             &self,
             launch: &SessionLaunch,
+            authority: Option<&AutomationAuthorityConsumerProjection>,
             _writer: Option<crate::maintenance_gate::WriterLease>,
             ownership_established: &mut dyn FnMut() -> anyhow::Result<()>,
         ) -> anyhow::Result<()> {
-            let (profile, extension): (Option<String>, Option<String>) = self.conn.query_row(
+            let authority = authority
+                .ok_or_else(|| anyhow::anyhow!("runtime authority projection is missing"))?;
+            assert_eq!(
+                authority.profile,
+                crate::automations::contract::authority::AuthorityProfile::V1
+            );
+            assert_eq!(authority.principal_id.as_str(), "principal:val");
+            assert_eq!(authority.familiar_root_id.as_str(), "familiar:charm");
+            assert_eq!(
+                authority.runtime.runtime_id.as_str(),
+                launch.harness.as_str()
+            );
+            let projected = serde_json::to_value(authority)?;
+            for omitted in [
+                "authorization",
+                "approval",
+                "contextProjection",
+                "memoryProjection",
+                "authentication",
+            ] {
+                anyhow::ensure!(
+                    projected.get(omitted).is_none(),
+                    "consumer projection exposed `{omitted}`"
+                );
+            }
+            let (profile, extension): (Option<String>, String) = self.conn.query_row(
                 "SELECT r.authority_profile, a.authority_extension_json
                  FROM automation_runs AS r
                  JOIN automation_attempts AS a ON a.run_id = r.id
@@ -3692,9 +3749,14 @@ mod tests {
                 profile.as_deref() == Some("coven.automations.authority.v1"),
                 "runtime launch observed an unpinned authority profile"
             );
-            anyhow::ensure!(
-                extension.is_some(),
-                "runtime launch observed an unpinned authority extension"
+            let extension: serde_json::Value = serde_json::from_str(&extension)?;
+            let binding = &extension["executionBinding"];
+            assert_eq!(projected["occurrenceId"], binding["base"]["occurrenceId"]);
+            assert_eq!(projected["runId"], binding["base"]["runId"]);
+            assert_eq!(projected["attemptId"], binding["base"]["attemptId"]);
+            assert_eq!(
+                projected["authorizationValidUntil"],
+                binding["authorization"]["validUntil"]
             );
             ownership_established()
         }
@@ -4483,6 +4545,61 @@ mod tests {
             .unwrap();
         assert_eq!(profile.as_deref(), Some("coven.automations.authority.v1"));
         assert!(extension.is_some());
+    }
+
+    #[test]
+    fn runtime_authority_refuses_a_consumer_that_does_not_accept_the_projection() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("daily-notes");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 3, 12, 0, 0).unwrap();
+        let occurrence_id = "occurrence.daily-notes-unaware-runtime";
+        assert!(
+            insert_claimed_occurrence(&conn, occurrence_id, &routine.id, "daemon", 60, now,)
+                .unwrap()
+        );
+        let mut clock = || now;
+        let cancelled = || false;
+        let mut control = DispatchControl {
+            clock: &mut clock,
+            cancelled: &cancelled,
+            authority: AutomationAuthorityMode::RuntimeAuthority(&VectorAuthority),
+            scheduler_fence: None,
+        };
+
+        let dispatch = dispatch_occurrence_with_clock(
+            &conn,
+            &ContainedRuntime,
+            &routine,
+            occurrence_id,
+            routine.cwd.as_deref().unwrap(),
+            now,
+            &mut control,
+        )
+        .unwrap();
+        let DispatchAttempt::Completed(outcome) = dispatch else {
+            panic!("authority-bound dispatch must settle an unaware runtime refusal");
+        };
+
+        assert_eq!(outcome.status, "failed");
+        assert_eq!(outcome.session_id, None);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("runtime does not accept automation authority projections")
+        );
+        let (attempt_state, session_status): (String, String) = conn
+            .query_row(
+                "SELECT a.state, s.status
+                 FROM automation_attempts AS a
+                 JOIN automation_runs AS r ON r.id = a.run_id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+                [&outcome.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempt_state, "failed");
+        assert_eq!(session_status, "failed");
     }
 
     #[test]
