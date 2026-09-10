@@ -11,7 +11,10 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use uuid::Uuid;
 
-use super::contract::{MobileDeviceScope, MobilePairedDevice, MobilePairingRequest};
+use super::assurance::{NewAuthorizationKey, StepUpAuthorizationEnrollment};
+use super::contract::{
+    AssuranceClass, MobileDeviceScope, MobilePairedDevice, MobilePairingRequest,
+};
 use super::registry::{DeviceRecord, DeviceRegistry, DeviceScope};
 use super::MOBILE_PROTOCOL_VERSION;
 
@@ -41,6 +44,13 @@ pub struct PendingDevice {
     pub public_key_x963: String,
     pub app_version: String,
     pub scopes: Vec<DeviceScope>,
+    pub step_up_authorization: Option<PendingAuthorizationKey>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAuthorizationKey {
+    pub public_key_x963: String,
+    pub assurance_class: AssuranceClass,
 }
 
 #[derive(Debug, Clone)]
@@ -222,6 +232,9 @@ impl PairingManager {
             public_key,
         );
         let transcript_hash = transcript.hash();
+        if let Some(step_up) = &request.step_up_authorization {
+            verify_step_up_enrollment(step_up, transcript_hash)?;
+        }
         let phrase = derive_pairing_phrase(&transcript);
         pairing.transcript_hash = Some(transcript_hash);
         pairing.device = Some(PendingDevice {
@@ -229,6 +242,12 @@ impl PairingManager {
             public_key_x963: request.device_public_key,
             app_version: request.app_version,
             scopes: vec![DeviceScope::MemoryRead],
+            step_up_authorization: request.step_up_authorization.map(|step_up| {
+                PendingAuthorizationKey {
+                    public_key_x963: step_up.public_key,
+                    assurance_class: step_up.assurance_class,
+                }
+            }),
         });
         Ok(EnrolledPairing {
             id: pairing_id,
@@ -347,8 +366,22 @@ impl PairingManager {
             revoked_at: None,
             scopes: device.scopes,
         };
+        let grant = super::grant::DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            record.paired_at,
+        )
+        .map_err(|_| PairingError::InvalidRequest)?;
+        let authorization_key = device
+            .step_up_authorization
+            .map(|step_up| NewAuthorizationKey {
+                public_key_x963: step_up.public_key_x963,
+                assurance_class: step_up.assurance_class,
+                enrolled_at: now,
+            });
         self.registry
-            .register(record.clone())
+            .register_with_grant_and_authorization(record.clone(), grant, authorization_key)
             .map_err(|_| PairingError::InvalidRequest)?;
         let completed = MobilePairedDevice {
             id: record.id,
@@ -389,6 +422,7 @@ enum PairingTranscript {
         device_public_key: Vec<u8>,
         device_name: String,
         app_version: String,
+        step_up_authorization: Option<(Vec<u8>, AssuranceClass)>,
     },
 }
 
@@ -415,6 +449,14 @@ impl PairingTranscript {
                 device_public_key,
                 device_name: request.device_name.clone(),
                 app_version: request.app_version.clone(),
+                step_up_authorization: request.step_up_authorization.as_ref().map(|step_up| {
+                    (
+                        URL_SAFE_NO_PAD
+                            .decode(&step_up.public_key)
+                            .expect("validated step-up key"),
+                        step_up.assurance_class,
+                    )
+                }),
             }
         }
     }
@@ -448,6 +490,7 @@ impl PairingTranscript {
                 device_public_key,
                 device_name,
                 app_version,
+                step_up_authorization,
             } => {
                 let protocol_version = protocol_version.to_be_bytes();
                 let supported_minimum = supported_minimum.to_be_bytes();
@@ -463,6 +506,10 @@ impl PairingTranscript {
                     app_version.as_bytes(),
                 ] {
                     update_length_prefixed(&mut digest, field);
+                }
+                if let Some((public_key, assurance_class)) = step_up_authorization {
+                    update_length_prefixed(&mut digest, public_key);
+                    update_length_prefixed(&mut digest, assurance_class.as_str().as_bytes());
                 }
             }
         }
@@ -536,7 +583,40 @@ fn validate_pairing_request(request: &MobilePairingRequest) -> Result<(), Pairin
     {
         return Err(PairingError::InvalidRequest);
     }
+    if let Some(step_up) = &request.step_up_authorization {
+        if request.protocol_version != PAIRING_PROTOCOL_VERSION
+            || step_up.public_key == request.device_public_key
+            || super::assurance::validate_public_key(&step_up.public_key).is_err()
+        {
+            return Err(PairingError::InvalidRequest);
+        }
+    }
     Ok(())
+}
+
+fn verify_step_up_enrollment(
+    enrollment: &StepUpAuthorizationEnrollment,
+    transcript_hash: [u8; 32],
+) -> Result<(), PairingError> {
+    use p256::ecdsa::signature::Verifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+
+    let public_key = super::assurance::validate_public_key(&enrollment.public_key)
+        .map_err(|_| PairingError::InvalidRequest)?;
+    let verifying_key =
+        VerifyingKey::from_sec1_bytes(&public_key).map_err(|_| PairingError::InvalidRequest)?;
+    let signature = URL_SAFE_NO_PAD
+        .decode(&enrollment.enrollment_signature)
+        .map_err(|_| PairingError::InvalidRequest)?;
+    if URL_SAFE_NO_PAD.encode(&signature) != enrollment.enrollment_signature {
+        return Err(PairingError::InvalidRequest);
+    }
+    let signature = Signature::from_der(&signature).map_err(|_| PairingError::InvalidRequest)?;
+    let mut message = b"COVEN-STEPUP-ENROLL/1\0".to_vec();
+    message.extend_from_slice(&transcript_hash);
+    verifying_key
+        .verify(&message, &signature)
+        .map_err(|_| PairingError::InvalidRequest)
 }
 
 fn derive_pairing_phrase(transcript: &PairingTranscript) -> [String; 6] {
@@ -623,6 +703,8 @@ pub fn render_pairing_invitation(
 mod tests {
     use super::*;
     use chrono::Duration;
+    use p256::ecdsa::signature::Signer;
+    use p256::ecdsa::{Signature, SigningKey};
     use p256::elliptic_curve::sec1::ToEncodedPoint;
     use rand::random;
     use std::collections::HashSet;
@@ -678,6 +760,7 @@ mod tests {
                         minimum: 1,
                         maximum: 1,
                     },
+                    step_up_authorization: None,
                 },
             }
         }
@@ -686,6 +769,42 @@ mod tests {
             self.request.protocol_version = PAIRING_PROTOCOL_VERSION;
             self.request.supported_protocol.minimum = PAIRING_PROTOCOL_MINIMUM_VERSION;
             self.request.supported_protocol.maximum = PAIRING_PROTOCOL_VERSION;
+        }
+
+        fn enroll_step_up(&mut self, seed: u8, assurance_class: AssuranceClass) {
+            self.use_v2();
+            let signing_key = SigningKey::from_slice(&[seed; 32]).unwrap();
+            self.request.step_up_authorization = Some(StepUpAuthorizationEnrollment {
+                public_key: URL_SAFE_NO_PAD.encode(
+                    signing_key
+                        .verifying_key()
+                        .to_encoded_point(false)
+                        .as_bytes(),
+                ),
+                assurance_class,
+                enrollment_signature: String::new(),
+            });
+            let device_public_key = URL_SAFE_NO_PAD
+                .decode(&self.request.device_public_key)
+                .unwrap();
+            let transcript = PairingTranscript::for_request(
+                &self.request,
+                PairingOfferV2 {
+                    host_fingerprint: [3; 32],
+                    pairing_id: self.pairing_id,
+                    nonce: self.pairing_nonce,
+                    expires_at: self.now + Duration::minutes(5),
+                },
+                device_public_key,
+            );
+            let mut enrollment = b"COVEN-STEPUP-ENROLL/1\0".to_vec();
+            enrollment.extend_from_slice(&transcript.hash());
+            let signature: Signature = signing_key.sign(&enrollment);
+            self.request
+                .step_up_authorization
+                .as_mut()
+                .unwrap()
+                .enrollment_signature = URL_SAFE_NO_PAD.encode(signature.to_der().as_bytes());
         }
 
         fn enroll(&self) -> EnrolledPairing {
@@ -749,6 +868,7 @@ mod tests {
             device_public_key: vec![4; 65],
             device_name: "Synthetic phone".to_owned(),
             app_version: "1.0.0".to_owned(),
+            step_up_authorization: None,
         }
     }
 
@@ -801,6 +921,66 @@ mod tests {
         );
         let device = assert_complete(harness.confirm_host(&pending.phrase), false);
         assert_eq!(device.scopes, [MobileDeviceScope::MemoryRead]);
+    }
+
+    #[test]
+    fn pairing_v2_step_up_is_transcript_bound_and_persisted_after_confirmation() {
+        let mut baseline = PairingHarness::new();
+        baseline.use_v2();
+        let baseline_phrase = baseline.enroll().phrase;
+
+        let mut enrolled = PairingHarness::new();
+        enrolled.enroll_step_up(2, AssuranceClass::BiometricOnly);
+        let pending = enrolled.enroll();
+        assert_ne!(pending.phrase, baseline_phrase);
+        assert_eq!(
+            enrolled.confirm_host(&pending.phrase),
+            PairingProgress::Pending
+        );
+        let device = assert_complete(enrolled.confirm_device(&pending.phrase), false);
+        let key = enrolled
+            .manager
+            .registry
+            .authorization_key(device.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.assurance_class, AssuranceClass::BiometricOnly);
+        assert_eq!(key.key_epoch, 1);
+    }
+
+    #[test]
+    fn pairing_rejects_step_up_on_v1_same_key_and_invalid_possession_proof() {
+        let mut v1 = PairingHarness::new();
+        v1.enroll_step_up(2, AssuranceClass::UserVerification);
+        v1.request.protocol_version = MOBILE_PROTOCOL_VERSION;
+        assert_eq!(
+            v1.enroll_with_nonce(v1.pairing_nonce).unwrap_err(),
+            PairingError::InvalidRequest
+        );
+
+        let mut same_key = PairingHarness::new();
+        same_key.enroll_step_up(1, AssuranceClass::BiometricOnly);
+        assert_eq!(
+            same_key
+                .enroll_with_nonce(same_key.pairing_nonce)
+                .unwrap_err(),
+            PairingError::InvalidRequest
+        );
+
+        let mut invalid_signature = PairingHarness::new();
+        invalid_signature.enroll_step_up(2, AssuranceClass::DeviceCredential);
+        invalid_signature
+            .request
+            .step_up_authorization
+            .as_mut()
+            .unwrap()
+            .enrollment_signature = URL_SAFE_NO_PAD.encode([7; 64]);
+        assert_eq!(
+            invalid_signature
+                .enroll_with_nonce(invalid_signature.pairing_nonce)
+                .unwrap_err(),
+            PairingError::InvalidRequest
+        );
     }
 
     #[test]
@@ -962,6 +1142,7 @@ mod tests {
                 minimum: 1,
                 maximum: 1,
             },
+            step_up_authorization: None,
         };
         manager
             .begin_pairing_with_id(
@@ -1157,6 +1338,7 @@ mod tests {
             device_public_key: decode_hex(vector["devicePublicKeyX963Hex"].as_str().unwrap()),
             device_name: vector["deviceName"].as_str().unwrap().to_owned(),
             app_version: vector["appVersion"].as_str().unwrap().to_owned(),
+            step_up_authorization: None,
         };
         assert_eq!(
             encode_hex(&transcript.hash()),
