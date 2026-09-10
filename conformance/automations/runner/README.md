@@ -158,8 +158,9 @@ The native Coven target currently implements two structural suites.
 definition parser and capability policy. `run-terminal-monotonicity` executes
 the checked-in settlement and replay cases against the real Rust run ledger in
 an isolated in-memory store, proving that a later terminal observation cannot
-rewrite the first committed terminal state. It does not claim the complete
-occurrence or attempt state machines.
+rewrite the first committed terminal state. Each vector must use distinct first
+and replay statuses so a passing case exercises an actual conflict. It does not
+claim the complete occurrence or attempt state machines.
 
 The runner computes a JCS SHA-256 digest of returned evidence and discards the
 raw evidence after building the result envelope. Evidence is restricted to JSON
