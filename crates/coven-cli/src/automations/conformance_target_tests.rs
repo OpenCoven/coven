@@ -1,8 +1,8 @@
 use serde_json::{json, Value};
 
 use super::conformance_target::{
-    capability, evaluate, TargetSuiteStatus, CAPABILITY_NEGOTIATION_SUITE,
-    RUN_TERMINAL_MONOTONICITY_SUITE,
+    capability, evaluate, evaluate_run_terminal_monotonicity_case_counts, TargetSuiteStatus,
+    CAPABILITY_NEGOTIATION_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
 fn request_for(suite_id: &str, vector: Value) -> Value {
@@ -205,6 +205,64 @@ fn run_terminal_monotonicity_suite_fails_closed_on_an_expectation_mismatch() {
 
     assert_eq!(response.status, TargetSuiteStatus::Failed);
     assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn run_terminal_monotonicity_suite_rejects_non_conflicting_replay_vectors() {
+    assert_eq!(
+        evaluate(&request_for(
+            RUN_TERMINAL_MONOTONICITY_SUITE,
+            json!({
+                "schemaVersion": "coven.automations.run-terminal-monotonicity-vectors.v1",
+                "cases": [{
+                    "caseId": "duplicate-succeeded-replay",
+                    "firstStatus": "succeeded",
+                    "replayStatus": "succeeded",
+                    "expected": {
+                        "firstCommitted": true,
+                        "replayCommitted": false,
+                        "finalStatus": "succeeded"
+                    }
+                }]
+            }),
+        ))
+        .unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn run_terminal_monotonicity_suite_continues_executing_after_a_mismatch() {
+    let vector = json!({
+        "schemaVersion": "coven.automations.run-terminal-monotonicity-vectors.v1",
+        "cases": [
+            {
+                "caseId": "rewrite-wrongly-expected",
+                "firstStatus": "failed",
+                "replayStatus": "succeeded",
+                "expected": {
+                    "firstCommitted": true,
+                    "replayCommitted": true,
+                    "finalStatus": "succeeded"
+                }
+            },
+            {
+                "caseId": "cancelled-cannot-be-rewritten",
+                "firstStatus": "cancelled",
+                "replayStatus": "timed_out",
+                "expected": {
+                    "firstCommitted": true,
+                    "replayCommitted": false,
+                    "finalStatus": "cancelled"
+                }
+            }
+        ]
+    });
+
+    assert_eq!(
+        evaluate_run_terminal_monotonicity_case_counts(&vector).unwrap(),
+        (2, 1)
+    );
 }
 
 #[test]

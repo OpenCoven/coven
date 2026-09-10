@@ -188,6 +188,13 @@ fn evaluate_capability_negotiation(vector: &Value) -> Result<bool, &'static str>
 }
 
 fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static str> {
+    let (executed_cases, passed_cases) = evaluate_run_terminal_monotonicity_case_counts(vector)?;
+    Ok(passed_cases == executed_cases)
+}
+
+pub(super) fn evaluate_run_terminal_monotonicity_case_counts(
+    vector: &Value,
+) -> Result<(usize, usize), &'static str> {
     let vectors: RunTerminalVectorSet =
         serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
     if vectors.schema_version != RUN_TERMINAL_VECTOR_SCHEMA_VERSION
@@ -199,7 +206,10 @@ fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static s
 
     let mut case_ids = BTreeSet::new();
     for case in &vectors.cases {
-        if !valid_case_id(&case.case_id) || !case_ids.insert(&case.case_id) {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || case.first_status == case.replay_status
+        {
             return Err("conformance vector is invalid");
         }
     }
@@ -213,12 +223,11 @@ fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static s
         .map_err(|_| "conformance suite execution failed")?;
     let now = DateTime::<Utc>::from_timestamp(0, 0).ok_or("conformance suite execution failed")?;
 
+    let mut passed_cases = 0;
     for (index, case) in vectors.cases.iter().enumerate() {
-        if !run_terminal_case_matches(&conn, case, index, now)? {
-            return Ok(false);
-        }
+        passed_cases += usize::from(run_terminal_case_matches(&conn, case, index, now)?);
     }
-    Ok(true)
+    Ok((vectors.cases.len(), passed_cases))
 }
 
 fn run_terminal_case_matches(
