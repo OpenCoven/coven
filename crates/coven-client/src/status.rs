@@ -10,8 +10,16 @@ pub fn write_owner_only_windows_daemon_status(
     coven_home: &Path,
     contents: &[u8],
 ) -> Result<(), ClientError> {
+    write_owner_only_windows_daemon_status_with_staging(coven_home, coven_home, contents)
+}
+
+pub fn write_owner_only_windows_daemon_status_with_staging(
+    coven_home: &Path,
+    staging_directory: &Path,
+    contents: &[u8],
+) -> Result<(), ClientError> {
     let status_path = coven_home.join("daemon.json");
-    let temporary_path = temporary_status_path(&status_path);
+    let temporary_path = temporary_status_path(&staging_directory.join("daemon.json"));
     let write_result = (|| {
         let mut file = create_owner_only_status_file(&temporary_path)?;
         file.write_all(contents)
@@ -868,10 +876,10 @@ mod tests {
         trace_handle_security_matrix(&ordinary.0, "ordinary");
         trace_handle_security_matrix(&home.0, "restricted");
 
-        write_owner_only_windows_daemon_status(&home.0, b"first")
+        write_owner_only_windows_daemon_status_with_staging(&home.0, &ordinary.0, b"first")
             .expect("create secure status under inherited modify-only rights");
         assert_status_file_is_owner_only(&home.0.join("daemon.json"));
-        write_owner_only_windows_daemon_status(&home.0, b"second")
+        write_owner_only_windows_daemon_status_with_staging(&home.0, &ordinary.0, b"second")
             .expect("replace secure status under inherited modify-only rights");
         assert_status_file_is_owner_only(&home.0.join("daemon.json"));
         assert_eq!(
@@ -879,6 +887,7 @@ mod tests {
             b"second\n"
         );
         assert_eq!(std::fs::read_dir(&home.0).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&ordinary.0).unwrap().count(), 0);
     }
 
     #[test]

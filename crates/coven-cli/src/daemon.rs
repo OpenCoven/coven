@@ -2246,8 +2246,31 @@ fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
     let coven_home = status_path
         .parent()
         .context("daemon status path has no Coven home")?;
-    coven_client::write_owner_only_windows_daemon_status(coven_home, json.as_bytes())
-        .map_err(anyhow::Error::new)
+    let staging_directory = resolve_windows_status_staging_directory(
+        coven_home,
+        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
+    )?;
+    coven_client::write_owner_only_windows_daemon_status_with_staging(
+        coven_home,
+        &staging_directory,
+        json.as_bytes(),
+    )
+    .map_err(anyhow::Error::new)
+}
+
+#[cfg(windows)]
+fn resolve_windows_status_staging_directory(
+    coven_home: &Path,
+    configured: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(coven_home.to_path_buf());
+    };
+    let staging_directory = PathBuf::from(configured);
+    if !staging_directory.is_absolute() {
+        anyhow::bail!("COVEN_WINDOWS_STATUS_STAGING_DIR must be absolute");
+    }
+    Ok(staging_directory)
 }
 
 pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
@@ -5508,6 +5531,35 @@ mod tests {
 
     fn test_daemon_status_socket(coven_home: &Path) -> String {
         daemon_startup_status_socket(coven_home).expect("derive test daemon endpoint")
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_staging_defaults_to_coven_home() {
+        let coven_home = Path::new(r"C:\coven-home");
+        assert_eq!(
+            resolve_windows_status_staging_directory(coven_home, None).unwrap(),
+            coven_home
+        );
+        assert_eq!(
+            resolve_windows_status_staging_directory(coven_home, Some(std::ffi::OsString::new()))
+                .unwrap(),
+            coven_home
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_staging_requires_an_absolute_path() {
+        let error = resolve_windows_status_staging_directory(
+            Path::new(r"C:\coven-home"),
+            Some(std::ffi::OsString::from("relative")),
+        )
+        .expect_err("relative staging directory must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "COVEN_WINDOWS_STATUS_STAGING_DIR must be absolute"
+        );
     }
 
     fn write_test_daemon_status_text(coven_home: &Path, contents: &str) -> Result<()> {
