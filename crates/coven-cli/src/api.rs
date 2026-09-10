@@ -17576,8 +17576,66 @@ pub(crate) mod tests {
                 let mut definition = complete_definition.clone();
                 definition["outputTarget"] = json!("result.md");
                 definition["policies"] = json!({
-                    "retry": {"retryableClasses": [1]}
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": [1]
+                    }
                 });
+                definition
+            }),
+            ("malformed-rich-schedule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "version": 1,
+                    "schedule": {
+                        "rrule": "FREQ=YEARLY;BYHOUR=not-a-number",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("missing-rich-schedule-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "schedule": {
+                        "rrule": "FREQ=DAILY",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("fixed-rich-retry-missing-seconds", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "fixed"
+                    }
+                });
+                definition
+            }),
+            ("supported-rich-action-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["action"] = json!({
+                    "variant": "familiarInvocation",
+                    "prompt": "Run it."
+                });
+                definition
+            }),
+            ("unsupported-rich-condition-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["conditions"] = json!([{
+                    "variant": "branch",
+                    "branch": {"expression": "result.ok"}
+                }]);
                 definition
             }),
             ("malformed-rrule", {
@@ -17636,6 +17694,8 @@ pub(crate) mod tests {
                 "retry-class",
                 json!({
                     "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
                         "retryableClasses": ["runtime_unavailable", "ambiguous"]
                     }
                 }),

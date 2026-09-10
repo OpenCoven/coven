@@ -399,13 +399,23 @@ capability refusal. Rules:
 - Refusal is per-variant and additive: refusing one variant says nothing about others.
 - The current control route accepts the flat #816 `RoutineDefinition` JSON. Its
   negative-negotiation projection maps flat `outputTarget`, `misfire`,
-  `overlap`, retry `backoffPolicy`, and unsupported RRULE frequencies to stable
-  variant identifiers. It also recognizes richer nested `trigger`,
-  `conditions`, `action`, retryable-class, retention, and other policy hints
-  only to classify a refusal when the surrounding flat compatibility
-  definition is otherwise valid; a nested shape composed solely of supported
-  hints still proceeds to ordinary flat definition validation and is not
-  accepted as the normative rich object.
+  `overlap`, retry `backoffPolicy`/`retryableClasses`, exact timezones, and
+  unsupported RRULE frequencies to stable variant identifiers. Exact
+  trigger/action/condition and policy support is read from the packaged
+  capability profile; RRULE grammar and retryable failure-class vocabulary
+  remain owned by the Rust schema types. It also recognizes richer nested
+  `trigger`, `conditions`, `action`, retention, and other policy hints only to
+  classify a refusal when the surrounding flat compatibility definition is
+  otherwise valid.
+- A rich hint is removable only when every supplied subsection satisfies its
+  v1 structural requirements. The schedule and familiar-invocation unions
+  require `version: 1` plus their required fields; schedule RRULEs are parsed
+  after neutralizing only an unsupported `FREQ`, timezone syntax is validated
+  without resolving host `local`, retry conditionals are enforced, and
+  unsupported unions require a non-empty discriminator and `version: 1`.
+  Unknown members on an unsupported union remain opaque. A nested shape
+  composed solely of supported hints still proceeds to ordinary flat
+  definition validation and is not accepted as the normative rich object.
 - Malformed types, missing required fields, and malformed syntax within a
   supported RRULE frequency remain `VALIDATION_FAILED`. Unsupported
   identifiers are bounded to identifier-like ASCII components before they are
@@ -414,7 +424,11 @@ capability refusal. Rules:
   preflight. Their rejections are stored in the existing adoption ledger, so
   exact retries replay the same rejection and changed requests return
   `ADOPTION_REPLAY_MISMATCH`; rejected commands mutate no definition, revision,
-  occurrence, run, or event. Legacy create/update/import behavior is unchanged.
+  occurrence, run, or event. Adoption canonicalization serializes the parsed
+  unresolved compatibility definition, so `timezone: local` fingerprints do
+  not depend on the daemon host. Create/revise resolve `local` only immediately
+  before persistence; resolution failures become durable `VALIDATION_FAILED`
+  outcomes. Legacy create/update/import behavior is unchanged.
 - Unknown values inside a supported variant are still unknown variants.
 - The negative path is also a schema property: v1 unions are closed, so an unknown variant fails schema validation before negotiation is even needed; producers that relax schema validation in future profiles still refuse at the capability layer.
 

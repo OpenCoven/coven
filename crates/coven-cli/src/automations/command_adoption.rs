@@ -958,7 +958,14 @@ fn apply_create(
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
     let definition = match negotiate_definition(definition_value) {
-        Ok(DefinitionNegotiation::Supported(definition)) => *definition,
+        Ok(DefinitionNegotiation::Supported(definition)) => {
+            match definition.resolve_timezone_for_persistence() {
+                Ok(definition) => definition,
+                Err(error) => {
+                    return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+                }
+            }
+        }
         Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
             return Ok(capability_unsupported(unsupported));
         }
@@ -1018,7 +1025,14 @@ fn apply_revise(
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
     let definition = match negotiate_definition(definition_value) {
-        Ok(DefinitionNegotiation::Supported(definition)) => *definition,
+        Ok(DefinitionNegotiation::Supported(definition)) => {
+            match definition.resolve_timezone_for_persistence() {
+                Ok(definition) => definition,
+                Err(error) => {
+                    return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+                }
+            }
+        }
         Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
             return Ok(capability_unsupported(unsupported));
         }
@@ -1437,6 +1451,10 @@ mod tests {
         .unwrap()
     }
 
+    fn definition_command_fingerprint(command: &DefinitionCommand) -> String {
+        sha256_hex(&canonicalize(&canonical_command(command).unwrap()).unwrap())
+    }
+
     #[test]
     fn unsupported_create_is_durably_rejected_without_mutation_or_event() {
         let (_temp, conn) = temp_store();
@@ -1573,7 +1591,11 @@ mod tests {
             definition("malformed-rich-policy", "Malformed rich policy");
         malformed_rich_policy["outputTarget"] = json!("result.md");
         malformed_rich_policy["policies"] = json!({
-            "retry": {"retryableClasses": "runtime_unavailable"}
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": "runtime_unavailable"
+            }
         });
 
         let mut malformed_rrule = definition("malformed-rrule", "Malformed RRULE");
@@ -1626,6 +1648,8 @@ mod tests {
         let mut retry = definition("unsupported-retry-class", "Unsupported retry class");
         retry["policies"] = json!({
             "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
                 "retryableClasses": ["transient_dispatch", "ambiguous"]
             }
         });
@@ -1930,6 +1954,234 @@ mod tests {
         );
         assert_eq!(list_definitions(&conn).unwrap().len(), 1);
         assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_command_fingerprint_is_stable_across_timezone_environments() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_COMMAND_FINGERPRINT_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_command_fingerprint_is_stable_across_timezone_environments";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let command = DefinitionCommand::Create {
+                definition: definition("stable-local-fingerprint", "Stable local fingerprint"),
+            };
+            let canonical = canonical_command(&command).unwrap();
+            assert_eq!(canonical["definition"]["value"]["timezone"], "local");
+            println!("fingerprint={}", definition_command_fingerprint(&command));
+            return;
+        }
+
+        let fingerprint_for = |timezone: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TZ", timezone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child fingerprint assertion failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("fingerprint="))
+                .expect("child emitted fingerprint")
+                .to_owned()
+        };
+
+        assert_eq!(
+            fingerprint_for("Pacific/Kiritimati"),
+            fingerprint_for("America/Chicago")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_failure_is_durably_rejected_and_replayed() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_RESOLUTION_REJECTION_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_resolution_failure_is_durably_rejected_and_replayed";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let command = DefinitionCommand::Create {
+                definition: definition("local-resolution-failure", "Local resolution failure"),
+            };
+            unsafe {
+                std::env::set_var("TZ", ":/tmp/coven-invalid-zoneinfo");
+            }
+            let first = execute_definition_command(
+                &conn,
+                "adopt:create:local-resolution-failure:0001",
+                command.clone(),
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(
+                first.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed)
+            );
+            assert!(get_definition(&conn, "local-resolution-failure")
+                .unwrap()
+                .is_none());
+            assert_eq!(definition_event_count(&conn, "local-resolution-failure"), 0);
+            assert_eq!(adoption_count(&conn), 1);
+
+            unsafe {
+                std::env::set_var("TZ", "Pacific/Kiritimati");
+            }
+            let replay = execute_definition_command(
+                &conn,
+                "adopt:create:local-resolution-failure:0001",
+                command,
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(replay.error, first.error);
+            assert!(get_definition(&conn, "local-resolution-failure")
+                .unwrap()
+                .is_none());
+            assert_eq!(definition_event_count(&conn, "local-resolution-failure"), 0);
+            assert_eq!(adoption_count(&conn), 1);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revise_local_resolution_failure_is_durable_without_mutation_or_event() {
+        const CHILD_ENV: &str = "COVEN_TEST_REVISE_LOCAL_RESOLUTION_REJECTION_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::revise_local_resolution_failure_is_durable_without_mutation_or_event";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let mut original = definition("local-revise-failure", "Original");
+            original["timezone"] = json!("utc");
+            execute_definition_command(
+                &conn,
+                "adopt:create:local-revise-failure:0001",
+                DefinitionCommand::Create {
+                    definition: original,
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            let command = DefinitionCommand::Revise {
+                definition: definition("local-revise-failure", "Must not land"),
+                expected_revision: Some(1),
+            };
+            unsafe {
+                std::env::set_var("TZ", ":/tmp/coven-invalid-zoneinfo");
+            }
+            let first = execute_definition_command(
+                &conn,
+                "adopt:revise:local-resolution-failure:0002",
+                command.clone(),
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(
+                first.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed)
+            );
+            let stored = get_definition(&conn, "local-revise-failure")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.revision, 1);
+            assert_eq!(stored.name, "Original");
+            assert_eq!(definition_event_count(&conn, "local-revise-failure"), 1);
+
+            unsafe {
+                std::env::set_var("TZ", "America/Chicago");
+            }
+            let replay = execute_definition_command(
+                &conn,
+                "adopt:revise:local-resolution-failure:0002",
+                command,
+                "2026-09-03T09:02:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(replay.error, first.error);
+            let stored = get_definition(&conn, "local-revise-failure")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.revision, 1);
+            assert_eq!(stored.name, "Original");
+            assert_eq!(definition_event_count(&conn, "local-revise-failure"), 1);
+            assert_eq!(adoption_count(&conn), 2);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_compatibility_input_persists_the_exact_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_PERSISTENCE_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_compatibility_input_persists_the_exact_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let response = execute_definition_command(
+                &conn,
+                "adopt:create:exact-local-normalized:0001",
+                DefinitionCommand::Create {
+                    definition: definition("exact-local-normalized", "Exact local normalized"),
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(response.outcome, DefinitionCommandOutcome::Committed);
+            let record = get_definition(&conn, "exact-local-normalized")
+                .unwrap()
+                .unwrap();
+            let stored: Value = serde_json::from_str(&record.definition_json).unwrap();
+            assert_eq!(stored["timezone"], "Pacific/Kiritimati");
+            assert_eq!(
+                response.result.unwrap()["routine"]["timezone"],
+                "Pacific/Kiritimati"
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Pacific/Kiritimati")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
     }
 
     #[test]
