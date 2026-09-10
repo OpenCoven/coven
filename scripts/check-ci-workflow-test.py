@@ -106,6 +106,9 @@ class CheckCiWorkflowTests(unittest.TestCase):
             "\n  rust-test-macos:\n", 1
         )[0]
         self.assertIn("\n    timeout-minutes: 30\n", windows)
+        for step in ["Exercise isolated Threads clock feature", "Exercise real-daemon Threads journeys"]:
+            self.assertIn(f"- name: {step}\n        if: ${{{{ !cancelled() }}}}", windows)
+        self.assertNotIn("continue-on-error: true", windows)
 
     def test_native_link_dependency_installs_use_scoped_apt_helper(self) -> None:
         release_stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
