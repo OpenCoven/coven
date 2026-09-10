@@ -34,6 +34,7 @@
     "expected-revision-conflict",
     "duplicate-and-out-of-order-event-replay",
     "typed-transport-domain-error-mapping",
+    "timezone-dst-and-clock-replanning",
     "golden-vectors-external-runners",
     "packed-artifact-canaries"
   ],

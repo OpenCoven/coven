@@ -1,0 +1,75 @@
+{
+  "profile": "coven.automations.authority.v1",
+  "artifacts": [
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "path": "schemas/familiar-embodiment-binding.schema.json",
+      "sha256": "9cafde21a460f688add8e796651e6af98cec26361c839f29400cb21f65afafdf",
+      "size": 10999
+    },
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "path": "tests/conformance/embodiment-bindings/manifest.json",
+      "sha256": "14aea1848afa808b64688f3b5379a37a26253f0d846a2cd655d9651e32348a80",
+      "size": 10844
+    },
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "path": "tests/conformance/embodiment-bindings/positive/09-scheduled-automation-run.json",
+      "sha256": "5980fc5b312a3e1dd1d90fa7967166a57bc941101aa88e58683223180ad5ed60",
+      "size": 4544
+    },
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "path": "tests/conformance/embodiment-bindings/negative/02-stale-cached-revision.json",
+      "sha256": "996ca1e225993c11e4cee190dfe024d54b7df70c970d5482e4356059b64548a9",
+      "size": 4572
+    },
+    {
+      "repository": "OpenCoven/familiar-contract",
+      "commit": "13d150a32a817da19bb4e5053f2205b15db0bb0a",
+      "path": "tests/conformance/embodiment-bindings/negative/14-unverifiable-authentication.json",
+      "sha256": "6c995e8ac33b03c20205f16ae5636b4e29e4b212d9bc75fcf23a8666eec072c0",
+      "size": 4454
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "path": "profiles/automation-authority/v1/manifest.json",
+      "sha256": "f58778c2661549e7ca9e69003906c3c116c1dda7f5a4487f6594279706fbf03a",
+      "size": 42629
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "path": "profiles/automation-authority/v1/schemas/decision.schema.json",
+      "sha256": "8602dc0156becd6f0fdd85fcafe81a968c4e38ce4b8123f27813aed6df2e7369",
+      "size": 7138
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "path": "profiles/automation-authority/v1/vectors/01-r0-read-permit.json",
+      "sha256": "e05338aa37d97944445fb3ec24fa99c99ba64e8cc23663eea44a6c34b188101c",
+      "size": 7004
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "path": "profiles/automation-authority/v1/vectors/14-runtime-capability-downgrade.json",
+      "sha256": "db2214f672dfc01a179e881d637df4098442f494ad21403353160e1f743e1994",
+      "size": 9308
+    },
+    {
+      "repository": "OpenCoven/coven-threads",
+      "commit": "c3bd46bcadb6396db8436c47411a4d0eac17192b",
+      "path": "profiles/automation-authority/v1/vectors/15-stale-fence-before-dispatch.json",
+      "sha256": "9d4974407abab985ec91bdc9ea52d0c25497a75fcc07ceb011a46c47ca72de65",
+      "size": 9309
+    }
+  ]
+}

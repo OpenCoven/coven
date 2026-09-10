@@ -7,13 +7,21 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, SecondsFormat, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_runs (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
+        automation_revision INTEGER NOT NULL DEFAULT 1 CHECK (automation_revision >= 1),
+        definition_digest TEXT,
+        definition_json TEXT,
         occurrence_id TEXT,
+        authority_profile TEXT CHECK (
+            authority_profile IS NULL
+            OR authority_profile = 'coven.automations.authority.v1'
+        ),
+        receipt_id TEXT,
         session_id TEXT,
         familiar_id TEXT,
         runtime TEXT,
@@ -31,6 +39,99 @@ pub const AUTOMATION_RUNS_SCHEMA_SQL: &str = "
         ON automation_runs(automation_id, started_at DESC);
 ";
 
+pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
+    CREATE TABLE IF NOT EXISTS automation_attempts (
+        id TEXT PRIMARY KEY NOT NULL,
+        run_id TEXT NOT NULL,
+        occurrence_id TEXT NOT NULL,
+        attempt_number INTEGER NOT NULL CHECK (attempt_number BETWEEN 1 AND 10),
+        adoption_key TEXT NOT NULL UNIQUE,
+        occurrence_fence_generation INTEGER NOT NULL
+            CHECK (occurrence_fence_generation >= 1),
+        dispatch_generation INTEGER NOT NULL DEFAULT 0
+            CHECK (dispatch_generation >= 0),
+        state TEXT NOT NULL CHECK (
+            state IN (
+                'adopted', 'dispatching', 'started', 'observing',
+                'succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous'
+            )
+        ),
+        failure_class TEXT CHECK (
+            failure_class IS NULL OR failure_class IN (
+                'transient_dispatch', 'lease_expired', 'runtime_unavailable',
+                'launch_refused', 'runtime_error', 'timeout', 'cancelled',
+                'ambiguous_evidence', 'runtime_authority_unsupported'
+            )
+        ),
+        prior_attempt_number INTEGER CHECK (
+            prior_attempt_number IS NULL OR prior_attempt_number >= 1
+        ),
+        prior_disposition TEXT CHECK (
+            prior_disposition IS NULL OR prior_disposition IN (
+                'failed', 'timed_out', 'cancelled', 'ambiguous'
+            )
+        ),
+        retry_classification TEXT NOT NULL CHECK (
+            retry_classification IN (
+                'initial', 'automatic_retry', 'operator_retry', 'operator_recovery'
+            )
+        ),
+        authority_extension_json TEXT,
+        not_before TEXT NOT NULL,
+        session_id TEXT UNIQUE,
+        state_reason TEXT,
+        opened_at TEXT NOT NULL,
+        settled_at TEXT,
+        FOREIGN KEY (run_id) REFERENCES automation_runs(id) ON DELETE CASCADE,
+        FOREIGN KEY (occurrence_id) REFERENCES automation_occurrences(id) ON DELETE RESTRICT,
+        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE RESTRICT,
+        UNIQUE (run_id, attempt_number),
+        CHECK (
+            (attempt_number = 1
+             AND prior_attempt_number IS NULL
+             AND prior_disposition IS NULL)
+            OR
+            (attempt_number > 1
+             AND prior_attempt_number = attempt_number - 1
+             AND prior_disposition IS NOT NULL)
+        )
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_automation_attempts_dispatch
+        ON automation_attempts(state, not_before);
+
+    CREATE TRIGGER IF NOT EXISTS automation_attempts_terminal_immutable
+    BEFORE UPDATE ON automation_attempts
+    WHEN OLD.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal automation attempt is immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_attempts_delete_terminal_refused
+    BEFORE DELETE ON automation_attempts
+    WHEN OLD.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')
+    BEGIN
+        SELECT RAISE(ABORT, 'terminal automation attempt cannot be deleted');
+    END;
+
+    CREATE TABLE IF NOT EXISTS automation_retry_state (
+        automation_id TEXT PRIMARY KEY NOT NULL,
+        consecutive_exhaustions INTEGER NOT NULL DEFAULT 0
+            CHECK (consecutive_exhaustions >= 0),
+        quarantined_at TEXT,
+        failure_class TEXT,
+        reason TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (automation_id)
+            REFERENCES automation_definitions(id) ON DELETE CASCADE,
+        CHECK (
+            (quarantined_at IS NULL AND failure_class IS NULL AND reason IS NULL)
+            OR
+            (quarantined_at IS NOT NULL AND failure_class IS NOT NULL AND reason IS NOT NULL)
+        )
+    );
+";
+
 #[allow(dead_code)]
 const LOG_ENTRY_MAX_CHARS: usize = 64 * 1024;
 
@@ -43,7 +144,10 @@ fn iso(instant: DateTime<Utc>) -> String {
 pub struct RunRecord {
     pub id: String,
     pub automation_id: String,
+    pub automation_revision: u64,
+    pub definition_digest: Option<String>,
     pub occurrence_id: Option<String>,
+    pub receipt_id: Option<String>,
     pub session_id: Option<String>,
     pub familiar_id: Option<String>,
     pub runtime: String,
@@ -56,10 +160,32 @@ pub struct RunRecord {
     pub finished_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub id: String,
+    pub run_id: String,
+    pub occurrence_id: String,
+    pub attempt_number: i64,
+    pub adoption_key: String,
+    pub occurrence_fence_generation: i64,
+    pub dispatch_generation: i64,
+    pub state: String,
+    pub failure_class: Option<String>,
+    pub prior_attempt_number: Option<i64>,
+    pub prior_disposition: Option<String>,
+    pub retry_classification: String,
+    pub not_before: String,
+    pub session_id: Option<String>,
+    pub state_reason: Option<String>,
+    pub opened_at: String,
+    pub settled_at: Option<String>,
+}
+
 #[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
 pub struct RunStart<'a> {
     pub automation_id: &'a str,
     pub occurrence_id: Option<&'a str>,
+    pub authority_profile: Option<&'a str>,
     pub session_id: Option<&'a str>,
     pub familiar_id: Option<&'a str>,
     pub runtime: &'a str,
@@ -72,15 +198,23 @@ pub fn record_run_start(
     start: RunStart<'_>,
     now: DateTime<Utc>,
 ) -> Result<()> {
+    let (automation_revision, definition_digest, definition_json) =
+        definition_pin(conn, start.automation_id, start.occurrence_id)?;
     conn.execute(
         "INSERT INTO automation_runs
-            (id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-             status, started_at, timeout_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'running', ?7, ?8)",
+            (id, automation_id, automation_revision, definition_digest, definition_json,
+             occurrence_id, authority_profile, session_id, familiar_id, runtime, status,
+             started_at, timeout_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'running', ?11, ?12)",
         params![
             run_id,
             start.automation_id,
+            i64::try_from(automation_revision)
+                .context("automation revision exceeds SQLite range")?,
+            definition_digest,
+            definition_json,
             start.occurrence_id,
+            start.authority_profile,
             start.session_id,
             start.familiar_id,
             start.runtime,
@@ -90,6 +224,81 @@ pub fn record_run_start(
     )
     .context("failed to record run start")?;
     Ok(())
+}
+
+fn definition_pin(
+    conn: &Connection,
+    automation_id: &str,
+    occurrence_id: Option<&str>,
+) -> Result<(u64, Option<String>, Option<String>)> {
+    if let Some(occurrence_id) = occurrence_id {
+        let occurrence = conn
+            .query_row(
+                "SELECT automation_id, automation_revision, definition_digest
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed to read occurrence definition pin")?;
+        let Some((occurrence_automation_id, revision, digest)) = occurrence else {
+            anyhow::bail!("automation occurrence `{occurrence_id}` does not exist");
+        };
+        if occurrence_automation_id != automation_id {
+            anyhow::bail!(
+                "automation occurrence `{occurrence_id}` does not belong to automation `{automation_id}`"
+            );
+        }
+        let definition_json = conn
+            .query_row(
+                "SELECT definition_json
+                 FROM automation_definitions
+                 WHERE id = ?1
+                   AND revision = ?2
+                   AND definition_digest IS ?3",
+                params![automation_id, revision, digest],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("failed to read pinned automation definition")?;
+        return Ok((
+            u64::try_from(revision).context("occurrence revision is negative")?,
+            digest,
+            definition_json,
+        ));
+    }
+
+    let current = conn
+        .query_row(
+            "SELECT revision, definition_digest, definition_json
+             FROM automation_definitions
+             WHERE id = ?1 AND tombstoned_at IS NULL",
+            [automation_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to read automation definition pin")?;
+    match current {
+        Some((revision, digest, definition_json)) => Ok((
+            u64::try_from(revision).context("automation definition revision is negative")?,
+            digest,
+            Some(definition_json),
+        )),
+        None => Ok((1, None, None)),
+    }
 }
 
 #[allow(dead_code)] // consumed by the part-4 dispatch path; tests cover it today
@@ -115,9 +324,9 @@ pub fn record_run_finish(
         log_json,
         output_commit,
     } = finish;
-    if status != "succeeded" && status != "failed" && status != "cancelled" {
+    if !matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
         return Err(anyhow::anyhow!(
-            "run status must be succeeded, failed, or cancelled"
+            "run status must be succeeded, failed, cancelled, or timed_out"
         ));
     }
     let bounded_log = log_json
@@ -160,8 +369,9 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     let bounded = limit.clamp(1, 100);
     let mut statement = conn
         .prepare(
-            "SELECT id, automation_id, occurrence_id, session_id, familiar_id, runtime,
-                    status, exit_code, log_json, output_commit, started_at, timeout_at, finished_at
+            "SELECT id, automation_id, automation_revision, definition_digest, occurrence_id,
+                    receipt_id, session_id, familiar_id, runtime, status, exit_code, log_json,
+                    output_commit, started_at, timeout_at, finished_at
              FROM automation_runs
              WHERE automation_id = ?1
              ORDER BY started_at DESC
@@ -173,17 +383,26 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
             Ok(RunRecord {
                 id: row.get(0)?,
                 automation_id: row.get(1)?,
-                occurrence_id: row.get(2)?,
-                session_id: row.get(3)?,
-                familiar_id: row.get(4)?,
-                runtime: row.get(5)?,
-                status: row.get(6)?,
-                exit_code: row.get(7)?,
-                log_json: row.get(8)?,
-                output_commit: row.get(9)?,
-                started_at: row.get(10)?,
-                timeout_at: row.get(11)?,
-                finished_at: row.get(12)?,
+                automation_revision: u64::try_from(row.get::<_, i64>(2)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                definition_digest: row.get(3)?,
+                occurrence_id: row.get(4)?,
+                receipt_id: row.get(5)?,
+                session_id: row.get(6)?,
+                familiar_id: row.get(7)?,
+                runtime: row.get(8)?,
+                status: row.get(9)?,
+                exit_code: row.get(10)?,
+                log_json: row.get(11)?,
+                output_commit: row.get(12)?,
+                started_at: row.get(13)?,
+                timeout_at: row.get(14)?,
+                finished_at: row.get(15)?,
             })
         })
         .context("failed to list runs")?;
@@ -192,32 +411,410 @@ pub fn list_runs(conn: &Connection, automation_id: &str, limit: i64) -> Result<V
     for row in rows {
         records.push(row.context("failed to read run row")?);
     }
-
     Ok(records)
 }
 
+pub fn is_retry_quarantined(conn: &Connection, automation_id: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM automation_retry_state
+            WHERE automation_id = ?1 AND quarantined_at IS NOT NULL
+        )",
+        [automation_id],
+        |row| row.get(0),
+    )
+    .context("failed to inspect automation retry quarantine")
+}
+
+#[cfg(test)]
+pub fn list_attempts(conn: &Connection, run_id: &str) -> Result<Vec<AttemptRecord>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, not_before, session_id, state_reason,
+                    opened_at, settled_at
+             FROM automation_attempts
+             WHERE run_id = ?1
+             ORDER BY attempt_number ASC",
+        )
+        .context("failed to prepare automation attempt list")?;
+    let rows = statement
+        .query_map([run_id], attempt_record_from_row)
+        .context("failed to list automation attempts")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation attempt")
+}
+
+pub fn list_attempts_for_automation(
+    conn: &Connection,
+    automation_id: &str,
+    run_limit: i64,
+) -> Result<Vec<AttemptRecord>> {
+    let bounded = run_limit.clamp(1, 100);
+    let mut statement = conn
+        .prepare(
+            "SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, not_before, session_id, state_reason,
+                    opened_at, settled_at
+             FROM automation_attempts
+             WHERE run_id IN (
+                 SELECT id
+                 FROM automation_runs
+                 WHERE automation_id = ?1
+                 ORDER BY started_at DESC
+                 LIMIT ?2
+             )
+             ORDER BY run_id, attempt_number ASC",
+        )
+        .context("failed to prepare automation attempt batch list")?;
+    let rows = statement
+        .query_map(params![automation_id, bounded], attempt_record_from_row)
+        .context("failed to list automation attempt batch")?;
+    rows.collect::<std::result::Result<Vec<_>, _>>()
+        .context("failed to read automation attempt batch")
+}
+
+fn attempt_record_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRecord> {
+    Ok(AttemptRecord {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        occurrence_id: row.get(2)?,
+        attempt_number: row.get(3)?,
+        adoption_key: row.get(4)?,
+        occurrence_fence_generation: row.get(5)?,
+        dispatch_generation: row.get(6)?,
+        state: row.get(7)?,
+        failure_class: row.get(8)?,
+        prior_attempt_number: row.get(9)?,
+        prior_disposition: row.get(10)?,
+        retry_classification: row.get(11)?,
+        not_before: row.get(12)?,
+        session_id: row.get(13)?,
+        state_reason: row.get(14)?,
+        opened_at: row.get(15)?,
+        settled_at: row.get(16)?,
+    })
+}
+
+pub fn record_retry_exhaustion(
+    conn: &Connection,
+    automation_id: &str,
+    failure_class: &str,
+    reason: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO automation_retry_state
+            (automation_id, consecutive_exhaustions, quarantined_at,
+             failure_class, reason, updated_at)
+         VALUES (?1, 1, ?2, ?3, ?4, ?2)
+         ON CONFLICT(automation_id) DO UPDATE SET
+             consecutive_exhaustions = automation_retry_state.consecutive_exhaustions + 1,
+             quarantined_at = excluded.quarantined_at,
+             failure_class = excluded.failure_class,
+             reason = excluded.reason,
+             updated_at = excluded.updated_at",
+        params![automation_id, iso(now), failure_class, reason],
+    )
+    .context("failed to quarantine exhausted automation")?;
+    Ok(())
+}
+
+pub fn clear_retry_quarantine(
+    conn: &Connection,
+    automation_id: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let changed = conn
+        .execute(
+            "UPDATE automation_retry_state
+             SET consecutive_exhaustions = 0,
+                 quarantined_at = NULL,
+                 failure_class = NULL,
+                 reason = NULL,
+                 updated_at = ?2
+             WHERE automation_id = ?1 AND quarantined_at IS NOT NULL",
+            params![automation_id, iso(now)],
+        )
+        .context("failed to clear automation retry quarantine")?;
+    Ok(changed == 1)
+}
+
 pub fn ensure_timeout_column(conn: &Connection) -> Result<()> {
-    let present = {
+    let columns = {
         let mut statement = conn
             .prepare("PRAGMA table_info(automation_runs)")
             .context("failed to inspect automation_runs columns")?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))
             .context("failed to query automation_runs columns")?;
-        let mut present = false;
+        let mut names = Vec::new();
         for column in columns {
-            if column.context("failed to read automation_runs column")? == "timeout_at" {
-                present = true;
-                break;
-            }
+            names.push(column.context("failed to read automation_runs column")?);
         }
-        present
+        names
     };
-    if !present {
+    if !columns.iter().any(|column| column == "timeout_at") {
         conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN timeout_at TEXT")
             .context("failed to add automation_runs.timeout_at")?;
     }
+    if !columns.iter().any(|column| column == "definition_json") {
+        conn.execute_batch("ALTER TABLE automation_runs ADD COLUMN definition_json TEXT")
+            .context("failed to add automation_runs.definition_json")?;
+    }
     Ok(())
+}
+
+pub fn ensure_authority_columns(conn: &Connection) -> Result<()> {
+    let run_columns = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .context("failed to inspect automation_runs authority columns")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to query automation_runs authority columns")?;
+        let mut names = Vec::new();
+        for column in columns {
+            names.push(column.context("failed to read automation_runs authority column")?);
+        }
+        names
+    };
+    if !run_columns
+        .iter()
+        .any(|column| column == "authority_profile")
+    {
+        conn.execute_batch(
+            "ALTER TABLE automation_runs
+             ADD COLUMN authority_profile TEXT CHECK (
+                 authority_profile IS NULL
+                 OR authority_profile = 'coven.automations.authority.v1'
+             )",
+        )
+        .context("failed to add automation_runs.authority_profile")?;
+    }
+
+    let attempt_columns = {
+        let mut statement = conn
+            .prepare("PRAGMA table_info(automation_attempts)")
+            .context("failed to inspect automation_attempts authority columns")?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("failed to query automation_attempts authority columns")?;
+        let mut names = Vec::new();
+        for column in columns {
+            names.push(column.context("failed to read automation_attempts authority column")?);
+        }
+        names
+    };
+    if !attempt_columns
+        .iter()
+        .any(|column| column == "authority_extension_json")
+    {
+        conn.execute_batch(
+            "ALTER TABLE automation_attempts
+             ADD COLUMN authority_extension_json TEXT",
+        )
+        .context("failed to add automation_attempts.authority_extension_json")?;
+    }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS automation_run_authority_profile_immutable
+         BEFORE UPDATE OF authority_profile ON automation_runs
+         WHEN OLD.authority_profile IS NOT NEW.authority_profile
+         BEGIN
+             SELECT RAISE(ABORT, 'automation run authority profile is immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS automation_attempt_authority_immutable
+         BEFORE UPDATE OF authority_extension_json ON automation_attempts
+         WHEN OLD.authority_extension_json IS NOT NULL
+              AND OLD.authority_extension_json IS NOT NEW.authority_extension_json
+         BEGIN
+             SELECT RAISE(ABORT, 'automation attempt authority is immutable');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS automation_attempt_authority_delete_refused
+         BEFORE DELETE ON automation_attempts
+         WHEN OLD.authority_extension_json IS NOT NULL
+         BEGIN
+             SELECT RAISE(ABORT, 'authority-bound automation attempt cannot be deleted');
+         END;",
+    )
+    .context("failed to install automation authority immutability guards")?;
+    Ok(())
+}
+
+pub(crate) fn ensure_runtime_authority_unsupported_failure_class(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'automation_attempts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect automation_attempts schema")?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if !table_sql.contains("failure_class") || table_sql.contains("'runtime_authority_unsupported'")
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "automation attempt failure-class migration requires autocommit"
+    );
+    let attempt_columns = conn
+        .prepare("PRAGMA table_info(automation_attempts)")
+        .context("failed to inspect automation_attempt columns before failure-class migration")?
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query automation_attempt columns before failure-class migration")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_attempt columns before failure-class migration")?;
+    let authority_extension_source = if attempt_columns
+        .iter()
+        .any(|column| column == "authority_extension_json")
+    {
+        "authority_extension_json"
+    } else {
+        "NULL"
+    };
+    let schema_objects = conn
+        .prepare(
+            "SELECT type, name, sql
+             FROM sqlite_master
+             WHERE tbl_name = 'automation_attempts'
+               AND type IN ('index', 'trigger')
+               AND sql IS NOT NULL
+             ORDER BY type, name",
+        )
+        .context("failed to inspect automation_attempt indexes and triggers")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .context("failed to query automation_attempt indexes and triggers")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_attempt indexes and triggers")?;
+    let foreign_keys_enabled: bool = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .context("failed to inspect SQLite foreign-key mode")?;
+    let legacy_alter_table_enabled: bool = conn
+        .query_row("PRAGMA legacy_alter_table", [], |row| row.get(0))
+        .context("failed to inspect SQLite alter-table mode")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;",
+        )
+        .context("failed to begin automation attempt failure-class migration")?;
+        let current_table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'automation_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to recheck automation_attempts schema during migration")?;
+        if current_table_sql.contains("'runtime_authority_unsupported'") {
+            conn.execute_batch("COMMIT")
+                .context("failed to finish concurrent automation attempt migration")?;
+            return Ok(());
+        }
+        for (object_type, name, _) in &schema_objects {
+            let quoted_name = name.replace('"', "\"\"");
+            conn.execute_batch(&format!("DROP {object_type} IF EXISTS \"{quoted_name}\";"))
+                .with_context(|| {
+                    format!("failed to drop automation_attempt schema object {name} for migration")
+                })?;
+        }
+        conn.execute_batch(
+            "ALTER TABLE automation_attempts
+                 RENAME TO automation_attempts_legacy_failure_class;",
+        )
+        .context("failed to rename legacy automation_attempts table")?;
+        conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
+            .context("failed to recreate automation_attempts schema")?;
+        conn.execute_batch(&format!(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                failure_class, prior_attempt_number, prior_disposition,
+                retry_classification, authority_extension_json, not_before,
+                session_id, state_reason, opened_at, settled_at
+             )
+             SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, {authority_extension_source}, not_before,
+                    session_id, state_reason, opened_at, settled_at
+             FROM automation_attempts_legacy_failure_class;
+             DROP TABLE automation_attempts_legacy_failure_class;"
+        ))
+        .context("failed to copy automation attempts into the widened schema")?;
+        for (_, name, sql) in &schema_objects {
+            if matches!(
+                name.as_str(),
+                "idx_automation_attempts_dispatch"
+                    | "automation_attempts_terminal_immutable"
+                    | "automation_attempts_delete_terminal_refused"
+            ) {
+                continue;
+            }
+            conn.execute_batch(sql).with_context(|| {
+                format!("failed to restore automation_attempt schema object {name}")
+            })?;
+        }
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .context("failed to verify foreign keys after automation attempt migration")?;
+        anyhow::ensure!(
+            foreign_key_errors == 0,
+            "automation attempt failure-class migration produced {foreign_key_errors} foreign-key violation(s)"
+        );
+        conn.execute_batch("COMMIT")
+            .context("failed to commit automation attempt failure-class migration")
+    })();
+    let mut failure = migration.err();
+    if failure.is_some() && !conn.is_autocommit() {
+        if let Err(rollback_error) = conn.execute_batch("ROLLBACK;") {
+            let migration_error = failure.take().expect("migration failure is present");
+            failure = Some(migration_error.context(format!(
+                "failed to roll back automation attempt failure-class migration: {rollback_error}"
+            )));
+        }
+    }
+    if !legacy_alter_table_enabled {
+        if let Err(restore_error) = conn.execute_batch("PRAGMA legacy_alter_table = OFF;") {
+            failure = Some(match failure.take() {
+                Some(migration_error) => migration_error.context(format!(
+                    "also failed to restore SQLite alter-table mode: {restore_error}"
+                )),
+                None => restore_error.into(),
+            });
+        }
+    }
+    if foreign_keys_enabled {
+        if let Err(restore_error) = conn.execute_batch("PRAGMA foreign_keys = ON;") {
+            failure = Some(match failure.take() {
+                Some(migration_error) => migration_error.context(format!(
+                    "also failed to restore SQLite foreign-key mode: {restore_error}"
+                )),
+                None => restore_error.into(),
+            });
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 #[cfg(test)]
@@ -239,6 +836,386 @@ mod tests {
     }
 
     #[test]
+    fn run_schema_migration_adds_timeout_and_definition_snapshot_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL,
+                automation_id TEXT NOT NULL
+            )",
+        )
+        .unwrap();
+
+        ensure_timeout_column(&conn).unwrap();
+
+        let columns = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "timeout_at"));
+        assert!(columns.iter().any(|column| column == "definition_json"));
+    }
+
+    #[test]
+    fn initialized_store_pins_authority_profile_and_attempt_extension() {
+        let (_temp, conn) = temp_store();
+        let run_columns = conn
+            .prepare("PRAGMA table_info(automation_runs)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        let attempt_columns = conn
+            .prepare("PRAGMA table_info(automation_attempts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert!(run_columns
+            .iter()
+            .any(|column| column == "authority_profile"));
+        assert!(attempt_columns
+            .iter()
+            .any(|column| column == "authority_extension_json"));
+    }
+
+    #[test]
+    fn authority_column_migration_installs_immutability_guards() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE automation_runs (
+                id TEXT PRIMARY KEY NOT NULL
+            );
+            CREATE TABLE automation_attempts (
+                id TEXT PRIMARY KEY NOT NULL,
+                run_id TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        ensure_authority_columns(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs (id, authority_profile)
+             VALUES ('run-1', 'coven.automations.authority.v1')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (id, run_id, authority_extension_json)
+             VALUES ('attempt-1', 'run-1', '{\"profile\":\"coven.automations.authority.v1\"}')",
+            [],
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE automation_runs SET authority_profile = NULL WHERE id = 'run-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET authority_extension_json = '{}'
+                 WHERE id = 'attempt-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute("DELETE FROM automation_attempts WHERE id = 'attempt-1'", [],)
+            .is_err());
+    }
+
+    #[test]
+    fn initialize_store_migrates_the_no_launch_failure_class_without_losing_attempt_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let legacy_attempt_schema =
+            AUTOMATION_ATTEMPTS_SCHEMA_SQL.replace(", 'runtime_authority_unsupported'", "");
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, scheduled_for, state, attempt, created_at, updated_at
+             ) VALUES (
+                'occurrence-existing', 'automation-existing',
+                '2026-09-03T12:00:00.000Z', 'running', 1,
+                '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                id, project_root, harness, title, status, created_at, updated_at
+             ) VALUES (
+                'session-existing', '/work/project', 'coven-code', 'existing',
+                'created', '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs (
+                id, automation_id, occurrence_id, session_id, runtime, status, started_at
+             ) VALUES (
+                'run-existing', 'automation-existing', 'occurrence-existing',
+                'session-existing', 'coven-code', 'running', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, state, retry_classification,
+                authority_extension_json, not_before, opened_at
+             ) VALUES (
+                'attempt-existing', 'run-existing', 'occurrence-existing', 1,
+                'automation:run-existing:1', 1, 'dispatching', 'initial',
+                '{\"profile\":\"coven.automations.authority.v1\"}',
+                '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE receipt_link (
+                attempt_id TEXT NOT NULL
+                    REFERENCES automation_attempts(id) ON DELETE RESTRICT
+             );
+             INSERT INTO receipt_link (attempt_id) VALUES ('attempt-existing');
+
+             PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;
+             DROP TRIGGER automation_attempt_adoption_key_global_insert;
+             DROP TRIGGER automation_attempts_terminal_immutable;
+             DROP TRIGGER automation_attempts_delete_terminal_refused;
+             DROP TRIGGER automation_attempt_authority_immutable;
+             DROP TRIGGER automation_attempt_authority_delete_refused;
+             DROP INDEX idx_automation_attempts_dispatch;
+             ALTER TABLE automation_attempts
+                 RENAME TO automation_attempts_current_failure_class;",
+        )
+        .unwrap();
+        conn.execute_batch(&legacy_attempt_schema).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                failure_class, prior_attempt_number, prior_disposition,
+                retry_classification, authority_extension_json, not_before,
+                session_id, state_reason, opened_at, settled_at
+             )
+             SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, authority_extension_json, not_before,
+                    session_id, state_reason, opened_at, settled_at
+             FROM automation_attempts_current_failure_class;
+             DROP TABLE automation_attempts_current_failure_class;
+             CREATE INDEX idx_automation_attempts_existing_run
+                 ON automation_attempts(run_id);
+             CREATE TRIGGER automation_attempts_existing_insert
+             AFTER INSERT ON automation_attempts
+             BEGIN
+                 SELECT NEW.id;
+             END;
+             COMMIT;
+             PRAGMA legacy_alter_table = OFF;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET failure_class = 'not_a_failure_class'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE automation_attempts
+             SET state = 'failed',
+                 failure_class = 'runtime_authority_unsupported',
+                 state_reason = 'runtime does not accept automation authority projections; no process started',
+                 settled_at = '2026-09-03T12:00:01.000Z'
+             WHERE id = 'attempt-existing'",
+            [],
+        )
+        .unwrap();
+        let preserved: (String, String, String, String) = conn
+            .query_row(
+                "SELECT run_id, occurrence_id, failure_class, authority_extension_json
+                 FROM automation_attempts
+                 WHERE id = 'attempt-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "run-existing".to_string(),
+                "occurrence-existing".to_string(),
+                "runtime_authority_unsupported".to_string(),
+                "{\"profile\":\"coven.automations.authority.v1\"}".to_string(),
+            )
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let receipt_parent: String = conn
+            .query_row("PRAGMA foreign_key_list(receipt_link)", [], |row| {
+                row.get(2)
+            })
+            .unwrap();
+        assert_eq!(receipt_parent, "automation_attempts");
+        for (object_type, name) in [
+            ("index", "idx_automation_attempts_dispatch"),
+            ("trigger", "automation_attempts_terminal_immutable"),
+            ("trigger", "automation_attempts_delete_terminal_refused"),
+            ("trigger", "automation_attempt_authority_immutable"),
+            ("trigger", "automation_attempt_authority_delete_refused"),
+            ("trigger", "automation_attempt_adoption_key_global_insert"),
+            ("index", "idx_automation_attempts_existing_run"),
+            ("trigger", "automation_attempts_existing_insert"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = ?1 AND name = ?2 AND tbl_name = 'automation_attempts'",
+                    [object_type, name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{object_type} {name} was not preserved");
+        }
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET authority_extension_json = '{}'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET state_reason = 'rewritten'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn initialize_store_rolls_back_a_failed_no_launch_failure_class_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE automation_definitions (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE automation_occurrences (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE automation_runs (id TEXT PRIMARY KEY NOT NULL);
+             INSERT INTO automation_definitions (id) VALUES ('automation-existing');
+             INSERT INTO automation_occurrences (id) VALUES ('occurrence-existing');
+             INSERT INTO sessions (id) VALUES ('session-existing');
+             INSERT INTO automation_runs (id) VALUES ('run-existing');",
+        )
+        .unwrap();
+        let malformed_attempt_schema = AUTOMATION_ATTEMPTS_SCHEMA_SQL
+            .replace(", 'runtime_authority_unsupported'", "")
+            .replace("        state_reason TEXT,\n", "");
+        conn.execute_batch(&malformed_attempt_schema).unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, state, retry_classification,
+                authority_extension_json, not_before, session_id, opened_at
+             ) VALUES (
+                'attempt-existing', 'run-existing', 'occurrence-existing', 1,
+                'automation:run-existing:1', 1, 'dispatching', 'initial',
+                '{\"profile\":\"coven.automations.authority.v1\"}',
+                '2026-09-03T12:00:00.000Z', 'session-existing',
+                '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = initialize_store(&path)
+            .expect_err("an incompatible legacy attempt schema must fail atomically");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to copy automation attempts"),
+            "{error:#}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'automation_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_sql.contains("'runtime_authority_unsupported'"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_attempts
+                 WHERE id = 'attempt-existing'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name = 'automation_attempts_legacy_failure_class'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn run_lifecycle_round_trip() {
         let (_temp, conn) = temp_store();
         let start = utc(2026, 8, 28, 9, 0);
@@ -256,6 +1233,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: Some("occ-1"),
+                authority_profile: None,
                 session_id: None,
                 familiar_id: Some("charm"),
                 runtime: "coven-code",
@@ -292,6 +1270,68 @@ mod tests {
     }
 
     #[test]
+    fn run_start_pins_the_occurrence_definition_metadata() {
+        let (_temp, conn) = temp_store();
+        let start = utc(2026, 8, 28, 9, 0);
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, definition_digest, scheduled_for,
+                state, attempt, created_at, updated_at
+             ) VALUES (
+                'occ-pinned', 'daily', 7, 'definition-seven',
+                '2026-08-28T09:00:00.000Z', 'claimed', 1,
+                '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        record_run_start(
+            &conn,
+            "run-pinned",
+            RunStart {
+                automation_id: "daily",
+                occurrence_id: Some("occ-pinned"),
+                authority_profile: None,
+                session_id: None,
+                familiar_id: Some("cody"),
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap();
+
+        let pin: (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest, receipt_id
+                 FROM automation_runs
+                 WHERE id = 'run-pinned'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(pin, (7, "definition-seven".to_string(), None));
+
+        let error = record_run_start(
+            &conn,
+            "run-mismatched",
+            RunStart {
+                automation_id: "other",
+                occurrence_id: Some("occ-pinned"),
+                authority_profile: None,
+                session_id: None,
+                familiar_id: Some("cody"),
+                runtime: "coven-code",
+                timeout_at: start + chrono::Duration::minutes(30),
+            },
+            start,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not belong to automation `other`"));
+    }
+
+    #[test]
     fn finishing_a_non_running_run_is_a_no_op() {
         let (_temp, conn) = temp_store();
         let start = utc(2026, 8, 28, 9, 0);
@@ -301,6 +1341,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: None,
+                authority_profile: None,
                 session_id: None,
                 familiar_id: None,
                 runtime: "coven-code",
@@ -352,6 +1393,7 @@ mod tests {
             RunStart {
                 automation_id: "daily",
                 occurrence_id: None,
+                authority_profile: None,
                 session_id: None,
                 familiar_id: None,
                 runtime: "coven-code",
@@ -373,6 +1415,70 @@ mod tests {
             start,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("succeeded, failed, or cancelled"));
+        assert!(format!("{error:#}").contains("succeeded, failed, cancelled, or timed_out"));
+    }
+
+    #[test]
+    fn attempt_ledger_is_unique_and_terminal_rows_are_immutable() {
+        let (_temp, conn) = temp_store();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+             VALUES ('occ-attempt', 'daily', '2026-08-28T09:00:00.000Z', 'failed', 1,
+                     '2026-08-28T09:00:00.000Z', '2026-08-28T09:01:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, runtime, status, started_at, finished_at)
+             VALUES ('run-attempt', 'daily', 'occ-attempt', 'coven-code', 'failed',
+                     '2026-08-28T09:00:00.000Z', '2026-08-28T09:01:00.000Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                retry_classification, not_before, opened_at, settled_at
+             ) VALUES (
+                'attempt-1', 'run-attempt', 'occ-attempt', 1, 'run-attempt:1',
+                1, 1, 'failed', 'initial',
+                '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z',
+                '2026-08-28T09:01:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+
+        let duplicate_number = conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                retry_classification, not_before, opened_at
+             ) VALUES (
+                'attempt-duplicate-number', 'run-attempt', 'occ-attempt', 1,
+                'run-attempt:duplicate', 1, 0, 'adopted', 'automatic_retry',
+                '2026-08-28T09:02:00.000Z', '2026-08-28T09:01:00.000Z'
+             )",
+            [],
+        );
+        assert!(duplicate_number.is_err());
+
+        let update_terminal = conn.execute(
+            "UPDATE automation_attempts SET state = 'adopted' WHERE id = 'attempt-1'",
+            [],
+        );
+        assert!(update_terminal.is_err());
+        let delete_terminal =
+            conn.execute("DELETE FROM automation_attempts WHERE id = 'attempt-1'", []);
+        assert!(delete_terminal.is_err());
+
+        let attempts = list_attempts(&conn, "run-attempt").unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[0].state, "failed");
+        assert_eq!(attempts[0].retry_classification, "initial");
     }
 }

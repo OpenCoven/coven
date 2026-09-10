@@ -143,6 +143,7 @@ const HELP_GROUPS: &[HelpGroupSpec] = &[
         id: "repair-and-administer",
         title: "Repair and administer",
         commands: &[
+            HelpCommandSpec::new("device", "/cli/device"),
             HelpCommandSpec::new("logs", "/cli/observe"),
             HelpCommandSpec::new("vacuum", "/cli/observe"),
             HelpCommandSpec::new("reset", "/cli"),

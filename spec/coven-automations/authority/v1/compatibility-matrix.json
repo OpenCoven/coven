@@ -1,0 +1,64 @@
+{
+  "contractProfile": "coven.automations.authority.v1",
+  "version": 1,
+  "baseProfile": "coven.automations.v1",
+  "transportKey": "coven.automations.authority.v1",
+  "consumerClasses": [
+    {
+      "consumer": "generic-base-v1",
+      "advertises": ["coven.automations.v1"],
+      "behavior": "Preserve the namespaced value as opaque JSON. Never interpret it and never claim Runtime Authority conformance."
+    },
+    {
+      "consumer": "runtime-authority-v1",
+      "advertises": [
+        "coven.automations.v1",
+        "coven.automations.authority.v1",
+        "automations.runtime-authority.v1"
+      ],
+      "behavior": "Require the namespaced value at every run and receipt authority boundary; validate, verify, and exact-match it against trusted state or fail closed."
+    }
+  ],
+  "changeClasses": [
+    {
+      "id": "base-profile-byte-change",
+      "allowed": false,
+      "behavior": "The existing spec/coven-automations/v1 tree is frozen for this slice. Authority evolution must not rewrite or relabel its historical artifact."
+    },
+    {
+      "id": "authority-optional-field",
+      "allowed": false,
+      "behavior": "Closed schemas reject unknown fields. Additions require a new companion profile."
+    },
+    {
+      "id": "authority-semantic-change",
+      "allowed": false,
+      "behavior": "Changes to required anchors, validation, freshness, replay, or refusal behavior require a new companion profile."
+    },
+    {
+      "id": "opaque-preservation",
+      "allowed": true,
+      "behavior": "A generic base-v1 consumer may preserve an authority value it does not understand, but preservation conveys no authority conformance."
+    }
+  ],
+  "profileRefusal": {
+    "missing": "AUTHORITY_PROFILE_MISSING",
+    "unknown": "AUTHORITY_PROFILE_UNKNOWN",
+    "malformed": "AUTHORITY_SCHEMA_INVALID",
+    "unknownField": "AUTHORITY_SCHEMA_UNKNOWN_FIELD",
+    "stale": "AUTHORITY_STALE",
+    "chronologyInvalid": "AUTHORITY_CHRONOLOGY_INVALID",
+    "familiarStale": "AUTHORITY_FAMILIAR_STALE",
+    "familiarTimeInvalid": "AUTHORITY_FAMILIAR_TIME_INVALID",
+    "dispatchConsumptionMissing": "AUTHORITY_DISPATCH_CONSUMPTION_MISSING",
+    "dispatchConsumptionMismatch": "AUTHORITY_DISPATCH_CONSUMPTION_MISMATCH",
+    "approvalExhausted": "AUTHORITY_APPROVAL_EXHAUSTED",
+    "approvalScopeMismatch": "AUTHORITY_APPROVAL_SCOPE_MISMATCH",
+    "ijsonInvalid": "AUTHORITY_IJSON_INVALID",
+    "integrityInvalid": "AUTHORITY_INTEGRITY_INVALID",
+    "authenticationInvalid": "AUTHORITY_AUTHENTICATION_INVALID",
+    "authenticationUnverifiable": "AUTHORITY_AUTHENTICATION_UNVERIFIABLE",
+    "adapterMissing": "AUTHORITY_ADAPTER_MISSING",
+    "trustedStateUnavailable": "AUTHORITY_TRUSTED_STATE_UNAVAILABLE"
+  }
+}

@@ -283,7 +283,16 @@
               "description": "Scoped RRULE text per the #816 scheduler vocabulary: FREQ=DAILY|WEEKLY, optional BYHOUR list, optional BYDAY list for weekly. Anything else is refused at validation."
             },
             "timezone": {
-              "enum": ["local", "utc"]
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "not": { "const": "local" },
+              "anyOf": [
+                { "const": "utc" },
+                { "format": "iana-time-zone" }
+              ],
+              "requiredIanaValidation": true,
+              "description": "Canonical `utc` or an exact IANA TZID validated by the Rust authority against its pinned tz database. `local` is compatibility input only and MUST be resolved before a definition enters this durable contract."
             }
           }
         }

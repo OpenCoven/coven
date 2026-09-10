@@ -123,6 +123,7 @@ This repository keeps only documentation that must evolve with the source:
 | [CLI core functionality](docs/development/cli-core-functionality.md) | Maintainer source map and verification loop |
 | [Documentation maintenance](docs/DOCS-MAINTENANCE.md) | Ownership rules for public docs versus repository contracts |
 | [Security policy](SECURITY.md) | Vulnerability reporting and repository security policy |
+| [Reliability scorecard](docs/reliability-scorecard.md) | Current outcome, recovery, release-quality, benchmark, and usefulness decision view |
 
 ---
 

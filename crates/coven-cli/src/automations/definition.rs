@@ -5,9 +5,13 @@
 //! are the source of truth for identity and lifecycle; execution state lives
 //! in the occurrence ledger, not here (coven#816).
 
-use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+use chrono_tz::Tz;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use super::contract::types::{BackoffPolicy, RetryableClass};
 use super::rrule::{parse_rrule, ParsedRrule};
 
 pub const AUTOMATION_SCHEMA_VERSION: u32 = 1;
@@ -23,13 +27,111 @@ pub const AUTOMATION_ID_MAX_CHARS: usize = 96;
 pub enum RoutineStatus {
     Active,
     Paused,
+    Disabled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoutineTimezone {
+    /// Compatibility input only. Durable definitions must resolve this to an
+    /// exact IANA zone before they are stored.
     Local,
     Utc,
+    Iana(Tz),
+}
+
+impl RoutineTimezone {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "local" => Ok(Self::Local),
+            "utc" => Ok(Self::Utc),
+            value => value.parse::<Tz>().map(Self::Iana).map_err(|_| {
+                format!(
+                    "timezone must be `utc`, compatibility input `local`, or a valid IANA timezone, got `{value}`"
+                )
+            }),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Utc => "utc",
+            Self::Iana(timezone) => timezone.name(),
+        }
+    }
+
+    pub fn resolve_for_persistence(self) -> Result<Self, String> {
+        if self != Self::Local {
+            return Ok(self);
+        }
+        #[cfg(unix)]
+        match std::env::var("TZ") {
+            Ok(value) => {
+                let timezone = Self::parse(&value).map_err(|_| {
+                    format!("TZ override must be `utc` or an exact IANA timezone, got `{value}`")
+                })?;
+                if timezone == Self::Local {
+                    return Err(
+                        "TZ override must resolve to `utc` or an exact IANA timezone, not `local`"
+                            .to_string(),
+                    );
+                }
+                return Ok(timezone);
+            }
+            Err(std::env::VarError::NotPresent) => {}
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(
+                    "TZ override must be valid UTF-8 naming `utc` or an exact IANA timezone"
+                        .to_string(),
+                );
+            }
+        }
+        self.resolve_local_with(|| {
+            iana_time_zone::get_timezone()
+                .map_err(|error| format!("could not determine the system IANA timezone: {error}"))
+        })
+    }
+
+    pub(crate) fn resolve_local_with(
+        self,
+        resolver: impl FnOnce() -> Result<String, String>,
+    ) -> Result<Self, String> {
+        if self != Self::Local {
+            return Ok(self);
+        }
+        let resolved = resolver()?;
+        let timezone = Self::parse(&resolved)?;
+        if timezone == Self::Local {
+            return Err(
+                "system timezone resolver returned `local` instead of an exact IANA timezone"
+                    .to_string(),
+            );
+        }
+        Ok(timezone)
+    }
+
+    pub fn is_durable(self) -> bool {
+        self != Self::Local
+    }
+}
+
+impl Serialize for RoutineTimezone {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RoutineTimezone {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,10 +148,42 @@ pub enum RoutineOverlap {
     Forbid,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RoutineRetryPolicy {
+    pub max_attempts: u8,
+    pub backoff_policy: BackoffPolicy,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub retryable_classes: BTreeSet<RetryableClass>,
+}
+
+impl Default for RoutineRetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 1,
+            backoff_policy: BackoffPolicy::None,
+            backoff_seconds: None,
+            retryable_classes: BTreeSet::new(),
+        }
+    }
+}
+
+impl RoutineRetryPolicy {
+    fn is_disabled(&self) -> bool {
+        self == &Self::default()
+    }
+
+    pub fn retries(&self, failure_class: RetryableClass) -> bool {
+        self.retryable_classes.contains(&failure_class)
+    }
+}
+
 /// A validated routine definition. Serialized to `definition_json` in the
 /// store with camelCase keys, mirroring the control-plane wire style.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RoutineDefinition {
     pub schema_version: u32,
     pub id: String,
@@ -62,6 +196,8 @@ pub struct RoutineDefinition {
     pub overlap: RoutineOverlap,
     /// Per-run wall-clock timeout in minutes. Bounded and required.
     pub timeout_minutes: u32,
+    #[serde(default, skip_serializing_if = "RoutineRetryPolicy::is_disabled")]
+    pub retry: RoutineRetryPolicy,
     /// Runtime identifier (harness), default `coven-code`.
     pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -88,6 +224,42 @@ impl RoutineDefinition {
             .map_err(|error| format!("routine definition failed validation: {error}"))?;
         parsed.validate()?;
         Ok(parsed)
+    }
+
+    pub fn from_legacy_json(value: &Value) -> Result<Self, String> {
+        Self::from_json(&Self::legacy_wire_projection(value))
+    }
+
+    pub(crate) fn legacy_wire_projection(value: &Value) -> Value {
+        const LEGACY_FIELDS: &[&str] = &[
+            "schemaVersion",
+            "id",
+            "name",
+            "status",
+            "rrule",
+            "timezone",
+            "misfire",
+            "overlap",
+            "timeoutMinutes",
+            "retry",
+            "runtime",
+            "familiarId",
+            "cwd",
+            "outputTarget",
+            "prompt",
+            "model",
+            "tags",
+        ];
+        match value {
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .filter(|(key, _)| LEGACY_FIELDS.contains(&key.as_str()))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -122,6 +294,27 @@ impl RoutineDefinition {
         if self.timeout_minutes == 0 || self.timeout_minutes > 60 * 24 * 31 {
             return Err("timeoutMinutes must be 1..=44640".to_string());
         }
+        if self.retry.max_attempts == 0 || self.retry.max_attempts > 10 {
+            return Err("retry.maxAttempts must be 1..=10".to_string());
+        }
+        if self
+            .retry
+            .backoff_seconds
+            .is_some_and(|seconds| seconds == 0)
+        {
+            return Err("retry.backoffSeconds must be 1..=86400".to_string());
+        }
+        if self
+            .retry
+            .backoff_seconds
+            .is_some_and(|seconds| seconds > 86_400)
+        {
+            return Err("retry.backoffSeconds must be 1..=86400".to_string());
+        }
+        if self.retry.backoff_policy == BackoffPolicy::Fixed && self.retry.backoff_seconds.is_none()
+        {
+            return Err("fixed retry backoff requires retry.backoffSeconds".to_string());
+        }
         if self.runtime.trim().is_empty() || self.runtime.len() > 64 {
             return Err("runtime must be 1..=64 characters".to_string());
         }
@@ -142,7 +335,24 @@ impl RoutineDefinition {
         Ok(())
     }
 
+    pub fn validate_durable(&self) -> Result<(), String> {
+        self.validate()?;
+        if !self.timezone.is_durable() {
+            return Err(
+                "timezone `local` is compatibility input only and must resolve to an exact IANA timezone before persistence"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn resolve_timezone_for_persistence(mut self) -> Result<Self, String> {
+        self.timezone = self.timezone.resolve_for_persistence()?;
+        Ok(self)
+    }
+
     /// Normalized wire form (camelCase, schema stamped) used by list/get.
+    #[allow(dead_code)]
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).unwrap_or(Value::Null)
     }
@@ -177,6 +387,116 @@ mod tests {
         assert_eq!(definition.status, RoutineStatus::Paused);
         assert_eq!(definition.timezone, RoutineTimezone::Local);
         assert_eq!(definition.timeout_minutes, 30);
+    }
+
+    #[test]
+    fn accepts_a_valid_iana_timezone() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("timezone".to_string(), json!("America/New_York"));
+
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(definition).unwrap()["timezone"],
+            "America/New_York"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_iana_timezone() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("timezone".to_string(), json!("Mars/Olympus"));
+
+        let error = RoutineDefinition::from_json(&value).unwrap_err();
+
+        assert!(error.contains("valid IANA timezone"), "{error}");
+    }
+
+    #[test]
+    fn accepts_a_bounded_retry_policy() {
+        let mut value = valid_definition();
+        value.as_object_mut().unwrap().insert(
+            "retry".to_string(),
+            json!({
+                "maxAttempts": 3,
+                "backoffPolicy": "exponential",
+                "backoffSeconds": 5,
+                "retryableClasses": ["runtime_unavailable"]
+            }),
+        );
+
+        let definition = RoutineDefinition::from_json(&value).unwrap();
+        let serialized = serde_json::to_value(definition).unwrap();
+
+        assert_eq!(serialized["retry"]["maxAttempts"], 3);
+        assert_eq!(serialized["retry"]["backoffPolicy"], "exponential");
+        assert_eq!(
+            serialized["retry"]["retryableClasses"],
+            json!(["runtime_unavailable"])
+        );
+    }
+
+    #[test]
+    fn local_resolution_fails_explicitly_when_the_platform_cannot_prove_a_zone() {
+        let error = RoutineTimezone::Local
+            .resolve_local_with(|| Err("platform did not provide a TZID".to_string()))
+            .unwrap_err();
+
+        assert_eq!(error, "platform did not provide a TZID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_rejects_an_unrepresentable_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_rejects_an_unrepresentable_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let error = RoutineTimezone::Local
+                .resolve_for_persistence()
+                .unwrap_err();
+            assert!(error.contains("TZ"), "{error}");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", ":/tmp/coven-custom-zoneinfo")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_prefers_an_iana_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_IANA_TIMEZONE_CHILD";
+        const TEST_NAME: &str =
+            "automations::definition::tests::local_resolution_prefers_an_iana_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let timezone = RoutineTimezone::Local.resolve_for_persistence().unwrap();
+            assert_eq!(timezone.as_str(), "Pacific/Kiritimati");
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Pacific/Kiritimati")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
     }
 
     #[test]
@@ -229,5 +549,18 @@ mod tests {
             .insert("outputTarget".to_string(), json!("result.md"));
         let error = RoutineDefinition::from_json(&value).unwrap_err();
         assert!(error.contains("outputTarget is not supported"), "{error}");
+    }
+
+    #[test]
+    fn legacy_parser_ignores_unknown_fields_while_v1_parser_rejects_them() {
+        let mut value = valid_definition();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("futureField".to_string(), json!("ignored by legacy"));
+
+        assert!(RoutineDefinition::from_legacy_json(&value).is_ok());
+        let error = RoutineDefinition::from_json(&value).unwrap_err();
+        assert!(error.contains("unknown field `futureField`"), "{error}");
     }
 }

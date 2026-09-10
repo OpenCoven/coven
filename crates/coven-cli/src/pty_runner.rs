@@ -2163,7 +2163,7 @@ unsafe fn guardian_wait_for_process_group_exit(pid: libc::pid_t) -> bool {
     false
 }
 
-fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Result<()> {
+pub(crate) fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
