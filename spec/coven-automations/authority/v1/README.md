@@ -141,7 +141,20 @@ signature evidence. A missing adapter returns
 `AUTHORITY_ADAPTER_MISSING`; unavailable trusted data returns a typed refusal
 instead of falling back to the base run's string references.
 
-No scheduler or runtime launch path calls this seam in this slice.
+The Automations runner now has an explicit Runtime Authority dispatch mode. In
+that mode it constructs the exact run/attempt correlation request inside the
+immediate dispatch transaction, calls this validation seam, requires the
+returned binding to match Coven-owned definition, occurrence, fence, run,
+attempt, adoption, and runtime identifiers, and durably pins the validated
+extension before runtime launch. The run profile and attempt extension are
+immutable, including across no-process recovery.
+
+Production scheduler and manual-run entry points remain base-v1 only until a
+trusted adapter can resolve and consume the canonical Familiar, Threads,
+approval/replay, and runtime evidence. Coven therefore does not yet advertise
+`automations.runtime-authority.v1`; selecting Runtime Authority without a
+concrete adapter remains impossible rather than falling back to an unbound
+launch.
 
 ## Artifact
 

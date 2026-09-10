@@ -27,6 +27,7 @@ pub const AUTOMATION_ID_MAX_CHARS: usize = 96;
 pub enum RoutineStatus {
     Active,
     Paused,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

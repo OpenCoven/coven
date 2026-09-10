@@ -604,6 +604,11 @@ impl<'de> Deserialize<'de> for RuntimeCapabilities {
 pub struct ExercisedCapabilities(Vec<Capability>);
 
 impl ExercisedCapabilities {
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
     fn new(values: Vec<Capability>) -> Result<Self, StringConstraintError> {
         if values.len() > 128 {
             return Err(StringConstraintError(
