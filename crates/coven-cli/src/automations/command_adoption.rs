@@ -39,11 +39,68 @@ pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_automation_command_adoptions_automation
         ON automation_command_adoptions(automation_id, adopted_at);
 
-    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_no_update
-    BEFORE UPDATE ON automation_command_adoptions
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_immutable_columns
+    BEFORE UPDATE OF
+        adoption_key,
+        request_digest,
+        command,
+        automation_id,
+        outcome,
+        revision,
+        adopted_at
+    ON automation_command_adoptions
     BEGIN
         SELECT RAISE(ABORT, 'automation command adoptions are append-only');
     END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_immutable_rowid
+    BEFORE UPDATE ON automation_command_adoptions
+    WHEN NEW.rowid IS NOT OLD.rowid
+    BEGIN
+        SELECT RAISE(ABORT, 'automation command adoptions are append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_response_update_guard
+    BEFORE UPDATE OF response_json ON automation_command_adoptions
+    WHEN NOT (
+        OLD.command IN ('definition.create.v1', 'definition.revise.v1')
+        AND OLD.outcome = 'rejected'
+        AND json_valid(OLD.response_json)
+        AND json_extract(OLD.response_json, '$.outcome') IS 'rejected'
+        AND json_extract(OLD.response_json, '$.error.code') IS 'VALIDATION_FAILED'
+        AND json_valid(NEW.response_json)
+        AND json_type(NEW.response_json, '$') IS 'object'
+        AND json_extract(NEW.response_json, '$.outcome') IS 'rejected'
+        AND json_type(NEW.response_json, '$.error') IS 'object'
+        AND json_extract(NEW.response_json, '$.error.code') IS 'VALIDATION_FAILED'
+        AND json_extract(NEW.response_json, '$.error.httpStatus') IS 400
+        AND json_extract(NEW.response_json, '$.error.message')
+            IS 'automation definition failed validation'
+        AND json_extract(NEW.response_json, '$.error.retryable') IS 0
+        AND json_extract(NEW.response_json, '$.error.currentRevision')
+            IS json_extract(OLD.response_json, '$.error.currentRevision')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.response_json)
+            WHERE key NOT IN ('outcome', 'error')
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.response_json, '$.error')
+            WHERE key NOT IN (
+                'code',
+                'httpStatus',
+                'message',
+                'retryable',
+                'currentRevision'
+            )
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation command adoptions are append-only');
+    END;
+
+    DROP TRIGGER IF EXISTS automation_command_adoptions_no_update;
 
     CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_no_delete
     BEFORE DELETE ON automation_command_adoptions
@@ -290,13 +347,34 @@ pub fn execute_definition_command(
         return Ok(response);
     }
 
-    if let Some(stored) = load_adoption(&transaction, adoption_key.as_str())? {
-        let response =
-            if request_digest_matches(&stored.request_digest, &compatible_request_digests) {
-                replay_response(stored)
+    if let Some(mut stored) = load_adoption(&transaction, adoption_key.as_str())? {
+        if request_digest_matches(&stored.request_digest, &compatible_request_digests) {
+            let sanitized = sanitize_v1_validation_replay(&mut stored);
+            if sanitized {
+                transaction
+                    .execute(
+                        "UPDATE automation_command_adoptions
+                         SET response_json = ?2
+                         WHERE adoption_key = ?1",
+                        params![
+                            adoption_key.as_str(),
+                            serde_json::to_string(&stored.response).context(
+                                "failed to serialize sanitized automation command response"
+                            )?,
+                        ],
+                    )
+                    .context("failed to persist sanitized automation command response")?;
+                transaction
+                    .commit()
+                    .context("failed to commit sanitized automation command replay")?;
             } else {
-                replay_mismatch_response(&adoption_key, &stored)
-            };
+                transaction
+                    .rollback()
+                    .context("failed to close automation command replay transaction")?;
+            }
+            return Ok(replay_response(stored));
+        }
+        let response = replay_mismatch_response(&adoption_key, &stored);
         transaction
             .rollback()
             .context("failed to close automation command replay transaction")?;
@@ -453,11 +531,14 @@ fn compatible_request_digests(command: &DefinitionCommand) -> Result<Vec<String>
 
     let mut legacy_preimages = Vec::with_capacity(3);
     if let Ok(parsed) = RoutineDefinition::from_json(definition) {
-        legacy_preimages.push(json!({
-            "kind": "valid",
-            "value": serde_json::to_value(parsed)
-                .context("failed to normalize routine definition for legacy adoption replay")?,
-        }));
+        let normalized = serde_json::to_value(parsed)
+            .context("failed to normalize routine definition for legacy adoption replay")?;
+        if definition == &normalized {
+            legacy_preimages.push(json!({
+                "kind": "valid",
+                "value": normalized,
+            }));
+        }
     }
     let wire = lossless_json_fingerprint(definition);
     legacy_preimages.push(json!({
@@ -487,6 +568,36 @@ fn compatible_request_digests(command: &DefinitionCommand) -> Result<Vec<String>
 
 fn request_digest_matches(stored: &str, compatible: &[String]) -> bool {
     compatible.iter().any(|digest| digest == stored)
+}
+
+fn sanitize_v1_validation_replay(stored: &mut StoredAdoption) -> bool {
+    if !matches!(
+        stored.command.as_str(),
+        "definition.create.v1" | "definition.revise.v1"
+    ) {
+        return false;
+    }
+    let StoredResponse::Rejected { error } = &stored.response else {
+        return false;
+    };
+    if error.code() != ErrorCode::ValidationFailed {
+        return false;
+    }
+
+    let mut sanitized = ErrorEnvelope::try_new(
+        ErrorCode::ValidationFailed,
+        DEFINITION_VALIDATION_FAILED_MESSAGE,
+        false,
+    )
+    .expect("static automation definition validation message is valid");
+    if let Some(current_revision) = error.current_revision {
+        sanitized = sanitized.with_current_revision(current_revision);
+    }
+    if error == &sanitized {
+        return false;
+    }
+    stored.response = StoredResponse::Rejected { error: sanitized };
+    true
 }
 
 fn adoption_definition_preimage(definition: &Value) -> Result<Value> {
@@ -1549,8 +1660,8 @@ mod tests {
         canonical_command_digest(&canonical).unwrap()
     }
 
-    fn stored_validation_rejection(message: &str) -> (ErrorEnvelope, String) {
-        let error = rejected(ErrorCode::ValidationFailed, message, None)
+    fn stored_capability_rejection(message: &str) -> (ErrorEnvelope, String) {
+        let error = rejected(ErrorCode::CapabilityUnsupported, message, None)
             .error
             .unwrap();
         let stored = StoredResponse::Rejected {
@@ -1669,7 +1780,7 @@ mod tests {
     fn exact_replay_accepts_every_legacy_v1_definition_digest_form() {
         let (_temp, conn) = temp_store();
         let (stored_error, stored_response) =
-            stored_validation_rejection("stored legacy validation rejection");
+            stored_capability_rejection("stored legacy capability rejection");
 
         for command_kind in ["create", "revise"] {
             for legacy_kind in ["valid", "invalid", "unsupported"] {
@@ -1721,6 +1832,42 @@ mod tests {
                     "{command_kind} {legacy_kind}"
                 );
 
+                if legacy_kind == "valid" {
+                    let mut default_explicit_body = body.clone();
+                    default_explicit_body["retry"] = json!({
+                        "maxAttempts": 1,
+                        "backoffPolicy": "none",
+                        "retryableClasses": []
+                    });
+                    let default_explicit_command = match command_kind {
+                        "create" => DefinitionCommand::Create {
+                            definition: default_explicit_body,
+                        },
+                        "revise" => DefinitionCommand::Revise {
+                            definition: default_explicit_body,
+                            expected_revision: Some(7),
+                        },
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        legacy_v1_command_digest(&command, legacy_kind),
+                        legacy_v1_command_digest(&default_explicit_command, legacy_kind),
+                        "{command_kind} fixture must reproduce the old normalized digest alias"
+                    );
+                    let default_explicit = execute_definition_command(
+                        &conn,
+                        &adoption_key,
+                        default_explicit_command,
+                        "2026-09-03T09:01:30.000Z",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        default_explicit.error.as_ref().map(ErrorEnvelope::code),
+                        Some(ErrorCode::AdoptionReplayMismatch),
+                        "{command_kind} explicit default retry must not match an omitted retry"
+                    );
+                }
+
                 let mut changed_body = body.clone();
                 changed_body["prompt"] = json!("Changed payload must not replay.");
                 let changed_command = match command_kind {
@@ -1767,6 +1914,194 @@ mod tests {
         }
 
         assert_eq!(adoption_count(&conn), 6);
+    }
+
+    #[test]
+    fn exact_v1_validation_replay_sanitizes_legacy_response_and_mismatch_preserves_storage() {
+        let (_temp, conn) = temp_store();
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-{command_kind}");
+            let body = definition(&id, "Legacy secret response");
+            let command = match command_kind {
+                "create" => DefinitionCommand::Create {
+                    definition: body.clone(),
+                },
+                "revise" => DefinitionCommand::Revise {
+                    definition: body.clone(),
+                    expected_revision: Some(7),
+                },
+                _ => unreachable!(),
+            };
+            let current_revision = PositiveInteger::new(4).unwrap();
+            let secret = format!("SECRET_{command_kind}_VALIDATION_VALUE");
+            let legacy_error = ErrorEnvelope::try_new(
+                ErrorCode::ValidationFailed,
+                format!("legacy validation exposed {secret}"),
+                true,
+            )
+            .unwrap()
+            .with_details(BTreeMap::from([(
+                "submittedValue".to_owned(),
+                Value::String(secret.clone()),
+            )]))
+            .with_adoption(ErrorAdoption {
+                key: AdoptionKey::new(format!("adopt:legacy:{command_kind}:secret")).unwrap(),
+                conflict_outcome: Some(AdoptionConflictOutcome::Rejected),
+            })
+            .with_current_revision(current_revision);
+            let legacy_response = serde_json::to_string(&StoredResponse::Rejected {
+                error: legacy_error,
+            })
+            .unwrap();
+            let adoption_key = format!("adopt:{command_kind}:legacy-secret:0001");
+            conn.execute(
+                "INSERT INTO automation_command_adoptions (
+                    adoption_key, request_digest, command, automation_id, outcome,
+                    revision, response_json, adopted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                params![
+                    adoption_key,
+                    legacy_v1_command_digest(&command, "valid"),
+                    command_identity(&command).0,
+                    id,
+                    legacy_response,
+                    "2026-09-03T09:00:00.000Z",
+                ],
+            )
+            .unwrap();
+
+            let replay = execute_definition_command(
+                &conn,
+                &adoption_key,
+                command.clone(),
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            let replay_error = replay.error.as_ref().unwrap();
+            assert_eq!(replay_error.code(), ErrorCode::ValidationFailed);
+            assert_eq!(
+                replay_error.message.as_str(),
+                DEFINITION_VALIDATION_FAILED_MESSAGE
+            );
+            assert!(!replay_error.retryable);
+            assert!(replay_error.details.is_none());
+            assert!(replay_error.adoption.is_none());
+            assert_eq!(
+                replay_error.current_revision.map(PositiveInteger::get),
+                Some(4)
+            );
+            let replay_json = serde_json::to_string(replay_error).unwrap();
+            assert!(!replay_json.contains(&secret));
+
+            let sanitized_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!sanitized_response.contains(&secret));
+            assert_eq!(
+                sanitized_response,
+                serde_json::to_string(&StoredResponse::Rejected {
+                    error: replay_error.clone(),
+                })
+                .unwrap()
+            );
+
+            let repeated = execute_definition_command(
+                &conn,
+                &adoption_key,
+                command.clone(),
+                "2026-09-03T09:02:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(repeated.error, replay.error);
+            let repeated_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repeated_response, sanitized_response);
+
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let mismatch_secret = format!("SECRET_{command_kind}_MISMATCH_VALUE");
+            let mismatch_error = ErrorEnvelope::try_new(
+                ErrorCode::ValidationFailed,
+                format!("legacy validation exposed {mismatch_secret}"),
+                false,
+            )
+            .unwrap()
+            .with_details(BTreeMap::from([(
+                "submittedValue".to_owned(),
+                Value::String(mismatch_secret.clone()),
+            )]));
+            let mismatch_response = serde_json::to_string(&StoredResponse::Rejected {
+                error: mismatch_error,
+            })
+            .unwrap();
+            conn.execute(
+                "INSERT INTO automation_command_adoptions (
+                    adoption_key, request_digest, command, automation_id, outcome,
+                    revision, response_json, adopted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'rejected', NULL, ?5, ?6)",
+                params![
+                    mismatch_key,
+                    legacy_v1_command_digest(&command, "valid"),
+                    command_identity(&command).0,
+                    id,
+                    mismatch_response,
+                    "2026-09-03T09:00:00.000Z",
+                ],
+            )
+            .unwrap();
+            let mut changed_body = body;
+            changed_body["retry"] = json!({
+                "maxAttempts": 1,
+                "backoffPolicy": "none",
+                "retryableClasses": []
+            });
+            let changed_command = match command_kind {
+                "create" => DefinitionCommand::Create {
+                    definition: changed_body,
+                },
+                "revise" => DefinitionCommand::Revise {
+                    definition: changed_body,
+                    expected_revision: Some(7),
+                },
+                _ => unreachable!(),
+            };
+            let mismatch = execute_definition_command(
+                &conn,
+                &mismatch_key,
+                changed_command,
+                "2026-09-03T09:03:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(
+                mismatch.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::AdoptionReplayMismatch)
+            );
+            let unchanged_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&mismatch_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged_response, mismatch_response);
+            assert!(unchanged_response.contains(&mismatch_secret));
+        }
     }
 
     #[test]
@@ -2292,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    fn adoption_ledger_is_append_only() {
+    fn adoption_ledger_blocks_arbitrary_updates_and_deletes() {
         let (_temp, conn) = temp_store();
         execute_definition_command(
             &conn,
@@ -2312,6 +2647,26 @@ mod tests {
                 [],
             )
             .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_command_adoptions
+                 SET response_json = '{\"outcome\":\"rejected\",\"error\":{\"code\":\"VALIDATION_FAILED\",\"httpStatus\":400,\"message\":\"automation definition failed validation\",\"retryable\":false}}'
+                 WHERE adoption_key = 'adopt:create:immutable:0001'",
+                [],
+            )
+            .is_err());
+        for rowid_alias in ["rowid", "_rowid_", "oid"] {
+            assert!(conn
+                .execute(
+                    &format!(
+                        "UPDATE automation_command_adoptions
+                         SET {rowid_alias} = {rowid_alias} + 1
+                         WHERE adoption_key = 'adopt:create:immutable:0001'"
+                    ),
+                    [],
+                )
+                .is_err());
+        }
         assert!(conn
             .execute(
                 "DELETE FROM automation_command_adoptions

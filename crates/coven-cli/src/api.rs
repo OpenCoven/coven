@@ -17922,6 +17922,174 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn v1_definition_validation_replay_scrubs_legacy_secret_bearing_storage() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-api-{command_kind}");
+            let definition = json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Legacy validation replay",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "invalid legacy timezone",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not run."
+            });
+            let action = format!("coven.automations.definition.{command_kind}.v1");
+            let source_key = format!("adopt:{command_kind}:legacy-secret-source:0001");
+            let replay_key = format!("adopt:{command_kind}:legacy-secret-replay:0001");
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let request_for = |adoption_key: &str, definition: Value| {
+                let mut request = json!({
+                    "action": action,
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(7);
+                }
+                request
+            };
+            let source_request = request_for(&source_key, definition.clone()).to_string();
+            let source = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&source_request),
+            )?;
+            assert_eq!(source.status, 400, "{command_kind}: {}", source.body);
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let request_digest: String = conn.query_row(
+                "SELECT request_digest
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )?;
+            let secret = format!("SECRET_{command_kind}_API_VALIDATION_VALUE");
+            let legacy_response = json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": "VALIDATION_FAILED",
+                    "httpStatus": 400,
+                    "message": format!("legacy validation exposed {secret}"),
+                    "retryable": true,
+                    "details": {"submittedValue": secret},
+                    "adoption": {
+                        "key": replay_key,
+                        "conflictOutcome": "rejected"
+                    },
+                    "currentRevision": 4
+                }
+            })
+            .to_string();
+            for adoption_key in [&replay_key, &mismatch_key] {
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, request_digest, command, automation_id, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                    rusqlite::params![
+                        adoption_key,
+                        request_digest,
+                        format!("definition.{command_kind}.v1"),
+                        id,
+                        legacy_response,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )?;
+            }
+            drop(conn);
+
+            let exact_request = request_for(&replay_key, definition.clone()).to_string();
+            let replay = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(replay.status, 400, "{command_kind}: {}", replay.body);
+            let replay_body: Value = serde_json::from_str(&replay.body)?;
+            assert_eq!(replay_body["error"]["code"], "VALIDATION_FAILED");
+            assert_eq!(
+                replay_body["error"]["message"],
+                "automation definition failed validation"
+            );
+            assert_eq!(replay_body["error"]["retryable"], false);
+            assert_eq!(replay_body["error"]["currentRevision"], 4);
+            assert!(replay_body["error"].get("details").is_none());
+            assert!(replay_body["error"].get("adoption").is_none());
+            assert!(!replay.body.contains(&secret));
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let sanitized_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert!(!sanitized_response.contains(&secret));
+            drop(conn);
+
+            let repeated = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(repeated.body, replay.body);
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let repeated_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(repeated_response, sanitized_response);
+            drop(conn);
+
+            let mut changed_definition = definition;
+            changed_definition["prompt"] = json!("Changed request.");
+            let mismatch_request = request_for(&mismatch_key, changed_definition).to_string();
+            let mismatch = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&mismatch_request),
+            )?;
+            assert_eq!(mismatch.status, 409, "{command_kind}: {}", mismatch.body);
+            assert!(mismatch
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let unchanged_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&mismatch_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(unchanged_response, legacy_response);
+            assert!(unchanged_response.contains(&secret));
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn control_actions_refuse_unsupported_rich_policy_variants() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
 
