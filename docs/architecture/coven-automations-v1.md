@@ -401,9 +401,11 @@ capability refusal. Rules:
   negative-negotiation projection maps flat `outputTarget`, `misfire`,
   `overlap`, retry `backoffPolicy`, and unsupported RRULE frequencies to stable
   variant identifiers. It also recognizes richer nested `trigger`,
-  `conditions`, `action`, and policy hints only to classify a refusal; a nested
-  shape composed solely of supported hints still proceeds to ordinary flat
-  definition validation and is not accepted as the normative rich object.
+  `conditions`, `action`, retryable-class, retention, and other policy hints
+  only to classify a refusal when the surrounding flat compatibility
+  definition is otherwise valid; a nested shape composed solely of supported
+  hints still proceeds to ordinary flat definition validation and is not
+  accepted as the normative rich object.
 - Malformed types, missing required fields, and malformed syntax within a
   supported RRULE frequency remain `VALIDATION_FAILED`. Unsupported
   identifiers are bounded to identifier-like ASCII components before they are

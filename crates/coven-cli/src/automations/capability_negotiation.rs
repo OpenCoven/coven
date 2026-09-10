@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use super::definition::RoutineDefinition;
 
 const CAPABILITIES_JSON: &str =
     include_str!("../../../../spec/coven-automations/v1/capabilities.json");
@@ -50,6 +53,12 @@ pub struct RefusedVariant {
 pub struct UnsupportedVariant {
     pub variant: String,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum DefinitionNegotiation {
+    Supported(Box<RoutineDefinition>),
+    Unsupported(UnsupportedVariant),
 }
 
 pub fn capability_profile() -> &'static CapabilityProfile {
@@ -135,6 +144,26 @@ pub fn preflight_definition(definition: &Value) -> Option<UnsupportedVariant> {
                 return unsupported_from_component("retry.backoff", backoff, false);
             }
         }
+        if let Some(retryable_classes) = policies
+            .get("retry")
+            .and_then(Value::as_object)
+            .and_then(|retry| retry.get("retryableClasses"))
+            .and_then(Value::as_array)
+            .filter(|classes| classes.iter().all(Value::is_string))
+        {
+            for retryable_class in retryable_classes.iter().filter_map(Value::as_str) {
+                if !matches!(
+                    retryable_class,
+                    "transient_dispatch" | "lease_expired" | "runtime_unavailable"
+                ) {
+                    return unsupported_from_component(
+                        "retry.safe-classes",
+                        retryable_class,
+                        false,
+                    );
+                }
+            }
+        }
         if let Some(delivery) = policies.get("delivery").and_then(Value::as_object) {
             if delivery
                 .get("outputTarget")
@@ -143,6 +172,20 @@ pub fn preflight_definition(definition: &Value) -> Option<UnsupportedVariant> {
             {
                 if let Some(mode) = delivery.get("mode").and_then(Value::as_str) {
                     return unsupported_from_component("outputTarget", mode, false);
+                }
+            }
+        }
+        if let Some(retention) = policies.get("retention").and_then(Value::as_object) {
+            for field in ["occurrenceHistory", "runLogs", "receipts"] {
+                if let Some(classification) = retention
+                    .get(field)
+                    .and_then(Value::as_object)
+                    .and_then(|retention_class| retention_class.get("classification"))
+                    .and_then(Value::as_str)
+                {
+                    if classification != "standard" {
+                        return unsupported_from_component("retention", classification, false);
+                    }
                 }
             }
         }
@@ -182,6 +225,308 @@ pub fn preflight_definition(definition: &Value) -> Option<UnsupportedVariant> {
     }
 
     None
+}
+
+pub fn negotiate_definition(definition: &Value) -> Result<DefinitionNegotiation, String> {
+    let Some(unsupported) = preflight_definition(definition) else {
+        return RoutineDefinition::from_json(definition)
+            .and_then(RoutineDefinition::resolve_timezone_for_persistence)
+            .map(Box::new)
+            .map(DefinitionNegotiation::Supported);
+    };
+
+    let projection = validation_projection(definition);
+    RoutineDefinition::from_json(&projection)
+        .and_then(RoutineDefinition::resolve_timezone_for_persistence)?;
+    Ok(DefinitionNegotiation::Unsupported(unsupported))
+}
+
+fn validation_projection(definition: &Value) -> Value {
+    let Value::Object(mut projection) = definition.clone() else {
+        return definition.clone();
+    };
+
+    neutralize_flat_unsupported_values(&mut projection);
+    for key in ["trigger", "conditions", "action", "policies"] {
+        if projection
+            .get(key)
+            .is_some_and(|value| rich_hint_is_well_formed(key, value))
+        {
+            projection.remove(key);
+        }
+    }
+
+    Value::Object(projection)
+}
+
+fn neutralize_flat_unsupported_values(definition: &mut Map<String, Value>) {
+    if definition
+        .get("misfire")
+        .and_then(Value::as_str)
+        .is_some_and(|misfire| misfire != "latest")
+    {
+        definition.insert("misfire".to_owned(), Value::String("latest".to_owned()));
+    }
+    if definition
+        .get("overlap")
+        .and_then(Value::as_str)
+        .is_some_and(|overlap| overlap != "forbid")
+    {
+        definition.insert("overlap".to_owned(), Value::String("forbid".to_owned()));
+    }
+    if let Some(retry) = definition.get_mut("retry").and_then(Value::as_object_mut) {
+        if retry
+            .get("backoffPolicy")
+            .and_then(Value::as_str)
+            .is_some_and(|backoff| !matches!(backoff, "none" | "fixed" | "exponential"))
+        {
+            retry.insert("backoffPolicy".to_owned(), Value::String("none".to_owned()));
+        }
+    }
+    if definition.get("outputTarget").is_some_and(Value::is_string) {
+        definition.remove("outputTarget");
+    }
+    if let Some(rrule) = definition.get("rrule").and_then(Value::as_str) {
+        if unsupported_rrule_frequency(rrule).is_some() {
+            let frequency = if rrule.split(';').any(|part| {
+                part.split_once('=')
+                    .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("BYDAY"))
+            }) {
+                "WEEKLY"
+            } else {
+                "DAILY"
+            };
+            definition.insert(
+                "rrule".to_owned(),
+                Value::String(neutralize_rrule_frequency(rrule, frequency)),
+            );
+        }
+    }
+}
+
+fn neutralize_rrule_frequency(rrule: &str, supported_frequency: &str) -> String {
+    rrule
+        .split(';')
+        .map(|part| match part.split_once('=') {
+            Some((key, _)) if key.trim().eq_ignore_ascii_case("FREQ") => {
+                format!("{key}={supported_frequency}")
+            }
+            _ => part.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn rich_hint_is_well_formed(key: &str, value: &Value) -> bool {
+    match key {
+        "trigger" => trigger_hint_is_well_formed(value),
+        "conditions" => conditions_hint_is_well_formed(value),
+        "action" => action_hint_is_well_formed(value),
+        "policies" => policies_hint_is_well_formed(value),
+        _ => false,
+    }
+}
+
+fn trigger_hint_is_well_formed(value: &Value) -> bool {
+    let Some(trigger) = value.as_object() else {
+        return false;
+    };
+    if !has_only_fields(trigger, &["variant", "version", "schedule"]) {
+        return false;
+    }
+    let Some(variant) = trigger.get("variant").and_then(Value::as_str) else {
+        return false;
+    };
+    if variant.trim().is_empty()
+        || !optional_version_is_well_formed(trigger.get("version"))
+        || !optional_schedule_is_well_formed(trigger.get("schedule"))
+    {
+        return false;
+    }
+    true
+}
+
+fn optional_schedule_is_well_formed(schedule: Option<&Value>) -> bool {
+    schedule.is_none_or(schedule_is_well_formed)
+}
+
+fn schedule_is_well_formed(value: &Value) -> bool {
+    let Some(schedule) = value.as_object() else {
+        return false;
+    };
+    has_only_fields(schedule, &["rrule", "timezone"])
+        && schedule.get("rrule").is_some_and(Value::is_string)
+        && schedule.get("timezone").is_some_and(Value::is_string)
+}
+
+fn conditions_hint_is_well_formed(value: &Value) -> bool {
+    value.as_array().is_some_and(|conditions| {
+        conditions.iter().all(|condition| {
+            let Some(condition) = condition.as_object() else {
+                return false;
+            };
+            has_only_fields(condition, &["variant", "version"])
+                && condition
+                    .get("variant")
+                    .and_then(Value::as_str)
+                    .is_some_and(|variant| !variant.trim().is_empty())
+                && optional_version_is_well_formed(condition.get("version"))
+        })
+    })
+}
+
+fn action_hint_is_well_formed(value: &Value) -> bool {
+    let Some(action) = value.as_object() else {
+        return false;
+    };
+    if !has_only_fields(action, &["variant", "version", "prompt", "cwd"]) {
+        return false;
+    }
+    let Some(variant) = action.get("variant").and_then(Value::as_str) else {
+        return false;
+    };
+    if variant.trim().is_empty()
+        || !optional_version_is_well_formed(action.get("version"))
+        || !optional_string_is_well_formed(action.get("prompt"))
+        || !optional_string_is_well_formed(action.get("cwd"))
+    {
+        return false;
+    }
+    true
+}
+
+fn policies_hint_is_well_formed(value: &Value) -> bool {
+    let Some(policies) = value.as_object() else {
+        return false;
+    };
+    !policies.is_empty()
+        && has_only_fields(
+            policies,
+            &[
+                "timeout",
+                "retry",
+                "concurrency",
+                "misfire",
+                "delivery",
+                "retention",
+            ],
+        )
+        && policies.iter().all(|(key, value)| match key.as_str() {
+            "timeout" => timeout_hint_is_well_formed(value),
+            "retry" => retry_hint_is_well_formed(value),
+            "concurrency" => single_string_field_is_well_formed(value, "overlap"),
+            "misfire" => single_string_field_is_well_formed(value, "disposition"),
+            "delivery" => delivery_hint_is_well_formed(value),
+            "retention" => retention_hint_is_well_formed(value),
+            _ => false,
+        })
+}
+
+fn timeout_hint_is_well_formed(value: &Value) -> bool {
+    let Some(timeout) = value.as_object() else {
+        return false;
+    };
+    has_only_fields(timeout, &["perRunMinutes"])
+        && timeout
+            .get("perRunMinutes")
+            .and_then(Value::as_u64)
+            .is_some_and(|minutes| (1..=44_640).contains(&minutes))
+}
+
+fn retry_hint_is_well_formed(value: &Value) -> bool {
+    let Some(retry) = value.as_object() else {
+        return false;
+    };
+    if retry.is_empty()
+        || !has_only_fields(
+            retry,
+            &[
+                "maxAttempts",
+                "backoffPolicy",
+                "backoffSeconds",
+                "retryableClasses",
+            ],
+        )
+        || !retry.get("maxAttempts").is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|attempts| (1..=10).contains(&attempts))
+        })
+        || !optional_string_is_well_formed(retry.get("backoffPolicy"))
+        || !retry.get("backoffSeconds").is_none_or(|value| {
+            value
+                .as_u64()
+                .is_some_and(|seconds| (1..=86_400).contains(&seconds))
+        })
+    {
+        return false;
+    }
+    let Some(retryable_classes) = retry.get("retryableClasses") else {
+        return true;
+    };
+    let Some(retryable_classes) = retryable_classes.as_array() else {
+        return false;
+    };
+    let mut unique = BTreeSet::new();
+    retryable_classes.iter().all(|value| {
+        value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .is_some_and(|value| unique.insert(value))
+    })
+}
+
+fn delivery_hint_is_well_formed(value: &Value) -> bool {
+    let Some(delivery) = value.as_object() else {
+        return false;
+    };
+    has_only_fields(delivery, &["outputTarget", "mode"])
+        && delivery.get("outputTarget").is_some_and(Value::is_string)
+        && delivery.get("mode").is_some_and(Value::is_string)
+}
+
+fn retention_hint_is_well_formed(value: &Value) -> bool {
+    let Some(retention) = value.as_object() else {
+        return false;
+    };
+    !retention.is_empty()
+        && has_only_fields(retention, &["occurrenceHistory", "runLogs", "receipts"])
+        && retention.values().all(retention_class_is_well_formed)
+}
+
+fn retention_class_is_well_formed(value: &Value) -> bool {
+    let Some(retention_class) = value.as_object() else {
+        return false;
+    };
+    has_only_fields(retention_class, &["classification", "deleteAfter"])
+        && retention_class
+            .get("classification")
+            .and_then(Value::as_str)
+            .is_some_and(|classification| !classification.trim().is_empty())
+        && optional_string_is_well_formed(retention_class.get("deleteAfter"))
+}
+
+fn single_string_field_is_well_formed(value: &Value, field: &str) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    has_only_fields(object, &[field]) && object.get(field).is_some_and(Value::is_string)
+}
+
+fn has_only_fields(object: &Map<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn optional_version_is_well_formed(version: Option<&Value>) -> bool {
+    version.is_none_or(is_version_one)
+}
+
+fn is_version_one(value: &Value) -> bool {
+    value.as_u64() == Some(1)
+}
+
+fn optional_string_is_well_formed(value: Option<&Value>) -> bool {
+    value.is_none_or(Value::is_string)
 }
 
 fn unsupported_rrule_frequency(rrule: &str) -> Option<UnsupportedVariant> {
@@ -342,6 +687,37 @@ mod tests {
     }
 
     #[test]
+    fn capability_negotiation_classifies_unknown_retryable_classes() {
+        for (retryable_class, expected) in [
+            ("ambiguous", "retry.safe-classes.ambiguous"),
+            ("operator_required", "retry.safe-classes.operator_required"),
+        ] {
+            assert_variant(
+                json!({"policies": {"retry": {
+                    "retryableClasses": ["transient_dispatch", retryable_class]
+                }}}),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn capability_negotiation_classifies_unsupported_retention_classes() {
+        for (field, classification, expected) in [
+            ("occurrenceHistory", "ephemeral", "retention.ephemeral"),
+            ("runLogs", "extended", "retention.extended"),
+            ("receipts", "forever", "retention.forever"),
+        ] {
+            assert_variant(
+                json!({"policies": {"retention": {
+                    field: {"classification": classification}
+                }}}),
+                expected,
+            );
+        }
+    }
+
+    #[test]
     fn capability_negotiation_leaves_malformed_types_for_validation() {
         for definition in [
             json!({"outputTarget": {"private": "value"}}),
@@ -356,6 +732,12 @@ mod tests {
             json!({"action": {"variant": []}}),
             json!({"policies": {"misfire": "backfill"}}),
             json!({"policies": {"delivery": {"mode": "atomic"}}}),
+            json!({"policies": {"retry": {"retryableClasses": "runtime_unavailable"}}}),
+            json!({"policies": {"retry": {"retryableClasses": [1]}}}),
+            json!({"policies": {"retention": {"occurrenceHistory": "standard"}}}),
+            json!({"policies": {"retention": {
+                "occurrenceHistory": {"classification": 1}
+            }}}),
         ] {
             assert_eq!(preflight_definition(&definition), None, "{definition}");
         }
@@ -377,7 +759,19 @@ mod tests {
             "policies": {
                 "misfire": {"disposition": "latest"},
                 "concurrency": {"overlap": "forbid"},
-                "retry": {"backoffPolicy": "fixed"}
+                "retry": {
+                    "backoffPolicy": "fixed",
+                    "retryableClasses": [
+                        "transient_dispatch",
+                        "lease_expired",
+                        "runtime_unavailable"
+                    ]
+                },
+                "retention": {
+                    "occurrenceHistory": {"classification": "standard"},
+                    "runLogs": {"classification": "standard"},
+                    "receipts": {"classification": "standard"}
+                }
             }
         });
 
@@ -391,6 +785,15 @@ mod tests {
             preflight_definition(&json!({"trigger": {"variant": private_value}})).unwrap();
 
         assert_eq!(unsupported.variant, "trigger.unknown");
+        assert!(!unsupported.reason.contains("secret"));
+
+        let private_retry_class = format!("secret-{}", "x".repeat(500));
+        let unsupported = preflight_definition(&json!({"policies": {"retry": {
+            "retryableClasses": [private_retry_class]
+        }}}))
+        .unwrap();
+
+        assert_eq!(unsupported.variant, "retry.safe-classes.unknown");
         assert!(!unsupported.reason.contains("secret"));
     }
 

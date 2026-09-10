@@ -7,7 +7,9 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::capability_negotiation::{capability_profile, preflight_definition, UnsupportedVariant};
+use super::capability_negotiation::{
+    capability_profile, negotiate_definition, DefinitionNegotiation, UnsupportedVariant,
+};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{AdoptionConflictOutcome, ErrorAdoption, ErrorCode, ErrorEnvelope};
 use super::contract::types::{AdoptionKey, PositiveInteger};
@@ -431,14 +433,12 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
 }
 
 fn adoption_definition_preimage(definition: &Value) -> Result<Value> {
-    if preflight_definition(definition).is_some() {
-        return Ok(json!({
+    match negotiate_definition(definition) {
+        Ok(DefinitionNegotiation::Unsupported(_)) => Ok(json!({
             "kind": "unsupported",
             "value": lossless_json_fingerprint(definition),
-        }));
-    }
-    match RoutineDefinition::from_json(definition) {
-        Ok(definition) => Ok(json!({
+        })),
+        Ok(DefinitionNegotiation::Supported(definition)) => Ok(json!({
             "kind": "valid",
             "value": serde_json::to_value(definition)
                 .context("failed to normalize routine definition for adoption")?,
@@ -957,16 +957,12 @@ fn apply_create(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    if let Some(unsupported) = preflight_definition(definition_value) {
-        return Ok(capability_unsupported(unsupported));
-    }
-    let definition = match RoutineDefinition::from_json(definition_value)
-        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
-    {
-        Ok(definition) => definition,
-        Err(error) => {
-            return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+    let definition = match negotiate_definition(definition_value) {
+        Ok(DefinitionNegotiation::Supported(definition)) => *definition,
+        Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
+            return Ok(capability_unsupported(unsupported));
         }
+        Err(error) => return Ok(rejected(ErrorCode::ValidationFailed, error, None)),
     };
     if definition.status == super::definition::RoutineStatus::Disabled {
         return Ok(rejected(
@@ -1021,16 +1017,12 @@ fn apply_revise(
     expected_revision: Option<u64>,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    if let Some(unsupported) = preflight_definition(definition_value) {
-        return Ok(capability_unsupported(unsupported));
-    }
-    let definition = match RoutineDefinition::from_json(definition_value)
-        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
-    {
-        Ok(definition) => definition,
-        Err(error) => {
-            return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+    let definition = match negotiate_definition(definition_value) {
+        Ok(DefinitionNegotiation::Supported(definition)) => *definition,
+        Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
+            return Ok(capability_unsupported(unsupported));
         }
+        Err(error) => return Ok(rejected(ErrorCode::ValidationFailed, error, None)),
     };
     let Some(current) = current_definition_state(conn, &definition.id)? else {
         return Ok(rejected(
@@ -1510,6 +1502,176 @@ mod tests {
         );
         assert_eq!(adoption_count(&conn), 1);
         assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+    }
+
+    #[test]
+    fn unsupported_partial_create_remains_a_durable_validation_rejection() {
+        let (_temp, conn) = temp_store();
+        let command = DefinitionCommand::Create {
+            definition: json!({"misfire": "backfill"}),
+        };
+
+        let first = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            command.clone(),
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            first.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::ValidationFailed)
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert!(list_definitions(&conn).unwrap().is_empty());
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            command,
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(replay.error, first.error);
+        assert_eq!(adoption_count(&conn), 1);
+
+        let changed = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            DefinitionCommand::Create {
+                definition: definition("partial-unsupported", "Corrected"),
+            },
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            changed.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::AdoptionReplayMismatch)
+        );
+        assert!(list_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_create_does_not_mask_independent_validation_failures() {
+        let (_temp, conn) = temp_store();
+
+        let mut malformed_retry = definition("malformed-retry", "Malformed retry");
+        malformed_retry["outputTarget"] = json!("result.md");
+        malformed_retry["retry"] = json!({
+            "maxAttempts": 3,
+            "backoffPolicy": ["linear"]
+        });
+
+        let mut unknown_field = definition("unknown-field", "Unknown field");
+        unknown_field["outputTarget"] = json!("result.md");
+        unknown_field["futureField"] = json!("must fail closed");
+
+        let mut malformed_rich_policy =
+            definition("malformed-rich-policy", "Malformed rich policy");
+        malformed_rich_policy["outputTarget"] = json!("result.md");
+        malformed_rich_policy["policies"] = json!({
+            "retry": {"retryableClasses": "runtime_unavailable"}
+        });
+
+        let mut malformed_rrule = definition("malformed-rrule", "Malformed RRULE");
+        malformed_rrule["outputTarget"] = json!("result.md");
+        malformed_rrule["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+
+        let mut malformed_retention = definition("malformed-retention", "Malformed retention");
+        malformed_retention["outputTarget"] = json!("result.md");
+        malformed_retention["policies"] = json!({
+            "retention": {
+                "occurrenceHistory": {"classification": 1}
+            }
+        });
+
+        for (index, invalid) in [
+            malformed_retry,
+            unknown_field,
+            malformed_rich_policy,
+            malformed_rrule,
+            malformed_retention,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = execute_definition_command(
+                &conn,
+                &format!("adopt:create:unsupported-invalid:{index:04}"),
+                DefinitionCommand::Create {
+                    definition: invalid,
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(
+                response.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed),
+                "case {index}"
+            );
+        }
+
+        assert_eq!(adoption_count(&conn), 5);
+        assert!(list_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn rich_policy_variants_are_refused_only_when_the_flat_definition_is_valid() {
+        let (_temp, conn) = temp_store();
+
+        let mut retry = definition("unsupported-retry-class", "Unsupported retry class");
+        retry["policies"] = json!({
+            "retry": {
+                "retryableClasses": ["transient_dispatch", "ambiguous"]
+            }
+        });
+        let retry_response = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported-retry-class:0001",
+            DefinitionCommand::Create { definition: retry },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            retry_response.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::CapabilityUnsupported)
+        );
+        assert_eq!(
+            serde_json::to_value(retry_response.error.unwrap()).unwrap()["details"]["variant"],
+            "retry.safe-classes.ambiguous"
+        );
+
+        let mut retention = definition("unsupported-retention", "Unsupported retention");
+        retention["policies"] = json!({
+            "retention": {
+                "occurrenceHistory": {"classification": "standard"},
+                "receipts": {"classification": "extended"}
+            }
+        });
+        let retention_response = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported-retention:0001",
+            DefinitionCommand::Create {
+                definition: retention,
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            retention_response.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::CapabilityUnsupported)
+        );
+        assert_eq!(
+            serde_json::to_value(retention_response.error.unwrap()).unwrap()["details"]["variant"],
+            "retention.extended"
+        );
+
+        assert_eq!(adoption_count(&conn), 2);
+        assert!(list_definitions(&conn).unwrap().is_empty());
     }
 
     #[test]

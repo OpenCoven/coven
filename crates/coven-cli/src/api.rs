@@ -17539,6 +17539,165 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn control_actions_preserve_validation_precedence_over_capability_refusal() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let complete_definition = json!({
+            "schemaVersion": 1,
+            "id": "validation-precedence",
+            "name": "Validation precedence",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "local",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Must not be stored."
+        });
+        let cases = [
+            ("partial", json!({"misfire": "backfill"})),
+            ("malformed-retry", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["retry"] = json!({
+                    "maxAttempts": 3,
+                    "backoffPolicy": ["linear"]
+                });
+                definition
+            }),
+            ("unknown-field", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["futureField"] = json!("must fail closed");
+                definition
+            }),
+            ("malformed-rich-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {"retryableClasses": [1]}
+                });
+                definition
+            }),
+            ("malformed-rrule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+                definition
+            }),
+            ("malformed-retention", {
+                let mut definition = complete_definition;
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": false}
+                    }
+                });
+                definition
+            }),
+        ];
+
+        for (case, definition) in cases {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:validation-precedence:{case}"),
+                "definition": definition
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 400, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "VALIDATION_FAILED", "{case}");
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_refuse_unsupported_rich_policy_variants() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        for (case, policies, expected_variant) in [
+            (
+                "retry-class",
+                json!({
+                    "retry": {
+                        "retryableClasses": ["runtime_unavailable", "ambiguous"]
+                    }
+                }),
+                "retry.safe-classes.ambiguous",
+            ),
+            (
+                "retention",
+                json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": "standard"},
+                        "runLogs": {"classification": "ephemeral"}
+                    }
+                }),
+                "retention.ephemeral",
+            ),
+        ] {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:unsupported-policy:{case}"),
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": format!("unsupported-policy-{case}"),
+                    "name": "Unsupported policy",
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Must not be stored.",
+                    "policies": policies
+                }
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 422, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "CAPABILITY_UNSUPPORTED", "{case}");
+            assert_eq!(
+                body["error"]["details"]["variant"], expected_variant,
+                "{case}"
+            );
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
     fn control_actions_durably_reject_unsupported_create_and_revise_variants() -> anyhow::Result<()>
     {
         let temp_dir = tempfile::tempdir()?;
