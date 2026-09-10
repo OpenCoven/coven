@@ -3155,10 +3155,9 @@ fn fail_after_conditional_rollback(
                 ApprovedApplyFailure::RolledBack,
             )),
             Err(cleanup_error) => Err(approved_apply_error(
-                anyhow!(
-                    "{error:#}; approved proposal was rolled back but cleanup failed: \
-                     {cleanup_error:#}"
-                ),
+                error.context(format!(
+                    "approved proposal was rolled back but cleanup failed: {cleanup_error:#}"
+                )),
                 ApprovedApplyFailure::RolledBackCleanupFailed {
                     targets: prepared
                         .iter()

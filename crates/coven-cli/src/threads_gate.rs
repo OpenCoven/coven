@@ -29,7 +29,7 @@
 //! layers fail closed; neither can be skipped on the daemon's only
 //! arbitrary-file write path into familiar homes (`POST /familiars/{id}/edits`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -232,6 +232,7 @@ pub struct GateRequest<'a> {
 pub(crate) struct WeaveState {
     pub familiar_uuid: threads::FamiliarId,
     pub weave: threads::Weave,
+    pub baseline_snapshot: BTreeMap<String, Option<Vec<u8>>>,
 }
 
 /// Gate a proposal's protected targets through the coven-threads weave.
@@ -488,12 +489,18 @@ pub(crate) fn build_weave_state_for_writer_at(
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
     let mut woven = Vec::with_capacity(surfaces.len());
+    let mut baseline_snapshot = BTreeMap::new();
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
         let disk = read_surface(workspace, surface)?;
         let current_hash = threads::manifest_entry_hash(&surface_id, &disk);
 
         let baseline = load_baseline(conn, familiar_id, surface)?;
+        let validated_baseline = match &baseline {
+            Some(recorded) => Some(recorded.clone()),
+            None if bootstrap_missing_baselines => Some(current_hash.to_vec()),
+            None => None,
+        };
         let (entry_hash, drifted) = match baseline {
             Some(recorded) => {
                 let drifted = recorded.as_slice() != current_hash.as_slice();
@@ -508,6 +515,7 @@ pub(crate) fn build_weave_state_for_writer_at(
             }
             None => (current_hash.to_vec(), false),
         };
+        baseline_snapshot.insert(surface.clone(), validated_baseline);
 
         let mut thread = threads::Thread {
             id: threads::ThreadId::new(),
@@ -577,6 +585,7 @@ pub(crate) fn build_weave_state_for_writer_at(
     Ok(WeaveState {
         familiar_uuid,
         weave,
+        baseline_snapshot,
     })
 }
 

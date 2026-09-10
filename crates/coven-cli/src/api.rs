@@ -391,6 +391,62 @@ fn set_proposal_decision_failpoint(failpoint: Option<(ProposalDecisionFailpoint,
     }
 }
 
+#[cfg(test)]
+fn proposal_baseline_commit_mutations(
+) -> &'static Mutex<std::collections::HashMap<String, (String, String, Vec<u8>)>> {
+    static MUTATIONS: OnceLock<
+        Mutex<std::collections::HashMap<String, (String, String, Vec<u8>)>>,
+    > = OnceLock::new();
+    MUTATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_proposal_baseline_commit_mutation(
+    proposal_id: String,
+    familiar_id: String,
+    surface: String,
+    entry_hash: Vec<u8>,
+) {
+    proposal_baseline_commit_mutations()
+        .lock()
+        .expect("proposal baseline mutation lock poisoned")
+        .insert(proposal_id, (familiar_id, surface, entry_hash));
+}
+
+fn maybe_mutate_proposal_baseline_before_commitment(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+) -> Result<()> {
+    #[cfg(test)]
+    {
+        let mutation = proposal_baseline_commit_mutations()
+            .lock()
+            .expect("proposal baseline mutation lock poisoned")
+            .remove(proposal_id);
+        if let Some((familiar_id, surface, entry_hash)) = mutation {
+            let changed = conn.execute(
+                "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(familiar_id, surface) DO UPDATE
+                 SET entry_hash = excluded.entry_hash",
+                rusqlite::params![
+                    familiar_id,
+                    surface,
+                    uuid::Uuid::nil().to_string(),
+                    entry_hash
+                ],
+            )?;
+            anyhow::ensure!(
+                changed == 1,
+                "proposal baseline mutation did not match one manifest row"
+            );
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (conn, proposal_id);
+    Ok(())
+}
+
 fn recovery_authorization(
     _proposal_id: &str,
     authorization: &ward::Authorization,
@@ -8146,6 +8202,8 @@ struct ProposalDecisionStatePreflight {
     #[serde(default)]
     recovery_commitment: Option<JsonByteArrayLen>,
     #[serde(default)]
+    baseline_snapshot: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
     weave_hash: Option<JsonByteArrayLen>,
     #[serde(default)]
     rationale: Option<serde::de::IgnoredAny>,
@@ -9543,21 +9601,22 @@ fn proposal_recovery_is_proven_unapplied(
     {
         return false;
     }
-    let targets: Vec<String> = pending
-        .edits
-        .iter()
-        .map(|edit| edit.surface.as_str().to_string())
-        .collect();
+    let Some(expected_baselines) = applying.baseline_snapshot.as_ref() else {
+        return false;
+    };
+    let Ok(live_baselines) = reload_proposal_baselines(conn, &familiar_id, expected_baselines)
+    else {
+        return false;
+    };
     let Ok(commitment) = proposal_recovery_commitment(
-        conn,
         &config,
         document,
         ProposalRecoveryContext {
             coven_home,
             workspace: &workspace,
             familiar_id: &familiar_id,
-            targets: &targets,
             authorization: &authorization_from_writer(&pending.writer),
+            baseline_snapshot: &live_baselines,
             identity_context: None,
             require_bound_identity_context: false,
         },
@@ -10486,16 +10545,26 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
+        let Some(expected_baselines) = applying.baseline_snapshot.as_ref() else {
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-recovery-intent-unverifiable",
+                    "proposalId": proposal_id,
+                }),
+            );
+        };
+        let live_baselines = reload_proposal_baselines(&conn, &familiar_id, expected_baselines)?;
         let recovery_commitment = proposal_recovery_commitment(
-            &conn,
             &config,
             &document,
             ProposalRecoveryContext {
                 coven_home,
                 workspace: &workspace,
                 familiar_id: &familiar_id,
-                targets: &targets,
                 authorization: &authorization,
+                baseline_snapshot: &live_baselines,
                 identity_context: None,
                 require_bound_identity_context: false,
             },
@@ -10959,6 +11028,10 @@ fn decide_threads_proposal_inner(
             }
         };
         let expected_before = proposal_expected_before(&applying)?;
+        let expected_baselines = applying
+            .baseline_snapshot
+            .as_ref()
+            .context("verified recovery state lost its baseline snapshot")?;
         let recovery_authorization = recovery_authorization(proposal_id, &authorization);
         if !ward_config_is_unchanged(&workspace, &config)? {
             return json_response(
@@ -10985,8 +11058,8 @@ fn decide_threads_proposal_inner(
                         coven_home,
                         workspace: &workspace,
                         familiar_id: &familiar_id,
-                        targets: &targets,
                         authorization: &authorization,
+                        baseline_snapshot: expected_baselines,
                         identity_context: None,
                         require_bound_identity_context: false,
                     },
@@ -11015,10 +11088,9 @@ fn decide_threads_proposal_inner(
                         Some(ward::ApprovedApplyFailure::Applied(report)) => {
                             (report, Some(format!("{error:#}")))
                         }
-                        Some(
-                            ward::ApprovedApplyFailure::NoWrite
-                            | ward::ApprovedApplyFailure::RolledBack,
-                        ) if is_final_authority_drift(&error) => {
+                        Some(ward::ApprovedApplyFailure::NoWrite)
+                            if is_final_authority_drift(&error) =>
+                        {
                             claim.preserve();
                             audit_reservation.preserve()?;
                             return json_response(
@@ -11030,6 +11102,31 @@ fn decide_threads_proposal_inner(
                                     "terminal": false,
                                 }),
                             );
+                        }
+                        Some(
+                            failure @ (ward::ApprovedApplyFailure::RolledBack
+                            | ward::ApprovedApplyFailure::RolledBackCleanupFailed {
+                                ..
+                            }),
+                        ) if is_final_authority_drift(&error) => {
+                            if let Some(opened) = opened_window.as_ref() {
+                                claim.preserve();
+                                append_open_window_revalidation_failure(
+                                    &conn,
+                                    proposal_id,
+                                    pending,
+                                    opened,
+                                    &decision_semantics.approval_path_label,
+                                    note.as_deref(),
+                                    decision_now,
+                                )?;
+                                audit_reservation.finish()?;
+                                claim.consume()?;
+                                return final_authority_drift_response(proposal_id, true, &failure);
+                            }
+                            claim.restore_pending(&document)?;
+                            audit_reservation.finish()?;
+                            return final_authority_drift_response(proposal_id, false, &failure);
                         }
                         Some(
                             failure @ (ward::ApprovedApplyFailure::RolledBack
@@ -11278,16 +11375,16 @@ fn decide_threads_proposal_inner(
             );
         }
     }
+    maybe_mutate_proposal_baseline_before_commitment(&conn, proposal_id)?;
     let recovery_commitment = proposal_recovery_commitment(
-        &conn,
         &config,
         &document,
         ProposalRecoveryContext {
             coven_home,
             workspace: &workspace,
             familiar_id: &familiar_id,
-            targets: &targets,
             authorization: &authorization,
+            baseline_snapshot: &state.baseline_snapshot,
             identity_context: identity_context.as_ref(),
             require_bound_identity_context: true,
         },
@@ -11295,6 +11392,7 @@ fn decide_threads_proposal_inner(
     let applying = ProposalApplyingState {
         decision: "approve".to_string(),
         recovery_commitment,
+        baseline_snapshot: Some(state.baseline_snapshot.clone()),
         weave_hash: state.weave.weave_hash().to_vec(),
         before_images,
         rationale: note.clone(),
@@ -11360,8 +11458,11 @@ fn decide_threads_proposal_inner(
                     coven_home,
                     workspace: &workspace,
                     familiar_id: &familiar_id,
-                    targets: &targets,
                     authorization: &authorization,
+                    baseline_snapshot: applying
+                        .baseline_snapshot
+                        .as_ref()
+                        .expect("new applying state carries its validated baseline snapshot"),
                     identity_context: None,
                     require_bound_identity_context: false,
                 },
@@ -11393,8 +11494,9 @@ fn decide_threads_proposal_inner(
                         (report, Some(format!("{error:#}")))
                     }
                     Some(
-                        ward::ApprovedApplyFailure::NoWrite
-                        | ward::ApprovedApplyFailure::RolledBack,
+                        failure @ (ward::ApprovedApplyFailure::NoWrite
+                        | ward::ApprovedApplyFailure::RolledBack
+                        | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
                     ) if is_final_authority_drift(&error) => {
                         if let Some(opened) = opened_window.as_ref() {
                             claim.preserve();
@@ -11409,15 +11511,7 @@ fn decide_threads_proposal_inner(
                             )?;
                             audit_reservation.finish()?;
                             claim.consume()?;
-                            return json_response(
-                                409,
-                                &json!({
-                                    "blocked": true,
-                                    "why": "proposal-revalidation-failed",
-                                    "proposalId": proposal_id,
-                                    "terminal": true,
-                                }),
-                            );
+                            return final_authority_drift_response(proposal_id, true, &failure);
                         }
                         append_proposal_refusal_audit(
                             &conn,
@@ -11431,15 +11525,7 @@ fn decide_threads_proposal_inner(
                         )?;
                         claim.restore_pending(&document)?;
                         audit_reservation.finish()?;
-                        return json_response(
-                            409,
-                            &json!({
-                                "blocked": true,
-                                "why": "proposal-revalidation-failed",
-                                "proposalId": proposal_id,
-                                "terminal": false,
-                            }),
-                        );
+                        return final_authority_drift_response(proposal_id, false, &failure);
                     }
                     Some(
                         failure @ (ward::ApprovedApplyFailure::NoWrite
@@ -12524,6 +12610,8 @@ fn proposal_decision_request(raw_value: &Value) -> Result<Option<ProposalDecisio
 struct ProposalApplyingState {
     decision: String,
     recovery_commitment: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    baseline_snapshot: Option<BTreeMap<String, Option<Vec<u8>>>>,
     weave_hash: Vec<u8>,
     before_images: Vec<ProposalBeforeImage>,
     rationale: Option<String>,
@@ -12548,14 +12636,13 @@ struct ProposalRecoveryContext<'a> {
     coven_home: &'a Path,
     workspace: &'a Path,
     familiar_id: &'a str,
-    targets: &'a [String],
     authorization: &'a ward::Authorization,
+    baseline_snapshot: &'a BTreeMap<String, Option<Vec<u8>>>,
     identity_context: Option<&'a coven_threads_core::CandidateIdentityContext>,
     require_bound_identity_context: bool,
 }
 
 fn proposal_recovery_commitment(
-    conn: &rusqlite::Connection,
     config: &ward::WardConfig,
     document: &ProposalEnvelopeDocument,
     context: ProposalRecoveryContext<'_>,
@@ -12564,25 +12651,22 @@ fn proposal_recovery_commitment(
         coven_home,
         workspace,
         familiar_id,
-        targets,
         authorization,
+        baseline_snapshot,
         identity_context,
         require_bound_identity_context,
     } = context;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"coven:proposal-decision-recovery:v2");
+    hasher.update(b"coven:proposal-decision-recovery:v3");
     let config_bytes = serde_json::to_vec(config).context("serializing Ward config")?;
     hasher.update(&(config_bytes.len() as u64).to_be_bytes());
     hasher.update(&config_bytes);
     let authority_bytes = document.authority_bytes()?;
     hasher.update(&(authority_bytes.len() as u64).to_be_bytes());
     hasher.update(&authority_bytes);
-    let mut targets = targets.to_vec();
-    targets.sort();
-    for target in targets {
-        hasher.update(&(target.len() as u64).to_be_bytes());
-        hasher.update(target.as_bytes());
-        let baseline = crate::threads_gate::load_baseline(conn, familiar_id, &target)?;
+    for (surface, baseline) in baseline_snapshot {
+        hasher.update(&(surface.len() as u64).to_be_bytes());
+        hasher.update(surface.as_bytes());
         match baseline {
             Some(bytes) => {
                 hasher.update(&[1]);
@@ -12662,6 +12746,47 @@ fn is_final_authority_drift(error: &anyhow::Error) -> bool {
     })
 }
 
+fn final_authority_drift_response(
+    proposal_id: &str,
+    terminal: bool,
+    failure: &ward::ApprovedApplyFailure,
+) -> Result<ApiResponse> {
+    let mut body = json!({
+        "blocked": true,
+        "why": "proposal-revalidation-failed",
+        "proposalId": proposal_id,
+        "terminal": terminal,
+    });
+    if let ward::ApprovedApplyFailure::RolledBackCleanupFailed { targets } = failure {
+        body.as_object_mut()
+            .expect("proposal revalidation response is an object")
+            .insert(
+                "cleanupFailure".to_string(),
+                json!({
+                    "temporaryArtifactsRemain": true,
+                    "targets": targets,
+                }),
+            );
+    }
+    json_response(409, &body)
+}
+
+fn reload_proposal_baselines(
+    conn: &rusqlite::Connection,
+    familiar_id: &str,
+    expected: &BTreeMap<String, Option<Vec<u8>>>,
+) -> Result<BTreeMap<String, Option<Vec<u8>>>> {
+    expected
+        .keys()
+        .map(|surface| {
+            Ok((
+                surface.clone(),
+                crate::threads_gate::load_baseline(conn, familiar_id, surface)?,
+            ))
+        })
+        .collect()
+}
+
 fn ensure_proposal_final_authority_unchanged(
     conn: &rusqlite::Connection,
     config: &ward::WardConfig,
@@ -12674,8 +12799,23 @@ fn ensure_proposal_final_authority_unchanged(
     {
         return Err(final_authority_drift("ward-config-changed", None));
     }
-    let current = proposal_recovery_commitment(conn, config, document, context)
-        .map_err(|error| final_authority_drift("authority-evidence-unavailable", Some(error)))?;
+    let live_baselines =
+        reload_proposal_baselines(conn, context.familiar_id, context.baseline_snapshot)
+            .map_err(|error| final_authority_drift("baseline-evidence-unavailable", Some(error)))?;
+    let current = proposal_recovery_commitment(
+        config,
+        document,
+        ProposalRecoveryContext {
+            coven_home: context.coven_home,
+            workspace: context.workspace,
+            familiar_id: context.familiar_id,
+            authorization: context.authorization,
+            baseline_snapshot: &live_baselines,
+            identity_context: context.identity_context,
+            require_bound_identity_context: context.require_bound_identity_context,
+        },
+    )
+    .map_err(|error| final_authority_drift("authority-evidence-unavailable", Some(error)))?;
     if current != expected_recovery_commitment {
         return Err(final_authority_drift("authority-evidence-changed", None));
     }
@@ -30271,6 +30411,38 @@ tier = 0
     }
 
     #[test]
+    fn identity_predicate_approve_binds_the_validated_baseline_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_baseline_commit_mutation(
+            proposal_id.clone(),
+            "sage".to_string(),
+            "TOOLS.md".to_string(),
+            vec![0x5a; 32],
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert!(pending.exists(), "failed approval must stay pending");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools before\n"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn identity_predicate_recovery_preserves_claim_if_identity_evidence_diverged() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -30317,6 +30489,102 @@ tier = 0
         assert_eq!(
             std::fs::read_to_string(workspace.join("TOOLS.md"))?,
             "Synthetic tools after\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_recovery_restores_pending_after_proven_drift_rollback() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        );
+        assert!(interrupted.is_err());
+
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a recovery claim");
+        std::fs::write(workspace.join("TOOLS.md"), "Synthetic tools before\n")?;
+        crate::ward::set_conditional_write_actions(
+            workspace.canonicalize()?.join("TOOLS.md"),
+            vec![(
+                workspace.canonicalize()?.join("IDENTITY.md"),
+                b"# IDENTITY.md - Synthetic-other\n- **Name:** Synthetic-other\n- **Pronouns:** they/them\n"
+                    .to_vec(),
+            )],
+        );
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(retry.status, 409, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert_eq!(body["terminal"], false);
+        assert!(
+            pending.exists(),
+            "proven rollback must restore the proposal"
+        );
+        assert!(!claim.exists(), "applying claim must not remain stranded");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools before\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identity_predicate_drift_reports_cleanup_failure_after_proven_rollback() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) = stage_pending_identity_predicate_edit(home)?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        let target = workspace.canonicalize()?.join("TOOLS.md");
+        crate::ward::set_conditional_write_actions(
+            target.clone(),
+            vec![(
+                workspace.canonicalize()?.join("IDENTITY.md"),
+                b"# IDENTITY.md - Synthetic-other\n- **Name:** Synthetic-other\n- **Pronouns:** they/them\n"
+                    .to_vec(),
+            )],
+        );
+        crate::ward::set_cleanup_artifact_replacement(
+            target,
+            b"concurrent staging replacement".to_vec(),
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-revalidation-failed");
+        assert_eq!(body["cleanupFailure"]["temporaryArtifactsRemain"], true);
+        assert_eq!(body["cleanupFailure"]["targets"], json!(["TOOLS.md"]));
+        assert!(pending.exists(), "failed approval must stay pending");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "Synthetic tools before\n"
         );
         Ok(())
     }
