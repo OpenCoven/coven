@@ -38,6 +38,7 @@ pub enum ConformanceResultError {
     RunnerVersionMismatch,
     RunnerArtifactDigestMismatch,
     VectorSetDigestMismatch,
+    SubjectArtifactMismatch,
     ProfileDuplicate,
     SuiteDuplicate,
     SuiteSetMismatch,
@@ -83,6 +84,7 @@ impl fmt::Display for ConformanceResultError {
                 "conformance runner artifact digest does not match"
             }
             Self::VectorSetDigestMismatch => "conformance vector set digest does not match",
+            Self::SubjectArtifactMismatch => "conformance subject artifact does not match",
             Self::ProfileDuplicate => "conformance profile results contain a duplicate",
             Self::SuiteDuplicate => "conformance suite results contain a duplicate",
             Self::SuiteSetMismatch => "conformance required suite results do not match",
@@ -447,6 +449,22 @@ pub struct ConformanceRunnerBinding {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConformanceArtifactPlatform {
+    pub os: ConformanceEnvironmentFact,
+    pub arch: ConformanceEnvironmentFact,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConformanceSubjectArtifactBinding {
+    pub artifact_id: ConformanceResultId,
+    pub artifact_version: ConformanceVersion,
+    pub platform: ConformanceArtifactPlatform,
+    pub sha256: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConformanceEnvironment {
     pub os: ConformanceEnvironmentFact,
     pub arch: ConformanceEnvironmentFact,
@@ -498,6 +516,7 @@ pub struct ConformanceResultStatement {
     pub source: ConformanceSourceBinding,
     pub protocol_artifact: ConformanceProtocolArtifactBinding,
     pub runner: ConformanceRunnerBinding,
+    pub subject_artifact: ConformanceSubjectArtifactBinding,
     pub environment: ConformanceEnvironment,
     pub observed_at: ConformanceTimestamp,
     #[serde(
@@ -616,6 +635,7 @@ pub struct ExpectedArtifactBinding {
     source: ExpectedSourceBinding,
     protocol_artifact: ExpectedProtocolArtifactBinding,
     runner: ExpectedRunnerBinding,
+    subject_artifact: ExpectedSubjectArtifactBinding,
 }
 
 impl ExpectedArtifactBinding {
@@ -624,12 +644,43 @@ impl ExpectedArtifactBinding {
         source: ExpectedSourceBinding,
         protocol_artifact: ExpectedProtocolArtifactBinding,
         runner: ExpectedRunnerBinding,
+        subject_artifact: ExpectedSubjectArtifactBinding,
     ) -> Self {
         Self {
             source,
             protocol_artifact,
             runner,
+            subject_artifact,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedSubjectArtifactBinding {
+    artifact_id: ConformanceResultId,
+    artifact_version: ConformanceVersion,
+    platform: ConformanceArtifactPlatform,
+    sha256: Sha256Digest,
+}
+
+impl ExpectedSubjectArtifactBinding {
+    pub fn new(
+        artifact_id: impl Into<String>,
+        artifact_version: impl Into<String>,
+        os: impl Into<String>,
+        arch: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Result<Self, ConformanceResultError> {
+        Ok(Self {
+            artifact_id: ConformanceResultId::new(artifact_id)?,
+            artifact_version: ConformanceVersion::new(artifact_version)?,
+            platform: ConformanceArtifactPlatform {
+                os: ConformanceEnvironmentFact::new(os)?,
+                arch: ConformanceEnvironmentFact::new(arch)?,
+            },
+            sha256: Sha256Digest::new(sha256.into())
+                .map_err(|_| ConformanceResultError::SchemaInvalid)?,
+        })
     }
 }
 
@@ -934,6 +985,13 @@ fn verify_exact_binding(
     }
     if statement.runner.vector_set_sha256 != expected.runner.vector_set_sha256 {
         return Err(ConformanceResultError::VectorSetDigestMismatch);
+    }
+    if statement.subject_artifact.artifact_id != expected.subject_artifact.artifact_id
+        || statement.subject_artifact.artifact_version != expected.subject_artifact.artifact_version
+        || statement.subject_artifact.platform != expected.subject_artifact.platform
+        || statement.subject_artifact.sha256 != expected.subject_artifact.sha256
+    {
+        return Err(ConformanceResultError::SubjectArtifactMismatch);
     }
     Ok(())
 }

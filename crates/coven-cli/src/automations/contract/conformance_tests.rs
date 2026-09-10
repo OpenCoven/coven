@@ -14,7 +14,7 @@ use super::conformance::{
     ConformanceProfileRequirement, ConformanceResult, ConformanceResultError,
     ConformanceTrustPolicy, ConformanceVerificationClass, ExpectedArtifactBinding,
     ExpectedPolicyBinding, ExpectedProtocolArtifactBinding, ExpectedRunnerBinding,
-    ExpectedSourceBinding,
+    ExpectedSourceBinding, ExpectedSubjectArtifactBinding,
 };
 
 const SOURCE_REPOSITORY: &str = "https://example.invalid/OpenCoven/coven";
@@ -26,6 +26,10 @@ const RUNNER_NAME: &str = "fixture-conformance-runner";
 const RUNNER_VERSION: &str = "1.0.0-test";
 const RUNNER_SHA256: &str = "3333333333333333333333333333333333333333333333333333333333333333";
 const VECTOR_SHA256: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+const SUBJECT_ARTIFACT_ID: &str = "coven-cli-macos-aarch64";
+const SUBJECT_ARTIFACT_VERSION: &str = "0.0.0-test";
+const SUBJECT_ARTIFACT_SHA256: &str =
+    "6666666666666666666666666666666666666666666666666666666666666666";
 const POLICY_ID: &str = "release-policy";
 const POLICY_VERSION: &str = "2026-09-10";
 const POLICY_DIGEST: &str = "5555555555555555555555555555555555555555555555555555555555555555";
@@ -89,6 +93,15 @@ fn base_statement(
             "version": RUNNER_VERSION,
             "artifactSha256": RUNNER_SHA256,
             "vectorSetSha256": VECTOR_SHA256
+        },
+        "subjectArtifact": {
+            "artifactId": SUBJECT_ARTIFACT_ID,
+            "artifactVersion": SUBJECT_ARTIFACT_VERSION,
+            "platform": {
+                "os": "macos",
+                "arch": "aarch64"
+            },
+            "sha256": SUBJECT_ARTIFACT_SHA256
         },
         "environment": {
             "os": "linux",
@@ -198,6 +211,14 @@ fn expected_binding_with_file_count(file_count: u64) -> ExpectedArtifactBinding 
         .expect("valid expected protocol artifact"),
         ExpectedRunnerBinding::new(RUNNER_NAME, RUNNER_VERSION, RUNNER_SHA256, VECTOR_SHA256)
             .expect("valid expected runner"),
+        ExpectedSubjectArtifactBinding::new(
+            SUBJECT_ARTIFACT_ID,
+            SUBJECT_ARTIFACT_VERSION,
+            "macos",
+            "aarch64",
+            SUBJECT_ARTIFACT_SHA256,
+        )
+        .expect("valid expected subject artifact"),
     )
 }
 
@@ -355,6 +376,16 @@ fn checked_in_schema_vectors_manifest_and_types_are_listed() {
             "missing vector case: {expected}"
         );
     }
+    for case in vectors["cases"]
+        .as_array()
+        .expect("conformance result cases")
+    {
+        assert!(
+            case["object"]["statement"]["subjectArtifact"].is_object(),
+            "vector case must bind the tested subject artifact: {}",
+            case["name"]
+        );
+    }
     assert!(manifest["schemas"]
         .as_array()
         .expect("schema list")
@@ -371,6 +402,10 @@ fn checked_in_schema_vectors_manifest_and_types_are_listed() {
         "export interface ConformanceReleaseEligibilityStatement",
         "export type ConformanceResultStatement =",
         "export type ConformanceResult =",
+        "export interface ConformanceSubjectArtifactBinding",
+        "subjectArtifact: ConformanceSubjectArtifactBinding;",
+        "status: \"passed\";",
+        "evidenceDigest: Digest;",
         "authentication: ConformanceResultAuthentication;",
         "method: \"p256-sha256\";",
     ] {
@@ -611,6 +646,13 @@ fn every_exact_source_artifact_and_runner_mismatch_is_rejected() {
                 value["statement"]["runner"]["vectorSetSha256"] = json!("d".repeat(64));
             },
             ConformanceResultError::VectorSetDigestMismatch,
+        ),
+        (
+            "subject artifact digest",
+            |value| {
+                value["statement"]["subjectArtifact"]["sha256"] = json!("7".repeat(64));
+            },
+            ConformanceResultError::SubjectArtifactMismatch,
         ),
     ];
 

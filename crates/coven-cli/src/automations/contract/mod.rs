@@ -40,7 +40,7 @@ pub use conformance::{
     ConformanceProfileRequirement, ConformanceResult, ConformanceResultError,
     ConformanceTrustPolicy, ConformanceVerificationClass, ExpectedArtifactBinding,
     ExpectedPolicyBinding, ExpectedProtocolArtifactBinding, ExpectedRunnerBinding,
-    ExpectedSourceBinding, VerifiedConformanceResult,
+    ExpectedSourceBinding, ExpectedSubjectArtifactBinding, VerifiedConformanceResult,
 };
 #[allow(unused_imports)]
 pub use error::{ErrorCode, ErrorEnvelope};

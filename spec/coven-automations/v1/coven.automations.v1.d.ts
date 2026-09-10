@@ -599,17 +599,33 @@ export interface ConformanceRunnerBinding {
   vectorSetSha256: string;
 }
 
+export interface ConformanceSubjectArtifactBinding {
+  artifactId: string;
+  artifactVersion: string;
+  platform: {
+    os: string;
+    arch: string;
+  };
+  sha256: string;
+}
+
 export interface ConformanceEnvironment {
   os: string;
   arch: string;
   runtime: string;
 }
 
-export interface ConformanceSuiteResult {
-  suiteId: string;
-  status: ConformanceStatus;
-  evidenceDigest?: Digest;
-}
+export type ConformanceSuiteResult =
+  | {
+      suiteId: string;
+      status: "passed";
+      evidenceDigest: Digest;
+    }
+  | {
+      suiteId: string;
+      status: "failed" | "incomplete" | "not_applicable";
+      evidenceDigest?: Digest;
+    };
 
 export interface ConformanceProfileResult {
   profile: ConformanceProfile;
@@ -624,6 +640,7 @@ export interface ConformanceResultStatementBase {
   source: ConformanceSourceBinding;
   protocolArtifact: ConformanceProtocolArtifactBinding;
   runner: ConformanceRunnerBinding;
+  subjectArtifact: ConformanceSubjectArtifactBinding;
   environment: ConformanceEnvironment;
   observedAt: Timestamp;
   profileResults: ConformanceProfileResult[];

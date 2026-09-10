@@ -254,6 +254,47 @@
         }
       }
     },
+    "artifactPlatform": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "os",
+        "arch"
+      ],
+      "properties": {
+        "os": {
+          "$ref": "#/$defs/environmentFact"
+        },
+        "arch": {
+          "$ref": "#/$defs/environmentFact"
+        }
+      }
+    },
+    "subjectArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "artifactId",
+        "artifactVersion",
+        "platform",
+        "sha256"
+      ],
+      "properties": {
+        "artifactId": {
+          "$ref": "#/$defs/resultId"
+        },
+        "artifactVersion": {
+          "$ref": "#/$defs/version"
+        },
+        "platform": {
+          "$ref": "#/$defs/artifactPlatform"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      },
+      "description": "Exact implementation package, binary, archive, or image exercised by the suites. This is distinct from the protocol bundle and conformance runner artifacts."
+    },
     "environment": {
       "type": "object",
       "additionalProperties": false,
@@ -357,6 +398,7 @@
         "source",
         "protocolArtifact",
         "runner",
+        "subjectArtifact",
         "environment",
         "observedAt",
         "profileResults",
@@ -380,6 +422,9 @@
         },
         "runner": {
           "$ref": "#/$defs/runner"
+        },
+        "subjectArtifact": {
+          "$ref": "#/$defs/subjectArtifact"
         },
         "environment": {
           "$ref": "#/$defs/environment",

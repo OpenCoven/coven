@@ -64,16 +64,18 @@ Required test suites and canary requirements (Coven, SDK, Cave — each against 
 `conformance-result.schema.json` and `conformance-result.vectors.json` define the
 portable envelope accepted by the Rust verifier. The verifier always checks the
 JCS statement digest and exact source, protocol artifact, runner artifact, and
-vector-set bindings. An `audit_only` result remains audit-only even when it has
-a valid trusted signature. A `release_eligibility` result additionally requires
-the caller's exact policy binding, a caller-pinned suite inventory for every
-required passed profile, an exact match to one caller-allowed environment,
-bounded freshness, expiry, and a valid P-256 signature from a caller-supplied
-trusted key. The result's own `requiredSuites` values are evidence to compare
-against that policy; they are never a release trust root and are not derived
-from ambient source files. A policy requiring the `full` profile must also pin
-the exact suite inventory for all six component profiles; a producer cannot
-hide dummy component suites behind a passed `full` status.
+vector-set bindings, plus the exact implementation package, binary, archive, or
+image exercised by the suites. An `audit_only` result remains audit-only even
+when it has a valid trusted signature. A `release_eligibility` result
+additionally requires the caller's exact subject-artifact and policy bindings,
+a caller-pinned suite inventory for every required passed profile, an exact
+match to one caller-allowed environment, bounded freshness, expiry, and a valid
+P-256 signature from a caller-supplied trusted key. The result's own
+`requiredSuites` values are evidence to compare against that policy; they are
+never a release trust root and are not derived from ambient source files. A
+policy requiring the `full` profile must also pin the exact suite inventory for
+all six component profiles; a producer cannot hide dummy component suites
+behind a passed `full` status.
 
 This slice defines and verifies result envelopes only. It does **not** execute
 the vectors, certify the daemon or npm packages, provide a production signer or

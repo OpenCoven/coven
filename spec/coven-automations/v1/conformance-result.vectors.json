@@ -33,6 +33,15 @@
             "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
             "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
           },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
           "environment": {
             "os": "linux",
             "arch": "x86_64",
@@ -60,7 +69,7 @@
         "statementDigest": {
           "algorithm": "sha256",
           "canonicalization": "jcs-rfc8785",
-          "value": "e3e477f5825e3445f3c4b8453079267544df16a995257c38dadd9665252295aa"
+          "value": "aa1c589956523d9b06ca76312e80090680cc935fbbb705f88a7bbd242c1cb7f1"
         }
       }
     },
@@ -92,6 +101,15 @@
             "version": "1.0.0-test",
             "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
             "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
           },
           "environment": {
             "os": "linux",
@@ -153,6 +171,15 @@
             "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
             "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
           },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
           "environment": {
             "os": "linux",
             "arch": "x86_64",
@@ -180,7 +207,7 @@
         "statementDigest": {
           "algorithm": "sha256",
           "canonicalization": "jcs-rfc8785",
-          "value": "f6890b88ae5f71150a9cf9407643e40ff104775464c40e457ef1460c17b0f31b"
+          "value": "cb654ab7431aa11468187c1c3b2769067a60e3730fda7064d78bed5588f10da3"
         }
       }
     },
@@ -212,6 +239,15 @@
             "version": "1.0.0-test",
             "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
             "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
           },
           "environment": {
             "os": "linux",
@@ -335,7 +371,7 @@
         "statementDigest": {
           "algorithm": "sha256",
           "canonicalization": "jcs-rfc8785",
-          "value": "82c27cd09f92153fe697d77f4ed1eb538bedb229ed9e334bb32216062ee92d18"
+          "value": "3c098fe6ad42c3a3e3eda07de16683dbae0acdc477d5b5b2157fc0e2492bfcf3"
         }
       }
     }
