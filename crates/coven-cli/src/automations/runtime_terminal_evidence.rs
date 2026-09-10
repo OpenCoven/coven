@@ -98,8 +98,31 @@ pub(crate) fn ensure_runtime_terminal_evidence_schema(conn: &Connection) -> Anyh
     if classification_requires_upgrade || binding_index_requires_upgrade(conn)? {
         return migrate_runtime_terminal_evidence_schema(conn);
     }
-    conn.execute_batch(AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL)
+    // A savepoint commits standalone initialization without owning a caller's transaction.
+    let owns_transaction = conn.is_autocommit();
+    conn.execute_batch("SAVEPOINT automation_runtime_terminal_evidence_schema")
+        .context("failed to begin runtime evidence schema savepoint")?;
+    let result = conn
+        .execute_batch(AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL)
         .context("failed to initialize automation runtime terminal evidence schema")
+        .and_then(|()| {
+            conn.execute_batch("RELEASE SAVEPOINT automation_runtime_terminal_evidence_schema")
+                .context("failed to release runtime evidence schema savepoint")
+        });
+    if let Err(error) = result {
+        // RELEASE can remain busy even after ROLLBACK TO an outermost savepoint.
+        let rollback = if owns_transaction {
+            "ROLLBACK"
+        } else {
+            "ROLLBACK TO SAVEPOINT automation_runtime_terminal_evidence_schema;
+             RELEASE SAVEPOINT automation_runtime_terminal_evidence_schema;"
+        };
+        conn.execute_batch(rollback).with_context(|| {
+            format!("failed to roll back runtime evidence schema after: {error:#}")
+        })?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn binding_index_requires_upgrade(conn: &Connection) -> AnyhowResult<bool> {
@@ -740,9 +763,10 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        canonical_evidence, read_verified_runtime_terminal_evidence,
-        store_runtime_terminal_evidence, RuntimeTerminalEvidenceLookup,
-        RuntimeTerminalEvidenceStoreOutcome, AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL,
+        canonical_evidence, ensure_runtime_terminal_evidence_schema,
+        read_verified_runtime_terminal_evidence, store_runtime_terminal_evidence,
+        RuntimeTerminalEvidenceLookup, RuntimeTerminalEvidenceStoreOutcome,
+        AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL,
     };
     use crate::automations::contract::authority::test_support::{fixture, resign_binding};
     use crate::automations::contract::canonical_json::{canonicalize, sha256_hex};
@@ -1108,6 +1132,152 @@ mod tests {
             )
             .unwrap();
         extension["executionBinding"].clone()
+    }
+
+    fn schema_objects(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn schema_late_ddl_failure_leaves_no_new_prefix() {
+        for existing in [false, true] {
+            for nested in [false, true] {
+                let temp = tempfile::tempdir().unwrap();
+                let path = temp.path().join("runtime-evidence.sqlite");
+                let conn = Connection::open(&path).unwrap();
+                if existing {
+                    conn.execute_batch(AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL)
+                        .unwrap();
+                    conn.execute_batch(
+                        "DROP INDEX idx_automation_runtime_terminal_evidence_run;
+                         DROP INDEX idx_automation_runtime_terminal_evidence_binding;
+                         DROP TRIGGER automation_runtime_terminal_evidence_no_update;
+                         DROP TRIGGER automation_runtime_terminal_evidence_no_delete;",
+                    )
+                    .unwrap();
+                }
+                // The third DDL statement fails after the table and run index succeed.
+                conn.execute_batch(
+                    "CREATE TABLE idx_automation_runtime_terminal_evidence_binding (id INTEGER);
+                     CREATE TABLE caller_state (id INTEGER);",
+                )
+                .unwrap();
+                let before = schema_objects(&conn);
+                if nested {
+                    conn.execute_batch("BEGIN; INSERT INTO caller_state VALUES (1);")
+                        .unwrap();
+                }
+
+                let error = ensure_runtime_terminal_evidence_schema(&conn).unwrap_err();
+                assert!(
+                    format!("{error:#}").contains(
+                        "there is already a table named idx_automation_runtime_terminal_evidence_binding"
+                    ),
+                    "{error:#}"
+                );
+                assert_eq!(conn.is_autocommit(), !nested);
+                assert_eq!(
+                    schema_objects(&conn),
+                    before,
+                    "existing={existing}, nested={nested}"
+                );
+                if nested {
+                    assert_eq!(
+                        conn.query_row("SELECT COUNT(*) FROM caller_state", [], |row| row
+                            .get::<_, i64>(0))
+                            .unwrap(),
+                        1
+                    );
+                    conn.execute_batch("COMMIT").unwrap();
+                }
+                drop(conn);
+                assert_eq!(schema_objects(&Connection::open(&path).unwrap()), before);
+            }
+        }
+    }
+
+    #[test]
+    fn schema_success_commits_all_five_objects_without_changing_sql() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-evidence.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        let reference = Connection::open_in_memory().unwrap();
+        reference
+            .execute_batch(AUTOMATION_RUNTIME_TERMINAL_EVIDENCE_SCHEMA_SQL)
+            .unwrap();
+        let expected = schema_objects(&reference);
+        assert_eq!(expected.len(), 5);
+
+        for _ in 0..2 {
+            ensure_runtime_terminal_evidence_schema(&conn).unwrap();
+            assert!(conn.is_autocommit());
+            assert_eq!(schema_objects(&conn), expected);
+            assert_eq!(schema_objects(&Connection::open(&path).unwrap()), expected);
+        }
+    }
+
+    #[test]
+    fn schema_commit_failure_rolls_back_and_allows_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("runtime-evidence.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        conn.execute_batch("CREATE TABLE caller_state (id INTEGER);")
+            .unwrap();
+        let before = schema_objects(&conn);
+        let reader = Connection::open(&path).unwrap();
+        // A held rollback-journal reader allows DDL but prevents the final commit.
+        reader
+            .execute_batch("BEGIN; SELECT * FROM caller_state;")
+            .unwrap();
+
+        let error = ensure_runtime_terminal_evidence_schema(&conn).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("failed to release runtime evidence schema savepoint"),
+            "{error:#}"
+        );
+        assert!(matches!(
+            error.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(code, _))
+                if code.code == rusqlite::ErrorCode::DatabaseBusy
+        ));
+        assert!(conn.is_autocommit());
+        assert_eq!(schema_objects(&conn), before);
+        reader.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(schema_objects(&reader), before);
+
+        ensure_runtime_terminal_evidence_schema(&conn).unwrap();
+        assert!(conn.is_autocommit());
+        assert_eq!(schema_objects(&reader).len(), before.len() + 5);
+    }
+
+    #[test]
+    fn schema_success_preserves_caller_transaction_ownership() {
+        for commit in [false, true] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch("CREATE TABLE caller_state (id INTEGER); BEGIN; INSERT INTO caller_state VALUES (1);")
+                .unwrap();
+            ensure_runtime_terminal_evidence_schema(&conn).unwrap();
+            ensure_runtime_terminal_evidence_schema(&conn).unwrap();
+            assert!(!conn.is_autocommit());
+            assert_eq!(schema_objects(&conn).len(), 6);
+            conn.execute_batch(if commit { "COMMIT" } else { "ROLLBACK" })
+                .unwrap();
+            assert_eq!(schema_objects(&conn).len(), if commit { 6 } else { 1 });
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM caller_state", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                i64::from(commit)
+            );
+        }
     }
 
     #[test]
