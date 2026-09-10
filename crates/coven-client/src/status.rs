@@ -46,19 +46,23 @@ fn temporary_status_path(status_path: &Path) -> PathBuf {
 }
 
 fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientError> {
-    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+    use std::os::windows::{
+        ffi::OsStrExt,
+        io::{AsRawHandle, FromRawHandle},
+    };
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
         Security::{
             Authorization::{
                 ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SetSecurityInfo, SE_FILE_OBJECT,
             },
-            SECURITY_ATTRIBUTES,
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
         },
         Storage::FileSystem::{
-            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-            FILE_SHARE_WRITE,
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, WRITE_DAC, WRITE_OWNER,
         },
     };
 
@@ -89,11 +93,22 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
         return Err(StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::last_os_error()));
     }
     let _descriptor = LocalAllocation(descriptor);
-    let security = SECURITY_ATTRIBUTES {
-        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: descriptor,
-        bInheritHandle: 0,
-    };
+    let mut dacl = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+        == 0
+    {
+        return Err(StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::last_os_error()));
+    }
+    if present == 0 || dacl.is_null() {
+        return Err(
+            StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "status security descriptor has no DACL",
+            )),
+        );
+    }
     let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
     if path.contains(&0) {
         return Err(
@@ -104,14 +119,14 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
         );
     }
     path.push(0);
-    // Establish the explicit owner and protected DACL before any status bytes
-    // exist. Inherited OWNER RIGHTS restrictions can forbid later ACL updates.
+    // Retain the creation handle and deny data/deletion sharing until security
+    // is established and all payload bytes are synced.
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &security,
+            GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            0,
+            ptr::null(),
             CREATE_NEW,
             FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
@@ -121,7 +136,25 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
         return Err(StatusWriteStage::CreateTemporary.io_error(std::io::Error::last_os_error()));
     }
     // CreateFileW returned a new owned handle; File closes it exactly once.
-    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let code = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner.sid(),
+            ptr::null_mut(),
+            dacl,
+            ptr::null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(StatusWriteStage::ApplySecurity
+            .io_error(std::io::Error::from_raw_os_error(code as i32)));
+    }
+    Ok(file)
 }
 
 fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), ClientError> {
@@ -305,24 +338,33 @@ mod tests {
     }
 
     fn assert_status_file_is_owner_only(path: &Path) {
-        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
+        let file = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL)
+            .open(path)
+            .unwrap();
+        assert_status_handle_is_owner_only(&file);
+    }
+
+    fn assert_status_handle_is_owner_only(file: &std::fs::File) {
+        use std::os::windows::io::AsRawHandle;
         use std::ptr;
         use windows_sys::Win32::Security::{
-            Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT},
+            Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
             EqualSid, GetAce, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
             DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
         use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 
         let expected_owner = CurrentWindowsUser::read().unwrap();
-        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut descriptor = ptr::null_mut();
         assert_eq!(
             unsafe {
-                GetNamedSecurityInfoW(
-                    path.as_ptr(),
+                GetSecurityInfo(
+                    file.as_raw_handle(),
                     SE_FILE_OBJECT,
                     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                     &mut owner,
@@ -366,7 +408,14 @@ mod tests {
         let home = TestHome::new();
         let path = home.0.join("temporary");
         let mut file = create_owner_only_status_file(&path).expect("create secure empty file");
-        assert_status_file_is_owner_only(&path);
+        assert_status_handle_is_owner_only(&file);
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        let error =
+            std::fs::File::open(&path).expect_err("temporary data handle must not be shared");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION as i32)
+        );
         file.write_all(b"original").unwrap();
         file.sync_all().unwrap();
         drop(file);

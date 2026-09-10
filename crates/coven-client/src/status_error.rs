@@ -7,6 +7,7 @@ pub(crate) enum StatusWriteStage {
     WriteNewline,
     SyncTemporary,
     ConvertDescriptor,
+    ApplySecurity,
     OpenToken,
     ReadToken,
     ReplaceStatus,
@@ -30,6 +31,9 @@ impl StatusWriteStage {
                 }
                 Self::ConvertDescriptor => {
                     "failed to write owner-only Windows daemon status: convert-security-descriptor"
+                }
+                Self::ApplySecurity => {
+                    "failed to write owner-only Windows daemon status: apply-owner-only-security"
                 }
                 Self::OpenToken => {
                     "failed to write owner-only Windows daemon status: open-process-token"
@@ -72,6 +76,10 @@ mod tests {
             (
                 StatusWriteStage::ConvertDescriptor,
                 "failed to write owner-only Windows daemon status: convert-security-descriptor",
+            ),
+            (
+                StatusWriteStage::ApplySecurity,
+                "failed to write owner-only Windows daemon status: apply-owner-only-security",
             ),
             (
                 StatusWriteStage::OpenToken,
