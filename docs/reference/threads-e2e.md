@@ -46,6 +46,8 @@ Without the feature, Cargo runs only the smaller smoke/lifecycle subset. CI
 executes the feature-enabled target on Linux, Windows, and the existing macOS
 push lane. All platforms run the same 15 daemon journeys through `coven-client`
 discovery and authenticated transport; Windows uses the owner-only named pipe.
+Three additional artifact regressions exercise startup-evidence retention;
+they are not extra daemon journeys.
 HTTP framing regressions belong to the shared client's tests, not a separate
 harness parser. A cross-target compilation or Windows workspace run alone is
 not evidence that these journeys executed on Windows.
@@ -82,9 +84,15 @@ target/e2e-artifacts/<run-id>/junit.xml
 
 On failure, the same directory also contains the synthetic request and
 response, daemon recovery log, Ward audit rows, hashed pending/workspace
-inventories, and SQLite schema. Setup failures emit the same paths with explicit
-unavailable markers. Once dependency preflight completes, `manifest.json`
-includes exact Coven and Threads revisions and
-`local_threads_override_active`; earlier failures record those fields as null.
+inventories, SQLite schema, and a bounded, sanitized status snapshot. Startup
+failures retain the failed CLI event and available fixture evidence before
+cleanup; fallback markers do not overwrite captured files. A capture error in
+one state source is reported without discarding the others.
+
+For a constructed fixture, `manifest.json` includes exact Coven and Threads
+revisions and `local_threads_override_active`, even if daemon startup fails;
+earlier failures can record those fields as null. Windows readiness errors
+include a bounded last-probe category and observation of the retained child
+handle, without changing the startup deadline or identity checks.
 The fixtures use only synthetic identities and content; evidence never reads a
 developer's real Coven home.

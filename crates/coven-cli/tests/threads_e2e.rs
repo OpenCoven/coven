@@ -1030,6 +1030,87 @@ fn run_journey(name: &str, journey: impl FnOnce(&mut ThreadsFixture) -> Result<(
     run_fixture_journey(name, ThreadsFixture::start, journey)
 }
 
+#[test]
+fn startup_failure_retains_partial_fixture_evidence_before_cleanup() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let mut evidence = EvidenceContext::new("startup-retention-regression");
+    evidence.artifact_dir = artifacts.path().to_path_buf();
+    let mut fixture_home = None;
+    let result = ThreadsFixture::start_with_setup_and_start(
+        &evidence,
+        |home, workspace| {
+            fs::create_dir_all(home.join("pending"))?;
+            fs::write(home.join("pending/retained.txt"), b"synthetic pending")?;
+            fs::write(workspace.join("retained.txt"), b"synthetic workspace")?;
+            fs::write(
+                home.join("daemon-recovery.log"),
+                format!("startup checkpoint at {}\n", home.display()),
+            )?;
+            fs::write(home.join("daemon.json"), b"{\"pid\":0}")?;
+            // A partially initialized store must not prevent the other captures.
+            Connection::open(home.join("coven.sqlite3"))?;
+            Ok(())
+        },
+        |fixture| {
+            fixture_home = Some(fixture.coven_home.clone());
+            // No daemon was launched by this deterministic failure seam.
+            fixture.stopped = true;
+            #[cfg(unix)]
+            let status = {
+                use std::os::unix::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(256)
+            };
+            #[cfg(windows)]
+            let status = {
+                use std::os::windows::process::ExitStatusExt;
+                std::process::ExitStatus::from_raw(1)
+            };
+            fixture.complete_daemon_start(
+                None,
+                Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: b"synthetic startup failure".to_vec(),
+                },
+            )
+        },
+    );
+    let error = result.err().context("setup should fail")?;
+    assert!(
+        !fixture_home.as_ref().unwrap().exists(),
+        "temporary home leaked"
+    );
+    evidence.write_setup_failure(&error)?;
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(artifacts.path().join("manifest.json"))?)?;
+    assert_eq!(manifest["setup_completed"], false);
+    assert!(manifest["coven_commit"].is_string());
+    assert_eq!(manifest["daemon_lifecycle"][0]["command_status"], 1);
+    let log = fs::read_to_string(artifacts.path().join("logs/daemon.log"))?;
+    assert!(log.contains("synthetic startup failure"));
+    assert!(log.contains("startup checkpoint at <coven-home>"));
+    assert!(!log.contains(&fixture_home.unwrap().display().to_string()));
+    assert!(
+        fs::read_to_string(artifacts.path().join("state/pending-tree.txt"))?
+            .contains("retained.txt")
+    );
+    assert!(
+        fs::read_to_string(artifacts.path().join("state/workspace-tree.txt"))?
+            .contains("retained.txt")
+    );
+    assert!(
+        fs::read_to_string(artifacts.path().join("state/ward-audit.jsonl"))?
+            .contains("capture-error")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&fs::read(
+            artifacts.path().join("state/daemon-status.json")
+        )?)?["pid"],
+        0
+    );
+    Ok(())
+}
+
 fn run_fixture_journey(
     name: &str,
     initialize: impl FnOnce(&EvidenceContext) -> Result<ThreadsFixture>,
@@ -1585,6 +1666,14 @@ impl ThreadsFixture {
         evidence: &EvidenceContext,
         prepare: impl FnOnce(&Path, &Path) -> Result<()>,
     ) -> Result<Self> {
+        Self::start_with_setup_and_start(evidence, prepare, Self::start_daemon)
+    }
+
+    fn start_with_setup_and_start(
+        evidence: &EvidenceContext,
+        prepare: impl FnOnce(&Path, &Path) -> Result<()>,
+        start: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<Self> {
         let workspace_root = workspace_root();
         let dependency = threads_dependency(&workspace_root)?;
         if std::env::var_os(REQUIRE_OVERRIDE_ENV).is_some() {
@@ -1641,7 +1730,19 @@ impl ThreadsFixture {
             daemon_pid: None,
             stopped: false,
         };
-        fixture.start_daemon()?;
+        if let Err(error) = start(&mut fixture) {
+            let capture = (|| {
+                fixture.write_failure_evidence()?;
+                fixture.write_junit(Some(&error))?;
+                fixture.write_run_provenance_with_setup(Some(&error), false)
+            })();
+            if let Err(capture_error) = capture {
+                return Err(error.context(format!(
+                    "capturing setup failure evidence also failed: {capture_error:#}"
+                )));
+            }
+            return Err(error);
+        }
         Ok(fixture)
     }
 
@@ -1695,6 +1796,19 @@ impl ThreadsFixture {
         let pid_before = self.current_daemon_pid();
         self.stopped = false;
         let output = self.daemon_command(&["daemon", "start"])?;
+        self.complete_daemon_start(pid_before, output)
+    }
+
+    fn complete_daemon_start(&mut self, pid_before: Option<u32>, output: Output) -> Result<()> {
+        let pid_after = daemon_pid(&self.coven_home).ok();
+        self.daemon_events.push(DaemonLifecycleEvent::from_output(
+            "daemon start",
+            pid_before,
+            pid_after,
+            &output,
+            (!output.status.success())
+                .then(|| "CLI startup failed before fixture health check".to_owned()),
+        ));
         anyhow::ensure!(
             output.status.success(),
             "daemon start failed\nstdout:\n{}\nstderr:\n{}",
@@ -1703,16 +1817,15 @@ impl ThreadsFixture {
         );
         let health_result = wait_for_daemon_health(&self.coven_home);
         let pid_after = daemon_pid(&self.coven_home).ok();
-        self.daemon_events.push(DaemonLifecycleEvent::from_output(
-            "daemon start",
-            pid_before,
-            pid_after,
-            &output,
-            health_result
-                .as_ref()
-                .err()
-                .map(|error| format!("daemon health check failed after start: {error:#}")),
-        ));
+        let event = self
+            .daemon_events
+            .last_mut()
+            .context("startup event was not recorded")?;
+        event.pid_after = pid_after;
+        event.note = health_result
+            .as_ref()
+            .err()
+            .map(|error| format!("daemon health check failed after start: {error:#}"));
         health_result?;
 
         let pid_after = pid_after.context("daemon status is missing pid after start")?;
@@ -1803,10 +1916,10 @@ impl ThreadsFixture {
         fs::create_dir_all(&self.artifact_dir)?;
         let failure = error
             .map(|error| {
-                let sanitized = sanitize_for_artifact(&format!("{error:#}"));
+                let sanitized = self.sanitize_fixture_text(&format!("{error:#}"));
                 format!(
                     "<failure message=\"{}\">{}</failure>",
-                    xml_escape(&sanitize_for_artifact(&error.to_string())),
+                    xml_escape(&self.sanitize_fixture_text(&error.to_string())),
                     xml_escape(&sanitized)
                 )
             })
@@ -1826,33 +1939,39 @@ impl ThreadsFixture {
     }
 
     fn write_run_provenance(&self, error: Option<&anyhow::Error>) -> Result<()> {
+        self.write_run_provenance_with_setup(error, true)
+    }
+
+    fn write_run_provenance_with_setup(
+        &self,
+        error: Option<&anyhow::Error>,
+        setup_completed: bool,
+    ) -> Result<()> {
         fs::create_dir_all(&self.artifact_dir)?;
         let logs = self.artifact_dir.join("logs");
         fs::create_dir_all(&logs)?;
-        fs::write(
-            self.artifact_dir.join("manifest.json"),
-            serde_json::to_vec_pretty(&json!({
-                "run_id": self.run_id,
-                "scenario": self.scenario,
-                "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
-                "platform": std::env::consts::OS,
-                "setup_completed": true,
-                "result": if error.is_some() { "failed" } else { "passed" },
-                "coven_commit": self.coven_state.commit,
-                "coven_dirty": self.coven_state.dirty,
-                "coven_state_sha256": self.coven_state.state_sha256,
-                "coven_manifest_sha256": self.coven_manifest_sha256,
-                "coven_lock_sha256": self.coven_lock_sha256,
-                "threads_commit": self.threads_state.commit,
-                "threads_dirty": self.threads_state.dirty,
-                "threads_state_sha256": self.threads_state.state_sha256,
-                "threads_manifest_sha256": self.threads_manifest_sha256,
-                "local_threads_override_active": self.local_threads_override_active,
-                "authorization_limitation": "synthetic principal fingerprint uses the strongest current daemon-owned Ward path; signed principal proof is not yet available",
-                "daemon_lifecycle": self.daemon_events.iter().map(DaemonLifecycleEvent::as_json).collect::<Vec<_>>(),
-                "failure": error.map(|error| sanitize_for_artifact(&format!("{error:#}"))),
-            }))?,
-        )?;
+        let manifest = json!({
+            "run_id": self.run_id,
+            "scenario": self.scenario,
+            "command": "cargo test --locked -p coven-cli --test threads_e2e -- --nocapture",
+            "platform": std::env::consts::OS,
+            "setup_completed": setup_completed,
+            "fixture_evidence_captured": true,
+            "result": if error.is_some() { "failed" } else { "passed" },
+            "coven_commit": self.coven_state.commit,
+            "coven_dirty": self.coven_state.dirty,
+            "coven_state_sha256": self.coven_state.state_sha256,
+            "coven_manifest_sha256": self.coven_manifest_sha256,
+            "coven_lock_sha256": self.coven_lock_sha256,
+            "threads_commit": self.threads_state.commit,
+            "threads_dirty": self.threads_state.dirty,
+            "threads_state_sha256": self.threads_state.state_sha256,
+            "threads_manifest_sha256": self.threads_manifest_sha256,
+            "local_threads_override_active": self.local_threads_override_active,
+            "authorization_limitation": "synthetic principal fingerprint uses the strongest current daemon-owned Ward path; signed principal proof is not yet available",
+            "daemon_lifecycle": self.daemon_events.iter().map(DaemonLifecycleEvent::as_json).collect::<Vec<_>>(),
+            "failure": error.map(|error| self.sanitize_fixture_text(&format!("{error:#}"))),
+        });
         fs::write(
             self.artifact_dir.join("request.json"),
             serde_json::to_vec_pretty(&self.sanitized_json(&self.last_request))?,
@@ -1862,8 +1981,13 @@ impl ThreadsFixture {
             serde_json::to_vec_pretty(&self.sanitized_json(&self.last_response))?,
         )?;
 
-        let recovery_log = fs::read(self.coven_home.join("daemon-recovery.log"))
-            .unwrap_or_else(|_| b"<no daemon recovery log>\n".to_vec());
+        let recovery_log = match fs::read(self.coven_home.join("daemon-recovery.log")) {
+            Ok(log) => log,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                b"<no daemon recovery log>\n".to_vec()
+            }
+            Err(error) => format!("<capture-error: {error}>\n").into_bytes(),
+        };
         let mut daemon_log = String::new();
         if self.daemon_events.is_empty() {
             daemon_log.push_str("<no daemon lifecycle events recorded>\n");
@@ -1879,27 +2003,45 @@ impl ThreadsFixture {
             logs.join("daemon.log"),
             self.sanitize_fixture_text(&daemon_log),
         )?;
+        fs::write(
+            self.artifact_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&sanitize_json_strings(&manifest, &|text| {
+                self.sanitize_fixture_text(text)
+            }))?,
+        )?;
         Ok(())
     }
 
     fn write_failure_evidence(&self) -> Result<()> {
         let state = self.artifact_dir.join("state");
         fs::create_dir_all(&state)?;
+        for (name, capture) in [
+            (
+                "ward-audit.jsonl",
+                ward_audit_jsonl(&self.coven_home.join("coven.sqlite3")),
+            ),
+            (
+                "pending-tree.txt",
+                inventory(&self.coven_home.join("pending")),
+            ),
+            ("workspace-tree.txt", inventory(&self.workspace)),
+            (
+                "sqlite-schema.txt",
+                sqlite_schema(&self.coven_home.join("coven.sqlite3")),
+            ),
+        ] {
+            let contents = match capture {
+                Ok(contents) => contents,
+                Err(error) => format!("<capture-error: {error:#}>\n"),
+            };
+            fs::write(state.join(name), self.sanitize_fixture_text(&contents))?;
+        }
+        let status = capture_daemon_status(&self.coven_home);
         fs::write(
-            state.join("ward-audit.jsonl"),
-            ward_audit_jsonl(&self.coven_home.join("coven.sqlite3"))?,
-        )?;
-        fs::write(
-            state.join("pending-tree.txt"),
-            inventory(&self.coven_home.join("pending"))?,
-        )?;
-        fs::write(
-            state.join("workspace-tree.txt"),
-            inventory(&self.workspace)?,
-        )?;
-        fs::write(
-            state.join("sqlite-schema.txt"),
-            sqlite_schema(&self.coven_home.join("coven.sqlite3"))?,
+            state.join("daemon-status.json"),
+            serde_json::to_vec_pretty(&sanitize_json_strings(&status, &|text| {
+                self.sanitize_fixture_text(text)
+            }))?,
         )?;
         Ok(())
     }
@@ -1963,6 +2105,40 @@ struct EvidenceContext {
     artifact_dir: PathBuf,
 }
 
+fn write_missing_setup_artifact(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(contents.as_ref())?;
+    Ok(())
+}
+
+#[test]
+fn startup_failure_fallback_preserves_partially_captured_artifacts() -> Result<()> {
+    let artifacts = tempfile::tempdir()?;
+    let mut evidence = EvidenceContext::new("startup-partial-retention");
+    evidence.artifact_dir = artifacts.path().to_path_buf();
+    fs::create_dir_all(artifacts.path().join("logs"))?;
+    fs::write(
+        artifacts.path().join("logs/daemon.log"),
+        b"retained startup evidence\n",
+    )?;
+    evidence.write_setup_failure(&anyhow::anyhow!("synthetic capture failure"))?;
+    assert_eq!(
+        fs::read_to_string(artifacts.path().join("logs/daemon.log"))?,
+        "retained startup evidence\n"
+    );
+    Ok(())
+}
+
 impl EvidenceContext {
     fn new(scenario: &str) -> Self {
         let run_id = format!("{}-{}-{}", scenario, std::process::id(), Uuid::new_v4());
@@ -1978,6 +2154,13 @@ impl EvidenceContext {
     }
 
     fn write_setup_failure(&self, error: &anyhow::Error) -> Result<()> {
+        let manifest_path = self.artifact_dir.join("manifest.json");
+        if manifest_path.exists() {
+            let manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+            if manifest["fixture_evidence_captured"] == true {
+                return Ok(());
+            }
+        }
         fs::create_dir_all(&self.artifact_dir)?;
         let logs = self.artifact_dir.join("logs");
         let state = self.artifact_dir.join("state");
@@ -1989,7 +2172,7 @@ impl EvidenceContext {
             xml_escape(&sanitize_for_artifact(&error.to_string())),
             xml_escape(&sanitized)
         );
-        fs::write(
+        write_missing_setup_artifact(
             self.artifact_dir.join("junit.xml"),
             format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1999,7 +2182,7 @@ impl EvidenceContext {
                 xml_escape(&self.scenario)
             ),
         )?;
-        fs::write(
+        write_missing_setup_artifact(
             self.artifact_dir.join("manifest.json"),
             serde_json::to_vec_pretty(&json!({
                 "run_id": self.run_id,
@@ -2013,9 +2196,9 @@ impl EvidenceContext {
                 "failure": sanitized,
             }))?,
         )?;
-        fs::write(self.artifact_dir.join("request.json"), b"null\n")?;
-        fs::write(self.artifact_dir.join("response.json"), b"null\n")?;
-        fs::write(
+        write_missing_setup_artifact(self.artifact_dir.join("request.json"), b"null\n")?;
+        write_missing_setup_artifact(self.artifact_dir.join("response.json"), b"null\n")?;
+        write_missing_setup_artifact(
             logs.join("daemon.log"),
             "<daemon unavailable: fixture setup did not complete>\n",
         )?;
@@ -2025,7 +2208,7 @@ impl EvidenceContext {
             "workspace-tree.txt",
             "sqlite-schema.txt",
         ] {
-            fs::write(
+            write_missing_setup_artifact(
                 state.join(name),
                 "<unavailable: fixture setup did not complete>\n",
             )?;
@@ -2327,6 +2510,66 @@ fn daemon_http_request(
         response.status,
         String::from_utf8(response.body).context("fixture daemon response is not UTF-8")?,
     ))
+}
+
+#[test]
+fn startup_status_capture_is_bounded_and_excludes_unknown_fields() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    assert_eq!(
+        capture_daemon_status(home.path()),
+        json!({"present": false})
+    );
+    let path = home.path().join("daemon.json");
+    fs::write(&path, b"{")?;
+    assert_eq!(
+        capture_daemon_status(home.path()),
+        json!({"capture_error": "invalid-status-json"})
+    );
+    fs::write(&path, vec![b' '; coven_client::MAX_DAEMON_STATUS_BYTES + 1])?;
+    assert_eq!(
+        capture_daemon_status(home.path()),
+        json!({"capture_error": "status-too-large"})
+    );
+    fs::write(&path, br#"{"pid":42,"unknown":"synthetic-private-value"}"#)?;
+    let captured = capture_daemon_status(home.path());
+    assert_eq!(captured["pid"], 42);
+    assert!(captured.get("unknown").is_none());
+    assert!(!captured.to_string().contains("synthetic-private-value"));
+    Ok(())
+}
+
+fn capture_daemon_status(coven_home: &Path) -> Value {
+    use std::io::Read;
+
+    let file = match fs::File::open(coven_home.join("daemon.json")) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({"present": false})
+        }
+        Err(error) => {
+            return json!({"capture_error": "open-status", "io_kind": format!("{:?}", error.kind())})
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(error) = file
+        .take(coven_client::MAX_DAEMON_STATUS_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+    {
+        return json!({"capture_error": "read-status", "io_kind": format!("{:?}", error.kind())});
+    }
+    if bytes.len() > coven_client::MAX_DAEMON_STATUS_BYTES {
+        return json!({"capture_error": "status-too-large"});
+    }
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(status) => json!({
+            "present": true,
+            "pid": status.get("pid").and_then(Value::as_u64),
+            "socket": status.get("socket").and_then(Value::as_str),
+            "started_at": status.get("started_at").and_then(Value::as_str),
+            "process_creation_time": status.get("process_creation_time").and_then(Value::as_u64),
+        }),
+        Err(_) => json!({"capture_error": "invalid-status-json"}),
+    }
 }
 
 fn ward_audit_jsonl(store: &Path) -> Result<String> {

@@ -1876,6 +1876,7 @@ pub fn background_server_spec(
     }
 }
 
+#[cfg(any(not(windows), test))]
 pub fn start_background_server(
     coven_home: &Path,
     current_exe: &Path,
@@ -1991,7 +1992,7 @@ pub fn ensure_background_server(
         current_exe,
         started_at,
         &SystemDaemonStopController,
-        &SystemDaemonStartController,
+        &SystemDaemonStartController::default(),
         deadline,
     )?;
     #[cfg(unix)]
@@ -2396,7 +2397,7 @@ pub fn restart_background_server(
         current_exe,
         started_at,
         &SystemDaemonStopController,
-        &SystemDaemonStartController,
+        &SystemDaemonStartController::default(),
         deadline,
     )
 }
@@ -2558,7 +2559,31 @@ trait DaemonStartController {
     ) -> Result<Option<DaemonStatus>>;
 }
 
-struct SystemDaemonStartController;
+#[derive(Default)]
+struct SystemDaemonStartController {
+    #[cfg(any(windows, test))]
+    child: Mutex<Option<std::process::Child>>,
+}
+
+impl SystemDaemonStartController {
+    #[cfg(any(windows, test))]
+    fn child_observation(&self) -> String {
+        let Ok(mut child) = self.child.lock() else {
+            return "child=observation-lock-poisoned".to_owned();
+        };
+        let Some(child) = child.as_mut() else {
+            return "child=not-retained".to_owned();
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => match status.code() {
+                Some(code) => format!("child=exited code={code}"),
+                None => "child=exited-without-code".to_owned(),
+            },
+            Ok(None) => "child=still-running".to_owned(),
+            Err(error) => format!("child=observation-error kind={:?}", error.kind()),
+        }
+    }
+}
 
 impl DaemonStartController for SystemDaemonStartController {
     fn start_background_server(
@@ -2567,7 +2592,26 @@ impl DaemonStartController for SystemDaemonStartController {
         current_exe: &Path,
         started_at: String,
     ) -> Result<DaemonStatus> {
-        start_background_server(coven_home, current_exe, started_at)
+        #[cfg(not(windows))]
+        {
+            start_background_server(coven_home, current_exe, started_at)
+        }
+        #[cfg(windows)]
+        {
+            prevent_background_server_stdio_handle_leaks()?;
+            start_background_server_with_spawn(coven_home, current_exe, started_at, |spec| {
+                let child = background_server_command(spec).spawn().with_context(|| {
+                    format!("failed to start Coven daemon {}", spec.program.display())
+                })?;
+                let pid = child.id();
+                *self
+                    .child
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("startup child observation lock poisoned"))? =
+                    Some(child);
+                Ok(pid)
+            })
+        }
     }
 
     fn wait_for_running_daemon(
@@ -2603,6 +2647,7 @@ impl DaemonStartController for SystemDaemonStartController {
                 },
             )
             .map(Some)
+            .with_context(|| self.child_observation())
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -2652,6 +2697,27 @@ where
 }
 
 #[cfg(any(windows, test))]
+#[derive(Clone, Copy)]
+enum WindowsStartupReadinessPhase {
+    NotProbed,
+    UnavailableOrUnmatchedHealth,
+    ConnectTimeout,
+    NoResponseBytes,
+}
+
+#[cfg(any(windows, test))]
+impl WindowsStartupReadinessPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotProbed => "not-probed",
+            Self::UnavailableOrUnmatchedHealth => "unavailable-or-unmatched-health",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::NoResponseBytes => "no-response-bytes",
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
 fn wait_for_windows_running_daemon_with_identity_probe_until<P>(
     status: &DaemonStatus,
     deadline: LifecycleDeadline,
@@ -2660,10 +2726,17 @@ fn wait_for_windows_running_daemon_with_identity_probe_until<P>(
 where
     P: FnMut(&str, LifecycleDeadline) -> Result<Option<DaemonStatus>>,
 {
+    let mut last_phase = WindowsStartupReadinessPhase::NotProbed;
     loop {
         let probe_started = Instant::now();
         let probe_timeout = deadline
-            .remaining_at(probe_started, "waiting for Coven daemon startup health")?
+            .remaining_at(probe_started, "waiting for Coven daemon startup health")
+            .with_context(|| {
+                format!(
+                    "timed out waiting for Coven daemon startup health; last_readiness={}",
+                    last_phase.label()
+                )
+            })?
             .min(WINDOWS_STARTUP_HEALTH_PROBE_SLICE);
         let probe_deadline = LifecycleDeadline {
             instant: probe_started
@@ -2674,32 +2747,43 @@ where
         // connect and silent-response probes within the outer lifecycle deadline.
         match probe(&status.socket, probe_deadline) {
             Ok(Some(live)) => return Ok(live),
-            Ok(None) => {}
-            Err(error) if windows_startup_probe_is_pending(&error) => {}
-            Err(error) => return Err(error),
+            Ok(None) => last_phase = WindowsStartupReadinessPhase::UnavailableOrUnmatchedHealth,
+            Err(error) => match windows_startup_pending_phase(&error) {
+                Some(phase) => last_phase = phase,
+                None => return Err(error),
+            },
         }
-        let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
+        let remaining = deadline
+            .remaining("waiting for Coven daemon startup health")
+            .with_context(|| {
+                format!(
+                    "timed out waiting for Coven daemon startup health; last_readiness={}",
+                    last_phase.label()
+                )
+            })?;
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
 }
 
 /// Retry only known startup transport timeouts, never identity or protocol errors.
 #[cfg(any(windows, test))]
-fn windows_startup_probe_is_pending(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
+fn windows_startup_pending_phase(error: &anyhow::Error) -> Option<WindowsStartupReadinessPhase> {
+    error.chain().find_map(|cause| {
         cause
             .downcast_ref::<coven_client::ClientError>()
-            .is_some_and(|error| {
-                matches!(
-                    error,
-                    coven_client::ClientError::InvalidHttpResponse(message)
-                        if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
-                ) || matches!(
-                    error,
-                    coven_client::ClientError::Io { operation, source }
-                        if *operation == coven_client::WINDOWS_CONNECT_OPERATION
-                            && source.kind() == std::io::ErrorKind::TimedOut
-                )
+            .and_then(|error| match error {
+                coven_client::ClientError::InvalidHttpResponse(message)
+                    if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE =>
+                {
+                    Some(WindowsStartupReadinessPhase::NoResponseBytes)
+                }
+                coven_client::ClientError::Io { operation, source }
+                    if *operation == coven_client::WINDOWS_CONNECT_OPERATION
+                        && source.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    Some(WindowsStartupReadinessPhase::ConnectTimeout)
+                }
+                _ => None,
             })
     })
 }
@@ -5828,6 +5912,46 @@ mod tests {
 
         assert_eq!(ready, status);
         assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_timeout_retains_last_readiness_phase() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let deadline = LifecycleDeadline::after(Duration::from_secs(1))?;
+        let error =
+            wait_for_windows_running_daemon_with_identity_probe_until(&status, deadline, |_, _| {
+                std::thread::sleep(deadline.instant.saturating_duration_since(Instant::now()));
+                Err(anyhow::Error::new(
+                    coven_client::ClientError::InvalidHttpResponse(
+                        coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.to_owned(),
+                    ),
+                ))
+            })
+            .expect_err("exhausted readiness budget");
+        assert!(
+            format!("{error:#}").contains("last_readiness=no-response-bytes"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_child_observation_reports_exit_without_signaling() -> Result<()> {
+        let executable = std::env::current_exe()?;
+        let mut child = Command::new(executable)
+            .args([
+                "--list",
+                "startup_child_observation_reports_exit_without_signaling",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let exited = child.wait()?;
+        assert!(exited.success());
+        let controller = SystemDaemonStartController::default();
+        *controller.child.lock().unwrap() = Some(child);
+        assert_eq!(controller.child_observation(), "child=exited code=0");
         Ok(())
     }
 
