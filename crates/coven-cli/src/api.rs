@@ -392,10 +392,17 @@ fn set_proposal_decision_failpoint(failpoint: Option<(ProposalDecisionFailpoint,
 }
 
 #[cfg(test)]
+struct ProposalBaselineCommitMutation {
+    familiar_id: String,
+    surface: String,
+    entry_hash: Vec<u8>,
+}
+
+#[cfg(test)]
 fn proposal_baseline_commit_mutations(
-) -> &'static Mutex<std::collections::HashMap<String, (String, String, Vec<u8>)>> {
+) -> &'static Mutex<std::collections::HashMap<String, ProposalBaselineCommitMutation>> {
     static MUTATIONS: OnceLock<
-        Mutex<std::collections::HashMap<String, (String, String, Vec<u8>)>>,
+        Mutex<std::collections::HashMap<String, ProposalBaselineCommitMutation>>,
     > = OnceLock::new();
     MUTATIONS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
@@ -410,7 +417,14 @@ fn set_proposal_baseline_commit_mutation(
     proposal_baseline_commit_mutations()
         .lock()
         .expect("proposal baseline mutation lock poisoned")
-        .insert(proposal_id, (familiar_id, surface, entry_hash));
+        .insert(
+            proposal_id,
+            ProposalBaselineCommitMutation {
+                familiar_id,
+                surface,
+                entry_hash,
+            },
+        );
 }
 
 fn maybe_mutate_proposal_baseline_before_commitment(
@@ -423,17 +437,17 @@ fn maybe_mutate_proposal_baseline_before_commitment(
             .lock()
             .expect("proposal baseline mutation lock poisoned")
             .remove(proposal_id);
-        if let Some((familiar_id, surface, entry_hash)) = mutation {
+        if let Some(mutation) = mutation {
             let changed = conn.execute(
                 "INSERT INTO ward_manifest (familiar_id, surface, manifest_id, entry_hash)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(familiar_id, surface) DO UPDATE
                  SET entry_hash = excluded.entry_hash",
                 rusqlite::params![
-                    familiar_id,
-                    surface,
+                    mutation.familiar_id,
+                    mutation.surface,
                     uuid::Uuid::nil().to_string(),
-                    entry_hash
+                    mutation.entry_hash
                 ],
             )?;
             anyhow::ensure!(
@@ -12671,7 +12685,7 @@ fn proposal_recovery_commitment(
             Some(bytes) => {
                 hasher.update(&[1]);
                 hasher.update(&(bytes.len() as u64).to_be_bytes());
-                hasher.update(&bytes);
+                hasher.update(bytes);
             }
             None => {
                 hasher.update(&[0]);
