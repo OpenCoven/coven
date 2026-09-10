@@ -270,6 +270,36 @@ pub fn validate_authority_profile(
     phase: AuthorityValidationPhase,
     verifier: Option<&dyn AuthorityEvidenceVerifier>,
 ) -> Result<AuthorityProfileDisposition, AuthorityProfileError> {
+    let disposition = validate_authority_profile_structure(
+        extensions,
+        consumer,
+        advertised_profiles,
+        advertised_capabilities,
+        phase,
+    )?;
+    let AuthorityProfileDisposition::Validated(extension) = &disposition else {
+        return Ok(disposition);
+    };
+    let verifier = verifier.ok_or_else(|| {
+        AuthorityProfileError::new(
+            AuthorityProfileErrorCode::AdapterMissing,
+            "Runtime Authority verification adapter is unavailable",
+        )
+    })?;
+    verifier.verify(extension, phase)?;
+    Ok(disposition)
+}
+
+/// Validates the signed profile shape and integrity without consulting live
+/// replay state. Callers must authenticate the exact binding through a
+/// verifier-backed terminal extension before trusting this projection.
+pub(crate) fn validate_authority_profile_structure(
+    extensions: &ExtensionBag,
+    consumer: AuthorityConsumerClass,
+    advertised_profiles: &[&str],
+    advertised_capabilities: &[&str],
+    phase: AuthorityValidationPhase,
+) -> Result<AuthorityProfileDisposition, AuthorityProfileError> {
     if consumer == AuthorityConsumerClass::GenericBaseV1 {
         return Ok(AuthorityProfileDisposition::PreservedOpaque(
             extensions.clone(),
@@ -332,13 +362,6 @@ pub fn validate_authority_profile(
             AuthorityProfileError::new(AuthorityProfileErrorCode::SchemaInvalid, error.to_string())
         })?;
     extension.validate_structure(phase)?;
-    let verifier = verifier.ok_or_else(|| {
-        AuthorityProfileError::new(
-            AuthorityProfileErrorCode::AdapterMissing,
-            "Runtime Authority verification adapter is unavailable",
-        )
-    })?;
-    verifier.verify(&extension, phase)?;
     Ok(AuthorityProfileDisposition::Validated(Box::new(extension)))
 }
 
@@ -1625,15 +1648,19 @@ fn schema_error(message: impl Into<String>) -> AuthorityProfileError {
 }
 
 #[cfg(test)]
-mod structural_tests {
+pub(crate) mod test_support {
     use serde_json::{json, Value};
 
-    use super::*;
+    use super::{
+        canonicalize, sha256_hex, AuthorityEvidenceVerifier, AuthorityProfileError,
+        AuthorityValidationPhase, AutomationAuthorityExtension, ExtensionBag,
+        AUTHORITY_EXTENSION_KEY, BINDING_DOMAIN, RECEIPT_DOMAIN,
+    };
 
     const VECTORS: &str =
         include_str!("../../../../../spec/coven-automations/authority/v1/test-vectors.json");
 
-    fn fixture(name: &str) -> Value {
+    pub(crate) fn fixture(name: &str) -> Value {
         serde_json::from_str::<Value>(VECTORS)
             .expect("authority vectors")
             .pointer(&format!("/fixtures/{name}"))
@@ -1656,6 +1683,59 @@ mod structural_tests {
         value["authentication"]["signedDigest"] = json!(digest);
         digest
     }
+
+    pub(crate) fn resign_binding(binding: &mut Value) -> String {
+        resign(binding, BINDING_DOMAIN)
+    }
+
+    pub(crate) fn resign_receipt(receipt: &mut Value) -> String {
+        resign(receipt, RECEIPT_DOMAIN)
+    }
+
+    pub(crate) fn authority_extensions_value() -> Value {
+        json!({
+            AUTHORITY_EXTENSION_KEY: {
+                "profile": "coven.automations.authority.v1",
+                "kind": "AutomationAuthorityExtension",
+                "executionBinding": fixture("binding"),
+                "receiptEvidence": fixture("receiptEvidence")
+            }
+        })
+    }
+
+    pub(crate) fn resign_authority_extensions(value: &mut Value) {
+        let extension = &mut value[AUTHORITY_EXTENSION_KEY];
+        let binding_digest = resign_binding(&mut extension["executionBinding"]);
+        if !extension["receiptEvidence"].is_null() {
+            extension["receiptEvidence"]["bindingDigest"]["value"] = json!(binding_digest);
+            resign_receipt(&mut extension["receiptEvidence"]);
+        }
+    }
+
+    pub(crate) fn extension_bag(value: Value) -> ExtensionBag {
+        serde_json::from_value(value).expect("authority extension bag")
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct AcceptingVerifier;
+
+    impl AuthorityEvidenceVerifier for AcceptingVerifier {
+        fn verify(
+            &self,
+            _extension: &AutomationAuthorityExtension,
+            _phase: AuthorityValidationPhase,
+        ) -> Result<(), AuthorityProfileError> {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod structural_tests {
+    use serde_json::{json, Value};
+
+    use super::test_support::{fixture, resign_binding, resign_receipt};
+    use super::*;
 
     fn extension(binding: Value, receipt: Value) -> AutomationAuthorityExtension {
         serde_json::from_value(json!({
@@ -1691,9 +1771,9 @@ mod structural_tests {
             *receipt
                 .pointer_mut(receipt_path)
                 .expect("receipt capability set") = json!(["artifact.write", "analysis.read"]);
-            let binding_digest = resign(&mut binding, BINDING_DOMAIN);
+            let binding_digest = resign_binding(&mut binding);
             receipt["bindingDigest"]["value"] = json!(binding_digest);
-            resign(&mut receipt, RECEIPT_DOMAIN);
+            resign_receipt(&mut receipt);
 
             extension(binding, receipt)
                 .validate_structure(AuthorityValidationPhase::Terminal)
@@ -1707,7 +1787,7 @@ mod structural_tests {
     fn binding_rejects_familiar_age_beyond_signed_bound() {
         let mut binding = fixture("binding");
         binding["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:58.999Z");
-        resign(&mut binding, BINDING_DOMAIN);
+        resign_binding(&mut binding);
         let binding: AutomationExecutionBinding =
             serde_json::from_value(binding).expect("execution binding");
 
@@ -1721,7 +1801,7 @@ mod structural_tests {
     fn receipt_rejects_familiar_age_beyond_signed_bound() {
         let mut receipt = fixture("receiptEvidence");
         receipt["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:58.999Z");
-        resign(&mut receipt, RECEIPT_DOMAIN);
+        resign_receipt(&mut receipt);
         let receipt: AutomationReceiptAuthorityEvidence =
             serde_json::from_value(receipt).expect("receipt authority evidence");
 
@@ -1735,7 +1815,7 @@ mod structural_tests {
     fn binding_accepts_familiar_age_equal_to_signed_bound() {
         let mut binding = fixture("binding");
         binding["familiar"]["verifiedAt"] = json!("2026-09-03T11:54:59.000Z");
-        resign(&mut binding, BINDING_DOMAIN);
+        resign_binding(&mut binding);
         let binding: AutomationExecutionBinding =
             serde_json::from_value(binding).expect("execution binding");
 
@@ -1767,7 +1847,7 @@ mod structural_tests {
             *binding
                 .pointer_mut(path)
                 .expect("approval consumption field") = replacement;
-            resign(&mut binding, BINDING_DOMAIN);
+            resign_binding(&mut binding);
             let binding: AutomationExecutionBinding =
                 serde_json::from_value(binding).expect("execution binding");
 
@@ -1806,7 +1886,7 @@ mod structural_tests {
             *receipt
                 .pointer_mut(path)
                 .expect("approval consumption field") = replacement;
-            resign(&mut receipt, RECEIPT_DOMAIN);
+            resign_receipt(&mut receipt);
             let receipt: AutomationReceiptAuthorityEvidence =
                 serde_json::from_value(receipt).expect("receipt authority evidence");
 
@@ -1827,7 +1907,7 @@ mod structural_tests {
         let mut binding = fixture("binding");
         binding["base"]["occurrenceId"] = json!("occurrence.other-20260903");
         binding["approval"]["consumption"]["occurrenceId"] = json!("occurrence.other-20260903");
-        resign(&mut binding, BINDING_DOMAIN);
+        resign_binding(&mut binding);
         let binding: AutomationExecutionBinding =
             serde_json::from_value(binding).expect("execution binding");
 
@@ -1845,7 +1925,7 @@ mod structural_tests {
         let mut receipt = fixture("receiptEvidence");
         receipt["occurrenceId"] = json!("occurrence.other-20260903");
         receipt["approval"]["consumption"]["occurrenceId"] = json!("occurrence.other-20260903");
-        resign(&mut receipt, RECEIPT_DOMAIN);
+        resign_receipt(&mut receipt);
         let receipt: AutomationReceiptAuthorityEvidence =
             serde_json::from_value(receipt).expect("receipt authority evidence");
 

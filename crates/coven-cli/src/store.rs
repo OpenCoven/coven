@@ -1026,6 +1026,10 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
         .context("failed to initialize automation events schema")?;
     conn.execute_batch(crate::automations::receipts::AUTOMATION_RECEIPTS_SCHEMA_SQL)
         .context("failed to initialize automation receipts schema")?;
+    conn.execute_batch(
+        crate::automations::receipts::AUTOMATION_RECEIPT_AUTHORITY_EXTENSIONS_SCHEMA_SQL,
+    )
+    .context("failed to initialize automation receipt authority extensions schema")?;
     crate::automations::contract::events::backfill_definition_event_baselines(conn)
         .context("failed to backfill automation definition event baselines")?;
     crate::automations::store::migrate_durable_local_timezones(conn)?;
