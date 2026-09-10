@@ -177,7 +177,6 @@ impl CurrentWindowsUser {
         use std::mem::size_of;
         use std::ptr;
         use windows_sys::Win32::{
-            Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER},
             Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER},
             System::Threading::{GetCurrentProcess, OpenProcessToken},
         };
@@ -187,15 +186,7 @@ impl CurrentWindowsUser {
             return Err(StatusWriteStage::OpenToken.io_error(std::io::Error::last_os_error()));
         }
         let _token = Handle(process_token);
-        let mut bytes = 0;
-        let initial = unsafe {
-            GetTokenInformation(process_token, TokenUser, ptr::null_mut(), 0, &mut bytes)
-        };
-        if initial != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || bytes == 0 {
-            return Err(ClientError::Discovery(
-                "unable to size current Windows user token for daemon status".to_owned(),
-            ));
-        }
+        let mut bytes = Self::token_buffer_size(process_token)?;
         let word_len = (bytes as usize)
             .max(1)
             .div_ceil(std::mem::size_of::<usize>());
@@ -226,6 +217,39 @@ impl CurrentWindowsUser {
             ));
         }
         Ok(Self { words })
+    }
+
+    fn token_buffer_size(
+        process_token: windows_sys::Win32::Foundation::HANDLE,
+    ) -> Result<u32, ClientError> {
+        use windows_sys::Win32::{
+            Foundation::{GetLastError, ERROR_INSUFFICIENT_BUFFER},
+            Security::{GetTokenInformation, TokenUser},
+        };
+
+        let mut bytes = 0;
+        let initial = unsafe {
+            GetTokenInformation(
+                process_token,
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut bytes,
+            )
+        };
+        if initial == 0 {
+            let code = unsafe { GetLastError() };
+            if code != ERROR_INSUFFICIENT_BUFFER {
+                return Err(StatusWriteStage::ReadToken
+                    .io_error(std::io::Error::from_raw_os_error(code as i32)));
+            }
+        }
+        if initial != 0 || bytes == 0 {
+            return Err(ClientError::Discovery(
+                "unable to size current Windows user token for daemon status".to_owned(),
+            ));
+        }
+        Ok(bytes)
     }
 
     fn sid(&self) -> windows_sys::Win32::Security::PSID {
@@ -264,6 +288,85 @@ impl Drop for LocalAllocation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestHome(PathBuf);
+
+    impl TestHome {
+        fn new() -> Self {
+            let path = temporary_status_path(&std::env::temp_dir().join("daemon.json"));
+            std::fs::create_dir(&path).expect("create isolated writer test home");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_status_home_identifies_temporary_creation_and_preserves_os_error() {
+        use windows_sys::Win32::Foundation::ERROR_PATH_NOT_FOUND;
+
+        let parent = TestHome::new();
+        let error = write_owner_only_windows_daemon_status(&parent.0.join("missing"), b"{}")
+            .expect_err("missing parent must reject temporary creation");
+        let ClientError::Io { operation, source } = error else {
+            panic!("temporary creation must retain its I/O error");
+        };
+        assert_eq!(
+            operation,
+            "failed to write owner-only Windows daemon status: create-temporary-file"
+        );
+        assert_eq!(source.raw_os_error(), Some(ERROR_PATH_NOT_FOUND as i32));
+        assert_eq!(std::fs::read_dir(&parent.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn blocked_status_replacement_identifies_operation_and_cleans_temporary_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+        let home = TestHome::new();
+        let path = home.0.join("daemon.json");
+        std::fs::write(&path, b"old").expect("create current status");
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("hold a non-sharing status reader");
+        let result = write_owner_only_windows_daemon_status(&home.0, b"new");
+        drop(reader);
+        let error = result.expect_err("non-sharing reader must prevent replacement");
+        let ClientError::Io { operation, source } = error else {
+            panic!("replacement must retain its I/O error");
+        };
+        assert_eq!(
+            operation,
+            "failed to write owner-only Windows daemon status: replace-status-file"
+        );
+        assert!(matches!(source.raw_os_error(), Some(code)
+            if code == ERROR_ACCESS_DENIED as i32 || code == ERROR_SHARING_VIOLATION as i32));
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert_eq!(std::fs::read_dir(&home.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn invalid_token_size_query_preserves_operation_and_os_error() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+
+        let error = CurrentWindowsUser::token_buffer_size(std::ptr::null_mut())
+            .expect_err("null token must fail the sizing query");
+        let ClientError::Io { operation, source } = error else {
+            panic!("token sizing must retain its I/O error");
+        };
+        assert_eq!(
+            operation,
+            "failed to write owner-only Windows daemon status: read-process-token"
+        );
+        assert_eq!(source.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+    }
 
     #[test]
     fn daemon_status_dacl_does_not_inherit_directory_aces() {
