@@ -20,6 +20,7 @@ use uuid::Uuid;
 const FAMILIAR_ID: &str = "sage";
 const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const REQUIRE_OVERRIDE_ENV: &str = "COVEN_THREADS_E2E_REQUIRE_LOCAL_OVERRIDE";
+const ARTIFACT_ROOT_ENV: &str = "COVEN_THREADS_E2E_ARTIFACT_ROOT";
 
 #[cfg(feature = "threads-test-clock")]
 mod final_commit_cases {
@@ -2139,12 +2140,49 @@ fn startup_failure_fallback_preserves_partially_captured_artifacts() -> Result<(
     Ok(())
 }
 
+#[test]
+fn artifact_root_override_isolates_setup_failures_from_cached_evidence() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let cached = temp.path().join("target/e2e-artifacts/historical");
+    fs::create_dir_all(&cached)?;
+    fs::write(cached.join("manifest.json"), b"historical evidence")?;
+    let root = temp.path().join("runner-temp/run-123-attempt-2");
+    let evidence =
+        EvidenceContext::with_artifact_root("isolated-root", Some(root.clone().into_os_string()));
+    assert_eq!(evidence.artifact_dir.parent(), Some(root.as_path()));
+    evidence.write_setup_failure(&anyhow::anyhow!("synthetic setup failure"))?;
+    assert!(evidence.artifact_dir.join("manifest.json").is_file());
+    assert_eq!(fs::read_dir(&root)?.count(), 1);
+    assert_eq!(
+        fs::read(cached.join("manifest.json"))?,
+        b"historical evidence"
+    );
+    let next = EvidenceContext::with_artifact_root("isolated-root", Some(root.into_os_string()));
+    assert_ne!(evidence.artifact_dir, next.artifact_dir);
+    Ok(())
+}
+
+#[test]
+fn artifact_root_default_preserves_local_evidence_location() {
+    let evidence = EvidenceContext::with_artifact_root("local-root", None);
+    assert_eq!(
+        evidence.artifact_dir,
+        workspace_root()
+            .join("target/e2e-artifacts")
+            .join(&evidence.run_id)
+    );
+}
+
 impl EvidenceContext {
     fn new(scenario: &str) -> Self {
+        Self::with_artifact_root(scenario, std::env::var_os(ARTIFACT_ROOT_ENV))
+    }
+
+    fn with_artifact_root(scenario: &str, root: Option<OsString>) -> Self {
         let run_id = format!("{}-{}-{}", scenario, std::process::id(), Uuid::new_v4());
-        let artifact_dir = workspace_root()
-            .join("target")
-            .join("e2e-artifacts")
+        let artifact_dir = root
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace_root().join("target/e2e-artifacts"))
             .join(&run_id);
         Self {
             run_id,

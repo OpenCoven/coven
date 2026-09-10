@@ -98,7 +98,18 @@ class CheckCiWorkflowTests(unittest.TestCase):
         )[0]
         self.assertIn("name: Upload Threads daemon evidence", windows)
         self.assertIn("if: ${{ always() }}", windows)
-        self.assertIn("path: target/e2e-artifacts/", windows)
+        job_config, steps = windows.split("\n    steps:\n", 1)
+        self.assertIn(
+            "COVEN_THREADS_E2E_ARTIFACT_ROOT: ${{ github.workspace }}/../threads-e2e-${{ github.run_id }}-${{ github.run_attempt }}",
+            job_config,
+        )
+        self.assertNotIn("COVEN_THREADS_E2E_ARTIFACT_ROOT:", steps)
+        self.assertNotIn("runner.", job_config)
+        self.assertIn("path: ${{ env.COVEN_THREADS_E2E_ARTIFACT_ROOT }}", steps)
+        self.assertNotIn("path: target/e2e-artifacts/", steps)
+        upload = steps.split("- name: Upload Threads daemon evidence\n", 1)[1]
+        self.assertIn("if: ${{ always() }}", upload)
+        self.assertIn("if-no-files-found: error", upload)
         self.assertIn("retention-days: 14", windows)
 
     def test_windows_has_budget_for_both_threads_build_profiles(self) -> None:
