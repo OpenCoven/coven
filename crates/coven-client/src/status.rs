@@ -400,17 +400,28 @@ mod tests {
         use windows_sys::Win32::{
             Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
             Security::{
-                Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+                    SE_FILE_OBJECT,
+                },
+                DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
                 SECURITY_ATTRIBUTES,
             },
             Storage::FileSystem::{
                 CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
-                FILE_SHARE_WRITE,
+                FILE_SHARE_WRITE, WRITE_DAC, WRITE_OWNER,
             },
         };
 
         for (label, sddl, access) in [
             ("inherited", None, GENERIC_WRITE),
+            ("null-descriptor-attributes", None, GENERIC_WRITE),
+            ("copied-inherited", None, GENERIC_WRITE),
+            (
+                "inherited-security-access",
+                None,
+                GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+            ),
             ("owner", Some(format!("O:{sid}")), GENERIC_WRITE),
             (
                 "ow-default",
@@ -450,6 +461,36 @@ mod tests {
                     "convert creation probe descriptor"
                 );
             }
+            if label == "copied-inherited" {
+                let seed = directory.join("creation-probe-seed.tmp");
+                drop(
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&seed)
+                        .expect("create inherited descriptor seed"),
+                );
+                let encoded: Vec<u16> = seed.as_os_str().encode_wide().chain(Some(0)).collect();
+                assert_eq!(
+                    unsafe {
+                        GetNamedSecurityInfoW(
+                            encoded.as_ptr(),
+                            SE_FILE_OBJECT,
+                            OWNER_SECURITY_INFORMATION
+                                | GROUP_SECURITY_INFORMATION
+                                | DACL_SECURITY_INFORMATION,
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            ptr::null_mut(),
+                            &mut descriptor,
+                        )
+                    },
+                    0,
+                    "read inherited descriptor seed"
+                );
+                std::fs::remove_file(seed).expect("remove inherited descriptor seed");
+            }
             let _descriptor = LocalAllocation(descriptor);
             let security = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -463,7 +504,7 @@ mod tests {
                     encoded.as_ptr(),
                     access,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    if descriptor.is_null() {
+                    if descriptor.is_null() && label != "null-descriptor-attributes" {
                         ptr::null()
                     } else {
                         &security
