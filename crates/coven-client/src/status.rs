@@ -578,6 +578,204 @@ mod tests {
         }
     }
 
+    fn trace_handle_security_matrix(directory: &Path, context: &str) {
+        use std::os::windows::{
+            ffi::OsStrExt,
+            io::{AsRawHandle, FromRawHandle},
+        };
+        use std::ptr;
+        use windows_sys::Win32::{
+            Foundation::{GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE},
+            Security::{
+                Authorization::{
+                    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+                    SetSecurityInfo, SE_FILE_OBJECT,
+                },
+                EqualSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+                DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+                PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+            },
+            Storage::FileSystem::{
+                CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, READ_CONTROL, WRITE_DAC,
+                WRITE_OWNER,
+            },
+        };
+        // Dynamically resolve the documented diagnostic API; no production dependency.
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetModuleHandleW(name: *const u16) -> *mut std::ffi::c_void;
+            fn GetProcAddress(
+                module: *mut std::ffi::c_void,
+                name: *const u8,
+            ) -> *mut std::ffi::c_void;
+        }
+        type Query =
+            unsafe extern "system" fn(HANDLE, i32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
+        let module_name: Vec<u16> = "ntdll.dll".encode_utf16().chain(Some(0)).collect();
+        let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+        assert!(!module.is_null(), "loaded ntdll diagnostic module");
+        let address = unsafe { GetProcAddress(module, c"NtQueryObject".as_ptr().cast()) };
+        assert!(!address.is_null(), "NtQueryObject diagnostic export");
+        let query: Query = unsafe { std::mem::transmute(address) };
+        let owner = CurrentWindowsUser::read().unwrap();
+        let sddl: Vec<u16> = WINDOWS_OWNER_ONLY_FILE_DACL_SDDL
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    1,
+                    &mut descriptor,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let _descriptor = LocalAllocation(descriptor);
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            },
+            0
+        );
+        assert!(present != 0 && !dacl.is_null());
+        for (label, flags) in [
+            ("owner", OWNER_SECURITY_INFORMATION),
+            (
+                "dacl",
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            ),
+            (
+                "combined",
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+            ),
+        ] {
+            let path = directory.join(format!("handle-security-probe-{label}.tmp"));
+            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
+                    0,
+                    ptr::null(),
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                handle, INVALID_HANDLE_VALUE,
+                "create exclusive diagnostic file"
+            );
+            let file = unsafe { std::fs::File::from_raw_handle(handle) };
+            // PUBLIC_OBJECT_BASIC_INFORMATION consists of fourteen ULONG fields.
+            let mut basic = [0u32; 14];
+            let mut length = 0;
+            let status = unsafe {
+                query(
+                    handle,
+                    0,
+                    basic.as_mut_ptr().cast(),
+                    std::mem::size_of_val(&basic) as u32,
+                    &mut length,
+                )
+            };
+            eprintln!("handle-probe:{context}:{label}:query-status={status}");
+            if status >= 0 && length == std::mem::size_of_val(&basic) as u32 {
+                for (name, mask) in [
+                    ("read-control", READ_CONTROL),
+                    ("write-dac", WRITE_DAC),
+                    ("write-owner", WRITE_OWNER),
+                ] {
+                    eprintln!(
+                        "handle-probe:{context}:{label}:{name}={}",
+                        basic[1] & mask == mask
+                    );
+                }
+            }
+            for phase in ["before", "after"] {
+                let (mut actual_owner, mut actual_dacl, mut actual_descriptor) =
+                    (ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+                let code = unsafe {
+                    GetSecurityInfo(
+                        handle,
+                        SE_FILE_OBJECT,
+                        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                        &mut actual_owner,
+                        ptr::null_mut(),
+                        &mut actual_dacl,
+                        ptr::null_mut(),
+                        &mut actual_descriptor,
+                    )
+                };
+                let _actual_descriptor = LocalAllocation(actual_descriptor);
+                eprintln!("handle-probe:{context}:{label}:{phase}:read={code}");
+                if code == 0 {
+                    let (mut control, mut revision) = (0, 0);
+                    assert_ne!(
+                        unsafe {
+                            GetSecurityDescriptorControl(
+                                actual_descriptor,
+                                &mut control,
+                                &mut revision,
+                            )
+                        },
+                        0
+                    );
+                    eprintln!(
+                        "handle-probe:{context}:{label}:{phase}:current-owner={}",
+                        !actual_owner.is_null()
+                            && unsafe { EqualSid(actual_owner, owner.sid()) } != 0
+                    );
+                    eprintln!(
+                        "handle-probe:{context}:{label}:{phase}:protected={}",
+                        control & SE_DACL_PROTECTED != 0
+                    );
+                    eprintln!(
+                        "handle-probe:{context}:{label}:{phase}:ace-count={}",
+                        if actual_dacl.is_null() {
+                            0
+                        } else {
+                            unsafe { (*actual_dacl).AceCount }
+                        }
+                    );
+                }
+                if phase == "before" {
+                    let code = unsafe {
+                        SetSecurityInfo(
+                            file.as_raw_handle(),
+                            SE_FILE_OBJECT,
+                            flags,
+                            if flags & OWNER_SECURITY_INFORMATION != 0 {
+                                owner.sid()
+                            } else {
+                                ptr::null_mut()
+                            },
+                            ptr::null_mut(),
+                            if flags & DACL_SECURITY_INFORMATION != 0 {
+                                dacl
+                            } else {
+                                ptr::null_mut()
+                            },
+                            ptr::null_mut(),
+                        )
+                    };
+                    eprintln!("handle-probe:{context}:{label}:set={code}");
+                }
+            }
+            assert_eq!(file.metadata().unwrap().len(), 0);
+            drop(file);
+            std::fs::remove_file(path).expect("remove empty handle probe");
+        }
+    }
+
     #[test]
     fn status_replacement_succeeds_with_inherited_modify_only_owner_rights() {
         use std::os::windows::ffi::OsStrExt;
@@ -667,6 +865,8 @@ mod tests {
         let ordinary = TestHome::new();
         trace_creation_descriptor_matrix(&ordinary.0, &sid, "ordinary");
         trace_creation_descriptor_matrix(&home.0, &sid, "restricted");
+        trace_handle_security_matrix(&ordinary.0, "ordinary");
+        trace_handle_security_matrix(&home.0, "restricted");
 
         write_owner_only_windows_daemon_status(&home.0, b"first")
             .expect("create secure status under inherited modify-only rights");
