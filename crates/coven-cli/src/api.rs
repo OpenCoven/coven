@@ -18487,6 +18487,18 @@ pub(crate) mod tests {
         Ok(count.try_into()?)
     }
 
+    fn assert_adopted_launch_store_ready(coven_home: &Path) -> anyhow::Result<()> {
+        // Unlike open_store, this cannot hide cold-start migration work in a
+        // request-readiness deadline. Real daemon startup initializes first.
+        let conn = store::open_initialized_store(&store_path(coven_home))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
     fn assert_adoption_error(
         response: &ApiResponse,
         status: u16,
@@ -18937,6 +18949,8 @@ pub(crate) mod tests {
     fn adopted_launch_concurrent_replay_observes_committed_created() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let body = adopted_launch_body(
@@ -19071,6 +19085,8 @@ pub(crate) mod tests {
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let git = std::process::Command::new("git")
