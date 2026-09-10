@@ -7597,10 +7597,12 @@ mod tests {
             vec![b'x'; 1024 * 1024],
         )?;
         let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
         let runtime = Arc::new(PromptCancellationApiRuntime {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(Some(writing_tx)),
             await_root_exit_before_activate: None,
         });
         let body = serde_json::json!({
@@ -7625,7 +7627,8 @@ mod tests {
             let _ = response_tx.send(response);
         });
 
-        let session_id = launched_rx.recv_timeout(Duration::from_secs(2))?;
+        let session_id =
+            receive_prompt_launch_notification(&launched_rx, &response_rx, Duration::from_secs(2))?;
         let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
         let registration_deadline = Instant::now() + Duration::from_secs(2);
         while !runtime
@@ -7641,6 +7644,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        receive_prompt_delivery_phase(
+            &writing_rx,
+            "prompt writer entry before kill",
+            registration_deadline.saturating_duration_since(Instant::now()),
+        )?;
 
         let kill = crate::api::handle_request_with_runtime(
             "POST",
@@ -7651,7 +7659,12 @@ mod tests {
             runtime.as_ref(),
         )?;
         assert_eq!(kill.status, 202, "{}", kill.body);
-        let launch = response_rx.recv_timeout(Duration::from_secs(2))??;
+        let launch = receive_prompt_delivery_phase(
+            &response_rx,
+            "launch response after kill",
+            Duration::from_secs(2),
+        )?
+        .context("API launch returned an error after concurrent kill")?;
         assert_eq!(launch.status, 500, "{}", launch.body);
         let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
         let row = crate::store::get_session(&conn, &session_id)?
@@ -7659,6 +7672,92 @@ mod tests {
         assert_eq!(row.status, "killed");
         await_daemon_shutdown_descendant_exit(child_pid, "concurrent API cancellation")?;
         Ok(())
+    }
+
+    fn receive_prompt_delivery_phase<T>(
+        receiver: &std::sync::mpsc::Receiver<T>,
+        phase: &str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let started = Instant::now();
+        receiver.recv_timeout(timeout).with_context(|| {
+            format!(
+                "{phase}: elapsed={:?}, budget={timeout:?}",
+                started.elapsed()
+            )
+        })
+    }
+
+    fn receive_prompt_launch_notification(
+        notification: &std::sync::mpsc::Receiver<String>,
+        response: &std::sync::mpsc::Receiver<Result<crate::api::ApiResponse>>,
+        timeout: Duration,
+    ) -> Result<String> {
+        receive_prompt_delivery_phase(notification, "runtime launch notification", timeout)
+            .with_context(|| {
+                let early_response = match response.try_recv() {
+                    Ok(Ok(response)) => format!("HTTP {}: {}", response.status, response.body),
+                    Ok(Err(error)) => format!("API error: {error:#}"),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => "still pending".to_owned(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        "channel disconnected without a response".to_owned()
+                    }
+                };
+                format!("early launch response: {early_response}")
+            })
+    }
+
+    #[test]
+    fn prompt_delivery_phase_timeout_identifies_phase_and_elapsed() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        let error =
+            receive_prompt_delivery_phase(&receiver, "launch response after kill", Duration::ZERO)
+                .expect_err("an empty channel must report the awaited phase");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("launch response after kill"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(
+            diagnostic.contains("timed out waiting on channel"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_response() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Ok(crate::api::ApiResponse {
+                status: 500,
+                content_type: "application/json",
+                body: r#"{"error":"fixture launch failed"}"#.to_owned(),
+            }))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include the early response");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("runtime launch notification"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(diagnostic.contains("HTTP 500"), "{diagnostic}");
+        assert!(diagnostic.contains("fixture launch failed"), "{diagnostic}");
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_error() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Err(anyhow::anyhow!("fixture admission failed")))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include an early API error");
+        assert!(format!("{error:#}").contains("fixture admission failed"));
     }
 
     #[cfg(any(unix, windows))]
@@ -7680,6 +7779,7 @@ mod tests {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(None),
             await_root_exit_before_activate: Some(pid_file.clone()),
         };
         let body = serde_json::json!({
@@ -8194,6 +8294,7 @@ mod tests {
         inner: LiveSessionRuntime,
         command: Mutex<Option<pty_runner::HarnessCommand>>,
         launched: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        prompt_write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         await_root_exit_before_activate: Option<PathBuf>,
     }
 
@@ -8210,7 +8311,10 @@ mod tests {
                 .take()
                 .context("prompt-cancellation fixture command was already consumed")?;
             let (observer, registration) = self.inner.observer_for_session(launch.id.clone());
-            let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            let mut piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            if let Some(sender) = self.prompt_write_started.lock().unwrap().take() {
+                piped.notify_prompt_write_started_for_test(sender)?;
+            }
             if let Some(pid_file) = &self.await_root_exit_before_activate {
                 let pid = await_daemon_shutdown_descendant_pid(pid_file)?;
                 await_daemon_shutdown_descendant_exit(pid, "successful pre-delivery root exit")?;
