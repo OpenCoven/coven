@@ -1328,7 +1328,7 @@ mod tests {
         let harness = PairingHarness::new();
         let pending = harness.enroll();
         let mut wrong_phrase = pending.phrase.clone();
-        wrong_phrase[0] = "wrong".to_owned();
+        wrong_phrase[0].push_str("-mismatch");
 
         assert_eq!(
             harness
@@ -1390,7 +1390,7 @@ mod tests {
         );
         let device = assert_complete(harness.confirm_device(&pending.phrase), false);
         let mut wrong_phrase = pending.phrase.clone();
-        wrong_phrase[0] = "wrong".to_owned();
+        wrong_phrase[0].push_str("-mismatch");
 
         assert_eq!(
             harness
