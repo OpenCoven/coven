@@ -13,11 +13,7 @@ pub fn write_owner_only_windows_daemon_status(
     let status_path = coven_home.join("daemon.json");
     let temporary_path = temporary_status_path(&status_path);
     let write_result = (|| {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .map_err(|error| StatusWriteStage::CreateTemporary.io_error(error))?;
+        let mut file = create_owner_only_status_file(&temporary_path)?;
         file.write_all(contents)
             .map_err(|error| StatusWriteStage::WriteContents.io_error(error))?;
         if !contents.ends_with(b"\n") {
@@ -27,7 +23,6 @@ pub fn write_owner_only_windows_daemon_status(
         file.sync_all()
             .map_err(|error| StatusWriteStage::SyncTemporary.io_error(error))?;
         drop(file);
-        set_owner_only_file_security(&temporary_path)?;
         replace_status_file(&temporary_path, &status_path)
     })();
     if write_result.is_err() {
@@ -50,27 +45,41 @@ fn temporary_status_path(status_path: &Path) -> PathBuf {
     ))
 }
 
-fn set_owner_only_file_security(path: &Path) -> Result<(), ClientError> {
-    use std::ffi::OsStr;
-    use std::os::windows::ffi::OsStrExt;
+fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientError> {
+    use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
     use std::ptr;
-    use windows_sys::Win32::Security::{
-        Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
-            SE_FILE_OBJECT,
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Security::{
+            Authorization::{
+                ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            },
+            SECURITY_ATTRIBUTES,
         },
-        GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION,
+        Storage::FileSystem::{
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
     };
 
-    let descriptor_sddl: Vec<u16> = OsStr::new(WINDOWS_OWNER_ONLY_FILE_DACL_SDDL)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
+    let owner = CurrentWindowsUser::read()?;
+    let mut owner_text = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(owner.sid(), &mut owner_text) } == 0 {
+        return Err(StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::last_os_error()));
+    }
+    let _owner_text = LocalAllocation(owner_text.cast());
+    let mut owner_length = 0;
+    while unsafe { *owner_text.add(owner_length) } != 0 {
+        owner_length += 1;
+    }
+    let mut sddl: Vec<u16> = "O:".encode_utf16().collect();
+    sddl.extend_from_slice(unsafe { std::slice::from_raw_parts(owner_text, owner_length) });
+    sddl.extend(WINDOWS_OWNER_ONLY_FILE_DACL_SDDL.encode_utf16());
+    sddl.push(0);
     let mut descriptor = ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            descriptor_sddl.as_ptr(),
+            sddl.as_ptr(),
             1,
             &mut descriptor,
             ptr::null_mut(),
@@ -80,49 +89,39 @@ fn set_owner_only_file_security(path: &Path) -> Result<(), ClientError> {
         return Err(StatusWriteStage::ConvertDescriptor.io_error(std::io::Error::last_os_error()));
     }
     let _descriptor = LocalAllocation(descriptor);
-    let mut dacl_present = 0;
-    let mut dacl = ptr::null_mut();
-    let mut dacl_defaulted = 0;
-    if unsafe {
-        GetSecurityDescriptorDacl(
-            descriptor,
-            &mut dacl_present,
-            &mut dacl,
-            &mut dacl_defaulted,
-        )
-    } == 0
-        || dacl_present == 0
-        || dacl.is_null()
-    {
-        return Err(ClientError::Discovery(
-            "owner-only Windows daemon status descriptor had no DACL".to_owned(),
-        ));
+    let security = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        bInheritHandle: 0,
+    };
+    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return Err(
+            StatusWriteStage::CreateTemporary.io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "status path contains a NUL",
+            )),
+        );
     }
-
-    let owner = CurrentWindowsUser::read()?;
-    let mut path: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_mut_ptr(),
-            SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner.sid(),
-            ptr::null_mut(),
-            dacl,
+    path.push(0);
+    // Establish the explicit owner and protected DACL before any status bytes
+    // exist. Inherited OWNER RIGHTS restrictions can forbid later ACL updates.
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &security,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
             ptr::null_mut(),
         )
     };
-    if status != 0 {
-        return Err(StatusWriteStage::ApplySecurity
-            .io_error(std::io::Error::from_raw_os_error(status as i32)));
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(StatusWriteStage::CreateTemporary.io_error(std::io::Error::last_os_error()));
     }
-    Ok(())
+    // CreateFileW returned a new owned handle; File closes it exactly once.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 fn replace_status_file(temporary_path: &Path, status_path: &Path) -> Result<(), ClientError> {
@@ -360,6 +359,39 @@ mod tests {
             unsafe { EqualSid(ace_sid, owner_rights.as_ptr().cast_mut().cast()) },
             0
         );
+    }
+
+    #[test]
+    fn secure_temporary_file_is_owner_only_before_writing_and_cannot_overwrite() {
+        let home = TestHome::new();
+        let path = home.0.join("temporary");
+        let mut file = create_owner_only_status_file(&path).expect("create secure empty file");
+        assert_status_file_is_owner_only(&path);
+        file.write_all(b"original").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let error = create_owner_only_status_file(&path).expect_err("exclusive create must fail");
+        let ClientError::Io { source, .. } = error else {
+            panic!("expected I/O error")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn secure_temporary_creation_rejects_nul_without_creating_truncated_path() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        let home = TestHome::new();
+        let path = home.0.join("must-not-exist");
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+        wide.extend([0, 120]);
+        let invalid = PathBuf::from(std::ffi::OsString::from_wide(&wide));
+        let error = create_owner_only_status_file(&invalid).expect_err("NUL must fail");
+        let ClientError::Io { source, .. } = error else {
+            panic!("expected I/O error")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(!path.exists());
     }
 
     #[test]

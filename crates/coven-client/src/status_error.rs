@@ -9,7 +9,6 @@ pub(crate) enum StatusWriteStage {
     ConvertDescriptor,
     OpenToken,
     ReadToken,
-    ApplySecurity,
     ReplaceStatus,
 }
 
@@ -37,9 +36,6 @@ impl StatusWriteStage {
                 }
                 Self::ReadToken => {
                     "failed to write owner-only Windows daemon status: read-process-token"
-                }
-                Self::ApplySecurity => {
-                    "failed to write owner-only Windows daemon status: apply-owner-only-security"
                 }
                 Self::ReplaceStatus => {
                     "failed to write owner-only Windows daemon status: replace-status-file"
@@ -84,10 +80,6 @@ mod tests {
             (
                 StatusWriteStage::ReadToken,
                 "failed to write owner-only Windows daemon status: read-process-token",
-            ),
-            (
-                StatusWriteStage::ApplySecurity,
-                "failed to write owner-only Windows daemon status: apply-owner-only-security",
             ),
             (
                 StatusWriteStage::ReplaceStatus,
