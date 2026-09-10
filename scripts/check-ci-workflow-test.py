@@ -119,6 +119,10 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertNotIn("/../", windows)
         self.assertNotIn("path: target/e2e-artifacts/", steps)
         upload = steps.split("- name: Upload Threads daemon evidence\n", 1)[1]
+        self.assertIn(
+            "name: threads-daemon-windows-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}",
+            upload,
+        )
         self.assertIn(f"path: {artifact_root}", upload)
         self.assertIn("if: ${{ always() }}", upload)
         self.assertIn("if-no-files-found: error", upload)

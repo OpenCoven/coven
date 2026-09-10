@@ -99,6 +99,9 @@ and fails if no files were produced. A canceled job cannot substitute
 historical artifacts restored from the build cache. Separate run attempts use
 different roots; multiple test invocations within an attempt share the root
 but retain unique scenario directories.
+Uploaded artifact names also include the commit, workflow run, and attempt,
+so name-based selection distinguishes repeated attempts at the same commit.
+For older artifacts with commit-only names, select the exact artifact ID.
 
 Local default directories still accumulate evidence. Inspect each manifest's
 revision and result rather than treating aggregate file counts as acceptance
