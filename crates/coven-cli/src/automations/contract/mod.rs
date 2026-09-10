@@ -12,6 +12,10 @@ pub mod authority;
 pub mod error;
 pub mod events;
 pub mod migration;
+// This receiving contract intentionally has no production verifier or runtime
+// producer until a later adapter slice wires one.
+#[allow(dead_code)]
+pub mod runtime_terminal_evidence;
 // These projections are intentionally available to the following protocol slices.
 #[allow(dead_code)]
 pub mod types;
