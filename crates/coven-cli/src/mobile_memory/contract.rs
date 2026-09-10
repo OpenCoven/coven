@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use super::assurance::{AssuranceClass, StepUpAuthorizationEnrollment};
 use super::MOBILE_PROTOCOL_VERSION;
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,6 +63,7 @@ pub enum MobileErrorCode {
     RequestExpired,
     RequestReplayed,
     RateLimited,
+    AssuranceRequired,
     ProtocolUnsupported,
     CapabilityUnavailable,
     MemoryNotFound,
@@ -81,6 +83,7 @@ impl MobileErrorCode {
                 | Self::RequestExpired
                 | Self::RequestReplayed
                 | Self::RateLimited
+                | Self::AssuranceRequired
                 | Self::MemoryContentUnavailable
                 | Self::DaemonUnavailable
         )
@@ -243,6 +246,7 @@ pub struct MobilePairingRequest {
     pub device_public_key: String,
     pub app_version: String,
     pub supported_protocol: MobileProtocolRange,
+    pub step_up_authorization: Option<StepUpAuthorizationEnrollment>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -250,6 +254,13 @@ pub struct MobilePairingRequest {
 pub struct MobilePendingPairing {
     pub pairing_id: Uuid,
     pub phrase: Vec<String>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileAssuranceChallenge {
+    pub challenge: String,
     pub expires_at: DateTime<Utc>,
 }
 
@@ -324,5 +335,51 @@ mod tests {
         .unwrap();
         assert_eq!(encoded["error"]["code"], "device_revoked");
         assert!(encoded["error"].get("message").is_none());
+    }
+
+    #[test]
+    fn pairing_step_up_enrollment_is_closed_and_requires_all_fields() {
+        let valid = serde_json::json!({
+            "protocolVersion": 2,
+            "pairingNonce": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "deviceName": "Synthetic phone",
+            "devicePublicKey": "synthetic",
+            "appVersion": "1.0.0",
+            "supportedProtocol": { "minimum": 1, "maximum": 2 },
+            "stepUpAuthorization": {
+                "publicKey": "synthetic-step-up",
+                "assuranceClass": "biometric_only",
+                "enrollmentSignature": "synthetic-signature"
+            }
+        });
+        let parsed: MobilePairingRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(
+            parsed.step_up_authorization.unwrap().assurance_class,
+            AssuranceClass::BiometricOnly
+        );
+
+        for invalid in [
+            {
+                let mut value = valid.clone();
+                value["stepUpAuthorization"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("enrollmentSignature");
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["stepUpAuthorization"]["assuranceClass"] =
+                    serde_json::json!("recent_user_verification");
+                value
+            },
+            {
+                let mut value = valid;
+                value["stepUpAuthorization"]["unexpected"] = serde_json::json!(true);
+                value
+            },
+        ] {
+            assert!(serde_json::from_value::<MobilePairingRequest>(invalid).is_err());
+        }
     }
 }
