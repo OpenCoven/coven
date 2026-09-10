@@ -1,7 +1,9 @@
+pub mod assurance;
 pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod contract;
+pub mod device;
 pub mod gateway;
 pub mod grant;
 pub mod identity;

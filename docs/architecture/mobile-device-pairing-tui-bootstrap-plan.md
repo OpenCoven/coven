@@ -59,6 +59,7 @@ plan extends it; nothing here starts from zero.
 | Transcript binding v2 | Offer digest, selected/supported versions, device key, device name, and app version bound into a digest that derives the six-word phrase | `crates/coven-cli/src/mobile_memory/pairing.rs` (`PairingTranscript::V2`), fixture `crates/coven-cli/tests/fixtures/mobile-pairing-v2/transcript-vector.json` |
 | QR rendering | Unicode half-block rendering of the pairing URL plus a printed copyable URL and expiry line | `crates/coven-cli/src/mobile_memory/pairing.rs` (`render_pairing_invitation`), `qrcode` crate 0.14 in `crates/coven-cli/Cargo.toml` |
 | Device grant model | Versioned grant object with scopes, restrictions, assurance levels, audience, and exact-action intents | `crates/coven-cli/src/mobile_memory/grant.rs` (`DeviceGrant`, `DeviceScope`, `AssuranceLevel`, `DeviceActionIntent`) |
+| Device administration | Top-level privacy-safe `coven device list|inspect|rename|revoke`, bounded `device grant reissue`, and already-paired replacement-device rotation; legacy `coven memory mobile ...` remains supported | `crates/coven-cli/src/mobile_memory/device.rs`, command enums in `crates/coven-cli/src/main.rs` |
 | Request authentication | Canonical signed requests with timestamp, nonce, and body digest; replay window; per-device rate limiting | `crates/coven-cli/src/mobile_memory/auth.rs` (`canonical_request`, `MobileAuthenticator`) |
 | Host identity | Stable P-256 host key, self-signed certificate, SHA-256 public-key fingerprint pinned in the QR | `crates/coven-cli/src/mobile_memory/identity.rs` (`load_or_create_host_identity`, `HostIdentity`) |
 | Mobile gateway | Private-network rustls TLS listener with bounded routes, body caps, and inflight-connection limits; 5-minute pairing lifetime | `crates/coven-cli/src/mobile_memory/gateway.rs` (`MobileRoute`, `PAIRING_LIFETIME`) |
@@ -72,7 +73,7 @@ plan extends it; nothing here starts from zero.
 
 | Issue requirement | Today | Gap |
 | --- | --- | --- |
-| `coven device pair` / `--scope` | `coven memory mobile pair` with a fixed `memory_read` scope (`PAIRING_SCOPE_MEMORY_READ` in `pairing.rs`) | New top-level `device` command family; selectable, previewed scopes |
+| `coven device pair` / `--scope` | Device administration is top-level; pairing remains `coven memory mobile pair` with a fixed `memory_read` scope (`PAIRING_SCOPE_MEMORY_READ` in `pairing.rs`) | Add only the top-level pairing alias and selectable, previewed pairing scopes |
 | Canonical CBOR offer + compact URL-safe encoding | URL query members (JSON-flavored, not CBOR) in `build_pairing_url` | Deterministic CBOR offer and base64url encoding per §5 |
 | Universal Link/App Link | `coven-memory://pair` custom scheme only | HTTPS Universal Link carrying the offer in a fragment per §5.4 |
 | Forward-secret E2EE handshake (Noise) | TLS 1.3 transport plus phrase confirmation; no application-layer AKEX, no session keys | Noise_XK handshake per §6; new crypto dependencies |

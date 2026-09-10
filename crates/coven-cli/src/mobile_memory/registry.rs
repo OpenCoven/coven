@@ -1,15 +1,22 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{LazyLock, Mutex, MutexGuard, RwLock};
 
 use anyhow::{bail, Context, Result};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::assurance::{
+    AuthorizationKeyRegistry, DeviceAuthorizationKeyRecord, NewAuthorizationKey,
+};
+use super::audit::{
+    AuditDeliveryReceipt, DeviceGrantReissueAuditTransition, DeviceRotationAuditTransition,
+};
 use super::config::{atomic_replace_private, ensure_private_mobile_dir, validate_private_file};
 use super::contract::{MobileDeviceScope, MobilePairedDevice};
 pub use super::grant::DeviceScope;
@@ -19,7 +26,44 @@ pub const DEVICES_FILE: &str = "devices.json";
 const DEVICE_REGISTRY_VERSION: u16 = 2;
 const LEGACY_DEVICE_REGISTRY_VERSION: u16 = 1;
 const MAX_DEVICE_RECORDS: usize = 128;
+const MAX_ROTATION_TRANSITIONS: usize = 128;
+const MAX_GRANT_REISSUE_TRANSITIONS: usize = 128;
 const MAX_DEVICE_NAME_CHARS: usize = 80;
+const DEVICE_REGISTRY_LOCK_FILE: &str = ".devices.lock";
+static DEVICE_REGISTRY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+#[cfg(test)]
+static FAIL_DEVICE_REGISTRY_WRITE: LazyLock<Mutex<Option<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+struct DeviceRegistryStoreLock {
+    _process: MutexGuard<'static, ()>,
+    file: fs::File,
+}
+
+impl DeviceRegistryStoreLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        let process = DEVICE_REGISTRY_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("mobile device registry process lock poisoned"))?;
+        let parent = path
+            .parent()
+            .context("mobile device registry path has no parent")?;
+        let lock_path = parent.join(DEVICE_REGISTRY_LOCK_FILE);
+        let file = crate::state_lock::open_lock_file(&lock_path)?;
+        file.lock_exclusive()
+            .with_context(|| format!("failed to lock {}", lock_path.display()))?;
+        Ok(Self {
+            _process: process,
+            file,
+        })
+    }
+}
+
+impl Drop for DeviceRegistryStoreLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -45,11 +89,54 @@ pub struct DeviceAuthorizationRecord {
     pub grant: DeviceGrant,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeviceGrantRevision {
+    pub device_id: Uuid,
+    pub grant_id: Uuid,
+    pub revocation_epoch: u64,
+}
+
+impl From<&DeviceAuthorizationRecord> for DeviceGrantRevision {
+    fn from(record: &DeviceAuthorizationRecord) -> Self {
+        Self {
+            device_id: record.device.id,
+            grant_id: record.grant.id,
+            revocation_epoch: record.grant.revocation_epoch,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceRotationResult {
+    pub replacement: DeviceAuthorizationRecord,
+    pub transition: DeviceRotationAuditTransition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeviceGrantReissueResult {
+    pub device: DeviceAuthorizationRecord,
+    pub transition: DeviceGrantReissueAuditTransition,
+}
+
+pub(crate) struct DeviceGrantReissueRequest {
+    pub expected: DeviceGrantRevision,
+    pub scopes: Vec<DeviceScope>,
+    pub restrictions: super::grant::DeviceGrantRestrictions,
+    pub minimum_assurance: AssuranceLevel,
+    pub expires_at: DateTime<Utc>,
+    pub issued_at: DateTime<Utc>,
+    pub requested_policy_digest: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StoredDeviceRegistry {
     version: u16,
     devices: Vec<GrantedDeviceRecord>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rotation_transitions: Vec<DeviceRotationAuditTransition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,12 +165,15 @@ enum LegacyDeviceScope {
 
 struct LoadedRegistry {
     devices: Vec<GrantedDeviceRecord>,
+    rotation_transitions: Vec<DeviceRotationAuditTransition>,
+    grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
     migrated: bool,
 }
 
 pub struct DeviceRegistry {
     path: PathBuf,
     devices: RwLock<Vec<GrantedDeviceRecord>>,
+    authorization_keys: AuthorizationKeyRegistry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -104,13 +194,20 @@ impl DeviceRegistry {
     pub fn load(coven_home: &Path) -> Result<Self> {
         let mobile_dir = ensure_private_mobile_dir(coven_home)?;
         let path = mobile_dir.join(DEVICES_FILE);
+        let _store_lock = DeviceRegistryStoreLock::acquire(&path)?;
         let loaded = read_registry(&path)?;
         if loaded.migrated {
-            write_registry(&path, &loaded.devices)?;
+            write_registry(
+                &path,
+                &loaded.devices,
+                &loaded.rotation_transitions,
+                &loaded.grant_reissue_transitions,
+            )?;
         }
         Ok(Self {
             path,
             devices: RwLock::new(loaded.devices),
+            authorization_keys: AuthorizationKeyRegistry::load(coven_home)?,
         })
     }
 
@@ -123,9 +220,15 @@ impl DeviceRegistry {
     }
 
     pub fn reload(&self) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
         let loaded = read_registry(&self.path)?;
         if loaded.migrated {
-            write_registry(&self.path, &loaded.devices)?;
+            write_registry(
+                &self.path,
+                &loaded.devices,
+                &loaded.rotation_transitions,
+                &loaded.grant_reissue_transitions,
+            )?;
         }
         *self
             .devices
@@ -146,50 +249,119 @@ impl DeviceRegistry {
     }
 
     pub fn register_with_grant(&self, record: DeviceRecord, grant: DeviceGrant) -> Result<()> {
+        self.register_with_grant_and_authorization(record, grant, None)
+    }
+
+    pub(crate) fn register_with_grant_and_authorization(
+        &self,
+        record: DeviceRecord,
+        grant: DeviceGrant,
+        authorization_key: Option<NewAuthorizationKey>,
+    ) -> Result<()> {
         let granted = GrantedDeviceRecord {
             device: record,
             grant,
         };
         validate_granted_device(&granted)?;
-        let mut devices = self
-            .devices
-            .write()
-            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
-        if devices.len() >= MAX_DEVICE_RECORDS {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        if loaded.devices.len() >= MAX_DEVICE_RECORDS {
             bail!("mobile device registry is full");
         }
-        if devices
+        if loaded
+            .devices
             .iter()
             .any(|existing| existing.device.id == granted.device.id)
         {
             bail!("mobile device id is already registered");
         }
-        if devices
+        if loaded
+            .devices
             .iter()
             .any(|existing| existing.device.public_key_x963 == granted.device.public_key_x963)
         {
             bail!("mobile device public key is already registered");
         }
-        if devices
+        if loaded
+            .devices
             .iter()
             .any(|existing| existing.grant.id == granted.grant.id)
         {
             bail!("mobile device grant id is already registered");
         }
-        let mut updated = devices.clone();
-        updated.push(granted);
-        validate_devices(&updated)?;
-        write_registry(&self.path, &updated)?;
-        *devices = updated;
+        self.commit_registration(
+            loaded.devices,
+            loaded.rotation_transitions,
+            loaded.grant_reissue_transitions,
+            granted,
+            authorization_key,
+        )
+    }
+
+    fn commit_registration(
+        &self,
+        mut devices: Vec<GrantedDeviceRecord>,
+        rotation_transitions: Vec<DeviceRotationAuditTransition>,
+        grant_reissue_transitions: Vec<DeviceGrantReissueAuditTransition>,
+        granted: GrantedDeviceRecord,
+        authorization_key: Option<NewAuthorizationKey>,
+    ) -> Result<()> {
+        devices.push(granted);
+        validate_devices(&devices)?;
+        let enrolled_authorization = if let Some(key) = authorization_key {
+            Some(
+                self.authorization_keys.enroll_initial(
+                    devices.last().expect("new device is present").device.id,
+                    &devices
+                        .last()
+                        .expect("new device is present")
+                        .device
+                        .public_key_x963,
+                    key,
+                )?,
+            )
+        } else {
+            None
+        };
+        if let Err(error) = write_registry(
+            &self.path,
+            &devices,
+            &rotation_transitions,
+            &grant_reissue_transitions,
+        ) {
+            if enrolled_authorization.is_some() {
+                self.authorization_keys
+                    .remove_device(devices.last().expect("new device is present").device.id)
+                    .with_context(|| {
+                        format!(
+                            "failed to roll back authorization key after device commit failed: {error:#}"
+                        )
+                    })?;
+            }
+            return Err(error);
+        }
+        *self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))? = devices;
         Ok(())
     }
 
     pub fn replace_grant(&self, device_id: Uuid, grant: DeviceGrant) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        if loaded
+            .grant_reissue_transitions
+            .iter()
+            .any(|transition| transition.device_id == device_id && transition.audited_at.is_none())
+        {
+            bail!("mobile device grant reissue audit delivery is pending");
+        }
         let mut devices = self
             .devices
             .write()
             .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
-        let mut updated = devices.clone();
+        let mut updated = loaded.devices;
         let index = updated
             .iter()
             .position(|record| record.device.id == device_id)
@@ -197,8 +369,11 @@ impl DeviceRegistry {
         grant
             .validate(&updated[index].device.public_key_x963)
             .context("replacement mobile device grant is invalid")?;
-        if grant.revocation_epoch < updated[index].grant.revocation_epoch {
-            bail!("mobile device grant revocation epoch cannot decrease");
+        if grant.id == updated[index].grant.id {
+            bail!("replacement mobile device grant must use a fresh grant id");
+        }
+        if grant.revocation_epoch <= updated[index].grant.revocation_epoch {
+            bail!("replacement mobile device grant must advance its revocation epoch");
         }
         if updated
             .iter()
@@ -210,34 +385,327 @@ impl DeviceRegistry {
         updated[index].device.scopes = grant.scopes.clone();
         updated[index].grant = grant;
         validate_devices(&updated)?;
-        write_registry(&self.path, &updated)?;
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
         *devices = updated;
         Ok(())
     }
 
-    pub fn rename(&self, device_id: Uuid, display_name: String) -> Result<()> {
+    pub(crate) fn reissue_grant_atomically(
+        &self,
+        request: DeviceGrantReissueRequest,
+    ) -> Result<DeviceGrantReissueResult> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        if loaded.grant_reissue_transitions.iter().any(|transition| {
+            transition.device_id == request.expected.device_id && transition.audited_at.is_none()
+        }) {
+            bail!("mobile device grant reissue audit delivery is pending");
+        }
+        let mut grant_reissue_transitions = loaded.grant_reissue_transitions.clone();
+        if grant_reissue_transitions.len() >= MAX_GRANT_REISSUE_TRANSITIONS {
+            if let Some(index) = grant_reissue_transitions
+                .iter()
+                .position(|transition| transition.audited_at.is_some())
+            {
+                grant_reissue_transitions.remove(index);
+            } else {
+                bail!("mobile device grant-reissue audit outbox is full");
+            }
+        }
         let mut devices = self
             .devices
             .write()
             .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
-        let mut updated = devices.clone();
+        let mut updated = loaded.devices;
+        let index = updated
+            .iter()
+            .position(|record| record.device.id == request.expected.device_id)
+            .context("mobile device is not registered")?;
+        let current = &updated[index];
+        if current.grant.id != request.expected.grant_id
+            || current.grant.revocation_epoch != request.expected.revocation_epoch
+        {
+            bail!("mobile device grant changed during reissue");
+        }
+        if current.device.revoked_at.is_some() {
+            bail!("mobile device is revoked");
+        }
+        current
+            .grant
+            .authorize(None, current.grant.minimum_assurance, request.issued_at)
+            .context("mobile device grant is not active")?;
+        let replacement = current
+            .grant
+            .reissue(
+                &current.device.public_key_x963,
+                request.scopes,
+                request.restrictions,
+                request.minimum_assurance,
+                request.issued_at,
+                request.expires_at,
+            )
+            .context("replacement mobile device grant policy is invalid")?;
+        let transition = DeviceGrantReissueAuditTransition {
+            transition_id: Uuid::new_v4(),
+            device_id: request.expected.device_id,
+            requested_policy_digest: request.requested_policy_digest,
+            previous_grant_id: current.grant.id,
+            previous_revocation_epoch: current.grant.revocation_epoch,
+            replacement_grant_id: replacement.id,
+            replacement_revocation_epoch: replacement.revocation_epoch,
+            occurred_at: request.issued_at,
+            audited_at: None,
+        };
+        updated[index].device.scopes = replacement.scopes.clone();
+        updated[index].grant = replacement;
+        grant_reissue_transitions.push(transition.clone());
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &grant_reissue_transitions,
+        )?;
+        let device = DeviceAuthorizationRecord {
+            device: updated[index].device.clone(),
+            grant: updated[index].grant.clone(),
+        };
+        *devices = updated;
+        Ok(DeviceGrantReissueResult { device, transition })
+    }
+
+    pub(crate) fn rotate_devices_atomically(
+        &self,
+        source_revision: DeviceGrantRevision,
+        replacement_revision: DeviceGrantRevision,
+        rotated_at: DateTime<Utc>,
+    ) -> Result<DeviceRotationResult> {
+        if source_revision.device_id == replacement_revision.device_id {
+            bail!("source and replacement mobile devices must differ");
+        }
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        let mut devices = self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
+        let mut updated = loaded.devices;
+        let source_index = updated
+            .iter()
+            .position(|record| record.device.id == source_revision.device_id)
+            .context("source mobile device is not registered")?;
+        let replacement_index = updated
+            .iter()
+            .position(|record| record.device.id == replacement_revision.device_id)
+            .context("replacement mobile device is not registered")?;
+        let source = &updated[source_index];
+        let replacement = &updated[replacement_index];
+        if let Some(transition) = loaded.rotation_transitions.iter().rev().find(|transition| {
+            transition.source_device_id == source_revision.device_id
+                && transition.replacement_device_id == replacement_revision.device_id
+                && source.device.revoked_at.is_some()
+                && source.grant.id == transition.source_grant_id
+                && source.grant.revocation_epoch == transition.source_revocation_epoch
+        }) {
+            let result = DeviceRotationResult {
+                replacement: DeviceAuthorizationRecord {
+                    device: replacement.device.clone(),
+                    grant: replacement.grant.clone(),
+                },
+                transition: transition.clone(),
+            };
+            *devices = updated;
+            drop(devices);
+            drop(_store_lock);
+            self.complete_rotation_authorization_key_cleanup(&result.transition)?;
+            return Ok(result);
+        }
+        if loaded.grant_reissue_transitions.iter().any(|transition| {
+            transition.audited_at.is_none()
+                && (transition.device_id == source_revision.device_id
+                    || transition.device_id == replacement_revision.device_id)
+        }) {
+            bail!("mobile device grant reissue audit delivery is pending");
+        }
+        let mut rotation_transitions = loaded.rotation_transitions.clone();
+        if rotation_transitions.len() >= MAX_ROTATION_TRANSITIONS {
+            if let Some(index) = rotation_transitions.iter().position(|transition| {
+                transition.audited_at.is_some()
+                    && transition.authorization_key_cleanup_completed_at.is_some()
+            }) {
+                rotation_transitions.remove(index);
+            } else {
+                bail!("mobile device rotation audit outbox is full");
+            }
+        }
+        if source.grant.id != source_revision.grant_id
+            || source.grant.revocation_epoch != source_revision.revocation_epoch
+        {
+            bail!("source mobile device grant changed during rotation");
+        }
+        if replacement.grant.id != replacement_revision.grant_id
+            || replacement.grant.revocation_epoch != replacement_revision.revocation_epoch
+        {
+            bail!("replacement mobile device grant changed during rotation");
+        }
+        if source.device.revoked_at.is_some() {
+            bail!("source mobile device is revoked");
+        }
+        if replacement.device.revoked_at.is_some() {
+            bail!("replacement mobile device is revoked");
+        }
+        source
+            .grant
+            .authorize(None, source.grant.minimum_assurance, rotated_at)
+            .context("source mobile device grant is not active")?;
+        replacement
+            .grant
+            .authorize(None, replacement.grant.minimum_assurance, rotated_at)
+            .context("replacement mobile device grant is not active")?;
+        let required_replacement_assurance = if source
+            .grant
+            .restrictions
+            .require_fresh_user_verification_for
+            .is_empty()
+        {
+            source.grant.minimum_assurance
+        } else {
+            source
+                .grant
+                .minimum_assurance
+                .max(AssuranceLevel::FreshUserVerification)
+        };
+        if required_replacement_assurance > AssuranceLevel::Possession {
+            let replacement_key = self
+                .authorization_keys
+                .active(replacement_revision.device_id)?
+                .context(
+                    "replacement mobile device lacks an active step-up authorization key required by the source grant",
+                )?;
+            if replacement_key.assurance_class.ceiling() < required_replacement_assurance {
+                bail!(
+                    "replacement mobile device authorization key cannot satisfy the source grant assurance policy"
+                );
+            }
+        }
+
+        let expires_at = source.grant.expires_at.unwrap_or(
+            rotated_at + chrono::Duration::days(super::grant::MAX_DEVICE_GRANT_LIFETIME_DAYS),
+        );
+        let replacement_grant = replacement
+            .grant
+            .reissue(
+                &replacement.device.public_key_x963,
+                source.grant.scopes.clone(),
+                source.grant.restrictions.clone(),
+                source.grant.minimum_assurance,
+                rotated_at,
+                expires_at,
+            )
+            .context("source mobile device grant policy cannot be transferred")?;
+
+        updated[source_index].device.revoked_at = Some(rotated_at);
+        updated[source_index].grant.revocation_epoch = updated[source_index]
+            .grant
+            .revocation_epoch
+            .checked_add(1)
+            .context("source mobile device revocation epoch overflow")?;
+        updated[replacement_index].device.scopes = replacement_grant.scopes.clone();
+        updated[replacement_index].grant = replacement_grant;
+        validate_devices(&updated)?;
+
+        let transition = DeviceRotationAuditTransition {
+            transition_id: Uuid::new_v4(),
+            source_device_id: source_revision.device_id,
+            replacement_device_id: replacement_revision.device_id,
+            source_grant_id: updated[source_index].grant.id,
+            source_revocation_epoch: updated[source_index].grant.revocation_epoch,
+            replacement_grant_id: updated[replacement_index].grant.id,
+            replacement_revocation_epoch: updated[replacement_index].grant.revocation_epoch,
+            occurred_at: rotated_at,
+            audited_at: None,
+            authorization_key_cleanup_completed_at: None,
+        };
+        rotation_transitions.push(transition.clone());
+        write_registry(
+            &self.path,
+            &updated,
+            &rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
+        let replacement = DeviceAuthorizationRecord {
+            device: updated[replacement_index].device.clone(),
+            grant: updated[replacement_index].grant.clone(),
+        };
+        *devices = updated;
+        drop(devices);
+        drop(_store_lock);
+        let result = DeviceRotationResult {
+            replacement,
+            transition,
+        };
+        self.complete_rotation_authorization_key_cleanup(&result.transition)?;
+        Ok(result)
+    }
+
+    fn complete_rotation_authorization_key_cleanup(
+        &self,
+        transition: &DeviceRotationAuditTransition,
+    ) -> Result<()> {
+        if transition.authorization_key_cleanup_completed_at.is_some() {
+            return Ok(());
+        }
+        self.authorization_keys
+            .revoke(transition.source_device_id, transition.occurred_at)?;
+        self.mark_rotation_authorization_key_cleanup_completed(
+            transition.transition_id,
+            transition.occurred_at,
+        )
+    }
+
+    pub fn rename(&self, device_id: Uuid, display_name: String) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        let mut devices = self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
+        let mut updated = loaded.devices;
         let device = updated
             .iter_mut()
             .find(|record| record.device.id == device_id)
             .context("mobile device is not registered")?;
         device.device.display_name = display_name;
         validate_devices(&updated)?;
-        write_registry(&self.path, &updated)?;
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
         *devices = updated;
         Ok(())
     }
 
     pub fn revoke(&self, device_id: Uuid, revoked_at: DateTime<Utc>) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        if loaded
+            .grant_reissue_transitions
+            .iter()
+            .any(|transition| transition.device_id == device_id && transition.audited_at.is_none())
+        {
+            bail!("mobile device grant reissue audit delivery is pending");
+        }
         let mut devices = self
             .devices
             .write()
             .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
-        let mut updated = devices.clone();
+        let mut updated = loaded.devices;
         let record = updated
             .iter_mut()
             .find(|record| record.device.id == device_id)
@@ -251,19 +719,36 @@ impl DeviceRegistry {
                 .context("mobile device revocation epoch overflow")?;
         }
         validate_devices(&updated)?;
-        write_registry(&self.path, &updated)?;
+        write_registry(
+            &self.path,
+            &updated,
+            &loaded.rotation_transitions,
+            &loaded.grant_reissue_transitions,
+        )?;
         *devices = updated;
-        Ok(())
+        self.authorization_keys.revoke(device_id, revoked_at)
     }
 
     pub fn forget_all(&self) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        if loaded.rotation_transitions.iter().any(|transition| {
+            transition.audited_at.is_none()
+                || transition.authorization_key_cleanup_completed_at.is_none()
+        }) || loaded
+            .grant_reissue_transitions
+            .iter()
+            .any(|transition| transition.audited_at.is_none())
+        {
+            bail!("cannot forget mobile devices while audit delivery is pending");
+        }
         let mut devices = self
             .devices
             .write()
             .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))?;
-        write_registry(&self.path, &[])?;
+        write_registry(&self.path, &[], &[], &[])?;
         devices.clear();
-        Ok(())
+        self.authorization_keys.forget_all()
     }
 
     pub fn device(&self, device_id: Uuid) -> Result<Option<DeviceRecord>> {
@@ -290,6 +775,176 @@ impl DeviceRegistry {
                 device: record.device.clone(),
                 grant: record.grant.clone(),
             }))
+    }
+
+    pub fn authorization_key(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Option<DeviceAuthorizationKeyRecord>> {
+        self.authorization_keys.active(device_id)
+    }
+
+    pub fn revoke_authorization_key(
+        &self,
+        device_id: Uuid,
+        revoked_at: DateTime<Utc>,
+    ) -> Result<()> {
+        self.device(device_id)?
+            .context("mobile device is not registered")?;
+        self.authorization_keys.revoke(device_id, revoked_at)
+    }
+
+    pub fn authorization_key_history(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Vec<DeviceAuthorizationKeyRecord>> {
+        self.authorization_keys.history(device_id)
+    }
+
+    pub(crate) fn pending_rotation_audits(&self) -> Result<Vec<DeviceRotationAuditTransition>> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        Ok(loaded
+            .rotation_transitions
+            .into_iter()
+            .filter(|transition| transition.audited_at.is_none())
+            .collect())
+    }
+
+    pub(crate) fn pending_grant_reissue_audit(
+        &self,
+        device_id: Uuid,
+    ) -> Result<Option<DeviceGrantReissueAuditTransition>> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let loaded = read_registry(&self.path)?;
+        let pending: Vec<_> = loaded
+            .grant_reissue_transitions
+            .iter()
+            .filter(|transition| {
+                transition.device_id == device_id && transition.audited_at.is_none()
+            })
+            .collect();
+        let transition = match pending.as_slice() {
+            [] => return Ok(None),
+            [transition] => (*transition).clone(),
+            _ => bail!("mobile device has multiple pending grant-reissue audits"),
+        };
+        let current = loaded
+            .devices
+            .iter()
+            .find(|record| record.device.id == device_id)
+            .context("mobile device grant-reissue transition references an unknown device")?;
+        if current.grant.id != transition.replacement_grant_id
+            || current.grant.revocation_epoch != transition.replacement_revocation_epoch
+        {
+            bail!("pending mobile device grant-reissue audit does not match current authority");
+        }
+        Ok(Some(transition))
+    }
+
+    pub(crate) fn mark_rotation_audited(
+        &self,
+        receipt: &AuditDeliveryReceipt,
+        audited_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let mut loaded = read_registry(&self.path)?;
+        let transition = loaded
+            .rotation_transitions
+            .iter_mut()
+            .find(|transition| transition.transition_id == receipt.transition_id())
+            .context("mobile device rotation transition is not registered")?;
+        if transition.audited_at.is_none() {
+            transition.audited_at = Some(audited_at);
+            write_registry(
+                &self.path,
+                &loaded.devices,
+                &loaded.rotation_transitions,
+                &loaded.grant_reissue_transitions,
+            )?;
+        }
+        *self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))? = loaded.devices;
+        Ok(())
+    }
+
+    fn mark_rotation_authorization_key_cleanup_completed(
+        &self,
+        transition_id: Uuid,
+        completed_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let mut loaded = read_registry(&self.path)?;
+        let transition = loaded
+            .rotation_transitions
+            .iter_mut()
+            .find(|transition| transition.transition_id == transition_id)
+            .context("mobile device rotation transition is not registered")?;
+        let source = loaded
+            .devices
+            .iter()
+            .find(|record| record.device.id == transition.source_device_id)
+            .context("mobile device rotation transition references an unknown source device")?;
+        if source.device.revoked_at.is_none()
+            || source.grant.id != transition.source_grant_id
+            || source.grant.revocation_epoch != transition.source_revocation_epoch
+        {
+            bail!("mobile device rotation cleanup does not match committed source revocation");
+        }
+        if transition.authorization_key_cleanup_completed_at.is_none() {
+            transition.authorization_key_cleanup_completed_at = Some(completed_at);
+            write_registry(
+                &self.path,
+                &loaded.devices,
+                &loaded.rotation_transitions,
+                &loaded.grant_reissue_transitions,
+            )?;
+        }
+        *self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))? = loaded.devices;
+        Ok(())
+    }
+
+    pub(crate) fn mark_grant_reissue_audited(
+        &self,
+        receipt: &AuditDeliveryReceipt,
+        audited_at: DateTime<Utc>,
+    ) -> Result<()> {
+        let _store_lock = DeviceRegistryStoreLock::acquire(&self.path)?;
+        let mut loaded = read_registry(&self.path)?;
+        let transition = loaded
+            .grant_reissue_transitions
+            .iter_mut()
+            .find(|transition| transition.transition_id == receipt.transition_id())
+            .context("mobile device grant-reissue transition is not registered")?;
+        let current = loaded
+            .devices
+            .iter()
+            .find(|record| record.device.id == transition.device_id)
+            .context("mobile device grant-reissue transition references an unknown device")?;
+        if current.grant.id != transition.replacement_grant_id
+            || current.grant.revocation_epoch != transition.replacement_revocation_epoch
+        {
+            bail!("mobile device grant-reissue audit cannot acknowledge absent authority");
+        }
+        if transition.audited_at.is_none() {
+            transition.audited_at = Some(audited_at);
+            write_registry(
+                &self.path,
+                &loaded.devices,
+                &loaded.rotation_transitions,
+                &loaded.grant_reissue_transitions,
+            )?;
+        }
+        *self
+            .devices
+            .write()
+            .map_err(|_| anyhow::anyhow!("mobile device registry lock poisoned"))? = loaded.devices;
+        Ok(())
     }
 
     pub fn active_device(&self, device_id: Uuid) -> Result<Option<DeviceRecord>> {
@@ -356,6 +1011,8 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(LoadedRegistry {
                 devices: Vec::new(),
+                rotation_transitions: Vec::new(),
+                grant_reissue_transitions: Vec::new(),
                 migrated: false,
             });
         }
@@ -386,6 +1043,8 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
                     .into_iter()
                     .map(migrate_legacy_device)
                     .collect::<Result<Vec<_>>>()?,
+                rotation_transitions: Vec::new(),
+                grant_reissue_transitions: Vec::new(),
                 migrated: true,
             }
         }
@@ -397,12 +1056,16 @@ fn read_registry(path: &Path) -> Result<LoadedRegistry> {
             }
             LoadedRegistry {
                 devices: stored.devices,
+                rotation_transitions: stored.rotation_transitions,
+                grant_reissue_transitions: stored.grant_reissue_transitions,
                 migrated: false,
             }
         }
         _ => bail!("unsupported mobile device registry version"),
     };
     validate_devices(&loaded.devices)?;
+    validate_rotation_transitions(&loaded.devices, &loaded.rotation_transitions)?;
+    validate_grant_reissue_transitions(&loaded.devices, &loaded.grant_reissue_transitions)?;
     Ok(loaded)
 }
 
@@ -431,16 +1094,105 @@ fn migrate_legacy_device(record: LegacyDeviceRecord) -> Result<GrantedDeviceReco
     Ok(GrantedDeviceRecord { device, grant })
 }
 
-fn write_registry(path: &Path, devices: &[GrantedDeviceRecord]) -> Result<()> {
+fn write_registry(
+    path: &Path,
+    devices: &[GrantedDeviceRecord],
+    rotation_transitions: &[DeviceRotationAuditTransition],
+    grant_reissue_transitions: &[DeviceGrantReissueAuditTransition],
+) -> Result<()> {
     validate_devices(devices)?;
+    validate_rotation_transitions(devices, rotation_transitions)?;
+    validate_grant_reissue_transitions(devices, grant_reissue_transitions)?;
     let stored = StoredDeviceRegistry {
         version: DEVICE_REGISTRY_VERSION,
         devices: devices.to_vec(),
+        rotation_transitions: rotation_transitions.to_vec(),
+        grant_reissue_transitions: grant_reissue_transitions.to_vec(),
     };
     let mut encoded =
         serde_json::to_vec_pretty(&stored).context("failed to encode mobile device registry")?;
     encoded.push(b'\n');
+    #[cfg(test)]
+    {
+        let mut failure = FAIL_DEVICE_REGISTRY_WRITE
+            .lock()
+            .map_err(|_| anyhow::anyhow!("device registry write failure hook poisoned"))?;
+        if failure
+            .as_ref()
+            .is_some_and(|failure_path| failure_path == path)
+        {
+            *failure = None;
+            bail!("injected mobile device registry write failure");
+        }
+    }
     atomic_replace_private(path, &encoded)
+}
+
+#[cfg(test)]
+fn fail_next_device_registry_write(path: &Path) {
+    *FAIL_DEVICE_REGISTRY_WRITE.lock().unwrap() = Some(path.to_path_buf());
+}
+
+fn validate_grant_reissue_transitions(
+    devices: &[GrantedDeviceRecord],
+    transitions: &[DeviceGrantReissueAuditTransition],
+) -> Result<()> {
+    if transitions.len() > MAX_GRANT_REISSUE_TRANSITIONS {
+        bail!("mobile device grant-reissue audit outbox exceeds the record limit");
+    }
+    for (index, transition) in transitions.iter().enumerate() {
+        let policy_digest = URL_SAFE_NO_PAD
+            .decode(&transition.requested_policy_digest)
+            .context("mobile device grant-reissue policy digest is invalid")?;
+        if policy_digest.len() != 32
+            || URL_SAFE_NO_PAD.encode(policy_digest) != transition.requested_policy_digest
+            || transitions[..index]
+                .iter()
+                .any(|existing| existing.transition_id == transition.transition_id)
+            || !devices
+                .iter()
+                .any(|device| device.device.id == transition.device_id)
+            || transition.previous_grant_id == transition.replacement_grant_id
+            || transition.replacement_revocation_epoch <= transition.previous_revocation_epoch
+            || transition
+                .audited_at
+                .is_some_and(|audited_at| audited_at < transition.occurred_at)
+        {
+            bail!("mobile device grant-reissue audit transition is invalid");
+        }
+    }
+    Ok(())
+}
+
+fn validate_rotation_transitions(
+    devices: &[GrantedDeviceRecord],
+    transitions: &[DeviceRotationAuditTransition],
+) -> Result<()> {
+    if transitions.len() > MAX_ROTATION_TRANSITIONS {
+        bail!("mobile device rotation audit outbox exceeds the record limit");
+    }
+    for (index, transition) in transitions.iter().enumerate() {
+        if transition.source_device_id == transition.replacement_device_id
+            || transitions[..index]
+                .iter()
+                .any(|existing| existing.transition_id == transition.transition_id)
+            || !devices
+                .iter()
+                .any(|device| device.device.id == transition.source_device_id)
+            || !devices
+                .iter()
+                .any(|device| device.device.id == transition.replacement_device_id)
+            || transition
+                .audited_at
+                .is_some_and(|audited_at| audited_at < transition.occurred_at)
+            || transition
+                .authorization_key_cleanup_completed_at
+                .is_some_and(|completed_at| completed_at < transition.occurred_at)
+        {
+            bail!("mobile device rotation audit transition is invalid");
+        }
+    }
+    Ok(())
 }
 
 fn validate_devices(devices: &[GrantedDeviceRecord]) -> Result<()> {
@@ -519,6 +1271,7 @@ fn validate_device(device: &DeviceRecord) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::assurance::AssuranceClass;
     use super::*;
     use p256::elliptic_curve::sec1::ToEncodedPoint;
 
@@ -663,9 +1416,231 @@ mod tests {
             .unwrap()
             .unwrap()
             .grant;
+        assert!(registry.replace_grant(record.id, grant.clone()).is_err());
+        grant.id = Uuid::new_v4();
         grant.revocation_epoch = 2;
         registry.replace_grant(record.id, grant.clone()).unwrap();
+        grant.id = Uuid::new_v4();
         grant.revocation_epoch = 1;
         assert!(registry.replace_grant(record.id, grant).is_err());
+    }
+
+    #[test]
+    fn authorization_store_failure_cannot_block_possession_revocation_or_forget() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let first = device(Uuid::from_u128(1), "First synthetic phone");
+        registry.register(first.clone()).unwrap();
+        let authorization_path = temp
+            .path()
+            .join("mobile")
+            .join(super::super::assurance::AUTHORIZATION_KEYS_FILE);
+        atomic_replace_private(&authorization_path, b"{not valid json}\n").unwrap();
+
+        assert!(registry.revoke(first.id, Utc::now()).is_err());
+        let revoked = registry.authorization_record(first.id).unwrap().unwrap();
+        assert!(revoked.device.revoked_at.is_some());
+        assert_eq!(revoked.grant.revocation_epoch, 1);
+
+        std::fs::remove_file(&authorization_path).unwrap();
+        std::fs::create_dir(&authorization_path).unwrap();
+        assert!(registry.forget_all().is_err());
+        assert!(registry.list_status().unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_registry_handle_cannot_resurrect_a_revoked_device() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = DeviceRegistry::load(temp.path()).unwrap();
+        let first_device = device(Uuid::from_u128(1), "First synthetic phone");
+        first.register(first_device.clone()).unwrap();
+        let second = DeviceRegistry::load(temp.path()).unwrap();
+
+        second.revoke(first_device.id, Utc::now()).unwrap();
+        first
+            .register(device(Uuid::from_u128(2), "Second synthetic phone"))
+            .unwrap();
+        first.reload().unwrap();
+
+        let revoked = first
+            .authorization_record(first_device.id)
+            .unwrap()
+            .unwrap();
+        assert!(revoked.device.revoked_at.is_some());
+        assert_eq!(revoked.grant.revocation_epoch, 1);
+        assert_eq!(first.list_status().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn failed_device_commit_rolls_back_new_authorization_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let record = device(Uuid::from_u128(1), "Synthetic phone");
+        let grant = DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            record.paired_at,
+        )
+        .unwrap();
+        std::fs::create_dir(&registry.path).unwrap();
+
+        assert!(registry
+            .commit_registration(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                GrantedDeviceRecord {
+                    device: record.clone(),
+                    grant,
+                },
+                Some(NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(2), "Step-up key").public_key_x963,
+                    assurance_class: AssuranceClass::BiometricOnly,
+                    enrolled_at: record.paired_at,
+                }),
+            )
+            .is_err());
+        assert!(registry
+            .authorization_key_history(record.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn device_revoke_and_forget_cascade_to_authorization_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let first = device(Uuid::from_u128(1), "First synthetic phone");
+        let second = device(Uuid::from_u128(2), "Second synthetic phone");
+        registry.register(first.clone()).unwrap();
+        registry.register(second.clone()).unwrap();
+        registry
+            .authorization_keys
+            .enroll_initial(
+                first.id,
+                &first.public_key_x963,
+                NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(3), "Step-up one").public_key_x963,
+                    assurance_class: super::super::assurance::AssuranceClass::BiometricOnly,
+                    enrolled_at: first.paired_at,
+                },
+            )
+            .unwrap();
+        registry
+            .authorization_keys
+            .enroll_initial(
+                second.id,
+                &second.public_key_x963,
+                NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(4), "Step-up two").public_key_x963,
+                    assurance_class: super::super::assurance::AssuranceClass::UserVerification,
+                    enrolled_at: second.paired_at,
+                },
+            )
+            .unwrap();
+
+        registry.revoke(first.id, Utc::now()).unwrap();
+        assert!(registry.authorization_key(first.id).unwrap().is_none());
+        assert!(registry.authorization_key(second.id).unwrap().is_some());
+
+        registry.forget_all().unwrap();
+        assert!(registry
+            .authorization_keys
+            .history(first.id)
+            .unwrap()
+            .is_empty());
+        assert!(registry
+            .authorization_keys
+            .history(second.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn stale_handles_have_no_raw_authorization_key_rotation_bypass() {
+        let temp = tempfile::tempdir().unwrap();
+        let stale = DeviceRegistry::load(temp.path()).unwrap();
+        let record = device(Uuid::from_u128(1), "Synthetic phone");
+        let grant = DeviceGrant::for_device(
+            record.id,
+            &record.public_key_x963,
+            record.scopes.clone(),
+            record.paired_at,
+        )
+        .unwrap();
+        stale
+            .register_with_grant_and_authorization(
+                record.clone(),
+                grant,
+                Some(NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(2), "Step-up key").public_key_x963,
+                    assurance_class: AssuranceClass::BiometricOnly,
+                    enrolled_at: record.paired_at,
+                }),
+            )
+            .unwrap();
+        let current = DeviceRegistry::load(temp.path()).unwrap();
+        current.revoke(record.id, Utc::now()).unwrap();
+
+        assert!(stale.authorization_key(record.id).unwrap().is_none());
+        let registry_bypass = ["pub fn ", "rotate_authorization_key("].concat();
+        let key_store_bypass = ["    pub fn ", "rotate("].concat();
+        assert!(!include_str!("registry.rs").contains(&registry_bypass));
+        assert!(!include_str!("assurance.rs").contains(&key_store_bypass));
+    }
+
+    #[test]
+    fn rotation_registry_write_failure_preserves_source_device_and_authorization_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = DeviceRegistry::load(temp.path()).unwrap();
+        let source = device(Uuid::from_u128(1), "Source phone");
+        let replacement = device(Uuid::from_u128(2), "Replacement phone");
+        registry.register(source.clone()).unwrap();
+        registry.register(replacement.clone()).unwrap();
+        registry
+            .authorization_keys
+            .enroll_initial(
+                source.id,
+                &source.public_key_x963,
+                NewAuthorizationKey {
+                    public_key_x963: device(Uuid::from_u128(3), "Step-up key").public_key_x963,
+                    assurance_class: AssuranceClass::BiometricOnly,
+                    enrolled_at: source.paired_at,
+                },
+            )
+            .unwrap();
+        let source_before = registry.authorization_record(source.id).unwrap().unwrap();
+        let replacement_before = registry
+            .authorization_record(replacement.id)
+            .unwrap()
+            .unwrap();
+        let authorization_before = registry.authorization_key(source.id).unwrap().unwrap();
+        fail_next_device_registry_write(&registry.path);
+
+        assert!(registry
+            .rotate_devices_atomically(
+                DeviceGrantRevision::from(&source_before),
+                DeviceGrantRevision::from(&replacement_before),
+                Utc::now(),
+            )
+            .is_err());
+
+        registry.reload().unwrap();
+        assert_eq!(
+            registry.authorization_record(source.id).unwrap().unwrap(),
+            source_before
+        );
+        assert_eq!(
+            registry
+                .authorization_record(replacement.id)
+                .unwrap()
+                .unwrap(),
+            replacement_before
+        );
+        assert_eq!(
+            registry.authorization_key(source.id).unwrap(),
+            Some(authorization_before)
+        );
     }
 }

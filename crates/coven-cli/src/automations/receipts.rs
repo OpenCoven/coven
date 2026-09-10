@@ -74,6 +74,171 @@ pub enum ReceiptCommitOutcome {
     Replayed,
 }
 
+struct StoredReceiptEvidence {
+    run_id: String,
+    attempt_id: String,
+    automation_id: String,
+    automation_revision: i64,
+    definition_digest: Option<String>,
+    occurrence_id: String,
+    occurrence_fence_generation: i64,
+    attempt_number: i64,
+    outcome: String,
+    receipt_digest: String,
+    receipt_json: String,
+    event_id: String,
+    produced_at: String,
+}
+
+struct StoredEventEvidence {
+    event_id: String,
+    stream_kind: String,
+    stream_id: String,
+    sequence: i64,
+    recorded_at: String,
+    recorded_at_millis: i64,
+    observed_at: String,
+    event_json: String,
+}
+
+/// Read committed evidence in one snapshot, rechecking the body, terminal
+/// correlation, run reference and event rather than trusting an indexed ID.
+pub fn read_receipt(conn: &Connection, receipt_id: &str) -> Result<Option<AutomationReceipt>> {
+    if conn.is_autocommit() {
+        let transaction = conn.unchecked_transaction()?;
+        let receipt = read_receipt_in(&transaction, receipt_id)?;
+        transaction.commit()?;
+        return Ok(receipt);
+    }
+    read_receipt_in(conn, receipt_id)
+}
+
+fn read_receipt_in(conn: &Connection, receipt_id: &str) -> Result<Option<AutomationReceipt>> {
+    let stored: Option<StoredReceiptEvidence> = conn
+        .query_row(
+            "SELECT run_id, attempt_id, automation_id, automation_revision,
+                    definition_digest, occurrence_id, occurrence_fence_generation,
+                    attempt_number, outcome, receipt_digest, receipt_json, event_id,
+                    produced_at
+             FROM automation_receipts WHERE id = ?1",
+            [receipt_id],
+            |row| {
+                Ok(StoredReceiptEvidence {
+                    run_id: row.get(0)?,
+                    attempt_id: row.get(1)?,
+                    automation_id: row.get(2)?,
+                    automation_revision: row.get(3)?,
+                    definition_digest: row.get(4)?,
+                    occurrence_id: row.get(5)?,
+                    occurrence_fence_generation: row.get(6)?,
+                    attempt_number: row.get(7)?,
+                    outcome: row.get(8)?,
+                    receipt_digest: row.get(9)?,
+                    receipt_json: row.get(10)?,
+                    event_id: row.get(11)?,
+                    produced_at: row.get(12)?,
+                })
+            },
+        )
+        .optional()
+        .context("failed to read automation receipt")?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let receipt: AutomationReceipt =
+        serde_json::from_str(&stored.receipt_json).context("invalid stored automation receipt")?;
+    validate_receipt_index(receipt_id, &receipt, &stored)?;
+    let stored_event: StoredEventEvidence = conn
+        .query_row(
+            "SELECT event_id, stream_kind, stream_id, sequence, recorded_at,
+                    recorded_at_millis, observed_at, event_json
+             FROM automation_events WHERE event_id = ?1",
+            [&stored.event_id],
+            |row| {
+                Ok(StoredEventEvidence {
+                    event_id: row.get(0)?,
+                    stream_kind: row.get(1)?,
+                    stream_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    recorded_at: row.get(4)?,
+                    recorded_at_millis: row.get(5)?,
+                    observed_at: row.get(6)?,
+                    event_json: row.get(7)?,
+                })
+            },
+        )
+        .context("automation receipt event is unavailable")?;
+    let event: EventEnvelope = serde_json::from_str(&stored_event.event_json)
+        .context("invalid stored automation receipt event")?;
+    anyhow::ensure!(
+        event.integrity.is_some(),
+        "automation receipt event integrity is unavailable"
+    );
+    validate_event_index(&event, &stored_event)?;
+    validate_receipt_event(&receipt, &event)?;
+    validate_durable_correlation(&receipt, &durable_correlation(conn, &receipt)?)?;
+    anyhow::ensure!(
+        existing_commit(
+            conn,
+            &receipt,
+            &event,
+            &stored.receipt_json,
+            &stored_event.event_json
+        )? == Some(ReceiptCommitOutcome::Replayed),
+        "automation receipt commitment is unavailable"
+    );
+    Ok(Some(receipt))
+}
+
+fn validate_receipt_index(
+    requested_receipt_id: &str,
+    receipt: &AutomationReceipt,
+    stored: &StoredReceiptEvidence,
+) -> Result<()> {
+    anyhow::ensure!(
+        receipt.receipt_id.as_str() == requested_receipt_id
+            && stored.run_id == receipt.run_id.as_str()
+            && stored.attempt_id == receipt.attempt_id.as_str()
+            && stored.automation_id == receipt.automation_id.as_str()
+            && u64::try_from(stored.automation_revision).ok()
+                == Some(receipt.automation_revision.get())
+            && stored.definition_digest.as_deref()
+                == receipt
+                    .definition_digest
+                    .as_ref()
+                    .map(|digest| digest.value.as_str())
+            && stored.occurrence_id == receipt.occurrence_id.as_str()
+            && u64::try_from(stored.occurrence_fence_generation).ok()
+                == receipt
+                    .occurrence_fence_generation
+                    .map(|generation| generation.get())
+            && u64::try_from(stored.attempt_number).ok()
+                == receipt.attempt_number.map(|attempt| attempt.get())
+            && stored.outcome == terminal_outcome_name(receipt.outcome.disposition)
+            && stored.receipt_digest == receipt.integrity.value.as_str()
+            && stored.produced_at == receipt.produced_at.as_str(),
+        "automation receipt index does not match committed evidence"
+    );
+    Ok(())
+}
+
+fn validate_event_index(event: &EventEnvelope, stored: &StoredEventEvidence) -> Result<()> {
+    let recorded_at_millis = chrono::DateTime::parse_from_rfc3339(event.recorded_at.as_str())
+        .context("invalid stored automation receipt event time")?
+        .timestamp_millis();
+    anyhow::ensure!(
+        stored.event_id == event.event_id.as_str()
+            && stored.stream_kind == "run"
+            && stored.stream_id == event.stream.id.as_str()
+            && u64::try_from(stored.sequence).ok() == Some(event.sequence.get())
+            && stored.recorded_at == event.recorded_at.as_str()
+            && stored.recorded_at_millis == recorded_at_millis
+            && stored.observed_at == event.observed_at.as_str(),
+        "automation receipt event index does not match committed evidence"
+    );
+    Ok(())
+}
+
 struct DurableCorrelation {
     automation_id: String,
     automation_revision: i64,
@@ -116,6 +281,10 @@ fn commit_receipt_in(
     receipt: &AutomationReceipt,
     event: &EventEnvelope,
 ) -> Result<ReceiptCommitOutcome> {
+    anyhow::ensure!(
+        event.integrity.is_some(),
+        "automation receipt event integrity is required"
+    );
     receipt
         .verify_integrity()
         .context("automation receipt integrity is invalid")?;
@@ -467,10 +636,14 @@ const fn terminal_states(outcome: TerminalOutcome) -> (&'static str, &'static st
 
 #[cfg(test)]
 mod tests {
-    use super::{commit_receipt, ReceiptCommitOutcome};
+    use super::{commit_receipt, read_receipt, ReceiptCommitOutcome};
+    use crate::api::{
+        handle_request_with_runtime_and_authority, NoopSessionRuntime, RequestAuthority,
+    };
     use crate::automations::contract::canonical_json::{
         canonicalize_without_integrity, sha256_hex,
     };
+    use crate::automations::contract::events::stream_head;
     use crate::automations::contract::types::{AutomationReceipt, EventEnvelope};
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::occurrences::insert_claimed_occurrence;
@@ -491,13 +664,23 @@ mod tests {
         produced_at: DateTime<Utc>,
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct ReceiptCommitState {
+        receipt_row_count: i64,
+        receipt_table_count: i64,
+        run_receipt_id: Option<String>,
+        event_row_count: i64,
+        event_table_count: i64,
+        stream_head: Option<u64>,
+    }
+
     fn fixture() -> Fixture {
         fixture_with_attempt_occurrence("occurrence-daily-1")
     }
 
     fn fixture_with_attempt_occurrence(attempt_occurrence_id: &str) -> Fixture {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("store.sqlite");
+        let path = temp.path().join("coven.sqlite3");
         initialize_store(&path).unwrap();
         let conn = crate::store::open_store(&path).unwrap();
         let definition = RoutineDefinition::from_json(&json!({
@@ -654,7 +837,7 @@ mod tests {
     }
 
     fn receipt_event(receipt: &AutomationReceipt, sequence: u64) -> EventEnvelope {
-        serde_json::from_value(json!({
+        let mut value = json!({
             "schemaVersion": "coven.automations.v1",
             "eventId": "evt00000000000000000000000000001",
             "stream": {"kind": "run", "id": receipt.run_id.as_str()},
@@ -678,11 +861,62 @@ mod tests {
                 "sideEffectClass": "external_mutation"
             },
             "privacy": {
-                "classification": "operational",
-                "retention": {"classification": "standard"}
+                "classification": &receipt.privacy.classification,
+                "retention": &receipt.privacy.retention
             }
-        }))
-        .unwrap()
+        });
+        value["integrity"] = json!({
+            "algorithm": "sha256",
+            "canonicalization": "jcs-rfc8785",
+            "value": sha256_hex(&canonicalize_without_integrity(&value).unwrap())
+        });
+        serde_json::from_value(value).unwrap()
+    }
+
+    fn receipt_commit_state(
+        fixture: &Fixture,
+        receipt: &AutomationReceipt,
+        event: &EventEnvelope,
+    ) -> ReceiptCommitState {
+        ReceiptCommitState {
+            receipt_row_count: fixture
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_receipts WHERE id = ?1",
+                    [receipt.receipt_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            receipt_table_count: fixture
+                .conn
+                .query_row("SELECT COUNT(*) FROM automation_receipts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            run_receipt_id: fixture
+                .conn
+                .query_row(
+                    "SELECT receipt_id FROM automation_runs WHERE id = ?1",
+                    [receipt.run_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            event_row_count: fixture
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM automation_events WHERE event_id = ?1",
+                    [event.event_id.as_str()],
+                    |row| row.get(0),
+                )
+                .unwrap(),
+            event_table_count: fixture
+                .conn
+                .query_row("SELECT COUNT(*) FROM automation_events", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            stream_head: stream_head(&fixture.conn, "run", receipt.run_id.as_str()).unwrap(),
+        }
     }
 
     #[test]
@@ -749,6 +983,286 @@ mod tests {
             .is_err());
     }
 
+    fn read_response(fixture: &Fixture, authority: RequestAuthority) -> crate::api::ApiResponse {
+        handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/actions",
+            fixture._temp.path(),
+            None,
+            Some(r#"{"action":"coven.automations.receipt.get.v1","id":"receipt-daily-1"}"#),
+            &NoopSessionRuntime,
+            authority,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn automation_receipt_read_survives_reopen_without_claiming_authentication() {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        let event = receipt_event(&receipt, 0);
+        commit_receipt(&fixture.conn, &receipt, &event).unwrap();
+
+        let reopened = crate::store::open_store(&fixture.store_path).unwrap();
+        assert_eq!(
+            read_receipt(&reopened, "receipt-daily-1").unwrap(),
+            Some(receipt.clone())
+        );
+        let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
+        assert_eq!(response.status, 200, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(
+            body["result"]["receipt"],
+            serde_json::to_value(&receipt).unwrap()
+        );
+        assert_eq!(body["result"]["verification"]["status"], "unverifiable");
+        assert_eq!(body["result"]["verification"]["integrity"], "valid");
+        assert_eq!(
+            body["result"]["verification"]["receiptAuthentication"]["status"],
+            "unverified"
+        );
+        assert_eq!(
+            body["result"]["verification"]["receiptAuthentication"]["evidence"],
+            "unavailable"
+        );
+        assert_eq!(
+            body["result"]["verification"]["runtimeAuthority"]["status"],
+            "unverified"
+        );
+        assert_eq!(
+            body["result"]["verification"]["runtimeAuthority"]["evidence"],
+            "unavailable"
+        );
+        assert!(
+            body.get("event").is_none(),
+            "a read must not emit a mutation event"
+        );
+        let runs = crate::control_plane::route_action(
+            json!({"action": "coven.automations.runs", "id": "daily"}),
+            &fixture.conn,
+            &NoopSessionRuntime,
+        );
+        assert_eq!(
+            runs.1.event.unwrap().payload["runs"][0]["receiptId"],
+            "receipt-daily-1"
+        );
+        assert_eq!(
+            commit_receipt(&fixture.conn, &receipt, &event).unwrap(),
+            ReceiptCommitOutcome::Replayed,
+            "reads must leave committed evidence unchanged"
+        );
+    }
+
+    #[test]
+    fn automation_receipt_read_denies_tcp_before_id_or_store_access() {
+        let temp = tempfile::tempdir().unwrap();
+        for action in [
+            "coven.automations.receipt.get.v1",
+            " coven.automations.receipt.get.v1 ",
+        ] {
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/actions",
+                temp.path(),
+                None,
+                Some(
+                    &json!({
+                        "action": action,
+                        "id": null,
+                        "principal": "owner",
+                        "authority": "OwnerLocalIpc",
+                        "origin": "local",
+                        "includeSensitive": true
+                    })
+                    .to_string(),
+                ),
+                &NoopSessionRuntime,
+                RequestAuthority::Tcp,
+            )
+            .unwrap();
+            assert_eq!(response.status, 403, "{}", response.body);
+            assert!(response.body.contains("AUTHORITY_REQUIRED"));
+            assert!(!temp.path().join("coven.sqlite3").exists());
+        }
+    }
+
+    #[test]
+    fn automation_receipt_read_does_not_trust_authentication_labels() {
+        for authentication in ["none", "producer-hmac", "cosign"] {
+            let fixture = fixture();
+            let mut value =
+                serde_json::to_value(make_receipt(&fixture, "receipt-daily-1")).unwrap();
+            value["integrity"]["authentication"] = json!(authentication);
+            let receipt: AutomationReceipt = serde_json::from_value(value).unwrap();
+            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
+            assert_eq!(response.status, 200);
+            let body: Value = serde_json::from_str(&response.body).unwrap();
+            assert_eq!(
+                body["result"]["verification"]["receiptAuthentication"]["status"],
+                "unverified"
+            );
+            assert_eq!(
+                body["result"]["verification"]["receiptAuthentication"]["evidence"],
+                "unavailable"
+            );
+            assert_eq!(body["result"]["verification"]["status"], "unverifiable");
+        }
+    }
+
+    #[test]
+    fn automation_receipt_read_rejects_malformed_ids() {
+        let fixture = fixture();
+        for id in [Value::Null, json!(false), json!(""), json!("x".repeat(161))] {
+            let response = crate::control_plane::route_action(
+                json!({"action": "coven.automations.receipt.get.v1", "id": id}),
+                &fixture.conn,
+                &NoopSessionRuntime,
+            );
+            assert_eq!(response.0, 400);
+            assert_eq!(response.1.error.unwrap()["code"], "VALIDATION_FAILED");
+            assert!(response.1.event.is_none());
+        }
+    }
+
+    #[test]
+    fn automation_receipt_read_does_not_turn_missing_or_restricted_evidence_into_success() {
+        let fixture = fixture();
+        let missing = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
+        assert_eq!(missing.status, 404);
+        assert!(!missing.body.contains("\"receipt\":"));
+        assert_eq!(read_receipt(&fixture.conn, "absent").unwrap(), None);
+
+        for classification in ["sensitive", "restricted"] {
+            let fixture = fixture_with_attempt_occurrence("occurrence-daily-1");
+            let mut value =
+                serde_json::to_value(make_receipt(&fixture, "receipt-daily-1")).unwrap();
+            value["privacy"]["classification"] = json!(classification);
+            value["privacy"]["notes"] = json!("private receipt content");
+            value["integrity"]["value"] =
+                json!(sha256_hex(&canonicalize_without_integrity(&value).unwrap()));
+            let receipt: AutomationReceipt = serde_json::from_value(value).unwrap();
+            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
+            assert_eq!(response.status, 403);
+            assert!(!response.body.contains("private receipt content"));
+            assert!(!response.body.contains("\"receipt\":"));
+        }
+    }
+
+    fn assert_private_corruption_is_rejected(fixture: &Fixture, private_content: &str) {
+        let error = read_receipt(&fixture.conn, "receipt-daily-1")
+            .expect_err("corrupt evidence must not produce a receipt");
+        assert!(!format!("{error:#}").contains(private_content));
+
+        let response = read_response(fixture, RequestAuthority::OwnerLocalIpc);
+        assert_eq!(response.status, 500, "{}", response.body);
+        let body: Value = serde_json::from_str(&response.body).unwrap();
+        assert_eq!(body["error"]["code"], "INTERNAL");
+        assert_eq!(
+            body["error"]["message"],
+            "Stored automation receipt evidence could not be validated."
+        );
+        assert!(body["result"].is_null());
+        assert!(!response.body.contains(private_content));
+        assert!(!response.body.contains("\"receipt\":"));
+    }
+
+    #[test]
+    fn automation_receipt_read_requires_integrity_for_non_correlation_event_fields() {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        fixture
+            .conn
+            .execute_batch(
+                "DROP TRIGGER automation_events_no_update;
+                 UPDATE automation_events
+                 SET event_json = json_remove(
+                     json_set(event_json, '$.summary', 'private tampered summary'),
+                     '$.integrity'
+                 );",
+            )
+            .unwrap();
+
+        assert_private_corruption_is_rejected(&fixture, "private tampered summary");
+    }
+
+    #[test]
+    fn automation_receipt_read_rejects_malformed_receipt_json_without_disclosure() {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        fixture
+            .conn
+            .execute_batch(
+                "DROP TRIGGER automation_receipts_no_update;
+                 PRAGMA ignore_check_constraints = ON;
+                 UPDATE automation_receipts
+                 SET receipt_json = '{private malformed receipt content';
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+            .unwrap();
+
+        assert_private_corruption_is_rejected(&fixture, "private malformed receipt content");
+    }
+
+    #[test]
+    fn automation_receipt_read_rejects_malformed_event_json_without_disclosure() {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+        fixture
+            .conn
+            .execute_batch(
+                "DROP TRIGGER automation_events_no_update;
+                 UPDATE automation_events
+                 SET event_json = '{private malformed event content';",
+            )
+            .unwrap();
+
+        assert_private_corruption_is_rejected(&fixture, "private malformed event content");
+    }
+
+    #[test]
+    fn automation_receipt_read_refuses_tampered_body_and_terminal_correlation() {
+        for corrupt_sql in [
+            "DROP TRIGGER automation_receipts_no_update;
+             UPDATE automation_receipts SET receipt_json =
+                 json_set(receipt_json, '$.privacy.notes', 'private tampered content');",
+            "DROP TRIGGER automation_attempts_terminal_immutable;
+             UPDATE automation_attempts SET state = 'failed' WHERE id = 'attempt-daily-1';",
+            "DROP TRIGGER automation_run_receipt_once;
+             UPDATE automation_runs SET receipt_id = NULL WHERE id = 'run-daily-1';",
+            "DROP TRIGGER automation_events_no_update;
+             UPDATE automation_events SET event_json =
+                 json_set(event_json, '$.payload.receiptRef', 'receipt-other');",
+            "DROP TRIGGER automation_events_no_update;
+             UPDATE automation_events SET stream_id = 'unrelated-run';",
+            "DROP TRIGGER automation_receipts_no_update;
+             UPDATE automation_receipts SET receipt_digest = printf('%064d', 0);",
+            "DROP TRIGGER automation_receipts_no_update;
+             UPDATE automation_receipts SET outcome = 'failed';",
+            "DROP TRIGGER automation_events_no_update;
+             UPDATE automation_events SET observed_at = observed_at || 'x';",
+            "DROP TRIGGER automation_events_no_update;
+             UPDATE automation_events SET recorded_at_millis = recorded_at_millis + 1;",
+        ] {
+            let fixture = fixture();
+            let receipt = make_receipt(&fixture, "receipt-daily-1");
+            commit_receipt(&fixture.conn, &receipt, &receipt_event(&receipt, 0)).unwrap();
+            fixture.conn.execute_batch(corrupt_sql).unwrap();
+            assert!(
+                read_receipt(&fixture.conn, "receipt-daily-1").is_err(),
+                "{corrupt_sql}"
+            );
+            let response = read_response(&fixture, RequestAuthority::OwnerLocalIpc);
+            assert_eq!(response.status, 500, "{corrupt_sql}: {}", response.body);
+            assert!(!response.body.contains("private tampered content"));
+            assert!(!response.body.contains("\"receipt\":"));
+        }
+    }
+
     #[test]
     fn receipt_commit_refuses_conflict_or_correlation_mismatch() {
         let fixture = fixture();
@@ -797,6 +1311,27 @@ mod tests {
             .unwrap();
         assert_eq!(receipt_count, 0);
         assert_eq!(run_receipt_id, None);
+    }
+
+    #[test]
+    fn receipt_commit_refuses_missing_event_integrity_without_writes() {
+        let fixture = fixture();
+        let receipt = make_receipt(&fixture, "receipt-daily-1");
+        let mut event = receipt_event(&receipt, 0);
+        event.integrity = None;
+
+        let before = receipt_commit_state(&fixture, &receipt, &event);
+
+        let result = commit_receipt(&fixture.conn, &receipt, &event);
+
+        let after = receipt_commit_state(&fixture, &receipt, &event);
+
+        let error = result.expect_err("receipt commitment must require event integrity");
+        assert!(
+            format!("{error:#}").contains("automation receipt event integrity is required"),
+            "{error:#}"
+        );
+        assert_eq!(after, before, "rejected commitment must be atomic");
     }
 
     #[test]

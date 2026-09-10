@@ -6,8 +6,8 @@ Parent program: #854
 
 This document separates the shipped runtime path from the frozen
 `coven.automations.v1` contract. The contract defines an
-`AutomationReceipt`; the current runtime does not yet produce, persist,
-publish, or serve one.
+`AutomationReceipt`; the current runtime has an immutable commitment seam and
+an owner-local base-receipt read, but no production terminal-evidence producer.
 
 ## Evidence boundary
 
@@ -44,7 +44,7 @@ producer:
 terminal evidence
   -> [missing producer] immutable base receipt + authority sidecar correlation
   -> immutable receipt commitment + run reference + receipt event
-  -> privacy-authorized daemon read
+  -> owner-local base read (principal-aware sensitive reads still missing)
   -> SDK verification result
   -> Cave verified/degraded/unverifiable/invalid presentation
 ```
@@ -67,8 +67,8 @@ The first path is useful operational history. It is not an
 | Runtime authority companion contract | Dispatch pin seam exists; production adapter missing | The profile defines the execution binding and receipt-correlated sidecar and requires terminal evidence to match the base receipt (`spec/coven-automations/authority/v1/README.md:1-41`). The runner's explicit Runtime Authority mode now resolves, validates, exactly correlates, and stores one pre-dispatch extension in the same immediate transaction that moves the attempt to `dispatching`, before runtime launch (`crates/coven-cli/src/automations/runner.rs`). Existing scheduler and manual-run entry points remain base-v1 because no trusted Familiar/Threads/approval/runtime adapter is wired and the capability is not advertised. |
 | Authority and approval outcome distinction | Contract and dispatch pin seam exist; live policy adapter is missing | The companion admits only `permit` and satisfied `requires_approval` bindings and makes `degrade_to_proposal` or `reject` non-dispatch outcomes (`spec/coven-automations/authority/v1/README.md:39-64`). Runtime Authority validation failures roll back the launch transaction and expose only stable refusal codes, but current production Automations actions still have no approval request/decision or effective-authority read action (`crates/coven-cli/src/control_plane.rs:108-131`). |
 | Receipt event/changefeed | Atomic commitment exists; producer is missing | The event schema and append-only store support `receipt.recorded`. The receipt commitment seam writes that event atomically with the receipt and run reference, but production appends remain definition lifecycle/import events because terminal settlement does not yet construct a receipt. |
-| Daemon receipt read | Missing | `coven.automations.runs` is the only run-history action. Although `list_runs` reads `receipt_id`, `automation_runs_payload` omits it and there is no `receipt.get` action (`crates/coven-cli/src/control_plane.rs:1053-1111`). |
-| Privacy and redaction | Stored classification; authorized reads still missing | The receipt contract and commitment seam preserve `public`, `operational`, `sensitive`, or `restricted` classification plus retention (`crates/coven-cli/src/automations/contract/types.rs:867-895,2279-2292`). There is no receipt read API, and event reads deserialize and return stored `event_json` without a principal-aware field filter (`crates/coven-cli/src/automations/contract/events.rs:577-700`). The legacy runs action also exposes `logJson`; receipt authorization/redaction must be explicit rather than inherited from that route. |
+| Daemon receipt read | Owner-local base read exists; principal-aware sensitive reads missing | `coven.automations.runs` includes nullable `receiptId`. `coven.automations.receipt.get.v1` returns a committed public/operational base receipt only over owner-local IPC, after rechecking integrity, terminal correlation, run reference and committed event in one snapshot. Missing, corrupt, sensitive or restricted evidence fails explicitly. This is not Runtime Authority verification. |
+| Privacy and redaction | Conservative base-read boundary; general principal-aware projections still missing | The receipt contract and commitment seam preserve `public`, `operational`, `sensitive`, or `restricted` classification plus retention. The new owner-local receipt read refuses sensitive/restricted bodies rather than inventing a redaction policy. Existing event reads still return stored `event_json` without a principal-aware field filter, and legacy runs still expose `logJson`; the receipt-read boundary does not certify those separate surfaces. |
 | Effective-authority explanation | Missing read contract | The authority profile contains requested, granted, denied, degraded, approval, risk, runtime, and policy evidence, but it is not bound at dispatch and no action projects an effective `may` / `must ask` / `cannot` explanation. Daemon health advertises generic execution/request-adoption contracts, not Automations authority profiles (`crates/coven-cli/src/api_health.rs:117-145`). |
 | Per-action evidence and daily aggregation | Unknown and therefore unsupported | The base receipt can list exercised capability keys and a maximum side-effect class, but the current runtime reports only session/run terminal evidence. There is no authoritative per-action ledger proving counts such as files changed, commands run, remote calls, or protected surfaces untouched. A daily view may later count verified receipts by outcome/side-effect class; it must not invent action counts from logs or model summaries. |
 | SDK consumer | Contract canary only | At SDK revision `160864ad61ef`, `conformance/automations-v1-artifact-lock.json:1-41` pins the immutable base artifact, and the canary checks its object manifest. No package source implements `automations.getReceipt`, `verifyReceipt`, or subscriptions. OpenCoven/sdk#80 remains the owner. |
@@ -198,6 +198,37 @@ verification-state presentation. After the SDK read/verify slice:
 A per-familiar daily view may count verified receipts by outcome and
 side-effect class. Counts of individual actions or claims about protected
 resources remain disabled until a canonical per-action evidence source exists.
+
+### Owner-local base receipt read
+
+The additive action on `POST /api/v1/actions` is:
+
+```json
+{"action":"coven.automations.receipt.get.v1","id":"receipt-id"}
+```
+
+The daemon derives transport authority; request fields cannot grant it.
+TCP is rejected with `403 AUTHORITY_REQUIRED` before opening the store.
+Owner-local IPC may retrieve only `public` and `operational` receipts.
+`sensitive` and `restricted` receipts require a principal-aware policy adapter
+that is not yet available and return `403 AUTHORITY_REQUIRED`, without a body
+projection. No client-supplied privacy override is accepted.
+
+A successful read returns `result.receipt` unchanged, plus
+`result.verification`. Base-receipt integrity and durable correlation are
+`valid`. `receiptAuthentication` and `runtimeAuthority` each report
+`status: unverified` and `evidence: unavailable`, so the overall status is
+`unverifiable`. The base receipt has no stored signature proof or Runtime
+Authority receipt sidecar; even an authentication label or authority claim in
+the stored base object is not treated as verified evidence. The read emits no
+mutation event and creates no receipt. Missing evidence returns
+`404 NOT_FOUND`; malformed or inconsistent stored evidence returns a sanitized
+`500 INTERNAL`.
+
+The nullable `receiptId` in legacy run history is a lookup reference only.
+Neither that reference nor this read advertises Runtime Authority conformance,
+proves an authorized familiar embodiment, or fills the production-producer,
+SDK verification, principal-filtered changefeed, or Cave certification gates.
 
 ### 6. Complete #937: fixture-only repo-caretaker demonstration
 
