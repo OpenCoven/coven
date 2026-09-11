@@ -7,7 +7,48 @@ Parent program: #854
 This document separates the shipped runtime path from the frozen
 `coven.automations.v1` contract. The contract defines an
 `AutomationReceipt`; the current runtime has an immutable commitment seam and
-an owner-local base-receipt read, but no production terminal-evidence producer.
+an owner-local base-receipt read. Coven now also owns a proposed, internal
+runtime-terminal-evidence contract and immutable inbox, but it has no
+production producer, verifier adapter, or consumption path.
+
+## Runtime terminal evidence receiving boundary
+
+The profile `coven.automations.runtime-terminal-evidence.v1` is a Coven-owned,
+non-production receiving contract for authority-bound launched sessions. It
+pins the evidence, session, run, attempt, dispatch binding, and runtime
+descriptor; authenticates a domain-separated digest over JCS canonical bytes;
+and carries typed terminal observations rather than nullable inference.
+
+Side effects and exercised capabilities are each either `observed` with
+`complete` or `partial` coverage, or `unknown` with a bounded reason code.
+Results and deliveries likewise distinguish explicit outcomes from unknown
+state. Unknown effects never mean `none`, and unknown capabilities never mean
+an empty set. Verified evidence is classified as receipt-eligible complete,
+authenticated partial/ambiguous, authenticated unknown, or policy-violating.
+Classification precedence is deterministic: policy violations take precedence
+over unknown observations, unknown observations take precedence over partial or
+ambiguous observations, and only complete conforming evidence is receipt
+eligible. Authenticated capability or side-effect escalation remains immutable
+evidence and is classified nonconformant instead of being rejected or erased.
+
+`automation_runtime_terminal_evidence` is an append-only internal inbox. Every
+store and read rechecks JCS integrity, caller-supplied authentication,
+the exact attempt-owned session plus run/attempt correlation, and the exact
+pinned Runtime Authority binding and runtime descriptor. Identical canonical
+replay is idempotent; collisions or tampering fail closed with privacy-safe
+typed errors. The store operation owns an immediate transaction and refuses a
+caller-owned transaction so concurrent identical submissions cannot turn an
+idempotent replay into a snapshot race.
+
+This slice intentionally adds no daemon action or other public submission
+endpoint, advertises no runtime capability, and constructs no launched-session
+receipt. No accepting verifier exists. Until a production runtime adapter can
+submit and consume trustworthy evidence, reconciliation places terminal
+Runtime Authority sessions on the existing recovery-required surface and
+leaves their run and attempt unresolved. Output text, exit status, granted
+capabilities, and merely stored but unconsumed inbox rows cannot settle them.
+The already-terminal dispatcher-controlled no-launch refusal remains separate,
+and base-v1 reconciliation is unchanged.
 
 ## Evidence boundary
 
@@ -37,12 +78,15 @@ terminal session evidence
   -> status, timestamp, summary/log presentation
 ```
 
-The required v1 path now has a durable commitment seam but no production
-producer:
+The required v1 path now has durable commitment and terminal-evidence receiving
+seams but no production producer, verifier adapter, or evidence consumer:
 
 ```text
-terminal evidence
-  -> [missing producer] immutable base receipt + authority sidecar correlation
+runtime terminal observation
+  -> [missing producer/verifier adapter]
+  -> immutable verified inbox
+  -> [missing evidence consumer]
+  -> immutable base receipt + authority sidecar correlation
   -> immutable receipt commitment + run reference + receipt event
   -> owner-local base read (principal-aware sensitive reads still missing)
   -> SDK verification result
@@ -57,10 +101,11 @@ The first path is useful operational history. It is not an
 | Surface | Status | Evidence and consequence |
 | --- | --- | --- |
 | Frozen base receipt contract | Existing | `spec/coven-automations/v1/automation-receipt.schema.json:1-141` defines immutable correlation, outcome, side-effect, integrity, producer, and privacy fields. `AutomationReceipt` verifies its JCS SHA-256 digest during deserialization (`crates/coven-cli/src/automations/contract/types.rs:2075-2200`). This proves object validation, not production. |
-| Terminal session reconciliation | Existing, partial v1 projection | `settle_finished_runs` treats only `completed` plus exit code `0` before the deadline as success, settles occurrence and active attempt, finishes the run, and commits atomically. All other terminal session evidence becomes failed (`crates/coven-cli/src/automations/runner.rs:1973-2164`). |
+| Terminal session reconciliation | Base v1 existing; Runtime Authority held | Base-v1 runs retain the existing exit/timeout/cancellation settlement. A still-running Runtime Authority run with a terminal session is moved to the existing recovery-required occurrence surface before reconciliation interprets exit code or output; its run and attempt remain unresolved, no retry is created, and no receipt is committed. Repeated passes and restart are idempotent. |
 | Retry and timeout settlement | Existing, partial v1 projection | Rejected pre-ownership launches persist failed attempts and either schedule a new adopted attempt or finish the run (`crates/coven-cli/src/automations/runner.rs:505-662`). A waiting retry that exceeds the run deadline records an attempt as `timed_out` but finishes the run as `failed` (`runner.rs:1793-1868`). |
 | Occurrence distinctions | Existing, narrower than the v1 schema | Production occurrence rows use `planned`, `claimed`, `running`, `succeeded`, `failed`, and `skipped`; stale planned slots become `skipped` during claim (`crates/coven-cli/src/automations/occurrences.rs:127-179`), while settlement accepts only `succeeded` or `failed` (`occurrences.rs:371-413`). `skipped` is occurrence evidence, not a receipt outcome. |
 | Receipt construction | Missing | The contract type validates integrity, but no production settlement branch constructs an `AutomationReceipt`. Coven still lacks authoritative terminal inputs for per-action side-effect class, exercised capabilities, result/delivery digests, producer authentication, and authority receipt evidence, so the legacy run projection must not fabricate them. |
+| Runtime terminal evidence contract and inbox | Proposed internal seam; production adapters missing | `coven.automations.runtime-terminal-evidence.v1` defines closed typed observations, JCS integrity, domain-separated authentication, privacy/retention, exact binding/runtime correlation, and receipt-eligibility classification. `automation_runtime_terminal_evidence` stores verified canonical evidence immutably and preserves authenticated policy violations. There is no public submission action, no accepting production verifier, no runtime capability advertisement, and reconciliation does not consume these rows yet. |
 | Durable receipt persistence | Immutable commitment seam exists; production producer missing | `automation_receipts` stores one validated receipt per run and terminal attempt. `commit_receipt` exact-correlates the typed receipt and `receipt.recorded` event to durable run/attempt state, inserts the immutable receipt, sets `automation_runs.receipt_id`, and appends the event under one savepoint (`crates/coven-cli/src/automations/receipts.rs`). Database triggers refuse receipt mutation/deletion and receipt-reference reassignment. No normal settlement path calls the seam yet. |
 | Receipt idempotency and restart recovery | Commitment replay is safe; settlement replay remains missing | Replaying the identical receipt/event returns the committed result without a second row or event. A changed body, receipt ID, run/attempt correlation, or event fails closed, and event-append failure rolls back the receipt and run reference. Restart settlement still needs a producer that deterministically reconstructs the same terminal evidence. |
 | Run/attempt correlation inputs | Existing, with immutable authority slots | Runs pin definition revision/digest, occurrence, and nullable authority profile; attempts pin run, occurrence, attempt number, adoption key, occurrence fence, dispatch generation, session, and nullable authority-extension JSON (`crates/coven-cli/src/automations/runs.rs`). Database triggers prevent a pinned run profile or attempt extension from being rewritten and prevent deletion of an authority-bound attempt. |

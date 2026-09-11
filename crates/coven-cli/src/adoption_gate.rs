@@ -29,7 +29,7 @@ impl AdoptionGate {
         request_key: &str,
         attempt_scope: Option<&[&str]>,
     ) -> Result<Self> {
-        crate::daemon::ensure_private_coven_home(coven_home)?;
+        crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
         let directory = coven_home.join(LOCK_DIR);
         fs::create_dir_all(&directory).with_context(|| {
             format!(

@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "coven.automations.capability-negotiation-vectors.v1",
+  "cases": [
+    {
+      "caseId": "supported-minimal",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "native-supported",
+        "name": "Native supported",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "local",
+        "prompt": "Run the native conformance probe",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code"
+      },
+      "expected": {
+        "outcome": "supported"
+      }
+    },
+    {
+      "caseId": "refused-trigger",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "native-refused",
+        "name": "Native refused",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY",
+        "timezone": "local",
+        "prompt": "Run the native conformance probe",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "trigger": {
+          "variant": "webhook",
+          "version": 1,
+          "webhook": {}
+        }
+      },
+      "expected": {
+        "outcome": "unsupported",
+        "variant": "trigger.webhook"
+      }
+    }
+  ]
+}

@@ -19,7 +19,7 @@ impl Drop for StateLock {
 }
 
 pub(crate) fn acquire_shared(coven_home: &Path) -> Result<StateLock> {
-    crate::daemon::ensure_private_coven_home(coven_home)?;
+    crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let dir = Dir::open_ambient_dir(coven_home, ambient_authority())
         .with_context(|| format!("failed to open COVEN_HOME {}", coven_home.display()))?;
     let path = coven_home.join(STATE_LOCK_FILE);
@@ -191,6 +191,46 @@ mod tests {
     #[test]
     fn platform_lock_contention_is_recognized() {
         assert!(is_lock_contended(&fs2::lock_contended_error()));
+    }
+
+    #[test]
+    fn lock_initializers_use_supervised_home_validation() {
+        for (label, source, start, end) in [
+            (
+                "shared state",
+                include_str!("state_lock.rs"),
+                "pub(crate) fn acquire_shared",
+                "#[cfg(test)]",
+            ),
+            (
+                "adoption",
+                include_str!("adoption_gate.rs"),
+                "    pub fn acquire(",
+                "\n}\n\nfn lock_path",
+            ),
+            (
+                "automations leadership",
+                include_str!("automations/leadership.rs"),
+                "    pub(crate) fn acquire(",
+                "\n    pub(crate) fn fence",
+            ),
+        ] {
+            let source = source
+                .split(start)
+                .nth(1)
+                .and_then(|source| source.split(end).next())
+                .unwrap_or_else(|| panic!("{label} lock source"));
+            assert!(
+                source.contains(
+                    "crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?"
+                ),
+                "{label} lock did not validate the supervised home"
+            );
+            assert!(
+                !source.contains("crate::daemon::ensure_private_coven_home(coven_home)?"),
+                "{label} lock directly hardened the supervised home"
+            );
+        }
     }
 
     #[cfg(unix)]
