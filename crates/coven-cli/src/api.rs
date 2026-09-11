@@ -760,6 +760,12 @@ pub(crate) fn handle_request_with_runtime_and_authority(
             &health_response_with_hub(coven_home, daemon, runtime.event_writer_health(), authority),
         ),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
+        ("GET", "/session-policy") => crate::session_policy::discovery_response(),
+        ("POST", "/sessions/restricted") => crate::session_policy::restricted_response(
+            body.map(str::as_bytes),
+            authority,
+            Utc::now().timestamp_millis(),
+        ),
         ("POST", "/afs/sessions") => afs_create(coven_home, body),
         ("GET", "/afs/sessions") => afs_list(coven_home),
         ("GET", p) if p.starts_with("/afs/sessions/") => afs_read(coven_home, p, query),
@@ -2220,6 +2226,14 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    if payload.get("sessionPolicy").is_some() {
+        return api_error(
+            400,
+            "invalid_request",
+            "sessionPolicy is not accepted on legacy launch; use /api/v1/sessions/restricted.",
+            None,
+        );
+    }
     if let Some(value) = payload.get("executionBinding") {
         let binding = match crate::execution_binding::parse(value) {
             Ok(binding) => binding,
@@ -18698,6 +18712,34 @@ pub(crate) mod tests {
 
         assert_eq!(response.status, 404);
         assert!(response.body.contains(r#""code":"session_not_found""#));
+        Ok(())
+    }
+
+    #[test]
+    fn session_policy_guard_preserves_other_legacy_parsing() -> anyhow::Result<()> {
+        for authority in [RequestAuthority::OwnerLocalIpc, RequestAuthority::Tcp] {
+            let temp = tempfile::tempdir()?;
+            let runtime = RecordingRuntime::default();
+            let root = serde_json::to_string(temp.path())?;
+            let body = format!(
+                r#"{{"projectRoot":{root},"harness":"codex","prompt":"first","prompt":"last","unknown":{{"sessionPolicy":null}}}}"#
+            );
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/sessions",
+                temp.path(),
+                None,
+                Some(&body),
+                &runtime,
+                authority,
+            )?;
+            assert_eq!(response.status, 201, "{}", response.body);
+            let launches = runtime.launches.borrow();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].prompt, "last");
+            assert_eq!(launches[0].launch_mode, HarnessLaunchMode::Interactive);
+            assert!(launches[0].launch_policy.is_none());
+        }
         Ok(())
     }
 
