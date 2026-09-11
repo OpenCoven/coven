@@ -10,7 +10,8 @@
     "CommandEnvelope",
     "CommandResponse",
     "ErrorEnvelope",
-    "EventEnvelope"
+    "EventEnvelope",
+    "ConformanceResult"
   ],
   "schemas": [
     "common.schema.json",
@@ -21,11 +22,13 @@
     "automation-receipt.schema.json",
     "command-envelope.schema.json",
     "error-envelope.schema.json",
-    "event-envelope.schema.json"
+    "event-envelope.schema.json",
+    "conformance-result.schema.json"
   ],
   "stateMachines": "state-machines.json",
   "compatibilityMatrix": "compatibility-matrix.json",
   "goldenVectors": "test-vectors.json",
+  "conformanceResultVectors": "conformance-result.vectors.json",
   "requiredSuites": [
     "schema-validation",
     "rust-round-trip",
@@ -34,8 +37,10 @@
     "expected-revision-conflict",
     "duplicate-and-out-of-order-event-replay",
     "typed-transport-domain-error-mapping",
+    "timezone-dst-and-clock-replanning",
     "golden-vectors-external-runners",
-    "packed-artifact-canaries"
+    "packed-artifact-canaries",
+    "conformance-result-envelope-verification"
   ],
   "releaseState": "proposed",
   "productionReady": false,

@@ -133,6 +133,35 @@ impl ScheduledProposal {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_persisted_parts(
+        schema: &str,
+        pending: threads::PendingProposal,
+        classification: threads::ProposalClassification,
+        materialized_diff: threads::MaterializedDiff,
+        region_evidence: Vec<threads::RegionEvidence>,
+        lifecycle: ProposalLifecycle,
+        staged_at: OffsetDateTime,
+        veto_deadline: Option<OffsetDateTime>,
+        earliest_close: Option<OffsetDateTime>,
+    ) -> Result<Self> {
+        if schema != "phase5_v1" {
+            bail!("scheduled proposal contains unknown schema {schema}");
+        }
+        let expected = Self::try_new(pending, classification, materialized_diff)?;
+        if region_evidence != expected.region_evidence {
+            bail!("persisted region evidence does not match daemon predicate replay");
+        }
+        if staged_at != expected.staged_at
+            || lifecycle != expected.lifecycle
+            || veto_deadline != expected.veto_deadline
+            || earliest_close != expected.earliest_close
+        {
+            bail!("scheduled proposal carries inconsistent derived lifecycle state");
+        }
+        Ok(expected)
+    }
+
     pub(crate) fn lifecycle(&self) -> &ProposalLifecycle {
         &self.lifecycle
     }

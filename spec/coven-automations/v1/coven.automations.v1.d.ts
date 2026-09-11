@@ -30,6 +30,8 @@ export interface Digest {
 
 export type AdoptionKey = string;
 export type CorrelationId = string;
+/** Exact IANA TZID validated by the Rust authority before persistence. */
+export type IanaTimezoneId = string & { readonly __ianaTimezoneId: unique symbol };
 
 export interface PrincipalRef {
   principalId: string;
@@ -143,7 +145,7 @@ export interface ScheduleTrigger {
   schedule: {
     /** Scoped RRULE: FREQ=DAILY|WEEKLY, optional BYHOUR list, optional BYDAY list for weekly. */
     rrule: string;
-    timezone: "local" | "utc";
+    timezone: "utc" | IanaTimezoneId;
   };
 }
 
@@ -526,6 +528,14 @@ export interface ErrorEnvelope {
   currentRevision?: number;
 }
 
+export interface EventRef {
+  stream: string;
+  sequence: number;
+}
+
+export type CommandResultByCommand<C extends CommandName> =
+  C extends "events.read.v1" | "events.subscribe.v1" ? EventPage : Record<string, unknown>;
+
 export interface CommandResponse<C extends CommandName = CommandName> {
   schemaVersion: SchemaVersion;
   command: C;
@@ -533,11 +543,147 @@ export interface CommandResponse<C extends CommandName = CommandName> {
   outcome: "committed" | "replayed" | "rejected";
   replay?: { firstCommittedAt: Timestamp };
   revision?: number;
-  result?: Record<string, unknown>;
+  result?: CommandResultByCommand<C>;
   error?: ErrorEnvelope;
   receiptRef?: string;
-  eventRef?: { stream: string; sequence: number };
+  eventRef?: EventRef;
 }
+
+// ---------------------------------------------------------------------------
+// Portable conformance result
+// ---------------------------------------------------------------------------
+
+export type ConformanceResultSchemaVersion = "coven.automations.conformance-result.v1";
+
+export type ConformanceProfile =
+  | "structural"
+  | "scheduler_reliability"
+  | "runtime_authority"
+  | "continuity"
+  | "privacy"
+  | "interoperability"
+  | "full";
+
+export type ConformanceStatus = "passed" | "failed" | "incomplete" | "not_applicable";
+
+export interface ConformancePolicyBinding {
+  policyId: string;
+  policyVersion: string;
+  digest: string;
+}
+
+export type ConformanceDecisionScope =
+  | { kind: "audit_only" }
+  | {
+      kind: "release_eligibility";
+      policyBinding: ConformancePolicyBinding;
+    };
+
+export interface ConformanceSourceBinding {
+  repository: string;
+  commit: string;
+}
+
+export interface ConformanceProtocolArtifactBinding {
+  bundleSchemaVersion: string;
+  sourceCommit: string;
+  bundleSha256: string;
+  contractContentSha256: string;
+  fileCount: number;
+}
+
+export interface ConformanceRunnerBinding {
+  name: string;
+  version: string;
+  artifactSha256: string;
+  vectorSetSha256: string;
+}
+
+export interface ConformanceSubjectArtifactBinding {
+  artifactId: string;
+  artifactVersion: string;
+  platform: {
+    os: string;
+    arch: string;
+  };
+  sha256: string;
+}
+
+export interface ConformanceEnvironment {
+  os: string;
+  arch: string;
+  runtime: string;
+}
+
+export type ConformanceSuiteResult =
+  | {
+      suiteId: string;
+      status: "passed";
+      evidenceDigest: Digest;
+    }
+  | {
+      suiteId: string;
+      status: "failed" | "incomplete" | "not_applicable";
+      evidenceDigest?: Digest;
+    };
+
+export interface ConformanceProfileResult {
+  profile: ConformanceProfile;
+  status: ConformanceStatus;
+  requiredSuites: string[];
+  suiteResults: ConformanceSuiteResult[];
+}
+
+export interface ConformanceResultStatementBase {
+  contractProfile: SchemaVersion;
+  resultId: string;
+  source: ConformanceSourceBinding;
+  protocolArtifact: ConformanceProtocolArtifactBinding;
+  runner: ConformanceRunnerBinding;
+  subjectArtifact: ConformanceSubjectArtifactBinding;
+  environment: ConformanceEnvironment;
+  observedAt: Timestamp;
+  profileResults: ConformanceProfileResult[];
+  overallStatus: ConformanceStatus;
+}
+
+export interface ConformanceAuditOnlyStatement extends ConformanceResultStatementBase {
+  decisionScope: { kind: "audit_only" };
+  expiresAt?: Timestamp;
+}
+
+export interface ConformanceReleaseEligibilityStatement extends ConformanceResultStatementBase {
+  decisionScope: {
+    kind: "release_eligibility";
+    policyBinding: ConformancePolicyBinding;
+  };
+  expiresAt: Timestamp;
+}
+
+export type ConformanceResultStatement =
+  | ConformanceAuditOnlyStatement
+  | ConformanceReleaseEligibilityStatement;
+
+export interface ConformanceResultAuthentication {
+  method: "p256-sha256";
+  keyId: string;
+  signature: string;
+}
+
+export interface ConformanceResultEnvelopeBase {
+  schemaVersion: ConformanceResultSchemaVersion;
+  statementDigest: Digest;
+}
+
+export type ConformanceResult =
+  | (ConformanceResultEnvelopeBase & {
+      statement: ConformanceAuditOnlyStatement;
+      authentication?: ConformanceResultAuthentication;
+    })
+  | (ConformanceResultEnvelopeBase & {
+      statement: ConformanceReleaseEligibilityStatement;
+      authentication: ConformanceResultAuthentication;
+    });
 
 // ---------------------------------------------------------------------------
 // Events / changefeed
@@ -559,38 +705,59 @@ export type EventKind =
   | "receipt.recorded"
   | "feed.snapshot";
 
-export type EventPayload =
-  | {
-      revision: number;
-      definitionDigest?: Digest;
-      lifecycleState?: DefinitionLifecycleState | "tombstoned";
-      importedFrom?: string;
-    }
-  | {
-      entity: "occurrence" | "run" | "attempt";
-      from: string;
-      to: string;
-      reason: string;
-      fenceGeneration?: number;
-      attemptNumber?: number;
-      commandAdoptionKey?: AdoptionKey;
-    }
-  | {
-      disposition: MisfireDisposition;
-      collapsedSlots: Timestamp[];
-    }
-  | {
-      receiptRef: string;
-      outcome: RunOutcome;
-      sideEffectClass?: SideEffectClass;
-    }
-  | {
-      throughSequence: number;
-      state: Record<string, unknown>;
-      reason?: "retention_compaction" | "manual_snapshot";
-    };
+export interface EventPage {
+  stream: StreamRef;
+  /** Concrete exclusive cursor used for this page; null means the stream beginning. */
+  after: number | null;
+  events: EventEnvelope[];
+  /** Last delivered sequence, or the concrete exclusive cursor when the page is empty. */
+  nextAfter: number | null;
+  checkpoint: string;
+  checkpointExpiresAt: Timestamp;
+}
 
-export interface EventEnvelope {
+export interface DefinitionLifecycleEventPayload {
+  revision: number;
+  definitionDigest?: Digest;
+  lifecycleState?: DefinitionLifecycleState | "tombstoned";
+  importedFrom?: string;
+}
+
+export interface TransitionEventPayload {
+  entity: "occurrence" | "run" | "attempt";
+  from: string;
+  to: string;
+  reason: string;
+  fenceGeneration?: number;
+  attemptNumber?: number;
+  commandAdoptionKey?: AdoptionKey;
+}
+
+export interface MisfireEventPayload {
+  disposition: MisfireDisposition;
+  collapsedSlots: Timestamp[];
+}
+
+export interface ReceiptEventPayload {
+  receiptRef: string;
+  outcome: RunOutcome;
+  sideEffectClass?: SideEffectClass;
+}
+
+export interface SnapshotEventPayload {
+  throughSequence: number;
+  state: Record<string, unknown>;
+  reason?: "retention_compaction" | "manual_snapshot";
+}
+
+export type EventPayload =
+  | DefinitionLifecycleEventPayload
+  | TransitionEventPayload
+  | MisfireEventPayload
+  | ReceiptEventPayload
+  | SnapshotEventPayload;
+
+export interface EventEnvelopeBase {
   schemaVersion: SchemaVersion;
   /** Globally unique; duplicates of a delivered eventId are redeliveries: ignore, never re-apply. */
   eventId: string;
@@ -609,12 +776,50 @@ export interface EventEnvelope {
   occurrenceId?: string;
   runId?: string;
   attemptId?: string;
-  kind: EventKind;
   summary: string;
-  payload: EventPayload;
   privacy: {
     classification: PrivacyClassification;
     retention: RetentionClass;
   };
   integrity?: Digest;
 }
+
+export type EventEnvelope = EventEnvelopeBase &
+  (
+    | {
+        kind:
+          | "definition.created"
+          | "definition.revised"
+          | "definition.activated"
+          | "definition.paused"
+          | "definition.disabled"
+          | "definition.invalidated"
+          | "definition.tombstoned"
+          | "definition.imported";
+        payload: DefinitionLifecycleEventPayload;
+      }
+    | {
+        kind: "occurrence.transitioned";
+        payload: TransitionEventPayload & { entity: "occurrence" };
+      }
+    | {
+        kind: "run.transitioned";
+        payload: TransitionEventPayload & { entity: "run" };
+      }
+    | {
+        kind: "attempt.transitioned";
+        payload: TransitionEventPayload & { entity: "attempt" };
+      }
+    | {
+        kind: "occurrence.misfire_recorded";
+        payload: MisfireEventPayload;
+      }
+    | {
+        kind: "receipt.recorded";
+        payload: ReceiptEventPayload;
+      }
+    | {
+        kind: "feed.snapshot";
+        payload: SnapshotEventPayload;
+      }
+  );

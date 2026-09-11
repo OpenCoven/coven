@@ -144,6 +144,8 @@ struct DaemonHealthStatus {
 #[cfg(not(windows))]
 const MAX_DAEMON_STATUS_BYTES: usize = coven_client::MAX_DAEMON_STATUS_BYTES;
 const DAEMON_LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(windows, test))]
+const WINDOWS_STARTUP_HEALTH_PROBE_SLICE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DaemonSpawnSpec {
@@ -265,10 +267,11 @@ impl LiveLaunchGate {
             Ok(state) => state,
             Err(poisoned) => poisoned.into_inner(),
         };
-        anyhow::ensure!(
-            !state.closed,
-            "daemon is shutting down; refusing to launch a new live session"
-        );
+        if state.closed {
+            return Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ));
+        }
         let id = state.next_id;
         state.next_id = state.next_id.wrapping_add(1);
         state.in_flight.insert(id, None);
@@ -971,10 +974,12 @@ impl LiveSessionRuntime {
         ownership_established: Option<&mut dyn FnMut() -> Result<()>>,
         strict_containment: bool,
     ) -> Result<()> {
-        anyhow::ensure!(
-            !self.shutting_down.load(Ordering::Acquire),
-            "daemon is shutting down; refusing to launch a new session"
-        );
+        if self.shutting_down.load(Ordering::Acquire) {
+            self.record_no_process_receipt(launch, strict_containment)?;
+            return Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ));
+        }
         let familiar_ctx = match (&self.coven_home, launch.familiar_id.as_deref()) {
             (Some(home), familiar_id) => {
                 crate::familiar_identity::resolve_optional(home, familiar_id)?
@@ -1070,7 +1075,18 @@ impl LiveSessionRuntime {
         // handle is in the live registry. Shutdown closes and drains this gate,
         // so a detached request handler cannot lose a pre-registration Unix
         // process group when the daemon exits.
-        let launch_admission = self.begin_launch()?;
+        let launch_admission = match self.begin_launch() {
+            Ok(admission) => admission,
+            Err(error)
+                if error
+                    .downcast_ref::<crate::api::RuntimeLaunchAdmissionClosedError>()
+                    .is_some() =>
+            {
+                self.record_no_process_receipt(launch, strict_containment)?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
 
         if launch.launch_mode == crate::harness::HarnessLaunchMode::Stream {
             // Defense in depth: only allow Stream mode for harnesses that
@@ -1164,6 +1180,41 @@ impl LiveSessionRuntime {
         )?;
         launch_admission.release();
         publish_established_runtime_ownership(&mut ownership_established)
+    }
+
+    fn record_no_process_receipt(
+        &self,
+        launch: &SessionLaunch,
+        strict_containment: bool,
+    ) -> Result<()> {
+        if !strict_containment {
+            return Ok(());
+        }
+        let coven_home = self
+            .coven_home
+            .as_deref()
+            .context("strict automation containment requires COVEN_HOME")?;
+        let receipt_path =
+            crate::automations::runner::containment_receipt_path(coven_home, &launch.id);
+        let receipt_dir = receipt_path
+            .parent()
+            .context("automation containment receipt path has no parent")?;
+        std::fs::create_dir_all(receipt_dir).with_context(|| {
+            format!(
+                "failed creating automation containment receipt directory `{}`",
+                receipt_dir.display()
+            )
+        })?;
+        crate::pty_runner::write_containment_receipt(
+            &receipt_path,
+            crate::pty_runner::CONTAINMENT_NO_PROCESS_RECEIPT,
+        )
+        .with_context(|| {
+            format!(
+                "failed recording no-process automation containment receipt `{}`",
+                receipt_path.display()
+            )
+        })
     }
 
     fn deliver_initial_stream_prompt(&self, launch: &SessionLaunch) -> Result<()> {
@@ -2610,13 +2661,47 @@ where
     P: FnMut(&str, LifecycleDeadline) -> Result<Option<DaemonStatus>>,
 {
     loop {
-        deadline.remaining("waiting for Coven daemon startup health")?;
-        if let Some(live) = probe(&status.socket, deadline)? {
-            return Ok(live);
+        let probe_started = Instant::now();
+        let probe_timeout = deadline
+            .remaining_at(probe_started, "waiting for Coven daemon startup health")?
+            .min(WINDOWS_STARTUP_HEALTH_PROBE_SLICE);
+        let probe_deadline = LifecycleDeadline {
+            instant: probe_started
+                .checked_add(probe_timeout)
+                .context("Windows daemon startup probe deadline overflowed")?,
+        };
+        // Startup may precede pipe creation or the accept loop. Bound both
+        // connect and silent-response probes within the outer lifecycle deadline.
+        match probe(&status.socket, probe_deadline) {
+            Ok(Some(live)) => return Ok(live),
+            Ok(None) => {}
+            Err(error) if windows_startup_probe_is_pending(&error) => {}
+            Err(error) => return Err(error),
         }
         let remaining = deadline.remaining("waiting for Coven daemon startup health")?;
         std::thread::sleep(remaining.min(Duration::from_millis(50)));
     }
+}
+
+/// Retry only known startup transport timeouts, never identity or protocol errors.
+#[cfg(any(windows, test))]
+fn windows_startup_probe_is_pending(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<coven_client::ClientError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    coven_client::ClientError::InvalidHttpResponse(message)
+                        if message == coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE
+                ) || matches!(
+                    error,
+                    coven_client::ClientError::Io { operation, source }
+                        if *operation == coven_client::WINDOWS_CONNECT_OPERATION
+                            && source.kind() == std::io::ErrorKind::TimedOut
+                )
+            })
+    })
 }
 
 impl DaemonStopController for SystemDaemonStopController {
@@ -4314,8 +4399,15 @@ pub fn serve_forever(
         status_path: status_path.clone(),
         pid: status.pid,
     };
-    let mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
+    let tcp_listener = if let Some(addr) = tcp_addr {
+        let listener = bind_tcp_listener(addr)?;
+        listener
+            .set_nonblocking(true)
+            .context("failed to configure interruptible TCP API listener")?;
+        Some(listener)
+    } else {
+        None
+    };
     append_daemon_recovery_log(
         coven_home,
         &format!(
@@ -4332,13 +4424,12 @@ pub fn serve_forever(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
-    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let automations_scheduler =
+        crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
 
-    let (tcp_thread, active_tcp_connection) = if let Some(addr) = tcp_addr {
-        let tcp_listener = bind_tcp_listener(addr)?;
-        tcp_listener
-            .set_nonblocking(true)
-            .context("failed to configure interruptible TCP API listener")?;
+    let (tcp_thread, active_tcp_connection) = if let Some(tcp_listener) = tcp_listener {
         let tcp_home = coven_home.to_path_buf();
         let tcp_status = status.clone();
         let tcp_runtime = Arc::clone(&runtime);
@@ -4525,9 +4616,12 @@ pub fn serve_forever(
     // a request and be sitting inside a 30-second socket read; the documented
     // daemon-stop budget is two seconds, so shutdown must not wait for that
     // client before it kills live sessions.
+    let scheduler_shutdown_deadline = Instant::now() + Duration::from_millis(250);
+    automations_scheduler.request_shutdown();
     let runtime_shutdown = runtime
         .shutdown_all()
         .context("failed to terminate live sessions during daemon shutdown");
+    let scheduler_shutdown = automations_scheduler.finish_shutdown(scheduler_shutdown_deadline);
     let tcp_shutdown = if let Some(tcp_thread) = tcp_thread {
         let deadline = Instant::now() + Duration::from_millis(250);
         while !tcp_thread.is_finished() && Instant::now() < deadline {
@@ -4552,7 +4646,7 @@ pub fn serve_forever(
     } else {
         Ok(())
     };
-    let shutdown_result = runtime_shutdown.and(tcp_shutdown);
+    let shutdown_result = scheduler_shutdown.and(runtime_shutdown).and(tcp_shutdown);
     drop(unix_listener);
     drop(mobile_gateway);
     drop(shutdown_guard);
@@ -5028,6 +5122,7 @@ fn http_reason_phrase(status: u16) -> &'static str {
         422 => "Unprocessable Content",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
+        507 => "Insufficient Storage",
         _ => "OK",
     }
 }
@@ -5276,9 +5371,6 @@ fn serve_forever_with_lifetime_job_installer(
         .security_descriptor(security_descriptor)
         .create_sync()
         .context("failed to bind Windows named pipe")?;
-    let _mobile_gateway =
-        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
-
     // Claim the pipe before mutating shared daemon/session state. A duplicate
     // daemon must fail at bind without replacing the incumbent's daemon.json
     // or marking sessions owned by that live daemon orphaned.
@@ -5293,7 +5385,10 @@ fn serve_forever_with_lifetime_job_installer(
     )?);
     start_threads_proposal_scheduler(coven_home)?;
     start_store_maintenance_scheduler(coven_home)?;
-    crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let _automations_scheduler =
+        crate::automations::daemon_tick::start_automations_scheduler(coven_home, runtime.clone())?;
+    let _mobile_gateway =
+        crate::mobile_memory::gateway::start_mobile_gateway_for_daemon(coven_home)?;
 
     const MAX_INFLIGHT: usize = 64;
     let inflight = Arc::new(AtomicUsize::new(0));
@@ -5647,6 +5742,121 @@ mod tests {
                 .contains("timed out waiting for Coven daemon startup health"),
             "unexpected timeout phase: {error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_caps_each_probe_to_preserve_retry_budget() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let observed = std::cell::RefCell::new(Vec::new());
+        let calls = std::cell::Cell::new(0);
+
+        let ready = wait_for_windows_running_daemon_with_probe(
+            &status,
+            Duration::from_secs(2),
+            |_, _, timeout| {
+                observed.borrow_mut().push(timeout);
+                let next = calls.get() + 1;
+                calls.set(next);
+                Ok(next >= 3)
+            },
+        )?;
+
+        assert!(ready);
+        assert_eq!(calls.get(), 3);
+        let observed = observed.into_inner();
+        assert_eq!(observed.len(), 3);
+        assert!(
+            observed
+                .iter()
+                .take(2)
+                .all(|timeout| *timeout > Duration::ZERO
+                    && *timeout <= WINDOWS_STARTUP_HEALTH_PROBE_SLICE),
+            "startup probes must stay capped so retries preserve the outer lifecycle budget: {observed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_retries_response_pending_until_health_arrives() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+
+        let ready = wait_for_windows_running_daemon_with_identity_probe_until(
+            &status,
+            LifecycleDeadline::after(Duration::from_secs(1))?,
+            |_, _| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                if next < 3 {
+                    Err(anyhow::Error::new(
+                        coven_client::ClientError::InvalidHttpResponse(
+                            coven_client::EMPTY_RESPONSE_TIMEOUT_MESSAGE.to_owned(),
+                        ),
+                    ))
+                } else {
+                    Ok(Some(status.clone()))
+                }
+            },
+        )?;
+
+        assert_eq!(ready, status);
+        assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_retries_pre_connect_timeout_until_health_arrives() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+
+        let ready = wait_for_windows_running_daemon_with_identity_probe_until(
+            &status,
+            LifecycleDeadline::after(Duration::from_secs(1))?,
+            |_, _| {
+                let next = calls.get() + 1;
+                calls.set(next);
+                if next < 3 {
+                    Err(anyhow::Error::new(coven_client::ClientError::Io {
+                        operation: coven_client::WINDOWS_CONNECT_OPERATION,
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "timed out connecting to Coven daemon pipe",
+                        ),
+                    }))
+                } else {
+                    Ok(Some(status.clone()))
+                }
+            },
+        )?;
+
+        assert_eq!(ready, status);
+        assert_eq!(calls.get(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn windows_start_wait_does_not_retry_unrelated_io_errors() -> Result<()> {
+        let status = parse_daemon_status(&windows_status_fixture(None))?;
+        let calls = std::cell::Cell::new(0);
+
+        let result = wait_for_windows_running_daemon_with_identity_probe_until(
+            &status,
+            LifecycleDeadline::after(Duration::from_secs(1))?,
+            |_, _| {
+                calls.set(calls.get() + 1);
+                Err(anyhow::Error::new(coven_client::ClientError::Io {
+                    operation: coven_client::WINDOWS_CONNECT_OPERATION,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "access denied",
+                    ),
+                }))
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
         Ok(())
     }
 
@@ -7361,10 +7571,12 @@ mod tests {
             vec![b'x'; 1024 * 1024],
         )?;
         let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
         let runtime = Arc::new(PromptCancellationApiRuntime {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(Some(writing_tx)),
             await_root_exit_before_activate: None,
         });
         let body = serde_json::json!({
@@ -7389,7 +7601,8 @@ mod tests {
             let _ = response_tx.send(response);
         });
 
-        let session_id = launched_rx.recv_timeout(Duration::from_secs(2))?;
+        let session_id =
+            receive_prompt_launch_notification(&launched_rx, &response_rx, Duration::from_secs(2))?;
         let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
         let registration_deadline = Instant::now() + Duration::from_secs(2);
         while !runtime
@@ -7405,6 +7618,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        receive_prompt_delivery_phase(
+            &writing_rx,
+            "prompt writer entry before kill",
+            registration_deadline.saturating_duration_since(Instant::now()),
+        )?;
 
         let kill = crate::api::handle_request_with_runtime(
             "POST",
@@ -7415,7 +7633,12 @@ mod tests {
             runtime.as_ref(),
         )?;
         assert_eq!(kill.status, 202, "{}", kill.body);
-        let launch = response_rx.recv_timeout(Duration::from_secs(2))??;
+        let launch = receive_prompt_delivery_phase(
+            &response_rx,
+            "launch response after kill",
+            Duration::from_secs(2),
+        )?
+        .context("API launch returned an error after concurrent kill")?;
         assert_eq!(launch.status, 500, "{}", launch.body);
         let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
         let row = crate::store::get_session(&conn, &session_id)?
@@ -7423,6 +7646,92 @@ mod tests {
         assert_eq!(row.status, "killed");
         await_daemon_shutdown_descendant_exit(child_pid, "concurrent API cancellation")?;
         Ok(())
+    }
+
+    fn receive_prompt_delivery_phase<T>(
+        receiver: &std::sync::mpsc::Receiver<T>,
+        phase: &str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let started = Instant::now();
+        receiver.recv_timeout(timeout).with_context(|| {
+            format!(
+                "{phase}: elapsed={:?}, budget={timeout:?}",
+                started.elapsed()
+            )
+        })
+    }
+
+    fn receive_prompt_launch_notification(
+        notification: &std::sync::mpsc::Receiver<String>,
+        response: &std::sync::mpsc::Receiver<Result<crate::api::ApiResponse>>,
+        timeout: Duration,
+    ) -> Result<String> {
+        receive_prompt_delivery_phase(notification, "runtime launch notification", timeout)
+            .with_context(|| {
+                let early_response = match response.try_recv() {
+                    Ok(Ok(response)) => format!("HTTP {}: {}", response.status, response.body),
+                    Ok(Err(error)) => format!("API error: {error:#}"),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => "still pending".to_owned(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        "channel disconnected without a response".to_owned()
+                    }
+                };
+                format!("early launch response: {early_response}")
+            })
+    }
+
+    #[test]
+    fn prompt_delivery_phase_timeout_identifies_phase_and_elapsed() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        let error =
+            receive_prompt_delivery_phase(&receiver, "launch response after kill", Duration::ZERO)
+                .expect_err("an empty channel must report the awaited phase");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("launch response after kill"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(
+            diagnostic.contains("timed out waiting on channel"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_response() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Ok(crate::api::ApiResponse {
+                status: 500,
+                content_type: "application/json",
+                body: r#"{"error":"fixture launch failed"}"#.to_owned(),
+            }))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include the early response");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("runtime launch notification"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(diagnostic.contains("HTTP 500"), "{diagnostic}");
+        assert!(diagnostic.contains("fixture launch failed"), "{diagnostic}");
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_error() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Err(anyhow::anyhow!("fixture admission failed")))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include an early API error");
+        assert!(format!("{error:#}").contains("fixture admission failed"));
     }
 
     #[cfg(any(unix, windows))]
@@ -7444,6 +7753,7 @@ mod tests {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(None),
             await_root_exit_before_activate: Some(pid_file.clone()),
         };
         let body = serde_json::json!({
@@ -7958,6 +8268,7 @@ mod tests {
         inner: LiveSessionRuntime,
         command: Mutex<Option<pty_runner::HarnessCommand>>,
         launched: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        prompt_write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         await_root_exit_before_activate: Option<PathBuf>,
     }
 
@@ -7974,7 +8285,10 @@ mod tests {
                 .take()
                 .context("prompt-cancellation fixture command was already consumed")?;
             let (observer, registration) = self.inner.observer_for_session(launch.id.clone());
-            let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            let mut piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            if let Some(sender) = self.prompt_write_started.lock().unwrap().take() {
+                piped.notify_prompt_write_started_for_test(sender)?;
+            }
             if let Some(pid_file) = &self.await_root_exit_before_activate {
                 let pid = await_daemon_shutdown_descendant_pid(pid_file)?;
                 await_daemon_shutdown_descendant_exit(pid, "successful pre-delivery root exit")?;
@@ -8306,6 +8620,11 @@ mod tests {
     }
 
     #[test]
+    fn http_reason_phrase_names_audit_capacity_failures() {
+        assert_eq!(http_reason_phrase(507), "Insufficient Storage");
+    }
+
+    #[test]
     fn http_reason_phrase_names_memory_detail_failures() {
         let phrases = [
             (413, http_reason_phrase(413)),
@@ -8605,6 +8924,128 @@ mod tests {
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proposal_decision_http_route_preserves_transport_authority() {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        for decision in ["approve", "reject"] {
+            let proposal_id = uuid::Uuid::new_v4();
+            let request = format!(
+                "POST /api/v1/threads/proposals/{proposal_id}/{decision} HTTP/1.1\r\n\
+                 Host: localhost\r\nContent-Length: 2\r\n\r\n{{}}"
+            );
+
+            let tcp_home = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(tcp_home.path()).expect("ensure home");
+            let mut tcp_stream = Cursor::new(request.as_bytes().to_vec());
+            let mut tcp_output = Vec::new();
+            handle_http_stream(
+                &mut tcp_stream,
+                &mut tcp_output,
+                tcp_home.path(),
+                None,
+                &NoopSessionRuntime,
+                None,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            )
+            .expect("handle TCP request");
+            let tcp_response = String::from_utf8(tcp_output).expect("utf8");
+            assert!(
+                tcp_response.starts_with("HTTP/1.1 403 Forbidden"),
+                "{decision}: {tcp_response}"
+            );
+            assert!(
+                tcp_response.contains(r#""code":"transport_forbidden""#),
+                "{decision}: {tcp_response}"
+            );
+            assert!(!tcp_home.path().join("coven.sqlite3").exists());
+
+            let ipc_home = tempfile::tempdir().expect("tempdir");
+            ensure_private_coven_home(ipc_home.path()).expect("ensure home");
+            let mut ipc_stream = Cursor::new(request.as_bytes().to_vec());
+            let mut ipc_output = Vec::new();
+            handle_http_stream(
+                &mut ipc_stream,
+                &mut ipc_output,
+                ipc_home.path(),
+                None,
+                &NoopSessionRuntime,
+                None,
+                HostGuard::Disabled,
+            )
+            .expect("handle owner-local request");
+            let ipc_response = String::from_utf8(ipc_output).expect("utf8");
+            assert!(
+                ipc_response.starts_with("HTTP/1.1 404 Not Found"),
+                "{decision}: {ipc_response}"
+            );
+            assert!(
+                ipc_response.contains(r#""why":"proposal-not-found""#),
+                "{decision}: {ipc_response}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proposal_decision_http_route_preserves_typed_no_write_outcome() -> anyhow::Result<()> {
+        use crate::api::NoopSessionRuntime;
+        use std::io::Cursor;
+
+        let temp = tempfile::tempdir()?;
+        ensure_private_coven_home(temp.path())?;
+        let workspace = crate::api::tests::seed_warded_familiar(temp.path())?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "before")?;
+        let staged = crate::api::tests::post_edits(
+            temp.path(),
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+        )?;
+        let staged: serde_json::Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged["proposalId"]
+            .as_str()
+            .context("proposal id")?
+            .to_string();
+        crate::ward::set_conditional_write_hook(
+            workspace.canonicalize()?.join("reviewed/skill.md"),
+            b"concurrent".to_vec(),
+        );
+        let request = format!(
+            "POST /api/v1/threads/proposals/{proposal_id}/approve HTTP/1.1\r\n\
+             Host: local\r\nContent-Length: 2\r\n\r\n{{}}"
+        );
+        let mut stream = Cursor::new(request.into_bytes());
+        let mut output = Vec::new();
+
+        handle_http_stream(
+            &mut stream,
+            &mut output,
+            temp.path(),
+            None,
+            &NoopSessionRuntime,
+            None,
+            HostGuard::Disabled,
+        )?;
+
+        let response = String::from_utf8(output)?;
+        assert!(
+            response.starts_with("HTTP/1.1 500 Internal Server Error"),
+            "{response}"
+        );
+        assert!(
+            response.contains(r#""code":"ward_apply_failed""#),
+            "{response}"
+        );
+        assert!(response.contains(r#""writeApplied":false"#), "{response}");
+        assert!(
+            !response.contains(r#""code":"internal_error""#),
+            "{response}"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]

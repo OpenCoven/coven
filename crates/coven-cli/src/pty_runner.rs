@@ -2163,7 +2163,7 @@ unsafe fn guardian_wait_for_process_group_exit(pid: libc::pid_t) -> bool {
     false
 }
 
-fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Result<()> {
+pub(crate) fn write_containment_receipt(path: &Path, receipt: &[u8]) -> io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -4112,6 +4112,8 @@ struct PipedPromptDelivery {
     stdin: Option<std::process::ChildStdin>,
     prompt: Option<Vec<u8>>,
     outcome: Arc<PipedPromptOutcome>,
+    #[cfg(test)]
+    write_started: Option<mpsc::Sender<()>>,
 }
 
 struct PipedPromptOutcome {
@@ -4154,6 +4156,18 @@ impl PipedPromptOutcome {
 }
 
 impl PipedSession {
+    #[cfg(test)]
+    pub(crate) fn notify_prompt_write_started_for_test(
+        &mut self,
+        sender: mpsc::Sender<()>,
+    ) -> Result<()> {
+        self.prompt_delivery
+            .as_mut()
+            .context("prompt-write notification requires an initial stdin prompt")?
+            .write_started = Some(sender);
+        Ok(())
+    }
+
     pub(crate) fn cancellation_handle(&self) -> SharedStrictChildProcessTree {
         self.process_tree.clone()
     }
@@ -4212,7 +4226,14 @@ impl PipedPromptDelivery {
             .prompt
             .take()
             .context("piped prompt bytes were already consumed")?;
-        let result = deliver_piped_prompt(stdin, prompt, timeout, process_tree);
+        let result = deliver_piped_prompt(
+            stdin,
+            prompt,
+            timeout,
+            process_tree,
+            #[cfg(test)]
+            self.write_started.take(),
+        );
         outcome.finish(result.is_ok());
         result
     }
@@ -4232,6 +4253,7 @@ fn deliver_piped_prompt(
     prompt: Vec<u8>,
     timeout: Duration,
     process_tree: &SharedStrictChildProcessTree,
+    #[cfg(test)] write_started: Option<mpsc::Sender<()>>,
 ) -> Result<()> {
     if process_tree.is_terminated() {
         return Err(cleanup_piped_launch_failure(
@@ -4247,6 +4269,11 @@ fn deliver_piped_prompt(
         .name("coven-piped-prompt".into())
         .spawn(move || {
             let mut stdin = stdin;
+            // Test-only entry evidence; it does not claim the OS write is blocked.
+            #[cfg(test)]
+            if let Some(started) = write_started {
+                started.send(()).expect("prompt-write entry receiver");
+            }
             let result = stdin
                 .write_all(&prompt)
                 .and_then(|_| stdin.flush())
@@ -4480,6 +4507,8 @@ pub fn spawn_piped_with_observer(
                     stdin: Some(stdin),
                     prompt: Some(prompt),
                     outcome: Arc::clone(&prompt_outcome),
+                    #[cfg(test)]
+                    write_started: None,
                 }),
             )
         } else {

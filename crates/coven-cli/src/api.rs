@@ -1,7 +1,7 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs,
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
@@ -25,16 +25,337 @@ use crate::{
     privacy, project, session_launch, store, ward,
 };
 
+pub(crate) use crate::api_health::health_response_for_authority;
+use crate::api_health::HealthResponse;
+#[cfg(test)]
+pub use crate::api_health::COVEN_VERSION;
+pub use crate::api_health::{health_response, COVEN_API_NAMED_VERSION};
+pub use crate::api_response::ApiResponse;
+pub(crate) use crate::api_response::{api_error, json_response};
+pub(crate) use crate::request_authority::RequestAuthority;
+
 const MAX_EVENTS_LIMIT: i64 = 1_000;
 const EVENT_CANDIDATE_BATCH_LIMIT: usize = 16;
 const MAX_EVENT_CANDIDATE_BYTES: usize = coven_client::MAX_RESPONSE_BODY_BYTES;
-pub const COVEN_API_NAMED_VERSION: &str = "coven.daemon.v1";
-pub const COVEN_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn proposal_decision_lock() -> &'static Mutex<()> {
+// Stored proposals duplicate bounded content in tagged JSON strings and
+// decimal byte arrays. The multiplier covers their worst-case encoding forms;
+// the additive allowance covers keys, paths, lifecycle data, and whitespace.
+const PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const PROPOSAL_ENVELOPE_CONTENT_ENCODING_FACTOR: u64 = 24;
+const PROPOSAL_ENVELOPE_MAX_BYTES: u64 = ward::WARD_RETAINED_CONTENT_MAX_BYTES
+    * PROPOSAL_ENVELOPE_CONTENT_ENCODING_FACTOR
+    + PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES;
+const PROPOSAL_JSON_MAX_DEPTH: usize = 32;
+const PROPOSAL_JSON_MAX_OBJECT_FIELDS: usize = 64;
+const PROPOSAL_JSON_MAX_GENERIC_ARRAY_ITEMS: usize = 4_096;
+const PROPOSAL_JSON_MAX_PROBE_RESULTS: usize = 256;
+const PROPOSAL_JSON_MAX_KEY_BYTES: usize = 128;
+const PROPOSAL_JSON_MAX_METADATA_STRING_BYTES: usize = 64 * 1024;
+const PROPOSAL_JSON_MAX_ESTIMATED_HEAP_BYTES: u64 = 128 * 1024 * 1024;
+fn ward_write_audit_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
+
+#[cfg(test)]
+const TEST_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+#[derive(Default)]
+struct DirectApplyPauseState {
+    reached: bool,
+    released: bool,
+    watchdog_expired: bool,
+}
+
+#[cfg(test)]
+struct DirectApplyPause {
+    state: Mutex<DirectApplyPauseState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl DirectApplyPause {
+    fn wait_until_reached(&self, description: &str) {
+        let deadline = std::time::Instant::now() + TEST_SYNC_TIMEOUT;
+        let mut state = self.state.lock().expect("direct apply pause lock poisoned");
+        while !state.reached && !state.watchdog_expired {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                drop(state);
+                panic!("timed out after {TEST_SYNC_TIMEOUT:?} waiting for {description}");
+            }
+            let (next, timeout) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .expect("direct apply pause lock poisoned");
+            state = next;
+            if timeout.timed_out() && !state.reached && !state.watchdog_expired {
+                drop(state);
+                panic!("timed out after {TEST_SYNC_TIMEOUT:?} waiting for {description}");
+            }
+        }
+        let watchdog_expired = state.watchdog_expired;
+        drop(state);
+        assert!(
+            !watchdog_expired,
+            "direct apply pre-audit pause watchdog expired before {description}"
+        );
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().expect("direct apply pause lock poisoned");
+        let watchdog_expired = state.watchdog_expired;
+        state.released = true;
+        self.changed.notify_all();
+        drop(state);
+        assert!(
+            !watchdog_expired,
+            "direct apply pre-audit pause watchdog expired before release"
+        );
+    }
+
+    fn release_for_cleanup(&self) {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.released = true;
+        self.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+struct DirectApplyPauseGuard {
+    key: (PathBuf, String),
+    pause: std::sync::Arc<DirectApplyPause>,
+}
+
+#[cfg(test)]
+impl DirectApplyPauseGuard {
+    fn wait_until_reached(&self, description: &str) {
+        self.pause.wait_until_reached(description);
+    }
+
+    fn release(&self) {
+        self.pause.release();
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectApplyPauseGuard {
+    fn drop(&mut self) {
+        self.pause.release_for_cleanup();
+        if let Ok(mut pauses) = direct_apply_pauses().lock() {
+            let installed_pause = pauses
+                .get(&self.key)
+                .is_some_and(|pause| std::sync::Arc::ptr_eq(pause, &self.pause));
+            if installed_pause {
+                pauses.remove(&self.key);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+type DirectApplyPauseMap =
+    Mutex<std::collections::HashMap<(PathBuf, String), std::sync::Arc<DirectApplyPause>>>;
+
+#[cfg(test)]
+fn direct_apply_pauses() -> &'static DirectApplyPauseMap {
+    static PAUSES: OnceLock<DirectApplyPauseMap> = OnceLock::new();
+    PAUSES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn set_direct_apply_pause(coven_home: &Path, familiar_id: &str) -> DirectApplyPauseGuard {
+    let key = (coven_home.to_path_buf(), familiar_id.to_owned());
+    let pause = std::sync::Arc::new(DirectApplyPause {
+        state: Mutex::new(DirectApplyPauseState::default()),
+        changed: std::sync::Condvar::new(),
+    });
+    direct_apply_pauses()
+        .lock()
+        .expect("direct apply pauses lock poisoned")
+        .insert(key.clone(), std::sync::Arc::clone(&pause));
+    DirectApplyPauseGuard { key, pause }
+}
+
+#[cfg(test)]
+type DirectApplyLockProbeMap =
+    Mutex<std::collections::HashMap<(PathBuf, String), std::sync::mpsc::Sender<bool>>>;
+
+#[cfg(test)]
+type ProposalWriteLockProbeMap =
+    Mutex<std::collections::HashMap<(PathBuf, String), std::sync::mpsc::Sender<bool>>>;
+
+#[cfg(test)]
+type DirectAuditStoreFailureSet = Mutex<std::collections::HashSet<PathBuf>>;
+
+#[cfg(test)]
+fn direct_apply_lock_probes() -> &'static DirectApplyLockProbeMap {
+    static PROBES: OnceLock<DirectApplyLockProbeMap> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn proposal_write_lock_probes() -> &'static ProposalWriteLockProbeMap {
+    static PROBES: OnceLock<ProposalWriteLockProbeMap> = OnceLock::new();
+    PROBES.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn direct_audit_store_failures() -> &'static DirectAuditStoreFailureSet {
+    static FAILURES: OnceLock<DirectAuditStoreFailureSet> = OnceLock::new();
+    FAILURES.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+#[cfg(test)]
+fn set_direct_audit_store_failure(store_path: PathBuf) {
+    direct_audit_store_failures()
+        .lock()
+        .expect("direct audit store failures lock poisoned")
+        .insert(store_path);
+}
+
+#[cfg(test)]
+fn maybe_fail_direct_audit_store_verification(store_path: &Path) -> Result<()> {
+    if direct_audit_store_failures()
+        .lock()
+        .expect("direct audit store failures lock poisoned")
+        .remove(store_path)
+    {
+        anyhow::bail!("injected direct audit store verification failure");
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_direct_audit_store_verification(_store_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(test)]
+fn set_direct_apply_lock_probe(
+    coven_home: &Path,
+    familiar_id: &str,
+) -> std::sync::mpsc::Receiver<bool> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    direct_apply_lock_probes()
+        .lock()
+        .expect("direct apply lock probes poisoned")
+        .insert((coven_home.to_path_buf(), familiar_id.to_owned()), sender);
+    receiver
+}
+
+#[cfg(test)]
+fn set_proposal_write_lock_probe(
+    coven_home: &Path,
+    proposal_id: &str,
+) -> std::sync::mpsc::Receiver<bool> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    proposal_write_lock_probes()
+        .lock()
+        .expect("proposal write lock probes poisoned")
+        .insert((coven_home.to_path_buf(), proposal_id.to_owned()), sender);
+    receiver
+}
+
+#[cfg(test)]
+fn recv_test_signal<T>(receiver: std::sync::mpsc::Receiver<T>, description: &str) -> Result<T> {
+    receiver
+        .recv_timeout(TEST_SYNC_TIMEOUT)
+        .with_context(|| format!("timed out after {TEST_SYNC_TIMEOUT:?} waiting for {description}"))
+}
+
+#[cfg(test)]
+fn maybe_probe_direct_apply_lock(coven_home: &Path, familiar_id: &str) {
+    let sender = direct_apply_lock_probes()
+        .lock()
+        .expect("direct apply lock probes poisoned")
+        .remove(&(coven_home.to_path_buf(), familiar_id.to_owned()));
+    let Some(sender) = sender else {
+        return;
+    };
+    let is_held = match ward_write_audit_lock().try_lock() {
+        Ok(guard) => {
+            drop(guard);
+            false
+        }
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            panic!("direct Ward apply lock is poisoned")
+        }
+    };
+    let _ = sender.send(is_held);
+}
+
+#[cfg(not(test))]
+fn maybe_probe_direct_apply_lock(_coven_home: &Path, _familiar_id: &str) {}
+
+#[cfg(test)]
+fn maybe_probe_proposal_write_lock(coven_home: &Path, proposal_id: &str) {
+    let sender = proposal_write_lock_probes()
+        .lock()
+        .expect("proposal write lock probes poisoned")
+        .remove(&(coven_home.to_path_buf(), proposal_id.to_owned()));
+    let Some(sender) = sender else {
+        return;
+    };
+    let is_held = match ward_write_audit_lock().try_lock() {
+        Ok(guard) => {
+            drop(guard);
+            false
+        }
+        Err(std::sync::TryLockError::WouldBlock) => true,
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            panic!("proposal decision lock is poisoned")
+        }
+    };
+    let _ = sender.send(is_held);
+}
+
+#[cfg(not(test))]
+fn maybe_probe_proposal_write_lock(_coven_home: &Path, _proposal_id: &str) {}
+
+#[cfg(test)]
+fn maybe_pause_direct_apply_before_audit(coven_home: &Path, familiar_id: &str) {
+    let pause = direct_apply_pauses()
+        .lock()
+        .expect("direct apply pauses lock poisoned")
+        .remove(&(coven_home.to_path_buf(), familiar_id.to_owned()));
+    let Some(pause) = pause else {
+        return;
+    };
+    let mut state = pause
+        .state
+        .lock()
+        .expect("direct apply pause lock poisoned");
+    state.reached = true;
+    pause.changed.notify_all();
+    let deadline = std::time::Instant::now() + TEST_SYNC_TIMEOUT;
+    while !state.released {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            state.watchdog_expired = true;
+            pause.changed.notify_all();
+            return;
+        }
+        let (next, timeout) = pause
+            .changed
+            .wait_timeout(state, remaining)
+            .expect("direct apply pause lock poisoned");
+        state = next;
+        if timeout.timed_out() && !state.released {
+            state.watchdog_expired = true;
+            pause.changed.notify_all();
+            return;
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn maybe_pause_direct_apply_before_audit(_coven_home: &Path, _familiar_id: &str) {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProposalDecisionFailpoint {
@@ -117,105 +438,6 @@ fn maybe_fail_proposal_decision(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HealthCapabilities {
-    pub sessions: bool,
-    pub events: bool,
-    pub travel: bool,
-    pub scheduler: bool,
-    pub hub: bool,
-    pub executor_dispatch: bool,
-    pub event_cursor: String,
-    pub structured_errors: bool,
-    pub session_handoff: bool,
-    /// Whether `POST /sessions` accepts the exact, fail-closed
-    /// `launchPolicy` contract documented for unattended Codex work.
-    #[serde(default)]
-    pub session_launch_policy: bool,
-    /// Whether the `afs.*` route family is served at all.
-    pub afs: bool,
-    /// Mount backend, or `false` when none is available. A client must branch
-    /// on this rather than assume mounting works: SDK-only operation is a
-    /// supported mode, not a degraded one.
-    pub afs_mount: MountCapability,
-    /// Whether the daemon can materialize a delta into a git branch.
-    pub afs_commit: bool,
-    /// Whether `afs.session.commit` accepts the side-effect-free `dryRun`
-    /// contract. Clients must not infer this from `afsCommit`: older daemons
-    /// accepted commit requests before preview semantics existed.
-    #[serde(default)]
-    pub afs_commit_dry_run: bool,
-    /// Exact execution-binding contracts accepted by bound session
-    /// launch/input/kill. Additive: absent/older wire payloads default to
-    /// empty rather than failing deserialization.
-    #[serde(default)]
-    pub execution_binding_contracts: Vec<String>,
-    /// Exact request-adoption contracts accepted by dedicated adopted
-    /// launch/input routes. Additive: absent/older wire payloads default to
-    /// empty rather than failing deserialization.
-    #[serde(default)]
-    pub request_adoption_contracts: Vec<String>,
-}
-
-/// `afsMount`: a backend name, or `false`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum MountCapability {
-    Backend(String),
-    Unavailable(bool),
-}
-
-impl MountCapability {
-    /// What this daemon can actually mount.
-    ///
-    /// `false` on every platform and build without a backend, and `false` by
-    /// default even where one exists: the NFS export serves a single delta
-    /// rather than the merged base+delta view DESIGN.md §3.2 specifies (bead
-    /// `coven-vlw`), and an agent process could not write through the mount on
-    /// macOS (bead `coven-x77`). Advertising a backend before those close
-    /// would promise something the daemon cannot deliver, so the opt-in in
-    /// `afs_mount` gates it.
-    pub fn detect() -> Self {
-        match crate::afs_mount::backend() {
-            Some(backend) => Self::Backend(backend.to_string()),
-            None => Self::Unavailable(false),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HubHealth {
-    pub role: String,
-    pub hub_id: String,
-    pub nodes_total: usize,
-    pub nodes_available: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HealthResponse {
-    pub ok: bool,
-    pub api_version: String,
-    pub coven_version: String,
-    pub capabilities: HealthCapabilities,
-    pub daemon: Option<DaemonStatus>,
-    /// Hub control-plane summary (role + node availability). `None` when the
-    /// response is built without store access (e.g. CLI status printing).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hub: Option<HubHealth>,
-    /// Daemon-owned event persistence health.  Omitted for status rendering
-    /// paths that do not have a live runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub event_writer: Option<crate::event_writer::EventWriterHealth>,
-    /// Local SQLite pressure and bounded-maintenance state. This remains
-    /// present when collection fails so health consumers can distinguish a
-    /// storage problem from a daemon that is simply not running.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<store::StorageHealth>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct EventCursor {
     pub after_seq: i64,
 }
@@ -232,13 +454,6 @@ pub struct EventsResponse {
 pub struct SessionPageResponse {
     pub sessions: Vec<store::SessionRecord>,
     pub next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ApiResponse {
-    pub status: u16,
-    pub content_type: &'static str,
-    pub body: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +513,20 @@ impl std::fmt::Display for RuntimeOwnershipPublicationError {
 
 impl std::error::Error for RuntimeOwnershipPublicationError {}
 
+#[derive(Debug)]
+pub(crate) struct RuntimeLaunchAdmissionClosedError;
+
+impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("daemon is shutting down; refusing to launch a new live session")
+    }
+}
+
+impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
+
+pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
+    "runtime does not accept automation authority projections; no process started";
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -346,6 +575,31 @@ pub trait SessionRuntime {
         ownership_established: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         self.launch_adopted_session(launch, writer, ownership_established)
+    }
+    /// Reports whether this runtime accepts the bounded Runtime Authority
+    /// projection supplied to automation launches.
+    fn accepts_automation_authority_projection(&self) -> bool {
+        false
+    }
+    /// Launches an automation session with the bounded authority evidence that
+    /// the execution consumer is permitted to observe.
+    ///
+    /// Runtimes must explicitly opt in before accepting authority-bound work.
+    /// This keeps a newly activated Runtime Authority adapter from silently
+    /// dropping the projection and launching with ambient authority.
+    fn launch_authorized_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        authority: Option<
+            &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+        >,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if authority.is_some() {
+            anyhow::bail!(RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED);
+        }
+        self.launch_contained_adopted_session(launch, writer, ownership_established)
     }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
@@ -398,58 +652,6 @@ impl SessionRuntime for NoopSessionRuntime {
 
     fn kill_session(&self, _session_id: &str) -> Result<()> {
         Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestAuthority {
-    /// Filesystem-permission-protected Unix socket or owner-only Windows pipe.
-    OwnerLocalIpc,
-    /// Optional loopback TCP listener. Host/Origin checks reduce browser risk,
-    /// but they do not prove that the caller owns the daemon process.
-    Tcp,
-}
-
-impl RequestAuthority {
-    fn allows_session_launch_policy(self) -> bool {
-        matches!(self, Self::OwnerLocalIpc)
-    }
-}
-
-pub fn health_response(daemon: Option<DaemonStatus>) -> HealthResponse {
-    health_response_for_authority(daemon, RequestAuthority::OwnerLocalIpc)
-}
-
-pub(crate) fn health_response_for_authority(
-    daemon: Option<DaemonStatus>,
-    authority: RequestAuthority,
-) -> HealthResponse {
-    HealthResponse {
-        ok: true,
-        api_version: COVEN_API_NAMED_VERSION.to_string(),
-        coven_version: COVEN_VERSION.to_string(),
-        capabilities: HealthCapabilities {
-            sessions: true,
-            events: true,
-            travel: true,
-            scheduler: true,
-            hub: true,
-            executor_dispatch: true,
-            event_cursor: "sequence".to_string(),
-            structured_errors: true,
-            session_handoff: true,
-            session_launch_policy: authority.allows_session_launch_policy(),
-            afs: true,
-            afs_mount: MountCapability::detect(),
-            afs_commit: true,
-            afs_commit_dry_run: true,
-            execution_binding_contracts: vec![crate::execution_binding::CONTRACT.to_string()],
-            request_adoption_contracts: vec![crate::request_adoption::CONTRACT.to_string()],
-        },
-        daemon,
-        hub: None,
-        event_writer: None,
-        storage: None,
     }
 }
 
@@ -574,6 +776,11 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
+            if let Some(rejection) =
+                control_plane::automation_receipt_transport_rejection(&payload, authority)
+            {
+                return json_response(rejection.0, &rejection.1);
+            }
             let conn = match store::open_store(&store_path(coven_home)) {
                 Ok(conn) => conn,
                 Err(error) => {
@@ -587,6 +794,24 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 }
             };
             let (status, response) = control_plane::route_action(payload, &conn, runtime);
+            if status == 200
+                && response.accepted
+                && matches!(
+                    response.action.as_str(),
+                    "coven.automations.create"
+                        | "coven.automations.update"
+                        | "coven.automations.delete"
+                        | "coven.automations.definition.create.v1"
+                        | "coven.automations.definition.revise.v1"
+                        | "coven.automations.definition.tombstone.v1"
+                        | "coven.automations.run.cancel.v1"
+                        | "coven.automations.run"
+                        | "coven.automations.tick"
+                        | "coven.automations.unquarantine"
+                )
+            {
+                crate::automations::daemon_tick::wake_automations_scheduler(coven_home);
+            }
             json_response(status, &response)
         }
         ("POST", "/cast") => submit_cast(coven_home, body, runtime),
@@ -626,7 +851,21 @@ pub(crate) fn handle_request_with_runtime_and_authority(
             familiar_audit_response(coven_home, id, query)
         }
         ("GET", "/threads/weaves") => threads_weaves_response(coven_home),
-        ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None),
+        (_, path)
+            if (path == "/threads/proposals" || path.starts_with("/threads/proposals/"))
+                && !authority.allows_ward_proposal_access() =>
+        {
+            api_error(
+                403,
+                "transport_forbidden",
+                "Ward proposal access requires the owner-gated local IPC transport.",
+                Some(json!({
+                    "requiredAuthority": "owner_local_ipc",
+                    "writeApplied": false,
+                })),
+            )
+        }
+        ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None, query),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
             let id = path.trim_start_matches("/threads/proposals/");
             if Uuid::parse_str(id).is_err() {
@@ -637,7 +876,7 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     Some(serde_json::json!({ "id": id })),
                 )
             } else {
-                threads_proposals_response(coven_home, Some(id))
+                threads_proposals_response(coven_home, Some(id), None)
             }
         }
         ("POST", path) if path.starts_with("/threads/proposals/") && path.ends_with("/approve") => {
@@ -4738,14 +4977,7 @@ where
     body.push_str(&events_json);
     body.push_str(&events_response_tail(last_seq, has_more));
     debug_assert!(body.len() < coven_client::MAX_RESPONSE_BODY_BYTES);
-    Ok((
-        ApiResponse {
-            status: 200,
-            content_type: "application/json",
-            body,
-        },
-        stats,
-    ))
+    Ok((ApiResponse::json_body(200, body), stats))
 }
 
 fn events_response_tail(last_seq: Option<i64>, has_more: bool) -> String {
@@ -5051,6 +5283,14 @@ fn update_familiar_icon(
             None,
         );
     }
+    if crate::familiar_identity::resolve(coven_home, familiar_id)?.is_none() {
+        return api_error(
+            404,
+            "familiar_not_found",
+            "No familiar with that id is declared in familiars.toml.",
+            Some(json!({ "id": familiar_id })),
+        );
+    }
     let payload = match parse_body(body) {
         Ok(payload) => payload,
         Err(error) => {
@@ -5093,15 +5333,318 @@ fn update_familiar_icon(
     }
 }
 
+/// Convert a typed Ward edit-budget failure into the stable API error shape.
+fn ward_apply_too_large_response(
+    limit: &crate::ward::WardEditBudgetFailure,
+) -> Result<ApiResponse> {
+    use crate::ward::WardEditBudgetFailure;
+
+    let (message, details) = match limit {
+        WardEditBudgetFailure::BatchEditCount {
+            attempted_edits,
+            max_edits,
+        } => (
+            "The Ward apply contains too many edits. Split it into smaller \
+             batches before retrying."
+                .to_owned(),
+            json!({
+                "limit": "directBatchEdits",
+                "attemptedEdits": attempted_edits,
+                "maxEdits": max_edits,
+                "writeApplied": false,
+            }),
+        ),
+        WardEditBudgetFailure::ProposalEnvelopeBytes {
+            attempted_bytes,
+            max_bytes,
+        } => (
+            "The stored Ward proposal envelope is too large to inspect safely.".to_owned(),
+            json!({
+                "limit": "proposalEnvelopeBytes",
+                "attemptedBytes": attempted_bytes,
+                "maxBytes": max_bytes,
+                "writeApplied": false,
+            }),
+        ),
+        WardEditBudgetFailure::ExistingBeforeImage {
+            target,
+            observed_bytes,
+            max_bytes,
+        } => (
+            format!(
+                "Existing target `{target}` is too large for a Ward apply. \
+                 Shrink or archive it before retrying."
+            ),
+            json!({
+                "limit": "existingBeforeImageBytes",
+                "target": target,
+                "observedBytes": observed_bytes,
+                "maxBytes": max_bytes,
+                "writeApplied": false,
+            }),
+        ),
+        WardEditBudgetFailure::BatchRetainedMemory {
+            attempted_bytes,
+            max_bytes,
+        } => (
+            "The Ward apply would retain too much proposed or existing file \
+             content. Split it into smaller batches before retrying."
+                .to_owned(),
+            json!({
+                "limit": "directBatchRetainedBytes",
+                "attemptedBytes": attempted_bytes,
+                "maxBytes": max_bytes,
+                "writeApplied": false,
+            }),
+        ),
+    };
+    api_error(413, "ward_apply_too_large", &message, Some(details))
+}
+
+fn proposal_quota_exceeded_response(
+    limit: &crate::proposal_store::ProposalQuotaExceeded,
+) -> Result<ApiResponse> {
+    let details = match limit {
+        crate::proposal_store::ProposalQuotaExceeded::Count {
+            current_count,
+            attempted_count,
+            max_count,
+        } => json!({
+            "limit": "pendingProposalCount",
+            "currentCount": current_count,
+            "attemptedCount": attempted_count,
+            "maxCount": max_count,
+            "writeApplied": false,
+            "retrySafe": true,
+        }),
+        crate::proposal_store::ProposalQuotaExceeded::Bytes {
+            current_bytes,
+            incoming_bytes,
+            attempted_bytes,
+            max_bytes,
+        } => json!({
+            "limit": "pendingProposalBytes",
+            "currentBytes": current_bytes,
+            "incomingBytes": incoming_bytes,
+            "attemptedBytes": attempted_bytes,
+            "maxBytes": max_bytes,
+            "writeApplied": false,
+            "retrySafe": true,
+        }),
+    };
+    api_error(
+        413,
+        "proposal_quota_exceeded",
+        "The global pending Ward proposal quota is full. Decide, expire, or remove an existing \
+         proposal before retrying.",
+        Some(details),
+    )
+}
+
+fn ward_audit_capacity_exceeded_response(
+    limit: &store::WardAuditCapacityExceeded,
+    write_applied: Option<bool>,
+) -> Result<ApiResponse> {
+    api_error(
+        507,
+        "ward_audit_capacity_exceeded",
+        "The append-only Ward audit ledger has no durable capacity for this operation. \
+         Export and archive the store, then increase the operator-controlled capacity \
+         before retrying.",
+        Some(json!({
+            "resource": limit.resource.as_str(),
+            "limitBytes": limit.limit_bytes,
+            "usedBytes": limit.used_bytes,
+            "requiredBytes": limit.required_bytes,
+            "availableBytes": limit.available_bytes(),
+            "writeApplied": write_applied,
+            "retrySafe": write_applied == Some(false),
+        })),
+    )
+}
+
+fn proposal_audit_persist_failed_response(
+    proposal_id: &str,
+    report: &ward::ApplyReport,
+    error: &anyhow::Error,
+) -> Result<ApiResponse> {
+    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+    json_response(
+        500,
+        &json!({
+            "error": {
+                "code": "audit_persist_failed",
+                "message": format!(
+                    "The approved proposal write was applied but the audit ledger \
+                     could not be finalized: {error:#}"
+                ),
+                "details": {
+                    "proposalId": proposal_id,
+                    "writeApplied": true,
+                    "retrySafe": false,
+                },
+            },
+            "changes": changes,
+        }),
+    )
+}
+
+fn approved_apply_failed_response(
+    proposal_id: &str,
+    error: &anyhow::Error,
+    failure: &ward::ApprovedApplyFailure,
+    recovery: bool,
+) -> Result<ApiResponse> {
+    match failure {
+        ward::ApprovedApplyFailure::NoWrite if recovery => api_error(
+            500,
+            "ward_apply_ambiguous",
+            &format!(
+                "The Ward could not resume the approved proposal and the prior write state \
+                 remains unknown: {error:#}"
+            ),
+            Some(json!({
+                "proposalId": proposal_id,
+                "writeApplied": Value::Null,
+                "retrySafe": false,
+                "targets": [],
+            })),
+        ),
+        ward::ApprovedApplyFailure::NoWrite | ward::ApprovedApplyFailure::RolledBack => api_error(
+            500,
+            "ward_apply_failed",
+            &format!("The Ward could not apply the approved proposal; no write remains: {error:#}"),
+            Some(json!({
+                "proposalId": proposal_id,
+                "writeApplied": false,
+                "retrySafe": true,
+            })),
+        ),
+        ward::ApprovedApplyFailure::RolledBackCleanupFailed { targets } => api_error(
+            500,
+            "ward_apply_rollback_cleanup_failed",
+            &format!(
+                "The Ward rolled back the approved proposal but could not remove every \
+                 temporary staging or backup artifact: {error:#}"
+            ),
+            Some(json!({
+                "proposalId": proposal_id,
+                "writeApplied": false,
+                "retrySafe": false,
+                "targets": targets,
+            })),
+        ),
+        ward::ApprovedApplyFailure::Ambiguous { targets } => api_error(
+            500,
+            "ward_apply_ambiguous",
+            &format!(
+                "The Ward could not prove that the approved proposal was fully rolled back: \
+                 {error:#}"
+            ),
+            Some(json!({
+                "proposalId": proposal_id,
+                "writeApplied": Value::Null,
+                "retrySafe": false,
+                "targets": targets,
+            })),
+        ),
+        ward::ApprovedApplyFailure::Applied(_) => {
+            anyhow::bail!("applied Ward failure must continue through proposal audit finalization")
+        }
+    }
+}
+
+fn approved_apply_cleanup_failed_response(
+    proposal_id: &str,
+    report: &ward::ApplyReport,
+    error: &str,
+) -> Result<ApiResponse> {
+    let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
+    json_response(
+        500,
+        &json!({
+            "error": {
+                "code": "ward_apply_cleanup_failed",
+                "message": format!(
+                    "The approved proposal write was applied and audited, but temporary backup \
+                     cleanup failed: {error}"
+                ),
+                "details": {
+                    "proposalId": proposal_id,
+                    "writeApplied": true,
+                    "retrySafe": false,
+                },
+            },
+            "changes": changes,
+        }),
+    )
+}
+
+fn direct_audit_persist_failed_response(
+    changes: &[Value],
+    error: &anyhow::Error,
+) -> Result<ApiResponse> {
+    json_response(
+        500,
+        &json!({
+            "error": {
+                "code": "audit_persist_failed",
+                "message": format!(
+                    "The file write was applied but the audit ledger \
+                     could not be updated: {error:#}"
+                ),
+                "details": {
+                    "writeApplied": true,
+                    "retrySafe": false,
+                },
+            },
+            "changes": changes,
+        }),
+    )
+}
+
+fn direct_ward_audit_reservation_bytes(
+    conn: &rusqlite::Connection,
+    body_bytes: usize,
+    edit_count: usize,
+) -> Result<u64> {
+    let row_count = edit_count
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .context("Ward audit row reservation overflowed")?;
+    store::ward_audit_reservation_bytes(
+        conn,
+        row_count,
+        u64::try_from(body_bytes).context("Ward request body length overflowed")?,
+    )
+}
+
+fn proposal_decision_audit_reservation_bytes(
+    conn: &rusqlite::Connection,
+    decision: &str,
+) -> Result<u64> {
+    if decision == "reject" {
+        return store::ward_audit_reservation_bytes(conn, 2, PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES);
+    }
+    let row_count = ward::WARD_EDIT_MAX_COUNT
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(3))
+        .context("proposal decision audit row reservation overflowed")?;
+    let variable_payload = ward::WARD_RETAINED_CONTENT_MAX_BYTES
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(PROPOSAL_ENVELOPE_SYNTAX_MAX_BYTES))
+        .context("proposal decision audit byte reservation overflowed")?;
+    store::ward_audit_reservation_bytes(conn, row_count, variable_payload)
+}
+
 /// `POST /familiars/{id}/edits` — the Ward-enforced write path into a familiar
 /// home.
 ///
-/// The daemon is the sole write authority for familiar homes it manages, and
-/// this endpoint is deliberately the *only* daemon surface that writes
-/// arbitrary files there: every edit is adjudicated by [`crate::ward::Ward::apply`],
-/// the fail-closed Gates 1–2 + Gate 4 audit boundary. Fail-closed extends to
-/// configuration: a familiar without a `ward.toml` in its workspace cannot be
-/// written through this endpoint at all.
+/// The transport bounds initial JSON parsing (1 MiB over TCP, 4 MiB over the
+/// local socket/pipe). Immediately after body extraction, this handler checks
+/// the borrowed edit count and proposed byte total before allocating
+/// `FileEdit`s, cloning content, running Ward/Gate 2, opening the gate store, or
+/// staging a proposal.
 ///
 /// Request body:
 ///
@@ -5114,7 +5657,7 @@ fn update_familiar_icon(
 ///
 /// Responses: `200` applied (with Gate 4 audit records), `202` held for
 /// Gate 3 coherence review (nothing written), `403` refused (nothing
-/// written), `409` no ward.toml.
+/// written), `409` no ward.toml, `413` over the shared Ward edit budget.
 fn apply_familiar_edits(
     coven_home: &Path,
     familiar_id: &str,
@@ -5161,9 +5704,21 @@ fn apply_familiar_edits(
             None,
         );
     }
-    let mut edits = Vec::with_capacity(raw_edits.len());
+    // The transport has already bounded the raw JSON body to at most 4 MiB
+    // (1 MiB over TCP). From this point onward, reject attacker-controlled
+    // fan-out before any Ward evaluation, capacity derived from edit count,
+    // content clone, gate-store access, or proposal staging can amplify that
+    // bounded parse.
+    let mut edit_budget = match ward::WardEditBudget::for_edit_count(raw_edits.len()) {
+        Ok(budget) => budget,
+        Err(error) => {
+            let limit = ward::ward_edit_budget_failure(&error)
+                .expect("WardEditBudget::for_edit_count returns a typed budget failure");
+            return ward_apply_too_large_response(limit);
+        }
+    };
     for (index, edit) in raw_edits.iter().enumerate() {
-        let (Some(target), Some(contents)) = (
+        let (Some(_target), Some(contents)) = (
             edit.get("target").and_then(Value::as_str),
             edit.get("contents").and_then(Value::as_str),
         ) else {
@@ -5174,6 +5729,22 @@ fn apply_familiar_edits(
                 Some(json!({ "index": index })),
             );
         };
+        if let Err(error) = edit_budget.reserve_proposed_content(contents.as_bytes()) {
+            let limit = ward::ward_edit_budget_failure(&error)
+                .expect("reserving Ward proposed content returns a typed budget failure");
+            return ward_apply_too_large_response(limit);
+        }
+    }
+    let mut edits = Vec::with_capacity(raw_edits.len());
+    for edit in raw_edits {
+        let target = edit
+            .get("target")
+            .and_then(Value::as_str)
+            .expect("raw Ward edit shape was validated before allocation");
+        let contents = edit
+            .get("contents")
+            .and_then(Value::as_str)
+            .expect("raw Ward edit shape was validated before allocation");
         edits.push(ward::FileEdit::new(target, contents.to_owned()));
     }
 
@@ -5190,6 +5761,10 @@ fn apply_familiar_edits(
         }
     };
 
+    maybe_probe_direct_apply_lock(coven_home, familiar_id);
+    let _direct_apply_guard = ward_write_audit_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?;
     let workspace = crate::cockpit_sources::familiar_workspace(coven_home, familiar_id);
     let config = match ward::WardConfig::load(&workspace) {
         Ok(Some(config)) => config,
@@ -5239,6 +5814,8 @@ fn apply_familiar_edits(
             Some(json!({ "changes": changes })),
         );
     }
+    // Count and proposed-content budgets have already bounded this allocation;
+    // now reject aliases that converge on the same Gate-2 surface.
     let mut resolved_targets = HashSet::with_capacity(adjudication.decisions.len());
     if let Some(duplicate) = adjudication
         .decisions
@@ -5261,35 +5838,61 @@ fn apply_familiar_edits(
         .filter(|d| d.tier == ward::Tier::Protected && !d.verdict.is_blocked())
         .map(|d| d.resolved.clone())
         .collect();
-    let gate_report = {
-        let conn = store::open_store(&store_path(coven_home))?;
-        match crate::threads_gate::gate_protected_edits(
-            &conn,
-            &crate::threads_gate::GateRequest {
-                coven_home,
-                familiar_id,
-                workspace: &workspace,
-                config: &config,
-                edits: &edits,
-                gated_targets: &gated_targets,
-                authorization: &authorization,
-            },
-        ) {
-            Ok(report) => report,
-            Err(error) => {
-                // Fail closed: a gate that cannot run is a refusal, never a
-                // pass-through (RFC-0001 §5.4 Gate 4).
-                return api_error(
-                    500,
-                    "threads_gate_unavailable",
-                    &format!("The authority gate could not adjudicate the proposal: {error:#}"),
-                    None,
-                );
-            }
+    let store_path = store_path(coven_home);
+    let conn = store::open_store(&store_path)?;
+    let reservation_bytes = direct_ward_audit_reservation_bytes(
+        &conn,
+        body.map(str::len).unwrap_or_default(),
+        edits.len(),
+    )?;
+    let mut audit_reservation = match store::WardAuditReservation::acquire(
+        &conn,
+        &store_path,
+        format!("direct:{}", Uuid::new_v4()),
+        "direct-ward-apply",
+        reservation_bytes,
+    ) {
+        Ok(reservation) => reservation,
+        Err(error) if store::ward_audit_capacity_failure(&error).is_some() => {
+            let limit = store::ward_audit_capacity_failure(&error)
+                .expect("guard established a typed Ward audit capacity failure");
+            return ward_audit_capacity_exceeded_response(limit, Some(false));
+        }
+        Err(error) => return Err(error),
+    };
+    let gate_report = match crate::threads_gate::gate_protected_edits(
+        audit_reservation.connection(),
+        &crate::threads_gate::GateRequest {
+            coven_home,
+            familiar_id,
+            workspace: &workspace,
+            config: &config,
+            edits: &edits,
+            gated_targets: &gated_targets,
+            authorization: &authorization,
+        },
+    ) {
+        Ok(report) => report,
+        Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
+            let limit = crate::proposal_store::quota_failure(&error)
+                .expect("guard established a typed pending proposal quota failure");
+            audit_reservation.finish()?;
+            return proposal_quota_exceeded_response(limit);
+        }
+        Err(error) => {
+            // Fail closed: a gate that cannot run is a refusal, never a
+            // pass-through (RFC-0001 §5.4 Gate 4).
+            return api_error(
+                500,
+                "threads_gate_unavailable",
+                &format!("The authority gate could not adjudicate the proposal: {error:#}"),
+                None,
+            );
         }
     };
     match &gate_report.outcome {
         crate::threads_gate::GateOutcome::Rejected => {
+            audit_reservation.finish()?;
             return api_error(
                 403,
                 "ward_refused",
@@ -5300,6 +5903,7 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Staged { .. } => {
             // §5 DegradeToProposal: staged at ~/.coven/pending/, principal
             // notified via the pending file + audit ledger; no write happens.
+            audit_reservation.finish()?;
             return json_response(
                 202,
                 &json!({
@@ -5312,10 +5916,70 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Permitted => {}
     }
 
-    let report = ward.apply(&edits, &authorization)?;
+    let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
+        Ok(report) => (report, None),
+        Err(error) => {
+            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                audit_reservation.release_if_unneeded()?;
+                return ward_apply_too_large_response(limit);
+            }
+            match ward::direct_apply_failure(&error).cloned() {
+                Some(ward::DirectApplyFailure::RolledBack) => {
+                    audit_reservation.finish()?;
+                    return api_error(
+                        500,
+                        "ward_apply_failed",
+                        &format!(
+                            "The Ward could not apply the batch; all writes were rolled back: \
+                             {error:#}"
+                        ),
+                        Some(json!({ "writeApplied": false })),
+                    );
+                }
+                Some(ward::DirectApplyFailure::RolledBackCleanupFailed { targets }) => {
+                    audit_reservation.finish()?;
+                    return api_error(
+                        500,
+                        "ward_apply_rollback_cleanup_failed",
+                        &format!(
+                            "The Ward rolled back the file writes but could not remove every \
+                             temporary staging or backup artifact: {error:#}"
+                        ),
+                        Some(json!({
+                            "writeApplied": false,
+                            "targets": targets,
+                            "retrySafe": false,
+                        })),
+                    );
+                }
+                Some(ward::DirectApplyFailure::Applied(report)) => {
+                    audit_reservation.preserve_if_unfinished();
+                    (report, Some(format!("{error:#}")))
+                }
+                Some(ward::DirectApplyFailure::Ambiguous { targets }) => {
+                    audit_reservation.preserve()?;
+                    return api_error(
+                        500,
+                        "ward_apply_ambiguous",
+                        &format!(
+                            "The Ward could not prove that the failed batch was fully rolled back: \
+                             {error:#}"
+                        ),
+                        Some(json!({
+                            "writeApplied": Value::Null,
+                            "targets": targets,
+                            "retrySafe": false,
+                        })),
+                    );
+                }
+                None => return Err(error),
+            }
+        }
+    };
     let changes: Vec<Value> = report.changes.iter().map(ward_change_json).collect();
     let threads_gate_json = gate_report.to_json();
     if report.is_refused() {
+        audit_reservation.finish()?;
         return api_error(
             403,
             "ward_refused",
@@ -5341,16 +6005,26 @@ fn apply_familiar_edits(
             )
         });
         if coherence_only {
-            let conn = store::open_store(&store_path(coven_home))?;
-            let (pending_path, proposal_id) = crate::threads_gate::stage_coherence_proposal(
-                &conn,
+            let staged = crate::threads_gate::stage_coherence_proposal(
+                audit_reservation.connection(),
                 coven_home,
                 familiar_id,
                 &workspace,
                 &config,
                 &edits,
                 &authorization,
-            )?;
+            );
+            let (pending_path, proposal_id) = match staged {
+                Ok(staged) => staged,
+                Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
+                    let limit = crate::proposal_store::quota_failure(&error)
+                        .expect("guard established a typed pending proposal quota failure");
+                    audit_reservation.release_if_unneeded()?;
+                    return proposal_quota_exceeded_response(limit);
+                }
+                Err(error) => return Err(error),
+            };
+            audit_reservation.finish()?;
             return json_response(
                 202,
                 &json!({
@@ -5364,6 +6038,7 @@ fn apply_familiar_edits(
                 }),
             );
         }
+        audit_reservation.finish()?;
         return json_response(
             202,
             &json!({
@@ -5374,6 +6049,8 @@ fn apply_familiar_edits(
             }),
         );
     }
+    audit_reservation.preserve_if_unfinished();
+    maybe_pause_direct_apply_before_audit(coven_home, familiar_id);
     // Gate 4 persistence (#414): the audit records returned to the client
     // also land in the append-only ward_audit ledger, so applied writes stay
     // observable across daemon restarts. Persist before advancing protected
@@ -5382,31 +6059,88 @@ fn apply_familiar_edits(
     // changes so clients can distinguish "write applied, audit failed" from a
     // full failure and avoid blind retries that would produce duplicate writes.
     {
-        let mut conn = store::open_store(&store_path(coven_home))?;
-        if let Err(err) = crate::threads_gate::persist_apply_audit_records(
-            &mut conn,
+        if let Err(error) = maybe_fail_direct_audit_store_verification(&store_path)
+            .and_then(|()| audit_reservation.verify_store_path(&store_path))
+        {
+            audit_reservation.preserve()?;
+            return direct_audit_persist_failed_response(&changes, &error);
+        }
+        let persist_error = crate::threads_gate::persist_apply_audit_records_on_connection(
+            audit_reservation.connection(),
             familiar_id,
             &workspace,
             &config,
             &report,
-        ) {
-            return json_response(
-                500,
-                &json!({
-                    "error": {
-                        "code": "audit_persist_failed",
-                        "message": format!(
-                            "The file write was applied but the audit ledger \
-                             could not be updated: {err:#}"
-                        ),
-                        "details": { "writeApplied": true },
-                    },
-                    "changes": changes,
-                }),
-            );
+        )
+        .err();
+        if let Some(err) = persist_error {
+            audit_reservation.preserve()?;
+            return direct_audit_persist_failed_response(&changes, &err);
         }
     }
-    advance_applied_protected_baselines(coven_home, familiar_id, &workspace, &report.changes)?;
+    if let Err(error) = advance_applied_protected_baselines_on_connection(
+        audit_reservation.connection(),
+        familiar_id,
+        &workspace,
+        &report.changes,
+    ) {
+        audit_reservation.preserve()?;
+        return json_response(
+            500,
+            &json!({
+                "error": {
+                    "code": "ward_baseline_advance_failed",
+                    "message": format!(
+                        "The file write was applied and audited, but protected-surface \
+                         baseline advancement failed: {error:#}"
+                    ),
+                    "details": {
+                        "writeApplied": true,
+                        "retrySafe": false,
+                    },
+                },
+                "changes": changes,
+            }),
+        );
+    }
+    if let Err(error) = audit_reservation.finish() {
+        return json_response(
+            500,
+            &json!({
+                "error": {
+                    "code": "audit_reservation_release_failed",
+                    "message": format!(
+                        "The file write was applied and audited, but its durable audit \
+                         reservation could not be released: {error:#}"
+                    ),
+                    "details": {
+                        "writeApplied": true,
+                        "retrySafe": false,
+                    },
+                },
+                "changes": changes,
+            }),
+        );
+    }
+    if let Some(error) = apply_cleanup_error {
+        return json_response(
+            500,
+            &json!({
+                "error": {
+                    "code": "ward_apply_cleanup_failed",
+                    "message": format!(
+                        "The file write was applied and audited, but temporary backup cleanup \
+                         failed: {error}"
+                    ),
+                    "details": {
+                        "writeApplied": true,
+                        "retrySafe": false,
+                    },
+                },
+                "changes": changes,
+            }),
+        );
+    }
     json_response(
         200,
         &json!({
@@ -5418,8 +6152,8 @@ fn apply_familiar_edits(
     )
 }
 
-fn advance_applied_protected_baselines(
-    coven_home: &Path,
+fn advance_applied_protected_baselines_on_connection(
+    conn: &rusqlite::Connection,
     familiar_id: &str,
     workspace: &Path,
     changes: &[ward::AppliedChange],
@@ -5435,9 +6169,8 @@ fn advance_applied_protected_baselines(
     if protected.is_empty() {
         return Ok(());
     }
-    let conn = store::open_store(&store_path(coven_home))?;
     for surface in protected {
-        crate::threads_gate::advance_surface_baseline(&conn, familiar_id, workspace, &surface)?;
+        crate::threads_gate::advance_surface_baseline(conn, familiar_id, workspace, &surface)?;
     }
     Ok(())
 }
@@ -5695,6 +6428,419 @@ pub(crate) fn validate_ward_audit_event_tag(event: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod audit_capacity_tests {
+    use super::*;
+
+    fn seed_warded_familiar(home: &Path) -> Result<PathBuf> {
+        super::tests::seed_warded_familiar(home)
+    }
+
+    fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
+        super::tests::post_edits(home, body)
+    }
+
+    fn saturate_ward_audit_capacity(home: &Path) -> Result<i64> {
+        super::tests::saturate_ward_audit_capacity(home)
+    }
+
+    fn direct_ward_audit_reservation_bytes(
+        home: &Path,
+        body_bytes: usize,
+        edit_count: usize,
+    ) -> Result<i64> {
+        super::tests::direct_ward_audit_reservation_bytes(home, body_bytes, edit_count)
+    }
+
+    fn grow_test_wal_past(
+        conn: &rusqlite::Connection,
+        store_path: &Path,
+        minimum_bytes: u64,
+    ) -> Result<u64> {
+        conn.execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             CREATE TABLE IF NOT EXISTS ward_audit_wal_fill (
+                 id INTEGER PRIMARY KEY,
+                 payload BLOB NOT NULL
+             );",
+        )?;
+        let wal_path = PathBuf::from(format!("{}-wal", store_path.display()));
+        for _ in 0..64 {
+            conn.execute(
+                "INSERT INTO ward_audit_wal_fill(payload) VALUES(zeroblob(65536))",
+                [],
+            )?;
+            let wal_bytes = std::fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            if wal_bytes > minimum_bytes {
+                return Ok(wal_bytes);
+            }
+        }
+        anyhow::bail!("test WAL did not grow beyond {minimum_bytes} bytes")
+    }
+
+    #[test]
+    fn ward_audit_capacity_rejects_stage_before_proposal_publication() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::create_dir_all(target.parent().context("reviewed parent")?)?;
+        std::fs::write(&target, "before")?;
+        let before = std::fs::read(&target)?;
+        saturate_ward_audit_capacity(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"must not stage"}]}"#,
+        )
+        .expect("capacity exhaustion must be a stable API response");
+
+        assert_eq!(response.status, 507, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_audit_capacity_exceeded");
+        assert_eq!(body["error"]["details"]["resource"], "ledger");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read(&target)?, before);
+        assert!(
+            std::fs::read_dir(home.join("pending"))
+                .map(
+                    |entries| entries.filter_map(std::result::Result::ok).all(|entry| {
+                        !crate::proposal_store::is_active_proposal_file(
+                            &entry.file_name().to_string_lossy(),
+                        )
+                    })
+                )
+                .unwrap_or(true),
+            "capacity refusal must not publish a proposal"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_rejects_direct_tier2_before_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        saturate_ward_audit_capacity(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+        )
+        .expect("capacity exhaustion must be a stable API response");
+
+        assert_eq!(response.status, 507, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_audit_capacity_exceeded");
+        assert_eq!(body["error"]["details"]["resource"], "ledger");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_rejects_decisions_before_claim_or_target_write() -> Result<()> {
+        for decision in ["approve", "reject"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_warded_familiar(home)?;
+            std::fs::create_dir_all(workspace.join("reviewed"))?;
+            std::fs::write(workspace.join("reviewed/skill.md"), "before")?;
+            let staged = post_edits(
+                home,
+                r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+            )?;
+            let staged_body: Value = serde_json::from_str(&staged.body)?;
+            let proposal_id = staged_body["proposalId"].as_str().context("proposal id")?;
+            let pending = PathBuf::from(
+                staged_body["pendingPath"]
+                    .as_str()
+                    .context("pending path")?,
+            );
+            let pending_before = std::fs::read(&pending)?;
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let audit_before: i64 =
+                conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+            drop(conn);
+            saturate_ward_audit_capacity(home)?;
+
+            let response = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/{decision}"),
+                home,
+                None,
+                Some("{}"),
+            )
+            .expect("capacity exhaustion must be a stable API response");
+
+            assert_eq!(response.status, 507, "{decision}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "ward_audit_capacity_exceeded");
+            assert_eq!(body["error"]["details"]["resource"], "ledger");
+            assert_eq!(body["error"]["details"]["writeApplied"], false);
+            assert_eq!(std::fs::read(&pending)?, pending_before);
+            assert_eq!(
+                std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+                "before"
+            );
+            assert!(
+                find_any_pending_decision_claim(home, proposal_id).is_none(),
+                "capacity refusal must not leave a decision claim"
+            );
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let audit_after: i64 =
+                conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+            assert_eq!(audit_after, audit_before);
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(reservations, 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stage_reject_cycles_stop_at_durable_audit_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("reviewed"))?;
+        std::fs::write(workspace.join("reviewed/skill.md"), "before")?;
+
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"first"}]}"#,
+        )?;
+        let staged: Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged["proposalId"].as_str().context("proposal id")?;
+        let rejected = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+        assert_eq!(rejected.status, 200, "got {}", rejected.body);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (used, rows): (i64, i64) = conn.query_row(
+            "SELECT capacity.used_bytes, COUNT(audit.id)
+             FROM coven_ward_audit_capacity AS capacity
+             LEFT JOIN ward_audit AS audit ON TRUE
+             WHERE capacity.singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(rows, 2);
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1
+             WHERE singleton = 1",
+            [used],
+        )?;
+        drop(conn);
+
+        let blocked = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"second"}]}"#,
+        )?;
+
+        assert_eq!(blocked.status, 507, "got {}", blocked.body);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row
+                .get::<_, i64>(0))?,
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_capacity_serializes_concurrent_direct_writes_before_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        std::fs::write(workspace.join("notes/a.md"), "before")?;
+        std::fs::write(workspace.join("notes/b.md"), "before")?;
+        let bodies = [
+            r#"{"edits":[{"target":"notes/a.md","contents":"after-a"}]}"#.to_string(),
+            r#"{"edits":[{"target":"notes/b.md","contents":"after-b"}]}"#.to_string(),
+        ];
+        let reservation = bodies
+            .iter()
+            .map(|body| direct_ward_audit_reservation_bytes(home, body.len(), 1))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .context("reservation fixture")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+         SET limit_bytes = ?1, used_bytes = 0
+         WHERE singleton = 1",
+            [reservation],
+        )?;
+        drop(conn);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let writers = bodies
+            .into_iter()
+            .map(|body| {
+                let home = home.to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<ApiResponse> {
+                    barrier.wait();
+                    post_edits(&home, &body)
+                })
+            })
+            .collect::<Vec<_>>();
+        let responses = writers
+            .into_iter()
+            .map(|writer| writer.join().expect("Ward writer did not panic"))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| response.status == 200)
+                .count(),
+            1,
+            "{responses:?}"
+        );
+        assert_eq!(
+            responses
+                .iter()
+                .filter(|response| {
+                    response.status == 507
+                        && serde_json::from_str::<Value>(&response.body).is_ok_and(|body| {
+                            body["error"]["code"] == "ward_audit_capacity_exceeded"
+                                && body["error"]["details"]["writeApplied"] == false
+                        })
+                })
+                .count(),
+            1,
+            "{responses:?}"
+        );
+        let changed = [
+            std::fs::read_to_string(workspace.join("notes/a.md"))? == "after-a",
+            std::fs::read_to_string(workspace.join("notes/b.md"))? == "after-b",
+        ];
+        assert_eq!(changed.into_iter().filter(|changed| *changed).count(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(audits, 1);
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn ward_audit_wal_checkpoint_reclaims_idle_wal_but_rejects_pinned_wal() -> Result<()> {
+        let body = r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#;
+
+        let idle = tempfile::tempdir()?;
+        let idle_home = idle.path();
+        let idle_workspace = seed_warded_familiar(idle_home)?;
+        std::fs::create_dir_all(idle_workspace.join("notes"))?;
+        std::fs::write(idle_workspace.join("notes/today.md"), "before")?;
+        let idle_store_path = idle_home.join("coven.sqlite3");
+        let idle_reservation = u64::try_from(direct_ward_audit_reservation_bytes(
+            idle_home,
+            body.len(),
+            1,
+        )?)?;
+        let idle_wal_limit = idle_reservation + 64 * 1024;
+        let idle_writer = store::open_store(&idle_store_path)?;
+        idle_writer.execute(
+            "UPDATE coven_ward_audit_capacity
+         SET wal_limit_bytes = ?1
+         WHERE singleton = 1",
+            [i64::try_from(idle_wal_limit)?],
+        )?;
+        let idle_wal_before = grow_test_wal_past(&idle_writer, &idle_store_path, idle_wal_limit)?;
+
+        let admitted = post_edits(idle_home, body)?;
+
+        assert_eq!(
+            admitted.status, 200,
+            "an idle WAL should be checkpointed before admission: {}",
+            admitted.body
+        );
+        assert_eq!(
+            std::fs::read_to_string(idle_workspace.join("notes/today.md"))?,
+            "after"
+        );
+        let idle_wal_after = std::fs::metadata(format!("{}-wal", idle_store_path.display()))
+            .map(|metadata| metadata.len())
+            .unwrap_or_default();
+        assert!(
+            idle_wal_after < idle_wal_before,
+            "checkpoint did not reduce the idle WAL ({idle_wal_before} -> {idle_wal_after})"
+        );
+
+        let pinned = tempfile::tempdir()?;
+        let pinned_home = pinned.path();
+        let pinned_workspace = seed_warded_familiar(pinned_home)?;
+        std::fs::create_dir_all(pinned_workspace.join("notes"))?;
+        std::fs::write(pinned_workspace.join("notes/today.md"), "before")?;
+        let pinned_store_path = pinned_home.join("coven.sqlite3");
+        let pinned_reservation = u64::try_from(direct_ward_audit_reservation_bytes(
+            pinned_home,
+            body.len(),
+            1,
+        )?)?;
+        let pinned_wal_limit = pinned_reservation + 64 * 1024;
+        let pinned_reader = rusqlite::Connection::open(&pinned_store_path)?;
+        pinned_reader.execute_batch("BEGIN; SELECT COUNT(*) FROM ward_audit;")?;
+        let pinned_writer = store::open_initialized_store(&pinned_store_path)?;
+        pinned_writer.execute(
+            "UPDATE coven_ward_audit_capacity
+         SET wal_limit_bytes = ?1
+         WHERE singleton = 1",
+            [i64::try_from(pinned_wal_limit)?],
+        )?;
+        grow_test_wal_past(&pinned_writer, &pinned_store_path, pinned_wal_limit)?;
+
+        let blocked = post_edits(pinned_home, body)?;
+
+        assert_eq!(blocked.status, 507, "got {}", blocked.body);
+        let blocked: Value = serde_json::from_str(&blocked.body)?;
+        assert_eq!(blocked["error"]["code"], "ward_audit_capacity_exceeded");
+        assert_eq!(blocked["error"]["details"]["resource"], "wal");
+        assert_eq!(blocked["error"]["details"]["writeApplied"], false);
+        assert_eq!(
+            std::fs::read_to_string(pinned_workspace.join("notes/today.md"))?,
+            "before"
+        );
+        Ok(())
+    }
+}
+
 /// Lowercase hex of raw hash bytes for API payloads.
 fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -5707,15 +6853,118 @@ fn hex_string(bytes: &[u8]) -> String {
 /// authority-lane (Tier-0 `DegradeToProposal`) and coherence-lane (Tier-1
 /// hold) proposals, distinguished by `reviewKind` (absent in a staged file ⇒
 /// `authority`). A missing directory is an empty list; an unreadable or
-/// corrupt pending file is reported as a `degraded` entry rather than
-/// aborting the fleet read (same posture as `/threads/weaves`).
-fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<ApiResponse> {
+/// corrupt pending file is reported once as a `degraded` entry and quarantined
+/// rather than aborting the fleet read. List calls parse at most 64 entries in
+/// stable filename/cursor order; detail calls parse only the addressed file.
+fn quarantine_degraded_proposal(
+    coven_home: &Path,
+    path: &Path,
+    file_name: &str,
+    reason: &'static str,
+) -> Value {
+    let quarantined = match crate::proposal_store::quarantine(coven_home, path, "invalid") {
+        Ok(Some(destination)) => {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "threads proposals: quarantined invalid pending file {} at {}",
+                    path.display(),
+                    destination.display()
+                ),
+            );
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!(
+                    "threads proposals: failed to quarantine invalid pending file {}: {error:#}",
+                    path.display()
+                ),
+            );
+            false
+        }
+    };
+    json!({
+        "degraded": {
+            "file": file_name,
+            "reason": reason,
+            "quarantined": quarantined,
+        },
+    })
+}
+
+fn threads_proposals_response(
+    coven_home: &Path,
+    id: Option<&str>,
+    query: Option<&str>,
+) -> Result<ApiResponse> {
+    const DEFAULT_LIMIT: usize = crate::proposal_store::MAX_PENDING_PROPOSALS;
+    const MAX_LIMIT: usize = crate::proposal_store::MAX_PENDING_PROPOSALS;
+
+    let (requested_limit, requested_cursor) = if id.is_some() {
+        (1, None)
+    } else {
+        let limit = match query.and_then(|query| query_param(query, "limit")) {
+            Some(raw) => match raw.parse::<usize>() {
+                Ok(limit) if (1..=MAX_LIMIT).contains(&limit) => limit,
+                _ => {
+                    return api_error(
+                        400,
+                        "invalid_request",
+                        "Query parameter `limit` must be between 1 and 64.",
+                        Some(json!({ "limit": raw, "maxLimit": MAX_LIMIT })),
+                    )
+                }
+            },
+            None => DEFAULT_LIMIT,
+        };
+        let cursor = match query.and_then(|query| decoded_query_param(query, "cursor")) {
+            Some(encoded) => {
+                let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(encoded.as_bytes())
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                match decoded {
+                    Some(cursor)
+                        if !cursor.is_empty()
+                            && cursor.len() <= 255
+                            && !cursor.contains(['/', '\\'])
+                            && cursor.ends_with(".json") =>
+                    {
+                        Some(cursor)
+                    }
+                    _ => {
+                        return api_error(
+                            400,
+                            "invalid_request",
+                            "Query parameter `cursor` is not a valid proposal-list cursor.",
+                            None,
+                        )
+                    }
+                }
+            }
+            None => None,
+        };
+        (limit, cursor)
+    };
+
     let pending_dir = coven_home.join("pending");
+    crate::proposal_store::reconcile_invalid_active_names(coven_home)?;
     let entries = match fs::read_dir(&pending_dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return match id {
-                None => json_response(200, &json!({ "proposals": [] })),
+                None => json_response(
+                    200,
+                    &json!({
+                        "proposals": [],
+                        "limit": requested_limit,
+                        "hasMore": false,
+                        "nextCursor": Value::Null,
+                    }),
+                ),
                 Some(id) => api_error(
                     404,
                     "proposal_not_found",
@@ -5727,32 +6976,92 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
         Err(err) => return Err(err).with_context(|| format!("reading {}", pending_dir.display())),
     };
 
+    let (paths, limit, has_more, next_cursor): (Vec<PathBuf>, usize, bool, Option<String>) =
+        if let Some(id) = id {
+            let proposal_id =
+                Uuid::parse_str(id).context("validated proposal id stopped parsing")?;
+            (
+                find_pending_proposal(coven_home, proposal_id)?
+                    .into_iter()
+                    .collect(),
+                1,
+                false,
+                None,
+            )
+        } else {
+            let mut candidates = BTreeMap::new();
+            let candidate_cap = requested_limit.saturating_add(1);
+            for entry in entries {
+                let entry = entry?;
+                let path = entry.path();
+                let Some(file_name) = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+                else {
+                    continue;
+                };
+                if !crate::proposal_store::is_pending_proposal_file(&file_name) {
+                    continue;
+                }
+                if requested_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| file_name.as_str() <= cursor.as_str())
+                {
+                    continue;
+                }
+                candidates.insert(file_name, path);
+                if candidates.len() > candidate_cap {
+                    candidates.pop_last();
+                }
+            }
+            let has_more = candidates.len() > requested_limit;
+            if has_more {
+                candidates.pop_last();
+            }
+            let next_cursor = has_more
+                .then(|| candidates.last_key_value().map(|(name, _)| name))
+                .flatten()
+                .map(|name| {
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(name.as_bytes())
+                });
+            (
+                candidates.into_values().collect(),
+                requested_limit,
+                has_more,
+                next_cursor,
+            )
+        };
+
     let mut proposals = Vec::new();
-    for entry in entries {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
+    for path in paths {
         let file_name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let Some(raw) = fs::read_to_string(&path).ok() else {
-            proposals.push(json!({
-                "degraded": { "file": file_name, "reason": "proposal-unparseable" },
-            }));
+        let Some(raw) = read_pending_proposal_file(&path).ok() else {
+            proposals.push(quarantine_degraded_proposal(
+                coven_home,
+                &path,
+                &file_name,
+                "proposal-unparseable",
+            ));
             continue;
         };
-        let Some(raw_value) = serde_json::from_str::<Value>(&raw).ok() else {
-            proposals.push(json!({
-                "degraded": { "file": file_name, "reason": "proposal-unparseable" },
-            }));
+        let Some(document) = ProposalEnvelopeDocument::parse_preflighted(&raw).ok() else {
+            proposals.push(quarantine_degraded_proposal(
+                coven_home,
+                &path,
+                &file_name,
+                "proposal-unparseable",
+            ));
             continue;
         };
-        let (mut probes, mut probe_evidence_degraded) = match raw_value.get("probes") {
+        drop(raw);
+        let (mut probes, mut probe_evidence_degraded) = match document.probes.as_deref() {
             Some(value) => {
-                match serde_json::from_value::<Vec<crate::ward_probes::SurfaceProbeReport>>(
-                    value.clone(),
+                match serde_json::from_str::<Vec<crate::ward_probes::SurfaceProbeReport>>(
+                    value.get(),
                 ) {
                     Ok(probes) => (Some(probes), None),
                     Err(_) => (None, Some("proposal-probes-unparseable")),
@@ -5760,47 +7069,8 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             }
             None => (None, None),
         };
-        let mut proposal_value = raw_value.clone();
-        if let Some(object) = proposal_value.as_object_mut() {
-            object.remove("decisionRequest");
-            object.remove("decisionState");
-        }
-        let phase5_shape = is_phase5_proposal_shape(&proposal_value);
-        let scheduled = if phase5_shape {
-            match serde_json::from_value::<crate::proposal_scheduler::ScheduledProposal>(
-                proposal_value.clone(),
-            ) {
-                Ok(scheduled) => Some(scheduled),
-                Err(_) => {
-                    proposals.push(json!({
-                        "degraded": { "file": file_name, "reason": "proposal-unparseable" },
-                    }));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let legacy = if scheduled.is_none() {
-            match serde_json::from_value::<coven_threads_core::PendingProposal>(
-                proposal_value.clone(),
-            ) {
-                Ok(proposal) => Some(proposal),
-                Err(_) => {
-                    proposals.push(json!({
-                        "degraded": { "file": file_name, "reason": "proposal-unparseable" },
-                    }));
-                    continue;
-                }
-            }
-        } else {
-            None
-        };
-        let proposal = scheduled
-            .as_ref()
-            .map(crate::proposal_scheduler::ScheduledProposal::pending)
-            .or(legacy.as_ref())
-            .expect("scheduled or legacy proposal parsed");
+        let scheduled = document.scheduled();
+        let proposal = document.pending();
         let Some(familiar_id) = human_familiar_id_for_weave(coven_home, proposal.familiar_id)?
         else {
             // A proposal whose familiar vanished from familiars.toml cannot
@@ -5847,7 +7117,7 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             "writer": proposal.writer.as_str(),
             "stagedAt": proposal.staged_at.format(&format).ok(),
             "targets": targets,
-            "proposalRevision": proposal_revision(&proposal_value)?,
+            "proposalRevision": document.revision()?,
             "probeSummary": probe_summary,
         });
         if let Some(reason) = probe_evidence_degraded {
@@ -5899,10 +7169,7 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
             );
             view.insert("affectedRegions".to_string(), json!(affected_regions));
         } else {
-            let review_kind = raw_value
-                .get("reviewKind")
-                .and_then(Value::as_str)
-                .unwrap_or("authority");
+            let review_kind = document.review_kind.as_deref().unwrap_or("authority");
             view.as_object_mut()
                 .expect("proposal view is always a JSON object")
                 .insert("reviewKind".to_string(), json!(review_kind));
@@ -5911,16 +7178,15 @@ fn threads_proposals_response(coven_home: &Path, id: Option<&str>) -> Result<Api
     }
 
     match id {
-        None => {
-            // Deterministic order for scripts: newest first, ties broken by
-            // proposal id, degraded entries (no stagedAt) last.
-            proposals.sort_by_cached_key(|value| {
-                let staged = value["stagedAt"].as_str().map(str::to_owned);
-                let id = value["proposalId"].as_str().unwrap_or_default().to_owned();
-                (std::cmp::Reverse(staged), id)
-            });
-            json_response(200, &json!({ "proposals": proposals }))
-        }
+        None => json_response(
+            200,
+            &json!({
+                "proposals": proposals,
+                "limit": limit,
+                "hasMore": has_more,
+                "nextCursor": next_cursor,
+            }),
+        ),
         Some(id) => match proposals
             .into_iter()
             .find(|proposal| proposal["proposalId"] == id)
@@ -5994,21 +7260,6 @@ fn sanitize_ward_config_error(error: &anyhow::Error, workspace: &Path) -> String
     sanitized.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn is_phase5_proposal_shape(value: &Value) -> bool {
-    [
-        "schema",
-        "pending",
-        "classification",
-        "materialized_diff",
-        "region_evidence",
-        "lifecycle",
-        "veto_deadline",
-        "earliest_close",
-    ]
-    .iter()
-    .any(|field| value.get(field).is_some())
-}
-
 struct ProposalDecisionSemantics {
     rejection_event: coven_threads_core::AuditEventType,
     rejection_decision: &'static str,
@@ -6021,7 +7272,27 @@ fn proposal_decision_semantics(
     decision: &str,
     note: Option<&str>,
     now: time::OffsetDateTime,
+    expired: bool,
 ) -> std::result::Result<ProposalDecisionSemantics, &'static str> {
+    if expired {
+        if decision != "reject" {
+            return Err("proposal-expiry-decision-invalid");
+        }
+        return Ok(ProposalDecisionSemantics {
+            rejection_event: coven_threads_core::AuditEventType::ProposalRejected,
+            rejection_decision: "expired",
+            approval_path_label: scheduled
+                .map(|proposal| {
+                    proposal
+                        .classification()
+                        .approval_path
+                        .display_label()
+                        .to_string()
+                })
+                .unwrap_or_else(|| "human_review".to_string()),
+            window_close: None,
+        });
+    }
     let Some(scheduled) = scheduled else {
         return Ok(ProposalDecisionSemantics {
             rejection_event: coven_threads_core::AuditEventType::ProposalRejected,
@@ -6128,25 +7399,11 @@ fn revalidate_scheduled_materialized_before(
     Ok(())
 }
 
+#[cfg(test)]
 fn proposal_revision(authority_value: &Value) -> Result<String> {
-    fn canonicalize(value: &Value) -> Value {
-        match value {
-            Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
-            Value::Object(values) => {
-                let sorted: std::collections::BTreeMap<_, _> = values
-                    .iter()
-                    .map(|(key, value)| (key.clone(), canonicalize(value)))
-                    .collect();
-                serde_json::to_value(sorted).expect("canonical JSON map is serializable")
-            }
-            value => value.clone(),
-        }
-    }
-
-    let bytes = serde_json::to_vec(&canonicalize(authority_value))
-        .context("serializing canonical proposal revision authority")?;
-    let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let bytes =
+        serde_json::to_vec(authority_value).context("serializing proposal revision authority")?;
+    parse_proposal_envelope(&bytes)?.revision()
 }
 
 fn ward_tier_number(tier: ward::Tier) -> u8 {
@@ -6165,11 +7422,10 @@ enum PendingReviewKind {
 }
 
 impl PendingReviewKind {
-    fn from_pending_value(value: &Value) -> Option<Self> {
-        match value.get("reviewKind") {
-            None => Some(Self::Authority),
-            Some(Value::String(kind)) if kind == "authority" => Some(Self::Authority),
-            Some(Value::String(kind)) if kind == "coherence" => Some(Self::Coherence),
+    fn from_stored_value(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some("authority") => Some(Self::Authority),
+            Some("coherence") => Some(Self::Coherence),
             Some(_) => None,
         }
     }
@@ -6190,23 +7446,21 @@ struct CoherenceDecisionEvidence {
 }
 
 fn coherence_decision_evidence(
-    raw_value: &Value,
+    probes_value: Option<&serde_json::value::RawValue>,
     workspace: &Path,
     config: &ward::WardConfig,
     pending: &coven_threads_core::PendingProposal,
 ) -> CoherenceDecisionEvidence {
     let targets = pending.edits.len();
-    let reports = raw_value
-        .get("probes")
-        .cloned()
-        .map(serde_json::from_value::<Vec<crate::ward_probes::SurfaceProbeReport>>)
+    let reports = probes_value
+        .map(|raw| serde_json::from_str::<Vec<crate::ward_probes::SurfaceProbeReport>>(raw.get()))
         .transpose();
     let Ok(Some(reports)) = reports else {
         return CoherenceDecisionEvidence {
             validation: crate::ward_probes::ProbeEvidenceValidation::Inconsistent,
             summary: crate::ward_probes::ProbeSummary::unscored_targets(targets),
             reports: None,
-            degraded_reason: Some(if raw_value.get("probes").is_some() {
+            degraded_reason: Some(if probes_value.is_some() {
                 "proposal-probes-unparseable"
             } else {
                 "proposal-probes-missing"
@@ -6243,13 +7497,1771 @@ fn coherence_decision_evidence(
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ProposalEnvelopeLimits {
+    max_edits: usize,
+    max_content_bytes: u64,
+}
+
+const WARD_PROPOSAL_ENVELOPE_LIMITS: ProposalEnvelopeLimits = ProposalEnvelopeLimits {
+    max_edits: ward::WARD_EDIT_MAX_COUNT,
+    max_content_bytes: ward::WARD_RETAINED_CONTENT_MAX_BYTES,
+};
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProposalContentCollection {
+    count: usize,
+    bytes: u64,
+}
+
+impl ProposalContentCollection {
+    fn push_len(&mut self, bytes: u64) {
+        self.count = self.count.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JsonByteArrayLen(u64);
+
+impl<'de> Deserialize<'de> for JsonByteArrayLen {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ByteArrayVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ByteArrayVisitor {
+            type Value = JsonByteArrayLen;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON byte array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut bytes = 0_u64;
+                while sequence.next_element::<u8>()?.is_some() {
+                    bytes = bytes.saturating_add(1);
+                }
+                Ok(JsonByteArrayLen(bytes))
+            }
+        }
+
+        deserializer.deserialize_seq(ByteArrayVisitor)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StagedDataPreflight {
+    utf8_len: u64,
+    base64_len: Option<u64>,
+}
+
+impl StagedDataPreflight {
+    fn from_str(data: &str) -> Self {
+        Self {
+            utf8_len: u64::try_from(data.len()).unwrap_or(u64::MAX),
+            base64_len: ward::staged_contents_decoded_len("base64", data).ok(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StagedDataPreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct StagedDataVisitor;
+
+        impl serde::de::Visitor<'_> for StagedDataVisitor {
+            type Value = StagedDataPreflight;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a staged-content data string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(StagedDataPreflight::from_str(value))
+            }
+
+            fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(StagedDataVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedContentsPreflight {
+    encoding: String,
+    data: StagedDataPreflight,
+}
+
+impl StagedContentsPreflight {
+    fn decoded_len(&self) -> Result<u64> {
+        match self.encoding.as_str() {
+            "utf8" => Ok(self.data.utf8_len),
+            "base64" => self
+                .data
+                .base64_len
+                .context("staged base64 contents are invalid"),
+            encoding => anyhow::bail!("staged contents use unknown encoding `{encoding}`"),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingEditPreflight {
+    #[serde(default)]
+    surface: Option<serde::de::IgnoredAny>,
+    contents: StagedContentsPreflight,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingEditsPreflight(ProposalContentCollection);
+
+impl<'de> Deserialize<'de> for PendingEditsPreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PendingEditsVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PendingEditsVisitor {
+            type Value = PendingEditsPreflight;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a pending edits array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut collection = ProposalContentCollection::default();
+                while let Some(edit) = sequence.next_element::<PendingEditPreflight>()? {
+                    let bytes = edit
+                        .contents
+                        .decoded_len()
+                        .map_err(serde::de::Error::custom)?;
+                    collection.push_len(bytes);
+                }
+                Ok(PendingEditsPreflight(collection))
+            }
+        }
+
+        deserializer.deserialize_seq(PendingEditsVisitor)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum FrayReasonPreflight {
+    ContentHashMismatch,
+    SignatureInvalid,
+    ManifestEntryMismatch,
+    AuditTrailUnverifiable,
+    RequiredStrandMissing { kind: serde::de::IgnoredAny },
+    SerializationMarkerMismatch,
+    Other(String),
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum SnapReasonPreflight {
+    Revoked,
+    MultipleStrandFray,
+    PatternBroken,
+    Other(String),
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+enum FrayOrSnapPreflight {
+    NotCovered {
+        channel: serde::de::IgnoredAny,
+    },
+    Frayed {
+        strand: Option<serde::de::IgnoredAny>,
+        channel: serde::de::IgnoredAny,
+        reason: FrayReasonPreflight,
+    },
+    Snapped {
+        channel: serde::de::IgnoredAny,
+        reason: SnapReasonPreflight,
+    },
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct PendingProposalPreflight {
+    #[serde(default)]
+    id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    familiar_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    writer: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    channel: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    thread_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    fray: Option<FrayOrSnapPreflight>,
+    #[serde(default)]
+    edits: Option<PendingEditsPreflight>,
+    #[serde(default)]
+    staged_at: Option<serde::de::IgnoredAny>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MaterializedSurfacePreflight {
+    #[serde(default)]
+    surface: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    before: Option<JsonByteArrayLen>,
+    #[serde(default)]
+    after: Option<JsonByteArrayLen>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct MaterializedSurfacesPreflight {
+    count: usize,
+    before_bytes: u64,
+    after_bytes: u64,
+}
+
+impl<'de> Deserialize<'de> for MaterializedSurfacesPreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct MaterializedSurfacesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for MaterializedSurfacesVisitor {
+            type Value = MaterializedSurfacesPreflight;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a materialized surfaces array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut surfaces = MaterializedSurfacesPreflight::default();
+                while let Some(surface) = sequence.next_element::<MaterializedSurfacePreflight>()? {
+                    surfaces.count = surfaces.count.saturating_add(1);
+                    surfaces.before_bytes = surfaces
+                        .before_bytes
+                        .saturating_add(surface.before.map_or(0, |bytes| bytes.0));
+                    surfaces.after_bytes = surfaces
+                        .after_bytes
+                        .saturating_add(surface.after.map_or(0, |bytes| bytes.0));
+                }
+                Ok(surfaces)
+            }
+        }
+
+        deserializer.deserialize_seq(MaterializedSurfacesVisitor)
+    }
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct MaterializedDiffPreflight {
+    #[serde(default)]
+    surfaces: Option<MaterializedSurfacesPreflight>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JsonSequenceLen(usize);
+
+impl<'de> Deserialize<'de> for JsonSequenceLen {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SequenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SequenceVisitor {
+            type Value = JsonSequenceLen;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut count = 0_usize;
+                while sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    count = count.saturating_add(1);
+                }
+                Ok(JsonSequenceLen(count))
+            }
+        }
+
+        deserializer.deserialize_seq(SequenceVisitor)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalDurationPreflight {
+    secs: serde::de::IgnoredAny,
+    nanos: serde::de::IgnoredAny,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalVetoPreflight {
+    duration: ProposalDurationPreflight,
+    min_visible: ProposalDurationPreflight,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ApprovalPathPreflight {
+    AutoRegression { veto: Option<ProposalVetoPreflight> },
+    FamiliarCoherence { veto: ProposalVetoPreflight },
+    HumanApproval,
+    HumanApprovalWithRationale,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ProposalClassificationPreflight {
+    #[serde(default)]
+    proposal_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    familiar_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    channel: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    affected_surfaces: Option<JsonSequenceLen>,
+    #[serde(default)]
+    affected_regions: Option<JsonSequenceLen>,
+    #[serde(default)]
+    path_tier_floor: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    approval_path: Option<ApprovalPathPreflight>,
+    #[serde(default)]
+    evidence_replay_hash: Option<JsonByteArrayLen>,
+    #[serde(default)]
+    classified_at: Option<serde::de::IgnoredAny>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ProposalBeforeImagePreflight {
+    #[serde(default)]
+    target: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    resolved: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    contents: Option<StagedContentsPreflight>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProposalBeforeImagesPreflight(ProposalContentCollection);
+
+impl<'de> Deserialize<'de> for ProposalBeforeImagesPreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BeforeImagesVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BeforeImagesVisitor {
+            type Value = ProposalBeforeImagesPreflight;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a proposal before-images array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut collection = ProposalContentCollection::default();
+                while let Some(image) = sequence.next_element::<ProposalBeforeImagePreflight>()? {
+                    let bytes = image
+                        .contents
+                        .as_ref()
+                        .map(StagedContentsPreflight::decoded_len)
+                        .transpose()
+                        .map_err(serde::de::Error::custom)?
+                        .unwrap_or(0);
+                    collection.push_len(bytes);
+                }
+                Ok(ProposalBeforeImagesPreflight(collection))
+            }
+        }
+
+        deserializer.deserialize_seq(BeforeImagesVisitor)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProbeSummaryPreflight {
+    status: serde::de::IgnoredAny,
+    passed: serde::de::IgnoredAny,
+    failed: serde::de::IgnoredAny,
+    unscored: serde::de::IgnoredAny,
+    targets: serde::de::IgnoredAny,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
+struct ProposalDecisionStatePreflight {
+    #[serde(default)]
+    decision: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    before_images: Option<ProposalBeforeImagesPreflight>,
+    #[serde(default)]
+    recovery_commitment: Option<JsonByteArrayLen>,
+    #[serde(default)]
+    weave_hash: Option<JsonByteArrayLen>,
+    #[serde(default)]
+    rationale: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    probe_summary: Option<ProbeSummaryPreflight>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RegionEvidenceItemPreflight {
+    #[serde(default)]
+    region_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    affected_surfaces: Option<JsonSequenceLen>,
+    #[serde(default)]
+    min_path_tier: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    replay_bytes: Option<JsonByteArrayLen>,
+    #[serde(default)]
+    rationale: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RegionEvidencePreflight {
+    collection: ProposalContentCollection,
+    max_affected_surfaces: usize,
+}
+
+impl<'de> Deserialize<'de> for RegionEvidencePreflight {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RegionEvidenceVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RegionEvidenceVisitor {
+            type Value = RegionEvidencePreflight;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a region evidence array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut collection = ProposalContentCollection::default();
+                let mut max_affected_surfaces = 0;
+                while let Some(evidence) = sequence.next_element::<RegionEvidenceItemPreflight>()? {
+                    collection.push_len(evidence.replay_bytes.map_or(0, |bytes| bytes.0));
+                    max_affected_surfaces = max_affected_surfaces
+                        .max(evidence.affected_surfaces.map_or(0, |surfaces| surfaces.0));
+                }
+                Ok(RegionEvidencePreflight {
+                    collection,
+                    max_affected_surfaces,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(RegionEvidenceVisitor)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+enum ProposalLifecyclePreflight {
+    AwaitingHumanApproval,
+    VetoWindowOpen,
+    ReadyForReplay,
+    Blocked { reason: serde::de::IgnoredAny },
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProposalDecisionRequestPreflight {
+    decision: serde::de::IgnoredAny,
+    rationale: Option<serde::de::IgnoredAny>,
+    claimed_at: serde::de::IgnoredAny,
+    #[serde(default)]
+    expected_revision: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    revision_required: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    expired: Option<serde::de::IgnoredAny>,
+}
+
+#[allow(dead_code)]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ProposalEnvelopePreflight {
+    #[serde(default)]
+    schema: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pending: Option<PendingProposalPreflight>,
+    #[serde(default)]
+    edits: Option<PendingEditsPreflight>,
+    #[serde(default)]
+    id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    familiar_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    writer: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    channel: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    thread_id: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    fray: Option<FrayOrSnapPreflight>,
+    #[serde(default)]
+    staged_at: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    materialized_diff: Option<MaterializedDiffPreflight>,
+    #[serde(default)]
+    classification: Option<ProposalClassificationPreflight>,
+    #[serde(default)]
+    region_evidence: Option<RegionEvidencePreflight>,
+    #[serde(default)]
+    lifecycle: Option<ProposalLifecyclePreflight>,
+    #[serde(default)]
+    veto_deadline: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    earliest_close: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "reviewKind", default)]
+    review_kind: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    probes: Option<serde::de::IgnoredAny>,
+    #[serde(rename = "decisionRequest", default)]
+    decision_request: Option<ProposalDecisionRequestPreflight>,
+    #[serde(rename = "decisionState", default)]
+    decision_state: Option<ProposalDecisionStatePreflight>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProposalJsonStructureLimits {
+    max_depth: usize,
+    max_object_fields: usize,
+    max_generic_array_items: usize,
+    max_probe_reports: usize,
+    max_probe_results: usize,
+    max_key_bytes: usize,
+    max_metadata_string_bytes: usize,
+    max_content_string_bytes: usize,
+    max_estimated_heap_bytes: u64,
+}
+
+const WARD_PROPOSAL_JSON_STRUCTURE_LIMITS: ProposalJsonStructureLimits =
+    ProposalJsonStructureLimits {
+        max_depth: PROPOSAL_JSON_MAX_DEPTH,
+        max_object_fields: PROPOSAL_JSON_MAX_OBJECT_FIELDS,
+        max_generic_array_items: PROPOSAL_JSON_MAX_GENERIC_ARRAY_ITEMS,
+        max_probe_reports: ward::WARD_EDIT_MAX_COUNT,
+        max_probe_results: PROPOSAL_JSON_MAX_PROBE_RESULTS,
+        max_key_bytes: PROPOSAL_JSON_MAX_KEY_BYTES,
+        max_metadata_string_bytes: PROPOSAL_JSON_MAX_METADATA_STRING_BYTES,
+        max_content_string_bytes: PROPOSAL_ENVELOPE_MAX_BYTES as usize,
+        max_estimated_heap_bytes: PROPOSAL_JSON_MAX_ESTIMATED_HEAP_BYTES,
+    };
+
+#[derive(Debug, Clone, Copy)]
+enum ProposalJsonValueContext {
+    Root,
+    Field(ProposalJsonField),
+    ArrayItem(ProposalJsonField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProposalJsonField {
+    ContentData,
+    ByteArray,
+    Edits,
+    MaterializedSurfaces,
+    BeforeImages,
+    AffectedSurfaces,
+    AffectedRegions,
+    RegionEvidence,
+    Probes,
+    ProbeResults,
+    Generic,
+}
+
+struct ProposalJsonStructureScanner<'a> {
+    raw: &'a [u8],
+    offset: usize,
+    estimated_heap_bytes: u64,
+    limits: ProposalJsonStructureLimits,
+}
+
+impl ProposalJsonField {
+    fn for_key(key: &str) -> Self {
+        match key {
+            "data" => Self::ContentData,
+            "before"
+            | "after"
+            | "replay_bytes"
+            | "evidence_replay_hash"
+            | "recoveryCommitment"
+            | "weaveHash" => Self::ByteArray,
+            "edits" => Self::Edits,
+            "surfaces" => Self::MaterializedSurfaces,
+            "beforeImages" => Self::BeforeImages,
+            "affected_surfaces" => Self::AffectedSurfaces,
+            "affected_regions" => Self::AffectedRegions,
+            "region_evidence" => Self::RegionEvidence,
+            "probes" => Self::Probes,
+            "results" => Self::ProbeResults,
+            _ => Self::Generic,
+        }
+    }
+}
+
+fn proposal_json_object_key_allowed(context: ProposalJsonValueContext, key: &str) -> bool {
+    match context {
+        ProposalJsonValueContext::Root => [
+            "schema",
+            "pending",
+            "classification",
+            "materialized_diff",
+            "region_evidence",
+            "lifecycle",
+            "veto_deadline",
+            "earliest_close",
+            "id",
+            "familiar_id",
+            "writer",
+            "channel",
+            "thread_id",
+            "fray",
+            "edits",
+            "staged_at",
+            "reviewKind",
+            "probes",
+            "decisionRequest",
+            "decisionState",
+        ]
+        .contains(&key),
+        ProposalJsonValueContext::ArrayItem(ProposalJsonField::Probes) => [
+            "target",
+            "surface",
+            "baselineSha256",
+            "proposedSha256",
+            "status",
+            "error",
+            "results",
+        ]
+        .contains(&key),
+        ProposalJsonValueContext::ArrayItem(ProposalJsonField::ProbeResults) => [
+            "id",
+            "configuredSurface",
+            "configurationSha256",
+            "status",
+            "summary",
+            "detail",
+        ]
+        .contains(&key),
+        _ => true,
+    }
+}
+
+impl ProposalJsonStructureScanner<'_> {
+    fn error(&self, message: impl Into<String>) -> anyhow::Error {
+        serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message.into(),
+        ))
+        .into()
+    }
+
+    fn charge_heap(&mut self, bytes: u64) -> Result<()> {
+        self.estimated_heap_bytes = self.estimated_heap_bytes.saturating_add(bytes);
+        if self.estimated_heap_bytes > self.limits.max_estimated_heap_bytes {
+            return Err(self.error(format!(
+                "proposal JSON estimated heap exceeds {} bytes",
+                self.limits.max_estimated_heap_bytes
+            )));
+        }
+        Ok(())
+    }
+
+    fn skip_whitespace(&mut self) {
+        while self
+            .raw
+            .get(self.offset)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.offset += 1;
+        }
+    }
+
+    fn parse(mut self) -> Result<()> {
+        self.skip_whitespace();
+        self.parse_value(0, ProposalJsonValueContext::Root)?;
+        self.skip_whitespace();
+        if self.offset != self.raw.len() {
+            return Err(self.error("proposal JSON has trailing data"));
+        }
+        Ok(())
+    }
+
+    fn parse_value(&mut self, depth: usize, context: ProposalJsonValueContext) -> Result<()> {
+        if depth > self.limits.max_depth {
+            return Err(self.error(format!(
+                "proposal JSON nesting depth exceeds {}",
+                self.limits.max_depth
+            )));
+        }
+        self.skip_whitespace();
+        match self.raw.get(self.offset).copied() {
+            Some(b'{') => self.parse_object(depth, context),
+            Some(b'[') => self.parse_array(depth, context),
+            Some(b'"') => {
+                let field = match context {
+                    ProposalJsonValueContext::Field(field)
+                    | ProposalJsonValueContext::ArrayItem(field) => field,
+                    ProposalJsonValueContext::Root => ProposalJsonField::Generic,
+                };
+                let max = if field == ProposalJsonField::ContentData {
+                    self.limits.max_content_string_bytes
+                } else {
+                    self.limits.max_metadata_string_bytes
+                };
+                let len = self.parse_string(max, false)?;
+                self.charge_heap(u64::try_from(len).unwrap_or(u64::MAX))
+            }
+            Some(b't') => self.parse_literal(b"true"),
+            Some(b'f') => self.parse_literal(b"false"),
+            Some(b'n') => self.parse_literal(b"null"),
+            Some(b'-' | b'0'..=b'9') => self.parse_number(context),
+            Some(byte) => Err(self.error(format!(
+                "proposal JSON contains unexpected byte 0x{byte:02x}"
+            ))),
+            None => Err(self.error("proposal JSON ended before a value")),
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize, context: ProposalJsonValueContext) -> Result<()> {
+        self.offset += 1;
+        self.charge_heap(32)?;
+        self.skip_whitespace();
+        if self.raw.get(self.offset) == Some(&b'}') {
+            self.offset += 1;
+            return Ok(());
+        }
+        let mut fields = 0_usize;
+        loop {
+            self.skip_whitespace();
+            let key_start = self.offset;
+            let key_len = self.parse_string(self.limits.max_key_bytes, true)?;
+            let key: String = serde_json::from_slice(&self.raw[key_start..self.offset])
+                .map_err(anyhow::Error::from)?;
+            if !proposal_json_object_key_allowed(context, &key) {
+                return Err(self.error(format!(
+                    "proposal JSON object contains unknown field `{key}`"
+                )));
+            }
+            fields = fields.saturating_add(1);
+            if fields > self.limits.max_object_fields {
+                return Err(self.error(format!(
+                    "proposal JSON object contains more than {} fields",
+                    self.limits.max_object_fields
+                )));
+            }
+            self.charge_heap(
+                u64::try_from(key_len)
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(48),
+            )?;
+            self.skip_whitespace();
+            if self.raw.get(self.offset) != Some(&b':') {
+                return Err(self.error("proposal JSON object field is missing `:`"));
+            }
+            self.offset += 1;
+            self.parse_value(
+                depth.saturating_add(1),
+                ProposalJsonValueContext::Field(ProposalJsonField::for_key(&key)),
+            )?;
+            self.skip_whitespace();
+            match self.raw.get(self.offset) {
+                Some(b',') => self.offset += 1,
+                Some(b'}') => {
+                    self.offset += 1;
+                    return Ok(());
+                }
+                _ => return Err(self.error("proposal JSON object is missing `,` or closing `}`")),
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize, context: ProposalJsonValueContext) -> Result<()> {
+        self.offset += 1;
+        self.charge_heap(24)?;
+        self.skip_whitespace();
+        if self.raw.get(self.offset) == Some(&b']') {
+            self.offset += 1;
+            return Ok(());
+        }
+        let field = match context {
+            ProposalJsonValueContext::Field(field) | ProposalJsonValueContext::ArrayItem(field) => {
+                field
+            }
+            ProposalJsonValueContext::Root => ProposalJsonField::Generic,
+        };
+        let max_items = match field {
+            ProposalJsonField::ByteArray => {
+                usize::try_from(ward::WARD_RETAINED_CONTENT_MAX_BYTES.saturating_mul(2))
+                    .unwrap_or(usize::MAX)
+            }
+            ProposalJsonField::BeforeImages
+            | ProposalJsonField::AffectedSurfaces
+            | ProposalJsonField::AffectedRegions
+            | ProposalJsonField::RegionEvidence => ward::WARD_EDIT_MAX_COUNT,
+            ProposalJsonField::Edits | ProposalJsonField::MaterializedSurfaces => {
+                self.limits.max_generic_array_items
+            }
+            ProposalJsonField::Probes => self.limits.max_probe_reports,
+            ProposalJsonField::ProbeResults => self.limits.max_probe_results,
+            ProposalJsonField::ContentData | ProposalJsonField::Generic => {
+                self.limits.max_generic_array_items
+            }
+        };
+        let mut items = 0_usize;
+        loop {
+            items = items.saturating_add(1);
+            if items > max_items {
+                let label = match field {
+                    ProposalJsonField::Probes => "probes",
+                    ProposalJsonField::ProbeResults => "probe results",
+                    ProposalJsonField::Edits => "edits",
+                    ProposalJsonField::MaterializedSurfaces => "materialized surfaces",
+                    ProposalJsonField::BeforeImages => "before images",
+                    ProposalJsonField::AffectedSurfaces => "affected surfaces",
+                    ProposalJsonField::AffectedRegions => "affected regions",
+                    ProposalJsonField::RegionEvidence => "region evidence",
+                    ProposalJsonField::ByteArray => "byte array",
+                    ProposalJsonField::ContentData | ProposalJsonField::Generic => "array",
+                };
+                return Err(self.error(format!(
+                    "proposal JSON {label} contains more than {max_items} items"
+                )));
+            }
+            self.charge_heap(if field == ProposalJsonField::ByteArray {
+                1
+            } else {
+                24
+            })?;
+            self.parse_value(
+                depth.saturating_add(1),
+                ProposalJsonValueContext::ArrayItem(field),
+            )?;
+            self.skip_whitespace();
+            match self.raw.get(self.offset) {
+                Some(b',') => self.offset += 1,
+                Some(b']') => {
+                    self.offset += 1;
+                    return Ok(());
+                }
+                _ => return Err(self.error("proposal JSON array is missing `,` or closing `]`")),
+            }
+        }
+    }
+
+    fn parse_string(&mut self, max_bytes: usize, key: bool) -> Result<usize> {
+        if self.raw.get(self.offset) != Some(&b'"') {
+            return Err(self.error("proposal JSON object key is not a string"));
+        }
+        self.offset += 1;
+        let content_start = self.offset;
+        loop {
+            let Some(byte) = self.raw.get(self.offset).copied() else {
+                return Err(self.error("proposal JSON contains an unterminated string"));
+            };
+            match byte {
+                b'"' => {
+                    let raw_bytes = self.offset.saturating_sub(content_start);
+                    self.offset += 1;
+                    if raw_bytes > max_bytes {
+                        let label = if key { "key" } else { "string" };
+                        return Err(
+                            self.error(format!("proposal JSON {label} exceeds {max_bytes} bytes"))
+                        );
+                    }
+                    return Ok(raw_bytes);
+                }
+                b'\\' => {
+                    self.offset += 1;
+                    let Some(escape) = self.raw.get(self.offset).copied() else {
+                        return Err(self.error("proposal JSON contains an incomplete escape"));
+                    };
+                    if escape == b'u' {
+                        for _ in 0..4 {
+                            self.offset += 1;
+                            if !self
+                                .raw
+                                .get(self.offset)
+                                .is_some_and(|byte| byte.is_ascii_hexdigit())
+                            {
+                                return Err(
+                                    self.error("proposal JSON contains an invalid unicode escape")
+                                );
+                            }
+                        }
+                    } else if !matches!(
+                        escape,
+                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't'
+                    ) {
+                        return Err(self.error("proposal JSON contains an invalid escape"));
+                    }
+                    self.offset += 1;
+                }
+                0x00..=0x1f => {
+                    return Err(self.error("proposal JSON string contains a control byte"))
+                }
+                _ => self.offset += 1,
+            }
+            if self.offset.saturating_sub(content_start) > max_bytes {
+                let label = if key { "key" } else { "string" };
+                return Err(self.error(format!("proposal JSON {label} exceeds {max_bytes} bytes")));
+            }
+        }
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<()> {
+        if self
+            .raw
+            .get(self.offset..self.offset.saturating_add(literal.len()))
+            != Some(literal)
+        {
+            return Err(self.error("proposal JSON contains an invalid literal"));
+        }
+        self.offset += literal.len();
+        self.charge_heap(8)
+    }
+
+    fn parse_number(&mut self, context: ProposalJsonValueContext) -> Result<()> {
+        let start = self.offset;
+        while self
+            .raw
+            .get(self.offset)
+            .is_some_and(|byte| matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
+        {
+            self.offset += 1;
+        }
+        if self.offset == start {
+            return Err(self.error("proposal JSON contains an invalid number"));
+        }
+        self.charge_heap(
+            if matches!(
+                context,
+                ProposalJsonValueContext::ArrayItem(ProposalJsonField::ByteArray)
+            ) {
+                1
+            } else {
+                16
+            },
+        )
+    }
+}
+
+fn validate_proposal_json_structure(raw: &[u8]) -> Result<()> {
+    ProposalJsonStructureScanner {
+        raw,
+        offset: 0,
+        estimated_heap_bytes: 0,
+        limits: WARD_PROPOSAL_JSON_STRUCTURE_LIMITS,
+    }
+    .parse()
+}
+
+struct PresentField<T>(Option<T>);
+
+impl<T> Default for PresentField<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<'de, T> Deserialize<'de> for PresentField<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        T::deserialize(deserializer).map(|value| Self(Some(value)))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProposalEnvelopeWire {
+    #[serde(default)]
+    schema: Option<String>,
+    #[serde(default)]
+    pending: Option<coven_threads_core::PendingProposal>,
+    #[serde(default)]
+    classification: Option<coven_threads_core::ProposalClassification>,
+    #[serde(default)]
+    materialized_diff: Option<coven_threads_core::MaterializedDiff>,
+    #[serde(default)]
+    region_evidence: Option<Vec<coven_threads_core::RegionEvidence>>,
+    #[serde(default)]
+    lifecycle: Option<crate::proposal_scheduler::ProposalLifecycle>,
+    #[serde(default)]
+    veto_deadline: PresentField<Option<time::OffsetDateTime>>,
+    #[serde(default)]
+    earliest_close: PresentField<Option<time::OffsetDateTime>>,
+    #[serde(default)]
+    id: Option<coven_threads_core::ProposalId>,
+    #[serde(default)]
+    familiar_id: Option<coven_threads_core::FamiliarId>,
+    #[serde(default)]
+    writer: Option<coven_threads_core::WriterId>,
+    #[serde(default)]
+    channel: Option<coven_threads_core::Channel>,
+    #[serde(default)]
+    thread_id: Option<coven_threads_core::ThreadId>,
+    #[serde(default)]
+    fray: Option<coven_threads_core::FrayOrSnap>,
+    #[serde(default)]
+    edits: Option<Vec<coven_threads_core::StagedEdit>>,
+    #[serde(default)]
+    staged_at: Option<time::OffsetDateTime>,
+    #[serde(rename = "reviewKind", default)]
+    review_kind: PresentField<String>,
+    #[serde(default)]
+    probes: PresentField<Box<serde_json::value::RawValue>>,
+    #[serde(rename = "decisionRequest", default)]
+    decision_request: PresentField<ProposalDecisionRequest>,
+    #[serde(rename = "decisionState", default)]
+    decision_state: PresentField<ProposalApplyingState>,
+}
+
+enum ProposalAuthority {
+    Legacy(coven_threads_core::PendingProposal),
+    Scheduled(Box<crate::proposal_scheduler::ScheduledProposal>),
+}
+
+struct ProposalEnvelopeDocument {
+    authority: ProposalAuthority,
+    review_kind: Option<String>,
+    probes: Option<Box<serde_json::value::RawValue>>,
+    decision_request: Option<ProposalDecisionRequest>,
+    decision_state: Option<ProposalApplyingState>,
+}
+
+#[derive(Serialize)]
+struct StoredLegacyProposalRef<'a> {
+    #[serde(flatten)]
+    pending: &'a coven_threads_core::PendingProposal,
+    #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
+    review_kind: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probes: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
+    decision_request: Option<&'a ProposalDecisionRequest>,
+    #[serde(rename = "decisionState", skip_serializing_if = "Option::is_none")]
+    decision_state: Option<&'a ProposalApplyingState>,
+}
+
+#[derive(Serialize)]
+struct StoredScheduledProposalRef<'a> {
+    #[serde(flatten)]
+    scheduled: &'a crate::proposal_scheduler::ScheduledProposal,
+    #[serde(rename = "reviewKind", skip_serializing_if = "Option::is_none")]
+    review_kind: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    probes: Option<&'a serde_json::value::RawValue>,
+    #[serde(rename = "decisionRequest", skip_serializing_if = "Option::is_none")]
+    decision_request: Option<&'a ProposalDecisionRequest>,
+    #[serde(rename = "decisionState", skip_serializing_if = "Option::is_none")]
+    decision_state: Option<&'a ProposalApplyingState>,
+}
+
+fn json_value_end(raw: &[u8], start: usize, depth: usize) -> Result<usize> {
+    anyhow::ensure!(
+        depth <= PROPOSAL_JSON_MAX_DEPTH,
+        "canonical proposal JSON exceeded the validated depth"
+    );
+    let mut offset = start;
+    while raw
+        .get(offset)
+        .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
+        offset += 1;
+    }
+    match raw.get(offset).copied() {
+        Some(b'"') => {
+            offset += 1;
+            loop {
+                match raw.get(offset).copied() {
+                    Some(b'"') => return Ok(offset + 1),
+                    Some(b'\\') => {
+                        offset += 2;
+                    }
+                    Some(_) => offset += 1,
+                    None => {
+                        anyhow::bail!("canonical proposal JSON contains an unterminated string")
+                    }
+                }
+            }
+        }
+        Some(b'{') => {
+            offset += 1;
+            loop {
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                if raw.get(offset) == Some(&b'}') {
+                    return Ok(offset + 1);
+                }
+                offset = json_value_end(raw, offset, depth + 1)?;
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                anyhow::ensure!(
+                    raw.get(offset) == Some(&b':'),
+                    "canonical proposal JSON object is missing `:`"
+                );
+                offset = json_value_end(raw, offset + 1, depth + 1)?;
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                match raw.get(offset) {
+                    Some(b',') => offset += 1,
+                    Some(b'}') => return Ok(offset + 1),
+                    _ => anyhow::bail!("canonical proposal JSON object is not terminated"),
+                }
+            }
+        }
+        Some(b'[') => {
+            offset += 1;
+            loop {
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                if raw.get(offset) == Some(&b']') {
+                    return Ok(offset + 1);
+                }
+                offset = json_value_end(raw, offset, depth + 1)?;
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                match raw.get(offset) {
+                    Some(b',') => offset += 1,
+                    Some(b']') => return Ok(offset + 1),
+                    _ => anyhow::bail!("canonical proposal JSON array is not terminated"),
+                }
+            }
+        }
+        Some(_) => {
+            while raw.get(offset).is_some_and(|byte| {
+                !byte.is_ascii_whitespace() && !matches!(byte, b',' | b']' | b'}')
+            }) {
+                offset += 1;
+            }
+            anyhow::ensure!(
+                offset > start,
+                "canonical proposal JSON contains an empty scalar"
+            );
+            Ok(offset)
+        }
+        None => anyhow::bail!("canonical proposal JSON ended before a value"),
+    }
+}
+
+fn hash_canonical_json(raw: &[u8], hasher: &mut Sha256, depth: usize) -> Result<()> {
+    anyhow::ensure!(
+        depth <= PROPOSAL_JSON_MAX_DEPTH,
+        "canonical proposal JSON exceeded the validated depth"
+    );
+    let start = raw
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .context("canonical proposal JSON is empty")?;
+    let end = raw
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map(|index| index + 1)
+        .context("canonical proposal JSON is empty")?;
+    let raw = &raw[start..end];
+    match raw.first().copied() {
+        Some(b'{') => {
+            let object: BTreeMap<String, &serde_json::value::RawValue> =
+                serde_json::from_slice(raw).context("parsing canonical proposal object")?;
+            hasher.update(b"{");
+            for (index, (key, value)) in object.into_iter().enumerate() {
+                if index != 0 {
+                    hasher.update(b",");
+                }
+                hasher.update(
+                    &serde_json::to_vec(&key).context("serializing canonical proposal key")?,
+                );
+                hasher.update(b":");
+                hash_canonical_json(value.get().as_bytes(), hasher, depth + 1)?;
+            }
+            hasher.update(b"}");
+        }
+        Some(b'[') => {
+            hasher.update(b"[");
+            let mut offset = 1;
+            let mut index = 0;
+            loop {
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                if raw.get(offset) == Some(&b']') {
+                    break;
+                }
+                let value_end = json_value_end(raw, offset, depth + 1)?;
+                if index != 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_json(&raw[offset..value_end], hasher, depth + 1)?;
+                index += 1;
+                offset = value_end;
+                while raw
+                    .get(offset)
+                    .is_some_and(|byte| byte.is_ascii_whitespace())
+                {
+                    offset += 1;
+                }
+                match raw.get(offset) {
+                    Some(b',') => offset += 1,
+                    Some(b']') => break,
+                    _ => anyhow::bail!("canonical proposal array is not terminated"),
+                }
+            }
+            hasher.update(b"]");
+        }
+        Some(_) => hasher.update(raw),
+        None => anyhow::bail!("canonical proposal JSON is empty"),
+    }
+    Ok(())
+}
+
+impl ProposalEnvelopeDocument {
+    fn parse_preflighted(raw: &[u8]) -> Result<Self> {
+        let wire: ProposalEnvelopeWire =
+            serde_json::from_slice(raw).context("parsing typed proposal envelope")?;
+        let scheduled_shape = wire.schema.is_some()
+            || wire.pending.is_some()
+            || wire.classification.is_some()
+            || wire.materialized_diff.is_some()
+            || wire.region_evidence.is_some()
+            || wire.lifecycle.is_some()
+            || wire.veto_deadline.0.is_some()
+            || wire.earliest_close.0.is_some();
+
+        let authority = if scheduled_shape {
+            anyhow::ensure!(
+                wire.id.is_none()
+                    && wire.familiar_id.is_none()
+                    && wire.writer.is_none()
+                    && wire.channel.is_none()
+                    && wire.thread_id.is_none()
+                    && wire.fray.is_none()
+                    && wire.edits.is_none(),
+                "scheduled proposal mixes legacy authority fields"
+            );
+            ProposalAuthority::Scheduled(Box::new(
+                crate::proposal_scheduler::ScheduledProposal::from_persisted_parts(
+                    wire.schema
+                        .as_deref()
+                        .context("scheduled proposal is missing schema")?,
+                    wire.pending
+                        .context("scheduled proposal is missing pending")?,
+                    wire.classification
+                        .context("scheduled proposal is missing classification")?,
+                    wire.materialized_diff
+                        .context("scheduled proposal is missing materialized_diff")?,
+                    wire.region_evidence
+                        .context("scheduled proposal is missing region_evidence")?,
+                    wire.lifecycle
+                        .context("scheduled proposal is missing lifecycle")?,
+                    wire.staged_at
+                        .context("scheduled proposal is missing staged_at")?,
+                    wire.veto_deadline
+                        .0
+                        .context("scheduled proposal is missing veto_deadline")?,
+                    wire.earliest_close
+                        .0
+                        .context("scheduled proposal is missing earliest_close")?,
+                )?,
+            ))
+        } else {
+            ProposalAuthority::Legacy(coven_threads_core::PendingProposal {
+                id: wire.id.context("pending proposal is missing id")?,
+                familiar_id: wire
+                    .familiar_id
+                    .context("pending proposal is missing familiar_id")?,
+                writer: wire.writer.context("pending proposal is missing writer")?,
+                channel: wire
+                    .channel
+                    .context("pending proposal is missing channel")?,
+                thread_id: wire
+                    .thread_id
+                    .context("pending proposal is missing thread_id")?,
+                fray: wire.fray.context("pending proposal is missing fray")?,
+                edits: wire.edits.context("pending proposal is missing edits")?,
+                staged_at: wire
+                    .staged_at
+                    .context("pending proposal is missing staged_at")?,
+            })
+        };
+        let review_kind = wire.review_kind.0;
+        let probes = wire.probes.0;
+        let decision_request = wire.decision_request.0;
+        let decision_state = wire.decision_state.0;
+        Ok(Self {
+            authority,
+            review_kind,
+            probes,
+            decision_request,
+            decision_state,
+        })
+    }
+
+    fn pending(&self) -> &coven_threads_core::PendingProposal {
+        match &self.authority {
+            ProposalAuthority::Legacy(pending) => pending,
+            ProposalAuthority::Scheduled(scheduled) => scheduled.pending(),
+        }
+    }
+
+    fn scheduled(&self) -> Option<&crate::proposal_scheduler::ScheduledProposal> {
+        match &self.authority {
+            ProposalAuthority::Legacy(_) => None,
+            ProposalAuthority::Scheduled(scheduled) => Some(scheduled),
+        }
+    }
+
+    fn serialize_with_decision(
+        &self,
+        decision_request: Option<&ProposalDecisionRequest>,
+        decision_state: Option<&ProposalApplyingState>,
+    ) -> Result<Vec<u8>> {
+        let bytes = match &self.authority {
+            ProposalAuthority::Legacy(pending) => serde_json::to_vec(&StoredLegacyProposalRef {
+                pending,
+                review_kind: self.review_kind.as_ref(),
+                probes: self.probes.as_deref(),
+                decision_request,
+                decision_state,
+            }),
+            ProposalAuthority::Scheduled(scheduled) => {
+                serde_json::to_vec(&StoredScheduledProposalRef {
+                    scheduled,
+                    review_kind: self.review_kind.as_ref(),
+                    probes: self.probes.as_deref(),
+                    decision_request,
+                    decision_state,
+                })
+            }
+        }
+        .context("serializing proposal envelope")?;
+        let attempted_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        if attempted_bytes > PROPOSAL_ENVELOPE_MAX_BYTES {
+            return Err(ward::WardEditBudgetFailure::ProposalEnvelopeBytes {
+                attempted_bytes,
+                max_bytes: PROPOSAL_ENVELOPE_MAX_BYTES,
+            }
+            .into());
+        }
+        Ok(bytes)
+    }
+
+    fn authority_bytes(&self) -> Result<Vec<u8>> {
+        self.serialize_with_decision(None, None)
+    }
+
+    fn revision(&self) -> Result<String> {
+        let authority = self.authority_bytes()?;
+        let mut digest = Sha256::new();
+        hash_canonical_json(&authority, &mut digest, 0)?;
+        let digest = digest.finalize();
+        Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    }
+}
+
+#[cfg(test)]
+fn parse_proposal_envelope(raw: &[u8]) -> Result<ProposalEnvelopeDocument> {
+    validate_proposal_envelope_preflight(raw)?;
+    ProposalEnvelopeDocument::parse_preflighted(raw)
+}
+
+fn validate_proposal_collection(
+    collection: ProposalContentCollection,
+    limits: ProposalEnvelopeLimits,
+) -> Result<()> {
+    if collection.count > limits.max_edits {
+        return Err(ward::WardEditBudgetFailure::BatchEditCount {
+            attempted_edits: collection.count,
+            max_edits: limits.max_edits,
+        }
+        .into());
+    }
+    if collection.bytes == u64::MAX || collection.bytes > limits.max_content_bytes {
+        return Err(ward::WardEditBudgetFailure::BatchRetainedMemory {
+            attempted_bytes: collection.bytes,
+            max_bytes: limits.max_content_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_combined_proposal_bytes(
+    proposed_bytes: u64,
+    before_bytes: u64,
+    limits: ProposalEnvelopeLimits,
+) -> Result<()> {
+    let Some(attempted_bytes) = proposed_bytes.checked_add(before_bytes) else {
+        return Err(ward::WardEditBudgetFailure::BatchRetainedMemory {
+            attempted_bytes: u64::MAX,
+            max_bytes: limits.max_content_bytes,
+        }
+        .into());
+    };
+    if attempted_bytes > limits.max_content_bytes {
+        return Err(ward::WardEditBudgetFailure::BatchRetainedMemory {
+            attempted_bytes,
+            max_bytes: limits.max_content_bytes,
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn validate_proposal_envelope_preflight_with_limits(
+    raw: &[u8],
+    limits: ProposalEnvelopeLimits,
+) -> Result<ward::WardEditBudget> {
+    validate_proposal_json_structure(raw)?;
+    let envelope: ProposalEnvelopePreflight =
+        serde_json::from_slice(raw).context("preflighting proposal envelope")?;
+    let nested_edits = envelope.pending.and_then(|pending| pending.edits);
+    if let Some(edits) = nested_edits {
+        validate_proposal_collection(edits.0, limits)?;
+    }
+    if let Some(edits) = envelope.edits {
+        validate_proposal_collection(edits.0, limits)?;
+    }
+    let pending = nested_edits
+        .or(envelope.edits)
+        .context("proposal envelope is missing pending edits")?;
+
+    let materialized = envelope.materialized_diff.and_then(|diff| diff.surfaces);
+    if let Some(surfaces) = materialized {
+        validate_proposal_collection(
+            ProposalContentCollection {
+                count: surfaces.count,
+                bytes: surfaces.after_bytes,
+            },
+            limits,
+        )?;
+        validate_proposal_collection(
+            ProposalContentCollection {
+                count: surfaces.count,
+                bytes: surfaces.before_bytes,
+            },
+            limits,
+        )?;
+        validate_combined_proposal_bytes(pending.0.bytes, surfaces.before_bytes, limits)?;
+    }
+
+    let before_images = envelope
+        .decision_state
+        .as_ref()
+        .and_then(|state| state.before_images);
+    if let Some(before_images) = before_images {
+        validate_proposal_collection(before_images.0, limits)?;
+        validate_combined_proposal_bytes(pending.0.bytes, before_images.0.bytes, limits)?;
+    }
+    if let Some(state) = envelope.decision_state {
+        for bytes in [state.recovery_commitment, state.weave_hash]
+            .into_iter()
+            .flatten()
+        {
+            validate_proposal_collection(
+                ProposalContentCollection {
+                    count: 1,
+                    bytes: bytes.0,
+                },
+                limits,
+            )?;
+        }
+    }
+    if let Some(classification) = envelope.classification {
+        for count in [
+            classification.affected_surfaces,
+            classification.affected_regions,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            validate_proposal_collection(
+                ProposalContentCollection {
+                    count: count.0,
+                    bytes: 0,
+                },
+                limits,
+            )?;
+        }
+        if let Some(bytes) = classification.evidence_replay_hash {
+            validate_proposal_collection(
+                ProposalContentCollection {
+                    count: 1,
+                    bytes: bytes.0,
+                },
+                limits,
+            )?;
+        }
+    }
+    if let Some(evidence) = envelope.region_evidence {
+        validate_proposal_collection(evidence.collection, limits)?;
+        validate_proposal_collection(
+            ProposalContentCollection {
+                count: evidence.max_affected_surfaces,
+                bytes: 0,
+            },
+            limits,
+        )?;
+    }
+
+    let mut budget = ward::WardEditBudget::for_edit_count(pending.0.count)?;
+    budget.reserve_retained_content(pending.0.bytes)?;
+    if let Some(before_images) = before_images {
+        budget.reserve_retained_content(before_images.0.bytes)?;
+    } else if let Some(surfaces) = materialized {
+        budget.reserve_retained_content(surfaces.before_bytes)?;
+    }
+    Ok(budget)
+}
+
+fn validate_proposal_envelope_preflight(raw: &[u8]) -> Result<ward::WardEditBudget> {
+    validate_proposal_envelope_preflight_with_limits(raw, WARD_PROPOSAL_ENVELOPE_LIMITS)
+}
+
+fn read_bounded_proposal_file(path: &Path) -> Result<Vec<u8>> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("opening proposal envelope {}", path.display()))?;
+    let observed_bytes = file
+        .metadata()
+        .with_context(|| format!("reading proposal metadata {}", path.display()))?
+        .len();
+    if observed_bytes > PROPOSAL_ENVELOPE_MAX_BYTES {
+        return Err(ward::WardEditBudgetFailure::ProposalEnvelopeBytes {
+            attempted_bytes: observed_bytes,
+            max_bytes: PROPOSAL_ENVELOPE_MAX_BYTES,
+        }
+        .into());
+    }
+    let mut raw = Vec::with_capacity(usize::try_from(observed_bytes).unwrap_or(0));
+    file.take(PROPOSAL_ENVELOPE_MAX_BYTES.saturating_add(1))
+        .read_to_end(&mut raw)
+        .with_context(|| format!("reading proposal envelope {}", path.display()))?;
+    let attempted_bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    if attempted_bytes > PROPOSAL_ENVELOPE_MAX_BYTES {
+        return Err(ward::WardEditBudgetFailure::ProposalEnvelopeBytes {
+            attempted_bytes,
+            max_bytes: PROPOSAL_ENVELOPE_MAX_BYTES,
+        }
+        .into());
+    }
+    Ok(raw)
+}
+
+fn read_and_preflight_proposal_file(path: &Path) -> Result<Vec<u8>> {
+    let raw = read_bounded_proposal_file(path)?;
+    validate_proposal_envelope_preflight(&raw)?;
+    Ok(raw)
+}
+
+#[cfg(test)]
+fn staged_contents_value_len(contents: &Value) -> Result<u64> {
+    let encoding = contents
+        .get("encoding")
+        .and_then(Value::as_str)
+        .context("staged contents are missing string encoding")?;
+    let data = contents
+        .get("data")
+        .and_then(Value::as_str)
+        .context("staged contents are missing string data")?;
+    ward::staged_contents_decoded_len(encoding, data)
+}
+
+#[cfg(test)]
+fn validate_pending_value_edit_budget(raw_value: &Value) -> Result<ward::WardEditBudget> {
+    let pending = raw_value.get("pending").unwrap_or(raw_value);
+    let edits = pending
+        .get("edits")
+        .and_then(Value::as_array)
+        .context("pending proposal edits are not an array")?;
+    let mut budget = ward::WardEditBudget::for_edit_count(edits.len())?;
+    let mut pending_after = BTreeMap::new();
+    for edit in edits {
+        let contents = edit
+            .get("contents")
+            .context("pending proposal edit is missing contents")?;
+        budget.reserve_retained_content(staged_contents_value_len(contents)?)?;
+        let surface = edit
+            .get("surface")
+            .and_then(Value::as_str)
+            .context("pending proposal edit is missing string surface")?;
+        let staged: coven_threads_core::StagedContents =
+            serde_json::from_value(contents.clone()).context("decoding pending staged contents")?;
+        let after = staged.to_bytes().map_err(anyhow::Error::msg)?;
+        if pending_after.insert(surface.to_string(), after).is_some() {
+            anyhow::bail!("pending proposal contains duplicate surface {surface}");
+        }
+    }
+
+    let mut materialized_budget = budget;
+    if let Some(surfaces) = raw_value
+        .pointer("/materialized_diff/surfaces")
+        .and_then(Value::as_array)
+    {
+        ward::WardEditBudget::for_edit_count(surfaces.len())?;
+        let mut after_budget = ward::WardEditBudget::for_edit_count(surfaces.len())?;
+        let mut materialized_after = BTreeMap::new();
+        for surface in surfaces {
+            let name = surface
+                .get("surface")
+                .and_then(Value::as_str)
+                .context("materialized surface is missing string surface")?;
+            if let Some(before) = surface.get("before").filter(|value| !value.is_null()) {
+                let before: Vec<u8> = serde_json::from_value(before.clone())
+                    .context("materialized before-image is not a byte array")?;
+                materialized_budget
+                    .reserve_retained_content(u64::try_from(before.len()).unwrap_or(u64::MAX))?;
+            }
+            let after = surface
+                .get("after")
+                .filter(|value| !value.is_null())
+                .context("materialized surface is missing after contents")?;
+            let after: Vec<u8> = serde_json::from_value(after.clone())
+                .context("materialized after-image is not a byte array")?;
+            after_budget
+                .reserve_retained_content(u64::try_from(after.len()).unwrap_or(u64::MAX))?;
+            if materialized_after.insert(name.to_string(), after).is_some() {
+                anyhow::bail!("materialized diff contains duplicate surface {name}");
+            }
+        }
+        if pending_after != materialized_after {
+            anyhow::bail!("pending edits do not match the materialized diff");
+        }
+    }
+
+    let mut recovery_budget = budget;
+    let before_images = raw_value
+        .pointer("/decisionState/beforeImages")
+        .and_then(Value::as_array);
+    if let Some(before_images) = before_images {
+        ward::WardEditBudget::for_edit_count(before_images.len())?;
+        for before in before_images {
+            if let Some(contents) = before.get("contents").filter(|value| !value.is_null()) {
+                recovery_budget.reserve_retained_content(staged_contents_value_len(contents)?)?;
+            }
+        }
+    }
+
+    if let Some(evidence) = raw_value.get("region_evidence").and_then(Value::as_array) {
+        let mut replay_budget = ward::WardEditBudget::for_edit_count(evidence.len())?;
+        for item in evidence {
+            if let Some(replay) = item.get("replay_bytes").filter(|value| !value.is_null()) {
+                let replay: Vec<u8> = serde_json::from_value(replay.clone())
+                    .context("region replay evidence is not a byte array")?;
+                replay_budget
+                    .reserve_retained_content(u64::try_from(replay.len()).unwrap_or(u64::MAX))?;
+            }
+        }
+    }
+
+    Ok(if before_images.is_some() {
+        recovery_budget
+    } else if raw_value.get("materialized_diff").is_some() {
+        materialized_budget
+    } else {
+        budget
+    })
+}
+
 pub(crate) fn decide_threads_proposal(
     coven_home: &Path,
     proposal_id: &str,
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, true)
+    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, true, false)
 }
 
 fn decide_threads_proposal_automatic(
@@ -6258,7 +9270,129 @@ fn decide_threads_proposal_automatic(
     decision: &str,
     body: Option<&str>,
 ) -> Result<ApiResponse> {
-    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false)
+    decide_threads_proposal_inner(coven_home, proposal_id, decision, body, false, false)
+}
+
+fn expire_threads_proposal(coven_home: &Path, proposal_id: &str) -> Result<ApiResponse> {
+    decide_threads_proposal_inner(coven_home, proposal_id, "reject", None, false, true)
+}
+
+fn proposal_retention_expired(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+    now: time::OffsetDateTime,
+) -> bool {
+    document
+        .pending()
+        .staged_at
+        .checked_add(time::Duration::days(
+            crate::proposal_store::PENDING_PROPOSAL_RETENTION_DAYS,
+        ))
+        .is_some_and(|deadline| now >= deadline)
+        && proposal_recovery_is_proven_unapplied(coven_home, conn, document)
+}
+
+fn proposal_recovery_is_proven_unapplied(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> bool {
+    let Some(applying) = document.decision_state.as_ref() else {
+        return true;
+    };
+    if applying.decision != "approve" {
+        return false;
+    }
+    let pending = document.pending();
+    let Some(familiar_id) = human_familiar_id_for_weave(coven_home, pending.familiar_id)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+    let Some(config) = ward::WardConfig::load(&workspace).ok().flatten() else {
+        return false;
+    };
+    let proposal_id = pending.id.0.to_string();
+    if load_proposal_apply_intent(conn, &proposal_id)
+        .ok()
+        .flatten()
+        .as_ref()
+        != Some(applying)
+    {
+        return false;
+    }
+    let targets: Vec<String> = pending
+        .edits
+        .iter()
+        .map(|edit| edit.surface.as_str().to_string())
+        .collect();
+    let Ok(commitment) =
+        proposal_recovery_commitment(conn, &config, document, &familiar_id, &targets)
+    else {
+        return false;
+    };
+    if commitment != applying.recovery_commitment {
+        return false;
+    }
+    if applying.before_images.len() != pending.edits.len() {
+        return false;
+    }
+    let mut observed = BTreeSet::new();
+    for before in &applying.before_images {
+        if !observed.insert(before.target.as_str()) {
+            return false;
+        }
+        let Some(resolved) = before.resolved.as_deref() else {
+            return false;
+        };
+        if !pending
+            .edits
+            .iter()
+            .any(|edit| edit.surface.as_str() == before.target)
+        {
+            return false;
+        }
+        let Ok(current) = crate::threads_gate::read_surface_if_exists(&workspace, resolved) else {
+            return false;
+        };
+        let before = match before.contents.as_ref() {
+            Some(contents) => match contents.to_bytes() {
+                Ok(contents) => Some(contents),
+                Err(_) => return false,
+            },
+            None => None,
+        };
+        if current != before {
+            return false;
+        }
+    }
+    true
+}
+
+fn proposal_requires_terminal_expiry(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    proposal_id: Uuid,
+    now: time::OffsetDateTime,
+) -> bool {
+    let path = find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
+        .map(|(path, _)| path)
+        .or_else(|| {
+            find_pending_proposal(coven_home, proposal_id)
+                .ok()
+                .flatten()
+        });
+    let Some(path) = path else {
+        return false;
+    };
+    let Ok(raw) = read_pending_proposal_file(&path) else {
+        return false;
+    };
+    ProposalEnvelopeDocument::parse_preflighted(&raw)
+        .is_ok_and(|document| proposal_retention_expired(coven_home, conn, &document, now))
 }
 
 fn decide_threads_proposal_inner(
@@ -6267,10 +9401,12 @@ fn decide_threads_proposal_inner(
     decision: &str,
     body: Option<&str>,
     revision_required: bool,
+    expired: bool,
 ) -> Result<ApiResponse> {
-    let _decision_guard = proposal_decision_lock()
+    maybe_probe_proposal_write_lock(coven_home, proposal_id);
+    let _decision_guard = ward_write_audit_lock()
         .lock()
-        .map_err(|_| anyhow::anyhow!("proposal decision lock poisoned"))?;
+        .map_err(|_| anyhow::anyhow!("Ward write/audit lock is poisoned"))?;
     let proposal_uuid = match Uuid::parse_str(proposal_id) {
         Ok(uuid) => uuid,
         Err(_) => {
@@ -6303,7 +9439,8 @@ fn decide_threads_proposal_inner(
             )
         }
     };
-    let conn = store::open_store(&store_path(coven_home))?;
+    let proposal_store_path = store_path(coven_home);
+    let conn = store::open_store(&proposal_store_path)?;
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
         let matches_request = matches!(
             (decision, terminal.event_type.as_str()),
@@ -6333,62 +9470,180 @@ fn decide_threads_proposal_inner(
             }),
         );
     }
-    let mut claim = match PendingDecisionClaim::acquire(
-        coven_home,
-        proposal_uuid,
-        decision,
-        note.as_deref(),
-        expected_revision.as_deref(),
-        revision_required,
-    ) {
-        Ok(Some(claim)) => claim,
-        Ok(None) => {
-            return json_response(
-                404,
-                &json!({ "blocked": true, "why": "proposal-not-found" }),
-            )
+    let mut effective_decision = decision;
+    let mut effective_expired = expired;
+    if !effective_expired
+        && proposal_requires_terminal_expiry(
+            coven_home,
+            &conn,
+            proposal_uuid,
+            time::OffsetDateTime::now_utc(),
+        )
+    {
+        effective_decision = "reject";
+        effective_expired = true;
+    }
+    let (mut audit_reservation, mut claim) = loop {
+        let write_applied_if_capacity_blocked =
+            if find_any_pending_decision_claim(coven_home, proposal_id).is_some() {
+                None
+            } else {
+                Some(false)
+            };
+        let reservation_decision = proposal_reservation_decision(
+            &conn,
+            proposal_id,
+            effective_decision,
+            effective_expired,
+        )?;
+        let reservation_bytes =
+            proposal_decision_audit_reservation_bytes(&conn, effective_decision)?;
+        let audit_reservation = match store::WardAuditReservation::acquire(
+            &conn,
+            &proposal_store_path,
+            format!("proposal:{proposal_id}:{reservation_decision}"),
+            if effective_decision == "reject" {
+                "proposal-rejection"
+            } else {
+                "proposal-approval"
+            },
+            reservation_bytes,
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) if store::ward_audit_capacity_failure(&error).is_some() => {
+                let limit = store::ward_audit_capacity_failure(&error)
+                    .expect("guard established a typed Ward audit capacity failure");
+                return ward_audit_capacity_exceeded_response(
+                    limit,
+                    write_applied_if_capacity_blocked,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        let claim = match PendingDecisionClaim::acquire(
+            coven_home,
+            proposal_uuid,
+            PendingDecisionClaimRequest {
+                audit_conn: &conn,
+                decision: effective_decision,
+                rationale: note.as_deref(),
+                expected_revision: expected_revision.as_deref(),
+                revision_required,
+                expired: effective_expired,
+            },
+        ) {
+            Ok(Some(claim)) => claim,
+            Ok(None) => {
+                audit_reservation.release_if_unneeded()?;
+                return json_response(
+                    404,
+                    &json!({ "blocked": true, "why": "proposal-not-found" }),
+                );
+            }
+            Err(error)
+                if !effective_expired
+                    && error.downcast_ref::<ProposalExpiredBeforeClaim>().is_some() =>
+            {
+                audit_reservation.release_if_unneeded()?;
+                effective_decision = "reject";
+                effective_expired = true;
+                continue;
+            }
+            Err(error) if ward::ward_edit_budget_failure(&error).is_some() => {
+                let limit = ward::ward_edit_budget_failure(&error)
+                    .expect("guard established a typed Ward edit-budget failure");
+                audit_reservation.release_if_unneeded()?;
+                return ward_apply_too_large_response(limit);
+            }
+            Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
+                let limit = crate::proposal_store::quota_failure(&error)
+                    .expect("guard established a typed pending proposal quota failure");
+                audit_reservation.release_if_unneeded()?;
+                return proposal_quota_exceeded_response(limit);
+            }
+            Err(error)
+                if error
+                    .chain()
+                    .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some()) =>
+            {
+                audit_reservation.release_if_unneeded()?;
+                return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
+            }
+            Err(error) if error.to_string().contains("already claimed") => {
+                audit_reservation.release_if_unneeded()?;
+                return json_response(
+                    409,
+                    &json!({ "blocked": true, "why": "proposal-decision-in-progress" }),
+                );
+            }
+            Err(error) if error.downcast_ref::<ProposalRevisionMismatch>().is_some() => {
+                audit_reservation.release_if_unneeded()?;
+                return json_response(
+                    409,
+                    &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
+                );
+            }
+            Err(error) => return Err(error),
+        };
+        break (audit_reservation, claim);
+    };
+    let decision = effective_decision;
+    let expired = effective_expired;
+    if claim.recovery {
+        claim.preserve();
+        audit_reservation.preserve_if_unfinished();
+    }
+    let raw = match read_pending_proposal_file(&claim.path) {
+        Ok(raw) => raw,
+        Err(error) if ward::ward_edit_budget_failure(&error).is_some() => {
+            let limit = ward::ward_edit_budget_failure(&error)
+                .expect("guard established a typed Ward proposal limit");
+            audit_reservation.release_if_unneeded()?;
+            return ward_apply_too_large_response(limit);
+        }
+        Err(error) if crate::proposal_store::quota_failure(&error).is_some() => {
+            let limit = crate::proposal_store::quota_failure(&error)
+                .expect("guard established a typed pending proposal quota failure");
+            audit_reservation.release_if_unneeded()?;
+            return proposal_quota_exceeded_response(limit);
         }
         Err(error)
             if error
                 .chain()
                 .any(|cause| cause.downcast_ref::<serde_json::Error>().is_some()) =>
         {
-            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
+            audit_reservation.release_if_unneeded()?;
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
         }
-        Err(error) if error.to_string().contains("already claimed") => {
-            return json_response(
-                409,
-                &json!({ "blocked": true, "why": "proposal-decision-in-progress" }),
-            )
-        }
-        Err(error) if error.downcast_ref::<ProposalRevisionMismatch>().is_some() => {
-            return json_response(
-                409,
-                &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
-            )
-        }
-        Err(error) => return Err(error),
-    };
-    if claim.recovery {
-        claim.preserve();
-    }
-    let raw = fs::read_to_string(&claim.path)
-        .with_context(|| format!("reading proposal decision claim {}", claim.path.display()))?;
-    let mut raw_value: Value = match serde_json::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => {
-            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("reading proposal decision claim {}", claim.path.display())
+            })
         }
     };
-    let Some(review_kind) = PendingReviewKind::from_pending_value(&raw_value) else {
-        if raw_value.get("decisionState").is_some() {
+    let mut document = match ProposalEnvelopeDocument::parse_preflighted(&raw) {
+        Ok(document) => document,
+        Err(error) => {
+            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                audit_reservation.release_if_unneeded()?;
+                return ward_apply_too_large_response(limit);
+            }
+            audit_reservation.release_if_unneeded()?;
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
+        }
+    };
+    drop(raw);
+    let Some(review_kind) = PendingReviewKind::from_stored_value(document.review_kind.as_deref())
+    else {
+        if document.decision_state.is_some() {
             claim.preserve();
         } else {
-            claim.restore_pending(&mut raw_value)?;
+            claim.restore_pending(&document)?;
         }
+        audit_reservation.release_if_unneeded()?;
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     };
-    let durable_request = proposal_decision_request(&raw_value)?;
+    let durable_request = document.decision_request.take();
     maybe_fail_proposal_decision(
         ProposalDecisionFailpoint::ClaimBeforeValidation,
         proposal_id,
@@ -6397,96 +9652,112 @@ fn decide_threads_proposal_inner(
         .as_ref()
         .is_some_and(|request| request.decision != decision)
     {
+        audit_reservation.release_if_unneeded()?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-decision-conflict" }),
         );
     }
+    let request_is_expiry = expired
+        || durable_request
+            .as_ref()
+            .is_some_and(|request| request.expired);
     if let Some(request) = durable_request.as_ref() {
-        if note.is_some() && note != request.rationale {
+        if !request_is_expiry && note.is_some() && note != request.rationale {
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
             );
         }
-        if expected_revision.is_some() && expected_revision != request.expected_revision {
+        if !request_is_expiry
+            && expected_revision.is_some()
+            && expected_revision != request.expected_revision
+        {
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
             );
         }
     }
+    let expired = durable_request
+        .as_ref()
+        .map(|request| request.expired)
+        .unwrap_or(expired);
     let note = durable_request
         .as_ref()
         .map(|request| request.rationale.clone())
         .unwrap_or(note);
-    let applying_state = proposal_applying_state(&raw_value)?;
+    let applying_state = document.decision_state.take();
     if applying_state.is_some() {
         claim.preserve();
     }
-    let mut authority_value = raw_value.clone();
-    if let Some(object) = authority_value.as_object_mut() {
-        object.remove("decisionState");
-        object.remove("decisionRequest");
-    }
-    let phase5_shape = is_phase5_proposal_shape(&authority_value);
-    let actual_revision = proposal_revision(&authority_value)?;
+    let phase5_shape = document.scheduled().is_some();
+    let actual_revision = document.revision()?;
     if let Some(request) = durable_request.as_ref() {
-        if request
-            .expected_revision
-            .as_ref()
-            .is_some_and(|expected| expected != &actual_revision)
+        if !request.expired
+            && request
+                .expected_revision
+                .as_ref()
+                .is_some_and(|expected| expected != &actual_revision)
         {
             if applying_state.is_none() {
-                claim.restore_pending(&mut raw_value)?;
+                claim.restore_pending(&document)?;
             }
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-revision-mismatch" }),
             );
         }
-        if phase5_shape && request.revision_required && request.expected_revision.is_none() {
+        if !request.expired
+            && phase5_shape
+            && request.revision_required
+            && request.expected_revision.is_none()
+        {
             if applying_state.is_none() {
-                claim.restore_pending(&mut raw_value)?;
+                claim.restore_pending(&document)?;
             }
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-revision-required" }),
             );
         }
     }
-    let scheduled = if phase5_shape {
-        match serde_json::from_value::<crate::proposal_scheduler::ScheduledProposal>(
-            authority_value.clone(),
-        ) {
-            Ok(scheduled) => Some(scheduled),
-            Err(_) => {
-                return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
-            }
-        }
-    } else {
-        None
-    };
-    let pending: coven_threads_core::PendingProposal = match &scheduled {
-        Some(scheduled) => scheduled.pending().clone(),
-        None => match serde_json::from_value(authority_value.clone()) {
-            Ok(pending) => pending,
-            Err(_) => {
-                return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
-            }
-        },
-    };
+    let scheduled = document.scheduled();
+    let pending = document.pending();
     if pending.id.0 != proposal_uuid {
+        audit_reservation.release_if_unneeded()?;
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
+    }
+    if decision == "approve" {
+        if let Err(error) = ward::validate_staged_edit_budget(&pending.edits) {
+            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                if applying_state.is_none() {
+                    claim.restore_pending(&document)?;
+                }
+                audit_reservation.release_if_unneeded()?;
+                return ward_apply_too_large_response(limit);
+            }
+            if applying_state.is_none() {
+                claim.restore_pending(&document)?;
+            }
+            audit_reservation.release_if_unneeded()?;
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
+        }
     }
     let note = if let Some(applying) = applying_state.as_ref() {
         if applying.decision != decision {
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-decision-conflict" }),
             );
         }
         if note != applying.rationale {
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({ "blocked": true, "why": "proposal-recovery-request-conflict" }),
@@ -6497,19 +9768,21 @@ fn decide_threads_proposal_inner(
         note
     };
     let decision_semantics = match proposal_decision_semantics(
-        scheduled.as_ref(),
+        scheduled,
         decision,
         note.as_deref(),
         durable_request
             .as_ref()
             .map(|request| request.claimed_at)
             .unwrap_or_else(time::OffsetDateTime::now_utc),
+        expired,
     ) {
         Ok(semantics) => semantics,
         Err(reason) => {
             if applying_state.is_none() {
-                claim.restore_pending(&mut raw_value)?;
+                claim.restore_pending(&document)?;
             }
+            audit_reservation.release_if_unneeded()?;
             return json_response(
                 409,
                 &json!({
@@ -6521,6 +9794,7 @@ fn decide_threads_proposal_inner(
         }
     };
     let Some(familiar_id) = human_familiar_id_for_weave(coven_home, pending.familiar_id)? else {
+        audit_reservation.release_if_unneeded()?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-familiar-missing" }),
@@ -6528,21 +9802,24 @@ fn decide_threads_proposal_inner(
     };
     let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
     let Some(config) = ward::WardConfig::load(&workspace)? else {
+        audit_reservation.release_if_unneeded()?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "ward-not-configured" }),
         );
     };
     let authorization = authorization_from_writer(&pending.writer);
-    let edits = match staged_edits_to_ward_edits(&pending) {
+    let edits = match staged_edits_to_ward_edits(pending) {
         Ok(edits) => edits,
         Err(_) => {
-            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }))
+            audit_reservation.release_if_unneeded()?;
+            return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
         }
     };
     let targets: Vec<String> = edits.iter().map(|edit| edit.target.clone()).collect();
-    let coherence_evidence = (review_kind == PendingReviewKind::Coherence)
-        .then(|| coherence_decision_evidence(&authority_value, &workspace, &config, &pending));
+    let coherence_evidence = (review_kind == PendingReviewKind::Coherence).then(|| {
+        coherence_decision_evidence(document.probes.as_deref(), &workspace, &config, pending)
+    });
     let probe_summary = if review_kind == PendingReviewKind::Coherence {
         if let Some(applying) = applying_state.as_ref() {
             let Some(summary) = applying.probe_summary.clone() else {
@@ -6567,7 +9844,8 @@ fn decide_threads_proposal_inner(
     if decision == "approve" && applying_state.is_none() {
         if let Some(evidence) = coherence_evidence.as_ref() {
             if evidence.validation != crate::ward_probes::ProbeEvidenceValidation::Valid {
-                claim.restore_pending(&mut raw_value)?;
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
                 let reason = evidence
                     .degraded_reason
                     .unwrap_or("proposal-probes-inconsistent");
@@ -6597,6 +9875,7 @@ fn decide_threads_proposal_inner(
                 | ("reject", "proposal_rejected")
                 | ("reject", "proposal_vetoed")
         );
+        audit_reservation.finish()?;
         claim.consume()?;
         if !matches_request {
             return json_response(
@@ -6632,7 +9911,7 @@ fn decide_threads_proposal_inner(
             );
         }
         let recovery_commitment =
-            proposal_recovery_commitment(&conn, &config, &authority_value, &familiar_id, &targets)?;
+            proposal_recovery_commitment(&conn, &config, &document, &familiar_id, &targets)?;
         if applying.recovery_commitment != recovery_commitment {
             return json_response(
                 409,
@@ -6684,8 +9963,9 @@ fn decide_threads_proposal_inner(
             &targets,
             pending.channel,
         )?;
+        audit_reservation.release_if_unneeded()?;
         if applying_state.is_none() {
-            claim.restore_pending(&mut raw_value)?;
+            claim.restore_pending(&document)?;
         } else {
             claim.preserve();
         }
@@ -6730,6 +10010,7 @@ fn decide_threads_proposal_inner(
                 channel: pending.channel,
             },
         )?;
+        audit_reservation.finish()?;
         claim.consume()?;
         return json_response(
             409,
@@ -6758,7 +10039,8 @@ fn decide_threads_proposal_inner(
             &targets,
             pending.channel,
         )?;
-        claim.restore_pending(&mut raw_value)?;
+        audit_reservation.finish()?;
+        claim.restore_pending(&document)?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
@@ -6818,7 +10100,8 @@ fn decide_threads_proposal_inner(
             &targets,
             pending.channel,
         )?;
-        claim.restore_pending(&mut raw_value)?;
+        audit_reservation.finish()?;
+        claim.restore_pending(&document)?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
@@ -6838,7 +10121,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: state.weave.weave_hash(),
-                approver: Some(&pending.writer),
+                approver: (!expired).then_some(&pending.writer),
                 files_touched: &targets,
                 decision: decision_semantics.rejection_decision,
                 approval_rationale: note.as_deref(),
@@ -6847,6 +10130,7 @@ fn decide_threads_proposal_inner(
                 channel: pending.channel,
             },
         )?;
+        audit_reservation.finish()?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
         claim.consume()?;
         let mut response = json!({
@@ -6856,6 +10140,12 @@ fn decide_threads_proposal_inner(
             "filesTouched": targets,
             "note": note,
         });
+        if expired {
+            response
+                .as_object_mut()
+                .expect("proposal rejection response is an object")
+                .insert("expired".to_string(), json!(true));
+        }
         if let Some(summary) = probe_summary.as_ref() {
             let object = response
                 .as_object_mut()
@@ -6876,7 +10166,7 @@ fn decide_threads_proposal_inner(
     }
 
     if applying_state.is_none() {
-        if let Some(scheduled) = scheduled.as_ref() {
+        if let Some(scheduled) = scheduled {
             let live_tier_escalated = adjudication.decisions.iter().any(|decision| {
                 ward_tier_number(decision.tier) < scheduled.classification().path_tier_floor
             });
@@ -6903,6 +10193,7 @@ fn decide_threads_proposal_inner(
                         channel: pending.channel,
                     },
                 )?;
+                audit_reservation.finish()?;
                 claim.consume()?;
                 return json_response(
                     409,
@@ -6929,7 +10220,7 @@ fn decide_threads_proposal_inner(
     if let Some(applying) = applying_state {
         let expected_resolved = match verify_recoverable_apply_state(
             &workspace,
-            &pending,
+            pending,
             &applying,
             &adjudication.decisions,
         ) {
@@ -6958,7 +10249,7 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let report = apply_after_review_approval(
+        let (report, apply_cleanup_error) = match apply_after_review_approval(
             &ward,
             review_kind,
             &edits,
@@ -6966,7 +10257,34 @@ fn decide_threads_proposal_inner(
             &expected_before,
             &expected_resolved,
             ward::ApprovedApplyMode::Recovery,
-        )?;
+        ) {
+            Ok(report) => (report, None),
+            Err(error) => {
+                if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                    return ward_apply_too_large_response(limit);
+                }
+                match ward::approved_apply_failure(&error).cloned() {
+                    Some(ward::ApprovedApplyFailure::Applied(report)) => {
+                        (report, Some(format!("{error:#}")))
+                    }
+                    Some(
+                        failure @ (ward::ApprovedApplyFailure::RolledBack
+                        | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
+                    ) => {
+                        claim.restore_pending(&document)?;
+                        audit_reservation.finish()?;
+                        return approved_apply_failed_response(proposal_id, &error, &failure, true);
+                    }
+                    Some(failure @ ward::ApprovedApplyFailure::NoWrite)
+                    | Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
+                        claim.preserve();
+                        audit_reservation.preserve()?;
+                        return approved_apply_failed_response(proposal_id, &error, &failure, true);
+                    }
+                    None => return Err(error),
+                }
+            }
+        };
         if report.is_refused() {
             let rollback_edits = proposal_rollback_edits(&applying)?;
             let expected_after = proposal_expected_after(&edits);
@@ -6993,7 +10311,8 @@ fn decide_threads_proposal_inner(
                 &targets,
                 pending.channel,
             )?;
-            claim.restore_pending(&mut raw_value)?;
+            audit_reservation.finish()?;
+            claim.restore_pending(&document)?;
             return json_response(
                 409,
                 &json!({
@@ -7004,7 +10323,11 @@ fn decide_threads_proposal_inner(
             );
         }
         let approved_bytes = approved_bytes_by_resolved(&report, &edits)?;
-        finalize_approved_proposal(
+        if let Err(error) = audit_reservation.verify_store_path(&proposal_store_path) {
+            audit_reservation.preserve()?;
+            return proposal_audit_persist_failed_response(proposal_id, &report, &error);
+        }
+        if let Err(error) = finalize_approved_proposal(
             &conn,
             ApprovedProposalFinalization {
                 proposal_id,
@@ -7022,7 +10345,11 @@ fn decide_threads_proposal_inner(
                 channel: pending.channel,
                 probe_summary: applying.probe_summary.as_ref(),
             },
-        )?;
+        ) {
+            audit_reservation.preserve()?;
+            return proposal_audit_persist_failed_response(proposal_id, &report, &error);
+        }
+        audit_reservation.finish()?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
         claim.consume()?;
         let mut response = json!({
@@ -7038,6 +10365,9 @@ fn decide_threads_proposal_inner(
                 .expect("proposal recovery response is an object");
             object.insert("reviewKind".to_string(), json!(review_kind.as_str()));
             object.insert("probeSummary".to_string(), json!(summary));
+        }
+        if let Some(error) = apply_cleanup_error {
+            return approved_apply_cleanup_failed_response(proposal_id, &report, &error);
         }
         return json_response(200, &response);
     }
@@ -7070,6 +10400,7 @@ fn decide_threads_proposal_inner(
                     &targets,
                     pending.channel,
                 )?;
+                audit_reservation.finish()?;
                 return json_response(
                     409,
                     &json!({
@@ -7093,16 +10424,38 @@ fn decide_threads_proposal_inner(
     } else {
         None
     };
-    let before_images = proposal_before_images(
+    let mut approval_budget = match ward::validate_file_edit_budget(&edits) {
+        Ok(budget) => budget,
+        Err(error) => {
+            let limit = ward::ward_edit_budget_failure(&error)
+                .expect("file-edit budget validation returns a typed failure");
+            claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
+            return ward_apply_too_large_response(limit);
+        }
+    };
+    let before_images = match proposal_before_images(
         &workspace,
         &adjudication.decisions,
-        scheduled.as_ref(),
+        scheduled,
         review_kind,
         coherence_reports,
-    )?;
+        &mut approval_budget,
+    ) {
+        Ok(before_images) => before_images,
+        Err(error) => {
+            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+                return ward_apply_too_large_response(limit);
+            }
+            return Err(error);
+        }
+    };
     if let Some(reports) = coherence_reports {
         if verify_coherence_before_images_match_reports(&before_images, reports).is_err() {
-            claim.restore_pending(&mut raw_value)?;
+            claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
             let summary = crate::ward_probes::ProbeSummary::unscored_targets(targets.len());
             return json_response(
                 409,
@@ -7122,7 +10475,7 @@ fn decide_threads_proposal_inner(
         recovery_commitment: proposal_recovery_commitment(
             &conn,
             &config,
-            &authority_value,
+            &document,
             &familiar_id,
             &targets,
         )?,
@@ -7142,12 +10495,23 @@ fn decide_threads_proposal_inner(
         &applying,
         pending.channel,
     )?;
-    persist_proposal_applying_state(&claim.path, &mut raw_value, &applying)?;
+    audit_reservation.preserve_if_unfinished();
+    if let Err(error) =
+        persist_proposal_applying_state(&claim.path, &document, durable_request.as_ref(), &applying)
+    {
+        if let Some(limit) = crate::proposal_store::quota_failure(&error) {
+            claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
+            return proposal_quota_exceeded_response(limit);
+        }
+        return Err(error);
+    }
     claim.preserve();
     match ward_config_is_unchanged(&workspace, &config) {
         Ok(true) => {}
         Ok(false) => {
-            claim.restore_pending(&mut raw_value)?;
+            claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
             return json_response(
                 409,
                 &json!({
@@ -7158,12 +10522,13 @@ fn decide_threads_proposal_inner(
             );
         }
         Err(error) => {
-            claim.restore_pending(&mut raw_value)?;
+            claim.restore_pending(&document)?;
+            audit_reservation.finish()?;
             return Err(error);
         }
     }
     let expected_before = proposal_expected_before(&applying)?;
-    let report = match apply_after_review_approval(
+    let (report, apply_cleanup_error) = match apply_after_review_approval(
         &ward,
         review_kind,
         &edits,
@@ -7172,12 +10537,33 @@ fn decide_threads_proposal_inner(
         &expected_resolved,
         ward::ApprovedApplyMode::Initial,
     ) {
-        Ok(report) => report,
+        Ok(report) => (report, None),
         Err(error) => {
-            if ward::approved_apply_error_may_have_committed_write(&error) == Some(false) {
-                claim.restore_pending(&mut raw_value)?;
+            if let Some(limit) = ward::ward_edit_budget_failure(&error) {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+                return ward_apply_too_large_response(limit);
             }
-            return Err(error);
+            match ward::approved_apply_failure(&error).cloned() {
+                Some(ward::ApprovedApplyFailure::Applied(report)) => {
+                    (report, Some(format!("{error:#}")))
+                }
+                Some(
+                    failure @ (ward::ApprovedApplyFailure::NoWrite
+                    | ward::ApprovedApplyFailure::RolledBack
+                    | ward::ApprovedApplyFailure::RolledBackCleanupFailed { .. }),
+                ) => {
+                    claim.restore_pending(&document)?;
+                    audit_reservation.finish()?;
+                    return approved_apply_failed_response(proposal_id, &error, &failure, false);
+                }
+                Some(failure @ ward::ApprovedApplyFailure::Ambiguous { .. }) => {
+                    claim.preserve();
+                    audit_reservation.preserve()?;
+                    return approved_apply_failed_response(proposal_id, &error, &failure, false);
+                }
+                None => return Err(error),
+            }
         }
     };
     if report.is_refused() {
@@ -7190,7 +10576,8 @@ fn decide_threads_proposal_inner(
             &targets,
             pending.channel,
         )?;
-        claim.restore_pending(&mut raw_value)?;
+        audit_reservation.finish()?;
+        claim.restore_pending(&document)?;
         return json_response(
             409,
             &json!({ "blocked": true, "why": "proposal-revalidation-failed" }),
@@ -7198,7 +10585,11 @@ fn decide_threads_proposal_inner(
     }
     let approved_bytes = approved_bytes_by_resolved(&report, &edits)?;
     maybe_fail_proposal_decision(ProposalDecisionFailpoint::ApplyBeforeAudit, proposal_id)?;
-    finalize_approved_proposal(
+    if let Err(error) = audit_reservation.verify_store_path(&proposal_store_path) {
+        audit_reservation.preserve()?;
+        return proposal_audit_persist_failed_response(proposal_id, &report, &error);
+    }
+    if let Err(error) = finalize_approved_proposal(
         &conn,
         ApprovedProposalFinalization {
             proposal_id,
@@ -7216,7 +10607,11 @@ fn decide_threads_proposal_inner(
             channel: pending.channel,
             probe_summary: probe_summary.as_ref(),
         },
-    )?;
+    ) {
+        audit_reservation.preserve()?;
+        return proposal_audit_persist_failed_response(proposal_id, &report, &error);
+    }
+    audit_reservation.finish()?;
     maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
     claim.consume()?;
     let mut response = json!({
@@ -7232,6 +10627,9 @@ fn decide_threads_proposal_inner(
             .expect("proposal decision response is an object");
         object.insert("reviewKind".to_string(), json!(review_kind.as_str()));
         object.insert("probeSummary".to_string(), json!(summary));
+    }
+    if let Some(error) = apply_cleanup_error {
+        return approved_apply_cleanup_failed_response(proposal_id, &report, &error);
     }
     json_response(200, &response)
 }
@@ -7259,74 +10657,259 @@ fn find_pending_proposal(coven_home: &Path, proposal_id: Uuid) -> Result<Option<
     Ok(None)
 }
 
-pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+fn read_pending_proposal_file(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading pending proposal metadata {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "pending proposal is not a regular file"
+    );
+    let observed_bytes = metadata.len();
+    if observed_bytes > crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES {
+        return Err(crate::proposal_store::ProposalQuotaExceeded::Bytes {
+            current_bytes: observed_bytes,
+            incoming_bytes: 0,
+            attempted_bytes: observed_bytes,
+            max_bytes: crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES,
+        }
+        .into());
+    }
+    let raw = read_and_preflight_proposal_file(path)?;
+    let observed_bytes = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+    if observed_bytes > crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES {
+        return Err(crate::proposal_store::ProposalQuotaExceeded::Bytes {
+            current_bytes: observed_bytes,
+            incoming_bytes: 0,
+            attempted_bytes: observed_bytes,
+            max_bytes: crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES,
+        }
+        .into());
+    }
+    Ok(raw)
+}
+
+fn scheduler_cursor_path(coven_home: &Path) -> PathBuf {
+    coven_home.join("pending").join(".scheduler-cursor")
+}
+
+fn read_scheduler_cursor(coven_home: &Path) -> Option<String> {
+    let cursor = fs::read_to_string(scheduler_cursor_path(coven_home)).ok()?;
+    let cursor = cursor.trim();
+    (!cursor.is_empty()
+        && !cursor.contains(['/', '\\'])
+        && crate::proposal_store::is_active_proposal_file(cursor))
+    .then(|| cursor.to_string())
+}
+
+fn write_scheduler_cursor(coven_home: &Path, cursor: &str) -> Result<()> {
+    let path = scheduler_cursor_path(coven_home);
+    let pending_dir = path
+        .parent()
+        .context("proposal scheduler cursor has no parent")?;
+    fs::create_dir_all(pending_dir)
+        .with_context(|| format!("creating {}", pending_dir.display()))?;
+    let staged = pending_dir.join(format!(".scheduler-cursor.{}.staged", Uuid::new_v4()));
+    let write_result = (|| -> Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&staged)
+            .with_context(|| format!("creating proposal scheduler cursor {}", staged.display()))?;
+        file.write_all(cursor.as_bytes())
+            .with_context(|| format!("writing proposal scheduler cursor {}", staged.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing proposal scheduler cursor {}", staged.display()))?;
+        fs::rename(&staged, &path)
+            .with_context(|| format!("committing proposal scheduler cursor {}", path.display()))
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    write_result
+}
+
+fn retain_smallest_scheduler_candidate(
+    candidates: &mut BTreeMap<String, PathBuf>,
+    name: String,
+    path: PathBuf,
+) {
+    candidates.insert(name, path);
+    if candidates.len() > crate::proposal_store::PROPOSAL_SCHEDULER_BATCH_LIMIT {
+        candidates.pop_last();
+    }
+}
+
+fn scheduler_candidate_batch(coven_home: &Path) -> Result<Vec<(String, PathBuf)>> {
     let pending_dir = coven_home.join("pending");
+    crate::proposal_store::reconcile_invalid_active_names(coven_home)?;
     let entries = match fs::read_dir(&pending_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => {
             return Err(error)
                 .with_context(|| format!("reading proposal scheduler {}", pending_dir.display()))
         }
     };
-    let mut claims = Vec::new();
-    let mut scheduled = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+    let cursor = read_scheduler_cursor(coven_home);
+    let mut after = BTreeMap::new();
+    let mut wrapped = BTreeMap::new();
+    for entry in entries {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if name.ends_with(".deciding") {
-            claims.push(path);
-        } else if name.ends_with(".json") {
-            scheduled.push(path);
+        if !crate::proposal_store::is_active_proposal_file(&name) {
+            continue;
+        }
+        let path = entry.path();
+        if cursor
+            .as_ref()
+            .is_none_or(|cursor| name.as_str() > cursor.as_str())
+        {
+            retain_smallest_scheduler_candidate(&mut after, name, path);
+        } else {
+            retain_smallest_scheduler_candidate(&mut wrapped, name, path);
         }
     }
-    claims.sort();
-    scheduled.sort();
+    let mut candidates: Vec<_> = after.into_iter().collect();
+    let remaining =
+        crate::proposal_store::PROPOSAL_SCHEDULER_BATCH_LIMIT.saturating_sub(candidates.len());
+    candidates.extend(wrapped.into_iter().take(remaining));
+    Ok(candidates)
+}
 
+fn quarantine_scheduler_candidate(coven_home: &Path, path: &Path, error: &anyhow::Error) {
+    let quarantine = crate::proposal_store::quarantine(coven_home, path, "invalid");
+    let outcome = match quarantine {
+        Ok(Some(destination)) => format!(" quarantined at {}", destination.display()),
+        Ok(None) => " disappeared before quarantine".to_string(),
+        Err(quarantine_error) => format!(" quarantine failed: {quarantine_error:#}"),
+    };
+    crate::daemon::append_daemon_recovery_log(
+        coven_home,
+        &format!(
+            "threads scheduler: invalid proposal {}: {error:#};{outcome}",
+            path.display()
+        ),
+    );
+}
+
+fn read_pending_proposal_document(path: &Path) -> Result<ProposalEnvelopeDocument> {
+    let raw = read_pending_proposal_file(path)
+        .with_context(|| format!("reading scheduled proposal {}", path.display()))?;
+    ProposalEnvelopeDocument::parse_preflighted(&raw)
+        .with_context(|| format!("parsing scheduled proposal {}", path.display()))
+}
+
+fn parse_scheduler_authority_document(
+    path: &Path,
+    mut document: ProposalEnvelopeDocument,
+) -> Result<(
+    Uuid,
+    time::OffsetDateTime,
+    Option<crate::proposal_scheduler::ScheduledProposal>,
+    Option<ProposalDecisionRequest>,
+)> {
+    let request = document.decision_request.take();
+    match document.authority {
+        ProposalAuthority::Scheduled(proposal) => Ok((
+            proposal.pending().id.0,
+            proposal.pending().staged_at,
+            Some(*proposal),
+            request,
+        )),
+        ProposalAuthority::Legacy(proposal) => {
+            let _ = path;
+            Ok((proposal.id.0, proposal.staged_at, None, request))
+        }
+    }
+}
+
+/// Process one deterministic round-robin batch. The persistent filename cursor
+/// prevents a prefix of human-only proposals from starving later due work.
+pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+    let candidates = scheduler_candidate_batch(coven_home)?;
+    let last_cursor = candidates.last().map(|(name, _)| name.clone());
     let mut completed = 0;
-    for claim_path in claims {
-        match recover_proposal_claim(coven_home, &claim_path) {
-            Ok(true) => completed += 1,
-            Ok(false) => {}
-            Err(error) => crate::daemon::append_daemon_recovery_log(
-                coven_home,
-                &format!(
-                    "threads scheduler: claim recovery failed for {}: {error:#}",
-                    claim_path.display()
-                ),
-            ),
-        }
-    }
-
     let now = time::OffsetDateTime::now_utc();
-    for path in scheduled {
-        let result = (|| -> Result<bool> {
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("reading scheduled proposal {}", path.display()))?;
-            let mut value: Value = serde_json::from_str(&raw)
-                .with_context(|| format!("parsing scheduled proposal {}", path.display()))?;
-            let request = proposal_decision_request(&value)?;
-            if let Some(object) = value.as_object_mut() {
-                object.remove("decisionRequest");
-                object.remove("decisionState");
+    for (name, path) in candidates {
+        if name.ends_with(".deciding") {
+            let document = match read_pending_proposal_document(&path) {
+                Ok(document) => document,
+                Err(error) => {
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                    continue;
+                }
+            };
+            match recover_proposal_claim_document(coven_home, &path, document) {
+                Ok(true) => completed += 1,
+                Ok(false) => {}
+                Err(error) => crate::daemon::append_daemon_recovery_log(
+                    coven_home,
+                    &format!(
+                        "threads scheduler: claim recovery failed for {}: {error:#}",
+                        path.display()
+                    ),
+                ),
             }
-            let proposal: crate::proposal_scheduler::ScheduledProposal =
-                serde_json::from_value(value)
-                    .with_context(|| format!("parsing scheduled proposal {}", path.display()))?;
+            continue;
+        }
+
+        let document = match read_pending_proposal_document(&path) {
+            Ok(document) => document,
+            Err(error) => {
+                quarantine_scheduler_candidate(coven_home, &path, &error);
+                continue;
+            }
+        };
+        let (proposal_id, staged_at, proposal, request) =
+            match parse_scheduler_authority_document(&path, document) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    quarantine_scheduler_candidate(coven_home, &path, &error);
+                    continue;
+                }
+            };
+        let result = (|| -> Result<bool> {
             if let Some(request) = request {
                 let body = request
                     .rationale
                     .map(|note| json!({ "note": note }).to_string());
                 let response = decide_threads_proposal_automatic(
                     coven_home,
-                    &proposal.pending().id.0.to_string(),
+                    &proposal_id.to_string(),
                     &request.decision,
                     body.as_deref(),
                 )?;
                 return Ok(response.status == 200);
             }
+            let expired = staged_at
+                .checked_add(time::Duration::days(
+                    crate::proposal_store::PENDING_PROPOSAL_RETENTION_DAYS,
+                ))
+                .is_some_and(|deadline| now >= deadline);
+            if expired {
+                let response = expire_threads_proposal(coven_home, &proposal_id.to_string())?;
+                if response.status == 200 {
+                    return Ok(true);
+                }
+                let reason = anyhow::anyhow!(
+                    "expired proposal could not be terminally rejected: HTTP {} {}",
+                    response.status,
+                    response.body
+                );
+                crate::daemon::append_daemon_recovery_log(
+                    coven_home,
+                    &format!(
+                        "threads scheduler: expiry failure for {}: {reason:#}; retained for retry",
+                        path.display()
+                    ),
+                );
+                return Ok(false);
+            }
+            let Some(proposal) = proposal else {
+                return Ok(false);
+            };
             ensure_proposal_window_opened_audit(coven_home, &proposal)?;
             let due = match &proposal.classification().approval_path {
                 coven_threads_core::ApprovalPath::AutoRegression { veto: None } => true,
@@ -7342,7 +10925,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             }
             let response = decide_threads_proposal_automatic(
                 coven_home,
-                &proposal.pending().id.0.to_string(),
+                &proposal_id.to_string(),
                 "approve",
                 None,
             )?;
@@ -7360,10 +10943,24 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             ),
         }
     }
+    if let Some(cursor) = last_cursor {
+        write_scheduler_cursor(coven_home, &cursor)?;
+    }
     Ok(completed)
 }
 
+#[cfg(test)]
 fn recover_proposal_claim(coven_home: &Path, claim_path: &Path) -> Result<bool> {
+    let document = read_pending_proposal_document(claim_path)
+        .with_context(|| format!("reading proposal claim {}", claim_path.display()))?;
+    recover_proposal_claim_document(coven_home, claim_path, document)
+}
+
+fn recover_proposal_claim_document(
+    coven_home: &Path,
+    claim_path: &Path,
+    document: ProposalEnvelopeDocument,
+) -> Result<bool> {
     let name = claim_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -7375,26 +10972,9 @@ fn recover_proposal_claim(coven_home: &Path, claim_path: &Path) -> Result<bool> 
         .strip_suffix(".deciding")
         .filter(|decision| matches!(*decision, "approve" | "reject"))
         .context("proposal claim has unknown decision")?;
-    let raw = fs::read_to_string(claim_path)
-        .with_context(|| format!("reading proposal claim {}", claim_path.display()))?;
-    let value: Value = serde_json::from_str(&raw).context("parsing proposal recovery claim")?;
-    let applying = proposal_applying_state(&value)?;
-    let request = proposal_decision_request(&value)?;
-    let mut authority = value;
-    if let Some(object) = authority.as_object_mut() {
-        object.remove("decisionState");
-        object.remove("decisionRequest");
-    }
-    let proposal_id = if is_phase5_proposal_shape(&authority) {
-        serde_json::from_value::<crate::proposal_scheduler::ScheduledProposal>(authority)?
-            .pending()
-            .id
-            .0
-    } else {
-        serde_json::from_value::<coven_threads_core::PendingProposal>(authority)?
-            .id
-            .0
-    };
+    let proposal_id = document.pending().id.0;
+    let applying = document.decision_state;
+    let request = document.decision_request;
     let body = applying
         .and_then(|state| state.rationale)
         .or_else(|| request.and_then(|request| request.rationale))
@@ -7501,6 +11081,15 @@ struct PendingDecisionClaim {
     recovery: bool,
 }
 
+struct PendingDecisionClaimRequest<'a> {
+    audit_conn: &'a rusqlite::Connection,
+    decision: &'a str,
+    rationale: Option<&'a str>,
+    expected_revision: Option<&'a str>,
+    revision_required: bool,
+    expired: bool,
+}
+
 #[derive(Debug)]
 struct ProposalRevisionMismatch;
 
@@ -7512,22 +11101,97 @@ impl std::fmt::Display for ProposalRevisionMismatch {
 
 impl std::error::Error for ProposalRevisionMismatch {}
 
+#[derive(Debug)]
+struct ProposalExpiredBeforeClaim;
+
+impl std::fmt::Display for ProposalExpiredBeforeClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("proposal expired before the decision claim was committed")
+    }
+}
+
+impl std::error::Error for ProposalExpiredBeforeClaim {}
+
+fn release_superseded_proposal_reservation(
+    conn: &rusqlite::Connection,
+    proposal_id: Uuid,
+    decision: &str,
+) -> Result<()> {
+    if decision == "reject" {
+        return Ok(());
+    }
+    conn.execute(
+        "DELETE FROM coven_ward_audit_reservations
+         WHERE token = ?1
+           AND NOT EXISTS (
+               SELECT 1
+               FROM temp.coven_active_ward_audit_reservation
+               WHERE token = ?1
+           )",
+        [format!("proposal:{proposal_id}:{decision}")],
+    )
+    .context("releasing superseded proposal audit reservation")?;
+    Ok(())
+}
+
+fn proposal_reservation_decision(
+    conn: &rusqlite::Connection,
+    proposal_id: &str,
+    decision: &str,
+    expired: bool,
+) -> Result<String> {
+    if expired {
+        for candidate in ["reject", "approve"] {
+            let token = format!("proposal:{proposal_id}:{candidate}");
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS (
+                         SELECT 1
+                         FROM coven_ward_audit_reservations
+                         WHERE token = ?1 AND reserved_bytes > 0
+                     )",
+                    [&token],
+                    |row| row.get(0),
+                )
+                .context("checking reusable proposal audit reservation")?;
+            if exists {
+                return Ok(candidate.to_string());
+            }
+        }
+    }
+    Ok(decision.to_string())
+}
+
 impl PendingDecisionClaim {
     fn acquire(
         coven_home: &Path,
         proposal_id: Uuid,
-        decision: &str,
-        rationale: Option<&str>,
-        expected_revision: Option<&str>,
-        revision_required: bool,
+        request: PendingDecisionClaimRequest<'_>,
     ) -> Result<Option<Self>> {
+        let PendingDecisionClaimRequest {
+            audit_conn,
+            decision,
+            rationale,
+            expected_revision,
+            revision_required,
+            expired,
+        } = request;
+        let expiry_request = |existing: Option<&ProposalDecisionRequest>| ProposalDecisionRequest {
+            decision: "reject".to_string(),
+            rationale: existing
+                .and_then(|request| request.rationale.clone())
+                .or_else(|| rationale.map(str::to_string)),
+            claimed_at: existing
+                .map(|request| request.claimed_at)
+                .unwrap_or_else(time::OffsetDateTime::now_utc),
+            expected_revision: None,
+            revision_required: false,
+            expired: true,
+        };
         if let Some((path, claimed_decision)) =
             find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
         {
-            if claimed_decision != decision {
-                anyhow::bail!("proposal is already claimed for {claimed_decision}, not {decision}");
-            }
-            let suffix = format!(".{decision}.deciding");
+            let suffix = format!(".{claimed_decision}.deciding");
             let file_name = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -7535,8 +11199,64 @@ impl PendingDecisionClaim {
             let original_name = file_name
                 .strip_suffix(&suffix)
                 .context("proposal decision claim has an invalid suffix")?;
+            let original_path = path.with_file_name(original_name);
+            let raw = read_pending_proposal_file(&path)
+                .with_context(|| format!("reading pending proposal claim {}", path.display()))?;
+            let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
+                .context("parsing pending proposal claim before decision recovery")?;
+            drop(raw);
+            if !expired
+                && proposal_retention_expired(
+                    coven_home,
+                    audit_conn,
+                    &document,
+                    time::OffsetDateTime::now_utc(),
+                )
+            {
+                return Err(ProposalExpiredBeforeClaim.into());
+            }
+            if expired {
+                anyhow::ensure!(
+                    proposal_recovery_is_proven_unapplied(coven_home, audit_conn, &document),
+                    "proposal apply recovery is not proven safe for terminal expiry"
+                );
+                document.decision_state = None;
+                document.decision_request =
+                    Some(expiry_request(document.decision_request.as_ref()));
+                let body = document.serialize_with_decision(
+                    document.decision_request.as_ref(),
+                    document.decision_state.as_ref(),
+                )?;
+                release_superseded_proposal_reservation(
+                    audit_conn,
+                    proposal_id,
+                    &claimed_decision,
+                )?;
+                crate::proposal_store::replace_existing_for_terminal_decision(&path, &body)?;
+                let expiry_path =
+                    original_path.with_file_name(format!("{original_name}.reject.deciding"));
+                if path != expiry_path {
+                    crate::proposal_store::rename_existing(&path, &expiry_path).with_context(
+                        || {
+                            format!(
+                                "reclaiming pending proposal {} for terminal expiry",
+                                path.display()
+                            )
+                        },
+                    )?;
+                }
+                return Ok(Some(Self {
+                    path: expiry_path,
+                    original_path,
+                    preserve: false,
+                    recovery: true,
+                }));
+            }
+            if claimed_decision != decision {
+                anyhow::bail!("proposal is already claimed for {claimed_decision}, not {decision}");
+            }
             return Ok(Some(Self {
-                original_path: path.with_file_name(original_name),
+                original_path,
                 path,
                 preserve: false,
                 recovery: true,
@@ -7551,37 +11271,64 @@ impl PendingDecisionClaim {
             .and_then(|name| name.to_str())
             .context("pending proposal has a non-utf8 filename")?;
         let path = original_path.with_file_name(format!("{file_name}.{decision}.deciding"));
-        let raw = fs::read_to_string(&original_path)
+        let raw = read_pending_proposal_file(&original_path)
             .with_context(|| format!("reading pending proposal {}", original_path.display()))?;
-        let mut value: Value =
-            serde_json::from_str(&raw).context("parsing pending proposal before decision claim")?;
-        if proposal_decision_request(&value)?.is_none() {
-            let mut authority_value = value.clone();
-            if let Some(object) = authority_value.as_object_mut() {
-                object.remove("decisionState");
-                object.remove("decisionRequest");
-            }
+        let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
+            .context("parsing pending proposal before decision claim")?;
+        drop(raw);
+        if !expired
+            && proposal_retention_expired(
+                coven_home,
+                audit_conn,
+                &document,
+                time::OffsetDateTime::now_utc(),
+            )
+        {
+            return Err(ProposalExpiredBeforeClaim.into());
+        }
+        let superseded_decision = expired
+            .then(|| {
+                document
+                    .decision_request
+                    .as_ref()
+                    .map(|request| request.decision.clone())
+            })
+            .flatten();
+        if expired {
+            anyhow::ensure!(
+                proposal_recovery_is_proven_unapplied(coven_home, audit_conn, &document),
+                "proposal apply recovery is not proven safe for terminal expiry"
+            );
+            document.decision_state = None;
+            document.decision_request = Some(expiry_request(document.decision_request.as_ref()));
+        } else if document.decision_request.is_none() {
             if let Some(expected_revision) = expected_revision {
-                if proposal_revision(&authority_value)? != expected_revision {
+                if document.revision()? != expected_revision {
                     return Err(ProposalRevisionMismatch.into());
                 }
             }
-            value
-                .as_object_mut()
-                .context("pending proposal must be a JSON object")?
-                .insert(
-                    "decisionRequest".to_string(),
-                    serde_json::to_value(ProposalDecisionRequest {
-                        decision: decision.to_string(),
-                        rationale: rationale.map(str::to_string),
-                        claimed_at: time::OffsetDateTime::now_utc(),
-                        expected_revision: expected_revision.map(str::to_string),
-                        revision_required,
-                    })?,
-                );
+            document.decision_request = Some(ProposalDecisionRequest {
+                decision: decision.to_string(),
+                rationale: rationale.map(str::to_string),
+                claimed_at: time::OffsetDateTime::now_utc(),
+                expected_revision: expected_revision.map(str::to_string),
+                revision_required,
+                expired,
+            });
         }
-        persist_proposal_claim_value(&original_path, &value)?;
-        fs::rename(&original_path, &path).with_context(|| {
+        let body = document.serialize_with_decision(
+            document.decision_request.as_ref(),
+            document.decision_state.as_ref(),
+        )?;
+        if let Some(previous) = superseded_decision {
+            release_superseded_proposal_reservation(audit_conn, proposal_id, &previous)?;
+        }
+        if decision == "reject" {
+            crate::proposal_store::replace_existing_for_terminal_decision(&original_path, &body)?;
+        } else {
+            crate::proposal_store::replace_existing(&original_path, &body)?;
+        }
+        crate::proposal_store::rename_existing(&original_path, &path).with_context(|| {
             format!(
                 "claiming pending proposal {} as {}",
                 original_path.display(),
@@ -7601,29 +11348,24 @@ impl PendingDecisionClaim {
     }
 
     fn consume(&mut self) -> Result<()> {
-        fs::remove_file(&self.path)
+        crate::proposal_store::remove_existing(&self.path)
             .with_context(|| format!("removing proposal decision claim {}", self.path.display()))?;
         self.preserve = true;
         Ok(())
     }
 
-    fn restore_pending(&mut self, raw_value: &mut Value) -> Result<()> {
-        raw_value
-            .as_object_mut()
-            .context("pending proposal claim must be a JSON object")?
-            .remove("decisionState");
-        raw_value
-            .as_object_mut()
-            .context("pending proposal claim must be a JSON object")?
-            .remove("decisionRequest");
-        persist_proposal_claim_value(&self.path, raw_value)?;
-        fs::rename(&self.path, &self.original_path).with_context(|| {
-            format!(
-                "restoring proposal decision claim {} to {}",
-                self.path.display(),
-                self.original_path.display()
-            )
-        })?;
+    fn restore_pending(&mut self, document: &ProposalEnvelopeDocument) -> Result<()> {
+        let body = document.serialize_with_decision(None, None)?;
+        crate::proposal_store::replace_existing(&self.path, &body)?;
+        crate::proposal_store::rename_existing(&self.path, &self.original_path).with_context(
+            || {
+                format!(
+                    "restoring proposal decision claim {} to {}",
+                    self.path.display(),
+                    self.original_path.display()
+                )
+            },
+        )?;
         self.preserve = true;
         Ok(())
     }
@@ -7632,7 +11374,7 @@ impl PendingDecisionClaim {
 impl Drop for PendingDecisionClaim {
     fn drop(&mut self) {
         if !self.preserve && self.path.exists() {
-            let _ = fs::rename(&self.path, &self.original_path);
+            let _ = crate::proposal_store::rename_existing(&self.path, &self.original_path);
         }
     }
 }
@@ -7647,8 +11389,15 @@ struct ProposalDecisionRequest {
     expected_revision: Option<String>,
     #[serde(default)]
     revision_required: bool,
+    #[serde(default, skip_serializing_if = "bool_is_false")]
+    expired: bool,
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+#[cfg(test)]
 fn proposal_decision_request(raw_value: &Value) -> Result<Option<ProposalDecisionRequest>> {
     raw_value
         .get("decisionRequest")
@@ -7686,7 +11435,7 @@ struct ProposalBeforeImage {
 fn proposal_recovery_commitment(
     conn: &rusqlite::Connection,
     config: &ward::WardConfig,
-    authority_value: &Value,
+    document: &ProposalEnvelopeDocument,
     familiar_id: &str,
     targets: &[String],
 ) -> Result<Vec<u8>> {
@@ -7695,8 +11444,7 @@ fn proposal_recovery_commitment(
     let config_bytes = serde_json::to_vec(config).context("serializing Ward config")?;
     hasher.update(&(config_bytes.len() as u64).to_be_bytes());
     hasher.update(&config_bytes);
-    let authority_bytes =
-        serde_json::to_vec(authority_value).context("serializing proposal authority envelope")?;
+    let authority_bytes = document.authority_bytes()?;
     hasher.update(&(authority_bytes.len() as u64).to_be_bytes());
     hasher.update(&authority_bytes);
     let mut targets = targets.to_vec();
@@ -7725,25 +11473,26 @@ fn proposal_before_images(
     scheduled: Option<&crate::proposal_scheduler::ScheduledProposal>,
     review_kind: PendingReviewKind,
     coherence_reports: Option<&[crate::ward_probes::SurfaceProbeReport]>,
+    budget: &mut ward::WardEditBudget,
 ) -> Result<Vec<ProposalBeforeImage>> {
     decisions
         .iter()
         .map(|decision| {
             let target = &decision.target;
             let contents = if let Some(scheduled) = scheduled {
-                Some(
-                    scheduled
-                        .materialized_diff()
-                        .for_surface(&coven_threads_core::SurfaceId::new(target))
-                        .with_context(|| {
-                            format!("scheduled materialized diff is missing target {target}")
-                        })?
-                        .before
-                        .clone()
-                        .with_context(|| {
-                            format!("scheduled target {target} has no approved before-image")
-                        })?,
-                )
+                let before = scheduled
+                    .materialized_diff()
+                    .for_surface(&coven_threads_core::SurfaceId::new(target))
+                    .with_context(|| {
+                        format!("scheduled materialized diff is missing target {target}")
+                    })?
+                    .before
+                    .as_deref()
+                    .with_context(|| {
+                        format!("scheduled target {target} has no approved before-image")
+                    })?;
+                budget.reserve_proposed_content(before)?;
+                Some(before.to_vec())
             } else if review_kind == PendingReviewKind::Coherence {
                 let report = coherence_reports
                     .context("coherence before-images require current probe reports")?
@@ -7757,12 +11506,20 @@ fn proposal_before_images(
                         "coherence probe surface for {target} diverged from live Gate-2 resolution"
                     );
                 }
-                crate::threads_gate::read_surface_if_exists(workspace, &decision.resolved)?
-            } else {
-                Some(crate::threads_gate::read_surface(
+                crate::threads_gate::read_surface_if_exists_with_budget(
                     workspace,
                     &decision.resolved,
-                )?)
+                    budget,
+                )?
+            } else {
+                Some(
+                    crate::threads_gate::read_surface_if_exists_with_budget(
+                        workspace,
+                        &decision.resolved,
+                        budget,
+                    )?
+                    .unwrap_or_default(),
+                )
             };
             Ok(ProposalBeforeImage {
                 target: target.clone(),
@@ -7919,56 +11676,12 @@ fn proposal_rollback_edits(applying: &ProposalApplyingState) -> Result<Vec<ward:
 
 fn persist_proposal_applying_state(
     claim_path: &Path,
-    raw_value: &mut Value,
+    document: &ProposalEnvelopeDocument,
+    request: Option<&ProposalDecisionRequest>,
     state: &ProposalApplyingState,
 ) -> Result<()> {
-    raw_value
-        .as_object_mut()
-        .context("pending proposal claim must be a JSON object")?
-        .insert(
-            "decisionState".to_string(),
-            serde_json::to_value(state).context("serializing proposal applying state")?,
-        );
-    persist_proposal_claim_value(claim_path, raw_value)
-}
-
-fn persist_proposal_claim_value(claim_path: &Path, raw_value: &Value) -> Result<()> {
-    let body = serde_json::to_vec_pretty(raw_value).context("serializing proposal claim")?;
-    let file_name = claim_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .context("proposal decision claim has a non-utf8 filename")?;
-    let staged = claim_path.with_file_name(format!(".{file_name}.{}.staged", Uuid::new_v4()));
-    let write_result = (|| -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&staged)
-            .with_context(|| format!("creating proposal claim stage {}", staged.display()))?;
-        file.write_all(&body)
-            .with_context(|| format!("writing proposal claim stage {}", staged.display()))?;
-        file.sync_all()
-            .with_context(|| format!("syncing proposal claim stage {}", staged.display()))?;
-        fs::rename(&staged, claim_path).with_context(|| {
-            format!(
-                "committing proposal applying state {}",
-                claim_path.display()
-            )
-        })
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&staged);
-    }
-    write_result
-}
-
-fn proposal_applying_state(raw_value: &Value) -> Result<Option<ProposalApplyingState>> {
-    raw_value
-        .get("decisionState")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .context("invalid proposal applying state")
+    let body = document.serialize_with_decision(request, Some(state))?;
+    crate::proposal_store::replace_existing(claim_path, &body)
 }
 
 fn append_proposal_apply_intent(
@@ -8214,11 +11927,11 @@ fn find_pending_decision_claim(
 fn cleanup_terminal_proposal_artifacts(coven_home: &Path, proposal_id: Uuid) -> Result<()> {
     if let Some((claim, _)) = find_any_pending_decision_claim(coven_home, &proposal_id.to_string())
     {
-        fs::remove_file(&claim)
+        crate::proposal_store::remove_existing(&claim)
             .with_context(|| format!("removing terminal proposal claim {}", claim.display()))?;
     }
     if let Some(pending) = find_pending_proposal(coven_home, proposal_id)? {
-        fs::remove_file(&pending).with_context(|| {
+        crate::proposal_store::remove_existing(&pending).with_context(|| {
             format!(
                 "removing terminal proposal pending file {}",
                 pending.display()
@@ -8780,34 +12493,132 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
     let _ = store::mark_stale_created_sessions_failed(conn, &cutoff, &current_timestamp());
 }
 
-pub(crate) fn api_error(
-    status: u16,
-    code: &str,
-    message: &str,
-    details: Option<Value>,
-) -> Result<ApiResponse> {
-    let mut error = json!({
-        "code": code,
-        "message": message,
-    });
-    if let Some(d) = details {
-        error["details"] = d;
-    }
-    json_response(status, &json!({ "error": error }))
-}
-
-pub(crate) fn json_response<T: Serialize>(status: u16, body: &T) -> Result<ApiResponse> {
-    Ok(ApiResponse {
-        status,
-        content_type: "application/json",
-        body: serde_json::to_string(body).context("failed to serialize API response")?,
-    })
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
+
+    #[test]
+    fn default_authorized_launch_refuses_before_launch_or_ownership() {
+        struct CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize,
+        }
+
+        impl SessionRuntime for CountingRuntime {
+            fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+                self.launches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _session_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let extension: crate::automations::contract::authority::AutomationAuthorityExtension =
+            serde_json::from_value(
+                crate::automations::contract::authority::test_support::authority_extensions_value()
+                    [crate::automations::contract::authority::AUTHORITY_EXTENSION_KEY]
+                    .clone(),
+            )
+            .unwrap();
+        let authority =
+            crate::automations::authority_projection::AutomationAuthorityConsumerProjection::from_validated(
+                &extension,
+            );
+        let launch = SessionLaunch {
+            id: "session-authority-refusal".to_string(),
+            project_root: "/work/project".to_string(),
+            cwd: "/work/project".to_string(),
+            harness: "coven-code".to_string(),
+            model: None,
+            launch_mode: HarnessLaunchMode::NonInteractive,
+            launch_policy: None,
+            prompt: "Do the thing.".to_string(),
+            title: "authority refusal".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: Some("charm".to_string()),
+            caller_familiar_id: None,
+        };
+        let runtime = CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ownership_callbacks = std::sync::atomic::AtomicUsize::new(0);
+        let mut ownership_established = || {
+            ownership_callbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+
+        let error = runtime
+            .launch_authorized_contained_adopted_session(
+                &launch,
+                Some(&authority),
+                None,
+                &mut ownership_established,
+            )
+            .expect_err("the default runtime must reject authority projections");
+
+        assert_eq!(
+            error.to_string(),
+            "runtime does not accept automation authority projections; no process started"
+        );
+        assert_eq!(
+            runtime.launches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            ownership_callbacks.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    struct TestWorker<T> {
+        completion: std::sync::mpsc::Receiver<T>,
+        handle: std::thread::JoinHandle<()>,
+        description: &'static str,
+    }
+
+    impl<T: Send + 'static> TestWorker<T> {
+        fn spawn(description: &'static str, work: impl FnOnce() -> T + Send + 'static) -> Self {
+            let (sender, completion) = std::sync::mpsc::sync_channel(1);
+            let handle = std::thread::spawn(move || {
+                let result = work();
+                let _ = sender.send(result);
+            });
+            Self {
+                completion,
+                handle,
+                description,
+            }
+        }
+
+        fn wait(self) -> Result<T> {
+            match self.completion.recv_timeout(TEST_SYNC_TIMEOUT) {
+                Ok(result) => {
+                    self.handle.join().unwrap_or_else(|_| {
+                        panic!("{} panicked after reporting completion", self.description)
+                    });
+                    Ok(result)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.handle
+                        .join()
+                        .unwrap_or_else(|_| panic!("{} panicked", self.description));
+                    anyhow::bail!("{} exited without reporting completion", self.description)
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+                    "timed out after {TEST_SYNC_TIMEOUT:?} waiting for {}",
+                    self.description
+                ),
+            }
+        }
+    }
 
     thread_local! {
         /// Backing storage for the parent-correlation failpoint (issue #728
@@ -9007,51 +12818,1404 @@ mod tests {
     }
 
     #[test]
-    fn older_health_payloads_default_afs_commit_dry_run_to_false() -> anyhow::Result<()> {
-        let current = health_response(None);
-        let mut payload = serde_json::to_value(&current)?;
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("afsCommitDryRun");
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("sessionLaunchPolicy");
+    fn cancellation_replay_is_pending_while_the_first_runtime_stop_is_in_flight(
+    ) -> anyhow::Result<()> {
+        struct BlockingKillRuntime {
+            calls: std::sync::atomic::AtomicUsize,
+            started: std::sync::mpsc::SyncSender<()>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
 
-        let decoded: HealthResponse = serde_json::from_value(payload)?;
-        assert!(!decoded.capabilities.afs_commit_dry_run);
-        assert!(!decoded.capabilities.session_launch_policy);
+        impl SessionRuntime for BlockingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    self.started.send(())?;
+                    self.release
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
+                        .recv()?;
+                    Ok(())
+                } else {
+                    anyhow::bail!("duplicate runtime stop")
+                }
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:concurrent",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = std::sync::Arc::new(BlockingKillRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let first_home = temp_dir.path().to_path_buf();
+        let first_body = body.clone();
+        let first_runtime = std::sync::Arc::clone(&runtime);
+        let first = std::thread::spawn(move || {
+            post_cancellation(&first_home, &first_body, first_runtime.as_ref())
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+
+        let pending = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(pending.status, 409, "{}", pending.body);
+        let pending: Value = serde_json::from_str(&pending.body)?;
+        assert_eq!(pending["error"]["code"], "CANCEL_PENDING");
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a concurrent replay must not issue a second runtime stop"
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let timeout_failures = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            runtime.as_ref(),
+            Utc::now() + chrono::Duration::minutes(31),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(
+            timeout_failures.is_empty(),
+            "timeout enforcement must defer to the cancellation stop owner"
+        );
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "timeout enforcement must not issue a second runtime stop"
+        );
+        let definition = crate::automations::store::get_definition(&conn, "cancellation-target")?
+            .context("fixture definition must exist")?;
+        let definition: Value = serde_json::from_str(&definition.definition_json)?;
+        drop(conn);
+        let conflicting_command = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:cancel:cancellation-target:concurrent",
+            "expectedRevision": 1,
+            "definition": definition
+        })
+        .to_string();
+        let conflict = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&conflicting_command),
+        )?;
+        assert_eq!(conflict.status, 409, "{}", conflict.body);
+        assert!(
+            conflict
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            conflict.body
+        );
+
+        release_tx.send(())?;
+        let completed = first
+            .join()
+            .map_err(|_| anyhow::anyhow!("first cancellation request panicked"))??;
+        assert_eq!(completed.status, 200, "{}", completed.body);
+        let replayed = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(replayed.status, 200, "{}", replayed.body);
+        assert_eq!(runtime.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    struct BlockingTimeoutRuntime {
+        calls: std::sync::atomic::AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    struct TerminalDuringKillRuntime {
+        coven_home: std::path::PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionRuntime for TerminalDuringKillRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, session_id: &str) -> Result<()> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(call == 0, "duplicate runtime stop");
+            let conn = store::open_store(&store_path(&self.coven_home))?;
+            let stop_fences: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM automation_stop_fences
+                 WHERE session_id = ?1 AND owner = 'cancellation'",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                stop_fences == 1,
+                "cancellation must hold its stop fence before the terminal observation"
+            );
+            anyhow::ensure!(
+                store::update_session_terminal_if_active(
+                    &conn,
+                    session_id,
+                    "completed",
+                    Some(0),
+                    &current_timestamp(),
+                )?,
+                "the runtime race must terminalize an active session"
+            );
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_after_the_run_deadline_settles_as_timeout() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339()
+            ],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:past-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the overdue request must route through the timeout stop"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (String, String, String, Option<String>) = conn.query_row(
+            "SELECT r.status, o.state, a.state, a.failure_class
+                     FROM automation_runs AS r
+                     JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                     JOIN automation_attempts AS a ON a.run_id = r.id
+                     WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            lifecycle,
+            (
+                "failed".to_string(),
+                "failed".to_string(),
+                "timed_out".to_string(),
+                Some("timeout".to_string()),
+            )
+        );
         Ok(())
     }
 
     #[test]
-    fn health_request_adoption_contracts_are_additive_and_defaulted() -> anyhow::Result<()> {
-        let current = health_response(None);
-        let mut payload = serde_json::to_value(&current)?;
+    fn crash_after_stop_fence_never_reissues_cancellation_kill() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
 
-        assert_eq!(
-            payload["capabilities"]["requestAdoptionContracts"],
-            json!([crate::request_adoption::CONTRACT])
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:fence-crash",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
         );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop fence")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+                     SET execution_expires_at = ?2
+                     WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+                     SET execution_expires_at = ?2
+                     WHERE operation_key = ?1",
+            rusqlite::params!["adopt:cancel:cancellation-target:fence-crash", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
         assert_eq!(
-            payload["capabilities"]["executionBindingContracts"],
-            json!([crate::execution_binding::CONTRACT])
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired stop fence is an unknown external outcome"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_between_reconciliation_and_stop_fence_wins() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let hook_home = temp_dir.path().to_path_buf();
+        let hook_session = session_id.clone();
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+            move || {
+                let conn = store::open_store(&store_path(&hook_home)).unwrap();
+                let completed_at = current_timestamp();
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &hook_session,
+                    "completed",
+                    Some(0),
+                    &completed_at,
+                )
+                .unwrap());
+                assert_eq!(
+                    crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                        .unwrap()
+                        .succeeded,
+                    1
+                );
+            },
+        )));
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-before-fence",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
         assert!(
-            payload["daemon"].is_null(),
-            "daemon metadata must retain its null variant"
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        let history = cancellation_history(temp_dir.path())?;
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_authority_terminal_race_after_stop_fence_recovers_across_replays_and_restarts(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute_batch("DROP TRIGGER automation_run_authority_profile_immutable;")?;
+        conn.execute(
+            "UPDATE automation_runs
+             SET authority_profile = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                crate::automations::contract::authority::AUTHORITY_PROFILE
+            ],
+        )?;
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:authority-recovery",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "recover an authority-bound terminal session",
+        );
+        let runtime = TerminalDuringKillRuntime {
+            coven_home: temp_dir.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        for pass in 0..3 {
+            let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+            assert_eq!(recovered.status, 200, "pass {pass}: {}", recovered.body);
+            let recovered: Value = serde_json::from_str(&recovered.body)?;
+            assert_eq!(
+                recovered["event"]["payload"]["status"], "recovery_required",
+                "pass {pass}"
+            );
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            assert_eq!(
+                crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                    .map_err(anyhow::Error::msg)?,
+                crate::automations::runner::SettlementReport::default(),
+                "pass {pass}"
+            );
+            let lifecycle: (
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+            ) = conn.query_row(
+                "SELECT o.state, o.failure_reason, r.status, a.state, s.status, c.state,
+                        (SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = r.id),
+                        (
+                            SELECT outcome
+                            FROM automation_command_adoptions
+                            WHERE adoption_key = c.adoption_key
+                        )
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = a.session_id
+                 JOIN automation_cancellations AS c ON c.run_id = r.id
+                 WHERE r.id = ?1 AND a.id = ?2",
+                rusqlite::params![run_id, attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )?;
+            assert_eq!(
+                lifecycle,
+                (
+                    "recovery_required".to_string(),
+                    Some(
+                        "trusted runtime terminal evidence is required before Runtime Authority settlement"
+                            .to_string()
+                    ),
+                    "running".to_string(),
+                    "started".to_string(),
+                    "completed".to_string(),
+                    "recovery_required".to_string(),
+                    0,
+                    "committed".to_string(),
+                ),
+                "pass {pass}"
+            );
+            drop(conn);
+        }
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replay and restart must not reissue the runtime stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_terminal_race_after_stop_fence_remains_completion_won_across_replay(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:base-terminal-race",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "completion must remain authoritative",
+        );
+        let runtime = TerminalDuringKillRuntime {
+            coven_home: temp_dir.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        for pass in 0..3 {
+            let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+            assert_eq!(rejected.status, 422, "pass {pass}: {}", rejected.body);
+            let rejected: Value = serde_json::from_str(&rejected.body)?;
+            assert_eq!(
+                rejected["error"]["code"], "ILLEGAL_TRANSITION",
+                "pass {pass}"
+            );
+            assert_eq!(
+                rejected["error"]["message"],
+                "automation completion already won the cancellation race",
+                "pass {pass}"
+            );
+        }
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replay must preserve the completion-won cancellation rejection"
         );
 
-        payload["capabilities"]
-            .as_object_mut()
-            .expect("capabilities object")
-            .remove("requestAdoptionContracts");
-        let decoded: HealthResponse = serde_json::from_value(payload)?;
-        assert!(decoded.capabilities.request_adoption_contracts.is_empty());
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
         assert_eq!(
-            decoded.capabilities.execution_binding_contracts,
-            vec![crate::execution_binding::CONTRACT.to_string()]
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .succeeded,
+            1
+        );
+        let lifecycle: (String, String, String, String, String, i64, String) = conn.query_row(
+            "SELECT o.state, r.status, a.state, s.status, c.state,
+                    (SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = r.id),
+                    (
+                        SELECT outcome
+                        FROM automation_command_adoptions
+                        WHERE adoption_key = c.adoption_key
+                    )
+             FROM automation_runs AS r
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             JOIN sessions AS s ON s.id = a.session_id
+             JOIN automation_cancellations AS c ON c.run_id = r.id
+             WHERE r.id = ?1 AND a.id = ?2",
+            rusqlite::params![run_id, attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "completed".to_string(),
+                "rejected".to_string(),
+                0,
+                "rejected".to_string(),
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_authority_cancellation_recovery_resumes_after_recovery_state_crash_window(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute_batch("DROP TRIGGER automation_run_authority_profile_immutable;")?;
+        conn.execute(
+            "UPDATE automation_runs
+             SET authority_profile = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                crate::automations::contract::authority::AUTHORITY_PROFILE
+            ],
+        )?;
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:authority-recovery-crash",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "recover after authority state was held",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        crate::automations::runner::mark_terminal_stop_for_recovery(
+            &conn,
+            &run_id,
+            &session_id,
+            "cancellation stop outcome was not durably recorded",
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:authority-recovery-crash",
+                expired
+            ],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+             SET execution_expires_at = ?2
+             WHERE operation_key = ?1",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:authority-recovery-crash",
+                expired
+            ],
+        )?;
+        drop(conn);
+
+        for pass in 0..3 {
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let reconciled = crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &NoopSessionRuntime,
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(reconciled, i64::from(pass == 0) as usize, "pass {pass}");
+            drop(conn);
+
+            let recovered = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+            assert_eq!(recovered.status, 200, "pass {pass}: {}", recovered.body);
+            let recovered: Value = serde_json::from_str(&recovered.body)?;
+            assert_eq!(
+                recovered["event"]["payload"]["status"], "recovery_required",
+                "pass {pass}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn base_cancellation_recovery_preserves_known_terminal_completion() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:base-terminal-recovery",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "do not hide known completion",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        crate::automations::runner::mark_active_attempts_for_restart_reconciliation(
+            &conn,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-terminal-recovery",
+                expired
+            ],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+             SET execution_expires_at = ?2
+             WHERE operation_key = ?1",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-terminal-recovery",
+                expired
+            ],
+        )?;
+
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &NoopSessionRuntime,
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        drop(conn);
+
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+        let history = cancellation_history(temp_dir.path())?;
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["attempts"][0]["state"],
+            "succeeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn command_adoption_keys_cannot_alias_attempt_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let attempt_key: String = conn.query_row(
+            "SELECT adoption_key FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let cancel_body = cancellation_body(
+            &attempt_key,
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "must not alias attempt adoption",
+        );
+        let cancellation = post_cancellation(temp_dir.path(), &cancel_body, &NoopSessionRuntime)?;
+        assert_eq!(cancellation.status, 409, "{}", cancellation.body);
+        assert!(
+            cancellation
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            cancellation.body
+        );
+
+        let disable = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": attempt_key,
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "must not alias attempt adoption"
+        })
+        .to_string();
+        let definition = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable),
+        )?;
+        assert_eq!(definition.status, 409, "{}", definition.body);
+        assert!(
+            definition
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#),
+            "{}",
+            definition.body
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_adoption_keys_cannot_alias_command_keys() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, _session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let occurrence_id: String = conn.query_row(
+            "SELECT occurrence_id FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get(0),
+        )?;
+        let command_key = "adopt:cancel:cancellation-target:command-owned";
+        let now = current_timestamp();
+        conn.execute(
+            "INSERT INTO automation_command_reservations (
+                 adoption_key, request_digest, command, reserved_at
+             ) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![command_key, "digest", "cancel", now],
+        )?;
+
+        let error = conn
+            .execute(
+                "INSERT INTO automation_attempts (
+                     id, run_id, occurrence_id, attempt_number, adoption_key,
+                     occurrence_fence_generation, dispatch_generation, state,
+                     prior_attempt_number, prior_disposition, retry_classification,
+                     not_before, opened_at
+                 ) VALUES (?1, ?2, ?3, 2, ?4, 1, 0, 'adopted',
+                           1, 'failed', 'operator_retry', ?5, ?5)",
+                rusqlite::params![
+                    "attempt-command-key-alias",
+                    run_id,
+                    occurrence_id,
+                    command_key,
+                    now
+                ],
+            )
+            .expect_err("attempt insert must reject a command-owned adoption key");
+        assert!(
+            error
+                .to_string()
+                .contains("automation adoption key is already used by a command"),
+            "{error}"
+        );
+        Ok(())
+    }
+
+    impl SessionRuntime for BlockingTimeoutRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _: &str) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started.send(())?;
+            self.release
+                .lock()
+                .map_err(|_| anyhow::anyhow!("release channel mutex poisoned"))?
+                .recv()?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cancellation_defers_to_an_in_flight_timeout_stop() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let runtime = std::sync::Arc::new(BlockingTimeoutRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: started_tx,
+            release: std::sync::Mutex::new(release_rx),
+        });
+        let timeout_home = temp_dir.path().to_path_buf();
+        let timeout_runtime = std::sync::Arc::clone(&runtime);
+        let timeout = std::thread::spawn(move || -> anyhow::Result<Vec<String>> {
+            let conn = store::open_store(&store_path(&timeout_home))?;
+            crate::automations::runner::enforce_run_timeouts(
+                &conn,
+                timeout_runtime.as_ref(),
+                Utc::now() + chrono::Duration::minutes(31),
+            )
+            .map_err(anyhow::Error::msg)
+        });
+        started_rx.recv_timeout(std::time::Duration::from_secs(5))?;
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:timeout-owned",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, runtime.as_ref())?;
+        assert_eq!(rejected.status, 409, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"CANCEL_PENDING""#),
+            "{}",
+            rejected.body
+        );
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cancellation must not issue a second runtime stop"
+        );
+
+        release_tx.send(())?;
+        let failures = timeout
+            .join()
+            .map_err(|_| anyhow::anyhow!("timeout enforcement panicked"))??;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(runtime.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cancellation_consumes_a_valid_adoption_key() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let mut invalid: Value = serde_json::from_str(&cancellation_body(
+            "adopt:cancel:cancellation-target:invalid",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        ))?;
+        invalid["scope"] = json!("attempt");
+        let invalid_body = serde_json::to_string(&invalid)?;
+        let rejected = post_cancellation(temp_dir.path(), &invalid_body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+
+        invalid["scope"] = json!("run");
+        let corrected_body = serde_json::to_string(&invalid)?;
+        let replay_mismatch =
+            post_cancellation(temp_dir.path(), &corrected_body, &NoopSessionRuntime)?;
+        assert_eq!(replay_mismatch.status, 409, "{}", replay_mismatch.body);
+        let replay_mismatch: Value = serde_json::from_str(&replay_mismatch.body)?;
+        assert_eq!(replay_mismatch["error"]["code"], "ADOPTION_REPLAY_MISMATCH");
+        Ok(())
+    }
+
+    #[test]
+    fn expired_stopping_cancellation_never_reissues_the_runtime_stop() -> anyhow::Result<()> {
+        struct PanicKillRuntime {
+            home: std::path::PathBuf,
+            session_id: String,
+        }
+
+        impl SessionRuntime for PanicKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let conn = store::open_store(&store_path(&self.home))?;
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &self.session_id,
+                    "failed",
+                    Some(1),
+                    &current_timestamp(),
+                )?);
+                panic!("synthetic crash after the durable stopping transition")
+            }
+        }
+
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:crash-window",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let crashing_runtime = PanicKillRuntime {
+            home: temp_dir.path().to_path_buf(),
+            session_id: session_id.clone(),
+        };
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &crashing_runtime)
+        }));
+        assert!(
+            crashed.is_err(),
+            "the fixture must simulate a process crash"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:crash-window",
+                (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
+            ],
+        )?;
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let reconciled = crate::automations::cancellation::reconcile_expired_cancellations(
+            &conn,
+            &runtime,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            reconciled, 1,
+            "daemon reconciliation must consume the expired cancellation without client replay"
+        );
+        drop(conn);
+        let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(recovered.status, 200, "{}", recovered.body);
+        let recovered: Value = serde_json::from_str(&recovered.body)?;
+        assert_eq!(recovered["event"]["payload"]["status"], "recovery_required");
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an expired stopping lease represents an unknown outcome and must never repeat kill"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expired_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:requested-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(
+            crashed.is_err(),
+            "the fixture must leave a requested cancellation for recovery"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:requested-timeout",
+                expired
+            ],
+        )?;
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only timeout authority may stop the expired run"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:requested-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        drop(conn);
+
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(runtime.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn replayed_requested_cancellation_defers_to_timeout_authority() -> anyhow::Result<()> {
+        struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:replay-timeout",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash before durable stop ownership")
+        })));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }))
+        .is_err());
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:replay-timeout", expired],
+        )?;
+        drop(conn);
+
+        let runtime = CountingKillRuntime(std::sync::atomic::AtomicUsize::new(0));
+        let replay = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(replay.status, 422, "{}", replay.body);
+        assert!(
+            replay.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            replay.body
+        );
+        assert_eq!(
+            runtime.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the replay must route the stop through timeout authority"
+        );
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:replay-timeout"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_cancellation_executor_cannot_fence_timeout_recovery() -> anyhow::Result<()> {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-executor",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let executor_body = body.clone();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_stop_fence_clock_test_hook(Some(Box::new(
+                || Utc::now() + chrono::Duration::seconds(31),
+            )));
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &executor_body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let reconciled_at = Utc::now();
+        let expired = (reconciled_at - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'requested'",
+            rusqlite::params!["adopt:cancel:cancellation-target:stale-executor", expired],
+        )?;
+        let timeout_runtime = CountingKillRuntime(calls.clone());
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &timeout_runtime,
+                reconciled_at,
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        resume_tx.send(())?;
+        let stale_response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("stale cancellation executor panicked"))??;
+        assert_eq!(stale_response.status, 422, "{}", stale_response.body);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the stale cancellation executor must not issue a second stop"
+        );
+        let cancellation_fences: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_stop_fences
+             WHERE run_id = ?1 AND owner = 'cancellation'",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cancellation_fences, 0);
+        let states: (String, String) = conn.query_row(
+            "SELECT r.status, a.state
+             FROM automation_runs AS r
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(states, ("failed".into(), "timed_out".into()));
+        Ok(())
+    }
+
+    #[test]
+    fn paused_cancellation_executor_rechecks_deadline_before_stop_ownership() -> anyhow::Result<()>
+    {
+        #[derive(Clone)]
+        struct CountingKillRuntime(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+        impl SessionRuntime for CountingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:paused-deadline",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let (paused_tx, paused_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+        let home = temp_dir.path().to_path_buf();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let executor_runtime = CountingKillRuntime(calls.clone());
+        let executor = std::thread::spawn(move || {
+            crate::automations::cancellation::set_before_stop_fence_test_hook(Some(Box::new(
+                move || {
+                    paused_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                },
+            )));
+            post_cancellation(&home, &body, &executor_runtime)
+        });
+        paused_rx.recv()?;
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let expired = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_runs SET timeout_at = ?2 WHERE id = ?1",
+            rusqlite::params![run_id, expired],
+        )?;
+        resume_tx.send(())?;
+        let response = executor
+            .join()
+            .map_err(|_| anyhow::anyhow!("paused cancellation executor panicked"))??;
+        assert_eq!(response.status, 422, "{}", response.body);
+        assert!(
+            response.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            response.body
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the resumed executor must route the stop through timeout authority"
+        );
+        let states: (String, String, String, String) = conn.query_row(
+            "SELECT c.state, r.status, o.state, a.state
+             FROM automation_cancellations AS c
+             JOIN automation_runs AS r ON r.id = c.run_id
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.id = c.attempt_id
+             WHERE c.adoption_key = ?1",
+            ["adopt:cancel:cancellation-target:paused-deadline"],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            states,
+            (
+                "rejected".into(),
+                "failed".into(),
+                "failed".into(),
+                "timed_out".into()
+            )
         );
         Ok(())
     }
@@ -9455,28 +14619,6 @@ mod tests {
         assert_eq!(included.sessions[2].id, "oldest");
         assert!(included.sessions[2].archived_at.is_some());
         Ok(())
-    }
-
-    #[test]
-    fn builds_health_response() {
-        let response = health_response(None);
-
-        assert!(response.ok);
-        assert_eq!(response.api_version, COVEN_API_NAMED_VERSION);
-        assert_eq!(response.coven_version, COVEN_VERSION);
-        assert!(response.capabilities.sessions);
-        assert!(response.capabilities.events);
-        assert!(response.capabilities.travel);
-        assert!(response.capabilities.scheduler);
-        assert!(response.capabilities.hub);
-        assert!(response.capabilities.executor_dispatch);
-        assert_eq!(response.capabilities.event_cursor, "sequence");
-        assert!(response.capabilities.structured_errors);
-        assert!(response.capabilities.session_launch_policy);
-        assert_eq!(response.daemon, None);
-        assert_eq!(response.hub, None);
-        assert_eq!(response.event_writer, None);
-        assert_eq!(response.storage, None);
     }
 
     #[test]
@@ -10611,6 +15753,18 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let response = handle_request("GET", "/api/v1/capabilities", temp_dir.path(), None)?;
+        let body: Value = serde_json::from_str(&response.body)?;
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-automations/v1/capabilities.json"
+        ))?;
+        let automations = body["capabilities"]
+            .as_array()
+            .and_then(|capabilities| {
+                capabilities
+                    .iter()
+                    .find(|capability| capability["id"] == "coven.automations")
+            })
+            .expect("catalog includes coven.automations");
 
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""id":"coven.sessions""#));
@@ -10619,6 +15773,8 @@ mod tests {
         assert!(response.body.contains(r#""id":"coven.control.actions""#));
         assert!(response.body.contains(r#""id":"desktop.automation""#));
         assert!(response.body.contains(r#""policy":"requiresApproval""#));
+        assert_eq!(automations["variantNegotiation"], expected);
+        assert!(body.get("harness_capabilities").is_none());
         Ok(())
     }
 
@@ -10656,7 +15812,8 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let create_body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:daily-notes:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10684,8 +15841,58 @@ mod tests {
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""routine":"#));
         assert!(response.body.contains(r#""id":"daily-notes""#));
+        assert!(response.body.contains(r#""outcome":"committed""#));
 
-        let list_body = json!({ "action": "coven.automations.list" }).to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""outcome":"replayed""#));
+        assert!(response.body.contains(r#""firstCommittedAt":"#));
+        let replay_body: Value = serde_json::from_str(&response.body)?;
+        assert!(replay_body.get("event").is_none());
+
+        let conflicting_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:daily-notes:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "daily-notes",
+                "name": "Must not replace",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "familiarId": "charm",
+                "prompt": "Write the daily reflection."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&conflicting_create),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        assert!(response
+            .body
+            .contains(r#""committedCommand":"definition.create.v1""#));
+        assert!(response.body.contains(r#""committedRevision":1"#));
+
+        let list_body = json!({ "action": "coven.automations.definition.list.v1" }).to_string();
         let response = handle_request_with_body(
             "POST",
             "/api/v1/actions",
@@ -10695,9 +15902,12 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""routines":[{"#));
+        assert!(response
+            .body
+            .contains(r#""revisionById":{"daily-notes":1}"#));
 
         let get_body = json!({
-            "action": "coven.automations.get",
+            "action": "coven.automations.definition.get.v1",
             "id": "daily-notes"
         })
         .to_string();
@@ -10710,9 +15920,12 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""name":"Daily notes""#));
+        assert!(response.body.contains(r#""revision":1"#));
 
         let update_body = json!({
-            "action": "coven.automations.update",
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:daily-notes:0002",
+            "expectedRevision": 1,
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10740,7 +15953,9 @@ mod tests {
         assert!(response.body.contains(r#""status":"ACTIVE""#));
 
         let delete_body = json!({
-            "action": "coven.automations.delete",
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:delete:daily-notes:0003",
+            "expectedRevision": 2,
             "id": "daily-notes"
         })
         .to_string();
@@ -10753,6 +15968,392 @@ mod tests {
         )?;
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""deleted":true"#));
+
+        let get_tombstone_body = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "daily-notes"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&get_tombstone_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""revision":3"#));
+        assert!(response.body.contains(r#""tombstonedAt":"#));
+        assert!(response.body.contains(r#""id":"daily-notes""#));
+
+        let list_tombstones_body = json!({
+            "action": "coven.automations.definition.list.v1",
+            "includeTombstoned": true
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&list_tombstones_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response
+            .body
+            .contains(r#""revisionById":{"daily-notes":3}"#));
+        assert!(response
+            .body
+            .contains(r#""tombstonedAtById":{"daily-notes":"#));
+
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_control_actions_remain_request_and_response_compatible() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create = json!({
+            "action": "coven.automations.create",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-compatible",
+                "name": "Legacy",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Preserve the old request shape.",
+                "legacyExtension": { "ignored": true }
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert!(body.get("event").is_some());
+        assert!(body.get("result").is_none());
+        assert!(body["event"]["payload"].get("createdAt").is_some());
+        assert!(body["event"]["payload"].get("revision").is_none());
+        assert!(body["event"]["payload"]["routine"]
+            .get("legacyExtension")
+            .is_none());
+
+        let update = json!({
+            "action": "coven.automations.update",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-compatible",
+                "name": "Legacy revised",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 60,
+                "runtime": "coven-code",
+                "prompt": "Preserve the old update shape."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&update),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"]["routine"]["name"],
+            "Legacy revised"
+        );
+        assert!(body["event"]["payload"].get("updatedAt").is_some());
+        assert!(body["event"]["payload"].get("revision").is_none());
+
+        let delete = json!({
+            "action": "coven.automations.delete",
+            "id": "legacy-compatible"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"],
+            json!({ "id": "legacy-compatible", "deleted": true })
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"],
+            json!({ "id": "legacy-compatible", "deleted": false })
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["event"]["payload"]["routine"]["id"],
+            "legacy-compatible"
+        );
+        assert!(body["event"]["payload"].get("createdAt").is_some());
+
+        let get = json!({
+            "action": "coven.automations.get",
+            "id": "legacy-compatible"
+        })
+        .to_string();
+        let response =
+            handle_request_with_body("POST", "/api/v1/actions", temp_dir.path(), None, Some(&get))?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""id":"legacy-compatible""#));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_delete_cannot_erase_a_versioned_tombstone() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:retained-tombstone:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "retained-tombstone",
+                "name": "Retained",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Retain the tombstone."
+            }
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&create),
+            )?
+            .status,
+            200
+        );
+
+        let legacy_update = json!({
+            "action": "coven.automations.update",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "retained-tombstone",
+                "name": "Legacy overwrite",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not overwrite v1 authority."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_update),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response
+            .body
+            .contains("managed by the versioned authority API"));
+
+        let legacy_delete = json!({
+            "action": "coven.automations.delete",
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["deleted"], false);
+
+        let tombstone = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:retained-tombstone:0002",
+            "expectedRevision": 1,
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&tombstone),
+            )?
+            .status,
+            200
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_delete),
+        )?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["deleted"], false);
+
+        let get = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "retained-tombstone"
+        })
+        .to_string();
+        let response =
+            handle_request_with_body("POST", "/api/v1/actions", temp_dir.path(), None, Some(&get))?;
+        assert_eq!(response.status, 200);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["event"]["payload"]["revision"], 2);
+        assert!(body["event"]["payload"]["tombstonedAt"].is_string());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_recreate_advances_revision_and_rejects_stale_v1_cas() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let legacy_definition = |name: &str| {
+            json!({
+                "action": "coven.automations.create",
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": "legacy-aba",
+                    "name": name,
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Preserve identity generations."
+                }
+            })
+            .to_string()
+        };
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&legacy_definition("First generation")),
+            )?
+            .status,
+            200
+        );
+
+        let delete = json!({
+            "action": "coven.automations.delete",
+            "id": "legacy-aba"
+        })
+        .to_string();
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&delete),
+            )?
+            .status,
+            200
+        );
+        assert_eq!(
+            handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&legacy_definition("Second generation")),
+            )?
+            .status,
+            200
+        );
+
+        let stale_revise = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:legacy-aba:stale",
+            "expectedRevision": 1,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "legacy-aba",
+                "name": "Stale overwrite",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not overwrite the recreated identity."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&stale_revise),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""code":"REVISION_CONFLICT""#));
+        assert!(response.body.contains(r#""currentRevision":3"#));
+        assert!(!response.body.contains("Stale overwrite"));
         Ok(())
     }
 
@@ -10760,7 +16361,8 @@ mod tests {
     fn control_action_reports_launch_as_running_until_completion_evidence() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let create_body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:running-daily-notes:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "daily-notes",
@@ -10833,17 +16435,1083 @@ mod tests {
         Ok(())
     }
 
+    fn start_running_automation_for_cancellation(
+    ) -> anyhow::Result<(tempfile::TempDir, String, String, String)> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:cancellation-target:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "cancellation-target",
+                "name": "Cancellation target",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "retry": {
+                    "maxAttempts": 2,
+                    "backoffPolicy": "none",
+                    "retryableClasses": ["runtime_unavailable"]
+                },
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "familiarId": "charm",
+                "prompt": "Wait for cancellation."
+            }
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let started = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&run_body),
+        )?;
+        assert_eq!(started.status, 200, "{}", started.body);
+        let started: Value = serde_json::from_str(&started.body)?;
+        let run_id = started["event"]["payload"]["runId"]
+            .as_str()
+            .context("run action must return a run id")?
+            .to_string();
+        let session_id = started["event"]["payload"]["sessionId"]
+            .as_str()
+            .context("run action must return a runtime correlation")?
+            .to_string();
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        assert_eq!(history.status, 200, "{}", history.body);
+        let history: Value = serde_json::from_str(&history.body)?;
+        let attempt_id = history["event"]["payload"]["runs"][0]["attempts"][0]["id"]
+            .as_str()
+            .context("running automation must expose its current attempt")?
+            .to_string();
+        Ok((temp_dir, run_id, attempt_id, session_id))
+    }
+
+    fn cancellation_body(
+        adoption_key: &str,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+        reason: &str,
+    ) -> String {
+        json!({
+            "action": "coven.automations.run.cancel.v1",
+            "adoptionKey": adoption_key,
+            "runId": run_id,
+            "attemptId": attempt_id,
+            "runtimeCorrelation": { "sessionId": session_id },
+            "scope": "run",
+            "reason": reason,
+            "requestedBy": { "principalId": "operator:aria" }
+        })
+        .to_string()
+    }
+
+    fn post_cancellation(
+        coven_home: &std::path::Path,
+        body: &str,
+        runtime: &dyn SessionRuntime,
+    ) -> anyhow::Result<ApiResponse> {
+        handle_request_with_runtime(
+            "POST",
+            "/api/v1/actions",
+            coven_home,
+            None,
+            Some(body),
+            runtime,
+        )
+    }
+
+    fn cancellation_history(coven_home: &std::path::Path) -> anyhow::Result<Value> {
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            coven_home,
+            None,
+            Some(&history_body),
+        )?;
+        assert_eq!(history.status, 200, "{}", history.body);
+        Ok(serde_json::from_str(&history.body)?)
+    }
+
+    fn assert_rejected_cancellation_preserves_live_attempt(
+        coven_home: &std::path::Path,
+        rejected: ApiResponse,
+        run_id: &str,
+        attempt_id: &str,
+        session_id: &str,
+    ) -> anyhow::Result<()> {
+        assert_eq!(
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
+        );
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+
+        let history = cancellation_history(coven_home)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_attempt_without_corrupting_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-attempt",
+            &run_id,
+            "attempt-stale",
+            &session_id,
+            "stale attempt",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_runtime_correlation_without_corrupting_attempt(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-runtime",
+            &run_id,
+            &attempt_id,
+            "session-stale",
+            "stale runtime correlation",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_rejects_a_stale_run_without_corrupting_attempt_or_runtime_correlation(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:stale-run",
+            "run-stale",
+            &attempt_id,
+            &session_id,
+            "stale run",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_rejected_cancellation_preserves_live_attempt(
+            temp_dir.path(),
+            rejected,
+            &run_id,
+            &attempt_id,
+            &session_id,
+        )
+    }
+
+    #[test]
+    fn cancellation_persists_its_lifecycle_and_survives_definition_tombstone() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let cancel_body = cancellation_body(
+            "adopt:cancel:cancellation-target:0003",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let cancelled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(cancelled.status, 200, "{}", cancelled.body);
+        let cancelled: Value = serde_json::from_str(&cancelled.body)?;
+        let payload = &cancelled["event"]["payload"];
+        assert_eq!(payload["runId"], run_id);
+        assert_eq!(payload["attemptId"], attempt_id);
+        assert_eq!(payload["status"], "cancelled");
+        assert_eq!(
+            payload["cancellation"]["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(payload["cancellation"]["scope"], "run");
+        assert_eq!(
+            payload["cancellation"]["reason"],
+            "operator requested shutdown"
+        );
+        assert!(payload["cancellation"]["requestedAt"].is_string());
+        assert!(payload["cancellation"]["acknowledgedAt"].is_string());
+        assert!(payload["cancellation"]["reconciledAt"].is_string());
+        let requested_at = payload["cancellation"]["requestedAt"]
+            .as_str()
+            .context("cancellation must persist requestedAt")?;
+        let acknowledged_at = payload["cancellation"]["acknowledgedAt"]
+            .as_str()
+            .context("cancellation must persist acknowledgedAt")?;
+        let reconciled_at = payload["cancellation"]["reconciledAt"]
+            .as_str()
+            .context("cancellation must persist reconciledAt")?;
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(requested_at)?
+                <= chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                && chrono::DateTime::parse_from_rfc3339(acknowledged_at)?
+                    <= chrono::DateTime::parse_from_rfc3339(reconciled_at)?,
+            "cancellation lifecycle timestamps must be persisted in requested → acknowledged → reconciled order"
+        );
+
+        let replayed = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&cancel_body),
+        )?;
+        assert_eq!(replayed.status, 200, "{}", replayed.body);
+        let replayed: Value = serde_json::from_str(&replayed.body)?;
+        let replayed_cancellation = &replayed["event"]["payload"]["cancellation"];
+        assert_eq!(replayed_cancellation["requestedAt"], requested_at);
+        assert_eq!(replayed_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(replayed_cancellation["reconciledAt"], reconciled_at);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let persisted_history = &history["event"]["payload"]["runs"][0]["cancellation"];
+        assert_eq!(persisted_history["status"], "cancelled");
+        assert_eq!(persisted_history["scope"], "run");
+        assert_eq!(
+            persisted_history["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_history["reason"], "operator requested shutdown");
+        assert_eq!(persisted_history["requestedAt"], requested_at);
+        assert_eq!(persisted_history["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_history["reconciledAt"], reconciled_at);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let persisted_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'
+               AND command = 'run.cancel.v1'
+               AND automation_id = ?1
+               AND outcome = 'committed'",
+            ["cancellation-target"],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            persisted_adoptions, 1,
+            "the cancellation request must have exactly one durable adopted lifecycle record"
+        );
+        let persisted_response: String = conn.query_row(
+            "SELECT response_json FROM automation_command_adoptions
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:0003'",
+            [],
+            |row| row.get(0),
+        )?;
+        let persisted_response: Value = serde_json::from_str(&persisted_response)?;
+        let persisted_cancellation = &persisted_response["result"]["cancellation"];
+        assert_eq!(persisted_cancellation["requestedAt"], requested_at);
+        assert_eq!(persisted_cancellation["acknowledgedAt"], acknowledged_at);
+        assert_eq!(persisted_cancellation["reconciledAt"], reconciled_at);
+        assert_eq!(
+            persisted_cancellation["requestedBy"]["principalId"],
+            "operator:aria"
+        );
+        assert_eq!(persisted_cancellation["scope"], "run");
+        assert_eq!(
+            persisted_cancellation["reason"],
+            "operator requested shutdown"
+        );
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &current_timestamp(),
+            )?,
+            "a completion observed after cancellation must not rewrite its terminal session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?,
+            crate::automations::runner::SettlementReport::default(),
+            "a losing completion observation must not settle the cancelled run again"
+        );
+
+        let history_body = json!({
+            "action": "coven.automations.runs",
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let history = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&history_body),
+        )?;
+        let history: Value = serde_json::from_str(&history.body)?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "cancelled");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "cancelled");
+        assert_eq!(run["attempts"][0]["failureClass"], "cancelled");
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_runs: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_runs
+             WHERE id = ?1
+               AND status IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        let terminal_sessions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions
+             WHERE id = ?1
+               AND status IN ('completed', 'failed', 'cancelled', 'killed', 'idle')",
+            [&session_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_attempts, 1, "exactly one attempt may terminalize");
+        assert_eq!(terminal_runs, 1, "exactly one run may terminalize");
+        assert_eq!(
+            terminal_sessions, 1,
+            "exactly one session terminal evidence is allowed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_wins_over_late_cancellation_without_rewriting_terminal_evidence(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let completed_at = current_timestamp();
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(
+            store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "completed",
+                Some(0),
+                &completed_at,
+            )?,
+            "the first completion observation must terminalize the running session"
+        );
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .succeeded,
+            1
+        );
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-won",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "too late to cancel",
+        );
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(
+            rejected.status, 422,
+            "ILLEGAL_TRANSITION is pinned to HTTP 422 by the frozen v1 error map: {}",
+            rejected.body
+        );
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["status"], "succeeded");
+        assert_eq!(run["attempts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "succeeded");
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let terminal_attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts
+             WHERE run_id = ?1
+               AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'ambiguous')",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            terminal_attempts, 1,
+            "a losing cancel observation must not create another terminal attempt"
+        );
+        assert!(
+            !store::update_session_terminal_if_active(
+                &conn,
+                &session_id,
+                "cancelled",
+                None,
+                &current_timestamp(),
+            )?,
+            "a later cancellation observation must not rewrite completion"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completion_during_an_unconfirmed_stop_rejects_and_releases_the_cancellation(
+    ) -> anyhow::Result<()> {
+        struct CompletingKillRuntime {
+            home: std::path::PathBuf,
+            session_id: String,
+        }
+
+        impl SessionRuntime for CompletingKillRuntime {
+            fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+                Ok(())
+            }
+
+            fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _: &str) -> Result<()> {
+                let conn = store::open_store(&store_path(&self.home))?;
+                assert!(store::update_session_terminal_if_active(
+                    &conn,
+                    &self.session_id,
+                    "completed",
+                    Some(0),
+                    &current_timestamp(),
+                )?);
+                anyhow::bail!("runtime stop lost to terminal completion")
+            }
+        }
+
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:completion-during-stop",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "operator requested shutdown",
+        );
+        let runtime = CompletingKillRuntime {
+            home: temp_dir.path().to_path_buf(),
+            session_id,
+        };
+        let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        assert!(
+            rejected.body.contains(r#""code":"ILLEGAL_TRANSITION""#),
+            "{}",
+            rejected.body
+        );
+        let replayed = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(replayed.status, 422, "{}", replayed.body);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let state: String = conn.query_row(
+            "SELECT state FROM automation_cancellations WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(state, "rejected");
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_reservations
+             WHERE adoption_key = 'adopt:cancel:cancellation-target:completion-during-stop'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    struct UnconfirmedCancellationStopRuntime;
+
+    impl SessionRuntime for UnconfirmedCancellationStopRuntime {
+        fn launch_session(&self, _launch: &SessionLaunch) -> anyhow::Result<()> {
+            unreachable!("the cancellation test starts its run with the noop runtime")
+        }
+
+        fn send_input(
+            &self,
+            _session_id: &str,
+            _payload: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> anyhow::Result<()> {
+            anyhow::bail!("synthetic runtime did not confirm cancellation")
+        }
+    }
+
+    #[test]
+    fn cancellation_with_unconfirmed_runtime_stop_enters_recovery_without_retry(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:unconfirmed-stop",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "runtime has stopped responding",
+        );
+        let response =
+            post_cancellation(temp_dir.path(), &body, &UnconfirmedCancellationStopRuntime)?;
+        assert_eq!(response.status, 200, "{}", response.body);
+        let response: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            response["event"]["payload"]["status"], "recovery_required",
+            "an unconfirmed stop must remain explainably recoverable, not be reported cancelled"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let lifecycle: (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            String,
+        ) = conn.query_row(
+            "SELECT o.state, a.state, a.failure_class, a.state_reason, r.status, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE r.id = ?1",
+            [&run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        assert_eq!(lifecycle.0, "recovery_required");
+        assert_eq!(lifecycle.1, "ambiguous");
+        assert_eq!(lifecycle.2.as_deref(), Some("ambiguous_evidence"));
+        assert_eq!(
+            lifecycle.3.as_deref(),
+            Some("cancellation stop was not confirmed")
+        );
+        assert_eq!(lifecycle.4, "running");
+        assert_eq!(lifecycle.5, "running");
+        let attempts: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_attempts WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            attempts, 1,
+            "unconfirmed cancellation must not schedule an automatic retry even when retry is configured"
+        );
+        let timeout_failures = crate::automations::runner::enforce_run_timeouts(
+            &conn,
+            &NoopSessionRuntime,
+            Utc::now() + chrono::Duration::minutes(31),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(
+            timeout_failures.is_empty(),
+            "recovery-required work must not be stopped again by timeout enforcement"
+        );
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        let settlement = crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+            .map_err(anyhow::Error::msg)?;
+        assert_eq!(settlement.failed, 1);
+        let reconciled: (String, String, String, Option<String>, Option<String>) = conn.query_row(
+            "SELECT o.state, a.state, r.status, a.settled_at, r.finished_at
+             FROM automation_occurrences AS o
+             JOIN automation_runs AS r ON r.occurrence_id = o.id
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             WHERE r.id = ?1",
+            [&run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        assert_eq!(reconciled.0, "failed");
+        assert_eq!(
+            reconciled.1, "ambiguous",
+            "later evidence must not rewrite the immutable ambiguous attempt"
+        );
+        assert_eq!(reconciled.2, "failed");
+        assert_eq!(
+            reconciled.3, reconciled.4,
+            "ambiguous receipt correlation requires one terminal settlement timestamp"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabling_a_definition_stops_planning_without_rewriting_its_active_run() -> anyhow::Result<()>
+    {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            definition_status, "ACTIVE",
+            "the fixture must start active so its planning assertion is non-vacuous"
+        );
+        let before_disable = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_disable.planned.is_empty(),
+            "the active definition must plan a future occurrence before disable"
+        );
+        let planned_before_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let disable_body = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": "adopt:disable:cancellation-target:0002",
+            "expectedRevision": 1,
+            "id": "cancellation-target",
+            "reason": "operator disabled future runs"
+        })
+        .to_string();
+
+        let disabled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable_body),
+        )?;
+        assert_eq!(disabled.status, 200, "{}", disabled.body);
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let record = crate::automations::store::get_definition(&conn, "cancellation-target")?
+            .context("disabled definition must remain readable")?;
+        let mut revised_definition: Value = serde_json::from_str(&record.definition_json)?;
+        revised_definition["status"] = json!("ACTIVE");
+        drop(conn);
+        let revise_body = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:cancellation-target:disabled",
+            "expectedRevision": 2,
+            "definition": revised_definition
+        })
+        .to_string();
+        let rejected_reactivation = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&revise_body),
+        )?;
+        assert_eq!(
+            rejected_reactivation.status, 422,
+            "{}",
+            rejected_reactivation.body
+        );
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_status: String = conn.query_row(
+            "SELECT status FROM automation_definitions WHERE id = 'cancellation-target'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_status, "DISABLED");
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a disabled definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_disable: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_disable, planned_before_disable,
+            "disable must prevent future planning without rewriting the existing run"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_definitions_cannot_bypass_explicit_lifecycle_commands() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let definition = |id: &str, status: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Lifecycle guard",
+                "status": status,
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Preserve explicit lifecycle authority."
+            })
+        };
+        let legacy_create = json!({
+            "action": "coven.automations.create",
+            "definition": definition("legacy-lifecycle-guard", "ACTIVE")
+        })
+        .to_string();
+        let created = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_create),
+        )?;
+        assert_eq!(created.status, 200, "{}", created.body);
+
+        let disable = json!({
+            "action": "coven.automations.definition.disable.v1",
+            "adoptionKey": "adopt:disable:legacy-lifecycle-guard:0001",
+            "expectedRevision": 1,
+            "id": "legacy-lifecycle-guard"
+        })
+        .to_string();
+        let disabled = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&disable),
+        )?;
+        assert_eq!(disabled.status, 200, "{}", disabled.body);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute(
+            "UPDATE automation_definitions
+             SET lifecycle_state = 'draft'
+             WHERE id = 'legacy-lifecycle-guard' AND status = 'DISABLED'",
+            [],
+        )?;
+        drop(conn);
+
+        let legacy_reactivation = json!({
+            "action": "coven.automations.update",
+            "definition": definition("legacy-lifecycle-guard", "ACTIVE")
+        })
+        .to_string();
+        let rejected = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&legacy_reactivation),
+        )?;
+        assert_eq!(rejected.status, 400, "{}", rejected.body);
+
+        for (action, adoption_key, id, expected_status) in [
+            (
+                "coven.automations.create",
+                None,
+                "legacy-created-disabled",
+                400,
+            ),
+            (
+                "coven.automations.definition.create.v1",
+                Some("adopt:create:disabled-lifecycle-guard:0001"),
+                "v1-created-disabled",
+                422,
+            ),
+        ] {
+            let mut request = json!({
+                "action": action,
+                "definition": definition(id, "DISABLED")
+            });
+            if let Some(adoption_key) = adoption_key {
+                request["adoptionKey"] = json!(adoption_key);
+            }
+            let rejected = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&request.to_string()),
+            )?;
+            assert_eq!(rejected.status, expected_status, "{}", rejected.body);
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let status: String = conn.query_row(
+            "SELECT status FROM automation_definitions
+             WHERE id = 'legacy-lifecycle-guard'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "DISABLED");
+        Ok(())
+    }
+
+    #[test]
+    fn tombstoning_an_active_definition_stops_future_planning_without_rewriting_its_run(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let first_due_tick = Utc::now() + chrono::Duration::days(2);
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let before_tombstone = crate::automations::occurrences::tick(&conn, first_due_tick)?;
+        assert!(
+            !before_tombstone.planned.is_empty(),
+            "the active definition must plan before its tombstone is applied"
+        );
+        let planned_before_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        drop(conn);
+
+        let tombstone_body = json!({
+            "action": "coven.automations.definition.tombstone.v1",
+            "adoptionKey": "adopt:tombstone:cancellation-target:planning",
+            "expectedRevision": 1,
+            "id": "cancellation-target"
+        })
+        .to_string();
+        let tombstoned = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&tombstone_body),
+        )?;
+        assert_eq!(tombstoned.status, 200, "{}", tombstoned.body);
+
+        let history = cancellation_history(temp_dir.path())?;
+        let run = &history["event"]["payload"]["runs"][0];
+        assert_eq!(run["id"], run_id);
+        assert_eq!(run["sessionId"], session_id);
+        assert_eq!(run["status"], "running");
+        assert_eq!(run["attempts"][0]["id"], attempt_id);
+        assert_eq!(run["attempts"][0]["state"], "started");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let report = crate::automations::occurrences::tick(
+            &conn,
+            first_due_tick + chrono::Duration::days(2),
+        )?;
+        assert!(
+            report.planned.is_empty() && report.claimed.is_empty(),
+            "a tombstoned definition must not plan or claim future work: {report:?}"
+        );
+        let planned_after_tombstone: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_occurrences
+             WHERE automation_id = 'cancellation-target' AND kind = 'scheduled'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            planned_after_tombstone, planned_before_tombstone,
+            "tombstoning must retain in-flight history without creating future occurrences"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn control_action_rejects_stale_automation_revision_without_mutation() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let create_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:revision-guard:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revision-guard",
+                "name": "Original",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Keep the original."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&create_body),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let stale_update = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:revision-guard:stale",
+            "expectedRevision": 9,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revision-guard",
+                "name": "Must not land",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=10",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Do not persist."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&stale_update),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains(r#""code":"REVISION_CONFLICT""#));
+        assert!(response.body.contains(r#""currentRevision":1"#));
+
+        let get_body = json!({
+            "action": "coven.automations.definition.get.v1",
+            "id": "revision-guard"
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&get_body),
+        )?;
+        assert_eq!(response.status, 200);
+        assert!(response.body.contains(r#""name":"Original""#));
+        assert!(!response.body.contains("Must not land"));
+        Ok(())
+    }
+
     #[test]
     fn control_actions_reject_invalid_routine_definitions() -> anyhow::Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let body = json!({
-            "action": "coven.automations.create",
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:bad-schedule:0001",
             "definition": {
                 "schemaVersion": 1,
                 "id": "bad schedule!",
                 "name": "Bad",
                 "status": "PAUSED",
-                "rrule": "FREQ=HOURLY",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
                 "timezone": "local",
                 "misfire": "latest",
                 "overlap": "forbid",
@@ -10862,7 +17530,949 @@ mod tests {
         )?;
         assert_eq!(response.status, 400);
         assert!(response.body.contains(r#""accepted":false"#));
-        assert!(response.body.contains("coven.automations.create"));
+        assert!(response
+            .body
+            .contains("coven.automations.definition.create.v1"));
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+        assert!(!response.body.contains(r#""accepted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_preserve_validation_precedence_over_capability_refusal() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let complete_definition = json!({
+            "schemaVersion": 1,
+            "id": "validation-precedence",
+            "name": "Validation precedence",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "local",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Must not be stored."
+        });
+        let cases = [
+            ("partial", json!({"misfire": "backfill"})),
+            ("malformed-retry", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["retry"] = json!({
+                    "maxAttempts": 3,
+                    "backoffPolicy": ["linear"]
+                });
+                definition
+            }),
+            ("unknown-field", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["futureField"] = json!("must fail closed");
+                definition
+            }),
+            ("malformed-rich-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": [1]
+                    }
+                });
+                definition
+            }),
+            ("malformed-rich-schedule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "version": 1,
+                    "schedule": {
+                        "rrule": "FREQ=YEARLY;BYHOUR=not-a-number",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("missing-rich-schedule-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "schedule": {
+                        "rrule": "FREQ=DAILY",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("fixed-rich-retry-missing-seconds", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "fixed"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-flat-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["misfire"] = json!(" backfill ");
+                definition
+            }),
+            ("noncanonical-rich-union-discriminator", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": " webhook ",
+                    "version": 1,
+                    "webhook": {}
+                });
+                definition
+            }),
+            ("unsupported-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": "stream"
+                    }
+                });
+                definition
+            }),
+            ("bad-rich-delivery-target", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": 7,
+                        "mode": "atomic"
+                    }
+                });
+                definition
+            }),
+            ("rich-delivery-target-missing-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": " atomic "
+                    }
+                });
+                definition
+            }),
+            ("unsupported-rich-misfire", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "misfire": {"disposition": "backfill"}
+                });
+                definition
+            }),
+            ("unsupported-rich-concurrency", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "concurrency": {"overlap": "parallel"}
+                });
+                definition
+            }),
+            ("supported-rich-action-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["action"] = json!({
+                    "variant": "familiarInvocation",
+                    "prompt": "Run it."
+                });
+                definition
+            }),
+            ("unsupported-rich-condition-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["conditions"] = json!([{
+                    "variant": "branch",
+                    "branch": {"expression": "result.ok"}
+                }]);
+                definition
+            }),
+            ("malformed-rrule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+                definition
+            }),
+            ("malformed-retention", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": false}
+                    }
+                });
+                definition
+            }),
+        ];
+
+        for (case, definition) in cases {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:validation-precedence:{case}"),
+                "definition": definition
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 400, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "VALIDATION_FAILED", "{case}");
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_responses_and_adoptions_do_not_expose_secret_values(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let base_definition = |id: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Secret-free validation",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored."
+            })
+        };
+        let cases = [
+            (
+                "retryable-class",
+                "SECRET_RETRYABLE_CLASS must not escape",
+                {
+                    let mut definition = base_definition("secret-retryable-class");
+                    definition["retry"] = json!({
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["SECRET_RETRYABLE_CLASS must not escape"]
+                    });
+                    definition
+                },
+            ),
+            (
+                "union-discriminator",
+                "SECRET_UNION_DISCRIMINATOR must not escape",
+                {
+                    let mut definition = base_definition("secret-union-discriminator");
+                    definition["action"] = json!({
+                        "variant": "SECRET_UNION_DISCRIMINATOR must not escape",
+                        "version": 1
+                    });
+                    definition
+                },
+            ),
+            ("timezone", "SECRET_TIMEZONE must not escape", {
+                let mut definition = base_definition("secret-timezone");
+                definition["timezone"] = json!("SECRET_TIMEZONE must not escape");
+                definition
+            }),
+            ("rrule", "SECRET_RRULE_VALUE", {
+                let mut definition = base_definition("secret-rrule");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=SECRET_RRULE_VALUE");
+                definition
+            }),
+        ];
+
+        for (case, secret, invalid_definition) in cases {
+            for command_kind in ["create", "revise"] {
+                let target_id = format!("secret-free-{command_kind}-{case}");
+                let mut definition = invalid_definition.clone();
+                definition["id"] = json!(target_id);
+
+                if command_kind == "revise" {
+                    let setup = json!({
+                        "action": "coven.automations.definition.create.v1",
+                        "adoptionKey": format!("adopt:create:secret-free-setup-{case}:0001"),
+                        "definition": base_definition(&target_id)
+                    })
+                    .to_string();
+                    let response = handle_request_with_body(
+                        "POST",
+                        "/api/v1/actions",
+                        temp_dir.path(),
+                        None,
+                        Some(&setup),
+                    )?;
+                    assert_eq!(response.status, 200, "{case}: {}", response.body);
+                }
+
+                let adoption_key = format!("adopt:{command_kind}:secret-free-{case}:0001");
+                let mut request = json!({
+                    "action": format!(
+                        "coven.automations.definition.{command_kind}.v1"
+                    ),
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(1);
+                }
+                let request = request.to_string();
+
+                let first = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(first.status, 400, "{command_kind} {case}: {}", first.body);
+                let first_body: Value = serde_json::from_str(&first.body)?;
+                assert_eq!(
+                    first_body["error"]["code"], "VALIDATION_FAILED",
+                    "{command_kind} {case}"
+                );
+                assert_eq!(
+                    first_body["error"]["message"], "automation definition failed validation",
+                    "{command_kind} {case}"
+                );
+                assert!(
+                    !first.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+                assert!(
+                    !first.body.contains("CAPABILITY_UNSUPPORTED"),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+
+                let replay = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(replay.status, 400, "{command_kind} {case}: {}", replay.body);
+                assert_eq!(
+                    replay.body, first.body,
+                    "{command_kind} {case} replay changed"
+                );
+                assert!(
+                    !replay.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    replay.body
+                );
+
+                let conn = store::open_store(&store_path(temp_dir.path()))?;
+                let adoption_json: String = conn.query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    !adoption_json.contains(secret),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+                assert!(
+                    adoption_json.contains("automation definition failed validation"),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_replay_scrubs_legacy_secret_bearing_storage() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-api-{command_kind}");
+            let definition = json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Legacy validation replay",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "invalid legacy timezone",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not run."
+            });
+            let action = format!("coven.automations.definition.{command_kind}.v1");
+            let source_key = format!("adopt:{command_kind}:legacy-secret-source:0001");
+            let replay_key = format!("adopt:{command_kind}:legacy-secret-replay:0001");
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let request_for = |adoption_key: &str, definition: Value| {
+                let mut request = json!({
+                    "action": action,
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(7);
+                }
+                request
+            };
+            let source_request = request_for(&source_key, definition.clone()).to_string();
+            let source = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&source_request),
+            )?;
+            assert_eq!(source.status, 400, "{command_kind}: {}", source.body);
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let request_digest: String = conn.query_row(
+                "SELECT request_digest
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )?;
+            let secret = format!("SECRET_{command_kind}_API_VALIDATION_VALUE");
+            let legacy_response = json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": "VALIDATION_FAILED",
+                    "httpStatus": 400,
+                    "message": format!("legacy validation exposed {secret}"),
+                    "retryable": true,
+                    "details": {"submittedValue": secret},
+                    "adoption": {
+                        "key": replay_key,
+                        "conflictOutcome": "rejected"
+                    },
+                    "currentRevision": 4
+                }
+            })
+            .to_string();
+            for adoption_key in [&replay_key, &mismatch_key] {
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, request_digest, command, automation_id, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                    rusqlite::params![
+                        adoption_key,
+                        request_digest,
+                        format!("definition.{command_kind}.v1"),
+                        id,
+                        legacy_response,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )?;
+            }
+            drop(conn);
+
+            let exact_request = request_for(&replay_key, definition.clone()).to_string();
+            let replay = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(replay.status, 400, "{command_kind}: {}", replay.body);
+            let replay_body: Value = serde_json::from_str(&replay.body)?;
+            assert_eq!(replay_body["error"]["code"], "VALIDATION_FAILED");
+            assert_eq!(
+                replay_body["error"]["message"],
+                "automation definition failed validation"
+            );
+            assert_eq!(replay_body["error"]["retryable"], false);
+            assert_eq!(replay_body["error"]["currentRevision"], 4);
+            assert!(replay_body["error"].get("details").is_none());
+            assert!(replay_body["error"].get("adoption").is_none());
+            assert!(!replay.body.contains(&secret));
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let sanitized_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert!(!sanitized_response.contains(&secret));
+            drop(conn);
+
+            let repeated = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(repeated.body, replay.body);
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let repeated_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(repeated_response, sanitized_response);
+            drop(conn);
+
+            let mut changed_definition = definition;
+            changed_definition["prompt"] = json!("Changed request.");
+            let mismatch_request = request_for(&mismatch_key, changed_definition).to_string();
+            let mismatch = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&mismatch_request),
+            )?;
+            assert_eq!(mismatch.status, 409, "{command_kind}: {}", mismatch.body);
+            assert!(mismatch
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let unchanged_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&mismatch_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(unchanged_response, legacy_response);
+            assert!(unchanged_response.contains(&secret));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_refuse_unsupported_rich_policy_variants() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        for (case, policies, expected_variant) in [
+            (
+                "retry-class",
+                json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["runtime_unavailable", "ambiguous"]
+                    }
+                }),
+                "retry.safe-classes.ambiguous",
+            ),
+            (
+                "retention",
+                json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": "standard"},
+                        "runLogs": {"classification": "ephemeral"}
+                    }
+                }),
+                "retention.ephemeral",
+            ),
+        ] {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:unsupported-policy:{case}"),
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": format!("unsupported-policy-{case}"),
+                    "name": "Unsupported policy",
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Must not be stored.",
+                    "policies": policies
+                }
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 422, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "CAPABILITY_UNSUPPORTED", "{case}");
+            assert_eq!(
+                body["error"]["details"]["variant"], expected_variant,
+                "{case}"
+            );
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_durably_reject_unsupported_create_and_revise_variants() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let unsupported_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsupported-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsupported-create-http",
+                "name": "Unsupported create",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "outputTarget": "result.md",
+                "prompt": "Must not be stored."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_create: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_create["ok"], false);
+        assert_eq!(first_create["accepted"], false);
+        assert_eq!(first_create["status"], "rejected");
+        assert_eq!(first_create["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_create["error"]["message"],
+            "automation definition uses a variant not supported by the negotiated contract profile"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["variant"],
+            "outputTarget.atomic"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_create.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_create);
+
+        let mut changed_create = unsupported_create.clone();
+        changed_create["definition"]["outputTarget"] = json!("different.md");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_create.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let valid_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:revise-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Original",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Original prompt."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&valid_create.to_string()),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let unsupported_revise = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:unsupported-http:0002",
+            "expectedRevision": 1,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Must not land",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored.",
+                "action": {
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "First step"}]
+                }
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_revise: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_revise["ok"], false);
+        assert_eq!(first_revise["accepted"], false);
+        assert_eq!(first_revise["status"], "rejected");
+        assert_eq!(first_revise["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_revise["error"]["details"]["variant"],
+            "action.pipeline"
+        );
+        assert_eq!(
+            first_revise["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_revise.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_revise);
+
+        let mut changed_revise = unsupported_revise;
+        changed_revise["definition"]["action"]["variant"] = json!("batch");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition = crate::automations::store::get_definition(&conn, "revise-http")?
+            .expect("original definition remains");
+        assert_eq!(definition.revision, 1);
+        assert!(definition.definition_json.contains(r#""name":"Original""#));
+        assert!(
+            crate::automations::store::get_definition(&conn, "unsupported-create-http")?.is_none()
+        );
+        let definition_events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_events
+             WHERE stream_kind = 'automation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_events, 1);
+        let rejected_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE outcome = 'rejected'
+               AND adoption_key IN (
+                   'adopt:create:unsupported-http:0001',
+                   'adopt:revise:unsupported-http:0002'
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rejected_adoptions, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_durably_reject_unsafe_integer_definitions() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsafe-integer:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsafe-integer",
+                "name": "Unsafe integer",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 9_007_199_254_740_992_u64,
+                "runtime": "coven-code",
+                "prompt": "Never runs."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&body),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""accepted":false"#));
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+
+        let corrected = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsafe-integer:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsafe-integer",
+                "name": "Corrected",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Still must use a new key."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&corrected),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_versioned_commands_reserve_their_adoption_keys() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let adoption_key = "adopt:create:malformed-shape:0001";
+        let malformed = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": adoption_key,
+            "definition": []
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&malformed),
+        )?;
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
+
+        let corrected = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": adoption_key,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "malformed-shape",
+                "name": "Corrected",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must use a new adoption key."
+            }
+        })
+        .to_string();
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&corrected),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+        assert!(response.body.contains(r#""committedOutcome":"rejected""#));
         Ok(())
     }
 
@@ -11712,6 +19322,18 @@ mod tests {
         Ok(count.try_into()?)
     }
 
+    fn assert_adopted_launch_store_ready(coven_home: &Path) -> anyhow::Result<()> {
+        // Unlike open_store, this cannot hide cold-start migration work in a
+        // request-readiness deadline. Real daemon startup initializes first.
+        let conn = store::open_initialized_store(&store_path(coven_home))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
     fn assert_adoption_error(
         response: &ApiResponse,
         status: u16,
@@ -12162,6 +19784,8 @@ mod tests {
     fn adopted_launch_concurrent_replay_observes_committed_created() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let body = adopted_launch_body(
@@ -12296,6 +19920,8 @@ mod tests {
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let git = std::process::Command::new("git")
@@ -18798,6 +26424,325 @@ id = "size-delta"
     }
 
     #[test]
+    fn threads_proposal_count_quota_rejects_before_publication_or_target_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        for _ in 0..64 {
+            stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+        }
+
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        let response = handle_request_with_runtime_and_authority(
+            "POST",
+            "/api/v1/familiars/sage/edits",
+            home,
+            None,
+            Some(r#"{"edits":[{"target":"reviewed/skill.md","contents":"must not publish"}]}"#),
+            &NoopSessionRuntime,
+            RequestAuthority::Tcp,
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "proposal_quota_exceeded");
+        assert_eq!(body["error"]["details"]["limit"], "pendingProposalCount");
+        assert_eq!(body["error"]["details"]["currentCount"], 64);
+        assert_eq!(body["error"]["details"]["attemptedCount"], 65);
+        assert_eq!(body["error"]["details"]["maxCount"], 64);
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(body["error"]["details"]["retrySafe"], true);
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+
+        let entries = std::fs::read_dir(home.join("pending"))?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|name| name.ends_with(".json"))
+                .count(),
+            64
+        );
+        assert!(
+            entries.iter().all(|name| !name.ends_with(".staged")),
+            "quota rejection must clean every staging file: {entries:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_listing_is_bounded_and_cursor_paginated() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let mut expected = std::collections::BTreeSet::new();
+        for _ in 0..5 {
+            let (_, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            expected.insert(proposal_id);
+        }
+
+        let first = handle_request("GET", "/api/v1/threads/proposals?limit=2", home, None)?;
+        assert_eq!(first.status, 200, "got {}", first.body);
+        let first: Value = serde_json::from_str(&first.body)?;
+        assert_eq!(first["proposals"].as_array().map(Vec::len), Some(2));
+        assert_eq!(first["limit"], 2);
+        assert_eq!(first["hasMore"], true);
+        let first_cursor = first["nextCursor"]
+            .as_str()
+            .context("first page carries a cursor")?;
+
+        let repeated = handle_request("GET", "/api/v1/threads/proposals?limit=2", home, None)?;
+        let repeated: Value = serde_json::from_str(&repeated.body)?;
+        assert_eq!(repeated["proposals"], first["proposals"]);
+        assert_eq!(repeated["nextCursor"], first["nextCursor"]);
+
+        let second = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals?limit=2&cursor={first_cursor}"),
+            home,
+            None,
+        )?;
+        let second: Value = serde_json::from_str(&second.body)?;
+        assert_eq!(second["proposals"].as_array().map(Vec::len), Some(2));
+        assert_eq!(second["hasMore"], true);
+        let second_cursor = second["nextCursor"]
+            .as_str()
+            .context("second page carries a cursor")?;
+
+        let third = handle_request(
+            "GET",
+            &format!("/api/v1/threads/proposals?limit=2&cursor={second_cursor}"),
+            home,
+            None,
+        )?;
+        let third: Value = serde_json::from_str(&third.body)?;
+        assert_eq!(third["proposals"].as_array().map(Vec::len), Some(1));
+        assert_eq!(third["hasMore"], false);
+        assert!(third["nextCursor"].is_null());
+
+        let listed: std::collections::BTreeSet<String> = [&first, &second, &third]
+            .into_iter()
+            .flat_map(|page| {
+                page["proposals"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|proposal| proposal["proposalId"].as_str().map(str::to_owned))
+            })
+            .collect();
+        assert_eq!(listed, expected);
+
+        let invalid = handle_request("GET", "/api/v1/threads/proposals?limit=65", home, None)?;
+        assert_eq!(invalid.status, 400);
+        let invalid: Value = serde_json::from_str(&invalid.body)?;
+        assert_eq!(invalid["error"]["code"], "invalid_request");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_listing_validates_page_options_when_directory_is_missing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+
+        let empty = handle_request(
+            "GET",
+            "/api/v1/threads/proposals?limit=2",
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(empty.status, 200, "got {}", empty.body);
+        let empty: Value = serde_json::from_str(&empty.body)?;
+        assert_eq!(empty["proposals"], json!([]));
+        assert_eq!(empty["limit"], 2);
+
+        let invalid = handle_request(
+            "GET",
+            "/api/v1/threads/proposals?limit=65",
+            temp.path(),
+            None,
+        )?;
+        assert_eq!(invalid.status, 400, "got {}", invalid.body);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_listing_quarantines_only_the_requested_hostile_page() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        for index in 0..100 {
+            std::fs::write(pending.join(format!("hostile-{index:03}.json")), b"{")?;
+        }
+
+        let response = handle_request("GET", "/api/v1/threads/proposals?limit=3", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposals"].as_array().map(Vec::len), Some(3));
+        assert!(body["proposals"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|proposal| proposal["degraded"]["reason"] == "proposal-unparseable"));
+        assert_eq!(body["hasMore"], true);
+        assert!(body["nextCursor"].is_string());
+        let remaining = std::fs::read_dir(&pending)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json"))
+            })
+            .count();
+        assert_eq!(remaining, 97);
+        assert_eq!(std::fs::read_dir(pending.join("quarantine"))?.count(), 3);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_pending_name(prefix: &str, suffix: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut name = prefix.as_bytes().to_vec();
+        name.push(0xff);
+        name.extend_from_slice(suffix);
+        std::ffi::OsString::from_vec(name)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn threads_proposal_listing_quarantines_non_utf8_active_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (valid, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let pending = home.join("pending");
+        let invalid = pending.join(non_utf8_pending_name("invalid-", b".json"));
+        if let Err(error) = std::fs::write(&invalid, b"{}") {
+            if error.raw_os_error() == Some(92) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+
+        let response = handle_request("GET", "/api/v1/threads/proposals", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposals"].as_array().map(Vec::len), Some(1));
+        assert_eq!(body["proposals"][0]["proposalId"], proposal_id);
+        assert!(valid.exists());
+        assert!(std::fs::symlink_metadata(&invalid).is_err());
+        assert_eq!(std::fs::read_dir(pending.join("quarantine"))?.count(), 1);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn threads_proposal_listing_quarantines_dangling_symlink_without_following_it() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        let hostile = pending.join("hostile.json");
+        symlink(home.join("missing-private-target"), &hostile)?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals?limit=1", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["proposals"][0]["degraded"]["quarantined"], true);
+        assert!(std::fs::symlink_metadata(&hostile).is_err());
+        assert_eq!(std::fs::read_dir(pending.join("quarantine"))?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_listing_quarantines_global_oversize_from_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        let hostile = pending.join("oversized.json");
+        let file = std::fs::File::create(&hostile)?;
+        file.set_len(crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1)?;
+
+        let response = handle_request("GET", "/api/v1/threads/proposals?limit=1", home, None)?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(
+            body["proposals"][0]["degraded"],
+            json!({
+                "file": "oversized.json",
+                "reason": "proposal-unparseable",
+                "quarantined": true,
+            })
+        );
+        assert!(!hostile.exists());
+        let quarantined = std::fs::read_dir(pending.join("quarantine"))?
+            .next()
+            .transpose()?
+            .context("oversized proposal was quarantined")?;
+        assert_eq!(
+            std::fs::metadata(quarantined.path())?.len(),
+            crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantining_invalid_proposal_releases_count_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (template_path, _) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let template = std::fs::read(&template_path)?;
+        std::fs::remove_file(template_path)?;
+        let pending = home.join("pending");
+        std::fs::write(pending.join("aaaa-corrupt.json"), b"{")?;
+        write_pending_quota_fillers(home, &template, 63, "zzzz-quarantine")?;
+
+        let full = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"blocked"}]}"#,
+        )?;
+        assert_eq!(full.status, 413, "got {}", full.body);
+
+        let listed = handle_request("GET", "/api/v1/threads/proposals?limit=1", home, None)?;
+        assert_eq!(listed.status, 200, "got {}", listed.body);
+        let listed: Value = serde_json::from_str(&listed.body)?;
+        assert_eq!(listed["proposals"][0]["degraded"]["quarantined"], true);
+
+        let admitted = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"admitted"}]}"#,
+        )?;
+        assert_eq!(
+            admitted.status, 202,
+            "quarantined capacity must be reusable: {}",
+            admitted.body
+        );
+        Ok(())
+    }
+
+    #[test]
     fn threads_proposals_renders_validated_phase5_scheduler_state() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -19180,7 +27125,7 @@ id = "size-delta"
     /// Seed a warded sage: familiars.toml plus a workspace carrying a
     /// ward.toml with SOUL.md protected (tier 0), reviewed/ tier 1, and the
     /// default tier 2 everywhere else. Returns the workspace path.
-    fn seed_warded_familiar(home: &Path) -> Result<std::path::PathBuf> {
+    pub(crate) fn seed_warded_familiar(home: &Path) -> Result<std::path::PathBuf> {
         seed_familiars_toml(home)?;
         let workspace = home.join("familiars").join("sage");
         std::fs::create_dir_all(&workspace)?;
@@ -19211,7 +27156,7 @@ forbidden = ["(?i)ignore previous"]
         Ok(workspace)
     }
 
-    fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
+    pub(crate) fn post_edits(home: &Path, body: &str) -> Result<ApiResponse> {
         handle_request_with_body(
             "POST",
             "/api/v1/familiars/sage/edits",
@@ -19219,6 +27164,140 @@ forbidden = ["(?i)ignore previous"]
             None,
             Some(body),
         )
+    }
+
+    pub(super) fn saturate_ward_audit_capacity(home: &Path) -> Result<i64> {
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let used: i64 = conn.query_row(
+            "SELECT used_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let limit = used.max(1);
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1, used_bytes = ?1
+             WHERE singleton = 1",
+            [limit],
+        )?;
+        Ok(limit)
+    }
+
+    pub(super) fn direct_ward_audit_reservation_bytes(
+        home: &Path,
+        body_bytes: usize,
+        edit_count: usize,
+    ) -> Result<i64> {
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let row_overhead: i64 = conn.query_row(
+            "SELECT row_overhead_bytes
+             FROM coven_ward_audit_capacity
+             WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let rows = edit_count
+            .checked_mul(2)
+            .and_then(|rows| rows.checked_add(1))
+            .context("test audit row reservation overflowed")?;
+        i64::try_from(body_bytes)?
+            .checked_mul(2)
+            .and_then(|body| {
+                i64::try_from(rows)
+                    .ok()
+                    .and_then(|rows| rows.checked_mul(row_overhead + 4096))
+                    .and_then(|row_bytes| body.checked_add(row_bytes))
+            })
+            .context("test audit byte reservation overflowed")
+    }
+
+    fn expand_pending_edits(path: &Path, count: usize) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let template = value["edits"]
+            .as_array()
+            .and_then(|edits| edits.first())
+            .cloned()
+            .context("pending proposal has an edit template")?;
+        let edits = (0..count)
+            .map(|index| {
+                let mut edit = template.clone();
+                edit["surface"] = json!(if index == 0 {
+                    "reviewed/skill.md".to_string()
+                } else {
+                    format!("reviewed/hostile-{index}.md")
+                });
+                edit
+            })
+            .collect();
+        value["edits"] = Value::Array(edits);
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(())
+    }
+
+    fn replace_first_pending_contents(path: &Path, contents: String) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        value["edits"][0]["contents"] = json!({
+            "encoding": "utf8",
+            "data": contents,
+        });
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(())
+    }
+
+    fn expand_materialized_surfaces(path: &Path, count: usize) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let template = value["materialized_diff"]["surfaces"]
+            .as_array()
+            .and_then(|surfaces| surfaces.first())
+            .cloned()
+            .context("scheduled proposal has a materialized surface template")?;
+        let surfaces = (0..count)
+            .map(|index| {
+                let mut surface = template.clone();
+                surface["surface"] = json!(if index == 0 {
+                    "reviewed/skill.md".to_string()
+                } else {
+                    format!("reviewed/hostile-{index}.md")
+                });
+                surface
+            })
+            .collect();
+        value["materialized_diff"]["surfaces"] = Value::Array(surfaces);
+        std::fs::write(path, serde_json::to_vec(&value)?)?;
+        Ok(())
+    }
+
+    fn write_hostile_materialized_after(path: &Path, after_bytes: u64) -> Result<()> {
+        let file = std::fs::File::create(path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(
+            br#"{"pending":{"edits":[{"surface":"reviewed/skill.md","contents":{"encoding":"utf8","data":"x"}}]},"materialized_diff":{"surfaces":[{"surface":"reviewed/skill.md","before":[],"after":["#,
+        )?;
+        if after_bytes > 0 {
+            writer.write_all(b"0")?;
+            let repeated = b",0".repeat(8 * 1024);
+            let mut remaining = after_bytes - 1;
+            while remaining >= 8 * 1024 {
+                writer.write_all(&repeated)?;
+                remaining -= 8 * 1024;
+            }
+            writer.write_all(&repeated[..usize::try_from(remaining)? * 2])?;
+        }
+        writer.write_all(b"]}]}}")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn claim_pending_for_approval(path: &Path) -> Result<PathBuf> {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("pending proposal filename is UTF-8")?;
+        let claim = path.with_file_name(format!("{file_name}.approve.deciding"));
+        std::fs::rename(path, &claim)?;
+        Ok(claim)
     }
 
     #[test]
@@ -19248,6 +27327,1459 @@ forbidden = ["(?i)ignore previous"]
             std::fs::read_to_string(workspace.join("notes/today.md"))?,
             "hello ward"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_returns_413_and_writes_nothing_for_oversized_before_image() -> Result<()>
+    {
+        const EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX: u64 = 16 * 1024 * 1024;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("scratch"))?;
+        let oversized = workspace.join("scratch/large.bin");
+        std::fs::File::create(&oversized)?.set_len(EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/earlier.txt","contents":"must not commit"},
+                {"target":"scratch/large.bin","contents":"replacement"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(
+            body["error"]["details"]["limit"],
+            "existingBeforeImageBytes"
+        );
+        assert_eq!(
+            body["error"]["details"]["maxBytes"],
+            EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX
+        );
+        assert_eq!(body["error"]["details"]["target"], "scratch/large.bin");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(!workspace.join("notes/earlier.txt").exists());
+        assert_eq!(
+            std::fs::metadata(&oversized)?.len(),
+            EXPECTED_DIRECT_BATCH_RETAINED_BYTES_MAX + 1
+        );
+        assert!(
+            std::fs::read_dir(workspace.join("scratch"))?.all(|entry| {
+                !entry
+                    .map(|entry| entry.file_name().to_string_lossy().contains(".ward-"))
+                    .unwrap_or(false)
+            }),
+            "limit rejection must not leave staging artifacts"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_returns_413_and_writes_nothing_above_direct_edit_count_limit(
+    ) -> Result<()> {
+        const EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX: usize = 32;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let existing = workspace.join("notes/existing.txt");
+        std::fs::write(&existing, "before")?;
+        let mut edits = vec![json!({
+            "target": "notes/existing.txt",
+            "contents": "must not commit",
+        })];
+        edits.extend((1..=EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX).map(|index| {
+            json!({
+                "target": format!("batch/edit-{index}.txt"),
+                "contents": "",
+            })
+        }));
+
+        let response = post_edits(home, &json!({ "edits": edits }).to_string())?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+        assert_eq!(
+            body["error"]["details"]["attemptedEdits"],
+            EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX + 1
+        );
+        assert_eq!(
+            body["error"]["details"]["maxEdits"],
+            EXPECTED_DIRECT_BATCH_EDIT_COUNT_MAX
+        );
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read_to_string(existing)?, "before");
+        assert!(
+            !workspace.join("batch").exists(),
+            "count rejection must occur before preparing target parents"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_huge_empty_list_before_gate2_or_staging() -> Result<()> {
+        use std::fmt::Write as _;
+
+        const HOSTILE_EDIT_COUNT: usize = 100_000;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let mut request = String::with_capacity(crate::daemon::MAX_SOCKET_BODY_BYTES);
+        request.push_str("{\"edits\":[");
+        for index in 0..HOSTILE_EDIT_COUNT {
+            if index != 0 {
+                request.push(',');
+            }
+            write!(request, "{{\"target\":\"r/{index:x}\",\"contents\":\"\"}}")?;
+        }
+        request.push_str("]}");
+        assert!(
+            request.len() <= crate::daemon::MAX_SOCKET_BODY_BYTES,
+            "regression fixture must fit under the framework body cap"
+        );
+        ward::reset_evaluate_call_count();
+
+        let response = post_edits(home, &request)?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+        assert_eq!(
+            body["error"]["details"]["attemptedEdits"],
+            HOSTILE_EDIT_COUNT
+        );
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(
+            ward::evaluate_call_count(),
+            0,
+            "the shared edit budget must run before Ward Gate 2"
+        );
+        assert!(
+            !home.join("pending").exists(),
+            "oversized requests must not stage a proposal"
+        );
+        assert!(
+            !home.join("coven.sqlite3").exists(),
+            "oversized requests must not open the gate or audit store"
+        );
+        assert!(!workspace.join("r").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_accepts_exact_shared_count_with_one_tier1_edit() -> Result<()> {
+        const EXPECTED_WARD_EDIT_COUNT_MAX: usize = 32;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let mut edits = vec![json!({
+            "target": "reviewed/skill.md",
+            "contents": "held",
+        })];
+        edits.extend((0..EXPECTED_WARD_EDIT_COUNT_MAX - 1).map(|index| {
+            json!({
+                "target": format!("notes/lower-{index}.md"),
+                "contents": "",
+            })
+        }));
+
+        let response = post_edits(home, &json!({ "edits": edits }).to_string())?;
+
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["disposition"], "staged");
+        assert_eq!(body["reviewKind"], "coherence");
+        let pending_path = PathBuf::from(body["pendingPath"].as_str().context("pendingPath")?);
+        let pending: coven_threads_core::PendingProposal =
+            serde_json::from_slice(&std::fs::read(pending_path)?)?;
+        assert_eq!(pending.edits.len(), EXPECTED_WARD_EDIT_COUNT_MAX);
+        assert!(
+            !workspace.join("notes").exists(),
+            "held mixed-tier requests must not apply lower-tier edits"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rejects_one_tier1_plus_32_or_33_lower_tier_edits() -> Result<()> {
+        const EXPECTED_WARD_EDIT_COUNT_MAX: usize = 32;
+
+        for lower_tier_edits in [32, 33] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let workspace = seed_warded_familiar(home)?;
+            let mut edits = vec![json!({
+                "target": "reviewed/skill.md",
+                "contents": "held",
+            })];
+            edits.extend((0..lower_tier_edits).map(|index| {
+                json!({
+                    "target": format!("notes/lower-{index}.md"),
+                    "contents": "",
+                })
+            }));
+
+            let response = post_edits(home, &json!({ "edits": edits }).to_string())?;
+
+            assert_eq!(response.status, 413, "got {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "ward_apply_too_large");
+            assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+            assert_eq!(
+                body["error"]["details"]["attemptedEdits"],
+                lower_tier_edits + 1
+            );
+            assert_eq!(
+                body["error"]["details"]["maxEdits"],
+                EXPECTED_WARD_EDIT_COUNT_MAX
+            );
+            assert_eq!(body["error"]["details"]["writeApplied"], false);
+            assert!(!home.join("pending").exists());
+            assert!(!workspace.join("notes").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_hostile_stored_edit_count_without_claim_or_write() -> Result<()> {
+        const EXPECTED_WARD_EDIT_COUNT_MAX: usize = 32;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        expand_pending_edits(&pending, EXPECTED_WARD_EDIT_COUNT_MAX + 1)?;
+        let hostile = std::fs::read(&pending)?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(target.is_dir(), "budget rejection must precede target open");
+        assert_eq!(
+            std::fs::read(&pending)?,
+            hostile,
+            "budget rejection must precede proposal claim mutation"
+        );
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_hostile_stored_content_without_claim_or_write() -> Result<()> {
+        const EXPECTED_WARD_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        replace_first_pending_contents(&pending, "x".repeat(EXPECTED_WARD_RETAINED_BYTES_MAX + 1))?;
+        let hostile = std::fs::read(&pending)?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(
+            body["error"]["details"]["limit"],
+            "directBatchRetainedBytes"
+        );
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(target.is_dir(), "budget rejection must precede target open");
+        assert_eq!(std::fs::read(&pending)?, hostile);
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_too_many_materialized_surfaces_without_claim_or_write() -> Result<()>
+    {
+        const EXPECTED_WARD_EDIT_COUNT_MAX: usize = 32;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        expand_materialized_surfaces(&pending, EXPECTED_WARD_EDIT_COUNT_MAX + 1)?;
+        let hostile = std::fs::read(&pending)?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+        assert_eq!(
+            body["error"]["details"]["attemptedEdits"],
+            EXPECTED_WARD_EDIT_COUNT_MAX + 1
+        );
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(target.is_dir(), "budget rejection must precede target open");
+        assert_eq!(
+            std::fs::read(&pending)?,
+            hostile,
+            "budget rejection must precede proposal claim mutation"
+        );
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_raw_budget_rejects_bounded_materialized_after_mismatch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (pending, _) = stage_scheduled_reviewed_edit(
+            temp.path(),
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let mut value: Value = serde_json::from_slice(&std::fs::read(pending)?)?;
+        value["materialized_diff"]["surfaces"][0]["after"] = json!([0_u8]);
+
+        let error = validate_pending_value_edit_budget(&value)
+            .expect_err("bounded materialized content must be cross-checked before typed decode");
+
+        assert!(
+            error
+                .to_string()
+                .contains("pending edits do not match the materialized diff"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_one_huge_materialized_after_with_small_pending_edit() -> Result<()>
+    {
+        let error = validate_proposal_envelope_preflight_with_limits(
+            br#"{
+                "pending":{"edits":[
+                    {"surface":"reviewed/a.md","contents":{"encoding":"utf8","data":"x"}}
+                ]},
+                "materialized_diff":{"surfaces":[
+                    {"surface":"reviewed/a.md","before":[],"after":[1,2,3,4,5]}
+                ]}
+            }"#,
+            ProposalEnvelopeLimits {
+                max_edits: 32,
+                max_content_bytes: 4,
+            },
+        )
+        .expect_err("one oversized duplicate after-image must fail preflight");
+
+        assert!(matches!(
+            ward::ward_edit_budget_failure(&error),
+            Some(ward::WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: 5,
+                max_bytes: 4,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_unknown_top_level_fields_before_value_allocation() {
+        let raw = format!(
+            r#"{{
+                "edits":[
+                    {{"surface":"reviewed/a.md","contents":{{"encoding":"utf8","data":"x"}}}}
+                ],
+                "unknown":"{}"
+            }}"#,
+            "x".repeat(128 * 1024)
+        );
+
+        let error = validate_proposal_envelope_preflight(raw.as_bytes())
+            .expect_err("unknown proposal fields must fail the streaming preflight");
+
+        assert!(
+            format!("{error:#}").contains("unknown field"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_deep_probe_detail_before_value_allocation() {
+        let mut detail = "null".to_string();
+        for _ in 0..40 {
+            detail = format!(r#"{{"nested":{detail}}}"#);
+        }
+        let raw = format!(
+            r#"{{
+                "edits":[
+                    {{"surface":"reviewed/a.md","contents":{{"encoding":"utf8","data":"x"}}}}
+                ],
+                "probes":[{{
+                    "target":"reviewed/a.md",
+                    "surface":"reviewed/a.md",
+                    "baselineSha256":null,
+                    "proposedSha256":"{}",
+                    "status":"unscored",
+                    "results":[{{
+                        "id":"size-delta",
+                        "configuredSurface":"reviewed/**",
+                        "configurationSha256":"{}",
+                        "status":"unscored",
+                        "summary":"bounded",
+                        "detail":{detail}
+                    }}]
+                }}]
+            }}"#,
+            "0".repeat(64),
+            "0".repeat(64)
+        );
+
+        let error = validate_proposal_envelope_preflight(raw.as_bytes())
+            .expect_err("deep probe detail must fail before generic Value parsing");
+
+        assert!(
+            error.to_string().contains("nesting depth"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_probe_cardinality_bomb_before_value_allocation() {
+        let probes = std::iter::repeat_n("null", ward::WARD_EDIT_MAX_COUNT + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        let raw = format!(
+            r#"{{
+                "edits":[
+                    {{"surface":"reviewed/a.md","contents":{{"encoding":"utf8","data":"x"}}}}
+                ],
+                "probes":[{probes}]
+            }}"#
+        );
+
+        let error = validate_proposal_envelope_preflight(raw.as_bytes())
+            .expect_err("probe cardinality must be bounded before generic Value parsing");
+
+        assert!(
+            error.to_string().contains("probes"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_unknown_nested_probe_fields() {
+        let raw = format!(
+            r#"{{
+                "edits":[
+                    {{"surface":"reviewed/a.md","contents":{{"encoding":"utf8","data":"x"}}}}
+                ],
+                "probes":[{{
+                    "target":"reviewed/a.md",
+                    "surface":"reviewed/a.md",
+                    "baselineSha256":null,
+                    "proposedSha256":"{}",
+                    "status":"unscored",
+                    "results":[{{
+                        "id":"size-delta",
+                        "configuredSurface":"reviewed/**",
+                        "configurationSha256":"{}",
+                        "status":"unscored",
+                        "summary":"bounded",
+                        "detail":null,
+                        "unknown":"not allowed"
+                    }}]
+                }}]
+            }}"#,
+            "0".repeat(64),
+            "0".repeat(64)
+        );
+
+        let error = validate_proposal_envelope_preflight(raw.as_bytes())
+            .expect_err("unknown nested probe fields must fail strict preflight");
+
+        assert!(
+            format!("{error:#}").contains("unknown field"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn proposal_parser_keeps_probe_evidence_raw_until_bounded_decode() {
+        let source = include_str!("api.rs");
+        let wire_start = source.find("struct ProposalEnvelopeWire").unwrap();
+        let wire_end = source[wire_start..]
+            .find("enum ProposalAuthority")
+            .map(|offset| wire_start + offset)
+            .unwrap();
+
+        assert!(
+            source[wire_start..wire_end].contains("Box<serde_json::value::RawValue>"),
+            "proposal probes must remain raw until structural preflight has bounded them"
+        );
+    }
+
+    #[test]
+    fn proposal_revision_preserves_legacy_canonical_hash() -> Result<()> {
+        fn canonicalize(value: &Value) -> Value {
+            match value {
+                Value::Array(values) => Value::Array(values.iter().map(canonicalize).collect()),
+                Value::Object(values) => {
+                    let sorted: BTreeMap<_, _> = values
+                        .iter()
+                        .map(|(key, value)| (key.clone(), canonicalize(value)))
+                        .collect();
+                    serde_json::to_value(sorted).expect("canonical JSON map is serializable")
+                }
+                value => value.clone(),
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let (pending, _, _) =
+            stage_coherence_edit(temp.path(), "reviewed/skill.md", Some("before"), "after")?;
+        let raw = std::fs::read(pending)?;
+        let authority: Value = serde_json::from_slice(&raw)?;
+        let legacy = Sha256::digest(serde_json::to_vec(&canonicalize(&authority))?);
+        let document = parse_proposal_envelope(&raw)?;
+
+        assert_eq!(
+            document.revision()?,
+            legacy
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_unknown_huge_field_without_claim_or_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        value
+            .as_object_mut()
+            .context("proposal object")?
+            .insert("unknown".to_string(), json!("x".repeat(128 * 1024)));
+        let hostile = serde_json::to_vec(&value)?;
+        std::fs::write(&pending, &hostile)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 409, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["why"], "proposal-corrupt");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        assert_eq!(std::fs::read(&pending)?, hostile);
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_rejects_deep_probe_detail_without_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let claim = claim_pending_for_approval(&pending)?;
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+        let mut detail = Value::Null;
+        for _ in 0..40 {
+            detail = json!({ "nested": detail });
+        }
+        value["probes"][0]["results"][0]["detail"] = detail;
+        let hostile = serde_json::to_vec(&value)?;
+        std::fs::write(&claim, &hostile)?;
+
+        let error = recover_proposal_claim(home, &claim)
+            .expect_err("deep recovery proposal must fail structural preflight");
+
+        assert!(
+            format!("{error:#}").contains("nesting depth"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "before"
+        );
+        assert_eq!(std::fs::read(&claim)?, hostile);
+        assert!(!pending.exists());
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_actual_huge_materialized_after_without_claim_or_write() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let proposal_id = Uuid::new_v4().to_string();
+        let pending_dir = home.join("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        let pending = pending_dir.join(format!("{}-{proposal_id}.json", Uuid::new_v4()));
+        write_hostile_materialized_after(&pending, ward::WARD_RETAINED_CONTENT_MAX_BYTES + 1)?;
+        let hostile_len = std::fs::metadata(&pending)?.len();
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::create_dir_all(target.parent().context("target parent")?)?;
+        std::fs::create_dir(&target)?;
+        ward::reset_evaluate_call_count();
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(
+            body["error"]["details"]["limit"],
+            "directBatchRetainedBytes"
+        );
+        assert_eq!(
+            body["error"]["details"]["attemptedBytes"],
+            ward::WARD_RETAINED_CONTENT_MAX_BYTES + 1
+        );
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(target.is_dir(), "preflight must precede target open");
+        assert_eq!(
+            ward::evaluate_call_count(),
+            0,
+            "preflight must precede Ward target adjudication"
+        );
+        assert_eq!(std::fs::metadata(&pending)?.len(), hostile_len);
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_rejects_actual_huge_materialized_after_before_target_access() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        let proposal_id = Uuid::new_v4().to_string();
+        let pending_dir = home.join("pending");
+        std::fs::create_dir_all(&pending_dir)?;
+        let claim = pending_dir.join(format!(
+            "{}-{proposal_id}.json.approve.deciding",
+            Uuid::new_v4()
+        ));
+        write_hostile_materialized_after(&claim, ward::WARD_RETAINED_CONTENT_MAX_BYTES + 1)?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::create_dir_all(target.parent().context("target parent")?)?;
+        std::fs::create_dir(&target)?;
+        ward::reset_evaluate_call_count();
+
+        let error = recover_proposal_claim(home, &claim)
+            .expect_err("hostile duplicate after-image must fail recovery preflight");
+
+        assert!(
+            matches!(
+                ward::ward_edit_budget_failure(&error),
+                Some(ward::WardEditBudgetFailure::BatchRetainedMemory {
+                    attempted_bytes,
+                    max_bytes: ward::WARD_RETAINED_CONTENT_MAX_BYTES,
+                }) if *attempted_bytes == ward::WARD_RETAINED_CONTENT_MAX_BYTES + 1
+            ),
+            "typed={:?}; error={error:#}",
+            ward::ward_edit_budget_failure(&error)
+        );
+        assert!(target.is_dir(), "preflight must precede target open");
+        assert_eq!(
+            ward::evaluate_call_count(),
+            0,
+            "preflight must precede Ward target adjudication"
+        );
+        assert!(
+            claim.exists(),
+            "hostile recovery claim must remain inspectable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_too_many_materialized_surfaces() -> Result<()> {
+        let error = validate_proposal_envelope_preflight_with_limits(
+            br#"{
+                "pending":{"edits":[
+                    {"surface":"reviewed/a.md","contents":{"encoding":"utf8","data":""}}
+                ]},
+                "materialized_diff":{"surfaces":[
+                    {"surface":"reviewed/a.md","before":[],"after":[]},
+                    {"surface":"reviewed/b.md","before":[],"after":[]},
+                    {"surface":"reviewed/c.md","before":[],"after":[]}
+                ]}
+            }"#,
+            ProposalEnvelopeLimits {
+                max_edits: 2,
+                max_content_bytes: 16,
+            },
+        )
+        .expect_err("materialized surface cardinality must fail preflight");
+
+        assert!(matches!(
+            ward::ward_edit_budget_failure(&error),
+            Some(ward::WardEditBudgetFailure::BatchEditCount {
+                attempted_edits: 3,
+                max_edits: 2,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_rejects_materialized_after_aggregate_overflow() -> Result<()> {
+        let error = validate_proposal_envelope_preflight_with_limits(
+            br#"{
+                "pending":{"edits":[
+                    {"surface":"reviewed/a.md","contents":{"encoding":"utf8","data":"ab"}},
+                    {"surface":"reviewed/b.md","contents":{"encoding":"utf8","data":"cd"}}
+                ]},
+                "materialized_diff":{"surfaces":[
+                    {"surface":"reviewed/a.md","before":[],"after":[97,98]},
+                    {"surface":"reviewed/b.md","before":[],"after":[99,100,101]}
+                ]}
+            }"#,
+            ProposalEnvelopeLimits {
+                max_edits: 32,
+                max_content_bytes: 4,
+            },
+        )
+        .expect_err("individually bounded after-images must share an aggregate");
+
+        assert!(matches!(
+            ward::ward_edit_budget_failure(&error),
+            Some(ward::WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: 5,
+                max_bytes: 4,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_aggregate_accounting_is_overflow_safe() -> Result<()> {
+        let error = validate_combined_proposal_bytes(
+            u64::MAX,
+            1,
+            ProposalEnvelopeLimits {
+                max_edits: usize::MAX,
+                max_content_bytes: u64::MAX,
+            },
+        )
+        .expect_err("integer overflow must fail even at the numeric ceiling");
+
+        assert!(matches!(
+            ward::ward_edit_budget_failure(&error),
+            Some(ward::WardEditBudgetFailure::BatchRetainedMemory {
+                attempted_bytes: u64::MAX,
+                max_bytes: u64::MAX,
+            })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_accepts_exact_duplicate_content_boundaries() -> Result<()> {
+        let budget = validate_proposal_envelope_preflight_with_limits(
+            br#"{
+                "pending":{"edits":[
+                    {"surface":"reviewed/a.md","contents":{"encoding":"utf8","data":""}}
+                ]},
+                "materialized_diff":{"surfaces":[
+                    {"surface":"reviewed/a.md","before":[1,2,3,4],"after":[]}
+                ]},
+                "region_evidence":[
+                    {"replay_bytes":[1,2,3,4]}
+                ],
+                "decisionState":{"beforeImages":[
+                    {"target":"reviewed/a.md","contents":{"encoding":"base64","data":"AQIDBA=="}}
+                ]}
+            }"#,
+            ProposalEnvelopeLimits {
+                max_edits: 1,
+                max_content_bytes: 4,
+            },
+        )?;
+
+        assert_eq!(budget.retained_content_bytes(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn proposal_preflight_accepts_actual_materialized_after_byte_boundary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let proposal = temp.path().join("proposal.json");
+        write_hostile_materialized_after(&proposal, ward::WARD_RETAINED_CONTENT_MAX_BYTES)?;
+
+        let raw = read_bounded_proposal_file(&proposal)?;
+        let budget = validate_proposal_envelope_preflight(&raw)?;
+
+        assert_eq!(budget.retained_content_bytes(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_oversized_proposal_file_before_claim_or_write() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&pending)?
+            .set_len(crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1)?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "proposal_quota_exceeded");
+        assert_eq!(body["error"]["details"]["limit"], "pendingProposalBytes");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(
+            std::fs::metadata(&pending)?.len(),
+            crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1
+        );
+        assert!(target.is_dir(), "file cap must precede target access");
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_rejects_claim_growth_over_global_proposal_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let compact = serde_json::to_vec(&authority)?;
+        std::fs::write(&pending, &compact)?;
+        let filler_len = crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES
+            .checked_sub(u64::try_from(compact.len())?)
+            .and_then(|remaining| remaining.checked_sub(1))
+            .context("fixture proposal must leave byte-quota headroom")?;
+        let filler = home
+            .join("pending")
+            .join(format!("filler-{}.json", Uuid::new_v4()));
+        let filler_file = std::fs::File::create(&filler)?;
+        filler_file.set_len(filler_len)?;
+        let revision = proposal_revision(&authority)?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "proposal_quota_exceeded");
+        assert_eq!(body["error"]["details"]["limit"], "pendingProposalBytes");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+        assert!(
+            pending.exists(),
+            "the original proposal must remain pending"
+        );
+        assert!(find_pending_decision_claim(home, &proposal_id, "approve").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_reports_applying_state_quota_before_target_mutation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let revision = proposal_revision(&authority)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        );
+        assert!(interrupted.is_err());
+        assert!(
+            pending.exists(),
+            "interrupted pre-validation claim must restore the pending filename"
+        );
+        let claim_len = std::fs::metadata(&pending)?.len();
+        let filler_len = crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES
+            .checked_sub(claim_len)
+            .and_then(|remaining| remaining.checked_sub(1))
+            .context("fixture claim must leave byte-quota headroom")?;
+        let filler = home
+            .join("pending")
+            .join(format!("filler-{}.json", Uuid::new_v4()));
+        let filler_file = std::fs::File::create(&filler)?;
+        filler_file.set_len(filler_len)?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            None,
+        )
+        .expect("applying-state quota failure must be a stable API response");
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "proposal_quota_exceeded");
+        assert_eq!(body["error"]["details"]["limit"], "pendingProposalBytes");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+        assert!(
+            pending.exists(),
+            "pending recovery request must remain durable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_rejects_oversized_proposal_file_before_target_access() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, _proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let claim = claim_pending_for_approval(&pending)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&claim)?
+            .set_len(crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1)?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let error = recover_proposal_claim(home, &claim)
+            .expect_err("oversized recovery claim must return a typed limit failure");
+
+        assert!(matches!(
+            crate::proposal_store::quota_failure(&error),
+            Some(crate::proposal_store::ProposalQuotaExceeded::Bytes {
+                attempted_bytes,
+                max_bytes: crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES,
+                ..
+            }) if *attempted_bytes == crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES + 1
+        ));
+        assert!(target.is_dir(), "file cap must precede target access");
+        assert!(
+            claim.exists(),
+            "hostile recovery claim must remain inspectable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_manual_recovery_rejects_hostile_edit_count_before_target_access() -> Result<()> {
+        const EXPECTED_WARD_EDIT_COUNT_MAX: usize = 32;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let claim = claim_pending_for_approval(&pending)?;
+        expand_pending_edits(&claim, EXPECTED_WARD_EDIT_COUNT_MAX + 1)?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(target.is_dir(), "budget rejection must precede target open");
+        assert!(
+            claim.exists(),
+            "unsafe recovery state must remain inspectable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_recovery_rejects_hostile_content_before_target_access() -> Result<()> {
+        const EXPECTED_WARD_RETAINED_BYTES_MAX: usize = 16 * 1024 * 1024;
+
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, _proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        let claim = claim_pending_for_approval(&pending)?;
+        replace_first_pending_contents(&claim, "x".repeat(EXPECTED_WARD_RETAINED_BYTES_MAX + 1))?;
+        let target = workspace.join("reviewed/skill.md");
+        std::fs::remove_file(&target)?;
+        std::fs::create_dir(&target)?;
+
+        let completed = process_due_threads_proposals(home)?;
+
+        assert_eq!(completed, 0);
+        assert!(target.is_dir(), "budget rejection must precede target open");
+        assert!(
+            !claim.exists(),
+            "hostile recovery state must leave the scheduler hot path"
+        );
+        let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(quarantined.len(), 1);
+        assert!(
+            std::fs::metadata(quarantined[0].path())?.len() > 0,
+            "quarantined recovery state must remain inspectable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_rolls_back_tier2_write_after_later_commit_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        std::fs::create_dir_all(workspace.join("scratch"))?;
+        std::fs::write(workspace.join("notes/today.md"), "before")?;
+        let workspace = workspace.canonicalize()?;
+        let blocked = workspace.join("scratch/blocked.txt");
+        // This hook runs only when the commit loop reaches the second target,
+        // after the first Tier 2 exchange has completed.
+        ward::set_conditional_write_hook(blocked.clone(), b"concurrent create".to_vec());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/today.md","contents":"after"},
+                {"target":"scratch/blocked.txt","contents":"free"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(body.get("changes").is_none());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("notes/today.md"))?,
+            "before"
+        );
+        assert_eq!(std::fs::read_to_string(blocked)?, "concurrent create");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_persists_audit_before_reporting_cleanup_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.canonicalize()?.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        ward::set_direct_cleanup_failure(target.clone());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_cleanup_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], true);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert!(body["changes"][0]["audit"]["prevSha256"].is_string());
+        assert_eq!(std::fs::read_to_string(target)?, "after");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_reports_applied_changes_when_audit_store_verification_fails(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.canonicalize()?.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        set_direct_audit_store_failure(home.join("coven.sqlite3"));
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "audit_persist_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], true);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(body["changes"][0]["disposition"], "applied");
+        assert_eq!(body["changes"][0]["audit"]["target"], "notes/today.md");
+        assert_eq!(body["changes"][0]["audit"]["resolved"], "notes/today.md");
+        assert_eq!(body["changes"][0]["audit"]["tier"], 2);
+        assert!(body["changes"][0]["audit"]["prevSha256"].is_string());
+        assert_eq!(
+            body["changes"][0]["audit"]["nextSha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert_eq!(body["changes"][0]["audit"]["bytesWritten"], 5);
+        assert_eq!(std::fs::read_to_string(target)?, "after");
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_serializes_commit_through_audit_persistence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().to_path_buf();
+        let workspace = seed_warded_familiar(&home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.join("notes/today.md");
+        std::fs::write(&target, "before")?;
+        let pause = set_direct_apply_pause(&home, "sage");
+
+        let first_home = home.clone();
+        let first = TestWorker::spawn("first direct apply worker", move || {
+            post_edits(
+                &first_home,
+                r#"{"edits":[{"target":"notes/today.md","contents":"first"}]}"#,
+            )
+        });
+        pause.wait_until_reached("first direct apply to reach the pre-audit pause");
+
+        let lock_probe = set_direct_apply_lock_probe(&home, "sage");
+        let second_home = home.clone();
+        let second = TestWorker::spawn("second direct apply worker", move || {
+            post_edits(
+                &second_home,
+                r#"{"edits":[{"target":"notes/today.md","contents":"second"}]}"#,
+            )
+        });
+        let lock_was_held =
+            recv_test_signal(lock_probe, "second direct apply lock probe to complete")?;
+        pause.release();
+
+        let first_response = first.wait()??;
+        let second_response = second.wait()??;
+
+        assert!(
+            lock_was_held,
+            "direct apply lock was released before the first audit persisted"
+        );
+        assert_eq!(first_response.status, 200, "{}", first_response.body);
+        assert_eq!(second_response.status, 200, "{}", second_response.body);
+        assert_eq!(std::fs::read_to_string(target)?, "second");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn direct_and_approved_tier2_writes_share_commit_audit_serialization() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().to_path_buf();
+        let (_, proposal_id) = stage_scheduled_edit(
+            &home,
+            "logged/skill.md",
+            2,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        let decision_body = scheduled_decision_body(&home, &proposal_id, None)?;
+        let pause = set_direct_apply_pause(&home, "sage");
+
+        let direct_home = home.clone();
+        let direct = TestWorker::spawn("direct apply worker", move || {
+            post_edits(
+                &direct_home,
+                r#"{"edits":[{"target":"notes/direct.md","contents":"direct"}]}"#,
+            )
+        });
+        pause.wait_until_reached("direct apply to reach the pre-audit pause");
+
+        let lock_probe = set_proposal_write_lock_probe(&home, &proposal_id);
+        let approval_home = home.clone();
+        let approval_id = proposal_id.clone();
+        let approval = TestWorker::spawn("proposal approval worker", move || {
+            handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{approval_id}/approve"),
+                &approval_home,
+                None,
+                Some(&decision_body),
+            )
+        });
+        let lock_was_held = recv_test_signal(lock_probe, "proposal write lock probe to complete")?;
+
+        let approved_response = if lock_was_held {
+            pause.release();
+            approval.wait()??
+        } else {
+            let response = approval.wait()??;
+            pause.release();
+            response
+        };
+        let direct_response = direct.wait()??;
+
+        assert!(
+            lock_was_held,
+            "proposal approval was allowed to commit while a direct Tier-2 write awaited audit"
+        );
+        assert_eq!(direct_response.status, 200, "{}", direct_response.body);
+        assert_eq!(approved_response.status, 200, "{}", approved_response.body);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let proposal_ids = conn
+            .prepare(
+                "SELECT proposal_id
+                 FROM ward_audit
+                 WHERE event_type = 'apply_audit'
+                 ORDER BY id ASC",
+            )?
+            .query_map([], |row| row.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(
+            proposal_ids,
+            vec![None, Some(proposal_id)],
+            "Gate-4 rows must follow filesystem commit order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_marks_unproven_rollback_as_ambiguous() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        std::fs::create_dir_all(workspace.join("scratch"))?;
+        let workspace = workspace.canonicalize()?;
+        let logged = workspace.join("notes/today.md");
+        let free = workspace.join("scratch/output.txt");
+        std::fs::write(&logged, "before")?;
+        ward::set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        ward::set_conditional_rollback_sabotage(free.clone(), logged.clone());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/today.md","contents":"after"},
+                {"target":"scratch/output.txt","contents":"free"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_ambiguous");
+        assert!(body["error"]["details"]["writeApplied"].is_null());
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(
+            body["error"]["details"]["targets"],
+            serde_json::json!(["notes/today.md"])
+        );
+        assert_eq!(std::fs::read_to_string(logged)?, "after");
+        assert_eq!(std::fs::read_to_string(free)?, "concurrent create");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_distinguishes_rollback_cleanup_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        std::fs::create_dir_all(workspace.join("scratch"))?;
+        let workspace = workspace.canonicalize()?;
+        let logged = workspace.join("notes/today.md");
+        let free = workspace.join("scratch/output.txt");
+        std::fs::write(&logged, "before")?;
+        ward::set_conditional_write_hook(free.clone(), b"concurrent create".to_vec());
+        ward::set_direct_cleanup_failure(logged.clone());
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[
+                {"target":"notes/today.md","contents":"after"},
+                {"target":"scratch/output.txt","contents":"free"}
+            ]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_rollback_cleanup_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(body["error"]["details"]["targets"][0], "notes/today.md");
+        assert_eq!(std::fs::read_to_string(logged)?, "before");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let apply_audits: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE event_type = 'apply_audit'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(apply_audits, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn post_familiar_edits_distinguishes_staging_cleanup_failure() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::create_dir_all(workspace.join("notes"))?;
+        let target = workspace.canonicalize()?.join("notes/today.md");
+        ward::set_staging_write_cleanup_failure(
+            target.clone(),
+            b"concurrent staging replacement".to_vec(),
+        );
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes/today.md","contents":"after"}]}"#,
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_rollback_cleanup_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(
+            body["error"]["details"]["targets"],
+            serde_json::json!(["notes/today.md"])
+        );
+        assert!(!target.exists());
         Ok(())
     }
 
@@ -19301,6 +28833,32 @@ forbidden = ["(?i)ignore previous"]
             "reviewed/cafe\u{301}.md"
         );
         assert!(!home.join("pending").exists());
+
+        let mut edits = vec![
+            json!({"target": "reviewed/skill.md", "contents": "first"}),
+            json!({
+                "target": "reviewed/../reviewed/skill.md",
+                "contents": "second",
+            }),
+        ];
+        edits.extend((0..31).map(|index| {
+            json!({
+                "target": format!("notes/unique-{index}.md"),
+                "contents": "",
+            })
+        }));
+        let response = post_edits(home, &json!({ "edits": edits }).to_string())?;
+
+        assert_eq!(response.status, 413, "got {}", response.body);
+        let body: serde_json::Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_too_large");
+        assert_eq!(body["error"]["details"]["limit"], "directBatchEdits");
+        assert_eq!(body["error"]["details"]["attemptedEdits"], 33);
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert!(
+            !home.join("familiars/sage/notes").exists(),
+            "the count budget must run before Gate-2 alias resolution"
+        );
         Ok(())
     }
 
@@ -20172,14 +29730,35 @@ tier = 0
             home,
             None,
             Some("{}"),
-        );
-        assert!(
-            first.is_err(),
-            "the concurrent replacement must abort apply"
-        );
+        )
+        .expect("a proven no-write outcome must be a stable API response");
+        assert_eq!(first.status, 500, "got {}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        assert_eq!(first_body["error"]["code"], "ward_apply_failed");
+        assert_eq!(first_body["error"]["details"]["writeApplied"], false);
+        assert_eq!(first_body["error"]["details"]["retrySafe"], true);
         assert!(pending.exists(), "known pre-write failure stays retryable");
         let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
         assert!(staged.get("decisionState").is_none());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            reservations, 0,
+            "a proven no-write failure must release its durable reservation"
+        );
+        drop(conn);
+        let reopened = store::open_store(&home.join("coven.sqlite3"))?;
+        let reservations_after_restart: i64 = reopened.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations_after_restart, 0);
+        drop(reopened);
 
         let retry = handle_request_with_body(
             "POST",
@@ -20203,6 +29782,94 @@ tier = 0
     }
 
     #[test]
+    fn threads_approved_cleanup_failure_is_audited_and_typed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id, workspace) =
+            stage_coherence_edit(home, "reviewed/skill.md", Some("before"), "after")?;
+        crate::ward::set_cleanup_artifact_replacement(
+            workspace.canonicalize()?.join("reviewed/skill.md"),
+            b"concurrent backup".to_vec(),
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_cleanup_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], true);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(body["changes"][0]["disposition"], "applied");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("reviewed/skill.md"))?,
+            "after"
+        );
+        assert!(!pending.exists(), "terminally audited proposal is consumed");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 1);
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_proven_no_write_failures_do_not_exhaust_audit_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        for index in 0..8 {
+            let (pending, proposal_id, workspace) = stage_coherence_edit(
+                home,
+                &format!("reviewed/skill-{index}.md"),
+                Some("before"),
+                "after",
+            )?;
+            crate::ward::set_conditional_write_hook(
+                workspace
+                    .canonicalize()?
+                    .join(format!("reviewed/skill-{index}.md")),
+                b"concurrent".to_vec(),
+            );
+
+            let response = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+                home,
+                None,
+                Some("{}"),
+            )?;
+
+            assert_eq!(response.status, 500, "iteration {index}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["details"]["writeApplied"], false);
+            assert!(pending.exists());
+            let conn = store::open_store(&home.join("coven.sqlite3"))?;
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(reservations, 0, "iteration {index}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn threads_coherence_same_byte_create_cannot_retry_as_recovery() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -20219,8 +29886,13 @@ tier = 0
             home,
             None,
             Some("{}"),
-        );
-        assert!(first.is_err(), "the concurrent create must abort apply");
+        )
+        .expect("a proven no-write outcome must be a stable API response");
+        assert_eq!(first.status, 500, "got {}", first.body);
+        let first_body: Value = serde_json::from_str(&first.body)?;
+        assert_eq!(first_body["error"]["code"], "ward_apply_failed");
+        assert_eq!(first_body["error"]["details"]["writeApplied"], false);
+        assert_eq!(first_body["error"]["details"]["retrySafe"], true);
         assert!(pending.exists(), "known pre-write failure stays retryable");
         let staged: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
         assert!(staged.get("decisionState").is_none());
@@ -20855,6 +30527,23 @@ tier = 0
         Ok((path, proposal_id.to_string()))
     }
 
+    fn write_pending_quota_fillers(
+        home: &Path,
+        template: &[u8],
+        count: usize,
+        prefix: &str,
+    ) -> Result<Vec<PathBuf>> {
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        (0..count)
+            .map(|index| {
+                let path = pending.join(format!("{prefix}-{index:02}-{}.json", Uuid::new_v4()));
+                std::fs::write(&path, template)?;
+                Ok(path)
+            })
+            .collect()
+    }
+
     fn scheduled_decision_body(
         home: &Path,
         proposal_id: &str,
@@ -20934,6 +30623,174 @@ tier = 0
         assert_eq!(
             detail.rationale.as_deref(),
             Some("reviewed semantic change")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn approved_and_rejected_proposals_release_count_capacity() -> Result<()> {
+        for decision in ["approve", "reject"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+            let template = serde_json::to_vec(&authority)?;
+            std::fs::write(&pending, &template)?;
+            write_pending_quota_fillers(home, &template, 63, "zzzz-terminal")?;
+            let revision = proposal_revision(&authority)?;
+
+            let decided = handle_request_with_body(
+                "POST",
+                &format!("/api/v1/threads/proposals/{proposal_id}/{decision}"),
+                home,
+                None,
+                Some(&json!({ "expectedRevision": revision }).to_string()),
+            )?;
+            assert_eq!(decided.status, 200, "{decision} failed: {}", decided.body);
+            assert!(!pending.exists());
+
+            let admitted = post_edits(
+                home,
+                r#"{"edits":[{"target":"reviewed/skill.md","contents":"next"}]}"#,
+            )?;
+            assert_eq!(
+                admitted.status, 202,
+                "{decision} capacity was not reusable: {}",
+                admitted.body
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejection_remains_available_for_reconciled_overquota_backlog() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let template = serde_json::to_vec(&authority)?;
+        std::fs::write(&pending, &template)?;
+        write_pending_quota_fillers(home, &template, 64, "zzzz-overquota")?;
+        let revision = proposal_revision(&authority)?;
+
+        let rejected = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        )?;
+
+        assert_eq!(rejected.status, 200, "got {}", rejected.body);
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["decision"], "rejected");
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejection_remains_available_at_the_global_byte_boundary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let compact = serde_json::to_vec(&authority)?;
+        std::fs::write(&pending, &compact)?;
+        let filler_len = crate::proposal_store::MAX_PENDING_PROPOSAL_BYTES
+            .checked_sub(u64::try_from(compact.len())?)
+            .context("fixture proposal fits within the byte quota")?;
+        let filler = home
+            .join("pending")
+            .join(format!("filler-{}.json", Uuid::new_v4()));
+        let filler_file = std::fs::File::create(&filler)?;
+        filler_file.set_len(filler_len)?;
+        let revision = proposal_revision(&authority)?;
+
+        let rejected = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        )?;
+
+        assert_eq!(rejected.status, 200, "got {}", rejected.body);
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn idempotent_terminal_cleanup_releases_orphaned_pending_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let template = serde_json::to_vec(&authority)?;
+        let revision = proposal_revision(&authority)?;
+        let approved = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&json!({ "expectedRevision": revision }).to_string()),
+        )?;
+        assert_eq!(approved.status, 200, "got {}", approved.body);
+
+        let orphan = home
+            .join("pending")
+            .join(format!("orphan-{proposal_id}.json"));
+        std::fs::write(&orphan, &template)?;
+        write_pending_quota_fillers(home, &template, 63, "zzzz-idempotent")?;
+        let full = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"blocked"}]}"#,
+        )?;
+        assert_eq!(full.status, 413, "got {}", full.body);
+
+        let cleanup = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            None,
+        )?;
+        assert_eq!(cleanup.status, 200, "got {}", cleanup.body);
+        let cleanup: Value = serde_json::from_str(&cleanup.body)?;
+        assert_eq!(cleanup["idempotent"], true);
+        assert!(!orphan.exists());
+
+        let admitted = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"next"}]}"#,
+        )?;
+        assert_eq!(
+            admitted.status, 202,
+            "terminal cleanup capacity was not reusable: {}",
+            admitted.body
         );
         Ok(())
     }
@@ -21035,6 +30892,7 @@ tier = 0
             targets: vec!["reviewed/skill.md".to_string()],
             authorization: authorization_from_writer(&scheduled.pending().writer),
         });
+        let mut budget = ward::validate_staged_edit_budget(&scheduled.pending().edits)?;
 
         let before_images = proposal_before_images(
             &workspace,
@@ -21042,6 +30900,7 @@ tier = 0
             Some(&scheduled),
             PendingReviewKind::Authority,
             None,
+            &mut budget,
         )?;
 
         assert_eq!(
@@ -21069,7 +30928,12 @@ tier = 0
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
             time::OffsetDateTime::now_utc(),
         )?;
-        let premature_body = scheduled_decision_body(home, &proposal_id, None)?;
+        let authority: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let template = serde_json::to_vec(&authority)?;
+        std::fs::write(&pending, &template)?;
+        write_pending_quota_fillers(home, &template, 63, "zzzz-veto")?;
+        let revision = proposal_revision(&authority)?;
+        let premature_body = json!({ "expectedRevision": revision.clone() }).to_string();
 
         let premature = handle_request_with_body(
             "POST",
@@ -21086,7 +30950,11 @@ tier = 0
             "before"
         );
 
-        let veto_body = scheduled_decision_body(home, &proposal_id, Some("familiar objected"))?;
+        let veto_body = json!({
+            "expectedRevision": revision,
+            "note": "familiar objected",
+        })
+        .to_string();
         let vetoed = handle_request_with_body(
             "POST",
             &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
@@ -21110,6 +30978,16 @@ tier = 0
         assert_eq!(close.reason, coven_threads_core::WindowCloseReason::Vetoed);
         assert_eq!(close.replay_hash_matched, None);
         assert_eq!(close.rationale.as_deref(), Some("familiar objected"));
+
+        let admitted = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"next"}]}"#,
+        )?;
+        assert_eq!(
+            admitted.status, 202,
+            "vetoed proposal capacity was not reusable: {}",
+            admitted.body
+        );
         Ok(())
     }
 
@@ -21367,6 +31245,684 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduler_batches_advance_without_starving_later_due_proposals() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        for index in 0..16 {
+            let (path, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            std::fs::rename(
+                &path,
+                path.with_file_name(format!("aaaa-{index:02}-{proposal_id}.json")),
+            )?;
+        }
+        let (due_path, due_id) = stage_scheduled_edit(
+            home,
+            "logged/skill.md",
+            2,
+            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        std::fs::rename(
+            &due_path,
+            due_path.with_file_name(format!("zzzz-{due_id}.json")),
+        )?;
+
+        assert_eq!(
+            process_due_threads_proposals(home)?,
+            0,
+            "the first tick must stop after the bounded human-review batch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
+            "before"
+        );
+
+        assert_eq!(
+            process_due_threads_proposals(home)?,
+            1,
+            "the persistent cursor must advance to the later due proposal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
+            "after"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_quarantines_only_one_bounded_hostile_batch_per_tick() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        for index in 0..100 {
+            std::fs::write(pending.join(format!("hostile-{index:03}.json")), b"{")?;
+        }
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        let remaining = std::fs::read_dir(&pending)?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.ends_with(".json"))
+            })
+            .count();
+        assert_eq!(remaining, 84);
+        let quarantined = std::fs::read_dir(pending.join("quarantine"))?.count();
+        assert_eq!(quarantined, 16);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn threads_scheduler_quarantines_non_utf8_active_name_without_hot_loop() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let pending = home.join("pending");
+        std::fs::create_dir_all(&pending)?;
+        let invalid = pending.join(non_utf8_pending_name(
+            "invalid-claim-",
+            b".json.approve.deciding",
+        ));
+        if let Err(error) = std::fs::write(&invalid, b"{}") {
+            if error.raw_os_error() == Some(92) {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+        let (_, proposal_id) = stage_scheduled_edit(
+            home,
+            "logged/skill.md",
+            2,
+            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/logged/skill.md"))?,
+            "after"
+        );
+        assert!(std::fs::symlink_metadata(&invalid).is_err());
+        assert_eq!(std::fs::read_dir(pending.join("quarantine"))?.count(), 1);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let approved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approved, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_expires_pending_proposal_and_releases_quota() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (expired_path, expired_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        let expired_path = expired_path.with_file_name(format!("aaaa-{expired_id}.json"));
+        std::fs::rename(
+            home.join("pending").join(format!(
+                "{}-{expired_id}.json",
+                crate::threads_gate::familiar_weave_id("sage")
+            )),
+            &expired_path,
+        )?;
+        for index in 0..63 {
+            let (path, proposal_id) = stage_scheduled_reviewed_edit(
+                home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            std::fs::rename(
+                &path,
+                path.with_file_name(format!("zzzz-{index:02}-{proposal_id}.json")),
+            )?;
+        }
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!expired_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before",
+            "expiry must never apply the staged target"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&expired_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "expired");
+
+        let replacement = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"replacement"}]}"#,
+        )?;
+        assert_eq!(
+            replacement.status, 202,
+            "expired capacity must be immediately reusable: {}",
+            replacement.body
+        );
+        Ok(())
+    }
+
+    fn persist_stale_approval_request(path: &Path) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let staged_at = value
+            .pointer("/pending/staged_at")
+            .cloned()
+            .context("scheduled proposal carries staged_at")?;
+        let staged_at: time::OffsetDateTime = serde_json::from_value(staged_at)?;
+        let revision = proposal_revision(&value)?;
+        let request = ProposalDecisionRequest {
+            decision: "approve".to_string(),
+            rationale: None,
+            claimed_at: staged_at + time::Duration::days(1),
+            expected_revision: Some(revision),
+            revision_required: true,
+            expired: false,
+        };
+        value
+            .as_object_mut()
+            .context("scheduled proposal is an object")?
+            .insert(
+                "decisionRequest".to_string(),
+                serde_json::to_value(request)?,
+            );
+        std::fs::write(path, serde_json::to_vec_pretty(&value)?)?;
+        Ok(())
+    }
+
+    fn assert_proposal_expired_without_apply(home: &Path, proposal_id: &str) -> Result<()> {
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before",
+            "terminal expiry must not apply the stale proposal"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "expired");
+        let approved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approved, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_manual_approval_expires_stale_proposal_with_rejection_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let rejection_bytes = proposal_decision_audit_reservation_bytes(&conn, "reject")?;
+        let approval_bytes = proposal_decision_audit_reservation_bytes(&conn, "approve")?;
+        assert!(approval_bytes > rejection_bytes);
+        let used: i64 = conn.query_row(
+            "SELECT used_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1
+             WHERE singleton = 1",
+            [used
+                .checked_add(i64::try_from(rejection_bytes)?)
+                .context("test audit limit overflowed")?],
+        )?;
+        drop(conn);
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(response.status, 200, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["decision"], "expired");
+        assert_eq!(body["expired"], true);
+        assert!(!pending.exists());
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_expires_stale_durable_approval_request_before_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        persist_stale_approval_request(&pending)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+
+        assert!(!pending.exists());
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_expires_stale_approval_claim_before_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        persist_stale_approval_request(&pending)?;
+        let claim = pending.with_file_name(format!(
+            "{}.approve.deciding",
+            pending
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("pending filename is UTF-8")?
+        ));
+        std::fs::rename(&pending, &claim)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+
+        assert!(!claim.exists());
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_expiry_releases_superseded_approval_reservation_after_restart() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        persist_stale_approval_request(&pending)?;
+        let claim = pending.with_file_name(format!(
+            "{}.approve.deciding",
+            pending
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("pending filename is UTF-8")?
+        ));
+        std::fs::rename(&pending, &claim)?;
+        let store_path = home.join("coven.sqlite3");
+        let conn = store::open_store(&store_path)?;
+        let approval_bytes = proposal_decision_audit_reservation_bytes(&conn, "approve")?;
+        store::WardAuditReservation::acquire(
+            &conn,
+            &store_path,
+            format!("proposal:{proposal_id}:approve"),
+            "proposal-approval",
+            approval_bytes,
+        )?
+        .preserve()?;
+        let used: i64 = conn.query_row(
+            "SELECT used_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "UPDATE coven_ward_audit_capacity
+             SET limit_bytes = ?1
+             WHERE singleton = 1",
+            [used
+                .checked_add(i64::try_from(approval_bytes)?)
+                .context("test audit limit overflowed")?],
+        )?;
+        drop(conn);
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+
+        let conn = store::open_store(&store_path)?;
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations
+             WHERE token LIKE ?1",
+            [format!("proposal:{proposal_id}:%")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            reservations, 0,
+            "terminal expiry must release every superseded decision reservation"
+        );
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_stale_preapply_recovery_state_expires_without_reapplying() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let staged_at =
+            time::OffsetDateTime::now_utc() - time::Duration::days(30) + time::Duration::seconds(5);
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            staged_at,
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        );
+        assert!(interrupted.is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        std::fs::write(&target, b"before")?;
+        let deadline = staged_at + time::Duration::days(30);
+        let remaining = deadline - time::OffsetDateTime::now_utc();
+        if remaining.is_positive() {
+            std::thread::sleep(remaining.unsigned_abs() + std::time::Duration::from_millis(20));
+        }
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+
+        assert!(!claim.exists());
+        assert_proposal_expired_without_apply(home, &proposal_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn threads_stale_unverifiable_recovery_intent_remains_claimed() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let decision_body = scheduled_decision_body(home, &proposal_id, None)?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        );
+        assert!(interrupted.is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .context("interrupted approval leaves a recovery claim")?;
+        let target = home.join("familiars/sage/reviewed/skill.md");
+        std::fs::write(&target, b"before")?;
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&claim)?)?;
+        let stale = time::OffsetDateTime::now_utc() - time::Duration::days(31);
+        value["pending"]["staged_at"] = serde_json::to_value(stale)?;
+        value["staged_at"] = serde_json::to_value(stale)?;
+        let revision = proposal_revision(&value)?;
+        value["decisionRequest"]["expectedRevision"] = json!(revision);
+        std::fs::write(&claim, serde_json::to_vec_pretty(&value)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        assert!(claim.exists());
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_stale_claim_retains_original_request_when_expiry_audit_is_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        persist_stale_approval_request(&pending)?;
+        let claim = pending.with_file_name(format!(
+            "{}.approve.deciding",
+            pending
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("pending filename is UTF-8")?
+        ));
+        std::fs::rename(&pending, &claim)?;
+        let before = std::fs::read(&claim)?;
+        saturate_ward_audit_capacity(home)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        assert_eq!(std::fs::read(&claim)?, before);
+        assert!(
+            find_pending_decision_claim(home, &proposal_id, "reject").is_none(),
+            "capacity refusal must precede expiry-claim mutation"
+        );
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "transient expiry capacity failure must not quarantine a valid claim"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_retains_expired_proposal_when_audit_capacity_is_full() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (expired_path, expired_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        let expired_path = expired_path.with_file_name(format!("aaaa-{expired_id}.json"));
+        std::fs::rename(
+            home.join("pending").join(format!(
+                "{}-{expired_id}.json",
+                crate::threads_gate::familiar_weave_id("sage")
+            )),
+            &expired_path,
+        )?;
+        let (later_path, later_id) = stage_scheduled_edit(
+            home,
+            "logged/later.md",
+            2,
+            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        let later_path = later_path.with_file_name(format!("zzzz-{later_id}.json"));
+        std::fs::rename(
+            home.join("pending").join(format!(
+                "{}-{later_id}.json",
+                crate::threads_gate::familiar_weave_id("sage")
+            )),
+            &later_path,
+        )?;
+        saturate_ward_audit_capacity(home)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert!(
+            expired_path.exists(),
+            "transient capacity failure must retain the valid expired proposal"
+        );
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "valid transiently blocked proposals must not be quarantined"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/logged/later.md"))?,
+            "before"
+        );
+        let cursor = read_scheduler_cursor(home).context("scheduler cursor")?;
+        assert!(
+            cursor.contains(&later_id),
+            "the scheduler cursor must advance past the transient failure"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&expired_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_retains_valid_expiry_when_terminal_audit_cannot_be_built() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (expired, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        std::fs::remove_file(home.join("familiars/sage/ward.toml"))?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+
+        assert!(expired.exists());
+        assert!(
+            !home.join("pending/quarantine").exists(),
+            "a valid stale proposal must remain retryable when expiry audit construction fails"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_expires_legacy_coherence_proposal_without_applying() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_warded_familiar(home)?;
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"expired change"}]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+        let staged: Value = serde_json::from_str(&staged.body)?;
+        let proposal_id = staged["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(staged["pendingPath"].as_str().context("pending path")?);
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        value["staged_at"] =
+            serde_json::to_value(time::OffsetDateTime::now_utc() - time::Duration::days(31))?;
+        std::fs::write(&pending, serde_json::to_vec(&value)?)?;
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+
+        assert!(!pending.exists());
+        assert!(
+            !home.join("familiars/sage/reviewed/skill.md").exists(),
+            "expiry must not materialize a held target"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "expired");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_recovers_interrupted_expiry_from_durable_request() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc() - time::Duration::days(31),
+        )?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        let interrupted: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        assert_eq!(interrupted["decisionRequest"]["decision"], "reject");
+        assert_eq!(interrupted["decisionRequest"]["expired"], true);
+
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert!(!pending.exists());
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decision: String = conn.query_row(
+            "SELECT decision FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(decision, "expired");
+        Ok(())
+    }
+
+    #[test]
     fn threads_scheduler_recovers_durable_approval_claim() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -21545,6 +32101,29 @@ tier = 0
     }
 
     #[test]
+    fn threads_scheduler_fails_closed_when_audit_capacity_is_unavailable() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, _proposal_id) = stage_scheduled_edit(
+            home,
+            "logged/skill.md",
+            2,
+            coven_threads_core::ApprovalPath::AutoRegression { veto: None },
+            time::OffsetDateTime::now_utc(),
+            coven_threads_core::Channel::Mutation,
+        )?;
+        let target = home.join("familiars/sage/logged/skill.md");
+        saturate_ward_audit_capacity(home)?;
+
+        let processed = process_due_threads_proposals(home)?;
+
+        assert_eq!(processed, 0);
+        assert!(pending.exists());
+        assert_eq!(std::fs::read_to_string(target)?, "before");
+        Ok(())
+    }
+
+    #[test]
     fn threads_approve_revalidates_applies_audits_and_removes_pending() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
@@ -21651,6 +32230,178 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(approved_count, 1);
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_approval_audit_failure_reports_applied_outcome_and_keeps_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute_batch(
+            "CREATE TRIGGER fail_proposal_approval_audit
+             BEFORE INSERT ON ward_audit
+             WHEN NEW.event_type = 'proposal_approved'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected proposal approval audit failure');
+             END;",
+        )?;
+        drop(conn);
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"principal reviewed"}"#),
+        )
+        .expect("post-apply audit failure must be a stable API response");
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "audit_persist_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], true);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert_eq!(body["changes"][0]["disposition"], "applied");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        assert!(
+            find_pending_decision_claim(home, &proposal_id, "approve").is_some(),
+            "failed terminal audit must preserve the recovery claim"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn threads_recovery_capacity_failure_reports_unknown_write_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"principal reviewed"}"#),
+        );
+        assert!(interrupted.is_err());
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a durable claim");
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        conn.execute(
+            "DELETE FROM coven_ward_audit_reservations WHERE token = ?1",
+            [format!("proposal:{proposal_id}:approve")],
+        )?;
+        drop(conn);
+        saturate_ward_audit_capacity(home)?;
+
+        let retry = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(r#"{"note":"principal reviewed"}"#),
+        )?;
+
+        assert_eq!(retry.status, 507, "got {}", retry.body);
+        let body: Value = serde_json::from_str(&retry.body)?;
+        assert_eq!(body["error"]["code"], "ward_audit_capacity_exceeded");
+        assert_eq!(body["error"]["details"]["writeApplied"], Value::Null);
+        assert_eq!(body["error"]["details"]["retrySafe"], false);
+        assert!(claim.exists(), "recovery claim must remain durable");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let terminal: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM ward_audit
+             WHERE proposal_id = ?1
+               AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_recovery_request_cannot_release_reserved_audit_capacity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+        let token = format!("proposal:{proposal_id}:approve");
+
+        let conflict = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/reject"),
+            home,
+            None,
+            Some("{}"),
+        )?;
+
+        assert_eq!(conflict.status, 409, "got {}", conflict.body);
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let reserved: i64 = conn.query_row(
+            "SELECT COUNT(*)
+             FROM coven_ward_audit_reservations
+             WHERE token = ?1",
+            [&token],
+            |row| row.get(0),
+        )?;
+        assert_eq!(
+            reserved, 1,
+            "an unrelated conflicting retry must not release recovery capacity"
+        );
         Ok(())
     }
 
@@ -22260,6 +33011,186 @@ tier = 0
         assert_eq!(body["blocked"], true);
         assert_eq!(body["why"], "proposal-corrupt");
         assert!(file.exists(), "corrupt proposal must remain for inspection");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_decision_transport_differentiates_tcp_from_owner_local() -> Result<()> {
+        for decision in ["approve", "reject"] {
+            let tcp_temp = tempfile::tempdir()?;
+            let tcp_home = tcp_temp.path();
+            let (tcp_pending, tcp_proposal_id) = stage_scheduled_reviewed_edit(
+                tcp_home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let tcp_body = scheduled_decision_body(tcp_home, &tcp_proposal_id, None)?;
+            let pending_before = std::fs::read(&tcp_pending)?;
+            let conn = store::open_store(&tcp_home.join("coven.sqlite3"))?;
+            let audit_before: i64 =
+                conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+            drop(conn);
+
+            let forbidden = handle_request_with_runtime_and_authority(
+                "POST",
+                &format!("/api/v1/threads/proposals/{tcp_proposal_id}/{decision}"),
+                tcp_home,
+                None,
+                Some(&tcp_body),
+                &NoopSessionRuntime,
+                RequestAuthority::Tcp,
+            )?;
+
+            assert_eq!(forbidden.status, 403, "{decision}: {}", forbidden.body);
+            let body: Value = serde_json::from_str(&forbidden.body)?;
+            assert_eq!(body["error"]["code"], "transport_forbidden");
+            assert_eq!(body["error"]["details"]["writeApplied"], false);
+            assert_eq!(std::fs::read(&tcp_pending)?, pending_before);
+            let conn = store::open_store(&tcp_home.join("coven.sqlite3"))?;
+            let audit_after: i64 =
+                conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+            assert_eq!(audit_after, audit_before);
+
+            let ipc_temp = tempfile::tempdir()?;
+            let ipc_home = ipc_temp.path();
+            let (ipc_pending, ipc_proposal_id) = stage_scheduled_reviewed_edit(
+                ipc_home,
+                coven_threads_core::ApprovalPath::HumanApproval,
+                time::OffsetDateTime::now_utc(),
+            )?;
+            let ipc_body = scheduled_decision_body(ipc_home, &ipc_proposal_id, None)?;
+            let allowed = handle_request_with_runtime_and_authority(
+                "POST",
+                &format!("/api/v1/threads/proposals/{ipc_proposal_id}/{decision}"),
+                ipc_home,
+                None,
+                Some(&ipc_body),
+                &NoopSessionRuntime,
+                RequestAuthority::OwnerLocalIpc,
+            )?;
+
+            assert_eq!(allowed.status, 200, "{decision}: {}", allowed.body);
+            assert!(!ipc_pending.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_reads_require_owner_local_transport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApproval,
+            time::OffsetDateTime::now_utc(),
+        )?;
+
+        for path in [
+            "/api/v1/threads/proposals".to_string(),
+            format!("/api/v1/threads/proposals/{proposal_id}"),
+        ] {
+            let forbidden = handle_request_with_runtime_and_authority(
+                "GET",
+                &path,
+                home,
+                None,
+                None,
+                &NoopSessionRuntime,
+                RequestAuthority::Tcp,
+            )?;
+            assert_eq!(forbidden.status, 403, "{path}: {}", forbidden.body);
+            let body: Value = serde_json::from_str(&forbidden.body)?;
+            assert_eq!(body["error"]["code"], "transport_forbidden");
+
+            let allowed = handle_request_with_runtime_and_authority(
+                "GET",
+                &path,
+                home,
+                None,
+                None,
+                &NoopSessionRuntime,
+                RequestAuthority::OwnerLocalIpc,
+            )?;
+            assert_eq!(allowed.status, 200, "{path}: {}", allowed.body);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_decision_tcp_forbidden_precedes_id_body_and_store_access() -> Result<()> {
+        for decision in ["approve", "reject"] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                &format!("/api/v1/threads/proposals/not-a-uuid/{decision}"),
+                home,
+                None,
+                Some("{not-json"),
+                &NoopSessionRuntime,
+                RequestAuthority::Tcp,
+            )?;
+
+            assert_eq!(response.status, 403, "{decision}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "transport_forbidden");
+            assert_eq!(body["error"]["details"]["writeApplied"], false);
+            assert!(!home.join("coven.sqlite3").exists());
+            assert!(!home.join("pending").exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn threads_proposal_recovery_is_forbidden_over_tcp_without_side_effects() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (_pending, proposal_id) = stage_pending_protected_edit(home)?;
+        let workspace = home.join("familiars").join("sage");
+        std::fs::write(workspace.join("SOUL.md"), "# Sage\n")?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ApplyBeforeAudit,
+            proposal_id.clone(),
+        )));
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+        );
+        assert!(interrupted.is_err());
+        let claim = find_pending_decision_claim(home, &proposal_id, "approve")
+            .expect("interrupted approval leaves a durable claim");
+        let claim_before = std::fs::read(&claim)?;
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let audit_before: i64 =
+            conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        drop(conn);
+
+        let forbidden = handle_request_with_runtime_and_authority(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some("{}"),
+            &NoopSessionRuntime,
+            RequestAuthority::Tcp,
+        )?;
+
+        assert_eq!(forbidden.status, 403, "got {}", forbidden.body);
+        let body: Value = serde_json::from_str(&forbidden.body)?;
+        assert_eq!(body["error"]["code"], "transport_forbidden");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(std::fs::read(&claim)?, claim_before);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("SOUL.md"))?,
+            "approved identity"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let audit_after: i64 =
+            conn.query_row("SELECT COUNT(*) FROM ward_audit", [], |row| row.get(0))?;
+        assert_eq!(audit_after, audit_before);
         Ok(())
     }
 

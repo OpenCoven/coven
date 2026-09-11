@@ -3,27 +3,396 @@
 //! The daemon reconciles terminal session evidence before planning, recovering,
 //! claiming, and dispatching occurrences on a 60-second cadence.
 
-use std::path::Path;
-use std::time::Duration;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+
+const SCHEDULER_INTERVAL: Duration = Duration::from_secs(60);
+#[cfg(test)]
+// This is only a hang guard; shutdown promptness is proven by wake-signal tests.
+const SCHEDULER_SHUTDOWN_JOIN_BUDGET: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct MonotonicInstant(Duration);
+
+impl MonotonicInstant {
+    #[cfg(test)]
+    const ZERO: Self = Self(Duration::ZERO);
+
+    fn saturating_add(self, duration: Duration) -> Self {
+        Self(self.0.saturating_add(duration))
+    }
+
+    fn saturating_duration_since(self, earlier: Self) -> Duration {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeReason {
+    Deadline,
+    Signaled,
+    Shutdown,
+}
+
+trait AutomationClock: Send + Sync {
+    fn now_utc(&self) -> chrono::DateTime<chrono::Utc>;
+    fn monotonic_now(&self) -> MonotonicInstant;
+    fn sleep_until_or_wake(
+        &self,
+        deadline: MonotonicInstant,
+        wake: &AutomationWakeSignal,
+        observed_generation: u64,
+    ) -> WakeReason;
+}
+
+struct SystemAutomationClock {
+    monotonic_origin: Instant,
+}
+
+impl Default for SystemAutomationClock {
+    fn default() -> Self {
+        Self {
+            monotonic_origin: Instant::now(),
+        }
+    }
+}
+
+impl AutomationClock for SystemAutomationClock {
+    fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        MonotonicInstant(self.monotonic_origin.elapsed())
+    }
+
+    fn sleep_until_or_wake(
+        &self,
+        deadline: MonotonicInstant,
+        wake: &AutomationWakeSignal,
+        observed_generation: u64,
+    ) -> WakeReason {
+        let mut state = wake
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        loop {
+            if state.shutdown {
+                return WakeReason::Shutdown;
+            }
+            if state.generation != observed_generation {
+                return WakeReason::Signaled;
+            }
+            let remaining = deadline.saturating_duration_since(self.monotonic_now());
+            if remaining.is_zero() {
+                return WakeReason::Deadline;
+            }
+            let waited = wake
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = waited.0;
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AutomationWakeState {
+    generation: u64,
+    shutdown: bool,
+}
+
+#[derive(Debug, Default)]
+struct AutomationWakeSignal {
+    state: Mutex<AutomationWakeState>,
+    changed: Condvar,
+}
+
+impl AutomationWakeSignal {
+    fn generation(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .generation
+    }
+
+    fn wake(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.generation = state.generation.wrapping_add(1);
+        self.changed.notify_all();
+    }
+
+    fn is_shutdown(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown
+    }
+
+    fn shutdown(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.shutdown = true;
+        self.changed.notify_all();
+    }
+}
+
+static SCHEDULER_WAKES: OnceLock<Mutex<HashMap<PathBuf, Weak<AutomationWakeSignal>>>> =
+    OnceLock::new();
+
+fn scheduler_wakes() -> &'static Mutex<HashMap<PathBuf, Weak<AutomationWakeSignal>>> {
+    SCHEDULER_WAKES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+struct SchedulerWakeRegistration {
+    home: PathBuf,
+    wake: Weak<AutomationWakeSignal>,
+}
+
+impl Drop for SchedulerWakeRegistration {
+    fn drop(&mut self) {
+        let mut registrations = scheduler_wakes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if registrations
+            .get(&self.home)
+            .is_some_and(|registered| Weak::ptr_eq(registered, &self.wake))
+        {
+            registrations.remove(&self.home);
+        }
+    }
+}
+
+fn register_scheduler_wake(
+    coven_home: &Path,
+    wake: Weak<AutomationWakeSignal>,
+) -> Result<SchedulerWakeRegistration> {
+    let home = coven_home.to_path_buf();
+    let mut registrations = scheduler_wakes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if registrations.get(&home).and_then(Weak::upgrade).is_some() {
+        anyhow::bail!(
+            "automations scheduler is already registered for {}",
+            home.display()
+        );
+    }
+    registrations.insert(home.clone(), wake.clone());
+    Ok(SchedulerWakeRegistration { home, wake })
+}
+
+pub(crate) fn wake_automations_scheduler(coven_home: &Path) -> bool {
+    let wake = scheduler_wakes()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(coven_home)
+        .and_then(Weak::upgrade);
+    if let Some(wake) = wake {
+        wake.wake();
+        true
+    } else {
+        false
+    }
+}
 
 /// One automations pass: open the store, run the full tick (plan, recover,
 /// claim), then dispatch every claimed occurrence through the shared
 /// session-launch runtime. Failures land in the daemon recovery log via the
 /// caller.
-pub fn process_automations_tick(
+#[cfg(test)]
+fn process_automations_tick(
     coven_home: &Path,
     runtime: &dyn crate::api::SessionRuntime,
 ) -> Result<super::occurrences::TickReport> {
+    process_automations_pass(
+        coven_home,
+        runtime,
+        &SystemAutomationClock::default(),
+        &AutomationWakeSignal::default(),
+        None,
+    )
+}
+
+#[cfg(test)]
+fn process_automations_pass(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+    clock: &dyn AutomationClock,
+    wake: &AutomationWakeSignal,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+) -> Result<super::occurrences::TickReport> {
+    process_automations_pass_inner(coven_home, runtime, clock, wake, startup_cutoff, None)
+        .map(|report| report.tick)
+        .map_err(|failure| failure.error)
+}
+
+fn process_automations_pass_with_scheduler(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+    clock: &dyn AutomationClock,
+    wake: &AutomationWakeSignal,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    fence: &super::leadership::SchedulerFence,
+    pass: SchedulerPassContext<'_>,
+) -> Result<super::occurrences::TickReport> {
+    let started_at = clock.now_utc();
+    let started_monotonic = clock.monotonic_now();
+    let result = process_automations_pass_inner(
+        coven_home,
+        runtime,
+        clock,
+        wake,
+        startup_cutoff,
+        Some(fence),
+    );
+    let finished_at = clock.now_utc();
+    let duration_ms = i64::try_from(
+        clock
+            .monotonic_now()
+            .saturating_duration_since(started_monotonic)
+            .as_millis(),
+    )
+    .context("automations scheduler pass duration exceeds supported range")?;
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
-    let now = chrono::Utc::now();
-    reconcile_automation_runs(coven_home, &conn, runtime, now, false)?;
-    let report = super::occurrences::tick(&conn, now)?;
-    let _dispatch = super::runner::dispatch_claimed_occurrences(&conn, runtime, chrono::Utc::now())
-        .map_err(anyhow::Error::msg)?;
-    Ok(report)
+    match result {
+        Ok(report) => {
+            let record = super::diagnostics::SchedulerPassRecord {
+                trigger: pass.trigger,
+                scheduled_at: pass.scheduled_at,
+                started_at,
+                finished_at,
+                duration_ms,
+                status: "succeeded",
+                error_class: None,
+                planned: Some(report.tick.planned.len()),
+                recovered: Some(report.tick.recovered),
+                claimed: Some(report.tick.claimed.len()),
+                dispatched: Some(report.dispatch.dispatched.len()),
+                failures: Some(report.tick.failed.len() + report.dispatch.failed.len()),
+            };
+            super::diagnostics::record_scheduler_pass(&conn, fence, &record)?;
+            Ok(report.tick)
+        }
+        Err(failure) => {
+            let planned = failure.tick.as_ref().map(|tick| tick.planned.len());
+            let recovered = failure.tick.as_ref().map(|tick| tick.recovered);
+            let claimed = failure.tick.as_ref().map(|tick| tick.claimed.len());
+            let failures = failure
+                .tick
+                .as_ref()
+                .map(|tick| tick.failed.len().saturating_add(1));
+            let record = super::diagnostics::SchedulerPassRecord {
+                trigger: pass.trigger,
+                scheduled_at: pass.scheduled_at,
+                started_at,
+                finished_at,
+                duration_ms,
+                status: "failed",
+                error_class: Some("scheduler_pass_failed"),
+                planned,
+                recovered,
+                claimed,
+                dispatched: None,
+                failures,
+            };
+            super::diagnostics::record_scheduler_pass(&conn, fence, &record).with_context(
+                || {
+                    format!(
+                        "failed to record automations scheduler pass after: {:#}",
+                        failure.error
+                    )
+                },
+            )?;
+            Err(failure.error)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SchedulerPassContext<'a> {
+    trigger: &'a str,
+    scheduled_at: DateTime<Utc>,
+}
+
+struct CompletedAutomationPass {
+    tick: super::occurrences::TickReport,
+    dispatch: super::runner::DispatchReport,
+}
+
+struct FailedAutomationPass {
+    tick: Option<super::occurrences::TickReport>,
+    error: anyhow::Error,
+}
+
+fn process_automations_pass_inner(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+    clock: &dyn AutomationClock,
+    wake: &AutomationWakeSignal,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> std::result::Result<CompletedAutomationPass, FailedAutomationPass> {
+    let store_path = crate::api::store_path(coven_home);
+    let conn = crate::store::open_store(&store_path)
+        .map_err(|error| FailedAutomationPass { tick: None, error })?;
+    let now = clock.now_utc();
+    if let Some(fence) = scheduler_fence {
+        let current = fence
+            .is_current(&conn)
+            .map_err(|error| FailedAutomationPass { tick: None, error })?;
+        if !current {
+            return Err(FailedAutomationPass {
+                tick: None,
+                error: anyhow::anyhow!("automations scheduler fence is stale"),
+            });
+        }
+    }
+    reconcile_automation_runs(coven_home, &conn, runtime, now, startup_cutoff)
+        .map_err(|error| FailedAutomationPass { tick: None, error })?;
+    let report = match scheduler_fence {
+        Some(fence) => super::occurrences::tick_with_scheduler_fence(&conn, now, fence),
+        None => super::occurrences::tick(&conn, now),
+    }
+    .map_err(|error| FailedAutomationPass { tick: None, error })?;
+    let dispatch = match scheduler_fence {
+        Some(fence) => {
+            super::runner::dispatch_claimed_occurrences_with_clock_and_cancel_and_scheduler(
+                &conn,
+                runtime,
+                now,
+                || clock.now_utc(),
+                || wake.is_shutdown(),
+                fence,
+            )
+        }
+        None => super::runner::dispatch_claimed_occurrences_with_clock_and_cancel(
+            &conn,
+            runtime,
+            now,
+            || clock.now_utc(),
+            || wake.is_shutdown(),
+        ),
+    };
+    let dispatch = dispatch.map_err(|error| FailedAutomationPass {
+        tick: Some(report.clone()),
+        error: anyhow::Error::msg(error),
+    })?;
+    Ok(CompletedAutomationPass {
+        tick: report,
+        dispatch,
+    })
 }
 
 fn reconcile_automation_runs(
@@ -31,9 +400,11 @@ fn reconcile_automation_runs(
     conn: &rusqlite::Connection,
     runtime: &dyn crate::api::SessionRuntime,
     now: chrono::DateTime<chrono::Utc>,
-    startup: bool,
+    startup_cutoff: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Result<()> {
-    super::runner::recover_restart_containment(coven_home, conn, now, startup)
+    super::runner::recover_restart_containment(coven_home, conn, now, startup_cutoff)
+        .map_err(anyhow::Error::msg)?;
+    super::cancellation::reconcile_expired_cancellations(conn, runtime, now)
         .map_err(anyhow::Error::msg)?;
     for failure in
         super::runner::recover_abandoned_launches(conn, runtime, now).map_err(anyhow::Error::msg)?
@@ -51,32 +422,220 @@ fn reconcile_automation_runs(
     Ok(())
 }
 
-/// Starts the automations scheduler thread on the daemon's 60s cadence.
+pub struct AutomationSchedulerHandle {
+    wake: Arc<AutomationWakeSignal>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AutomationSchedulerHandle {
+    pub fn request_shutdown(&self) {
+        self.wake.shutdown();
+    }
+
+    pub fn finish_shutdown(mut self, deadline: Instant) -> Result<()> {
+        let Some(thread) = self.thread.take() else {
+            return Ok(());
+        };
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if thread.is_finished() {
+            thread.join().map_err(|_| {
+                anyhow::anyhow!("automations scheduler thread panicked during shutdown")
+            })
+        } else {
+            eprintln!(
+                "coven daemon: automations scheduler did not stop within the shared shutdown window; detaching for process exit"
+            );
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    fn shutdown(self) -> Result<()> {
+        let deadline = Instant::now() + SCHEDULER_SHUTDOWN_JOIN_BUDGET;
+        self.request_shutdown();
+        self.finish_shutdown(deadline)
+    }
+}
+
+impl Drop for AutomationSchedulerHandle {
+    fn drop(&mut self) {
+        self.wake.shutdown();
+    }
+}
+
+#[cfg(test)]
+fn run_automations_scheduler(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+    clock: &dyn AutomationClock,
+    wake: &AutomationWakeSignal,
+) -> Result<()> {
+    let conn = crate::store::open_store(&crate::api::store_path(coven_home))?;
+    let mut leadership =
+        super::leadership::SchedulerLeadership::acquire(coven_home, &conn, clock.now_utc())?;
+    let observed_generation = wake.generation();
+    let startup_cutoff = clock.now_utc();
+    process_automations_pass_with_scheduler(
+        coven_home,
+        runtime,
+        clock,
+        wake,
+        Some(startup_cutoff),
+        &leadership.fence(),
+        SchedulerPassContext {
+            trigger: "startup",
+            scheduled_at: startup_cutoff,
+        },
+    )?;
+    run_automations_scheduler_after_startup(
+        coven_home,
+        runtime,
+        clock,
+        wake,
+        observed_generation,
+        &leadership.fence(),
+    );
+    record_shutdown_reconciliation(coven_home, clock.now_utc());
+    leadership.release(&conn)?;
+    Ok(())
+}
+
+fn record_shutdown_reconciliation(coven_home: &Path, now: DateTime<Utc>) {
+    let result = crate::store::open_store(&crate::api::store_path(coven_home)).and_then(|conn| {
+        super::runner::mark_active_attempts_for_restart_reconciliation(&conn, now)
+            .map(|_| ())
+            .map_err(anyhow::Error::msg)
+    });
+    if let Err(error) = result {
+        crate::daemon::append_daemon_recovery_log(
+            coven_home,
+            &format!("automations shutdown reconciliation failed: {error:#}"),
+        );
+    }
+}
+
+fn run_automations_scheduler_after_startup(
+    coven_home: &Path,
+    runtime: &dyn crate::api::SessionRuntime,
+    clock: &dyn AutomationClock,
+    wake: &AutomationWakeSignal,
+    mut observed_generation: u64,
+    fence: &super::leadership::SchedulerFence,
+) {
+    loop {
+        let scheduled_at = clock.now_utc()
+            + chrono::Duration::from_std(SCHEDULER_INTERVAL)
+                .expect("scheduler interval must fit chrono duration");
+        let deadline = clock.monotonic_now().saturating_add(SCHEDULER_INTERVAL);
+        let wake_reason = clock.sleep_until_or_wake(deadline, wake, observed_generation);
+        match wake_reason {
+            WakeReason::Shutdown => return,
+            WakeReason::Deadline | WakeReason::Signaled => {
+                observed_generation = wake.generation();
+            }
+        }
+        let (trigger, scheduled_at) = match wake_reason {
+            WakeReason::Deadline => ("deadline", scheduled_at),
+            WakeReason::Signaled => ("wake", clock.now_utc()),
+            WakeReason::Shutdown => unreachable!("shutdown returned above"),
+        };
+        if let Err(error) = process_automations_pass_with_scheduler(
+            coven_home,
+            runtime,
+            clock,
+            wake,
+            None,
+            fence,
+            SchedulerPassContext {
+                trigger,
+                scheduled_at,
+            },
+        ) {
+            crate::daemon::append_daemon_recovery_log(
+                coven_home,
+                &format!("automations tick failed: {error:#}"),
+            );
+        }
+    }
+}
+
+/// Starts the automations scheduler. The worker immediately performs startup
+/// reconciliation and due-work dispatch without delaying transport readiness.
+/// The returned handle wakes and joins the worker on daemon shutdown.
 pub fn start_automations_scheduler(
     coven_home: &Path,
-    runtime: std::sync::Arc<dyn crate::api::SessionRuntime + Send + Sync>,
-) -> Result<()> {
+    runtime: Arc<dyn crate::api::SessionRuntime + Send + Sync>,
+) -> Result<AutomationSchedulerHandle> {
+    let wake = Arc::new(AutomationWakeSignal::default());
+    let registration = register_scheduler_wake(coven_home, Arc::downgrade(&wake))?;
+
     let store_path = crate::api::store_path(coven_home);
     let conn = crate::store::open_store(&store_path)?;
-    let now = chrono::Utc::now();
-    reconcile_automation_runs(coven_home, &conn, runtime.as_ref(), now, true)?;
-    let _dispatch =
-        super::runner::dispatch_claimed_occurrences(&conn, runtime.as_ref(), chrono::Utc::now())
-            .map_err(anyhow::Error::msg)?;
+    let recovery_now = chrono::Utc::now();
+    let leadership =
+        super::leadership::SchedulerLeadership::acquire(coven_home, &conn, recovery_now)?;
+    super::runner::recover_no_process_preownership_launches(coven_home, &conn, recovery_now)
+        .map_err(anyhow::Error::msg)?;
+    super::runner::restore_unlaunched_daemon_claims_for_retry(&conn, recovery_now)
+        .map_err(anyhow::Error::msg)?;
+    drop(conn);
+
+    let clock = Arc::new(SystemAutomationClock::default());
+    let observed_generation = wake.generation();
+
     let home = coven_home.to_path_buf();
-    std::thread::Builder::new()
+    let thread_wake = Arc::clone(&wake);
+    let thread = std::thread::Builder::new()
         .name("coven-automations-scheduler".into())
-        .spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(60));
-            if let Err(error) = process_automations_tick(&home, runtime.as_ref()) {
+        .spawn(move || {
+            let _registration = registration;
+            let mut leadership = leadership;
+            let fence = leadership.fence();
+            if let Err(error) = process_automations_pass_with_scheduler(
+                &home,
+                runtime.as_ref(),
+                clock.as_ref(),
+                thread_wake.as_ref(),
+                Some(recovery_now),
+                &fence,
+                SchedulerPassContext {
+                    trigger: "startup",
+                    scheduled_at: recovery_now,
+                },
+            ) {
                 crate::daemon::append_daemon_recovery_log(
                     &home,
-                    &format!("automations tick failed: {error:#}"),
+                    &format!("automations startup tick failed: {error:#}"),
                 );
+            }
+            if !thread_wake.is_shutdown() {
+                run_automations_scheduler_after_startup(
+                    &home,
+                    runtime.as_ref(),
+                    clock.as_ref(),
+                    thread_wake.as_ref(),
+                    observed_generation,
+                    &fence,
+                );
+            }
+            record_shutdown_reconciliation(&home, clock.now_utc());
+            match crate::store::open_store(&crate::api::store_path(&home))
+                .and_then(|conn| leadership.release(&conn).map(|_| ()))
+            {
+                Ok(()) => {}
+                Err(error) => crate::daemon::append_daemon_recovery_log(
+                    &home,
+                    &format!("automations scheduler authority release failed: {error:#}"),
+                ),
             }
         })
         .context("failed to spawn automations scheduler")?;
-    Ok(())
+    Ok(AutomationSchedulerHandle {
+        wake,
+        thread: Some(thread),
+    })
 }
 
 #[cfg(test)]
@@ -84,7 +643,157 @@ mod tests {
     use super::*;
     use crate::automations::definition::RoutineDefinition;
     use crate::automations::store::insert_definition;
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::collections::{BTreeSet, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::{Arc, Mutex};
+
+    struct FailingDispatchClock {
+        now: chrono::DateTime<Utc>,
+        store_path: std::path::PathBuf,
+        calls: AtomicUsize,
+    }
+
+    impl AutomationClock for FailingDispatchClock {
+        fn now_utc(&self) -> chrono::DateTime<Utc> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == 3 {
+                let conn = crate::store::open_store(&self.store_path).unwrap();
+                conn.execute_batch("DROP TABLE automation_occurrences")
+                    .unwrap();
+            }
+            self.now
+        }
+
+        fn monotonic_now(&self) -> MonotonicInstant {
+            MonotonicInstant::ZERO
+        }
+
+        fn sleep_until_or_wake(
+            &self,
+            _deadline: MonotonicInstant,
+            _wake: &AutomationWakeSignal,
+            _observed_generation: u64,
+        ) -> WakeReason {
+            unreachable!("the failing dispatch clock does not sleep")
+        }
+    }
+
+    #[test]
+    fn failed_pass_status_preserves_completed_tick_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let store_path = home.join("coven.sqlite3");
+        crate::store::initialize_store(&store_path).unwrap();
+        let conn = crate::store::open_store(&store_path).unwrap();
+        insert_definition(&conn, &definition("partial-pass")).unwrap();
+        set_created_at(&conn, "partial-pass", "2026-08-31T08:00:00.000Z");
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 10, 0, 0).unwrap();
+        let leadership =
+            super::super::leadership::SchedulerLeadership::acquire(home, &conn, now).unwrap();
+        let clock = FailingDispatchClock {
+            now,
+            store_path: store_path.clone(),
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = process_automations_pass_with_scheduler(
+            home,
+            &crate::api::NoopSessionRuntime,
+            &clock,
+            &AutomationWakeSignal::default(),
+            None,
+            &leadership.fence(),
+            SchedulerPassContext {
+                trigger: "startup",
+                scheduled_at: now,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("automation_occurrences"));
+        let (status, planned, claimed, failures): (String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT status, planned, claimed, failures
+                 FROM automation_scheduler_last_pass
+                 WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+        assert_eq!(planned, 1);
+        assert_eq!(claimed, 1);
+        assert_eq!(failures, 1);
+    }
+
+    #[test]
+    fn scheduler_start_pins_its_generation_on_scheduled_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("generation-pinned")).unwrap();
+        set_created_at(&conn, "generation-pinned", "2020-01-01T08:00:00.000Z");
+        drop(conn);
+        let (started_tx, started_rx) = sync_channel(1);
+
+        let handle = start_automations_scheduler(
+            home,
+            Arc::new(NotifyingRunningRuntime {
+                started: started_tx,
+            }),
+        )
+        .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup pass should publish runtime ownership");
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let (occurrence_generation, authority_generation): (i64, i64) = conn
+            .query_row(
+                "SELECT o.scheduler_generation, authority.generation
+                 FROM automation_occurrences AS o
+                 CROSS JOIN automation_scheduler_authority AS authority
+                 WHERE o.automation_id = 'generation-pinned'
+                   AND authority.id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(occurrence_generation, authority_generation);
+        assert!(occurrence_generation >= 1);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn direct_scheduler_runner_refuses_a_second_home_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let handle =
+            start_automations_scheduler(home, Arc::new(crate::api::NoopSessionRuntime)).unwrap();
+        let clock = FixedSystemClock {
+            now: Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).unwrap(),
+            system: SystemAutomationClock::default(),
+        };
+        let wake = AutomationWakeSignal::default();
+        wake.shutdown();
+
+        let error = run_automations_scheduler(home, &crate::api::NoopSessionRuntime, &clock, &wake)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("automations scheduler leadership is already held"),
+            "{error:#}"
+        );
+        handle.shutdown().unwrap();
+    }
 
     fn definition(id: &str) -> RoutineDefinition {
         RoutineDefinition::from_json(&json!({
@@ -115,7 +824,9 @@ mod tests {
         let old_created = (chrono::Utc::now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -181,5 +892,734 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    struct ScriptedClock {
+        state: Mutex<ScriptedClockState>,
+    }
+
+    struct ScriptedClockState {
+        now: chrono::DateTime<Utc>,
+        monotonic: MonotonicInstant,
+        waits: VecDeque<(chrono::Duration, Duration, WakeReason)>,
+    }
+
+    impl ScriptedClock {
+        fn new(
+            now: chrono::DateTime<Utc>,
+            waits: impl IntoIterator<Item = (chrono::Duration, Duration, WakeReason)>,
+        ) -> Self {
+            Self {
+                state: Mutex::new(ScriptedClockState {
+                    now,
+                    monotonic: MonotonicInstant::ZERO,
+                    waits: waits.into_iter().collect(),
+                }),
+            }
+        }
+    }
+
+    impl AutomationClock for ScriptedClock {
+        fn now_utc(&self) -> chrono::DateTime<Utc> {
+            self.state.lock().unwrap().now
+        }
+
+        fn monotonic_now(&self) -> MonotonicInstant {
+            self.state.lock().unwrap().monotonic
+        }
+
+        fn sleep_until_or_wake(
+            &self,
+            _deadline: MonotonicInstant,
+            _wake: &AutomationWakeSignal,
+            _observed_generation: u64,
+        ) -> WakeReason {
+            let mut state = self.state.lock().unwrap();
+            let (wall_advance, monotonic_advance, reason) =
+                state.waits.pop_front().expect("scripted wait");
+            state.now += wall_advance;
+            state.monotonic = state.monotonic.saturating_add(monotonic_advance);
+            reason
+        }
+    }
+
+    struct FixedSystemClock {
+        now: chrono::DateTime<Utc>,
+        system: SystemAutomationClock,
+    }
+
+    impl AutomationClock for FixedSystemClock {
+        fn now_utc(&self) -> chrono::DateTime<Utc> {
+            self.now
+        }
+
+        fn monotonic_now(&self) -> MonotonicInstant {
+            self.system.monotonic_now()
+        }
+
+        fn sleep_until_or_wake(
+            &self,
+            deadline: MonotonicInstant,
+            wake: &AutomationWakeSignal,
+            observed_generation: u64,
+        ) -> WakeReason {
+            self.system
+                .sleep_until_or_wake(deadline, wake, observed_generation)
+        }
+    }
+
+    struct BlockingFirstLaunchRuntime {
+        launches: AtomicUsize,
+        first_started: SyncSender<()>,
+        first_release: Mutex<Receiver<()>>,
+        second_started: SyncSender<()>,
+    }
+
+    impl crate::api::SessionRuntime for BlockingFirstLaunchRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> Result<()> {
+            anyhow::bail!("blocking runtime requires the contained adopted launch path")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &crate::api::SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            ownership_established()?;
+            match self.launches.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    self.first_started
+                        .send(())
+                        .context("failed to report first scheduler launch")?;
+                    self.first_release
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .recv()
+                        .context("failed to release first scheduler launch")?;
+                }
+                1 => {
+                    self.second_started
+                        .send(())
+                        .context("failed to report second scheduler launch")?;
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct BlockingRejectedLaunchRuntime {
+        started: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl crate::api::SessionRuntime for BlockingRejectedLaunchRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> Result<()> {
+            anyhow::bail!("blocking runtime requires the contained adopted launch path")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            _launch: &crate::api::SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            _ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            self.started
+                .send(())
+                .context("failed to report blocked scheduler launch")?;
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv()
+                .context("failed to release blocked scheduler launch")?;
+            Err(anyhow::Error::new(
+                crate::api::RuntimeLaunchAdmissionClosedError,
+            ))
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct NotifyingRunningRuntime {
+        started: SyncSender<String>,
+    }
+
+    impl crate::api::SessionRuntime for NotifyingRunningRuntime {
+        fn launch_session(&self, _launch: &crate::api::SessionLaunch) -> Result<()> {
+            unreachable!("automation dispatch uses the contained adopted launch path")
+        }
+
+        fn launch_contained_adopted_session(
+            &self,
+            launch: &crate::api::SessionLaunch,
+            _writer: Option<crate::maintenance_gate::WriterLease>,
+            ownership_established: &mut dyn FnMut() -> Result<()>,
+        ) -> Result<()> {
+            ownership_established()?;
+            self.started
+                .send(launch.id.clone())
+                .context("failed to report running automation launch")
+        }
+
+        fn send_input(&self, _session_id: &str, _payload: &serde_json::Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn set_created_at(conn: &rusqlite::Connection, id: &str, created_at: &str) {
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?2, updated_at = ?2
+             WHERE id = ?1",
+            rusqlite::params![id, created_at],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn scheduler_runs_a_full_due_pass_before_its_first_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("startup-due")).unwrap();
+        set_created_at(&conn, "startup-due", "2026-08-29T08:00:00.000Z");
+        drop(conn);
+
+        let clock = ScriptedClock::new(
+            Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap(),
+            [(
+                chrono::Duration::zero(),
+                Duration::ZERO,
+                WakeReason::Shutdown,
+            )],
+        );
+        let wake = Arc::new(AutomationWakeSignal::default());
+
+        run_automations_scheduler(home, &crate::api::NoopSessionRuntime, &clock, wake.as_ref())
+            .unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences WHERE automation_id = 'startup-due'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            state, "recovery_required",
+            "shutdown must preserve the launched work for restart reconciliation"
+        );
+    }
+
+    #[test]
+    fn startup_settles_terminal_run_before_planning_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let routine = definition("startup-order");
+        insert_definition(&conn, &routine).unwrap();
+        let previous_started = Utc::now();
+        let created_at = (previous_started - chrono::Duration::days(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        set_created_at(&conn, "startup-order", &created_at);
+        let previous = super::super::runner::run_routine_now(
+            &conn,
+            &crate::api::NoopSessionRuntime,
+            &routine,
+            previous_started,
+        )
+        .unwrap();
+        let previous_finished = previous_started + chrono::Duration::seconds(1);
+        crate::store::update_session_terminal_if_active(
+            &conn,
+            previous.session_id.as_deref().unwrap(),
+            "completed",
+            Some(0),
+            &previous_finished.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+        .unwrap();
+        drop(conn);
+
+        let clock = FixedSystemClock {
+            now: previous_started + chrono::Duration::days(1),
+            system: SystemAutomationClock::default(),
+        };
+        let wake = AutomationWakeSignal::default();
+        process_automations_pass(
+            home,
+            &crate::api::NoopSessionRuntime,
+            &clock,
+            &wake,
+            Some(clock.now),
+        )
+        .unwrap();
+        process_automations_pass(
+            home,
+            &crate::api::NoopSessionRuntime,
+            &clock,
+            &wake,
+            Some(clock.now),
+        )
+        .unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let runs = super::super::runs::list_runs(&conn, &routine.id, 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter().filter(|run| run.status == "succeeded").count(),
+            1
+        );
+        assert_eq!(runs.iter().filter(|run| run.status == "running").count(), 1);
+        let scheduled_occurrences: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = ?1 AND kind = 'scheduled'",
+                [&routine.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scheduled_occurrences, 1);
+    }
+
+    #[test]
+    fn scheduler_wake_replans_without_waiting_for_the_periodic_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("wake-due")).unwrap();
+        set_created_at(&conn, "wake-due", "2026-08-30T08:45:00.000Z");
+        drop(conn);
+
+        let clock = ScriptedClock::new(
+            Utc.with_ymd_and_hms(2026, 8, 30, 8, 30, 0).unwrap(),
+            [
+                (
+                    chrono::Duration::minutes(90),
+                    Duration::from_secs(1),
+                    WakeReason::Signaled,
+                ),
+                (
+                    chrono::Duration::zero(),
+                    Duration::ZERO,
+                    WakeReason::Shutdown,
+                ),
+            ],
+        );
+        let wake = Arc::new(AutomationWakeSignal::default());
+
+        run_automations_scheduler(home, &crate::api::NoopSessionRuntime, &clock, wake.as_ref())
+            .unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let (state, failure_reason): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, failure_reason
+                 FROM automation_occurrences
+                 WHERE automation_id = 'wake-due'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "recovery_required", "{failure_reason:?}");
+        assert!(failure_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("restart reconciliation")));
+    }
+
+    #[test]
+    fn mutation_racing_an_active_pass_is_not_lost_before_the_next_wait() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("first-due")).unwrap();
+        set_created_at(&conn, "first-due", "2026-08-29T08:00:00.000Z");
+        drop(conn);
+
+        let (first_started_tx, first_started_rx) = sync_channel(0);
+        let (first_release_tx, first_release_rx) = sync_channel(0);
+        let (second_started_tx, second_started_rx) = sync_channel(0);
+        let runtime = Arc::new(BlockingFirstLaunchRuntime {
+            launches: AtomicUsize::new(0),
+            first_started: first_started_tx,
+            first_release: Mutex::new(first_release_rx),
+            second_started: second_started_tx,
+        });
+        let clock = Arc::new(FixedSystemClock {
+            now: Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap(),
+            system: SystemAutomationClock::default(),
+        });
+        let wake = Arc::new(AutomationWakeSignal::default());
+        let scheduler_home = home.clone();
+        let scheduler_runtime = Arc::clone(&runtime);
+        let scheduler_clock = Arc::clone(&clock);
+        let scheduler_wake = Arc::clone(&wake);
+        let scheduler = std::thread::spawn(move || {
+            run_automations_scheduler(
+                &scheduler_home,
+                scheduler_runtime.as_ref(),
+                scheduler_clock.as_ref(),
+                scheduler_wake.as_ref(),
+            )
+        });
+
+        first_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup dispatch should reach the blocking runtime");
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("second-due")).unwrap();
+        set_created_at(&conn, "second-due", "2026-08-29T08:00:00.000Z");
+        drop(conn);
+        wake.wake();
+        first_release_tx.send(()).unwrap();
+
+        // This is a hang guard far below the 60-second periodic deadline, not
+        // a promptness assertion. The real wake must start the second pass.
+        let second_started = second_started_rx.recv_timeout(Duration::from_secs(5));
+        wake.shutdown();
+        scheduler.join().unwrap().unwrap();
+        second_started.expect("the pass-racing wake should dispatch the second definition");
+        assert_eq!(runtime.launches.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn scheduler_start_does_not_block_daemon_readiness_on_due_dispatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("startup-blocked")).unwrap();
+        set_created_at(&conn, "startup-blocked", "2020-01-01T08:00:00.000Z");
+        drop(conn);
+
+        let (started_tx, started_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let runtime = Arc::new(BlockingRejectedLaunchRuntime {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+
+        let scheduler_home = home.to_path_buf();
+        let (handle_tx, handle_rx) = sync_channel(1);
+        let starter = std::thread::spawn(move || {
+            let _ = handle_tx.send(start_automations_scheduler(&scheduler_home, runtime));
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup pass should begin");
+
+        let returned_before_dispatch = handle_rx.try_recv();
+        let returned_promptly = returned_before_dispatch.is_ok();
+        release_tx.send(()).unwrap();
+        let handle = match returned_before_dispatch {
+            Ok(result) => result.unwrap(),
+            Err(_) => handle_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("scheduler start should eventually return")
+                .unwrap(),
+        };
+        starter.join().unwrap();
+        handle.request_shutdown();
+        handle.shutdown().unwrap();
+        assert!(
+            returned_promptly,
+            "scheduler startup must not wait for due runtime dispatch"
+        );
+    }
+
+    #[test]
+    fn shutdown_racing_preownership_launch_restores_retryable_occurrence() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        insert_definition(&conn, &definition("shutdown-retry")).unwrap();
+        set_created_at(&conn, "shutdown-retry", "2020-01-01T08:00:00.000Z");
+        drop(conn);
+
+        let (started_tx, started_rx) = sync_channel(0);
+        let (release_tx, release_rx) = sync_channel(0);
+        let runtime = Arc::new(BlockingRejectedLaunchRuntime {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+        });
+        let clock = Arc::new(FixedSystemClock {
+            now: Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap(),
+            system: SystemAutomationClock::default(),
+        });
+        let wake = Arc::new(AutomationWakeSignal::default());
+        let scheduler_home = home.clone();
+        let scheduler_clock = Arc::clone(&clock);
+        let scheduler_wake = Arc::clone(&wake);
+        let scheduler = std::thread::spawn(move || {
+            run_automations_scheduler(
+                &scheduler_home,
+                runtime.as_ref(),
+                scheduler_clock.as_ref(),
+                scheduler_wake.as_ref(),
+            )
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("startup dispatch should reach the blocked runtime");
+
+        wake.shutdown();
+        release_tx.send(()).unwrap();
+        scheduler.join().unwrap().unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let (state, lease_owner, failure_reason): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, lease_owner, failure_reason
+                 FROM automation_occurrences
+                 WHERE automation_id = 'shutdown-retry'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+        assert_eq!(lease_owner, None);
+        assert_eq!(failure_reason, None);
+        let run_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM automation_runs", [], |row| row.get(0))
+            .unwrap();
+        let session_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(run_count, 0);
+        assert_eq!(session_count, 0);
+    }
+
+    #[test]
+    fn bounded_shutdown_drain_marks_every_active_attempt_for_restart_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let automation_ids = [
+            "shutdown-reconciliation-one",
+            "shutdown-reconciliation-two",
+            "shutdown-reconciliation-three",
+        ];
+        for automation_id in automation_ids {
+            insert_definition(&conn, &definition(automation_id)).unwrap();
+            set_created_at(&conn, automation_id, "2020-01-01T08:00:00.000Z");
+        }
+        drop(conn);
+
+        let (started_tx, started_rx) = sync_channel(automation_ids.len());
+        let handle = start_automations_scheduler(
+            home,
+            Arc::new(NotifyingRunningRuntime {
+                started: started_tx,
+            }),
+        )
+        .unwrap();
+        // Hang guard only: the channel proves every runtime ownership record
+        // exists before the bounded drain begins.
+        let started_sessions: BTreeSet<String> = (0..automation_ids.len())
+            .map(|_| {
+                started_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("startup pass should establish every runtime ownership")
+            })
+            .collect();
+        assert_eq!(started_sessions.len(), automation_ids.len());
+
+        handle.request_shutdown();
+        handle.shutdown().unwrap();
+
+        let conn = crate::store::open_store(&home.join("coven.sqlite3")).unwrap();
+        let lifecycle: Vec<(String, String, String, Option<String>, String, String)> = conn
+            .prepare(
+                "SELECT o.automation_id, o.state, a.state, a.state_reason, r.status, s.status
+                 FROM automation_occurrences AS o
+                 JOIN automation_runs AS r ON r.occurrence_id = o.id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = r.session_id
+                 WHERE o.automation_id IN (
+                    'shutdown-reconciliation-one',
+                    'shutdown-reconciliation-two',
+                    'shutdown-reconciliation-three'
+                 )
+                 ORDER BY o.automation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            lifecycle.len(),
+            automation_ids.len(),
+            "the bounded drain must record every active attempt for restart reconciliation"
+        );
+        for (automation_id, occurrence_state, attempt_state, reason, run_state, session_state) in
+            lifecycle
+        {
+            assert_eq!(occurrence_state, "recovery_required", "{automation_id}");
+            assert_eq!(attempt_state, "started", "{automation_id}");
+            assert!(
+                reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("restart reconciliation")),
+                "shutdown must durably explain why `{automation_id}` requires reconciliation"
+            );
+            assert_eq!(run_state, "running", "{automation_id}");
+            assert_eq!(
+                session_state, "running",
+                "scheduler shutdown must not assume `{automation_id}` stopped"
+            );
+        }
+    }
+
+    #[test]
+    fn successful_automation_actions_wake_only_their_registered_home() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for home in [first.path(), second.path()] {
+            crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        }
+        let first_wake = Arc::new(AutomationWakeSignal::default());
+        let second_wake = Arc::new(AutomationWakeSignal::default());
+        let _first_registration =
+            register_scheduler_wake(first.path(), Arc::downgrade(&first_wake)).unwrap();
+        let _second_registration =
+            register_scheduler_wake(second.path(), Arc::downgrade(&second_wake)).unwrap();
+
+        let invalid_body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:wake-test:invalid",
+            "definition": []
+        })
+        .to_string();
+        let invalid_response = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            first.path(),
+            None,
+            Some(&invalid_body),
+        )
+        .unwrap();
+        assert_eq!(invalid_response.status, 400);
+        assert_eq!(first_wake.generation(), 0);
+
+        let body = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:wake-test:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "wake-test",
+                "name": "Wake test",
+                "status": "ACTIVE",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "cwd": "/work/project",
+                "prompt": "Do the thing."
+            }
+        })
+        .to_string();
+
+        let response = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            first.path(),
+            None,
+            Some(&body),
+        )
+        .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(first_wake.generation(), 1);
+        assert_eq!(second_wake.generation(), 0);
+
+        let run_body = json!({
+            "action": "coven.automations.run",
+            "id": "wake-test"
+        })
+        .to_string();
+        let run_response = crate::api::handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            first.path(),
+            None,
+            Some(&run_body),
+        )
+        .unwrap();
+
+        assert_eq!(run_response.status, 200);
+        assert_eq!(first_wake.generation(), 2);
+        assert_eq!(second_wake.generation(), 0);
+    }
+
+    #[test]
+    fn wake_and_shutdown_are_observed_without_a_wall_clock_sleep() {
+        let clock = SystemAutomationClock::default();
+        let wake = AutomationWakeSignal::default();
+        let deadline = clock
+            .monotonic_now()
+            .saturating_add(Duration::from_secs(60));
+
+        wake.wake();
+        assert_eq!(
+            clock.sleep_until_or_wake(deadline, &wake, 0),
+            WakeReason::Signaled
+        );
+
+        let observed_generation = wake.generation();
+        wake.shutdown();
+        assert_eq!(
+            clock.sleep_until_or_wake(deadline, &wake, observed_generation),
+            WakeReason::Shutdown
+        );
+    }
+
+    #[test]
+    fn scheduler_handle_wakes_joins_and_unregisters_its_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        crate::store::initialize_store(&home.join("coven.sqlite3")).unwrap();
+        let handle =
+            start_automations_scheduler(home, Arc::new(crate::api::NoopSessionRuntime)).unwrap();
+
+        assert!(wake_automations_scheduler(home));
+        handle.shutdown().unwrap();
+        assert!(!wake_automations_scheduler(home));
     }
 }

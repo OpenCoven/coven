@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use super::definition::{RoutineDefinition, RoutineStatus};
 use crate::automations::schedule::next_due;
@@ -20,11 +20,14 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_occurrences (
         id TEXT PRIMARY KEY NOT NULL,
         automation_id TEXT NOT NULL,
+        automation_revision INTEGER NOT NULL DEFAULT 1 CHECK (automation_revision >= 1),
+        definition_digest TEXT,
         scheduled_for TEXT NOT NULL,
         kind TEXT NOT NULL DEFAULT 'scheduled',
         state TEXT NOT NULL DEFAULT 'planned',
         lease_owner TEXT,
         lease_expires_at TEXT,
+        scheduler_generation INTEGER CHECK (scheduler_generation IS NULL OR scheduler_generation >= 1),
         attempt INTEGER NOT NULL DEFAULT 0,
         failure_reason TEXT,
         created_at TEXT NOT NULL,
@@ -37,60 +40,87 @@ pub const AUTOMATION_OCCURRENCES_SCHEMA_SQL: &str = "
 
     CREATE INDEX IF NOT EXISTS idx_automation_occurrences_state
         ON automation_occurrences(state, lease_expires_at);
+
+    CREATE INDEX IF NOT EXISTS idx_automation_definitions_planning
+        ON automation_definitions(name, id)
+        WHERE tombstoned_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS automation_scheduler_planning_cursor (
+        id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+        after_name TEXT,
+        after_definition_id TEXT,
+        revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
+        CHECK (
+            (after_name IS NULL AND after_definition_id IS NULL)
+            OR (after_name IS NOT NULL AND after_definition_id IS NOT NULL)
+        )
+    );
+
+    INSERT OR IGNORE INTO automation_scheduler_planning_cursor
+        (id, after_name, after_definition_id)
+    VALUES (1, NULL, NULL);
 ";
 
 /// Migrates the occurrence source discriminator inside the store
 /// initialization transaction owned by `initialize_store`.
 pub fn ensure_occurrence_kind(conn: &Connection) -> Result<()> {
-    let has_kind = conn
+    let columns = conn
         .prepare("PRAGMA table_info(automation_occurrences)")
         .context("failed to inspect automation_occurrences schema")?
         .query_map([], |row| row.get::<_, String>(1))
         .context("failed to query automation_occurrences schema")?
         .collect::<std::result::Result<Vec<_>, _>>()
-        .context("failed to read automation_occurrences schema")?
-        .into_iter()
-        .any(|column| column == "kind");
-    if has_kind {
-        return Ok(());
-    }
-
-    conn.execute(
-        "ALTER TABLE automation_occurrences
-         ADD COLUMN kind TEXT NOT NULL DEFAULT 'scheduled'",
-        [],
-    )
-    .context("failed to add automation_occurrences.kind")?;
-
-    let rows: Vec<(String, String, String)> = {
-        let mut statement = conn
-            .prepare("SELECT id, automation_id, scheduled_for FROM automation_occurrences")
-            .context("failed to prepare automation occurrence migration")?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
-            .context("failed to query automation occurrences for migration")?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .context("failed to read automation occurrences for migration")?;
-        rows
-    };
-    for (id, automation_id, scheduled_for) in rows {
-        let scheduled_at = chrono::DateTime::parse_from_rfc3339(&scheduled_for)
-            .with_context(|| format!("occurrence `{id}` has invalid scheduled_for"))?
-            .with_timezone(&Utc);
-        let scheduled_id = format!("{automation_id}-{}", scheduled_at.timestamp_millis());
-        if id == scheduled_id {
-            continue;
-        }
+        .context("failed to read automation_occurrences schema")?;
+    if !columns.iter().any(|column| column == "kind") {
         conn.execute(
-            "UPDATE automation_occurrences
-             SET kind = 'manual', scheduled_for = ?2
-             WHERE id = ?1",
-            params![
-                id,
-                scheduled_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
-            ],
+            "ALTER TABLE automation_occurrences
+             ADD COLUMN kind TEXT NOT NULL DEFAULT 'scheduled'",
+            [],
         )
-        .with_context(|| format!("failed to migrate manual occurrence `{id}`"))?;
+        .context("failed to add automation_occurrences.kind")?;
+
+        let rows: Vec<(String, String, String)> = {
+            let mut statement = conn
+                .prepare("SELECT id, automation_id, scheduled_for FROM automation_occurrences")
+                .context("failed to prepare automation occurrence migration")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .context("failed to query automation occurrences for migration")?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("failed to read automation occurrences for migration")?;
+            rows
+        };
+        for (id, automation_id, scheduled_for) in rows {
+            let scheduled_at = chrono::DateTime::parse_from_rfc3339(&scheduled_for)
+                .with_context(|| format!("occurrence `{id}` has invalid scheduled_for"))?
+                .with_timezone(&Utc);
+            let scheduled_id = format!("{automation_id}-{}", scheduled_at.timestamp_millis());
+            if id == scheduled_id {
+                continue;
+            }
+            conn.execute(
+                "UPDATE automation_occurrences
+                 SET kind = 'manual', scheduled_for = ?2
+                 WHERE id = ?1",
+                params![
+                    id,
+                    scheduled_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                ],
+            )
+            .with_context(|| format!("failed to migrate manual occurrence `{id}`"))?;
+        }
+    }
+    if !columns
+        .iter()
+        .any(|column| column == "scheduler_generation")
+    {
+        conn.execute(
+            "ALTER TABLE automation_occurrences
+             ADD COLUMN scheduler_generation INTEGER
+             CHECK (scheduler_generation IS NULL OR scheduler_generation >= 1)",
+            [],
+        )
+        .context("failed to add automation_occurrences.scheduler_generation")?;
     }
     Ok(())
 }
@@ -122,7 +152,82 @@ pub struct TickReport {
     pub failed: Vec<String>,
 }
 
-const OCCURRENCE_TERMINAL_STATES: [&str; 2] = ["succeeded", "failed"];
+pub(crate) const SCHEDULER_PASS_BATCH_LIMIT: usize = 64;
+
+fn supersede_stale_misfires(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<()> {
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("failed to begin bounded misfire supersession transaction")?;
+    let limit = i64::try_from(SCHEDULER_PASS_BATCH_LIMIT)
+        .context("automation scheduler batch limit exceeds SQLite range")?;
+    transaction
+        .execute(
+            "WITH stale_occurrences(id) AS (
+                 SELECT occurrence.id
+                 FROM automation_occurrences AS occurrence
+                 WHERE occurrence.state = 'planned'
+                   AND occurrence.scheduled_for <= ?1
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_runs
+                       WHERE automation_runs.occurrence_id = occurrence.id
+                         AND automation_runs.status = 'running'
+                   )
+                   AND occurrence.scheduled_for < (
+                       SELECT MAX(candidate.scheduled_for)
+                       FROM automation_occurrences AS candidate
+                       WHERE candidate.automation_id = occurrence.automation_id
+                         AND candidate.state = 'planned'
+                         AND candidate.scheduled_for <= ?1
+                   )
+                 ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
+                 LIMIT ?2
+             )
+             UPDATE automation_occurrences
+             SET state = 'skipped',
+                 failure_reason = 'superseded by latest misfire policy',
+                 updated_at = ?1
+             WHERE id IN (SELECT id FROM stale_occurrences)
+               AND (
+                   ?3 IS NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM automation_scheduler_authority
+                       WHERE id = 1 AND owner_id = ?4 AND generation = ?3
+                   )
+               )",
+            params![
+                iso(now),
+                limit,
+                scheduler_fence.map(|fence| fence.generation()),
+                scheduler_fence.map(|fence| fence.owner_id()),
+            ],
+        )
+        .context("failed to supersede bounded stale occurrence fences")?;
+    if let Some(fence) = scheduler_fence {
+        let current: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM automation_scheduler_authority
+                    WHERE id = 1 AND owner_id = ?1 AND generation = ?2
+                )",
+                params![fence.owner_id(), fence.generation()],
+                |row| row.get(0),
+            )
+            .context("failed to verify scheduler authority after misfire supersession")?;
+        anyhow::ensure!(current, "automations scheduler fence is stale");
+    }
+    transaction
+        .commit()
+        .context("failed to commit bounded misfire supersession")?;
+    Ok(())
+}
+
+const OCCURRENCE_TERMINAL_STATES: [&str; 3] = ["succeeded", "failed", "cancelled"];
 
 /// Claims the earliest due PLANNED occurrence for a routine with a bounded
 /// lease. Returns the claimed occurrence id, or `None` when nothing is due.
@@ -138,6 +243,37 @@ pub fn claim_due_occurrence(
     lease_minutes: i64,
     now: DateTime<Utc>,
 ) -> Result<Option<String>, String> {
+    claim_due_occurrence_inner(conn, automation_id, owner, lease_minutes, now, None, true)
+}
+
+fn claim_due_occurrence_with_scheduler_fence(
+    conn: &Connection,
+    automation_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<Option<String>, String> {
+    claim_due_occurrence_inner(
+        conn,
+        automation_id,
+        owner,
+        lease_minutes,
+        now,
+        Some(fence),
+        false,
+    )
+}
+
+fn claim_due_occurrence_inner(
+    conn: &Connection,
+    automation_id: &str,
+    owner: &str,
+    lease_minutes: i64,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+    supersede_stale: bool,
+) -> Result<Option<String>, String> {
     if lease_minutes <= 0 || lease_minutes > 24 * 60 {
         return Err("lease minutes must be 1..=1440".to_string());
     }
@@ -147,56 +283,193 @@ pub fn claim_due_occurrence(
     let transaction = conn
         .unchecked_transaction()
         .map_err(|error| format!("failed to start occurrence claim transaction: {error}"))?;
-    transaction
-        .execute(
-            "UPDATE automation_occurrences
-             SET state = 'skipped',
-                 failure_reason = 'superseded by latest misfire policy',
-                 updated_at = ?2
-             WHERE automation_id = ?1
-               AND state = 'planned'
-               AND scheduled_for <= ?2
-               AND scheduled_for < (
-                   SELECT MAX(scheduled_for)
-                   FROM automation_occurrences
-                   WHERE automation_id = ?1
-                     AND state = 'planned'
-                     AND scheduled_for <= ?2
-               )",
+    if supersede_stale {
+        transaction
+            .execute(
+                "WITH stale_occurrences(id) AS (
+                     SELECT occurrence.id
+                     FROM automation_occurrences AS occurrence
+                     WHERE occurrence.automation_id = ?1
+                       AND occurrence.state = 'planned'
+                       AND occurrence.scheduled_for <= ?2
+                       AND NOT EXISTS (
+                           SELECT 1 FROM automation_runs
+                           WHERE automation_runs.occurrence_id = occurrence.id
+                             AND automation_runs.status = 'running'
+                       )
+                       AND occurrence.scheduled_for < (
+                           SELECT MAX(candidate.scheduled_for)
+                           FROM automation_occurrences AS candidate
+                           WHERE candidate.automation_id = ?1
+                             AND candidate.state = 'planned'
+                             AND candidate.scheduled_for <= ?2
+                       )
+                     ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
+                     LIMIT ?5
+                 )
+                 UPDATE automation_occurrences
+                 SET state = 'skipped',
+                     failure_reason = 'superseded by latest misfire policy',
+                     updated_at = ?2
+                 WHERE id IN (SELECT id FROM stale_occurrences)
+                   AND (
+                       ?3 IS NULL
+                       OR EXISTS (
+                           SELECT 1
+                           FROM automation_scheduler_authority
+                           WHERE id = 1 AND owner_id = ?4 AND generation = ?3
+                       )
+                   )",
+                params![
+                    automation_id,
+                    now_iso,
+                    scheduler_fence.map(|fence| fence.generation()),
+                    scheduler_fence.map(|fence| fence.owner_id()),
+                    i64::try_from(SCHEDULER_PASS_BATCH_LIMIT)
+                        .map_err(|_| "automation scheduler batch limit exceeds SQLite range")?,
+                ],
+            )
+            .map_err(|error| format!("failed to supersede stale occurrence fences: {error}"))?;
+    }
+    let stale_remains: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_occurrences AS occurrence
+                WHERE occurrence.automation_id = ?1
+                  AND occurrence.state = 'planned'
+                  AND occurrence.scheduled_for <= ?2
+                  AND NOT EXISTS (
+                      SELECT 1 FROM automation_runs
+                      WHERE automation_runs.occurrence_id = occurrence.id
+                        AND automation_runs.status = 'running'
+                  )
+                  AND occurrence.scheduled_for < (
+                      SELECT MAX(candidate.scheduled_for)
+                      FROM automation_occurrences AS candidate
+                      WHERE candidate.automation_id = ?1
+                        AND candidate.state = 'planned'
+                        AND candidate.scheduled_for <= ?2
+                  )
+             )",
             params![automation_id, now_iso],
+            |row| row.get(0),
         )
-        .map_err(|error| format!("failed to supersede stale occurrence fences: {error}"))?;
+        .map_err(|error| format!("failed to inspect stale occurrence fences: {error}"))?;
+    if stale_remains {
+        if let Some(fence) = scheduler_fence {
+            let current = fence.is_current(&transaction).map_err(|error| {
+                format!("failed to verify automations scheduler fence: {error:#}")
+            })?;
+            if !current {
+                return Err("automations scheduler fence is stale".to_string());
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit bounded misfire supersession: {error}"))?;
+        return Ok(None);
+    }
     let changed = transaction
         .execute(
             "UPDATE automation_occurrences
              SET state = 'claimed',
                  lease_owner = ?3,
                  lease_expires_at = ?4,
+                 scheduler_generation = ?5,
                  attempt = attempt + 1,
                  updated_at = ?2
              WHERE automation_id = ?1
                AND state = 'planned'
                AND scheduled_for <= ?2
+               AND (
+                   ?5 IS NULL
+                   OR EXISTS (
+                       SELECT 1
+                       FROM automation_scheduler_authority
+                       WHERE id = 1 AND owner_id = ?6 AND generation = ?5
+                   )
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM automation_occurrences
                    WHERE automation_id = ?1 AND state IN ('claimed', 'running')
                )
                AND NOT EXISTS (
                    SELECT 1 FROM automation_runs
-                   WHERE automation_id = ?1 AND status = 'running'
+                   WHERE automation_id = ?1
+                     AND status = 'running'
+                     AND occurrence_id IS NOT automation_occurrences.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM automation_runs AS retry_run
+                   JOIN automation_attempts AS retry_attempt
+                     ON retry_attempt.run_id = retry_run.id
+                   WHERE retry_run.occurrence_id = automation_occurrences.id
+                     AND retry_run.status = 'running'
+                     AND retry_attempt.state = 'adopted'
+                     AND (
+                         retry_attempt.not_before > ?2
+                         OR retry_run.timeout_at <= ?2
+                     )
                )
                AND id = (
                    SELECT id FROM automation_occurrences
-                   WHERE automation_id = ?1
-                     AND state = 'planned'
-                     AND scheduled_for <= ?2
+                   WHERE automation_occurrences.automation_id = ?1
+                     AND automation_occurrences.state = 'planned'
+                     AND automation_occurrences.scheduled_for <= ?2
+                     AND NOT EXISTS (
+                         SELECT 1 FROM automation_runs
+                         WHERE automation_runs.automation_id = ?1
+                           AND automation_runs.status = 'running'
+                           AND automation_runs.occurrence_id
+                               IS NOT automation_occurrences.id
+                     )
+                     AND NOT EXISTS (
+                         SELECT 1
+                         FROM automation_runs AS retry_run
+                         JOIN automation_attempts AS retry_attempt
+                           ON retry_attempt.run_id = retry_run.id
+                         WHERE retry_run.occurrence_id = automation_occurrences.id
+                           AND retry_run.status = 'running'
+                           AND retry_attempt.state = 'adopted'
+                           AND (
+                               retry_attempt.not_before > ?2
+                               OR retry_run.timeout_at <= ?2
+                           )
+                     )
                    ORDER BY scheduled_for DESC
                    LIMIT 1
                )",
-            params![automation_id, now_iso, owner, expires_iso],
+            params![
+                automation_id,
+                now_iso,
+                owner,
+                expires_iso,
+                scheduler_fence.map(|fence| fence.generation()),
+                scheduler_fence.map(|fence| fence.owner_id()),
+            ],
         )
         .map_err(|error| format!("failed to claim occurrence: {error}"))?;
     if changed == 0 {
+        if let Some(fence) = scheduler_fence {
+            let current: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1
+                        FROM automation_scheduler_authority
+                        WHERE id = 1 AND owner_id = ?1 AND generation = ?2
+                    )",
+                    params![fence.owner_id(), fence.generation()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| {
+                    format!("failed to verify automations scheduler fence: {error}")
+                })?;
+            if !current {
+                return Err("automations scheduler fence is stale".to_string());
+            }
+        }
         transaction
             .commit()
             .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
@@ -209,6 +482,37 @@ pub fn claim_due_occurrence(
             |row| row.get(0),
         )
         .map_err(|error| format!("failed to read claim: {error}"))?;
+    let retry_run_exists: bool = transaction
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_runs AS r
+                JOIN automation_attempts AS a ON a.run_id = r.id
+                WHERE r.occurrence_id = ?1
+                  AND r.status = 'running'
+                  AND a.state = 'adopted'
+            )",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to inspect claimed retry attempt: {error}"))?;
+    if retry_run_exists {
+        let rebound = transaction
+            .execute(
+                "UPDATE automation_attempts
+                 SET occurrence_fence_generation = (
+                     SELECT attempt FROM automation_occurrences WHERE id = ?1
+                 )
+                 WHERE occurrence_id = ?1
+                   AND state = 'adopted'
+                   AND not_before <= ?2",
+                params![id, now_iso],
+            )
+            .map_err(|error| format!("failed to bind retry attempt to claim fence: {error}"))?;
+        if rebound != 1 {
+            return Err("claimed retry attempt changed before fence binding".to_string());
+        }
+    }
     transaction
         .commit()
         .map_err(|error| format!("failed to commit occurrence claim: {error}"))?;
@@ -235,9 +539,11 @@ pub fn insert_claimed_occurrence(
     let expires_iso = iso(expires);
     conn.execute(
         "INSERT OR IGNORE INTO automation_occurrences
-            (id, automation_id, scheduled_for, kind, state, lease_owner,
-             lease_expires_at, attempt, created_at, updated_at)
-         SELECT ?1, ?2, ?5, 'manual', 'claimed', ?3, ?4, 1, ?6, ?6
+            (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+             state, lease_owner, lease_expires_at, attempt, created_at, updated_at)
+         SELECT ?1, ?2, definition.revision, definition.definition_digest, ?5, 'manual',
+                'claimed', ?3, ?4, 1, ?6, ?6
+         FROM automation_definitions AS definition
          WHERE NOT EXISTS (
              SELECT 1 FROM automation_occurrences
              WHERE automation_id = ?2 AND state IN ('claimed', 'running')
@@ -245,7 +551,14 @@ pub fn insert_claimed_occurrence(
            AND NOT EXISTS (
              SELECT 1 FROM automation_runs
              WHERE automation_id = ?2 AND status = 'running'
-         )",
+         )
+           AND definition.id = ?2
+           AND definition.tombstoned_at IS NULL
+           AND definition.definition_digest IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_retry_state
+               WHERE automation_id = ?2 AND quarantined_at IS NOT NULL
+           )",
         params![
             occurrence_id,
             automation_id,
@@ -286,6 +599,50 @@ pub fn recover_expired_leases(conn: &Connection, now: DateTime<Utc>) -> Result<u
     Ok(changed)
 }
 
+pub(crate) fn recover_expired_leases_with_scheduler_fence(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<usize, String> {
+    let now_iso = iso(now);
+    let changed = conn
+        .execute(
+            "UPDATE automation_occurrences
+             SET state = 'failed',
+                 failure_reason = 'lease expired',
+                 lease_owner = NULL,
+                 lease_expires_at = NULL,
+                 updated_at = ?1
+             WHERE state = 'claimed'
+               AND (
+                   (lease_owner = 'daemon' AND scheduler_generation = ?2)
+                   OR (kind = 'manual' AND scheduler_generation IS NULL)
+               )
+               AND lease_expires_at IS NOT NULL
+               AND lease_expires_at <= ?1
+               AND EXISTS (
+                   SELECT 1
+                   FROM automation_scheduler_authority
+                   WHERE id = 1 AND owner_id = ?3 AND generation = ?2
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM automation_runs
+                   WHERE automation_runs.occurrence_id = automation_occurrences.id
+                     AND automation_runs.status = 'running'
+               )",
+            params![now_iso, fence.generation(), fence.owner_id()],
+        )
+        .map_err(|error| format!("failed to recover expired scheduler leases: {error}"))?;
+    if changed == 0
+        && !fence
+            .is_current(conn)
+            .map_err(|error| format!("failed to verify automations scheduler fence: {error:#}"))?
+    {
+        return Err("automations scheduler fence is stale".to_string());
+    }
+    Ok(changed)
+}
+
 /// Finalizes an occurrence into a terminal state. Releasing a PLANNED
 /// occurrence is refused — only claimed work can settle.
 #[allow(dead_code)]
@@ -310,7 +667,7 @@ pub fn settle_occurrence(
                  lease_owner = NULL,
                  lease_expires_at = NULL,
                  updated_at = ?4
-             WHERE id = ?1 AND state IN ('claimed', 'running')",
+             WHERE id = ?1 AND state IN ('claimed', 'running', 'recovery_required')",
             params![occurrence_id, terminal_state, failure_reason, now_iso],
         )
         .map_err(|error| format!("failed to settle occurrence: {error}"))?;
@@ -338,31 +695,102 @@ pub fn mark_occurrence_running(
 /// One full tick: plan due slots, recover expired leases, then claim the
 /// earliest due occurrence of every ACTIVE routine that has one.
 pub fn tick(conn: &Connection, now: DateTime<Utc>) -> Result<TickReport> {
-    let mut report = TickReport::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
+    tick_inner(conn, now, None)
+}
 
-    let (definitions, failures) = active_definitions(conn)?;
-    report.failed.extend(failures);
-    for definition in &definitions {
-        if !seen.insert(definition.id.clone()) {
-            continue;
-        }
-        let created_at = definition_created_at(conn, &definition.id).unwrap_or(now);
-        match plan_latest_due_occurrence(conn, definition, created_at, now) {
-            Ok(PlanOutcome::Planned(occurrence)) => report.planned.push(occurrence.id),
-            Ok(PlanOutcome::AlreadyFenced) => report.already_fenced += 1,
-            Ok(PlanOutcome::NotDue) => {}
-            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
-        }
+pub(crate) fn tick_with_scheduler_fence(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    fence: &super::leadership::SchedulerFence,
+) -> Result<TickReport> {
+    if !fence.is_current(conn)? {
+        anyhow::bail!("automations scheduler fence is stale");
     }
+    let stale_recovered = recover_stale_scheduler_claims(conn, fence, now)?;
+    let mut report = tick_inner(conn, now, Some(fence))?;
+    report.recovered += stale_recovered;
+    Ok(report)
+}
 
-    report.recovered = recover_expired_leases(conn, now).unwrap_or(0);
+fn recover_stale_scheduler_claims(
+    conn: &Connection,
+    fence: &super::leadership::SchedulerFence,
+    now: DateTime<Utc>,
+) -> Result<usize> {
+    let recovered = conn
+        .execute(
+            "UPDATE automation_occurrences
+         SET state = 'planned',
+             lease_owner = NULL,
+             lease_expires_at = NULL,
+             scheduler_generation = NULL,
+             failure_reason = NULL,
+             updated_at = ?2
+         WHERE state = 'claimed'
+           AND lease_owner = 'daemon'
+           AND scheduler_generation IS NOT ?1
+           AND EXISTS (
+               SELECT 1
+               FROM automation_scheduler_authority
+               WHERE id = 1 AND owner_id = ?3 AND generation = ?1
+           )
+           AND NOT EXISTS (
+               SELECT 1 FROM automation_runs
+               WHERE automation_runs.occurrence_id = automation_occurrences.id
+           )",
+            params![fence.generation(), iso(now), fence.owner_id()],
+        )
+        .context("failed to recover stale scheduler claims")?;
+    if recovered == 0 && !fence.is_current(conn)? {
+        anyhow::bail!("automations scheduler fence is stale");
+    }
+    Ok(recovered)
+}
 
-    for definition in &definitions {
-        match claim_due_occurrence(conn, &definition.id, "daemon", 60, now) {
+fn tick_inner(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<TickReport> {
+    let planning = plan_bounded_definition_page(conn, now, scheduler_fence)?;
+    let mut report = TickReport {
+        planned: planning.report.planned,
+        already_fenced: planning.report.already_fenced,
+        paused_skipped: planning.report.paused_skipped,
+        failed: planning.report.failed,
+        ..TickReport::default()
+    };
+
+    report.recovered = match scheduler_fence {
+        Some(fence) => recover_expired_leases_with_scheduler_fence(conn, now, fence)
+            .map_err(anyhow::Error::msg)?,
+        None => recover_expired_leases(conn, now).unwrap_or(0),
+    };
+
+    supersede_stale_misfires(conn, now, scheduler_fence)?;
+    for eligible in eligible_occurrences_for_active_definition_ids(
+        conn,
+        now,
+        SCHEDULER_PASS_BATCH_LIMIT,
+        &planning.claimable_definition_ids,
+    )? {
+        let claimed = match scheduler_fence {
+            Some(fence) => claim_due_occurrence_with_scheduler_fence(
+                conn,
+                &eligible.automation_id,
+                "daemon",
+                60,
+                now,
+                fence,
+            ),
+            None => claim_due_occurrence(conn, &eligible.automation_id, "daemon", 60, now),
+        };
+        match claimed {
             Ok(Some(id)) => report.claimed.push(id),
             Ok(None) => {}
-            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
+            Err(error) => report
+                .failed
+                .push(format!("{}: {error}", eligible.automation_id)),
         }
     }
 
@@ -382,13 +810,347 @@ fn iso(instant: DateTime<Utc>) -> String {
     instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+#[derive(Debug)]
+struct PlanningDefinitionRow {
+    id: String,
+    name: String,
+    status: String,
+    definition_json: String,
+    quarantined: bool,
+}
+
+impl PlanningDefinitionRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            status: row.get(2)?,
+            definition_json: row.get(3)?,
+            quarantined: row.get(4)?,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct PlanningDefinitionPage {
+    rows: Vec<PlanningDefinitionRow>,
+    start_cursor: PlanningCursor,
+    rotating: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanningCursor {
+    after: Option<(String, String)>,
+    revision: i64,
+}
+
+fn read_planning_cursor(conn: &Connection) -> Result<PlanningCursor> {
+    let cursor: Option<(Option<String>, Option<String>, i64)> = conn
+        .query_row(
+            "SELECT after_name, after_definition_id, revision
+             FROM automation_scheduler_planning_cursor
+             WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get(2)?,
+                ))
+            },
+        )
+        .optional()
+        .context("failed to read automation planning cursor")?;
+    Ok(cursor.map_or(
+        PlanningCursor {
+            after: None,
+            revision: 0,
+        },
+        |cursor| PlanningCursor {
+            after: cursor.0.zip(cursor.1),
+            revision: cursor.2,
+        },
+    ))
+}
+
+fn query_planning_rows<P>(
+    conn: &Connection,
+    sql: &str,
+    parameters: P,
+) -> Result<Vec<PlanningDefinitionRow>>
+where
+    P: rusqlite::Params,
+{
+    let mut statement = conn
+        .prepare(sql)
+        .context("failed to prepare bounded automation planning page")?;
+    let rows = statement
+        .query_map(parameters, PlanningDefinitionRow::from_row)
+        .context("failed to query bounded automation planning page")?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read bounded automation planning page")
+}
+
+const PLANNING_ROW_SELECT: &str = "
+    SELECT definition.id,
+           definition.name,
+           definition.status,
+           definition.definition_json,
+           EXISTS (
+               SELECT 1
+               FROM automation_retry_state AS retry_state
+               WHERE retry_state.automation_id = definition.id
+                 AND retry_state.quarantined_at IS NOT NULL
+           )
+    FROM automation_definitions AS definition
+";
+
+fn planning_definition_page(conn: &Connection) -> Result<PlanningDefinitionPage> {
+    let cursor = read_planning_cursor(conn)?;
+    let probe_limit = i64::try_from(SCHEDULER_PASS_BATCH_LIMIT + 1)
+        .context("automation planning probe limit exceeds SQLite range")?;
+    let mut rows = if let Some((after_name, after_id)) = cursor.after.as_ref() {
+        query_planning_rows(
+            conn,
+            &format!(
+                "{PLANNING_ROW_SELECT}
+                 WHERE definition.tombstoned_at IS NULL
+                   AND (definition.name, definition.id) > (?1, ?2)
+                 ORDER BY definition.name ASC, definition.id ASC
+                 LIMIT ?3"
+            ),
+            params![after_name, after_id, probe_limit],
+        )?
+    } else {
+        query_planning_rows(
+            conn,
+            &format!(
+                "{PLANNING_ROW_SELECT}
+                 WHERE definition.tombstoned_at IS NULL
+                 ORDER BY definition.name ASC, definition.id ASC
+                 LIMIT ?1"
+            ),
+            [probe_limit],
+        )?
+    };
+    if let Some((after_name, after_id)) = cursor.after.as_ref() {
+        if rows.len() <= SCHEDULER_PASS_BATCH_LIMIT {
+            let remaining = SCHEDULER_PASS_BATCH_LIMIT + 1 - rows.len();
+            let remaining = i64::try_from(remaining)
+                .context("automation planning wrap limit exceeds SQLite range")?;
+            rows.extend(query_planning_rows(
+                conn,
+                &format!(
+                    "{PLANNING_ROW_SELECT}
+                     WHERE definition.tombstoned_at IS NULL
+                       AND (definition.name, definition.id) < (?1, ?2)
+                     ORDER BY definition.name ASC, definition.id ASC
+                     LIMIT ?3"
+                ),
+                params![after_name, after_id, remaining],
+            )?);
+        }
+    }
+    let cursor_exists = if let Some((after_name, after_id)) = cursor.after.as_ref() {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM automation_definitions
+                WHERE tombstoned_at IS NULL AND name = ?1 AND id = ?2
+             )",
+            params![after_name, after_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("failed to verify automation planning cursor target")?
+    } else {
+        false
+    };
+    let rotating = rows.len() > SCHEDULER_PASS_BATCH_LIMIT
+        || (cursor_exists && rows.len() == SCHEDULER_PASS_BATCH_LIMIT);
+    if !rotating && cursor_exists {
+        rows = query_planning_rows(
+            conn,
+            &format!(
+                "{PLANNING_ROW_SELECT}
+                 WHERE definition.tombstoned_at IS NULL
+                 ORDER BY definition.name ASC, definition.id ASC
+                 LIMIT ?1"
+            ),
+            [i64::try_from(SCHEDULER_PASS_BATCH_LIMIT)
+                .context("automation planning batch limit exceeds SQLite range")?],
+        )?;
+    } else {
+        rows.truncate(SCHEDULER_PASS_BATCH_LIMIT);
+    }
+    Ok(PlanningDefinitionPage {
+        rows,
+        start_cursor: cursor,
+        rotating,
+    })
+}
+
+fn advance_planning_cursor(
+    conn: &Connection,
+    page: &PlanningDefinitionPage,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<()> {
+    let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .context("failed to begin automation planning cursor transaction")?;
+    let current_cursor = read_planning_cursor(&transaction)?;
+    if current_cursor != page.start_cursor {
+        transaction
+            .commit()
+            .context("failed to close stale automation planning cursor transaction")?;
+        return Ok(());
+    }
+    let next = page.rotating.then(|| page.rows.last()).flatten();
+    let next_revision = page
+        .start_cursor
+        .revision
+        .checked_add(1)
+        .context("automation planning cursor revision overflow")?;
+    if let Some(fence) = scheduler_fence {
+        let current: bool = transaction
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1
+                FROM automation_scheduler_authority
+                WHERE id = 1 AND owner_id = ?1 AND generation = ?2
+            )",
+                params![fence.owner_id(), fence.generation()],
+                |row| row.get(0),
+            )
+            .context("failed to verify scheduler authority for planning cursor")?;
+        anyhow::ensure!(current, "automations scheduler fence is stale");
+    }
+    transaction
+        .execute(
+            "INSERT INTO automation_scheduler_planning_cursor
+                (id, after_name, after_definition_id, revision)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET
+                after_name = excluded.after_name,
+                after_definition_id = excluded.after_definition_id,
+                revision = excluded.revision",
+            params![
+                next.map(|row| row.name.as_str()),
+                next.map(|row| row.id.as_str()),
+                next_revision,
+            ],
+        )
+        .map_err(|error| {
+            anyhow::anyhow!("failed to advance automation planning cursor: {error}")
+        })?;
+    transaction
+        .commit()
+        .context("failed to commit automation planning cursor")?;
+    Ok(())
+}
+
+pub(crate) fn planning_cursor_definition_id(conn: &Connection) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT after_definition_id
+         FROM automation_scheduler_planning_cursor
+         WHERE id = 1",
+        [],
+        |row| row.get(0),
+    )
+    .optional()
+    .map(Option::flatten)
+    .context("failed to read automation planning cursor definition id")
+}
+
+fn plan_bounded_definition_page(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    scheduler_fence: Option<&super::leadership::SchedulerFence>,
+) -> Result<PlanningPass> {
+    let page = planning_definition_page(conn)?;
+    let mut report = PlanTickReport::default();
+    let mut claimable_definition_ids = BTreeSet::new();
+    for record in &page.rows {
+        if record.status != "ACTIVE" || record.quarantined {
+            continue;
+        }
+        let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {
+            Ok(definition) => definition,
+            Err(error) => {
+                report.failed.push(format!(
+                    "stored routine `{}` is unreadable: {error}",
+                    record.id
+                ));
+                continue;
+            }
+        };
+        if let Err(error) = definition.validate() {
+            report.failed.push(format!(
+                "stored routine `{}` is invalid: {error}",
+                record.id
+            ));
+            continue;
+        }
+        if let Err(error) = definition.validate_durable() {
+            report.failed.push(format!(
+                "stored routine `{}` is invalid: {error}",
+                record.id
+            ));
+            continue;
+        }
+        if definition.status != RoutineStatus::Active {
+            continue;
+        }
+        let created_at = definition_created_at(conn, &definition.id).unwrap_or(now);
+        match plan_latest_due_occurrence(conn, &definition, created_at, now) {
+            Ok(PlanOutcome::Planned(occurrence)) => {
+                claimable_definition_ids.insert(definition.id);
+                report.planned.push(occurrence.id);
+            }
+            Ok(PlanOutcome::AlreadyFenced) => {
+                claimable_definition_ids.insert(definition.id);
+                report.already_fenced += 1;
+            }
+            Ok(PlanOutcome::NotDue) => {
+                claimable_definition_ids.insert(definition.id);
+            }
+            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
+        }
+    }
+    advance_planning_cursor(conn, &page, scheduler_fence)?;
+    Ok(PlanningPass {
+        report,
+        claimable_definition_ids,
+    })
+}
+
+struct PlanningPass {
+    report: PlanTickReport,
+    claimable_definition_ids: BTreeSet<String>,
+}
+
 /// Reads the ACTIVE definitions from the store as validated records.
 fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<String>)> {
     let records = super::store::list_definitions(conn)?;
+    let quarantined: BTreeSet<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT automation_id
+                 FROM automation_retry_state
+                 WHERE quarantined_at IS NOT NULL",
+            )
+            .context("failed to prepare retry quarantine list")?;
+        let rows = statement
+            .query_map([], |row| row.get(0))
+            .context("failed to list retry quarantines")?;
+        rows.collect::<std::result::Result<_, _>>()
+            .context("failed to read retry quarantine")?
+    };
     let mut definitions = Vec::new();
     let mut failures = Vec::new();
     for record in records {
         if record.status != "ACTIVE" {
+            continue;
+        }
+        if quarantined.contains(&record.id) {
             continue;
         }
         let definition: RoutineDefinition = match serde_json::from_str(&record.definition_json) {
@@ -408,12 +1170,177 @@ fn active_definitions(conn: &Connection) -> Result<(Vec<RoutineDefinition>, Vec<
             ));
             continue;
         }
+        if let Err(error) = definition.validate_durable() {
+            failures.push(format!(
+                "stored routine `{}` is invalid: {error}",
+                record.id
+            ));
+            continue;
+        }
         if definition.status != RoutineStatus::Active {
             continue;
         }
         definitions.push(definition);
     }
     Ok((definitions, failures))
+}
+
+pub(crate) fn active_definition_ids(conn: &Connection) -> Result<BTreeSet<String>> {
+    active_definitions(conn).map(|(definitions, _)| {
+        definitions
+            .into_iter()
+            .map(|definition| definition.id)
+            .collect()
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EligibleOccurrence {
+    pub id: String,
+    pub automation_id: String,
+    pub scheduled_for: String,
+}
+
+pub(crate) fn eligible_occurrences(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    limit: usize,
+) -> Result<Vec<EligibleOccurrence>> {
+    let active_definition_ids = active_definition_ids(conn)?;
+    eligible_occurrences_for_active_definition_ids(conn, now, limit, &active_definition_ids)
+}
+
+fn eligible_occurrences_for_active_definition_ids(
+    conn: &Connection,
+    now: DateTime<Utc>,
+    limit: usize,
+    active_definition_ids: &BTreeSet<String>,
+) -> Result<Vec<EligibleOccurrence>> {
+    anyhow::ensure!(
+        (1..=100).contains(&limit),
+        "eligible occurrence limit must be between 1 and 100"
+    );
+    let now_iso = iso(now);
+    let active_definition_ids_json = serde_json::to_string(&active_definition_ids)
+        .context("failed to encode validated automation definition ids")?;
+    let bounded = i64::try_from(limit).context("eligible occurrence limit exceeds SQLite range")?;
+    let candidates: Vec<(String, String, String)> = {
+        let mut statement = conn
+            .prepare(
+                "WITH active_definition(automation_id) AS (
+                     SELECT value FROM json_each(?2)
+                 )
+                 SELECT occurrence.id,
+                        occurrence.automation_id,
+                        occurrence.scheduled_for
+                 FROM automation_occurrences AS occurrence
+                 WHERE occurrence.state = 'planned'
+                   AND occurrence.scheduled_for <= ?1
+                   AND occurrence.scheduled_for = (
+                       SELECT MAX(candidate.scheduled_for)
+                       FROM automation_occurrences AS candidate
+                       WHERE candidate.automation_id = occurrence.automation_id
+                         AND candidate.state = 'planned'
+                         AND candidate.scheduled_for <= ?1
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM automation_runs AS active_run
+                             WHERE active_run.automation_id = candidate.automation_id
+                               AND active_run.status = 'running'
+                               AND active_run.occurrence_id IS NOT candidate.id
+                         )
+                         AND NOT EXISTS (
+                             SELECT 1
+                             FROM automation_runs AS retry_run
+                             JOIN automation_attempts AS retry_attempt
+                               ON retry_attempt.run_id = retry_run.id
+                             WHERE retry_run.occurrence_id = candidate.id
+                               AND retry_run.status = 'running'
+                               AND retry_attempt.state = 'adopted'
+                               AND (
+                                   retry_attempt.not_before > ?1
+                                   OR retry_run.timeout_at <= ?1
+                               )
+                         )
+                   )
+                   AND (
+                       occurrence.automation_id IN (
+                           SELECT automation_id FROM active_definition
+                       )
+                       OR EXISTS (
+                            SELECT 1
+                            FROM automation_runs AS retry_run
+                            JOIN automation_attempts AS retry_attempt
+                              ON retry_attempt.run_id = retry_run.id
+                            WHERE retry_run.occurrence_id = occurrence.id
+                              AND retry_run.status = 'running'
+                              AND retry_attempt.state = 'adopted'
+                              AND retry_attempt.not_before <= ?1
+                              AND (
+                                  retry_run.timeout_at IS NULL
+                                  OR retry_run.timeout_at > ?1
+                              )
+                        )
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_retry_state
+                       WHERE automation_id = occurrence.automation_id
+                         AND quarantined_at IS NOT NULL
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_occurrences AS active_occurrence
+                       WHERE active_occurrence.automation_id = occurrence.automation_id
+                         AND active_occurrence.state IN ('claimed', 'running')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_runs AS active_run
+                       WHERE active_run.automation_id = occurrence.automation_id
+                         AND active_run.status = 'running'
+                         AND active_run.occurrence_id IS NOT occurrence.id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM automation_runs AS retry_run
+                       JOIN automation_attempts AS retry_attempt
+                         ON retry_attempt.run_id = retry_run.id
+                       WHERE retry_run.occurrence_id = occurrence.id
+                         AND retry_run.status = 'running'
+                         AND retry_attempt.state = 'adopted'
+                         AND (
+                             retry_attempt.not_before > ?1
+                             OR retry_run.timeout_at <= ?1
+                         )
+                   )
+                 ORDER BY occurrence.scheduled_for ASC, occurrence.id ASC
+                 LIMIT ?3",
+            )
+            .context("failed to prepare automations eligible queue query")?;
+        let rows = statement
+            .query_map(
+                params![now_iso, active_definition_ids_json, bounded],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .context("failed to query automations eligible queue")?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("failed to read automations eligible queue")?
+    };
+
+    candidates
+        .into_iter()
+        .map(|(id, automation_id, scheduled_for)| {
+            chrono::DateTime::parse_from_rfc3339(&scheduled_for).with_context(|| {
+                format!("invalid scheduled occurrence timestamp `{scheduled_for}`")
+            })?;
+            Ok(EligibleOccurrence {
+                id,
+                automation_id,
+                scheduled_for,
+            })
+        })
+        .collect()
 }
 
 fn definition_created_at(conn: &Connection, id: &str) -> Result<DateTime<Utc>> {
@@ -457,6 +1384,42 @@ fn latest_due_slot_after(
     Ok(latest)
 }
 
+fn latest_scheduled_slot(
+    conn: &Connection,
+    automation_id: &str,
+    automation_revision: u64,
+    definition_digest: &str,
+) -> Result<Option<DateTime<Utc>>, String> {
+    let latest: Option<String> = conn
+        .query_row(
+            "SELECT MAX(scheduled_for)
+             FROM automation_occurrences
+             WHERE automation_id = ?1
+               AND automation_revision = ?2
+               AND definition_digest = ?3
+               AND kind = 'scheduled'",
+            params![
+                automation_id,
+                i64::try_from(automation_revision)
+                    .map_err(|_| "definition revision exceeds SQLite range")?,
+                definition_digest,
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("failed to read latest scheduled occurrence: {error}"))?;
+    latest
+        .map(|timestamp| {
+            DateTime::parse_from_rfc3339(&timestamp)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .map_err(|error| {
+                    format!(
+                        "routine `{automation_id}` has an invalid scheduled occurrence timestamp: {error}"
+                    )
+                })
+        })
+        .transpose()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanOutcome {
     Planned(PlannedOccurrence),
@@ -475,11 +1438,115 @@ pub fn plan_latest_due_occurrence(
     created_at: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> Result<PlanOutcome, String> {
+    let owns_transaction = conn.is_autocommit();
+    if owns_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE")
+            .map_err(|error| format!("failed to begin occurrence planning transaction: {error}"))?;
+    } else {
+        conn.execute_batch("SAVEPOINT coven_automation_occurrence_planning")
+            .map_err(|error| format!("failed to create occurrence planning savepoint: {error}"))?;
+    }
+
+    let result = plan_latest_due_occurrence_in_transaction(conn, definition, created_at, now);
+    match result {
+        Ok(outcome) => {
+            let committed = if owns_transaction {
+                conn.execute_batch("COMMIT")
+                    .map_err(|error| format!("failed to commit occurrence planning: {error}"))
+            } else {
+                conn.execute_batch("RELEASE SAVEPOINT coven_automation_occurrence_planning")
+                    .map_err(|error| {
+                        format!("failed to release occurrence planning savepoint: {error}")
+                    })
+            };
+            if let Err(error) = committed {
+                if owns_transaction {
+                    let _ = conn.execute_batch("ROLLBACK");
+                } else {
+                    let _ = conn.execute_batch(
+                        "ROLLBACK TO SAVEPOINT coven_automation_occurrence_planning;
+                         RELEASE SAVEPOINT coven_automation_occurrence_planning;",
+                    );
+                }
+                return Err(error);
+            }
+            Ok(outcome)
+        }
+        Err(error) => {
+            if owns_transaction {
+                let _ = conn.execute_batch("ROLLBACK");
+            } else {
+                let _ = conn.execute_batch(
+                    "ROLLBACK TO SAVEPOINT coven_automation_occurrence_planning;
+                     RELEASE SAVEPOINT coven_automation_occurrence_planning;",
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+fn plan_latest_due_occurrence_in_transaction(
+    conn: &Connection,
+    definition: &RoutineDefinition,
+    created_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<PlanOutcome, String> {
     if definition.status != RoutineStatus::Active {
         return Ok(PlanOutcome::NotDue);
     }
-    let Some(slot) = latest_due_slot_after(definition, created_at, now)? else {
-        return Ok(PlanOutcome::NotDue);
+    let current = super::store::get_definition(conn, &definition.id)
+        .map_err(|error| format!("failed to load routine `{}`: {error:#}", definition.id))?
+        .ok_or_else(|| format!("routine `{}` vanished while planning", definition.id))?;
+    let Some(current_digest) = current.definition_digest else {
+        return Err(format!(
+            "routine `{}` has unverifiable definition metadata",
+            definition.id
+        ));
+    };
+    let persisted_digest = super::contract::migration::definition_digest(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "failed to digest stored routine `{}`: {error:#}",
+                definition.id
+            )
+        })?;
+    let persisted_definition: RoutineDefinition = serde_json::from_str(&current.definition_json)
+        .map_err(|error| {
+            format!(
+                "stored routine `{}` is unreadable while planning: {error}",
+                definition.id
+            )
+        })?;
+    if current.status != "ACTIVE"
+        || persisted_digest != current_digest
+        || persisted_definition != *definition
+    {
+        return Err(format!(
+            "routine `{}` definition changed while planning",
+            definition.id
+        ));
+    }
+    let revision_updated_at = DateTime::parse_from_rfc3339(&current.updated_at)
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+        .map_err(|error| {
+            format!(
+                "routine `{}` has invalid revision updated_at: {error}",
+                definition.id
+            )
+        })?;
+    let revision_effective_at = created_at.max(revision_updated_at);
+    let latest_scheduled =
+        latest_scheduled_slot(conn, &definition.id, current.revision, &current_digest)?;
+    let cursor = latest_scheduled.map_or(revision_effective_at, |latest| {
+        revision_effective_at.max(latest)
+    });
+    let Some(slot) = latest_due_slot_after(definition, cursor, now)? else {
+        return Ok(if latest_scheduled.is_some_and(|latest| latest <= now) {
+            PlanOutcome::AlreadyFenced
+        } else {
+            PlanOutcome::NotDue
+        });
     };
 
     let slot_iso = iso(slot);
@@ -488,14 +1555,45 @@ pub fn plan_latest_due_occurrence(
     let changed = conn
         .execute(
             "INSERT OR IGNORE INTO automation_occurrences
-                (id, automation_id, scheduled_for, kind, state, attempt, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'scheduled', 'planned', 0, ?4, ?4)",
-            params![id, definition.id, slot_iso, now_iso],
+                (id, automation_id, automation_revision, definition_digest, scheduled_for, kind,
+                 state, attempt, created_at, updated_at)
+             SELECT ?1, ?2, definition.revision, definition.definition_digest, ?3,
+                    'scheduled', 'planned', 0, ?4, ?4
+             FROM automation_definitions AS definition
+             WHERE definition.id = ?2
+               AND definition.revision = ?5
+               AND definition.definition_digest = ?6
+               AND definition.status = 'ACTIVE'
+               AND definition.tombstoned_at IS NULL
+               AND definition.definition_digest IS NOT NULL",
+            params![
+                id,
+                definition.id,
+                slot_iso,
+                now_iso,
+                i64::try_from(current.revision)
+                    .map_err(|_| "definition revision exceeds SQLite range")?,
+                current_digest,
+            ],
         )
         .map_err(|error| format!("failed to fence occurrence: {error}"))?;
 
     if changed == 0 {
-        return Ok(PlanOutcome::AlreadyFenced);
+        let already_fenced: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_occurrences WHERE id = ?1)",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to inspect occurrence fence: {error}"))?;
+        return if already_fenced {
+            Ok(PlanOutcome::AlreadyFenced)
+        } else {
+            Err(format!(
+                "routine `{}` definition changed while planning",
+                definition.id
+            ))
+        };
     }
 
     Ok(PlanOutcome::Planned(PlannedOccurrence {
@@ -506,29 +1604,14 @@ pub fn plan_latest_due_occurrence(
     }))
 }
 
-/// One planning tick across every stored routine. Idempotent: a repeated
-/// tick fences nothing twice. Production ticks go through `tick`, which
-/// adds lease recovery and claiming; this stays public for planning-only
-/// callers and tests.
+/// One bounded planning tick over the durable rotating definition page.
+/// Repeated pages are idempotent because each schedule slot has a unique
+/// occurrence fence. Production ticks go through `tick`, which adds lease
+/// recovery and claiming; this stays public for planning-only callers and
+/// tests.
 #[allow(dead_code)]
 pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickReport> {
-    let mut report = PlanTickReport::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
-
-    let (definitions, failures) = active_definitions(conn)?;
-    report.failed.extend(failures);
-    for definition in definitions {
-        if !seen.insert(definition.id.clone()) {
-            continue;
-        }
-        let created_at = definition_created_at(conn, &definition.id).unwrap_or(now);
-        match plan_latest_due_occurrence(conn, &definition, created_at, now) {
-            Ok(PlanOutcome::Planned(occurrence)) => report.planned.push(occurrence.id),
-            Ok(PlanOutcome::AlreadyFenced) => report.already_fenced += 1,
-            Ok(PlanOutcome::NotDue) => {}
-            Err(error) => report.failed.push(format!("{}: {error}", definition.id)),
-        }
-    }
+    let mut report = plan_bounded_definition_page(conn, now, None)?.report;
 
     // Count paused routines for observability.
     let paused: i64 = conn
@@ -547,7 +1630,7 @@ pub fn tick_planning(conn: &Connection, now: DateTime<Utc>) -> Result<PlanTickRe
 mod tests {
     use super::*;
     use crate::automations::definition::RoutineDefinition;
-    use crate::automations::store::insert_definition;
+    use crate::automations::store::{insert_definition, update_definition};
     use crate::store::initialize_store;
     use chrono::{TimeZone, Timelike};
     use serde_json::json;
@@ -558,6 +1641,219 @@ mod tests {
         initialize_store(&path).unwrap();
         let conn = crate::store::open_store(&path).unwrap();
         (temp, conn)
+    }
+
+    #[test]
+    fn scheduler_takeover_reclaims_unlaunched_work_with_a_new_generation() {
+        let (temp, conn) = temp_store();
+        let routine = definition("leader-takeover", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(now - chrono::Duration::days(1)), routine.id],
+        )
+        .unwrap();
+
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let first_tick = tick_with_scheduler_fence(&conn, now, &first.fence()).unwrap();
+        let occurrence_id = first_tick
+            .claimed
+            .first()
+            .expect("first leader should claim the due occurrence")
+            .clone();
+        drop(first);
+
+        let second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        let second_tick =
+            tick_with_scheduler_fence(&conn, now + chrono::Duration::seconds(1), &second.fence())
+                .unwrap();
+
+        assert_eq!(second_tick.recovered, 1);
+        assert_eq!(second_tick.claimed, vec![occurrence_id.clone()]);
+        let (generation, attempt): (i64, i64) = conn
+            .query_row(
+                "SELECT scheduler_generation, attempt
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [&occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(generation, second.fence().generation());
+        assert_eq!(attempt, 2);
+    }
+
+    #[test]
+    fn stale_scheduler_generation_cannot_tick_after_takeover() {
+        let (temp, conn) = temp_store();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let _second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        let error =
+            tick_with_scheduler_fence(&conn, now + chrono::Duration::seconds(1), &stale_fence)
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("scheduler fence is stale"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn stale_scheduler_fence_cannot_claim_without_the_tick_guard() {
+        let (temp, conn) = temp_store();
+        let routine = definition("stale-direct-claim", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest,
+                 scheduled_for, kind, state, attempt, created_at, updated_at)
+             SELECT 'stale-direct-claim-occurrence', id, revision, definition_digest,
+                    ?1, 'scheduled', 'planned', 0, ?1, ?1
+             FROM automation_definitions
+             WHERE id = ?2",
+            rusqlite::params![iso(now), routine.id],
+        )
+        .unwrap();
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let _second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+
+        let error = claim_due_occurrence_with_scheduler_fence(
+            &conn,
+            &routine.id,
+            "daemon",
+            60,
+            now + chrono::Duration::seconds(1),
+            &stale_fence,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("scheduler fence is stale"), "{error}");
+        let state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE id = 'stale-direct-claim-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "planned");
+    }
+
+    #[test]
+    fn stale_scheduler_fence_cannot_recover_a_successor_claim() {
+        let (temp, conn) = temp_store();
+        let routine = definition("successor-claim", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(now - chrono::Duration::days(1)), routine.id],
+        )
+        .unwrap();
+        let first =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+        let stale_fence = first.fence();
+        drop(first);
+        let second = crate::automations::leadership::SchedulerLeadership::acquire(
+            temp.path(),
+            &conn,
+            now + chrono::Duration::seconds(1),
+        )
+        .unwrap();
+        let report =
+            tick_with_scheduler_fence(&conn, now + chrono::Duration::seconds(1), &second.fence())
+                .unwrap();
+        let occurrence_id = report.claimed.first().unwrap();
+
+        let error =
+            recover_stale_scheduler_claims(&conn, &stale_fence, now + chrono::Duration::seconds(2))
+                .unwrap_err();
+
+        assert!(
+            error.to_string().contains("scheduler fence is stale"),
+            "{error:#}"
+        );
+        let (state, generation): (String, i64) = conn
+            .query_row(
+                "SELECT state, scheduler_generation
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [occurrence_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "claimed");
+        assert_eq!(generation, second.fence().generation());
+    }
+
+    #[test]
+    fn elected_scheduler_recovers_an_expired_manual_claim() {
+        let (temp, conn) = temp_store();
+        let routine = definition("expired-manual", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 9, 1, 9, 30, 0).unwrap();
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "expired-manual-occurrence",
+            &routine.id,
+            "manual",
+            60,
+            now - chrono::Duration::minutes(61),
+        )
+        .unwrap());
+        let leader =
+            crate::automations::leadership::SchedulerLeadership::acquire(temp.path(), &conn, now)
+                .unwrap();
+
+        assert_eq!(
+            recover_expired_leases_with_scheduler_fence(&conn, now, &leader.fence()).unwrap(),
+            1
+        );
+        let state: String = conn
+            .query_row(
+                "SELECT state
+                 FROM automation_occurrences
+                 WHERE id = 'expired-manual-occurrence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "failed");
     }
 
     #[test]
@@ -610,6 +1906,16 @@ mod tests {
         assert_eq!(rows[0].2, "2026-08-30T09:00:00.000Z");
         assert_eq!(rows[1].1, "manual");
         assert_eq!(rows[1].2, "2026-08-30T09:30:00.000000000Z");
+        let has_scheduler_generation: bool = conn
+            .prepare("PRAGMA table_info(automation_occurrences)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .iter()
+            .any(|column| column == "scheduler_generation");
+        assert!(has_scheduler_generation);
     }
 
     #[test]
@@ -690,7 +1996,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -707,6 +2015,105 @@ mod tests {
     }
 
     #[test]
+    fn new_occurrences_pin_the_current_definition_revision_and_digest() {
+        let (_temp, conn) = temp_store();
+        let initial = definition("pinned", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &initial).unwrap();
+        let mut routine = initial;
+        routine.prompt = "Revision two.".to_string();
+        let revised = update_definition(&conn, &routine).unwrap().unwrap();
+        let expected_digest = revised.definition_digest.unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
+
+        let PlanOutcome::Planned(planned) =
+            plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap()
+        else {
+            panic!("expected a planned occurrence");
+        };
+        assert!(insert_claimed_occurrence(
+            &conn,
+            "manual-pinned",
+            "pinned",
+            "operator",
+            60,
+            now + chrono::Duration::minutes(1),
+        )
+        .unwrap());
+
+        for occurrence_id in [planned.id.as_str(), "manual-pinned"] {
+            let pin: (i64, String) = conn
+                .query_row(
+                    "SELECT automation_revision, definition_digest
+                     FROM automation_occurrences
+                     WHERE id = ?1",
+                    [occurrence_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(pin, (2, expected_digest.clone()));
+        }
+    }
+
+    #[test]
+    fn planning_refuses_a_definition_that_changed_after_it_was_loaded() {
+        let (_temp, conn) = temp_store();
+        let stale = definition("planning-race", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &stale).unwrap();
+        let paused = definition("planning-race", "PAUSED", "FREQ=DAILY;BYHOUR=10");
+        update_definition(&conn, &paused).unwrap().unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+
+        let error = plan_latest_due_occurrence(&conn, &stale, created_at, now).unwrap_err();
+
+        assert!(error.contains("definition changed while planning"));
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM automation_occurrences WHERE automation_id = 'planning-race'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn planning_accepts_legacy_optional_fields_that_normalize_on_serialize() {
+        let (_temp, conn) = temp_store();
+        let definition_json = r#"{"schemaVersion":1,"id":"legacy-normalized","name":"Legacy normalized","status":"ACTIVE","rrule":"FREQ=DAILY;BYHOUR=9","timezone":"utc","misfire":"latest","overlap":"forbid","timeoutMinutes":30,"runtime":"coven-code","familiarId":null,"cwd":"/tmp/project","outputTarget":null,"prompt":"Do the thing.","model":null,"tags":[]}"#;
+        let digest =
+            crate::automations::contract::migration::definition_digest(definition_json).unwrap();
+        conn.execute(
+            "INSERT INTO automation_definitions (
+                id, name, status, definition_json, revision, definition_digest, lifecycle_state,
+                tombstoned_at, authority_version, created_at, updated_at
+             ) VALUES (
+                'legacy-normalized', 'Legacy normalized', 'ACTIVE', ?1, 1, ?2, 'active',
+                NULL, 0, '2026-08-29T08:00:00.000Z', '2026-08-29T08:00:00.000Z'
+             )",
+            rusqlite::params![definition_json, digest],
+        )
+        .unwrap();
+        let definition: RoutineDefinition = serde_json::from_str(definition_json).unwrap();
+
+        let outcome = plan_latest_due_occurrence(
+            &conn,
+            &definition,
+            Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap(),
+            Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap(),
+        )
+        .unwrap();
+
+        assert!(matches!(outcome, PlanOutcome::Planned(_)));
+    }
+
+    #[test]
     fn collapses_three_missed_days_to_the_latest() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
@@ -714,7 +2121,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(4))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -757,16 +2166,227 @@ mod tests {
         let created_at = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 30, 23, 30, 0).unwrap();
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = ?2",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
             rusqlite::params![iso(created_at), routine.id],
         )
         .unwrap();
-
         let outcome = plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap();
         let PlanOutcome::Planned(occurrence) = outcome else {
             panic!("expected the latest missed occurrence, got {outcome:?}");
         };
         assert_eq!(occurrence.scheduled_for, "2026-08-30T23:00:00.000Z");
+    }
+
+    #[test]
+    fn clock_forward_collapses_to_latest_and_backward_replan_adds_no_older_fence() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("clock-jump", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &routine).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 1, 1, 8, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
+
+        let first_now = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        assert!(matches!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, first_now).unwrap(),
+            PlanOutcome::Planned(_)
+        ));
+
+        let forward_now = Utc.with_ymd_and_hms(2026, 1, 5, 12, 0, 0).unwrap();
+        let PlanOutcome::Planned(forward) =
+            plan_latest_due_occurrence(&conn, &routine, created_at, forward_now).unwrap()
+        else {
+            panic!("forward jump should plan the latest due slot");
+        };
+        assert_eq!(forward.scheduled_for, "2026-01-05T09:00:00.000Z");
+
+        let backward_now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, backward_now).unwrap(),
+            PlanOutcome::NotDue
+        );
+
+        let slots: Vec<String> = conn
+            .prepare(
+                "SELECT scheduled_for FROM automation_occurrences
+                 WHERE automation_id = ?1 ORDER BY scheduled_for",
+            )
+            .unwrap()
+            .query_map([&routine.id], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            slots,
+            vec!["2026-01-01T09:00:00.000Z", "2026-01-05T09:00:00.000Z"]
+        );
+    }
+
+    #[test]
+    fn revised_schedule_plans_only_slots_after_the_revision_effective_time() {
+        let (_temp, conn) = temp_store();
+        let initial = definition("future-only", "ACTIVE", "FREQ=DAILY;BYHOUR=9");
+        insert_definition(&conn, &initial).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 30, 8, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), initial.id],
+        )
+        .unwrap();
+        let first_now = Utc.with_ymd_and_hms(2026, 8, 30, 10, 0, 0).unwrap();
+        let PlanOutcome::Planned(first) =
+            plan_latest_due_occurrence(&conn, &initial, created_at, first_now).unwrap()
+        else {
+            panic!("expected the original revision's 09:00 occurrence");
+        };
+        assert_eq!(first.scheduled_for, "2026-08-30T09:00:00.000Z");
+
+        let revised = definition("future-only", "ACTIVE", "FREQ=DAILY;BYHOUR=11");
+        update_definition(&conn, &revised).unwrap().unwrap();
+        let revised_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions SET updated_at = ?1 WHERE id = ?2",
+            rusqlite::params![iso(revised_at), revised.id],
+        )
+        .unwrap();
+
+        let same_day = Utc.with_ymd_and_hms(2026, 8, 30, 12, 30, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &revised, created_at, same_day).unwrap(),
+            PlanOutcome::NotDue
+        );
+
+        let older_revision_slot = Utc.with_ymd_and_hms(2026, 8, 31, 11, 0, 0).unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, scheduled_for, kind,
+                state, attempt, created_at, updated_at
+             ) VALUES (?1, ?2, 1, ?3, 'scheduled', 'succeeded', 1, ?3, ?3)",
+            rusqlite::params![
+                format!("{}-{}", revised.id, older_revision_slot.timestamp_millis()),
+                revised.id,
+                iso(older_revision_slot),
+            ],
+        )
+        .unwrap();
+        let duplicate_time = Utc.with_ymd_and_hms(2026, 8, 31, 11, 30, 0).unwrap();
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &revised, created_at, duplicate_time).unwrap(),
+            PlanOutcome::AlreadyFenced
+        );
+
+        let next_day = Utc.with_ymd_and_hms(2026, 9, 1, 11, 30, 0).unwrap();
+        let PlanOutcome::Planned(next) =
+            plan_latest_due_occurrence(&conn, &revised, created_at, next_day).unwrap()
+        else {
+            panic!("expected the first post-revision 11:00 occurrence");
+        };
+        assert_eq!(next.scheduled_for, "2026-09-01T11:00:00.000Z");
+
+        let pins: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT scheduled_for, automation_revision
+                 FROM automation_occurrences
+                 WHERE automation_id = ?1
+                 ORDER BY scheduled_for",
+            )
+            .unwrap()
+            .query_map([&revised.id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            pins,
+            vec![
+                ("2026-08-30T09:00:00.000Z".to_string(), 1),
+                ("2026-08-31T11:00:00.000Z".to_string(), 1),
+                ("2026-09-01T11:00:00.000Z".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn migrated_revision_one_uses_updated_at_as_its_effective_time() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("migrated-revision-one", "ACTIVE", "FREQ=DAILY;BYHOUR=11");
+        insert_definition(&conn, &routine).unwrap();
+        let created_at = Utc.with_ymd_and_hms(2026, 8, 1, 8, 0, 0).unwrap();
+        let updated_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?2
+             WHERE id = ?3",
+            rusqlite::params![iso(created_at), iso(updated_at), routine.id],
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 12, 30, 0).unwrap();
+
+        assert_eq!(
+            plan_latest_due_occurrence(&conn, &routine, created_at, now).unwrap(),
+            PlanOutcome::NotDue
+        );
+    }
+
+    #[test]
+    fn unverifiable_reused_id_history_does_not_advance_the_current_revision_cursor() {
+        let (_temp, conn) = temp_store();
+        let routine = definition("reused-id", "ACTIVE", "FREQ=DAILY;BYHOUR=13");
+        let record = insert_definition(&conn, &routine).unwrap();
+        let effective_at = Utc.with_ymd_and_hms(2026, 8, 30, 12, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(effective_at), routine.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, automation_revision, definition_digest,
+                scheduled_for, kind, state, attempt, created_at, updated_at
+             ) VALUES (
+                'old-unverifiable', ?1, 1, NULL,
+                '2026-09-05T09:00:00.000Z', 'scheduled', 'succeeded', 1,
+                '2026-08-01T09:00:00.000Z', '2026-08-01T09:05:00.000Z'
+             )",
+            [&routine.id],
+        )
+        .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2026, 8, 30, 13, 30, 0).unwrap();
+        let PlanOutcome::Planned(planned) =
+            plan_latest_due_occurrence(&conn, &routine, effective_at, now).unwrap()
+        else {
+            panic!("unverifiable reused-id history delayed the current definition");
+        };
+
+        assert_eq!(planned.scheduled_for, "2026-08-30T13:00:00.000Z");
+        let current_pin: (i64, String) = conn
+            .query_row(
+                "SELECT automation_revision, definition_digest
+                 FROM automation_occurrences
+                 WHERE id = ?1",
+                [&planned.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            current_pin,
+            (
+                1,
+                record
+                    .definition_digest
+                    .expect("inserted definition digest")
+            )
+        );
     }
 
     #[test]
@@ -780,6 +2400,13 @@ mod tests {
         insert_definition(&conn, &routine).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 20, 0, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 30, 23, 30, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO automation_occurrences
                 (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
@@ -839,7 +2466,7 @@ mod tests {
         insert_definition(&conn, &invalid).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 28, 8, 0, 0).unwrap();
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1",
+            "UPDATE automation_definitions SET created_at = ?1, updated_at = ?1",
             rusqlite::params![iso(created_at)],
         )
         .unwrap();
@@ -879,7 +2506,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -954,15 +2583,17 @@ mod tests {
             let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
             let now = Utc.with_ymd_and_hms(2026, 8, 30, 9, 59, 0).unwrap();
             conn.execute(
-                "UPDATE automation_definitions SET created_at = ?1 WHERE id = ?2",
+                "UPDATE automation_definitions
+                 SET created_at = ?1, updated_at = ?1
+                 WHERE id = ?2",
                 rusqlite::params![iso(created_at), routine.id],
             )
             .unwrap();
             conn.execute(
                 "INSERT INTO automation_occurrences
-                    (id, automation_id, scheduled_for, state, lease_owner, lease_expires_at,
+                    (id, automation_id, scheduled_for, kind, state, lease_owner, lease_expires_at,
                      attempt, created_at, updated_at)
-                 VALUES ('manual', ?1, '2026-08-30T09:30:00.000Z', ?2, 'manual', ?3, 1, ?3, ?3)",
+                 VALUES ('manual', ?1, '2026-08-30T09:30:00.000Z', 'manual', ?2, 'manual', ?3, 1, ?3, ?3)",
                 rusqlite::params![
                     routine.id,
                     manual_state,
@@ -987,6 +2618,13 @@ mod tests {
         insert_definition(&conn, &routine).unwrap();
         let created_at = Utc.with_ymd_and_hms(2026, 8, 29, 8, 0, 0).unwrap();
         let slot = Utc.with_ymd_and_hms(2026, 8, 30, 9, 0, 0).unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = ?2",
+            rusqlite::params![iso(created_at), routine.id],
+        )
+        .unwrap();
         assert!(insert_claimed_occurrence(
             &conn,
             "manual-exact-slot",
@@ -1053,7 +2691,9 @@ mod tests {
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();
@@ -1082,6 +2722,7 @@ mod tests {
     #[test]
     fn lease_is_expired_at_its_exact_deadline() {
         let (_temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap();
         assert!(insert_claimed_occurrence(
             &conn,
@@ -1130,13 +2771,670 @@ mod tests {
     }
 
     #[test]
+    fn claim_failure_rolls_back_superseded_misfire_rows() {
+        let (temp, conn) = temp_store();
+        insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'older-due', id, revision, definition_digest,
+                    '2026-08-28T08:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-08-28T08:00:00.000Z', '2026-08-28T08:00:00.000Z'
+             FROM automation_definitions WHERE id = 'daily';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'latest-due', id, revision, definition_digest,
+                    '2026-08-28T09:00:00.000Z', 'scheduled', 'planned', 0,
+                    '2026-08-28T09:00:00.000Z', '2026-08-28T09:00:00.000Z'
+             FROM automation_definitions WHERE id = 'daily';
+             CREATE TRIGGER synthetic_claim_crash
+             BEFORE UPDATE OF state ON automation_occurrences
+             WHEN NEW.state = 'claimed'
+              AND EXISTS (
+                  SELECT 1
+                  FROM automation_occurrences
+                  WHERE id = 'older-due' AND state = 'skipped'
+              )
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic claim crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = claim_due_occurrence(
+            &conn,
+            "daily",
+            "daemon-a",
+            60,
+            Utc.with_ymd_and_hms(2026, 8, 28, 10, 0, 0).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("synthetic claim crash"), "{error}");
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        let rows = conn
+            .prepare(
+                "SELECT id, state, lease_owner, attempt
+                 FROM automation_occurrences
+                 ORDER BY scheduled_for ASC",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("older-due".to_string(), "planned".to_string(), None, 0),
+                ("latest-due".to_string(), "planned".to_string(), None, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn planning_failure_restarts_without_duplicate_or_missed_fences() {
+        let (temp, conn) = temp_store();
+        for id in ["a-planning", "b-planning"] {
+            insert_definition(&conn, &definition(id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let now = real_now();
+        let created_at =
+            (now - chrono::Duration::days(1)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id IN ('a-planning', 'b-planning')",
+            [&created_at],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_planning_crash
+             BEFORE INSERT ON automation_occurrences
+             WHEN NEW.automation_id = 'a-planning'
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic planning crash');
+             END;",
+        )
+        .unwrap();
+
+        let interrupted = tick_planning(&conn, now).unwrap();
+
+        assert_eq!(interrupted.planned.len(), 1);
+        assert_eq!(interrupted.failed.len(), 1);
+        assert!(interrupted.failed[0].contains("synthetic planning crash"));
+        drop(conn);
+        let conn = crate::store::open_store(&temp.path().join("store.sqlite")).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT automation_id FROM automation_occurrences",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "b-planning"
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_planning_crash")
+            .unwrap();
+        let restarted = tick_planning(&conn, now).unwrap();
+        assert_eq!(restarted.planned.len(), 1);
+        assert_eq!(restarted.already_fenced, 1);
+        assert!(restarted.failed.is_empty());
+        let counts = conn
+            .prepare(
+                "SELECT automation_id, COUNT(*)
+                 FROM automation_occurrences
+                 GROUP BY automation_id
+                 ORDER BY automation_id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            counts,
+            vec![("a-planning".to_string(), 1), ("b-planning".to_string(), 1),]
+        );
+    }
+
+    #[test]
+    fn tick_claims_only_the_oldest_bounded_batch() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..65 {
+            let automation_id = format!("load-{index:02}");
+            insert_definition(
+                &conn,
+                &definition(&automation_id, "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+            )
+            .unwrap();
+            let occurrence_id = format!("occurrence-{index:02}");
+            let scheduled_for = now - chrono::Duration::seconds(65 - i64::from(index));
+            let scheduled_for = iso(scheduled_for);
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'planned', 0, ?3, ?3
+                 FROM automation_definitions
+                 WHERE id = ?4",
+                rusqlite::params![occurrence_id, scheduled_for, iso(now), automation_id],
+            )
+            .unwrap();
+        }
+
+        let first = tick(&conn, now).unwrap();
+
+        assert_eq!(first.claimed.len(), 64);
+        assert_eq!(
+            conn.query_row(
+                "SELECT id FROM automation_occurrences WHERE state = 'planned'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "occurrence-64"
+        );
+        let second = tick(&conn, now).unwrap();
+        assert_eq!(second.claimed, vec!["occurrence-64".to_string()]);
+    }
+
+    #[test]
+    fn tick_claims_ready_retry_before_newer_overlap_blocked_occurrence() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        insert_definition(
+            &conn,
+            &definition("retry-order", "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .unwrap();
+        let old_scheduled = iso(now - chrono::Duration::minutes(10));
+        let new_scheduled = iso(now - chrono::Duration::minutes(5));
+        conn.execute_batch(&format!(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'retry-old', id, revision, definition_digest, '{old_scheduled}',
+                    'scheduled', 'planned', 1, '{old_scheduled}', '{old_scheduled}'
+             FROM automation_definitions WHERE id = 'retry-order';
+             INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'newer-slot', id, revision, definition_digest, '{new_scheduled}',
+                    'scheduled', 'planned', 0, '{new_scheduled}', '{new_scheduled}'
+             FROM automation_definitions WHERE id = 'retry-order';
+             INSERT INTO automation_runs
+                (id, automation_id, occurrence_id, status, started_at, timeout_at)
+             VALUES
+                ('retry-run', 'retry-order', 'retry-old', 'running',
+                 '{old_scheduled}', '{}');
+             INSERT INTO automation_attempts
+                (id, run_id, occurrence_id, attempt_number, adoption_key,
+                 occurrence_fence_generation, state, prior_attempt_number, prior_disposition,
+                 retry_classification, not_before, opened_at)
+             VALUES
+                ('retry-attempt', 'retry-run', 'retry-old', 2, 'retry-order-key', 1,
+                 'adopted', 1, 'failed', 'automatic_retry',
+                 '{old_scheduled}', '{old_scheduled}');",
+            iso(now + chrono::Duration::minutes(20))
+        ))
+        .unwrap();
+
+        let report = tick(&conn, now).unwrap();
+
+        assert_eq!(report.claimed, vec!["retry-old".to_string()]);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state FROM automation_occurrences WHERE id = 'newer-slot'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "planned"
+        );
+    }
+
+    #[test]
+    fn tick_supersedes_stale_misfire_while_routine_is_busy() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        insert_definition(
+            &conn,
+            &definition("busy-misfire", "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .unwrap();
+        for (id, minutes, state) in [
+            ("older-misfire", 10, "planned"),
+            ("latest-misfire", 5, "planned"),
+            ("active-occurrence", 1, "running"),
+        ] {
+            let scheduled_for = iso(now - chrono::Duration::minutes(minutes));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', ?3, 0, ?2, ?2
+                 FROM automation_definitions WHERE id = 'busy-misfire'",
+                params![id, scheduled_for, state],
+            )
+            .unwrap();
+        }
+
+        let report = tick(&conn, now).unwrap();
+
+        assert!(report.claimed.is_empty());
+        let states = conn
+            .prepare(
+                "SELECT id, state
+                 FROM automation_occurrences
+                 WHERE id IN ('older-misfire', 'latest-misfire')
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            states,
+            vec![
+                ("latest-misfire".to_string(), "planned".to_string()),
+                ("older-misfire".to_string(), "skipped".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tick_supersedes_only_the_oldest_bounded_misfire_batch() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        insert_definition(
+            &conn,
+            &definition("busy-backlog", "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .unwrap();
+        for index in 0..66 {
+            let occurrence_id = format!("backlog-{index:02}");
+            let scheduled_for = iso(now - chrono::Duration::seconds(67 - i64::from(index)));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'planned', 0, ?2, ?2
+                 FROM automation_definitions WHERE id = 'busy-backlog'",
+                params![occurrence_id, scheduled_for],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'backlog-running', id, revision, definition_digest, ?1,
+                    'scheduled', 'running', 1, ?1, ?1
+             FROM automation_definitions WHERE id = 'busy-backlog'",
+            [iso(now)],
+        )
+        .unwrap();
+
+        tick(&conn, now).unwrap();
+
+        let (skipped, planned): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(state = 'skipped'),
+                    SUM(state = 'planned')
+                 FROM automation_occurrences
+                 WHERE automation_id = 'busy-backlog'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((skipped, planned), (64, 2));
+
+        tick(&conn, now).unwrap();
+        let (skipped, planned): (i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(state = 'skipped'),
+                    SUM(state = 'planned')
+                 FROM automation_occurrences
+                 WHERE automation_id = 'busy-backlog'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((skipped, planned), (65, 1));
+    }
+
+    #[test]
+    fn planning_scans_a_bounded_rotating_definition_page() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..65 {
+            let id = format!("planning-load-{index:02}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let created_at = iso(now - chrono::Duration::days(1));
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1",
+            [&created_at],
+        )
+        .unwrap();
+
+        let first = tick_planning(&conn, now).unwrap();
+        assert_eq!(first.planned.len(), 64);
+        assert_eq!(
+            planning_cursor_definition_id(&conn).unwrap().as_deref(),
+            Some("planning-load-63")
+        );
+
+        let second = tick_planning(&conn, now).unwrap();
+        assert_eq!(second.planned.len(), 1);
+        assert_eq!(second.already_fenced, 63);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM automation_occurrences", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            65
+        );
+    }
+
+    #[test]
+    fn planning_cursor_failure_repeats_the_committed_page_before_advancing() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..65 {
+            let id = format!("planning-restart-{index:02}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let created_at = iso(now - chrono::Duration::days(1));
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1",
+            [&created_at],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER synthetic_planning_cursor_crash
+             BEFORE UPDATE ON automation_scheduler_planning_cursor
+             BEGIN
+                 SELECT RAISE(ABORT, 'synthetic planning cursor crash');
+             END;",
+        )
+        .unwrap();
+
+        let error = tick_planning(&conn, now).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("synthetic planning cursor crash"));
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM automation_occurrences", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            64
+        );
+
+        conn.execute_batch("DROP TRIGGER synthetic_planning_cursor_crash")
+            .unwrap();
+        let repeated = tick_planning(&conn, now).unwrap();
+        assert!(repeated.planned.is_empty());
+        assert_eq!(repeated.already_fenced, 64);
+        let final_page = tick_planning(&conn, now).unwrap();
+        assert_eq!(final_page.planned.len(), 1);
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM automation_occurrences", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            65
+        );
+    }
+
+    #[test]
+    fn planning_cursor_recovers_when_its_singleton_row_is_missing() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..65 {
+            let id = format!("planning-cursor-recovery-{index:02}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let created_at = iso(now - chrono::Duration::days(1));
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1",
+            [&created_at],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM automation_scheduler_planning_cursor", [])
+            .unwrap();
+
+        let first = tick_planning(&conn, now).unwrap();
+        assert_eq!(first.planned.len(), 64);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_scheduler_planning_cursor",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+
+        let second = tick_planning(&conn, now).unwrap();
+        assert_eq!(second.planned.len(), 1);
+        assert_eq!(second.already_fenced, 63);
+    }
+
+    #[test]
+    fn bounded_planning_advances_past_invalid_and_paused_rows() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        insert_definition(
+            &conn,
+            &definition("planning-prefix-invalid", "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE automation_definitions
+             SET definition_json = '{'
+             WHERE id = 'planning-prefix-invalid'",
+            [],
+        )
+        .unwrap();
+        for index in 0..63 {
+            let id = format!("planning-prefix-paused-{index:02}");
+            insert_definition(&conn, &definition(&id, "PAUSED", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        for index in 0..2 {
+            let id = format!("planning-tail-active-{index:02}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let created_at = iso(now - chrono::Duration::days(1));
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1",
+            [&created_at],
+        )
+        .unwrap();
+
+        let prefix = tick_planning(&conn, now).unwrap();
+        assert!(prefix.planned.is_empty());
+        assert_eq!(prefix.failed.len(), 1);
+
+        let tail = tick_planning(&conn, now).unwrap();
+        assert_eq!(tail.planned.len(), 2);
+    }
+
+    #[test]
+    fn scheduler_does_not_claim_an_unvisited_definition_stale_slot() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..65 {
+            let id = format!("planning-claim-safety-{index:02}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+        let created_at = iso(now - chrono::Duration::days(1));
+        conn.execute(
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1",
+            [&created_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                 kind, state, attempt, created_at, updated_at)
+             SELECT 'unvisited-stale-slot', id, revision, definition_digest, ?1,
+                    'scheduled', 'planned', 0, ?1, ?1
+             FROM automation_definitions
+             WHERE id = 'planning-claim-safety-64'",
+            [iso(now - chrono::Duration::days(2))],
+        )
+        .unwrap();
+
+        tick(&conn, now).unwrap();
+        let stale_state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences
+                 WHERE id = 'unvisited-stale-slot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_state, "planned");
+
+        tick(&conn, now).unwrap();
+        let stale_state: String = conn
+            .query_row(
+                "SELECT state FROM automation_occurrences
+                 WHERE id = 'unvisited-stale-slot'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_state, "skipped");
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_occurrences
+                 WHERE automation_id = 'planning-claim-safety-64'
+                   AND state = 'claimed'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn overlapping_planning_pass_cannot_regress_a_newer_cursor() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        for index in 0..130 {
+            let id = format!("planning-cursor-cas-{index:03}");
+            insert_definition(&conn, &definition(&id, "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
+        }
+
+        tick_planning(&conn, now).unwrap();
+        let stale_page = planning_definition_page(&conn).unwrap();
+        tick_planning(&conn, now).unwrap();
+        conn.execute(
+            "UPDATE automation_scheduler_planning_cursor
+             SET after_name = 'planning-cursor-cas-063',
+                 after_definition_id = 'planning-cursor-cas-063',
+                 revision = revision + 1
+             WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            planning_cursor_definition_id(&conn).unwrap().as_deref(),
+            Some("planning-cursor-cas-063")
+        );
+
+        advance_planning_cursor(&conn, &stale_page, None).unwrap();
+        assert_eq!(
+            planning_cursor_definition_id(&conn).unwrap().as_deref(),
+            Some("planning-cursor-cas-063")
+        );
+    }
+
+    #[test]
+    fn direct_claim_supersedes_only_one_bounded_batch() {
+        let (_temp, conn) = temp_store();
+        let now = real_now();
+        insert_definition(
+            &conn,
+            &definition("bounded-direct-claim", "ACTIVE", "FREQ=DAILY;BYHOUR=9"),
+        )
+        .unwrap();
+        for index in 0..130 {
+            let occurrence_id = format!("bounded-direct-claim-{index:03}");
+            let scheduled_for = iso(now - chrono::Duration::seconds(131 - i64::from(index)));
+            conn.execute(
+                "INSERT INTO automation_occurrences
+                    (id, automation_id, automation_revision, definition_digest, scheduled_for,
+                     kind, state, attempt, created_at, updated_at)
+                 SELECT ?1, id, revision, definition_digest, ?2,
+                        'scheduled', 'planned', 0, ?2, ?2
+                 FROM automation_definitions WHERE id = 'bounded-direct-claim'",
+                params![occurrence_id, scheduled_for],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            claim_due_occurrence(&conn, "bounded-direct-claim", "daemon", 60, now).unwrap(),
+            None
+        );
+        let (skipped, planned, claimed): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                    SUM(state = 'skipped'),
+                    SUM(state = 'planned'),
+                    SUM(state = 'claimed')
+                 FROM automation_occurrences
+                 WHERE automation_id = 'bounded-direct-claim'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((skipped, planned, claimed), (64, 66, 0));
+    }
+
+    #[test]
     fn settles_claimed_work_but_never_planned() {
         let (_temp, conn) = temp_store();
         insert_definition(&conn, &definition("daily", "ACTIVE", "FREQ=DAILY;BYHOUR=9")).unwrap();
         let old_created = (real_now() - chrono::Duration::days(1))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         conn.execute(
-            "UPDATE automation_definitions SET created_at = ?1 WHERE id = 'daily'",
+            "UPDATE automation_definitions
+             SET created_at = ?1, updated_at = ?1
+             WHERE id = 'daily'",
             rusqlite::params![old_created],
         )
         .unwrap();

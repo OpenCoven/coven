@@ -77,6 +77,8 @@ jobs:
       - run: python3 scripts/check-api-contract-docs-test.py
       - run: python3 scripts/check-api-contract-docs.py
       - run: python3 scripts/check-docs-ownership-test.py
+      - run: python3 scripts/check-security-policy-test.py
+      - run: python3 scripts/check-security-policy.py
       - run: python scripts/check-secrets.py
       - name: Documentation ownership guard (pull request changes)
         if: github.event_name == 'pull_request'
@@ -105,9 +107,15 @@ jobs:
           fi
           python scripts/check-coven-privacy.py --range "${BEFORE_SHA}..${AFTER_SHA}"
       - run: python3 scripts/classify-ci-changes-test.py
+      - run: python3 scripts/check-reliability-scorecard-test.py
+      - run: python3 scripts/check-reliability-scorecard.py
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
+      - run: python3 scripts/install-native-link-dependencies-test.py
       - run: node --test scripts/package-github-release-test.mjs
+      - run: node --test scripts/package-automations-protocol.test.mjs
+      - run: node --test scripts/package-automations-authority-profile.test.mjs
+      - run: node --test conformance/automations/runner/conformance.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       # The benchmark harness tests also run inside `performance-baseline`,
       # but that job is push-only, so until this step existed a pull request
@@ -118,6 +126,84 @@ jobs:
       # second here rather than gating behind the expensive baseline job.
       - run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - run: scripts/check-workflows.sh
+
+  automations-protocol-bundle:
+    name: Automations v1 protocol bundle
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - name: Package exact-commit Automations protocol
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          AUTOMATIONS_ARTIFACT_DIR: ${{ runner.temp }}/coven-automations-v1-contract
+        run: |
+          set -euo pipefail
+          node --test scripts/package-automations-protocol.test.mjs
+          node scripts/package-automations-protocol.mjs \
+            --output "$AUTOMATIONS_ARTIFACT_DIR"
+          PROTOCOL_BUNDLE="$AUTOMATIONS_ARTIFACT_DIR/coven-automations-v1-contract-${SOURCE_COMMIT}.tar.gz"
+          PROTOCOL_SHA256="$(sha256sum "$PROTOCOL_BUNDLE" | awk '{print $1}')"
+          node scripts/package-automations-protocol.mjs verify \
+            --bundle "$PROTOCOL_BUNDLE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --sha256 "$PROTOCOL_SHA256"
+          jq -e --arg sourceCommit "$SOURCE_COMMIT" \
+            '.sourceCommit == $sourceCommit and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
+            "$AUTOMATIONS_ARTIFACT_DIR/manifest.json"
+      - name: Upload exact-commit Automations protocol
+        uses: actions/upload-artifact@v7
+        with:
+          name: coven-automations-v1-contract-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/coven-automations-v1-contract/coven-automations-v1-contract-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/coven-automations-v1-contract/manifest.json
+          if-no-files-found: error
+
+  automations-authority-profile-bundle:
+    name: Automations Runtime Authority v1 profile bundle
+    needs: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6.0.0
+        with:
+          node-version: 24
+      - name: Package exact-commit Automations authority profile
+        env:
+          SOURCE_COMMIT: ${{ github.sha }}
+          AUTHORITY_ARTIFACT_DIR: ${{ runner.temp }}/coven-automations-authority-v1-contract
+        run: |
+          set -euo pipefail
+          node --test scripts/package-automations-authority-profile.test.mjs
+          node scripts/package-automations-authority-profile.mjs \
+            --output "$AUTHORITY_ARTIFACT_DIR"
+          AUTHORITY_PROFILE_BUNDLE="$AUTHORITY_ARTIFACT_DIR/coven-automations-authority-v1-contract-${SOURCE_COMMIT}.tar.gz"
+          AUTHORITY_PROFILE_SHA256="$(sha256sum "$AUTHORITY_PROFILE_BUNDLE" | awk '{print $1}')"
+          node scripts/package-automations-authority-profile.mjs verify \
+            --bundle "$AUTHORITY_PROFILE_BUNDLE" \
+            --source-commit "$SOURCE_COMMIT" \
+            --sha256 "$AUTHORITY_PROFILE_SHA256"
+          jq -e --arg sourceCommit "$SOURCE_COMMIT" \
+            '.sourceCommit == $sourceCommit and .contractProfile == "coven.automations.authority.v1" and (.contractContentSha256 | test("^[0-9a-f]{64}$"))' \
+            "$AUTHORITY_ARTIFACT_DIR/manifest.json"
+      - name: Upload exact-commit Automations authority profile
+        uses: actions/upload-artifact@v7
+        with:
+          name: coven-automations-authority-v1-contract-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/coven-automations-authority-v1-contract/coven-automations-authority-v1-contract-${{ github.sha }}.tar.gz
+            ${{ runner.temp }}/coven-automations-authority-v1-contract/manifest.json
+          if-no-files-found: error
 
   rust-lint-linux:
     name: Rust lint (Linux)
@@ -140,7 +226,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-lint-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -165,7 +251,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo test --workspace --locked
 
   rust-test-windows:
@@ -235,7 +321,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-afs-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Clippy (coven-afs mount feature)
         run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
       - name: Test (coven-afs mount feature)
@@ -299,7 +385,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-perf-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Validate benchmark runner
@@ -449,7 +535,7 @@ jobs:
             ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
       - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
         env:
@@ -496,7 +582,7 @@ jobs:
             ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
       - name: Build the AFS mount export helper (macOS only)
         if: startsWith(matrix.npm-target, 'macos')
@@ -524,7 +610,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-engine-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Install the pinned engine
@@ -556,6 +642,8 @@ jobs:
     needs:
       - changes
       - policy-guard
+      - automations-protocol-bundle
+      - automations-authority-profile-bundle
       - rust-lint-linux
       - rust-test-linux
       - rust-test-windows
@@ -584,7 +672,7 @@ jobs:
               for name, data in jobs.items()
               if data["result"] not in {"success", "skipped"}
           }
-          for required in ("changes", "policy-guard"):
+          for required in ("changes", "policy-guard", "automations-protocol-bundle", "automations-authority-profile-bundle"):
               if jobs[required]["result"] != "success":
                   bad[required] = jobs[required]["result"]
           if bad:
