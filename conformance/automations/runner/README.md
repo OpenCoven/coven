@@ -121,6 +121,7 @@ source metadata for the files and binary under test. `source.commit` must equal
 - `subjectArtifact.sha256` from `--target-command`.
 
 The checked-in
+[`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 and
@@ -140,6 +141,7 @@ The runner invokes the target directly without a shell.
     {
       "profile": "structural",
       "suites": [
+        "attempt-terminal-immutability",
         "capability-negotiation",
         "definition-validation",
         "run-terminal-monotonicity"
@@ -155,9 +157,11 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements three structural suites.
-`capability-negotiation` executes the checked-in cases against Rust's real
-routine-definition parser and capability policy. `definition-validation`
+The native Coven target currently implements four structural suites.
+`attempt-terminal-immutability` executes every terminal attempt state against
+the production SQLite ledger and proves that later updates and deletion are
+refused. `capability-negotiation` executes the checked-in cases against Rust's
+real routine-definition parser and capability policy. `definition-validation`
 executes the portable v1 definition parser, integrity verification, and typed
 serialization path, accepting a canonical valid definition only when its
 normalized JCS digest matches and rejecting a tampered definition.

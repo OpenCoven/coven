@@ -5,6 +5,9 @@ use super::conformance_target::{
     CAPABILITY_NEGOTIATION_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
+const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/attempt-terminal-immutability.vectors.json"
+);
 const DEFINITION_VALIDATION_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/definition-validation.vectors.json");
 
@@ -46,12 +49,78 @@ fn capability_advertises_the_native_structural_suites() {
             "profiles": [{
                 "profile": "structural",
                 "suites": [
+                    "attempt-terminal-immutability",
                     CAPABILITY_NEGOTIATION_SUITE,
                     "definition-validation",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
+    );
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    let response = evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 5);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 5);
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["updateCommitted"] = json!(true);
+
+    let response = evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_rejects_duplicate_case_ids() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+
+    assert_eq!(
+        evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_rejects_nonterminal_start_states() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"][0]["firstState"] = json!("observing");
+
+    assert_eq!(
+        evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_rejects_noop_updates() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"][0]["attemptedState"] = vectors["cases"][0]["firstState"].clone();
+
+    assert_eq!(
+        evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn attempt_terminal_immutability_suite_requires_every_terminal_state() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"].as_array_mut().unwrap().pop();
+
+    assert_eq!(
+        evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap_err(),
+        "conformance vector is invalid"
     );
 }
 
