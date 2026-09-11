@@ -108,6 +108,21 @@ fn event_reducer_determinism_suite_rejects_duplicate_case_ids() {
 }
 
 #[test]
+fn event_reducer_determinism_suite_rejects_duplicate_canonical_event_ids() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    let duplicate = vectors["cases"][0]["events"][1].clone();
+    vectors["cases"][0]["events"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+
+    assert_eq!(
+        evaluate(&request_for("event-reducer-determinism", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
 fn event_reducer_determinism_suite_rejects_malformed_expected_digests() {
     let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
     vectors["cases"][0]["expectedStateDigest"] = json!("sha256:not-a-digest");

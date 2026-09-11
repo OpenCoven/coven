@@ -395,10 +395,15 @@ fn evaluate_event_reducer_determinism(vector: &Value) -> Result<bool, &'static s
 
     let mut case_ids = BTreeSet::new();
     for case in &vectors.cases {
+        let mut event_ids = BTreeSet::new();
         if !valid_case_id(&case.case_id)
             || !case_ids.insert(&case.case_id)
             || case.events.is_empty()
             || case.events.len() > MAX_CASES
+            || case
+                .events
+                .iter()
+                .any(|event| !event_ids.insert(event.event_id.as_str()))
             || case.duplicate_index >= case.events.len()
             || !valid_sha256_digest(&case.expected_state_digest)
         {

@@ -824,6 +824,14 @@ impl EventReducer {
                     actual: event.sequence.get(),
                 });
             }
+            if let Some(cursor) = self.cursor {
+                if through <= cursor {
+                    return Err(EventStoreError::StreamOutOfOrder {
+                        expected: cursor.saturating_add(1),
+                        actual: through,
+                    });
+                }
+            }
             self.state = Value::Object(
                 snapshot
                     .state
@@ -1160,6 +1168,27 @@ mod tests {
         compacted.apply(&events[4]).unwrap();
 
         assert_eq!(compacted.state(), full.state());
+    }
+
+    #[test]
+    fn snapshot_cannot_rewind_an_existing_reduction() {
+        let events = [
+            occurrence_event("evtoccurrence0000000020", 0, "none", "planned"),
+            occurrence_event("evtoccurrence0000000021", 1, "planned", "eligible"),
+            occurrence_event("evtoccurrence0000000022", 2, "eligible", "claimed"),
+            occurrence_event("evtoccurrence0000000023", 3, "claimed", "running"),
+        ];
+        let mut reducer = EventReducer::default();
+        for event in &events {
+            reducer.apply(event).unwrap();
+        }
+
+        let stale_snapshot = snapshot_event("evtsnapshot00000000002", 2, 2);
+        let error = reducer.apply(&stale_snapshot).unwrap_err();
+
+        assert_eq!(error.code(), "STREAM_OUT_OF_ORDER");
+        assert_eq!(reducer.state()["state"], "running");
+        assert_eq!(reducer.state()["eventWindow"]["lastSequence"], 3);
     }
 
     #[test]
