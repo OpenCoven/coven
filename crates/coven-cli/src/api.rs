@@ -57,6 +57,11 @@ fn ward_write_audit_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn threads_scheduler_pass_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(test)]
 const TEST_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -871,6 +876,22 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 })),
             )
         }
+        #[cfg(feature = "threads-test-clock")]
+        (_, path)
+            if (path == "/internal/threads/test-clock"
+                || path == "/internal/threads/test-clock/tick")
+                && !authority.allows_ward_proposal_access() =>
+        {
+            api_error(
+                403,
+                "transport_forbidden",
+                "Deterministic Threads clock control requires the owner-gated local IPC transport.",
+                Some(json!({
+                    "requiredAuthority": "owner_local_ipc",
+                    "writeApplied": false,
+                })),
+            )
+        }
         ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None, query),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
             let id = path.trim_start_matches("/threads/proposals/");
@@ -896,6 +917,14 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 .trim_start_matches("/threads/proposals/")
                 .trim_end_matches("/reject");
             decide_threads_proposal(coven_home, id, "reject", body)
+        }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/threads/test-clock") => {
+            deterministic_threads_clock_response(coven_home, body)
+        }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/threads/test-clock/tick") => {
+            deterministic_threads_tick_response(coven_home, body)
         }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
@@ -5930,6 +5959,7 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Permitted => {}
     }
 
+    let apply_now = crate::threads_clock::now(coven_home)?;
     let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
         Ok(report) => (report, None),
         Err(error) => {
@@ -6085,6 +6115,7 @@ fn apply_familiar_edits(
             &workspace,
             &config,
             &report,
+            apply_now,
         )
         .err();
         if let Some(err) = persist_error {
@@ -9455,6 +9486,7 @@ fn decide_threads_proposal_inner(
     };
     let proposal_store_path = store_path(coven_home);
     let conn = store::open_store(&proposal_store_path)?;
+    let decision_now = crate::threads_clock::now(coven_home)?;
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
         let matches_request = matches!(
             (decision, terminal.event_type.as_str()),
@@ -9487,12 +9519,7 @@ fn decide_threads_proposal_inner(
     let mut effective_decision = decision;
     let mut effective_expired = expired;
     if !effective_expired
-        && proposal_requires_terminal_expiry(
-            coven_home,
-            &conn,
-            proposal_uuid,
-            time::OffsetDateTime::now_utc(),
-        )
+        && proposal_requires_terminal_expiry(coven_home, &conn, proposal_uuid, decision_now)
     {
         effective_decision = "reject";
         effective_expired = true;
@@ -9544,6 +9571,7 @@ fn decide_threads_proposal_inner(
                 expected_revision: expected_revision.as_deref(),
                 revision_required,
                 expired: effective_expired,
+                now: decision_now,
             },
         ) {
             Ok(Some(claim)) => claim,
@@ -9788,7 +9816,7 @@ fn decide_threads_proposal_inner(
         durable_request
             .as_ref()
             .map(|request| request.claimed_at)
-            .unwrap_or_else(time::OffsetDateTime::now_utc),
+            .unwrap_or(decision_now),
         expired,
     ) {
         Ok(semantics) => semantics,
@@ -9960,13 +9988,14 @@ fn decide_threads_proposal_inner(
                 )
             }));
     if coherence_revalidation_failed {
-        let state = crate::threads_gate::build_weave_state(
+        let state = crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?;
         append_proposal_refusal_audit(
             &conn,
@@ -9976,6 +10005,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.release_if_unneeded()?;
         if applying_state.is_none() {
@@ -9998,13 +10028,14 @@ fn decide_threads_proposal_inner(
         && adjudication.is_blocked()
         && !coherence_rejection
     {
-        let state = crate::threads_gate::build_weave_state_for_writer(
+        let state = crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
             Some(&pending.writer),
         )?;
         claim.preserve();
@@ -10023,6 +10054,7 @@ fn decide_threads_proposal_inner(
                 window_close: None,
                 channel: pending.channel,
             },
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.consume()?;
@@ -10036,13 +10068,14 @@ fn decide_threads_proposal_inner(
         );
     }
     if adjudication.is_blocked() && !coherence_rejection {
-        let state = crate::threads_gate::build_weave_state(
+        let state = crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?;
         append_proposal_refusal_audit(
             &conn,
@@ -10052,6 +10085,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10073,32 +10107,35 @@ fn decide_threads_proposal_inner(
             .collect()
     };
     let state = if review_kind == PendingReviewKind::Coherence {
-        crate::threads_gate::build_weave_state(
+        crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?
     } else if scheduled.is_some() {
-        crate::threads_gate::build_weave_state_for_writer(
+        crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &gated_targets,
             false,
+            decision_now,
             Some(&pending.writer),
         )?
     } else {
-        crate::threads_gate::build_weave_state(
+        crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &gated_targets,
             false,
+            decision_now,
         )?
     };
     if decision == "approve"
@@ -10113,6 +10150,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10143,6 +10181,7 @@ fn decide_threads_proposal_inner(
                 window_close: decision_semantics.window_close.as_ref(),
                 channel: pending.channel,
             },
+            decision_now,
         )?;
         audit_reservation.finish()?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
@@ -10206,6 +10245,7 @@ fn decide_threads_proposal_inner(
                         window_close: None,
                         channel: pending.channel,
                     },
+                    decision_now,
                 )?;
                 audit_reservation.finish()?;
                 claim.consume()?;
@@ -10324,6 +10364,7 @@ fn decide_threads_proposal_inner(
                 &pending.writer,
                 &targets,
                 pending.channel,
+                decision_now,
             )?;
             audit_reservation.finish()?;
             claim.restore_pending(&document)?;
@@ -10358,6 +10399,7 @@ fn decide_threads_proposal_inner(
                 window_close: decision_semantics.window_close.as_ref(),
                 channel: pending.channel,
                 probe_summary: applying.probe_summary.as_ref(),
+                decided_at: decision_now,
             },
         ) {
             audit_reservation.preserve()?;
@@ -10402,7 +10444,7 @@ fn decide_threads_proposal_inner(
                 state.weave.weave_hash(),
                 &request,
                 &verdict,
-                time::OffsetDateTime::now_utc(),
+                decision_now,
             )?;
             if !verdict.permits_write() {
                 append_proposal_refusal_audit(
@@ -10413,6 +10455,7 @@ fn decide_threads_proposal_inner(
                     &pending.writer,
                     &targets,
                     pending.channel,
+                    decision_now,
                 )?;
                 audit_reservation.finish()?;
                 return json_response(
@@ -10508,6 +10551,7 @@ fn decide_threads_proposal_inner(
         &targets,
         &applying,
         pending.channel,
+        decision_now,
     )?;
     audit_reservation.preserve_if_unfinished();
     if let Err(error) =
@@ -10589,6 +10633,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10620,6 +10665,7 @@ fn decide_threads_proposal_inner(
             window_close: decision_semantics.window_close.as_ref(),
             channel: pending.channel,
             probe_summary: probe_summary.as_ref(),
+            decided_at: decision_now,
         },
     ) {
         audit_reservation.preserve()?;
@@ -10842,10 +10888,13 @@ fn parse_scheduler_authority_document(
 /// Process one deterministic round-robin batch. The persistent filename cursor
 /// prevents a prefix of human-only proposals from starving later due work.
 pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+    let _pass_guard = threads_scheduler_pass_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("threads proposal scheduler lock is poisoned"))?;
     let candidates = scheduler_candidate_batch(coven_home)?;
     let last_cursor = candidates.last().map(|(name, _)| name.clone());
     let mut completed = 0;
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::threads_clock::now(coven_home)?;
     for (name, path) in candidates {
         if name.ends_with(".deciding") {
             let document = match read_pending_proposal_document(&path) {
@@ -10924,7 +10973,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             let Some(proposal) = proposal else {
                 return Ok(false);
             };
-            ensure_proposal_window_opened_audit(coven_home, &proposal)?;
+            ensure_proposal_window_opened_audit(coven_home, &proposal, now)?;
             let due = match &proposal.classification().approval_path {
                 coven_threads_core::ApprovalPath::AutoRegression { veto: None } => true,
                 coven_threads_core::ApprovalPath::AutoRegression { veto: Some(_) }
@@ -11005,6 +11054,7 @@ fn recover_proposal_claim_document(
 fn ensure_proposal_window_opened_audit(
     coven_home: &Path,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let (Some(deadline), Some(earliest_close)) =
         (proposal.veto_deadline(), proposal.earliest_close())
@@ -11024,13 +11074,14 @@ fn ensure_proposal_window_opened_audit(
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
     let conn = store::open_store(&store_path(coven_home))?;
-    let state = crate::threads_gate::build_weave_state_for_writer(
+    let state = crate::threads_gate::build_weave_state_for_writer_at(
         &conn,
         &familiar_id,
         &workspace,
         &config,
         &targets,
         false,
+        now,
         Some(&pending.writer),
     )?;
     let detail = coven_threads_core::ProposalWindowAuditDetail {
@@ -11059,8 +11110,7 @@ fn ensure_proposal_window_opened_audit(
     let submitted_at = pending
         .staged_at
         .format(&time::format_description::well_known::Rfc3339)?;
-    let decided_at =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let decided_at = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_hash, decision, approver,
@@ -11102,6 +11152,7 @@ struct PendingDecisionClaimRequest<'a> {
     expected_revision: Option<&'a str>,
     revision_required: bool,
     expired: bool,
+    now: time::OffsetDateTime,
 }
 
 #[derive(Debug)]
@@ -11189,15 +11240,14 @@ impl PendingDecisionClaim {
             expected_revision,
             revision_required,
             expired,
+            now,
         } = request;
         let expiry_request = |existing: Option<&ProposalDecisionRequest>| ProposalDecisionRequest {
             decision: "reject".to_string(),
             rationale: existing
                 .and_then(|request| request.rationale.clone())
                 .or_else(|| rationale.map(str::to_string)),
-            claimed_at: existing
-                .map(|request| request.claimed_at)
-                .unwrap_or_else(time::OffsetDateTime::now_utc),
+            claimed_at: existing.map(|request| request.claimed_at).unwrap_or(now),
             expected_revision: None,
             revision_required: false,
             expired: true,
@@ -11219,14 +11269,7 @@ impl PendingDecisionClaim {
             let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
                 .context("parsing pending proposal claim before decision recovery")?;
             drop(raw);
-            if !expired
-                && proposal_retention_expired(
-                    coven_home,
-                    audit_conn,
-                    &document,
-                    time::OffsetDateTime::now_utc(),
-                )
-            {
+            if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
                 return Err(ProposalExpiredBeforeClaim.into());
             }
             if expired {
@@ -11290,14 +11333,7 @@ impl PendingDecisionClaim {
         let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
             .context("parsing pending proposal before decision claim")?;
         drop(raw);
-        if !expired
-            && proposal_retention_expired(
-                coven_home,
-                audit_conn,
-                &document,
-                time::OffsetDateTime::now_utc(),
-            )
-        {
+        if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
             return Err(ProposalExpiredBeforeClaim.into());
         }
         let superseded_decision = expired
@@ -11324,7 +11360,7 @@ impl PendingDecisionClaim {
             document.decision_request = Some(ProposalDecisionRequest {
                 decision: decision.to_string(),
                 rationale: rationale.map(str::to_string),
-                claimed_at: time::OffsetDateTime::now_utc(),
+                claimed_at: now,
                 expected_revision: expected_revision.map(str::to_string),
                 revision_required,
                 expired,
@@ -11409,6 +11445,22 @@ struct ProposalDecisionRequest {
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
+}
+
+#[cfg(feature = "threads-test-clock")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeterministicThreadsClockRequest {
+    capability: String,
+    #[serde(with = "time::serde::rfc3339")]
+    now: time::OffsetDateTime,
+}
+
+#[cfg(feature = "threads-test-clock")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeterministicThreadsTickRequest {
+    capability: String,
 }
 
 #[cfg(test)]
@@ -11698,6 +11750,8 @@ fn persist_proposal_applying_state(
     crate::proposal_store::replace_existing(claim_path, &body)
 }
 
+// Preserve the borrowed apply-intent inputs while passing the decision's captured time.
+#[allow(clippy::too_many_arguments)]
 fn append_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
@@ -11706,11 +11760,11 @@ fn append_proposal_apply_intent(
     files_touched: &[String],
     state: &ProposalApplyingState,
     channel: coven_threads_core::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let detail = serde_json::to_string(state).context("serializing proposal apply intent")?;
     let files_touched = serde_json::to_string(files_touched)?;
-    let now =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let now = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
@@ -12034,6 +12088,8 @@ fn staged_edits_to_ward_edits(
         .collect()
 }
 
+// Refusal evidence shares the decision's clock without copying its borrowed inputs.
+#[allow(clippy::too_many_arguments)]
 fn append_proposal_refusal_audit(
     conn: &rusqlite::Connection,
     proposal_id: &str,
@@ -12042,6 +12098,7 @@ fn append_proposal_refusal_audit(
     approver: &coven_threads_core::WriterId,
     files_touched: &[String],
     channel: coven_threads_core::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     append_proposal_decision_audit(
         conn,
@@ -12058,6 +12115,7 @@ fn append_proposal_refusal_audit(
             window_close: None,
             channel,
         },
+        now,
     )
 }
 
@@ -12090,6 +12148,7 @@ struct ApprovedProposalFinalization<'a> {
     window_close: Option<&'a coven_threads_core::ProposalWindowCloseAuditDetail>,
     channel: coven_threads_core::Channel,
     probe_summary: Option<&'a crate::ward_probes::ProbeSummary>,
+    decided_at: time::OffsetDateTime,
 }
 
 fn finalize_approved_proposal(
@@ -12099,13 +12158,14 @@ fn finalize_approved_proposal(
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("starting proposal approval transaction")?;
     let result = (|| -> Result<()> {
-        crate::threads_gate::append_apply_audit_records(
+        crate::threads_gate::append_apply_audit_records_at(
             conn,
             Some(finalization.proposal_id),
             finalization.familiar_id,
             finalization.weave_hash,
             finalization.apply_report,
             finalization.channel,
+            finalization.decided_at,
         )?;
         for target in finalization.gated_targets {
             let expected_bytes = finalization
@@ -12136,6 +12196,7 @@ fn finalize_approved_proposal(
                 channel: finalization.channel,
             },
             finalization.probe_summary,
+            finalization.decided_at,
         )?;
         conn.execute_batch("COMMIT")
             .context("committing proposal approval transaction")
@@ -12149,14 +12210,16 @@ fn finalize_approved_proposal(
 fn append_proposal_decision_audit(
     conn: &rusqlite::Connection,
     audit: ProposalDecisionAudit<'_>,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
-    append_proposal_decision_audit_with_probe_summary(conn, audit, None)
+    append_proposal_decision_audit_with_probe_summary(conn, audit, None, now)
 }
 
 fn append_proposal_decision_audit_with_probe_summary(
     conn: &rusqlite::Connection,
     audit: ProposalDecisionAudit<'_>,
     probe_summary: Option<&crate::ward_probes::ProbeSummary>,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let files_touched = serde_json::to_string(audit.files_touched)?;
     let detail = match audit.event_type {
@@ -12180,8 +12243,7 @@ fn append_proposal_decision_audit_with_probe_summary(
         }
         _ => None,
     };
-    let now =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let now = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
@@ -12474,6 +12536,115 @@ fn session_action_id<'a>(path: &'a str, suffix: &str) -> &'a str {
 
 pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn deterministic_threads_clock_response(
+    coven_home: &Path,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let request: DeterministicThreadsClockRequest =
+        match serde_json::from_str(body.unwrap_or_default()) {
+            Ok(request) => request,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &format!("Deterministic Threads clock request is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+    match crate::threads_clock::set_now(coven_home, &request.capability, request.now) {
+        Ok(snapshot) => json_response(
+            200,
+            &json!({
+                "ok": true,
+                "now": snapshot.now.format(&time::format_description::well_known::Rfc3339)?,
+                "source": snapshot.source.as_str(),
+            }),
+        ),
+        Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn deterministic_threads_tick_response(
+    coven_home: &Path,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let request: DeterministicThreadsTickRequest =
+        match serde_json::from_str(body.unwrap_or_default()) {
+            Ok(request) => request,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &format!("Deterministic Threads scheduler tick request is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+    let _clock_guard = crate::threads_clock::fixture_control_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deterministic Threads clock lock is poisoned"))?;
+    match crate::threads_clock::authorize_fixture(coven_home, &request.capability) {
+        Ok(snapshot) => json_response(
+            200,
+            &json!({
+                "ok": true,
+                "processed": process_due_threads_proposals(coven_home)?,
+                "now": snapshot.now.format(&time::format_description::well_known::Rfc3339)?,
+                "source": snapshot.source.as_str(),
+            }),
+        ),
+        Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn map_deterministic_threads_clock_error(error: anyhow::Error) -> Result<ApiResponse> {
+    if error
+        .downcast_ref::<crate::threads_clock::InactiveFixture>()
+        .is_some()
+    {
+        return api_error(
+            404,
+            "not_found",
+            "Deterministic Threads clock control is inactive for this Coven home.",
+            None,
+        );
+    }
+    if error
+        .downcast_ref::<crate::threads_clock::InvalidFixtureCapability>()
+        .is_some()
+    {
+        return api_error(
+            403,
+            "transport_forbidden",
+            "Deterministic Threads clock control rejected the supplied fixture capability.",
+            Some(json!({ "requiredAuthority": "synthetic_fixture_capability" })),
+        );
+    }
+    if let Some(non_monotonic) =
+        error.downcast_ref::<crate::threads_clock::NonMonotonicFixtureTime>()
+    {
+        return api_error(
+            409,
+            "threads_test_clock_not_monotonic",
+            &non_monotonic.to_string(),
+            Some(json!({
+                "current": non_monotonic.current.format(&time::format_description::well_known::Rfc3339)?,
+                "requested": non_monotonic.requested.format(&time::format_description::well_known::Rfc3339)?,
+            })),
+        );
+    }
+    api_error(
+        409,
+        "threads_test_clock_invalid",
+        "Deterministic Threads clock fixture is invalid.",
+        Some(json!({ "error": error.to_string() })),
+    )
 }
 
 /// The daemon has no periodic maintenance loop, so the sessions list — the
@@ -30610,6 +30781,55 @@ tier = 0
         })
     }
 
+    #[cfg(feature = "threads-test-clock")]
+    fn deterministic_threads_clock_time(value: &str) -> Result<time::OffsetDateTime> {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn seed_deterministic_threads_clock(
+        home: &Path,
+        capability: &str,
+        value: &str,
+    ) -> Result<time::OffsetDateTime> {
+        let now = deterministic_threads_clock_time(value)?;
+        crate::threads_clock::seed_fixture_for_tests(home, capability, now)?;
+        Ok(now)
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn advance_deterministic_threads_clock(
+        home: &Path,
+        capability: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock",
+            home,
+            None,
+            Some(
+                &json!({
+                    "capability": capability,
+                    "now": now.format(&time::format_description::well_known::Rfc3339)?,
+                })
+                .to_string(),
+            ),
+        )
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn tick_deterministic_threads_clock(home: &Path, capability: &str) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock/tick",
+            home,
+            None,
+            Some(&json!({ "capability": capability }).to_string()),
+        )
+    }
+
     #[test]
     fn threads_scheduled_human_required_enforces_rationale_and_applies() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -31283,6 +31503,353 @@ tier = 0
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "threads-test-clock"))]
+    #[test]
+    fn deterministic_threads_clock_route_is_unavailable_in_default_build() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for route in [
+            "/api/v1/internal/threads/test-clock",
+            "/api/v1/internal/threads/test-clock/tick",
+        ] {
+            let response = handle_request_with_body(
+                "POST",
+                route,
+                temp.path(),
+                None,
+                Some(r#"{"capability":"fixture-cap","now":"2026-09-09T10:00:00Z"}"#),
+            )?;
+
+            assert_eq!(response.status, 404, "{route}: {}", response.body);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_clock_controls_require_owner_transport_and_fixture_capability(
+    ) -> Result<()> {
+        for suffix in ["", "/tick"] {
+            for (authority, capability) in [
+                (RequestAuthority::Tcp, "fixture-cap"),
+                (RequestAuthority::OwnerLocalIpc, "wrong-fixture-cap"),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let initial =
+                    seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+                let (pending, _) = stage_scheduled_reviewed_edit(
+                    home,
+                    coven_threads_core::ApprovalPath::FamiliarCoherence {
+                        veto: coven_threads_core::VetoWindow::new(
+                            std::time::Duration::from_secs(300),
+                            std::time::Duration::from_secs(60),
+                        ),
+                    },
+                    initial - time::Duration::minutes(5),
+                )?;
+                let pending_before = std::fs::read(&pending)?;
+                let mut body = json!({ "capability": capability });
+                if suffix.is_empty() {
+                    body["now"] = json!("2026-09-09T10:05:00Z");
+                }
+                let response = handle_request_with_runtime_and_authority(
+                    "POST",
+                    &format!("/api/v1/internal/threads/test-clock{suffix}"),
+                    home,
+                    None,
+                    Some(&body.to_string()),
+                    &NoopSessionRuntime,
+                    authority,
+                )?;
+
+                assert_eq!(response.status, 403, "{suffix}: {}", response.body);
+                assert_eq!(crate::threads_clock::now(home)?, initial);
+                assert_eq!(std::fs::read(&pending)?, pending_before);
+                assert_eq!(
+                    std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                    "before"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_clock_control_rejects_invalid_and_non_monotonic_inputs() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let initial = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+
+        let inactive = tick_deterministic_threads_clock(tempfile::tempdir()?.path(), capability)?;
+        assert_eq!(inactive.status, 404, "got {}", inactive.body);
+
+        let malformed = handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock",
+            home,
+            None,
+            Some(r#"{"capability":"fixture-cap","now":"not-a-time"}"#),
+        )?;
+        assert_eq!(malformed.status, 400, "got {}", malformed.body);
+
+        let advanced = advance_deterministic_threads_clock(
+            home,
+            capability,
+            initial + time::Duration::minutes(5),
+        )?;
+        assert_eq!(advanced.status, 200, "got {}", advanced.body);
+        let advanced: Value = serde_json::from_str(&advanced.body)?;
+        assert_eq!(advanced["source"], "deterministic_fixture");
+
+        let backwards = advance_deterministic_threads_clock(
+            home,
+            capability,
+            initial + time::Duration::minutes(4),
+        )?;
+        assert_eq!(backwards.status, 409, "got {}", backwards.body);
+        let backwards: Value = serde_json::from_str(&backwards.body)?;
+        assert_eq!(
+            backwards["error"]["code"],
+            "threads_test_clock_not_monotonic"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["current"],
+            "2026-09-09T10:05:00Z"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["requested"],
+            "2026-09-09T10:04:00Z"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_rejects_missing_fixture_state_before_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::remove_file(home.join("test-fixtures/threads-deterministic-clock/state.json"))?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"must not be written"}]}"#,
+        );
+        assert!(
+            response.is_err(),
+            "an active clock with missing state must fail closed"
+        );
+        assert!(!workspace.join("notes.md").exists());
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_audit_uses_deterministic_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let fixture_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"first"},{"target":"other.md","contents":"second"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let mut statement = conn.prepare(
+            "SELECT submitted_at, decided_at FROM ward_audit
+             WHERE event_type = 'apply_audit' ORDER BY id",
+        )?;
+        let timestamps = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = fixture_now.format(&time::format_description::well_known::Rfc3339)?;
+        assert_eq!(
+            timestamps,
+            vec![
+                (expected.clone(), expected.clone()),
+                (expected.clone(), expected)
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_intake_uses_deterministic_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let fixture_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        seed_warded_familiar(home)?;
+
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+
+        let body: Value = serde_json::from_str(&staged.body)?;
+        let pending = PathBuf::from(body["pendingPath"].as_str().context("pendingPath")?);
+        let pending_json: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let staged_at_value = pending_json
+            .pointer("/pending/staged_at")
+            .or_else(|| pending_json.pointer("/pending/stagedAt"))
+            .or_else(|| pending_json.pointer("/staged_at"))
+            .cloned()
+            .context("scheduled proposal carries staged_at")?;
+        let staged_at: time::OffsetDateTime = serde_json::from_value(staged_at_value)?;
+        assert_eq!(staged_at, fixture_now);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decided_at: String = conn.query_row(
+            "SELECT decided_at
+             FROM ward_audit
+             WHERE event_type = 'proposal_submitted'
+             ORDER BY id DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let decided_at = time::OffsetDateTime::parse(
+            &decided_at,
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        assert_eq!(decided_at, fixture_now);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_scheduler_tick_observes_fixture_before_min_visible_at_earliest_close_and_beyond_deadline(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let staged_at = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            staged_at,
+        )?;
+
+        let initial_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(initial_tick.status, 200, "got {}", initial_tick.body);
+        let initial_tick: Value = serde_json::from_str(&initial_tick.body)?;
+        assert_eq!(initial_tick["processed"], 0);
+
+        let before_close = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(59),
+        )?;
+        assert_eq!(before_close.status, 200, "got {}", before_close.body);
+        let before_close_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(
+            before_close_tick.status, 200,
+            "got {}",
+            before_close_tick.body
+        );
+        let before_close_tick: Value = serde_json::from_str(&before_close_tick.body)?;
+        assert_eq!(before_close_tick["processed"], 0);
+
+        let earliest_close = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(60),
+        )?;
+        assert_eq!(earliest_close.status, 200, "got {}", earliest_close.body);
+        let earliest_close_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(
+            earliest_close_tick.status, 200,
+            "got {}",
+            earliest_close_tick.body
+        );
+        let earliest_close_tick: Value = serde_json::from_str(&earliest_close_tick.body)?;
+        assert_eq!(earliest_close_tick["processed"], 0);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+
+        let deadline = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(300),
+        )?;
+        assert_eq!(deadline.status, 200, "got {}", deadline.body);
+        let deadline_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(deadline_tick.status, 200, "got {}", deadline_tick.body);
+        let deadline_tick: Value = serde_json::from_str(&deadline_tick.body)?;
+        assert_eq!(deadline_tick["processed"], 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "after"
+        );
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let opened: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(opened, 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_scheduler_restart_path_reads_persisted_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let staged_at = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            staged_at,
+        )?;
+
+        let advanced = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(300),
+        )?;
+        assert_eq!(advanced.status, 200, "got {}", advanced.body);
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "after"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let approved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approved, 1);
         Ok(())
     }
 
