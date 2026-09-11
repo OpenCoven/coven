@@ -115,6 +115,7 @@ jobs:
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
+      - run: node --test conformance/automations/runner/conformance.test.mjs
       - run: node --test scripts/release-stress-test.mjs
       - run: scripts/check-workflows.sh
 

@@ -591,6 +591,7 @@ pub fn initialize_store(path: &Path) -> Result<()> {
     // transaction for the remaining idempotent schema work.
     ensure_ward_audit_schema(&conn)?;
     crate::automations::runs::ensure_runtime_authority_unsupported_failure_class(&conn)?;
+    crate::automations::runtime_terminal_evidence::ensure_runtime_terminal_evidence_schema(&conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("failed to acquire SQLite initialization transaction")?;
     let result = initialize_store_schema(&conn);

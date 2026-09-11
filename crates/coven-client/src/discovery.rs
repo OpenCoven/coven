@@ -69,13 +69,12 @@ impl DaemonEndpoint {
                     socket_candidate.display()
                 )));
             }
-            // Resolve symlinked ancestors and `..` before the definitive
-            // metadata checks, then retain this exact validated path.
-            let socket = std::fs::canonicalize(&socket_candidate).map_err(|source| {
-                selected_unix_socket_discovery_error(&socket_candidate, source, "resolve")
-            })?;
+            // The home already resolves symlinked ancestors and `..`. Retain
+            // the selected leaf: on macOS, canonicalizing a hard-linked socket
+            // can return its temporary publication alias, which is then unlinked.
+            let socket = socket_candidate;
             let metadata = std::fs::symlink_metadata(&socket).map_err(|source| {
-                selected_unix_socket_discovery_error(&socket_candidate, source, "inspect")
+                selected_unix_socket_discovery_error(&socket, source, "inspect")
             })?;
             if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
                 return Err(ClientError::Discovery(format!(
