@@ -212,6 +212,7 @@ enum LocalPairingState {
     Completed,
     Cancelled,
     Expired,
+    Unavailable,
 }
 
 #[cfg(unix)]
@@ -334,6 +335,17 @@ impl ActivePairingCancellation<'_> {
         }
         let cancellation: LocalPairingCancellation =
             serde_json::from_str(&body).context("daemon returned invalid pairing cancellation")?;
+        if !matches!(
+            cancellation.state,
+            LocalPairingState::Cancelled
+                | LocalPairingState::Completed
+                | LocalPairingState::Expired
+        ) {
+            bail!(
+                "pairing cancellation returned non-terminal state {:?}",
+                cancellation.state
+            );
+        }
         self.active = false;
         Ok(cancellation.state)
     }
@@ -436,6 +448,9 @@ fn run_pair_unix() -> Result<()> {
                     cancellation.disarm();
                     bail!("mobile pairing expired before the device enrolled");
                 }
+                LocalPairingState::Unavailable => {
+                    bail!("mobile pairing is unavailable after rejected enrollment");
+                }
             }
             thread::sleep(Duration::from_millis(250));
         };
@@ -452,18 +467,28 @@ fn run_pair_unix() -> Result<()> {
             let state = cancellation
                 .cancel()
                 .context("host declined pairing and cancellation failed")?;
-            if state == LocalPairingState::Completed {
-                bail!("mobile pairing completed before host decline could cancel it");
+            match state {
+                LocalPairingState::Cancelled => {
+                    println!("Mobile pairing cancelled.");
+                    return Ok(());
+                }
+                LocalPairingState::Completed => {
+                    bail!("mobile pairing completed before host decline could cancel it");
+                }
+                LocalPairingState::Expired => {
+                    bail!("mobile pairing expired before host decline could cancel it");
+                }
+                state => bail!("pairing cancellation returned non-terminal state {state:?}"),
             }
-            println!("Mobile pairing cancelled.");
-            return Ok(());
         }
         if interrupt.interrupted() {
             bail!("mobile pairing was interrupted");
         }
         let path = format!("/api/v1/internal/mobile/pairings/{}/confirm", invitation.id);
         let body = serde_json::json!({ "phrase": phrase }).to_string();
-        let (status, response) = post_mobile_control(&coven_home, &path, &body)?;
+        // Once sent, learn whether the daemon accepted confirmation before
+        // reacting to SIGINT; acceptance preserves the device's remaining window.
+        let (status, response) = post_mobile_control_without_interrupt(&coven_home, &path, &body)?;
         match status {
             200 => {
                 cancellation.disarm();
@@ -471,9 +496,6 @@ fn run_pair_unix() -> Result<()> {
                 Ok(())
             }
             409 => {
-                if interrupt.interrupted() {
-                    bail!("mobile pairing was interrupted");
-                }
                 cancellation.disarm();
                 println!("Host confirmed. Complete confirmation on the device before it expires.");
                 Ok(())

@@ -88,6 +88,7 @@ pub enum PairingLifecycleState {
     Completed,
     Cancelled,
     Expired,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -540,6 +541,8 @@ impl PendingPairing {
             PairingLifecycleState::Expired
         } else if self.transcript_hash.is_some() {
             PairingLifecycleState::WaitingForConfirmation
+        } else if self.consumed {
+            PairingLifecycleState::Unavailable
         } else {
             PairingLifecycleState::WaitingForDevice
         }
@@ -1076,6 +1079,48 @@ mod tests {
         );
         let device = assert_complete(harness.confirm_host(&pending.phrase), false);
         assert_eq!(device.scopes, [MobileDeviceScope::MemoryRead]);
+    }
+
+    #[test]
+    fn rejected_enrollment_never_reports_a_usable_waiting_state() {
+        for failure in ["nonce", "protocol", "public_key", "step_up"] {
+            let mut harness = PairingHarness::new();
+            let mut nonce = harness.pairing_nonce;
+            match failure {
+                "nonce" => nonce[0] ^= 1,
+                "protocol" => harness.request.protocol_version = 99,
+                "public_key" => harness.request.device_public_key = "invalid".to_owned(),
+                "step_up" => {
+                    harness.enroll_step_up(2, AssuranceClass::BiometricOnly);
+                    harness
+                        .request
+                        .step_up_authorization
+                        .as_mut()
+                        .unwrap()
+                        .enrollment_signature
+                        .clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(harness.enroll_with_nonce(nonce).is_err());
+            let status = harness
+                .manager
+                .status(harness.pairing_id, harness.now)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(status.state).unwrap(),
+                "unavailable",
+                "rejected {failure} enrollment must be terminal"
+            );
+            assert!(status.phrase.is_none());
+            assert_eq!(
+                harness
+                    .enroll_with_nonce(harness.pairing_nonce)
+                    .unwrap_err(),
+                PairingError::PairingConsumed
+            );
+            assert!(harness.devices().is_empty());
+        }
     }
 
     #[test]

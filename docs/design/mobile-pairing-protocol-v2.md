@@ -120,8 +120,9 @@ The first 66 bits of the transcript digest select six words from the existing fi
 ## Cancellation and owner status
 
 - The owner-only local daemon control reports `waiting_for_device`,
-  `waiting_for_confirmation`, `completed`, `cancelled`, or `expired`. Only the
-  confirmation phase includes the six-word phrase.
+  `waiting_for_confirmation`, `completed`, `cancelled`, `expired`, or
+  `unavailable` after a rejected single-use enrollment. Only the confirmation
+  phase includes the six-word phrase; a rejected enrollment cannot resume.
 - Explicit cancellation is idempotent until the invitation is pruned. It
   immediately erases the nonce hash, transcript hash, pending device metadata,
   and partial-confirmation flags.
@@ -131,7 +132,9 @@ The first 66 bits of the transcript digest select six words from the existing fi
 - The terminal pairing command attempts cancellation on host decline,
   interruption, expiry, and other pre-confirmation exits. Once host
   confirmation is accepted, the device retains the rest of the original
-  invitation window to finish.
+  invitation window to finish, even if an interrupt arrives while the host
+  confirmation response is in flight. A decline after expiry reports expiry,
+  not successful cancellation.
 - Remote callers receive the same unavailable response for expired, consumed,
   and locally cancelled invitations. Only the owner-only local control exposes
   the more precise terminal state.
