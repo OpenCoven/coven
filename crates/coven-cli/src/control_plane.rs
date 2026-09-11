@@ -16,6 +16,9 @@ pub struct Capability {
     pub status: CapabilityStatus,
     pub policy: CapabilityPolicy,
     pub actions: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_negotiation:
+        Option<&'static crate::automations::capability_negotiation::CapabilityProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +81,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.travel",
@@ -86,6 +90,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.scheduler",
@@ -94,6 +99,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.control.actions",
@@ -102,6 +108,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec!["coven.capabilities.refresh"],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.automations",
@@ -135,6 +142,9 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.occurrence.get.v1",
                     "coven.automations.unquarantine",
                 ],
+                variant_negotiation: Some(
+                    crate::automations::capability_negotiation::capability_profile(),
+                ),
             },
             Capability {
                 id: "desktop.automation",
@@ -143,6 +153,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Planned,
                 policy: CapabilityPolicy::RequiresApproval,
                 actions: vec![],
+                variant_negotiation: None,
             },
         ],
     }
@@ -1636,6 +1647,31 @@ mod tests {
     struct OwnershipThenErrorRuntime;
     struct RejectedRuntime;
     struct RetryableRejectedRuntime;
+
+    #[test]
+    fn automation_capability_negotiation_matches_the_packaged_profile() {
+        let catalog = serde_json::to_value(capabilities()).unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-automations/v1/capabilities.json"
+        ))
+        .unwrap();
+        let capabilities = catalog["capabilities"].as_array().unwrap();
+        let automations = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "coven.automations")
+            .unwrap();
+
+        assert_eq!(automations["variantNegotiation"], expected);
+        for capability in capabilities
+            .iter()
+            .filter(|capability| capability["id"] != "coven.automations")
+        {
+            assert!(
+                capability.get("variantNegotiation").is_none(),
+                "unrelated capability changed: {capability}"
+            );
+        }
+    }
 
     #[test]
     fn tick_action_plans_but_does_not_claim_without_scheduler_authority() {

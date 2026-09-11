@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::contract::authority::AUTHORITY_PROFILE;
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{ErrorCode, ErrorEnvelope};
 use super::contract::types::AdoptionKey;
@@ -361,46 +362,88 @@ pub struct CancellationSuccess {
     pub replayed: bool,
 }
 
+struct CancellationLifecycle {
+    run_state: String,
+    attempt_state: String,
+    occurrence_state: String,
+    session_state: String,
+    settled_at: Option<String>,
+    authority_profile: Option<String>,
+}
+
+fn lifecycle_requires_recovery(lifecycle: &CancellationLifecycle) -> bool {
+    if lifecycle.run_state != "running" || lifecycle.occurrence_state != "recovery_required" {
+        return false;
+    }
+    let terminal_session = matches!(
+        lifecycle.session_state.as_str(),
+        "completed" | "failed" | "cancelled" | "killed" | "idle"
+    );
+    if terminal_session {
+        lifecycle.authority_profile.as_deref() == Some(AUTHORITY_PROFILE)
+            && matches!(
+                lifecycle.attempt_state.as_str(),
+                "dispatching" | "started" | "observing" | "ambiguous"
+            )
+    } else {
+        lifecycle.attempt_state == "ambiguous"
+    }
+}
+
+fn cancellation_lifecycle(
+    conn: &Connection,
+    reservation: &ReservedCancellation,
+) -> Result<Option<CancellationLifecycle>, String> {
+    conn.query_row(
+        "SELECT r.status, a.state, o.state, s.status, a.settled_at,
+                r.authority_profile
+         FROM automation_runs AS r
+         JOIN automation_attempts AS a ON a.run_id = r.id
+         JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+         JOIN sessions AS s ON s.id = a.session_id
+         WHERE r.id = ?1 AND a.id = ?2 AND a.session_id = ?3",
+        params![
+            reservation.request.run_id,
+            reservation.request.attempt_id,
+            reservation.request.runtime_correlation.session_id
+        ],
+        |row| {
+            Ok(CancellationLifecycle {
+                run_state: row.get(0)?,
+                attempt_state: row.get(1)?,
+                occurrence_state: row.get(2)?,
+                session_state: row.get(3)?,
+                settled_at: row.get(4)?,
+                authority_profile: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("failed to reconcile reserved cancellation: {error}"))
+}
+
 fn recover_settled_result(
     conn: &Connection,
     reservation: &ReservedCancellation,
     now: DateTime<Utc>,
     unknown_stop_outcome: bool,
 ) -> Result<Option<CancellationExecution>, String> {
-    let lifecycle = conn
-        .query_row(
-            "SELECT r.status, a.state, o.state, s.status, a.settled_at
-             FROM automation_runs AS r
-             JOIN automation_attempts AS a ON a.run_id = r.id
-             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
-             JOIN sessions AS s ON s.id = a.session_id
-             WHERE r.id = ?1 AND a.id = ?2 AND a.session_id = ?3",
-            params![
-                reservation.request.run_id,
-                reservation.request.attempt_id,
-                reservation.request.runtime_correlation.session_id
-            ],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| format!("failed to reconcile reserved cancellation: {error}"))?;
-    let Some((run_state, attempt_state, occurrence_state, session_state, settled_at)) = lifecycle
-    else {
+    let Some(mut lifecycle) = cancellation_lifecycle(conn, reservation)? else {
         return Ok(None);
     };
+    if lifecycle_requires_recovery(&lifecycle) {
+        let payload = cancellation_payload(reservation, "recovery_required", None, None);
+        finalize_success(conn, reservation, "recovery_required", &payload, now)?;
+        return Ok(Some(CancellationExecution::Success(CancellationSuccess {
+            payload,
+            replayed: true,
+        })));
+    }
     let terminal_session = matches!(
-        session_state.as_str(),
+        lifecycle.session_state.as_str(),
         "completed" | "failed" | "cancelled" | "killed" | "idle"
     );
-    if run_state == "running" && terminal_session {
+    if lifecycle.run_state == "running" && terminal_session {
         let cancellation_owns_stop = conn
             .query_row(
                 "SELECT 1 FROM automation_stop_fences
@@ -418,7 +461,10 @@ fn recover_settled_result(
             .optional()
             .map_err(|error| format!("failed to inspect cancellation stop ownership: {error}"))?
             .is_some();
-        if unknown_stop_outcome && cancellation_owns_stop {
+        if unknown_stop_outcome
+            && cancellation_owns_stop
+            && lifecycle.occurrence_state != "recovery_required"
+        {
             super::runner::mark_terminal_stop_for_recovery(
                 conn,
                 &reservation.request.run_id,
@@ -434,8 +480,31 @@ fn recover_settled_result(
             })));
         }
         super::runner::settle_finished_runs(conn, now)?;
-        return recover_settled_result(conn, reservation, now, unknown_stop_outcome);
+        let Some(reconciled) = cancellation_lifecycle(conn, reservation)? else {
+            return Ok(None);
+        };
+        lifecycle = reconciled;
+        if lifecycle_requires_recovery(&lifecycle) {
+            let payload = cancellation_payload(reservation, "recovery_required", None, None);
+            finalize_success(conn, reservation, "recovery_required", &payload, now)?;
+            return Ok(Some(CancellationExecution::Success(CancellationSuccess {
+                payload,
+                replayed: true,
+            })));
+        }
     }
+    let CancellationLifecycle {
+        run_state,
+        attempt_state,
+        occurrence_state,
+        session_state,
+        settled_at,
+        authority_profile: _,
+    } = lifecycle;
+    let terminal_session = matches!(
+        session_state.as_str(),
+        "completed" | "failed" | "cancelled" | "killed" | "idle"
+    );
     if run_state == "cancelled"
         && attempt_state == "cancelled"
         && occurrence_state == "cancelled"
@@ -449,18 +518,6 @@ fn recover_settled_result(
             Some(&settled_at),
         );
         finalize_success(conn, reservation, "cancelled", &payload, now)?;
-        return Ok(Some(CancellationExecution::Success(CancellationSuccess {
-            payload,
-            replayed: true,
-        })));
-    }
-    if !terminal_session
-        && run_state == "running"
-        && attempt_state == "ambiguous"
-        && occurrence_state == "recovery_required"
-    {
-        let payload = cancellation_payload(reservation, "recovery_required", None, None);
-        finalize_success(conn, reservation, "recovery_required", &payload, now)?;
         return Ok(Some(CancellationExecution::Success(CancellationSuccess {
             payload,
             replayed: true,
@@ -792,45 +849,58 @@ fn execute_reserved_cancellation(
 
     match runtime.kill_session(&reservation.request.runtime_correlation.session_id) {
         Ok(()) => {
-            let settled = super::runner::settle_confirmed_stop(
+            let settlement = super::runner::settle_confirmed_stop(
                 conn,
                 &reservation.request.run_id,
                 &reservation.request.runtime_correlation.session_id,
                 super::runner::ConfirmedStop::Cancelled,
                 now,
             )?;
-            if !settled {
-                let error = typed_error(
-                    ErrorCode::IllegalTransition,
-                    "automation completion already won the cancellation race",
-                );
-                if !finalize_rejection(conn, &reservation, &error, now)? {
-                    if let Some(replay) = load_adopted_response(
-                        conn,
-                        &reservation.request.adoption_key,
-                        &reservation.digest,
-                    )? {
-                        return Ok(replay);
+            match settlement {
+                super::runner::ConfirmedStopSettlement::LostRace => {
+                    let error = typed_error(
+                        ErrorCode::IllegalTransition,
+                        "automation completion already won the cancellation race",
+                    );
+                    if !finalize_rejection(conn, &reservation, &error, now)? {
+                        if let Some(replay) = load_adopted_response(
+                            conn,
+                            &reservation.request.adoption_key,
+                            &reservation.digest,
+                        )? {
+                            return Ok(replay);
+                        }
+                        return Ok(CancellationExecution::Rejected(typed_error(
+                            ErrorCode::CancelPending,
+                            "the cancellation request is already being reconciled",
+                        )));
                     }
-                    return Ok(CancellationExecution::Rejected(typed_error(
-                        ErrorCode::CancelPending,
-                        "the cancellation request is already being reconciled",
-                    )));
+                    Ok(CancellationExecution::Rejected(error))
                 }
-                return Ok(CancellationExecution::Rejected(error));
+                super::runner::ConfirmedStopSettlement::RecoveryRequired => {
+                    let payload =
+                        cancellation_payload(&reservation, "recovery_required", None, None);
+                    finalize_success(conn, &reservation, "recovery_required", &payload, now)?;
+                    Ok(CancellationExecution::Success(CancellationSuccess {
+                        payload,
+                        replayed,
+                    }))
+                }
+                super::runner::ConfirmedStopSettlement::Settled => {
+                    let timestamp = iso(now);
+                    let payload = cancellation_payload(
+                        &reservation,
+                        "cancelled",
+                        Some(&timestamp),
+                        Some(&timestamp),
+                    );
+                    finalize_success(conn, &reservation, "cancelled", &payload, now)?;
+                    Ok(CancellationExecution::Success(CancellationSuccess {
+                        payload,
+                        replayed,
+                    }))
+                }
             }
-            let timestamp = iso(now);
-            let payload = cancellation_payload(
-                &reservation,
-                "cancelled",
-                Some(&timestamp),
-                Some(&timestamp),
-            );
-            finalize_success(conn, &reservation, "cancelled", &payload, now)?;
-            Ok(CancellationExecution::Success(CancellationSuccess {
-                payload,
-                replayed,
-            }))
         }
         Err(_) => {
             if let Err(mark_error) = super::runner::mark_unconfirmed_stop_for_recovery(

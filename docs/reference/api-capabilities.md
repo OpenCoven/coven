@@ -4,6 +4,7 @@ read_when:
   - Looking up the capabilities API
 title: "Capabilities endpoint"
 description: "Reference for the /api/v1/capabilities routes: the control-plane catalog on the bare path, the harness capability aggregate at /capabilities/harnesses, and single-harness manifests at /capabilities/:harnessId."
+source_adjacent_reason: "This page is source-adjacent API reference documenting behavior implemented in the coven-cli API handlers and contract."
 ---
 
 Coven exposes two capability concepts on adjacent paths. Do not confuse them:
@@ -24,6 +25,18 @@ values, and forward-compatibility rules are pinned in the
 ```json
 { "capabilities": [ { "id", "label", "adapter", "status", "policy", "actions" } ] }
 ```
+
+The `coven.automations` entry additionally includes optional
+`variantNegotiation`, exactly matching the packaged
+`spec/coven-automations/v1/capabilities.json` object. It advertises the
+contract profile and version plus supported, experimental, and refused
+trigger/action/policy variants and the negative-negotiation rules. Other
+catalog entries omit this field.
+
+Versioned automation create/revise enforcement reads these machine-readable
+variant identifiers directly. Rich definition objects remain negotiation hints
+only in this slice: they must satisfy their v1 required and conditional fields,
+and are never persisted as accepted `AutomationDefinition` values.
 
 To refresh it, `POST /api/v1/actions` with action id `coven.capabilities.refresh`.
 
