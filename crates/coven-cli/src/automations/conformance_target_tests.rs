@@ -8,6 +8,9 @@ use super::conformance_target::{
 const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/attempt-terminal-immutability.vectors.json"
 );
+const COMMAND_ADOPTION_IDEMPOTENCY_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/command-adoption-idempotency.vectors.json"
+);
 const DEFINITION_VALIDATION_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/definition-validation.vectors.json");
 const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
@@ -60,6 +63,7 @@ fn capability_advertises_the_native_structural_suites() {
                 "suites": [
                     "attempt-terminal-immutability",
                     CAPABILITY_NEGOTIATION_SUITE,
+                    "command-adoption-idempotency",
                     "definition-validation",
                     "event-reducer-determinism",
                     "occurrence-fence-uniqueness",
@@ -69,6 +73,58 @@ fn capability_advertises_the_native_structural_suites() {
             }]
         })
     );
+}
+
+#[test]
+fn command_adoption_idempotency_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(COMMAND_ADOPTION_IDEMPOTENCY_VECTORS).unwrap();
+    let response = evaluate(&request_for("command-adoption-idempotency", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 1);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 1);
+}
+
+#[test]
+fn command_adoption_idempotency_suite_rejects_impossible_expectations() {
+    let mut vectors: Value = serde_json::from_str(COMMAND_ADOPTION_IDEMPOTENCY_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["eventRows"] = json!(2);
+
+    assert_eq!(
+        evaluate(&request_for("command-adoption-idempotency", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn command_adoption_idempotency_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 7] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| vectors["cases"][0]["adoptionKey"] = json!("bad key"),
+        |vectors| vectors["cases"][0]["definition"] = json!("not-an-object"),
+        |vectors| {
+            vectors["cases"][0]["conflictingDefinition"]["id"] = json!("different-automation")
+        },
+        |vectors| {
+            vectors["cases"][0]["conflictingDefinition"] = vectors["cases"][0]["definition"].clone()
+        },
+        |vectors| {
+            let mut duplicate = vectors["cases"][0].clone();
+            duplicate["caseId"] = json!("second-case");
+            vectors["cases"].as_array_mut().unwrap().push(duplicate);
+        },
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value =
+            serde_json::from_str(COMMAND_ADOPTION_IDEMPOTENCY_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("command-adoption-idempotency", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
 }
 
 #[test]

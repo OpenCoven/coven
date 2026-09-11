@@ -1,0 +1,48 @@
+{
+  "schemaVersion": "coven.automations.command-adoption-idempotency-vectors.v1",
+  "cases": [
+    {
+      "caseId": "exact-replay-converges-and-conflict-is-refused",
+      "adoptionKey": "adopt:create:conformance:0001",
+      "definition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "conflictingDefinition": {
+        "schemaVersion": 1,
+        "id": "conformance-adoption",
+        "name": "Conflicting conformance adoption",
+        "status": "PAUSED",
+        "rrule": "FREQ=DAILY;BYHOUR=9",
+        "timezone": "utc",
+        "misfire": "latest",
+        "overlap": "forbid",
+        "timeoutMinutes": 30,
+        "runtime": "coven-code",
+        "prompt": "Run the native adoption conformance probe."
+      },
+      "expected": {
+        "firstOutcome": "committed",
+        "exactReplayOutcome": "replayed",
+        "conflictingReplayOutcome": "rejected",
+        "conflictCode": "ADOPTION_REPLAY_MISMATCH",
+        "exactReplayResultPreserved": true,
+        "exactReplayEventPreserved": true,
+        "firstCommitTimePreserved": true,
+        "originalDefinitionPreserved": true,
+        "definitionRows": 1,
+        "adoptionRows": 1,
+        "eventRows": 1
+      }
+    }
+  ]
+}
