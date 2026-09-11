@@ -10,6 +10,9 @@ const ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS: &str = include_str!(
 );
 const DEFINITION_VALIDATION_VECTORS: &str =
     include_str!("../../../../conformance/automations/runner/definition-validation.vectors.json");
+const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/event-reducer-determinism.vectors.json"
+);
 
 fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
@@ -52,11 +55,96 @@ fn capability_advertises_the_native_structural_suites() {
                     "attempt-terminal-immutability",
                     CAPABILITY_NEGOTIATION_SUITE,
                     "definition-validation",
+                    "event-reducer-determinism",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
     );
+}
+
+#[test]
+fn event_reducer_determinism_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    let response = evaluate(&request_for("event-reducer-determinism", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 1);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 1);
+}
+
+#[test]
+fn event_reducer_determinism_suite_fails_closed_on_a_digest_mismatch() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    vectors["cases"][0]["expectedStateDigest"] = json!(format!("sha256:{}", "0".repeat(64)));
+
+    let response = evaluate(&request_for("event-reducer-determinism", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn event_reducer_determinism_suite_rejects_an_invalid_duplicate_index() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    vectors["cases"][0]["duplicateIndex"] = json!(3);
+
+    assert_eq!(
+        evaluate(&request_for("event-reducer-determinism", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn event_reducer_determinism_suite_rejects_duplicate_case_ids() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    let duplicate = vectors["cases"][0].clone();
+    vectors["cases"].as_array_mut().unwrap().push(duplicate);
+
+    assert_eq!(
+        evaluate(&request_for("event-reducer-determinism", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn event_reducer_determinism_suite_rejects_duplicate_canonical_event_ids() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    let duplicate = vectors["cases"][0]["events"][1].clone();
+    vectors["cases"][0]["events"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+
+    assert_eq!(
+        evaluate(&request_for("event-reducer-determinism", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn event_reducer_determinism_suite_rejects_malformed_expected_digests() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    vectors["cases"][0]["expectedStateDigest"] = json!("sha256:not-a-digest");
+
+    assert_eq!(
+        evaluate(&request_for("event-reducer-determinism", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn event_reducer_determinism_suite_fails_closed_on_out_of_order_events() {
+    let mut vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
+    vectors["cases"][0]["events"]
+        .as_array_mut()
+        .unwrap()
+        .swap(0, 1);
+
+    let response = evaluate(&request_for("event-reducer-determinism", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
 }
 
 #[test]
