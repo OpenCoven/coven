@@ -1,6 +1,6 @@
 ---
 title: "Ward Gate 3 — Coherence Review"
-description: "Design for resolving held Ward proposals: stage Tier-1 holds beside the existing Tier-0 pending-proposal machinery, attach deterministic coherence probes, and keep the principal's decision as the only path to an applied write."
+description: "Design for resolving Tier-1 held Ward proposals with deterministic coherence probes and explicit principal review."
 ---
 
 # Ward Gate 3 — Coherence Review Design
@@ -14,14 +14,20 @@ the coven-threads §5 staging machinery that already exists. Tracking: #415
 
 ## Summary
 
-Gate 3 is RFC-0001's identity-coherence review for held proposals. Before this
-work, a hold was a dead end for Tier-1 targets and a principal-judgment loop
-(without probes) for Tier-0 targets. The implementation closes the gap by
-(a) giving Tier-1 holds the same staged-proposal lifecycle
-Tier-0 already has, (b) attaching **deterministic** coherence probes to every
-staged proposal so the principal decides with evidence, and (c) keeping the
-principal's explicit approval as the only transition from *held* to *applied*.
+Gate 3 is RFC-0001's identity-coherence review for held Tier-1 proposals. The
+implementation gives those holds a staged-proposal lifecycle, attaches
+**deterministic** coherence probes so the principal decides with evidence, and
+keeps explicit principal approval as the only transition from *held* to
+*applied*. Tier-0 surfaces and `ward.toml` are excluded from this lifecycle:
+the generic edit, proposal, approval, and recovery paths reject them. A future
+protected-write operation must have daemon-owned authenticated authority.
 Model-scored probes and any auto-approval are explicitly out of scope for v1.
+
+Proposal refusal preserves the declared Tier-0/control path after Gate-2 lexical
+normalization as well as the materialized target. An in-home symlink cannot
+demote a declared protected target, and the live materialized `ward.toml` is
+also excluded when addressed by its backing path. If a protected baseline
+cannot be read safely, refusal evidence fails closed before any mutation.
 
 ## Non-goals
 
@@ -52,20 +58,20 @@ amendment (RFC-0001 change), not an implementation choice at the Gate 3 layer.
 What already exists — Gate 3 must compose with all of it:
 
 - **Ward holds, fail-closed** (`ward.rs`): `requires_coherence` covers
-  `Verdict::RequiresCoherenceReview` (Tier 1) and
-  `Verdict::AuthorizedProtectedChange` (Gate-1-authorized Tier 0).
-  `Ward::apply` holds the whole proposal as a unit; nothing is written.
-- **Tier-0 staging** (`threads_gate.rs`): on `DegradeToProposal` the gate
-  stages the whole proposal at `~/.coven/pending/` as a
-  `coven_threads_core::PendingProposal` (typed staged edits, writer, channel,
-  thread, fray) and audits `proposal_submitted`.
+  `Verdict::RequiresCoherenceReview` (Tier 1). Although the lower-level Ward
+  type can describe an authorized protected change, the daemon proposal API
+  rejects Tier-0 targets before staging or apply.
+- **Legacy Tier-0 pending files**: old pending envelopes remain readable for
+  migration, but approval and scheduler recovery terminally reject them. An
+  interrupted applying claim is quarantined rather than resumed.
 - **Principal decision loop** (`api.rs::decide_threads_proposal`):
   `POST /api/v1/threads/proposals/:id/approve|reject` re-validates from disk
   (fail-closed 409s for corrupt/missing state), re-runs Gate 1–2 adjudication
   *and* the threads validator per target, audits every verdict, and on
-  approval applies via `ward.apply_after_threads_approval`, advances the
-  surface baselines, audits `proposal_approved`, and removes the pending file.
-  Rejection audits `proposal_rejected` and removes the file.
+  approval applies Tier-1 changes via `ward.apply_after_coherence_approval`,
+  audits `proposal_approved`, and removes the pending file. Tier-0
+  reclassification instead audits `proposal_rejected` and removes the pending
+  file.
 - **Audit ledger**: `ward_audit` (append-only, UPDATE/DELETE-abort triggers)
   already carries `proposal_submitted` / `proposal_approved` /
   `proposal_rejected` / `validation_verdict` tags.
@@ -93,19 +99,18 @@ What already exists — Gate 3 must compose with all of it:
 ### G3.1 — Stage Tier-1 holds as pending proposals
 
 When `Ward::apply` would hold a proposal **solely** for
-`RequiresCoherenceReview` (no blocked targets, no Tier-0 targets — those
-already route through the threads gate first), the `/api/v1/familiars/:id/edits`
-handler stages it at `~/.coven/pending/` using the same `PendingProposal`
-shape, marked so the decide path knows which re-apply primitive to use:
+`RequiresCoherenceReview` (no blocked or Tier-0 targets), the
+`/api/v1/familiars/:id/edits` handler stages it at `~/.coven/pending/` using
+the `PendingProposal` shape, marked so the decide path knows which re-apply
+primitive to use:
 
 - Reuse `stage_pending_proposal` with a `review_kind: "coherence"` marker
-  (additive field; Tier-0 staging writes `review_kind: "authority"`).
-  Absent field ⇒ `authority`, so existing pending files stay readable.
-- Audit `proposal_submitted` exactly as the Tier-0 path does.
+  (additive field). Absent fields from legacy authority proposals remain
+  readable so they can be rejected or quarantined safely.
+- Audit `proposal_submitted`.
 - Response stays `202`, now with `disposition: "staged"` + `pendingPath` +
   `proposalId` instead of a bare `held` — the caller learns where the
-  proposal went and how to resolve it. (`held` remains the shape for mixed
-  proposals until G3.4 lands; see Compatibility.)
+  proposal went and how to resolve it.
 
 ### G3.2 — Deterministic coherence probes
 
@@ -144,7 +149,9 @@ with evidence:
 
 `decide_threads_proposal` grows a branch on `review_kind`:
 
-- `authority` (today's flow): unchanged.
+- `authority`: legacy envelopes remain readable, but current Tier-0 or
+  `ward.toml` targets are rejected before approval semantics. Interrupted
+  applying claims with protected targets are quarantined, never resumed.
 - `coherence`: re-run Gate 1–2 adjudication fail-closed (as today), **skip**
   the threads validator (Tier-1 surfaces are not woven), re-run the probe
   set against current disk state, and bind the conditional write's before-image
@@ -162,13 +169,12 @@ with evidence:
 
 ### Compatibility and invariants
 
-- The write path stays single: `POST /api/v1/familiars/:id/edits` remains the only
-  arbitrary-file write surface; approval routes only re-drive it through the
-  Ward's own primitives. No new write authority is created.
-- All-or-nothing holds are preserved: mixed proposals (Tier-0 + Tier-1)
-  stage through the *authority* lane as a unit, exactly as today; the
-  coherence lane only takes proposals whose sole hold reason is Tier-1
-  review.
+- `POST /api/v1/familiars/:id/edits` and proposal approval never authorize
+  Tier-0 or `ward.toml` writes. Client-supplied fingerprint text does not
+  upgrade authority.
+- All-or-nothing behavior is preserved: any mixed proposal containing a
+  Tier-0 or Ward-control target is rejected before staging; the coherence lane
+  only takes proposals whose sole hold reason is Tier-1 review.
 - Staging-write hardening invariants (randomized create-new staging and
   no-follow parent traversal) remain intact. The resolved parent is retained as
   a directory handle, and approval routes target opens, staging, commit,

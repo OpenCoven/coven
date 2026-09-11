@@ -1101,6 +1101,13 @@ impl Ward {
         self.evaluate_with_home(proposal, None)
     }
 
+    pub(crate) fn declares_protected_target(&self, target: &str) -> bool {
+        lexical_join(Path::new(""), target).is_some_and(|normalized| {
+            let normalized = to_forward_slashes(&normalized);
+            self.classify(&normalized) == Tier::Protected || self.protected_ci.is_match(&normalized)
+        })
+    }
+
     fn evaluate_with_home(&self, proposal: &Proposal, canonical_home: Option<&Path>) -> Outcome {
         record_evaluate_call();
         let decisions = proposal
@@ -1203,7 +1210,7 @@ impl Ward {
     ///
     /// Returns the resolved path (forward-slashed, relative to home) or a
     /// [`BlockReason`] if the target cannot be safely confined to the home.
-    fn materialize(&self, target: &str) -> std::result::Result<String, BlockReason> {
+    pub(crate) fn materialize(&self, target: &str) -> std::result::Result<String, BlockReason> {
         let canonical_home = self
             .home
             .canonicalize()
@@ -5022,7 +5029,7 @@ fn compile_glob(pattern: &str, case_insensitive: bool) -> Result<Glob> {
 
 /// Lexically join `base` and a relative `target`, folding `.`/`..` without
 /// touching the filesystem. Returns `None` if the result would escape `base`.
-fn lexical_join(base: &Path, target: &str) -> Option<PathBuf> {
+pub(crate) fn lexical_join(base: &Path, target: &str) -> Option<PathBuf> {
     // An absolute target is never allowed; the surface is home-relative.
     let target_path = Path::new(target);
     if target_path.is_absolute() {
