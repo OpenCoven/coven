@@ -1007,14 +1007,24 @@ mod tests {
         contender.busy_timeout(Duration::ZERO)?;
 
         let transaction = begin_event_writer_transaction(&mut writer)?;
+        let event_count = transaction.query_row("SELECT COUNT(*) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        assert_eq!(event_count, 0);
         let error = contender
-            .execute_batch("BEGIN IMMEDIATE")
+            .execute("INSERT INTO events (id) VALUES (2)", [])
             .expect_err("the event writer must reserve the SQLite write slot");
         assert!(matches!(
             error.sqlite_error_code(),
             Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
         ));
-        transaction.rollback()?;
+        transaction.execute("INSERT INTO events (id) VALUES (1)", [])?;
+        transaction.commit()?;
+
+        let event_count = writer.query_row("SELECT COUNT(*) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })?;
+        assert_eq!(event_count, 1);
         Ok(())
     }
 
