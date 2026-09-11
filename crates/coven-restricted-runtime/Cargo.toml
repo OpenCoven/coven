@@ -1,0 +1,9 @@
+[package]
+name = "coven-restricted-runtime"
+version = "0.1.0"
+publish = false
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Single-use restricted worker controller; OS enforcement requires a reviewed backend"

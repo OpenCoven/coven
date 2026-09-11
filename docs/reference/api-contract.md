@@ -5,6 +5,7 @@ read_when:
   - Auditing whether a daemon upgrade is safe
 title: "API contract"
 description: "Reference for the coven.daemon.v1 local API contract: how Coven adds fields and endpoints safely and when breaking changes require a new contract version."
+source_adjacent_reason: "Tracks the named daemon API compatibility contract implemented in this repository."
 ---
 
 > **See also:** the fuller single-page contract — shapes, error codes, cursor pagination, hub control plane — lives in [`API-CONTRACT.md`](/API-CONTRACT) (`docs/API-CONTRACT.md`). This page is the condensed versioning and negotiation summary.
@@ -78,7 +79,8 @@ GET /api/v1/health
     "afsCommit": true,
     "afsCommitDryRun": true,
     "executionBindingContracts": ["psyche.execution_binding.v1"],
-    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"],
+    "sessionPolicyContracts": ["coven.session-policy.v1"]
   },
   "daemon": { "pid": 12345, "startedAt": "2026-07-14T12:00:00Z", "socket": "<local IPC endpoint>" },
   "eventWriter": {
@@ -94,11 +96,17 @@ GET /api/v1/health
 }
 ```
 
-The health `capabilities` object contains all 16 fields: `sessions`, `events`,
+The health `capabilities` object contains all 17 fields: `sessions`, `events`,
 `travel`, `scheduler`, `hub`, `executorDispatch`, `eventCursor`,
 `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`, `afs`, `afsMount`,
 `afsCommit`, `afsCommitDryRun`, `executionBindingContracts`, and
-`requestAdoptionContracts`.
+`requestAdoptionContracts`, and `sessionPolicyContracts`.
+
+`sessionPolicyContracts` is `["coven.session-policy.v1"]` only over owner-local
+IPC and `[]` over TCP. It advertises a refusal-only admission boundary, not an
+enforced runtime. `GET /api/v1/session-policy` is inert, and
+`POST /api/v1/sessions/restricted` never launches in this revision. See the
+[session-policy admission contract](../API-CONTRACT.md#session-policy-admission-covensession-policyv1).
 
 `sessionLaunchPolicy` is `true` only over owner-gated local IPC. TCP health
 always reports it as `false`, and TCP rejects any `POST /api/v1/sessions`

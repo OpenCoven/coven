@@ -22,6 +22,19 @@ the failure alongside the error, so a failing tool never costs the caller the
 items the run already produced. The runner does not append a failed run's items
 to the session; persisting them is the caller's decision.
 
+Each `Runner::run` call creates a fresh root `InvocationContext`. The same
+context is carried by every `RunEvent`, the successful `RunResult`, and any
+partial `RunFailure`. Use `RunEvent::invocation()` to read it without matching
+individual event variants. `Runner::run_with_invocation` accepts an explicit
+context, including an optional parent invocation ID for caller-managed nested
+work. These IDs provide correlation only: they do not authorize execution or
+promise durable adoption, idempotency, deduplication, or safe retries.
+
+This pre-1.0 API adds an `invocation` field to event and outcome shapes.
+`RunFailure::invocation` is boxed, and `RunFailure::new_items` is an owned boxed
+slice; use `.as_ref()` for a slice or `.into_vec()` for a growable transcript.
+Successful results retain `Vec<RunItem>`.
+
 Tool call ids must be unique across a run, including call and result ids loaded
 from session history. Results correlate to calls by id, so the runner rejects a
 response that reuses one before running any tool in that response, with

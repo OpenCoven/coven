@@ -6,6 +6,7 @@
 mod agent;
 mod error;
 mod guardrail;
+mod invocation;
 mod loop_journal;
 mod loop_runner;
 mod model;
@@ -17,6 +18,7 @@ mod tool;
 pub use agent::{Agent, AgentId, Handoff};
 pub use error::{BoxError, ConfigError, GuardrailStage, RunError, RunFailure};
 pub use guardrail::{GuardrailVerdict, InputGuardrail, OutputGuardrail};
+pub use invocation::{InvocationContext, InvocationId};
 pub use loop_journal::FileLoopJournal;
 pub use loop_runner::{
     GoalLoopRunner, InMemoryLoopJournal, LoopAttempt, LoopCheckpoint, LoopCheckpointStatus,

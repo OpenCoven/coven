@@ -189,10 +189,17 @@ with evidence:
 - Gate 2 and mutation share one retained familiar-root handle. The configured
   workspace spelling is re-resolved immediately before mutation as well, so
   retargeting an initially symlinked workspace fails closed.
-- Retained directory handles do not create a POSIX conditional-unlink
-  primitive. Cleanup still revalidates retained identity and bytes immediately
-  before `unlinkat`, but the final same-privilege verify-to-unlink interval is
-  inherited from #911 and tracked separately by #924.
+- Windows cleanup opens the captured regular file once with read and delete
+  access, excludes write- and delete-sharing, validates identity and bytes
+  through that handle, and applies `FileDispositionInfo` to the same handle.
+  A competing writer or rename/delete handle therefore prevents disposal
+  instead of changing its bytes or substituting a different object. Ward drops
+  its staging write handle in favor of a read-only retained identity before
+  cleanup, so its own handle does not weaken or conflict with that final
+  boundary. Retained directory handles do not create an equivalent POSIX
+  conditional-unlink primitive: Linux and macOS still revalidate immediately
+  before `unlinkat`, and the final same-privilege verify-to-unlink interval
+  remains tracked by #924.
 - `ward_audit` stays append-only with existing event tags; probe evidence
   rides in existing text columns. Logged edits carried in an approved proposal
   append their Gate-4 `apply_audit` rows in the same database transaction as

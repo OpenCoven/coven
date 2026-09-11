@@ -2118,7 +2118,7 @@ impl Drop for DaemonLifecycleLock {
 }
 
 fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let lock_path = daemon_lifecycle_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
         format!(
@@ -2135,7 +2135,7 @@ fn acquire_daemon_lifecycle_lock_until(
     coven_home: &Path,
     deadline: LifecycleDeadline,
 ) -> Result<DaemonLifecycleLock> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let lock_path = daemon_lifecycle_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
         format!(
@@ -2218,15 +2218,22 @@ pub fn recover_stale_created_sessions(coven_home: &Path, updated_at: &str) -> Re
 }
 
 pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
-    ensure_private_coven_home(coven_home)?;
-    let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
-    let status_path = daemon_status_path(coven_home);
     #[cfg(windows)]
     {
-        write_windows_status(&status_path, &json)
+        return write_windows_status(
+            coven_home,
+            status,
+            std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
+            std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID"),
+            std::env::var_os("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT"),
+        );
     }
     #[cfg(not(windows))]
     {
+        ensure_private_coven_home(coven_home)?;
+        let json =
+            serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
+        let status_path = daemon_status_path(coven_home);
         std::fs::write(&status_path, format!("{json}\n"))
             .context("failed to write daemon status")?;
         #[cfg(unix)]
@@ -2242,12 +2249,379 @@ pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
-    let coven_home = status_path
-        .parent()
-        .context("daemon status path has no Coven home")?;
-    coven_client::write_owner_only_windows_daemon_status(coven_home, json.as_bytes())
-        .map_err(anyhow::Error::new)
+fn write_windows_status(
+    coven_home: &Path,
+    status: &DaemonStatus,
+    configured_staging_directory: Option<std::ffi::OsString>,
+    configured_supervisor_sid: Option<std::ffi::OsString>,
+    configured_bootstrap_root: Option<std::ffi::OsString>,
+) -> Result<()> {
+    let staging_directory =
+        resolve_windows_status_staging_directory(coven_home, configured_staging_directory)?;
+    if windows_status_write_requires_private_home(coven_home, &staging_directory) {
+        ensure_private_coven_home(coven_home)?;
+    } else {
+        validate_windows_external_status_configuration(
+            coven_home,
+            &staging_directory,
+            configured_supervisor_sid,
+            configured_bootstrap_root,
+        )?;
+    }
+    let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
+    coven_client::write_owner_only_windows_daemon_status_with_staging(
+        coven_home,
+        &staging_directory,
+        json.as_bytes(),
+    )
+    .map_err(anyhow::Error::new)
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_access_allowed_ace_type(ace_type: u8) -> bool {
+    ace_type == 0
+}
+
+#[cfg(any(windows, test))]
+fn same_windows_volume_name(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(windows)]
+fn windows_volume_name(path: &Path) -> Result<std::ffi::OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+
+    const MAX_WINDOWS_PATH_CHARS: usize = 32_768;
+    let encoded: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut mount_point = vec![0_u16; MAX_WINDOWS_PATH_CHARS];
+    if unsafe {
+        GetVolumePathNameW(
+            encoded.as_ptr(),
+            mount_point.as_mut_ptr(),
+            mount_point.len() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to resolve volume for {}", path.display()));
+    }
+    let mount_point_length = mount_point
+        .iter()
+        .position(|value| *value == 0)
+        .context("Windows volume mount point was not terminated")?;
+    mount_point.truncate(mount_point_length + 1);
+    let mut volume_name = vec![0_u16; MAX_WINDOWS_PATH_CHARS];
+    if unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to identify volume for {}", path.display()));
+    }
+    let volume_name_length = volume_name
+        .iter()
+        .position(|value| *value == 0)
+        .context("Windows volume name was not terminated")?;
+    Ok(std::ffi::OsString::from_wide(
+        &volume_name[..volume_name_length],
+    ))
+}
+
+#[cfg(windows)]
+fn ensure_same_windows_status_volume(coven_home: &Path, staging_directory: &Path) -> Result<()> {
+    let home_volume = windows_volume_name(coven_home)?;
+    let staging_volume = windows_volume_name(staging_directory)?;
+    if !same_windows_volume_name(&home_volume, &staging_volume) {
+        anyhow::bail!("COVEN_WINDOWS_STATUS_STAGING_DIR must be on the same volume as COVEN_HOME");
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_status_write_requires_private_home(coven_home: &Path, staging_directory: &Path) -> bool {
+    if coven_home == staging_directory {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        match (
+            std::fs::canonicalize(coven_home),
+            std::fs::canonicalize(staging_directory),
+        ) {
+            (Ok(coven_home), Ok(staging_directory)) => coven_home == staging_directory,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+#[cfg(windows)]
+fn resolve_windows_status_staging_directory(
+    coven_home: &Path,
+    configured: Option<std::ffi::OsString>,
+) -> Result<PathBuf> {
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(coven_home.to_path_buf());
+    };
+    let staging_directory = PathBuf::from(configured);
+    if !staging_directory.is_absolute() {
+        anyhow::bail!("COVEN_WINDOWS_STATUS_STAGING_DIR must be absolute");
+    }
+    Ok(staging_directory)
+}
+
+pub(crate) fn ensure_windows_supervised_or_private_coven_home(coven_home: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR").is_some() {
+        validate_windows_external_status_environment(coven_home)?;
+        return Ok(());
+    }
+    ensure_private_coven_home(coven_home)
+}
+
+#[cfg(windows)]
+fn validate_windows_external_status_environment(coven_home: &Path) -> Result<PathBuf> {
+    let staging_directory = resolve_windows_status_staging_directory(
+        coven_home,
+        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
+    )?;
+    if windows_status_write_requires_private_home(coven_home, &staging_directory) {
+        ensure_private_coven_home(coven_home)?;
+        return Ok(staging_directory);
+    }
+    validate_windows_external_status_configuration(
+        coven_home,
+        &staging_directory,
+        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID"),
+        std::env::var_os("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT"),
+    )?;
+    Ok(staging_directory)
+}
+
+#[cfg(windows)]
+fn validate_windows_external_status_configuration(
+    coven_home: &Path,
+    staging_directory: &Path,
+    configured_supervisor_sid: Option<std::ffi::OsString>,
+    configured_bootstrap_root: Option<std::ffi::OsString>,
+) -> Result<()> {
+    ensure_same_windows_status_volume(coven_home, &staging_directory)?;
+    let supervisor_sid = configured_supervisor_sid
+        .filter(|value| !value.is_empty())
+        .context("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID is required with external staging")?;
+    let bootstrap_root = configured_bootstrap_root
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT is required with external staging")?;
+    validate_windows_supervised_status_directory(&bootstrap_root, &supervisor_sid, false, true)?;
+    let bootstrap_root = std::fs::canonicalize(&bootstrap_root)
+        .context("failed to resolve supervised Windows bootstrap root")?;
+    for (label, path) in [
+        ("COVEN_HOME", coven_home),
+        ("COVEN_WINDOWS_STATUS_STAGING_DIR", staging_directory),
+    ] {
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve supervised {label}"))?;
+        if !path.starts_with(&bootstrap_root) || path == bootstrap_root {
+            anyhow::bail!("{label} must be contained below OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT");
+        }
+    }
+    validate_windows_supervised_status_directory(coven_home, &supervisor_sid, false, false)?;
+    validate_windows_supervised_status_directory(&staging_directory, &supervisor_sid, true, true)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_supervised_status_directory(
+    path: &Path,
+    supervisor_sid: &std::ffi::OsStr,
+    staging: bool,
+    require_protected: bool,
+) -> Result<()> {
+    use std::{mem::size_of, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation,
+        Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
+        ACE_HEADER, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        SE_DACL_PROTECTED,
+    };
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect supervised status directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: path is not a real directory",
+            path.display()
+        );
+    }
+    let encoded: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            encoded.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        anyhow::bail!(
+            "failed to inspect supervised status directory security {}: Windows error {status}",
+            path.display()
+        );
+    }
+    let _descriptor = WindowsLocalAllocation(descriptor);
+    let current = current_windows_user_sid()?;
+    if owner.is_null() || dacl.is_null() || unsafe { EqualSid(owner, current.as_ptr()) } == 0 {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: owner or DACL is not trusted",
+            path.display()
+        );
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect supervised status directory DACL control");
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
+    if require_protected && !protected {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL is not protected",
+            path.display()
+        );
+    }
+    if !protected {
+        let parent = path
+            .parent()
+            .context("inherited supervised status directory has no parent security boundary")?;
+        if parent == path {
+            anyhow::bail!("inherited supervised status directory reached its filesystem root");
+        }
+        validate_windows_supervised_status_directory(parent, supervisor_sid, false, false)?;
+    }
+
+    let convert_sid = |value: &std::ffi::OsStr, label: &str| -> Result<WindowsLocalAllocation> {
+        let encoded: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
+        let mut sid = std::ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(encoded.as_ptr(), &mut sid) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to parse {label} SID"));
+        }
+        Ok(WindowsLocalAllocation(sid))
+    };
+    let system = convert_sid(std::ffi::OsStr::new("S-1-5-18"), "SYSTEM")?;
+    let administrators = convert_sid(std::ffi::OsStr::new("S-1-5-32-544"), "Administrators")?;
+    let supervisor = convert_sid(supervisor_sid, "status supervisor")?;
+    let owner_rights = convert_sid(std::ffi::OsStr::new("S-1-3-4"), "Owner Rights")?;
+    const DIRECTORY_FLAGS: u8 = 0x01 | 0x02;
+    const CHILD_FILE_ONLY_FLAGS: u8 = 0x01 | 0x08;
+    const INHERITED_ACE: u8 = 0x10;
+    const FILE_ALL_ACCESS: u32 = 0x001f01ff;
+    const FILE_MODIFY_ACCESS: u32 = 0x001301bf;
+    const READ_CONTROL: u32 = 0x00020000;
+    let directory_flags = DIRECTORY_FLAGS | if protected { 0 } else { INHERITED_ACE };
+    let mut expected = vec![
+        (system.0, FILE_ALL_ACCESS, directory_flags, false),
+        (administrators.0, FILE_ALL_ACCESS, directory_flags, false),
+        (supervisor.0, FILE_ALL_ACCESS, directory_flags, false),
+        (
+            current.as_ptr().cast(),
+            FILE_MODIFY_ACCESS,
+            directory_flags,
+            false,
+        ),
+        (owner_rights.0, READ_CONTROL, directory_flags, false),
+    ];
+    if staging {
+        expected.push((
+            current.as_ptr().cast(),
+            FILE_ALL_ACCESS,
+            CHILD_FILE_ONLY_FLAGS,
+            false,
+        ));
+    }
+    let mut acl = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut acl as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+        || acl.AceCount as usize != expected.len()
+    {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL entry count is not exact",
+            path.display()
+        );
+    }
+    for index in 0..acl.AceCount {
+        let mut entry = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect supervised status directory DACL");
+        }
+        let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+        if !is_windows_access_allowed_ace_type(header.AceType)
+            || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            anyhow::bail!(
+                "refusing to use supervised status directory {}: DACL entry is not allow-only",
+                path.display()
+            );
+        }
+        let ace = unsafe { &*entry.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        let Some(expected_entry) = expected.iter_mut().find(|candidate| {
+            !candidate.3
+                && candidate.1 == ace.Mask
+                && candidate.2 == ace.Header.AceFlags
+                && unsafe { EqualSid(candidate.0, ace_sid) } != 0
+        }) else {
+            anyhow::bail!(
+                "refusing to use supervised status directory {}: DACL entry is not trusted",
+                path.display()
+            );
+        };
+        expected_entry.3 = true;
+    }
+    if expected.iter().any(|entry| !entry.3) {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL entry is missing",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
@@ -3571,7 +3945,7 @@ fn canonical_lifecycle_home(coven_home: &Path) -> Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        ensure_private_coven_home(coven_home)?;
+        ensure_windows_supervised_or_private_coven_home(coven_home)?;
         Ok(coven_home.to_path_buf())
     }
 }
@@ -4151,7 +4525,7 @@ pub(crate) fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
 /// when the file closes — normal exit, panic, or termination — so it never
 /// wedges shut.
 fn try_acquire_serve_lock(coven_home: &Path) -> Result<Option<std::fs::File>> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let path = daemon_serve_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&path)
         .with_context(|| format!("failed to open serve lock {}", path.display()))?;
@@ -4784,6 +5158,33 @@ where
             }
         }
     }
+    if crate::session_policy::is_restricted_route(method, path) {
+        let authority = match guard {
+            HostGuard::Disabled => crate::api::RequestAuthority::OwnerLocalIpc,
+            HostGuard::Loopback { .. } => crate::api::RequestAuthority::Tcp,
+        };
+        let response = if let Some(response) =
+            crate::session_policy::preflight(authority, headers.content_length)?
+        {
+            response
+        } else {
+            match read_http_body(&mut reader, headers.content_length) {
+                Ok(body) => crate::session_policy::restricted_response(
+                    body.as_deref().map(str::as_bytes),
+                    authority,
+                    chrono::Utc::now().timestamp_millis(),
+                )?,
+                Err(error) if error.downcast_ref::<std::string::FromUtf8Error>().is_some() => {
+                    crate::session_policy::invalid_request(
+                        "Restricted session request must be valid UTF-8 JSON.",
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        write_api_response(&mut write, &response)?;
+        return Ok(HttpStreamOutcome::Complete);
+    }
     if let Some(max) = max_body_bytes {
         if headers.content_length > max {
             write_payload_too_large(&mut write, max)?;
@@ -4846,6 +5247,15 @@ where
         };
         (response, false)
     };
+    write_api_response(&mut write, &response)?;
+    if hold_for_shutdown {
+        Ok(HttpStreamOutcome::HoldForShutdown)
+    } else {
+        Ok(HttpStreamOutcome::Complete)
+    }
+}
+
+fn write_api_response<W: Write>(write: &mut W, response: &crate::api::ApiResponse) -> Result<()> {
     let reason = http_reason_phrase(response.status);
     let http = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -4858,11 +5268,7 @@ where
     write
         .write_all(http.as_bytes())
         .context("failed to write API response")?;
-    if hold_for_shutdown {
-        Ok(HttpStreamOutcome::HoldForShutdown)
-    } else {
-        Ok(HttpStreamOutcome::Complete)
-    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -5513,11 +5919,226 @@ mod tests {
         daemon_startup_status_socket(coven_home).expect("derive test daemon endpoint")
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_staging_defaults_to_coven_home() {
+        let coven_home = Path::new(r"C:\coven-home");
+        assert_eq!(
+            resolve_windows_status_staging_directory(coven_home, None).unwrap(),
+            coven_home
+        );
+        assert_eq!(
+            resolve_windows_status_staging_directory(coven_home, Some(std::ffi::OsString::new()))
+                .unwrap(),
+            coven_home
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_status_staging_requires_an_absolute_path() {
+        let error = resolve_windows_status_staging_directory(
+            Path::new(r"C:\coven-home"),
+            Some(std::ffi::OsString::from("relative")),
+        )
+        .expect_err("relative staging directory must be rejected");
+        assert_eq!(
+            error.to_string(),
+            "COVEN_WINDOWS_STATUS_STAGING_DIR must be absolute"
+        );
+    }
+
+    #[test]
+    fn external_windows_status_staging_does_not_require_home_acl_rewrite() {
+        let coven_home = Path::new(r"C:\isolated\profile\.coven");
+
+        assert!(windows_status_write_requires_private_home(
+            coven_home, coven_home
+        ));
+        assert!(!windows_status_write_requires_private_home(
+            coven_home,
+            Path::new(r"C:\isolated\status-staging")
+        ));
+    }
+
+    #[test]
+    fn supervised_status_acl_accepts_only_access_allowed_aces() {
+        assert!(is_windows_access_allowed_ace_type(0));
+        assert!(!is_windows_access_allowed_ace_type(1));
+        assert!(!is_windows_access_allowed_ace_type(9));
+    }
+
+    #[test]
+    fn windows_volume_names_compare_case_insensitively() {
+        assert!(same_windows_volume_name(
+            std::ffi::OsStr::new(r"\\?\Volume{ABC}\"),
+            std::ffi::OsStr::new(r"\\?\volume{abc}\")
+        ));
+        assert!(!same_windows_volume_name(
+            std::ffi::OsStr::new(r"\\?\Volume{ABC}\"),
+            std::ffi::OsStr::new(r"\\?\Volume{DEF}\")
+        ));
+    }
+
+    #[cfg(windows)]
+    fn apply_supervised_windows_directory_security(
+        path: &Path,
+        supervisor_sid: &str,
+        staging: bool,
+    ) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+                SE_FILE_OBJECT,
+            },
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        let owner = current_windows_user_sid()?;
+        let owner_sid = owner.to_sddl_string()?;
+        let child_only = if staging {
+            format!("(A;OIIO;FA;;;{owner_sid})")
+        } else {
+            String::new()
+        };
+        let sddl = format!(
+            "O:{owner_sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{supervisor_sid})(A;OICI;0x001301bf;;;{owner_sid}){child_only}(A;OICI;RC;;;OW)"
+        );
+        let encoded: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("convert restrictive test DACL");
+        }
+        let _descriptor = WindowsLocalAllocation(descriptor);
+        let mut dacl_present = 0;
+        let mut dacl = std::ptr::null_mut();
+        let mut dacl_defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            anyhow::bail!("restrictive test descriptor had no DACL");
+        }
+        let mut encoded_path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                encoded_path.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("apply restrictive test DACL: Windows error {status}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn set_current_windows_owner(path: &Path) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT},
+            OWNER_SECURITY_INFORMATION,
+        };
+
+        let owner = current_windows_user_sid()?;
+        let mut encoded: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                encoded.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("apply current test owner: Windows error {status}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_status_uses_external_staging_without_resecuring_existing_home() -> Result<()> {
+        const SUPERVISOR_SID: &str = "S-1-5-19";
+        let root = tempfile::tempdir()?;
+        let profile = root.path().join("profile");
+        let coven_home = profile.join(".coven");
+        let staging = root.path().join("staging");
+        std::fs::create_dir(&profile)?;
+        std::fs::create_dir(&coven_home)?;
+        std::fs::create_dir(&staging)?;
+        set_current_windows_owner(&profile)?;
+        set_current_windows_owner(&coven_home)?;
+        apply_supervised_windows_directory_security(root.path(), SUPERVISOR_SID, false)?;
+        apply_supervised_windows_directory_security(&staging, SUPERVISOR_SID, true)?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-09-10T00:00:00Z".to_owned(),
+            socket: windows_pipe_name(&coven_home)?,
+            process_creation_time: None,
+        };
+
+        write_windows_status(
+            &coven_home,
+            &status,
+            Some(staging.clone().into_os_string()),
+            Some(std::ffi::OsString::from(SUPERVISOR_SID)),
+            Some(root.path().as_os_str().to_owned()),
+        )?;
+
+        assert_eq!(
+            parse_daemon_status(
+                &coven_client::read_windows_daemon_status_for_lifecycle(&coven_home)
+                    .map_err(anyhow::Error::new)?
+                    .context("read staged status")?
+            )?,
+            status
+        );
+        assert_eq!(std::fs::read_dir(&staging)?.count(), 0);
+        Ok(())
+    }
+
     fn write_test_daemon_status_text(coven_home: &Path, contents: &str) -> Result<()> {
         #[cfg(windows)]
         {
             ensure_private_coven_home(coven_home)?;
-            write_windows_status(&daemon_status_path(coven_home), contents)
+            coven_client::write_owner_only_windows_daemon_status(coven_home, contents.as_bytes())
+                .map_err(anyhow::Error::new)
         }
         #[cfg(not(windows))]
         {
@@ -7574,10 +8195,12 @@ mod tests {
             vec![b'x'; 1024 * 1024],
         )?;
         let (launched_tx, launched_rx) = std::sync::mpsc::channel();
+        let (writing_tx, writing_rx) = std::sync::mpsc::channel();
         let runtime = Arc::new(PromptCancellationApiRuntime {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(Some(writing_tx)),
             await_root_exit_before_activate: None,
         });
         let body = serde_json::json!({
@@ -7602,7 +8225,8 @@ mod tests {
             let _ = response_tx.send(response);
         });
 
-        let session_id = launched_rx.recv_timeout(Duration::from_secs(2))?;
+        let session_id =
+            receive_prompt_launch_notification(&launched_rx, &response_rx, Duration::from_secs(2))?;
         let child_pid = await_daemon_shutdown_descendant_pid(&pid_file)?;
         let registration_deadline = Instant::now() + Duration::from_secs(2);
         while !runtime
@@ -7618,6 +8242,11 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        receive_prompt_delivery_phase(
+            &writing_rx,
+            "prompt writer entry before kill",
+            registration_deadline.saturating_duration_since(Instant::now()),
+        )?;
 
         let kill = crate::api::handle_request_with_runtime(
             "POST",
@@ -7628,7 +8257,12 @@ mod tests {
             runtime.as_ref(),
         )?;
         assert_eq!(kill.status, 202, "{}", kill.body);
-        let launch = response_rx.recv_timeout(Duration::from_secs(2))??;
+        let launch = receive_prompt_delivery_phase(
+            &response_rx,
+            "launch response after kill",
+            Duration::from_secs(2),
+        )?
+        .context("API launch returned an error after concurrent kill")?;
         assert_eq!(launch.status, 500, "{}", launch.body);
         let conn = crate::store::open_store(&temp_dir.path().join(crate::STORE_FILE_NAME))?;
         let row = crate::store::get_session(&conn, &session_id)?
@@ -7636,6 +8270,92 @@ mod tests {
         assert_eq!(row.status, "killed");
         await_daemon_shutdown_descendant_exit(child_pid, "concurrent API cancellation")?;
         Ok(())
+    }
+
+    fn receive_prompt_delivery_phase<T>(
+        receiver: &std::sync::mpsc::Receiver<T>,
+        phase: &str,
+        timeout: Duration,
+    ) -> Result<T> {
+        let started = Instant::now();
+        receiver.recv_timeout(timeout).with_context(|| {
+            format!(
+                "{phase}: elapsed={:?}, budget={timeout:?}",
+                started.elapsed()
+            )
+        })
+    }
+
+    fn receive_prompt_launch_notification(
+        notification: &std::sync::mpsc::Receiver<String>,
+        response: &std::sync::mpsc::Receiver<Result<crate::api::ApiResponse>>,
+        timeout: Duration,
+    ) -> Result<String> {
+        receive_prompt_delivery_phase(notification, "runtime launch notification", timeout)
+            .with_context(|| {
+                let early_response = match response.try_recv() {
+                    Ok(Ok(response)) => format!("HTTP {}: {}", response.status, response.body),
+                    Ok(Err(error)) => format!("API error: {error:#}"),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => "still pending".to_owned(),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        "channel disconnected without a response".to_owned()
+                    }
+                };
+                format!("early launch response: {early_response}")
+            })
+    }
+
+    #[test]
+    fn prompt_delivery_phase_timeout_identifies_phase_and_elapsed() {
+        let (_sender, receiver) = std::sync::mpsc::channel::<()>();
+        let error =
+            receive_prompt_delivery_phase(&receiver, "launch response after kill", Duration::ZERO)
+                .expect_err("an empty channel must report the awaited phase");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("launch response after kill"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(
+            diagnostic.contains("timed out waiting on channel"),
+            "{diagnostic}"
+        );
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_response() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Ok(crate::api::ApiResponse {
+                status: 500,
+                content_type: "application/json",
+                body: r#"{"error":"fixture launch failed"}"#.to_owned(),
+            }))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include the early response");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("runtime launch notification"),
+            "{diagnostic}"
+        );
+        assert!(diagnostic.contains("elapsed="), "{diagnostic}");
+        assert!(diagnostic.contains("HTTP 500"), "{diagnostic}");
+        assert!(diagnostic.contains("fixture launch failed"), "{diagnostic}");
+    }
+
+    #[test]
+    fn prompt_delivery_notification_timeout_reports_early_error() {
+        let (_launched, notification) = std::sync::mpsc::channel::<String>();
+        let (response_tx, response_rx) = std::sync::mpsc::channel();
+        response_tx
+            .send(Err(anyhow::anyhow!("fixture admission failed")))
+            .unwrap();
+        let error = receive_prompt_launch_notification(&notification, &response_rx, Duration::ZERO)
+            .expect_err("missing launch notification must include an early API error");
+        assert!(format!("{error:#}").contains("fixture admission failed"));
     }
 
     #[cfg(any(unix, windows))]
@@ -7657,6 +8377,7 @@ mod tests {
             inner: LiveSessionRuntime::with_coven_home(temp_dir.path().to_path_buf()),
             command: Mutex::new(Some(command)),
             launched: Mutex::new(Some(launched_tx)),
+            prompt_write_started: Mutex::new(None),
             await_root_exit_before_activate: Some(pid_file.clone()),
         };
         let body = serde_json::json!({
@@ -8171,6 +8892,7 @@ mod tests {
         inner: LiveSessionRuntime,
         command: Mutex<Option<pty_runner::HarnessCommand>>,
         launched: Mutex<Option<std::sync::mpsc::Sender<String>>>,
+        prompt_write_started: Mutex<Option<std::sync::mpsc::Sender<()>>>,
         await_root_exit_before_activate: Option<PathBuf>,
     }
 
@@ -8187,7 +8909,10 @@ mod tests {
                 .take()
                 .context("prompt-cancellation fixture command was already consumed")?;
             let (observer, registration) = self.inner.observer_for_session(launch.id.clone());
-            let piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            let mut piped = pty_runner::spawn_piped_with_observer(&command, Some(observer), false)?;
+            if let Some(sender) = self.prompt_write_started.lock().unwrap().take() {
+                piped.notify_prompt_write_started_for_test(sender)?;
+            }
             if let Some(pid_file) = &self.await_root_exit_before_activate {
                 let pid = await_daemon_shutdown_descendant_pid(pid_file)?;
                 await_daemon_shutdown_descendant_exit(pid, "successful pre-delivery root exit")?;
@@ -8823,6 +9548,147 @@ mod tests {
         .expect("handle ok");
         let response = String::from_utf8(output).expect("utf8");
         assert!(response.starts_with("HTTP/1.1 200 OK"), "got: {response}");
+    }
+
+    struct PolicyUntouchedRuntime;
+    impl SessionRuntime for PolicyUntouchedRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            panic!("denied request launched");
+        }
+        fn send_input(&self, _: &str, _: &serde_json::Value) -> Result<()> {
+            panic!("denied request accessed runtime");
+        }
+        fn kill_session(&self, _: &str) -> Result<()> {
+            panic!("denied request accessed runtime");
+        }
+        fn event_writer_health(&self) -> Option<crate::event_writer::EventWriterHealth> {
+            panic!("policy request inspected runtime health");
+        }
+    }
+
+    #[test]
+    fn session_policy_http_rejects_invalid_utf8_and_oversize_before_effects() {
+        for path in [
+            "/api/v1/sessions/restricted",
+            "/sessions/restricted",
+            "/api/v1/sessions/restricted?source=wand",
+        ] {
+            for guard in [
+                HostGuard::Disabled,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            ] {
+                for (length, body) in [(1, &b"\xff"[..]), (1_048_577, &b""[..])] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let home = temp.path().join("must-not-exist");
+                    let mut request = format!("POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {length}\r\n\r\n").into_bytes();
+                    request.extend_from_slice(body);
+                    let mut output = Vec::new();
+                    handle_http_stream(
+                        std::io::Cursor::new(request),
+                        &mut output,
+                        &home,
+                        None,
+                        &PolicyUntouchedRuntime,
+                        Some(MAX_SOCKET_BODY_BYTES),
+                        guard,
+                    )
+                    .unwrap();
+                    assert!(!home.exists(), "denied HTTP request created store/home");
+                    let output = String::from_utf8(output).unwrap();
+                    let (status, code) = match guard {
+                        HostGuard::Disabled => ("HTTP/1.1 400 Bad Request", "invalid_request"),
+                        HostGuard::Loopback { .. } => ("HTTP/1.1 403 Forbidden", "forbidden"),
+                    };
+                    assert!(output.starts_with(status), "{output}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(output.split_once("\r\n\r\n").unwrap().1).unwrap();
+                    assert_eq!(payload["error"]["code"], code);
+                    assert!(payload.get("admission").is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn session_policy_http_preserves_exact_refusal_digest_and_inert_discovery() -> Result<()> {
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-session-policy/v1/fixtures/request.json"
+        ))?;
+        value["expiresAtUnixMs"] =
+            serde_json::json!(chrono::Utc::now().timestamp_millis() + 300_000);
+        value["launch"]["title"] = serde_json::json!("caf\u{e9}");
+        let compact = value.to_string();
+        let padded = format!(" \n{compact}\n ");
+        for body in [&compact, &padded] {
+            for guard in [
+                HostGuard::Disabled,
+                HostGuard::Loopback { allowed_hosts: &[] },
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path().join("must-not-exist");
+                let request = format!("POST /api/v1/sessions/restricted HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                let mut output = Vec::new();
+                handle_http_stream(
+                    std::io::Cursor::new(request),
+                    &mut output,
+                    &home,
+                    None,
+                    &PolicyUntouchedRuntime,
+                    Some(MAX_SOCKET_BODY_BYTES),
+                    guard,
+                )?;
+                assert!(!home.exists());
+                let output = String::from_utf8(output)?;
+                let payload: serde_json::Value =
+                    serde_json::from_str(output.split_once("\r\n\r\n").unwrap().1)?;
+                match guard {
+                    HostGuard::Disabled => {
+                        assert!(output.starts_with("HTTP/1.1 409 Conflict"), "{output}");
+                        assert_eq!(payload["admission"], "not_started");
+                        assert_eq!(
+                            payload["requestDigest"],
+                            format!(
+                                "sha256:{}",
+                                crate::automations::contract::canonical_json::sha256_hex(
+                                    body.as_bytes()
+                                )
+                            )
+                        );
+                    }
+                    HostGuard::Loopback { .. } => {
+                        assert!(output.starts_with("HTTP/1.1 403 Forbidden"), "{output}");
+                        assert_eq!(payload["error"]["code"], "forbidden");
+                    }
+                }
+            }
+        }
+        for guard in [
+            HostGuard::Disabled,
+            HostGuard::Loopback { allowed_hosts: &[] },
+        ] {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path().join("must-not-exist");
+            let request = b"GET /api/v1/session-policy HTTP/1.1\r\nHost: localhost\r\n\r\n";
+            let mut output = Vec::new();
+            handle_http_stream(
+                std::io::Cursor::new(request),
+                &mut output,
+                &home,
+                None,
+                &PolicyUntouchedRuntime,
+                Some(MAX_SOCKET_BODY_BYTES),
+                guard,
+            )?;
+            assert!(!home.exists());
+            let output = String::from_utf8(output)?;
+            assert!(output.starts_with("HTTP/1.1 200 OK"), "{output}");
+            assert_eq!(
+                output.split_once("\r\n\r\n").unwrap().1,
+                include_str!("../../../spec/coven-session-policy/v1/fixtures/discovery.json")
+                    .trim_end_matches('\n')
+            );
+        }
+        Ok(())
     }
 
     #[cfg(unix)]
