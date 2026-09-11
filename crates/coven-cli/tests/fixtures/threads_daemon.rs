@@ -482,9 +482,19 @@ impl<S: Read, P: FnMut(&S) -> io::Result<()>> Read for NonblockingPipe<S, P> {
 }
 
 #[cfg(any(windows, test))]
-impl<S: Write, P> Write for NonblockingPipe<S, P> {
+impl<S: Write, P: FnMut(&S) -> io::Result<()>> Write for NonblockingPipe<S, P> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.stream.write(buffer)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        match self.stream.write(buffer) {
+            // A connected PIPE_NOWAIT writer can report zero under backpressure.
+            Ok(0) => {
+                (self.probe)(&self.stream)?;
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            result => result,
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -597,6 +607,46 @@ mod transport_tests {
             probe: |_: &ScriptedStream| panic!("empty read must not probe the pipe"),
         };
         assert_eq!(pipe.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn zero_pipe_write_retries_only_while_connected() {
+        let mut buffer = [0_u8; 1];
+        let mut pipe = NonblockingPipe {
+            stream: io::Cursor::new(buffer.as_mut_slice()),
+            probe: |_: &io::Cursor<&mut [u8]>| -> io::Result<()> { Ok(()) },
+        };
+        assert_eq!(pipe.write(b"ab").unwrap(), 1);
+        assert_eq!(
+            pipe.write(b"b").unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        pipe.stream.set_position(0);
+        assert_eq!(pipe.write(b"b").unwrap(), 1);
+    }
+
+    #[test]
+    fn zero_pipe_write_preserves_disconnect_error() {
+        let mut buffer = [];
+        let mut pipe = NonblockingPipe {
+            stream: io::Cursor::new(buffer.as_mut_slice()),
+            probe: |_: &io::Cursor<&mut [u8]>| -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(109))
+            },
+        };
+        assert_eq!(
+            pipe.write(b"request").unwrap_err().raw_os_error(),
+            Some(109)
+        );
+    }
+
+    #[test]
+    fn empty_pipe_write_does_not_probe() {
+        let mut pipe = NonblockingPipe {
+            stream: io::Cursor::new(Vec::new()),
+            probe: |_: &io::Cursor<Vec<u8>>| panic!("empty write must not probe the pipe"),
+        };
+        assert_eq!(pipe.write(&[]).unwrap(), 0);
     }
 
     #[test]
