@@ -1,23 +1,19 @@
 //! Durable Automations v1 event streams.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 pub use super::types::EventRef;
-use super::types::{EventEnvelope, EventRefStream, SafeInteger, StreamKind};
-
-#[cfg(test)]
-use super::types::{EventKind, EventPayload};
-#[cfg(test)]
-use serde_json::{Map, Value};
-#[cfg(test)]
-use std::collections::HashSet;
+use super::types::{
+    EventEnvelope, EventKind, EventPayload, EventRefStream, SafeInteger, StreamKind,
+};
 
 pub const AUTOMATION_EVENTS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_event_stream_heads (
@@ -791,7 +787,6 @@ pub fn resume_events(
     )
 }
 
-#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct EventReducer {
     stream: Option<(String, String)>,
@@ -800,7 +795,6 @@ pub struct EventReducer {
     state: Value,
 }
 
-#[cfg(test)]
 impl EventReducer {
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), EventStoreError> {
         if self.seen_event_ids.contains(event.event_id.as_str()) {

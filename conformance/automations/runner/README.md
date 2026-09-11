@@ -124,6 +124,7 @@ The checked-in
 [`attempt-terminal-immutability.vectors.json`](attempt-terminal-immutability.vectors.json),
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
+[`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
 files contain the current nonempty vector sets.
@@ -144,6 +145,7 @@ The runner invokes the target directly without a shell.
         "attempt-terminal-immutability",
         "capability-negotiation",
         "definition-validation",
+        "event-reducer-determinism",
         "run-terminal-monotonicity"
       ]
     }
@@ -157,7 +159,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements four structural suites.
+The native Coven target currently implements five structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -165,6 +167,9 @@ real routine-definition parser and capability policy. `definition-validation`
 executes the portable v1 definition parser, integrity verification, and typed
 serialization path, accepting a canonical valid definition only when its
 normalized JCS digest matches and rejecting a tampered definition.
+`event-reducer-determinism` replays a portable event stream through the native
+Rust reducer both canonically and with an exact duplicate delivery, requiring
+the same normalized final state and expected digest.
 `run-terminal-monotonicity` executes the checked-in settlement and replay cases
 against the real Rust run ledger in an isolated in-memory store, proving that a
 later terminal observation cannot rewrite the first committed terminal state.

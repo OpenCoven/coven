@@ -7,7 +7,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
-use super::contract::{canonicalize, sha256_hex, AutomationDefinition};
+use super::contract::events::EventReducer;
+use super::contract::{canonicalize, sha256_hex, AutomationDefinition, EventEnvelope};
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
@@ -21,6 +22,8 @@ const ATTEMPT_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.attempt-terminal-immutability-vectors.v1";
 const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.definition-validation-vectors.v1";
+const EVENT_REDUCER_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.event-reducer-determinism-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
@@ -29,6 +32,7 @@ const MAX_CASES: usize = 128;
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
+pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -183,6 +187,22 @@ enum ExpectedDefinitionValidation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventReducerVectorSet {
+    schema_version: String,
+    cases: Vec<EventReducerVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventReducerVectorCase {
+    case_id: String,
+    events: Vec<EventEnvelope>,
+    duplicate_index: usize,
+    expected_state_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunTerminalVectorSet {
     schema_version: String,
     cases: Vec<RunTerminalVectorCase>,
@@ -235,6 +255,7 @@ pub fn capability() -> TargetCapability {
                 ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
                 CAPABILITY_NEGOTIATION_SUITE,
                 DEFINITION_VALIDATION_SUITE,
+                EVENT_REDUCER_DETERMINISM_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
             ],
         }],
@@ -259,6 +280,7 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         }
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
+        EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
@@ -359,6 +381,59 @@ fn evaluate_definition_validation(vector: &Value) -> Result<bool, &'static str> 
     }
 
     Ok(vectors.cases.iter().all(definition_case_matches))
+}
+
+fn evaluate_event_reducer_determinism(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: EventReducerVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != EVENT_REDUCER_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || case.events.is_empty()
+            || case.events.len() > MAX_CASES
+            || case.duplicate_index >= case.events.len()
+            || !valid_sha256_digest(&case.expected_state_digest)
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= event_reducer_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn event_reducer_case_matches(case: &EventReducerVectorCase) -> Result<bool, &'static str> {
+    let mut canonical = EventReducer::default();
+    for event in &case.events {
+        if canonical.apply(event).is_err() {
+            return Ok(false);
+        }
+    }
+
+    let mut duplicated = EventReducer::default();
+    for (index, event) in case.events.iter().enumerate() {
+        if duplicated.apply(event).is_err()
+            || (index == case.duplicate_index && duplicated.apply(event).is_err())
+        {
+            return Ok(false);
+        }
+    }
+
+    let canonical_state =
+        canonicalize(canonical.state()).map_err(|_| "conformance suite execution failed")?;
+    let observed_digest = format!("sha256:{}", sha256_hex(&canonical_state));
+    Ok(canonical.state() == duplicated.state() && observed_digest == case.expected_state_digest)
 }
 
 fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static str> {
