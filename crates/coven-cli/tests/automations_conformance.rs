@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 
 const CAPABILITY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/capability-negotiation.vectors.json");
+const DEFINITION_VALIDATION_VECTORS: &str =
+    include_str!("../../../conformance/automations/runner/definition-validation.vectors.json");
 const RUN_TERMINAL_MONOTONICITY_VECTORS: &str =
     include_str!("../../../conformance/automations/runner/run-terminal-monotonicity.vectors.json");
 const MAX_CONFORMANCE_REQUEST_BYTES: usize = 1024 * 1024;
@@ -71,11 +73,60 @@ fn native_target_capability_is_stateless_and_machine_readable() -> anyhow::Resul
                 "profile": "structural",
                 "suites": [
                     "capability-negotiation",
+                    "definition-validation",
                     "run-terminal-monotonicity"
                 ]
             }]
         })
     );
+    assert!(!coven_home.exists());
+    Ok(())
+}
+
+#[test]
+fn native_target_evaluates_checked_in_definition_vectors() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let coven_home = temp_dir.path().join("must-not-be-created");
+    let vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS)?;
+    let request = json!({
+        "schemaVersion": "coven.automations.conformance-suite-request.v1",
+        "profile": "structural",
+        "suiteId": "definition-validation",
+        "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "1111111111111111111111111111111111111111",
+            "bundleSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "contractContentSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "fileCount": 19
+        },
+        "subjectArtifact": {
+            "artifactId": "coven-cli",
+            "artifactVersion": "0.1.0",
+            "platform": {"os": "linux", "arch": "x86_64"},
+            "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        },
+        "vector": vectors
+    });
+
+    let output = run_target(&coven_home, "evaluate", Some(&request))?;
+
+    assert!(
+        output.status.success(),
+        "evaluate command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(
+        response["schemaVersion"],
+        "coven.automations.conformance-suite-result.v1"
+    );
+    assert_eq!(response["suiteId"], "definition-validation");
+    assert_eq!(response["status"], "passed");
+    assert_eq!(response["evidence"]["executedCases"], 2);
+    assert_eq!(response["evidence"]["passedCases"], 2);
+    assert!(response["evidence"]["vectorDigest"]
+        .as_str()
+        .is_some_and(|digest| digest.starts_with("sha256:") && digest.len() == 71));
     assert!(!coven_home.exists());
     Ok(())
 }

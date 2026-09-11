@@ -121,7 +121,8 @@ source metadata for the files and binary under test. `source.commit` must equal
 - `subjectArtifact.sha256` from `--target-command`.
 
 The checked-in
-[`capability-negotiation.vectors.json`](capability-negotiation.vectors.json)
+[`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
+[`definition-validation.vectors.json`](definition-validation.vectors.json),
 and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
 files contain the current nonempty vector sets.
@@ -140,6 +141,7 @@ The runner invokes the target directly without a shell.
       "profile": "structural",
       "suites": [
         "capability-negotiation",
+        "definition-validation",
         "run-terminal-monotonicity"
       ]
     }
@@ -153,14 +155,18 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements two structural suites.
+The native Coven target currently implements three structural suites.
 `capability-negotiation` executes the checked-in cases against Rust's real
-definition parser and capability policy. `run-terminal-monotonicity` executes
-the checked-in settlement and replay cases against the real Rust run ledger in
-an isolated in-memory store, proving that a later terminal observation cannot
-rewrite the first committed terminal state. Each vector must use distinct first
-and replay statuses so a passing case exercises an actual conflict. It does not
-claim the complete occurrence or attempt state machines.
+routine-definition parser and capability policy. `definition-validation`
+executes the portable v1 definition parser, integrity verification, and typed
+serialization path, accepting a canonical valid definition only when its
+normalized JCS digest matches and rejecting a tampered definition.
+`run-terminal-monotonicity` executes the checked-in settlement and replay cases
+against the real Rust run ledger in an isolated in-memory store, proving that a
+later terminal observation cannot rewrite the first committed terminal state.
+Each vector must use distinct first and replay statuses so a passing case
+exercises an actual conflict. These suites do not claim the complete definition,
+occurrence, or attempt state machines.
 
 The runner computes a JCS SHA-256 digest of returned evidence and discards the
 raw evidence after building the result envelope. Evidence is restricted to JSON

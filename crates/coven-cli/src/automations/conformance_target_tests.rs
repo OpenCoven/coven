@@ -5,6 +5,9 @@ use super::conformance_target::{
     CAPABILITY_NEGOTIATION_SUITE, RUN_TERMINAL_MONOTONICITY_SUITE,
 };
 
+const DEFINITION_VALIDATION_VECTORS: &str =
+    include_str!("../../../../conformance/automations/runner/definition-validation.vectors.json");
+
 fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
         "schemaVersion": "coven.automations.conformance-suite-request.v1",
@@ -44,10 +47,54 @@ fn capability_advertises_the_native_structural_suites() {
                 "profile": "structural",
                 "suites": [
                     CAPABILITY_NEGOTIATION_SUITE,
+                    "definition-validation",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
+    );
+}
+
+#[test]
+fn definition_validation_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS).unwrap();
+    let response = evaluate(&request_for("definition-validation", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 2);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn definition_validation_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS).unwrap();
+    vectors["cases"][0]["expected"] = json!({"outcome": "rejected"});
+
+    let response = evaluate(&request_for("definition-validation", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn definition_validation_suite_rejects_malformed_expected_digests() {
+    let mut vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["normalizedDigest"] = json!("sha256:not-a-digest");
+
+    assert_eq!(
+        evaluate(&request_for("definition-validation", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn definition_validation_suite_rejects_duplicate_case_ids() {
+    let mut vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS).unwrap();
+    vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+
+    assert_eq!(
+        evaluate(&request_for("definition-validation", vectors)).unwrap_err(),
+        "conformance vector is invalid"
     );
 }
 

@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
+use super::contract::{canonicalize, sha256_hex, AutomationDefinition};
 use super::runs::{record_run_finish, record_run_start, RunFinish, RunStart};
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
@@ -14,12 +15,15 @@ const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
+const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.definition-validation-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
 const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
+pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -88,6 +92,31 @@ enum ExpectedNegotiation {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionValidationVectorSet {
+    schema_version: String,
+    cases: Vec<DefinitionValidationVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DefinitionValidationVectorCase {
+    case_id: String,
+    definition: Value,
+    expected: ExpectedDefinitionValidation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedDefinitionValidation {
+    Accepted {
+        #[serde(rename = "normalizedDigest")]
+        normalized_digest: String,
+    },
+    Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunTerminalVectorSet {
     schema_version: String,
     cases: Vec<RunTerminalVectorCase>,
@@ -138,6 +167,7 @@ pub fn capability() -> TargetCapability {
             profile: STRUCTURAL_PROFILE,
             suites: vec![
                 CAPABILITY_NEGOTIATION_SUITE,
+                DEFINITION_VALIDATION_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
             ],
         }],
@@ -158,6 +188,7 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
 
     let all_passed = match request.suite_id.as_str() {
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
+        DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
@@ -185,6 +216,34 @@ fn evaluate_capability_negotiation(vector: &Value) -> Result<bool, &'static str>
     }
 
     Ok(vectors.cases.iter().all(capability_case_matches))
+}
+
+fn evaluate_definition_validation(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: DefinitionValidationVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !case.definition.is_object()
+            || matches!(
+                &case.expected,
+                ExpectedDefinitionValidation::Accepted { normalized_digest }
+                    if !valid_sha256_digest(normalized_digest)
+            )
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+
+    Ok(vectors.cases.iter().all(definition_case_matches))
 }
 
 fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static str> {
@@ -338,6 +397,21 @@ fn capability_case_matches(case: &CapabilityVectorCase) -> bool {
     }
 }
 
+fn definition_case_matches(case: &DefinitionValidationVectorCase) -> bool {
+    let parsed = serde_json::from_value::<AutomationDefinition>(case.definition.clone());
+    match (&case.expected, parsed) {
+        (ExpectedDefinitionValidation::Accepted { normalized_digest }, Ok(definition)) => {
+            serde_json::to_value(definition)
+                .ok()
+                .and_then(|value| canonicalize(&value).ok())
+                .map(|canonical| format!("sha256:{}", sha256_hex(&canonical)))
+                .is_some_and(|observed| observed == *normalized_digest)
+        }
+        (ExpectedDefinitionValidation::Rejected, Err(_)) => true,
+        _ => false,
+    }
+}
+
 fn valid_case_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -345,4 +419,13 @@ fn valid_case_id(value: &str) -> bool {
             byte.is_ascii_alphanumeric()
                 || (index > 0 && matches!(byte, b'.' | b'_' | b':' | b'@' | b'-'))
         })
+}
+
+fn valid_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|digest| {
+        digest.len() == 64
+            && digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    })
 }
