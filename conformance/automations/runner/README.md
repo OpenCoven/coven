@@ -126,6 +126,7 @@ The checked-in
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
 [`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
+[`receipt-integrity-validation.vectors.json`](receipt-integrity-validation.vectors.json),
 and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
 files contain the current nonempty vector sets.
@@ -148,6 +149,7 @@ The runner invokes the target directly without a shell.
         "definition-validation",
         "event-reducer-determinism",
         "occurrence-fence-uniqueness",
+        "receipt-integrity-validation",
         "run-terminal-monotonicity"
       ]
     }
@@ -161,7 +163,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements six structural suites.
+The native Coven target currently implements seven structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -176,6 +178,12 @@ the same normalized final state and expected digest.
 production SQLite occurrence schema, proving that one automation cannot claim
 the same scheduled slot twice while different automations may share a slot and
 one automation may claim distinct slots.
+`receipt-integrity-validation` parses portable receipts through the native
+typed receipt contract. It requires a canonical receipt with a matching JCS
+SHA-256 integrity value and a minimally tampered receipt whose unchanged
+integrity value must be rejected. Accepted receipts are compared by a pinned
+digest of their normalized typed representation; receipt contents are not
+returned as target evidence.
 `run-terminal-monotonicity` executes the checked-in settlement and replay cases
 against the real Rust run ledger in an isolated in-memory store, proving that a
 later terminal observation cannot rewrite the first committed terminal state.

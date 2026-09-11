@@ -16,6 +16,9 @@ const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
 const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
 );
+const RECEIPT_INTEGRITY_VALIDATION_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/receipt-integrity-validation.vectors.json"
+);
 
 fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
@@ -60,11 +63,73 @@ fn capability_advertises_the_native_structural_suites() {
                     "definition-validation",
                     "event-reducer-determinism",
                     "occurrence-fence-uniqueness",
+                    "receipt-integrity-validation",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
     );
+}
+
+#[test]
+fn receipt_integrity_validation_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(RECEIPT_INTEGRITY_VALIDATION_VECTORS).unwrap();
+    let response = evaluate(&request_for("receipt-integrity-validation", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 2);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 2);
+}
+
+#[test]
+fn receipt_integrity_validation_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(RECEIPT_INTEGRITY_VALIDATION_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["normalizedDigest"] =
+        json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+
+    let response = evaluate(&request_for("receipt-integrity-validation", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn receipt_integrity_validation_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 9] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
+        |vectors| {
+            vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+        },
+        |vectors| vectors["cases"][0]["receipt"] = json!("not-an-object"),
+        |vectors| {
+            vectors["cases"][1]["receipt"] = json!({ "schemaVersion": "coven.automations.v1" })
+        },
+        |vectors| {
+            vectors["cases"][1]["receipt"]["integrity"]["value"] = json!("not-a-sha256-digest")
+        },
+        |vectors| {
+            vectors["cases"][0]["expected"]["normalizedDigest"] = json!("sha256:not-a-digest");
+        },
+        |vectors| vectors["cases"][0]["expected"] = json!({"outcome": "rejected"}),
+        |vectors| {
+            vectors["cases"][1]["expected"] = json!({
+                "outcome": "accepted",
+                "normalizedDigest":
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            });
+        },
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value =
+            serde_json::from_str(RECEIPT_INTEGRITY_VALIDATION_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("receipt-integrity-validation", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
 }
 
 #[test]
