@@ -11132,18 +11132,40 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 }
             }
             let proposal_id = document.pending().id.0.to_string();
-            match decide_threads_proposal_automatic(coven_home, &proposal_id, "reject", None) {
+            // Resume the durable verb so claim recovery reaches live reclassification
+            // instead of conflicting with an interrupted approval request.
+            let request = document.decision_request.as_ref();
+            let decision = request.map_or("reject", |request| request.decision.as_str());
+            let body = request
+                .and_then(|request| request.rationale.as_ref())
+                .map(|note| json!({ "note": note }).to_string());
+            match decide_threads_proposal_automatic(
+                coven_home,
+                &proposal_id,
+                decision,
+                body.as_deref(),
+            ) {
                 Ok(response) if response.status == 200 => completed += 1,
-                Ok(response) => crate::daemon::append_daemon_recovery_log(
-                    coven_home,
-                    &format!(
-                        "threads scheduler: protected proposal rejection failed for {}: HTTP {} \
-                         {}; retained for retry",
-                        path.display(),
-                        response.status,
-                        response.body
-                    ),
-                ),
+                Ok(response) => {
+                    let body: Value = serde_json::from_str(&response.body)?;
+                    if response.status == 409
+                        && body["terminal"] == true
+                        && body["why"] == "protected-target-not-proposable"
+                    {
+                        completed += 1;
+                    } else {
+                        crate::daemon::append_daemon_recovery_log(
+                            coven_home,
+                            &format!(
+                                "threads scheduler: protected proposal rejection failed for {}: \
+                                 HTTP {} {}; retained for retry",
+                                path.display(),
+                                response.status,
+                                response.body
+                            ),
+                        );
+                    }
+                }
                 Err(error) => crate::daemon::append_daemon_recovery_log(
                     coven_home,
                     &format!(
@@ -33048,6 +33070,85 @@ tier = 0
         let detail: coven_threads_core::ProposalApprovalAuditDetail =
             serde_json::from_str(&detail)?;
         assert_eq!(detail.rationale.as_deref(), Some("claim-time rationale"));
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_rejects_protected_target_after_interrupted_approval_claim() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let (pending, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::HumanApprovalWithRationale,
+            time::OffsetDateTime::now_utc(),
+        )?;
+        set_proposal_decision_failpoint(Some((
+            ProposalDecisionFailpoint::ClaimBeforeValidation,
+            proposal_id.clone(),
+        )));
+        let decision_body =
+            scheduled_decision_body(home, &proposal_id, Some("claim-time rationale"))?;
+        let interrupted = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        );
+        assert!(interrupted.is_err());
+        assert!(pending.exists());
+
+        let ward_path = home.join("familiars/sage/ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "protected_surface = [\"SOUL.md\"]",
+                "protected_surface = [\"SOUL.md\", \"reviewed/skill.md\"]",
+            )
+            .replace(
+                "path = \"reviewed/\"\ntier = 1",
+                "path = \"reviewed/skill.md\"\ntier = 0",
+            );
+        std::fs::write(&ward_path, ward)?;
+
+        assert_eq!(
+            process_due_threads_proposals(home)?,
+            1,
+            "protected target must terminalize despite the durable approval request: {}",
+            std::fs::read_to_string(crate::daemon::daemon_recovery_log_path(home))
+                .unwrap_or_default()
+        );
+        assert!(!pending.exists());
+        assert_eq!(process_due_threads_proposals(home)?, 0);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let (event_type, decision, detail): (String, String, Option<String>) = conn.query_row(
+            "SELECT event_type, decision, detail FROM ward_audit WHERE proposal_id = ?1
+             AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(event_type, "proposal_rejected");
+        assert_eq!(decision, "protected-target-not-proposable");
+        assert!(
+            detail.is_none(),
+            "a human-only proposal has no window to close"
+        );
+        let terminal_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit WHERE proposal_id = ?1
+             AND event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(terminal_count, 1);
+        let reservations: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM coven_ward_audit_reservations",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(reservations, 0);
         Ok(())
     }
 
