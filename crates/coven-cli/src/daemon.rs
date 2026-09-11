@@ -6026,6 +6026,37 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn set_current_windows_owner(path: &Path) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT},
+            OWNER_SECURITY_INFORMATION,
+        };
+
+        let owner = current_windows_user_sid()?;
+        let mut encoded: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                encoded.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("apply current test owner: Windows error {status}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
     #[test]
     fn write_status_uses_external_staging_without_resecuring_existing_home() -> Result<()> {
         const SUPERVISOR_SID: &str = "S-1-5-19";
@@ -6033,10 +6064,11 @@ mod tests {
         let profile = root.path().join("profile");
         let coven_home = profile.join(".coven");
         let staging = root.path().join("staging");
-        apply_supervised_windows_directory_security(root.path(), SUPERVISOR_SID, false)?;
         std::fs::create_dir(&profile)?;
-        std::fs::create_dir(&staging)?;
         std::fs::create_dir(&coven_home)?;
+        std::fs::create_dir(&staging)?;
+        set_current_windows_owner(&coven_home)?;
+        apply_supervised_windows_directory_security(root.path(), SUPERVISOR_SID, false)?;
         apply_supervised_windows_directory_security(&staging, SUPERVISOR_SID, true)?;
         let status = DaemonStatus {
             pid: 42,
