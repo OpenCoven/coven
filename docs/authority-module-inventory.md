@@ -8,13 +8,35 @@ belong. Update it when a slice lands or the concentration picture changes.
 
 ## Method
 
-This snapshot was generated from commit `380e765` on 2026-09-09. Rust modules
-were ranked by tracked-file lines and bytes:
+This snapshot was generated from commit
+`7928c4e899fa76ee4c46ba8895275988889ddb15` on 2026-09-11. The measurements
+below refer to that revision, not to a moving branch. Reproduce the ranking
+without changing your checkout:
 
 ```sh
-for file in $(git ls-files 'crates/**/*.rs'); do
-  wc -lc "$file"
-done
+python3 - <<'PY'
+import re
+import subprocess
+
+ref = "7928c4e899fa76ee4c46ba8895275988889ddb15"
+paths = subprocess.check_output(
+    ["git", "ls-tree", "-r", "--name-only", ref, "crates"], text=True
+).splitlines()
+rows = []
+for path in paths:
+    if not path.endswith(".rs"):
+        continue
+    data = subprocess.check_output(["git", "show", f"{ref}:{path}"])
+    lines = data.decode().splitlines()
+    production = next(
+        (i for i, line in enumerate(lines)
+         if re.fullmatch(r"(?:pub(?:\([^)]*\))? )?mod tests \{", line)),
+        len(lines),
+    )
+    rows.append((len(lines), production, len(data), path))
+for total, production, size, path in sorted(rows, reverse=True)[:20]:
+    print(f"{total:>7} / {production:<7} {size:>9} {path}")
+PY
 ```
 
 "Production lines" below means lines before the terminal module-scope
@@ -31,16 +53,18 @@ security sensitivity), not size alone.
 
 | Module | Total / production lines | Bytes | Responsibility classes | Review and coupling evidence |
 | --- | ---: | ---: | --- | --- |
-| [`api.rs`](../crates/coven-cli/src/api.rs) | 35,038 / 12,463 | 1,319,664 | transport dispatch, parsing, validation, transport authority, domain orchestration, persistence access, response mapping | **Highest concentration.** The 523-line central dispatch has 74 direct method arms plus guarded path arms ([lines 695-1217](../crates/coven-cli/src/api.rs#L695-L1217)). Session lifecycle occupies roughly lines 2173-5240; Ward and Threads proposal lifecycle occupies roughly lines 5240-12198. The latter also coordinates a process-wide Ward audit lock, filesystem artifacts, SQLite state, recovery, and response precedence. |
-| [`store.rs`](../crates/coven-cli/src/store.rs) | 12,890 / 6,146 | 476,081 | schema and migration, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 106 crate/public functions. Initialization and the full schema start at [`initialize_store`](../crates/coven-cli/src/store.rs#L577) while session, handoff, event, Ward, hub, Automations, maintenance, and health queries remain in the same module. Process-global initialized-path and health-snapshot caches add ownership coupling ([lines 249-252](../crates/coven-cli/src/store.rs#L249-L252), [521-522](../crates/coven-cli/src/store.rs#L521-L522)). |
-| [`daemon.rs`](../crates/coven-cli/src/daemon.rs) | 12,366 / 5,423 | 462,079 | local IPC and TCP transport, daemon lifecycle, live session ownership, process supervision, recovery, scheduler startup, telemetry | **High mutable-state risk.** `LiveSessionRuntime` owns the shared live-session registry and launch/shutdown coordination ([lines 210-217](../crates/coven-cli/src/daemon.rs#L210-L217)); `serve_forever` acquires lifecycle authority, initializes durable state, starts recovery and schedulers, and accepts concurrent transports ([lines 4307-4540](../crates/coven-cli/src/daemon.rs#L4307-L4540)). In `handle_http_stream_with_lifecycle`, ordinary API requests not consumed by owner-local lifecycle or mobile local-control handling derive transport authority and enter the central API dispatch ([lines 4694-4800](../crates/coven-cli/src/daemon.rs#L4694-L4800)). |
-| [`pty_runner.rs`](../crates/coven-cli/src/pty_runner.rs) | 9,925 / 5,522 | 366,689 | harness command construction, PTY/piped I/O, stream decoding, platform process containment, timeout/cancellation, supervisor protocol | **High platform/security risk.** Strict child containment, guardian/supervisor protocol, stream adapters, and detached/attached execution share one module. Windows and Unix ownership guarantees converge at [`spawn_strict_child_process_tree`](../crates/coven-cli/src/pty_runner.rs#L1865), while cancellation also uses process-global signal coordination ([lines 838-840](../crates/coven-cli/src/pty_runner.rs#L838-L840)). |
+| [`api.rs`](../crates/coven-cli/src/api.rs) | 36,410 / 12,496 | 1,373,450 | transport dispatch, parsing, validation, transport authority, domain orchestration, persistence access, response mapping | **Highest concentration.** `handle_request_with_runtime_and_authority` remains the central route dispatcher. Session lifecycle, Ward/Threads proposals, and Automations handlers share the module. The proposal path also coordinates a process-wide Ward audit lock, filesystem artifacts, SQLite state, recovery, and response precedence. |
+| [`daemon.rs`](../crates/coven-cli/src/daemon.rs) | 13,210 / 5,833 | 494,030 | local IPC and TCP transport, daemon lifecycle, live session ownership, process supervision, recovery, scheduler startup, telemetry | **High mutable-state risk.** `LiveSessionRuntime` owns the shared live-session registry and launch/shutdown coordination; `serve_forever` acquires lifecycle authority, initializes durable state, starts recovery and schedulers, and accepts concurrent transports. In `handle_http_stream_with_lifecycle`, ordinary API requests not consumed by owner-local lifecycle or mobile local-control handling derive transport authority and enter the central API dispatch. |
+| [`store.rs`](../crates/coven-cli/src/store.rs) | 12,899 / 6,155 | 476,581 | schema and migration, query/command persistence, retention, storage health mapping | **High fan-out.** The production portion exposes 106 crate/public free functions. `initialize_store` delegates schema work to `initialize_store_schema`, but both remain alongside session, handoff, event, Ward, hub, Automations, maintenance, and health queries. The process-global `initialized_store_paths` cache and `STORAGE_HEALTH_SNAPSHOTS` add ownership coupling. |
+| [`automations/runner.rs`](../crates/coven-cli/src/automations/runner.rs) | 10,101 / 3,966 | 376,070 | occurrence dispatch, scheduler fencing, runtime adoption, retries, timeout/cancellation, crash recovery, terminal settlement | **High state-machine risk.** `dispatch_occurrence_with_clock` combines direct SQL, scheduler-generation checks, runtime launch, cancellation, and settlement; recovery and stop fencing share the production module. #856 has landed, but remaining #857 correctness work should settle before structural movement. |
+| [`pty_runner.rs`](../crates/coven-cli/src/pty_runner.rs) | 9,954 / 5,551 | 367,600 | harness command construction, PTY/piped I/O, stream decoding, platform process containment, timeout/cancellation, supervisor protocol | **High platform/security risk.** Strict child containment, guardian/supervisor protocol, stream adapters, and detached/attached execution share one module. Windows and Unix ownership guarantees converge at `spawn_strict_child_process_tree`, while cancellation also uses process-global signal coordination in `SUPERVISED_STREAM_CANCELLATION_SIGNAL` and `SUPERVISED_STREAM_CANCELLATION_LOCK`. |
+| [`main.rs`](../crates/coven-cli/src/main.rs) | 9,028 / 5,542 | 330,896 | CLI parsing and command dispatch, setup, user-facing mapping | **Medium.** High fan-in but mostly presentation/entry-point code. Do not prioritize it ahead of authority-bearing modules merely for size. |
 | [`memory_import.rs`](../crates/coven-cli/src/memory_import.rs) | 8,914 / 4,598 | 322,653 | untrusted external-format parsing, normalization, validation, persistence | **Medium-high input risk.** Large because it combines several importer grammars with durable writes. It is not a central authority router, but malformed and cross-format ambiguity need characterization before splitting parsers from persistence. |
-| [`main.rs`](../crates/coven-cli/src/main.rs) | 8,551 / 5,270 | 314,483 | CLI parsing and command dispatch, setup, user-facing mapping | **Medium.** High fan-in but mostly presentation/entry-point code. Do not prioritize it ahead of authority-bearing modules merely for size. |
-| [`ward.rs`](../crates/coven-cli/src/ward.rs) | 8,367 / 4,888 | 309,928 | authorization/policy, path materialization, edit budgets, verified filesystem mutation, rollback/cleanup, audit evidence | **Highest security sensitivity, bounded apply engine.** `Ward::evaluate` is the read-only policy entry point. Direct `Ward::apply` and the two policy-specific approved-apply entry points each re-run fail-closed evaluation before reaching private atomic-write helpers ([lines 1090-1425](../crates/coven-cli/src/ward.rs#L1090-L1425)). The file has grown around hostile filesystem races and rollback evidence; decomposition must not expose those lower-level write helpers. |
-| [`automations/runner.rs`](../crates/coven-cli/src/automations/runner.rs) | 7,756 / 3,457 | 285,163 | occurrence dispatch, scheduler fencing, runtime adoption, retries, timeout/cancellation, crash recovery, terminal settlement | **High state-machine risk.** Dispatch combines direct SQL, scheduler-generation checks, runtime launch, cancellation, and settlement ([lines 1724-2145](../crates/coven-cli/src/automations/runner.rs#L1724-L2145)); recovery and stop fencing continue through the rest of the production module. Active hardening under #856 and #857 must settle before structural movement. |
+| [`ward.rs`](../crates/coven-cli/src/ward.rs) | 8,367 / 4,888 | 309,928 | authorization/policy, path materialization, edit budgets, verified filesystem mutation, rollback/cleanup, audit evidence | **Highest security sensitivity, bounded apply engine.** `Ward::evaluate` is the read-only policy entry point. Direct `Ward::apply` and the two policy-specific approved-apply entry points each re-run fail-closed evaluation before reaching private atomic-write helpers. The file has grown around hostile filesystem races and rollback evidence; decomposition must not expose those lower-level write helpers. |
 | [`harness.rs`](../crates/coven-cli/src/harness.rs) | 6,264 / 2,506 | 231,228 | supported-harness policy, adapter selection, launch validation and construction | **High policy sensitivity, narrower scope.** It exposes 26 production functions. Preserve the supported Codex/Claude Code/GitHub Copilot CLI set and keep process ownership in `pty_runner.rs`/the daemon. |
-| [`automations/contract/types.rs`](../crates/coven-cli/src/automations/contract/types.rs) | 3,432 / 3,432 | 110,686 | canonical wire/domain types and validation | **Medium.** Large but cohesive contract code. Split only by stable protocol ownership, not line count. |
+| [`automations/command_adoption.rs`](../crates/coven-cli/src/automations/command_adoption.rs) | 3,711 / 1,580 | 135,827 | command adoption, attempt/executor binding, durable receipts, recovery | **High adoption sensitivity.** Keep the distinction between dispatch and durable adoption explicit; extraction must preserve command identity, binding checks, and non-replay after ambiguous execution. |
+| [`automations/occurrences.rs`](../crates/coven-cli/src/automations/occurrences.rs) | 3,469 / 1,629 | 133,189 | occurrence persistence, claim transitions, deduplication, scheduler fencing | **High concurrency risk.** Claims and state transitions share SQL and fencing rules; characterize races and restart behavior before splitting storage from transitions. |
+| [`automations/contract/types.rs`](../crates/coven-cli/src/automations/contract/types.rs) | 3,437 / 3,437 | 110,776 | canonical wire/domain types and validation | **Medium.** Large but cohesive contract code. Split only by stable protocol ownership, not line count. |
 
 Large TUI modules are intentionally omitted from the authority priority. They
 matter for maintainability, but they do not outrank modules that decide
@@ -68,8 +92,8 @@ domain modules -> store command/query surface -> schema/migrations/maintenance
 The main review risk is not a single large file. It is a small number of entry
 points coordinating several authority classes at once:
 
-- `handle_request_with_runtime_and_authority` selects more than 70 route
-  operations and is the only production dispatch call from the daemon.
+- `handle_request_with_runtime_and_authority` selects the central route
+  operations and is the only production API dispatch call from the daemon.
 - the API's Threads proposal path combines transport authority, Ward policy,
   filesystem evidence, durable decision state, recovery, and error mapping;
 - `LiveSessionRuntime` and daemon startup combine process ownership with
@@ -110,7 +134,7 @@ The ranking accounts for current dependency blockers as well as inherent risk.
 | 4 | **Daemon transport accept loops from live-session supervision** | daemon inline tests, Unix/TCP request tests, `windows_daemon_lifecycle.rs`, stop/restart budget and recovery tests | single-writer lifecycle locks, owner-derived request authority, bounded in-flight handling, shutdown cleanup, live-session registry semantics | Ready only as separate platform-complete slices; Unix and Windows must keep equivalent outer behavior. |
 | 5 | **Process containment/supervisor from adapter and stream code in `pty_runner.rs`** | strict-containment tests, native Windows lifecycle tests, piped/PTY integration tests, timeout/cancellation tests | before-first-instruction ownership, kill-on-close/process-group guarantees, receipt protocol, terminal callback ordering | Characterize the supervisor protocol as one unit before moving it. Never split Unix and Windows into contracts that can drift. |
 | 6 | **Ward pure classification/budget code from verified apply engine** | Ward unit tests, direct/proposal API tests, hostile replacement and rollback tests | the bounded set of direct, Threads-approved, and coherence-approved Ward entry points; all-or-nothing disposition; path confinement; audit evidence; cleanup uncertainty | Defer until #924's platform guarantee is resolved. Pure helpers may move; private atomic-write helpers must not become callable outside the Ward engine. |
-| 7 | **Automations runner lifecycle sub-boundaries** | #856/#857 state-machine, crash, fencing, cancellation, authority, and receipt tests | adoption uncertainty, scheduler fences, retry/cancel semantics, terminal evidence, Rust authority ownership | Defer structural work until active correctness hardening lands. |
+| 7 | **Automations runner lifecycle sub-boundaries** | #856/#857 state-machine, crash, fencing, cancellation, authority, and receipt tests | adoption uncertainty, scheduler fences, retry/cancel semantics, terminal evidence, Rust authority ownership | #856 has landed; defer structural work until the remaining #857 correctness scope settles. |
 
 Travel, scheduler, AFS, and cockpit route groups are easier to move but rank
 below these boundaries because they do not currently dominate authority review
