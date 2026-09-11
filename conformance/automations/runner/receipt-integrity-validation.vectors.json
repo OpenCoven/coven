@@ -1,0 +1,136 @@
+{
+  "schemaVersion": "coven.automations.receipt-integrity-validation-vectors.v1",
+  "cases": [
+    {
+      "caseId": "canonical-receipt-verifies",
+      "receipt": {
+        "schemaVersion": "coven.automations.v1",
+        "receiptId": "receipt-daily-notes-0001",
+        "automationId": "daily-notes",
+        "automationRevision": 1,
+        "definitionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "8921b840a98f0b700d0144e70b9418af2431f9863bc4e4d8529b2d9848fa4ce9"
+        },
+        "occurrenceId": "daily-notes-1756544400000",
+        "occurrenceFenceGeneration": 1,
+        "runId": "run-daily-notes-0001",
+        "attemptId": "att-daily-notes-0001-1",
+        "attemptNumber": 1,
+        "identity": {
+          "familiarId": "charm"
+        },
+        "authority": {
+          "principal": {
+            "principalId": "principal:tim"
+          },
+          "approval": {
+            "approvalPolicyRef": "policy://authority/familiars/charm"
+          }
+        },
+        "runtime": {
+          "runtimeId": "coven-code",
+          "capabilities": [
+            "sessions.launch"
+          ]
+        },
+        "exercisedCapabilities": [
+          "sessions.launch"
+        ],
+        "sideEffectClass": "local_write",
+        "outcome": {
+          "disposition": "succeeded",
+          "recoveryDisposition": "not_required"
+        },
+        "producedAt": "2026-08-30T09:00:05.000Z",
+        "producer": {
+          "component": "coven-daemon",
+          "instanceId": "daemon@host-a",
+          "implementationVersion": "0.9.0"
+        },
+        "privacy": {
+          "classification": "operational",
+          "retention": {
+            "classification": "standard"
+          }
+        },
+        "integrity": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3b278869178dc3a8461a0cae5a1c671e77085e468261d651460ccf6822300418",
+          "authentication": "none"
+        }
+      },
+      "expected": {
+        "outcome": "accepted",
+        "normalizedDigest": "sha256:d02ac54baca682a57cc8750f4b7e432186ec10b4e93266f92e15ee2fe485c93f"
+      }
+    },
+    {
+      "caseId": "tampered-receipt-is-rejected",
+      "receipt": {
+        "schemaVersion": "coven.automations.v1",
+        "receiptId": "receipt-daily-notes-0001",
+        "automationId": "daily-notes",
+        "automationRevision": 1,
+        "definitionDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "8921b840a98f0b700d0144e70b9418af2431f9863bc4e4d8529b2d9848fa4ce9"
+        },
+        "occurrenceId": "daily-notes-1756544400000",
+        "occurrenceFenceGeneration": 1,
+        "runId": "run-daily-notes-0001",
+        "attemptId": "att-daily-notes-0001-1",
+        "attemptNumber": 1,
+        "identity": {
+          "familiarId": "charm"
+        },
+        "authority": {
+          "principal": {
+            "principalId": "principal:tim"
+          },
+          "approval": {
+            "approvalPolicyRef": "policy://authority/familiars/charm"
+          }
+        },
+        "runtime": {
+          "runtimeId": "coven-code",
+          "capabilities": [
+            "sessions.launch"
+          ]
+        },
+        "exercisedCapabilities": [
+          "sessions.launch"
+        ],
+        "sideEffectClass": "local_write",
+        "outcome": {
+          "disposition": "failed",
+          "recoveryDisposition": "not_required"
+        },
+        "producedAt": "2026-08-30T09:00:05.000Z",
+        "producer": {
+          "component": "coven-daemon",
+          "instanceId": "daemon@host-a",
+          "implementationVersion": "0.9.0"
+        },
+        "privacy": {
+          "classification": "operational",
+          "retention": {
+            "classification": "standard"
+          }
+        },
+        "integrity": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3b278869178dc3a8461a0cae5a1c671e77085e468261d651460ccf6822300418",
+          "authentication": "none"
+        }
+      },
+      "expected": {
+        "outcome": "rejected"
+      }
+    }
+  ]
+}

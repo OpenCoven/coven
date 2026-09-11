@@ -9,7 +9,9 @@ use sha2::{Digest, Sha256};
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
 use super::contract::events::EventReducer;
 use super::contract::types::{AutomationId, OccurrenceId};
-use super::contract::{canonicalize, sha256_hex, AutomationDefinition, EventEnvelope};
+use super::contract::{
+    canonicalize, sha256_hex, AutomationDefinition, AutomationReceipt, EventEnvelope,
+};
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
 };
@@ -27,6 +29,8 @@ const EVENT_REDUCER_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.event-reducer-determinism-vectors.v1";
 const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.occurrence-fence-uniqueness-vectors.v1";
+const RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.receipt-integrity-validation-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
@@ -37,6 +41,7 @@ pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutabi
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
 pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
+pub const RECEIPT_INTEGRITY_VALIDATION_SUITE: &str = "receipt-integrity-validation";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -248,6 +253,31 @@ struct ExpectedOccurrenceFence {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptIntegrityVectorSet {
+    schema_version: String,
+    cases: Vec<ReceiptIntegrityVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptIntegrityVectorCase {
+    case_id: String,
+    receipt: Value,
+    expected: ExpectedReceiptIntegrity,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+enum ExpectedReceiptIntegrity {
+    Accepted {
+        #[serde(rename = "normalizedDigest")]
+        normalized_digest: String,
+    },
+    Rejected,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunTerminalVectorSet {
     schema_version: String,
     cases: Vec<RunTerminalVectorCase>,
@@ -302,6 +332,7 @@ pub fn capability() -> TargetCapability {
                 DEFINITION_VALIDATION_SUITE,
                 EVENT_REDUCER_DETERMINISM_SUITE,
                 OCCURRENCE_FENCE_UNIQUENESS_SUITE,
+                RECEIPT_INTEGRITY_VALIDATION_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
             ],
         }],
@@ -328,6 +359,9 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
         OCCURRENCE_FENCE_UNIQUENESS_SUITE => evaluate_occurrence_fence_uniqueness(&request.vector)?,
+        RECEIPT_INTEGRITY_VALIDATION_SUITE => {
+            evaluate_receipt_integrity_validation(&request.vector)?
+        }
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
@@ -826,6 +860,58 @@ fn definition_case_matches(case: &DefinitionValidationVectorCase) -> bool {
                 .is_some_and(|observed| observed == *normalized_digest)
         }
         (ExpectedDefinitionValidation::Rejected, Err(_)) => true,
+        _ => false,
+    }
+}
+
+fn evaluate_receipt_integrity_validation(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: ReceiptIntegrityVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != RECEIPT_INTEGRITY_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut has_accepted = false;
+    let mut has_rejected = false;
+    for case in &vectors.cases {
+        match &case.expected {
+            ExpectedReceiptIntegrity::Accepted { normalized_digest } => {
+                has_accepted = true;
+                if !valid_sha256_digest(normalized_digest) {
+                    return Err("conformance vector is invalid");
+                }
+            }
+            ExpectedReceiptIntegrity::Rejected => has_rejected = true,
+        }
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !case.receipt.is_object()
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if !has_accepted || !has_rejected {
+        return Err("conformance vector is invalid");
+    }
+
+    Ok(vectors.cases.iter().all(receipt_integrity_case_matches))
+}
+
+fn receipt_integrity_case_matches(case: &ReceiptIntegrityVectorCase) -> bool {
+    let parsed = serde_json::from_value::<AutomationReceipt>(case.receipt.clone());
+    match (&case.expected, parsed) {
+        (ExpectedReceiptIntegrity::Accepted { normalized_digest }, Ok(receipt)) => {
+            serde_json::to_value(receipt)
+                .ok()
+                .and_then(|value| canonicalize(&value).ok())
+                .map(|canonical| format!("sha256:{}", sha256_hex(&canonical)))
+                .is_some_and(|observed| observed == *normalized_digest)
+        }
+        (ExpectedReceiptIntegrity::Rejected, Err(_)) => true,
         _ => false,
     }
 }
