@@ -20,8 +20,16 @@ pub fn write_owner_only_windows_daemon_status_with_staging(
 ) -> Result<(), ClientError> {
     let status_path = coven_home.join("daemon.json");
     let temporary_path = temporary_status_path(&staging_directory.join("daemon.json"));
+    write_owner_only_windows_daemon_status_at_paths(&status_path, &temporary_path, contents)
+}
+
+fn write_owner_only_windows_daemon_status_at_paths(
+    status_path: &Path,
+    temporary_path: &Path,
+    contents: &[u8],
+) -> Result<(), ClientError> {
+    let mut file = create_owner_only_status_file(temporary_path)?;
     let write_result = (|| {
-        let mut file = create_owner_only_status_file(&temporary_path)?;
         file.write_all(contents)
             .map_err(|error| StatusWriteStage::WriteContents.io_error(error))?;
         if !contents.ends_with(b"\n") {
@@ -31,10 +39,10 @@ pub fn write_owner_only_windows_daemon_status_with_staging(
         file.sync_all()
             .map_err(|error| StatusWriteStage::SyncTemporary.io_error(error))?;
         drop(file);
-        replace_status_file(&temporary_path, &status_path)
+        replace_status_file(temporary_path, status_path)
     })();
     if write_result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
+        let _ = std::fs::remove_file(temporary_path);
     }
     write_result
 }
@@ -117,8 +125,8 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
             )),
         );
     }
-    let mut path: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if path.contains(&0) {
+    let mut encoded_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded_path.contains(&0) {
         return Err(
             StatusWriteStage::CreateTemporary.io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -126,12 +134,12 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
             )),
         );
     }
-    path.push(0);
+    encoded_path.push(0);
     // Retain the creation handle and deny data/deletion sharing until security
     // is established and all payload bytes are synced.
     let handle = unsafe {
         CreateFileW(
-            path.as_ptr(),
+            encoded_path.as_ptr(),
             GENERIC_WRITE | WRITE_DAC | WRITE_OWNER,
             0,
             ptr::null(),
@@ -159,6 +167,8 @@ fn create_owner_only_status_file(path: &Path) -> Result<std::fs::File, ClientErr
         )
     };
     if code != 0 {
+        drop(file);
+        let _ = std::fs::remove_file(path);
         return Err(StatusWriteStage::ApplySecurity
             .io_error(std::io::Error::from_raw_os_error(code as i32)));
     }
@@ -433,6 +443,25 @@ mod tests {
         };
         assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn colliding_temporary_is_not_deleted_by_staged_status_writer() {
+        let home = TestHome::new();
+        let staging = TestHome::new();
+        let status_path = home.0.join("daemon.json");
+        let temporary_path = staging.0.join("collision.tmp");
+        std::fs::write(&temporary_path, b"not ours").expect("create colliding temporary");
+
+        let error =
+            write_owner_only_windows_daemon_status_at_paths(&status_path, &temporary_path, b"new")
+                .expect_err("exclusive temporary collision must fail");
+        let ClientError::Io { source, .. } = error else {
+            panic!("expected I/O error")
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&temporary_path).unwrap(), b"not ours");
+        assert!(!status_path.exists());
     }
 
     #[test]
