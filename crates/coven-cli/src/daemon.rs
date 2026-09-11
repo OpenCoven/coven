@@ -2118,7 +2118,7 @@ impl Drop for DaemonLifecycleLock {
 }
 
 fn acquire_daemon_lifecycle_lock(coven_home: &Path) -> Result<DaemonLifecycleLock> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let lock_path = daemon_lifecycle_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
         format!(
@@ -2135,7 +2135,7 @@ fn acquire_daemon_lifecycle_lock_until(
     coven_home: &Path,
     deadline: LifecycleDeadline,
 ) -> Result<DaemonLifecycleLock> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let lock_path = daemon_lifecycle_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&lock_path).with_context(|| {
         format!(
@@ -2218,15 +2218,22 @@ pub fn recover_stale_created_sessions(coven_home: &Path, updated_at: &str) -> Re
 }
 
 pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
-    ensure_private_coven_home(coven_home)?;
-    let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
-    let status_path = daemon_status_path(coven_home);
     #[cfg(windows)]
     {
-        write_windows_status(&status_path, &json)
+        return write_windows_status(
+            coven_home,
+            status,
+            std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
+            std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID"),
+            std::env::var_os("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT"),
+        );
     }
     #[cfg(not(windows))]
     {
+        ensure_private_coven_home(coven_home)?;
+        let json =
+            serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
+        let status_path = daemon_status_path(coven_home);
         std::fs::write(&status_path, format!("{json}\n"))
             .context("failed to write daemon status")?;
         #[cfg(unix)]
@@ -2242,20 +2249,123 @@ pub fn write_status(coven_home: &Path, status: &DaemonStatus) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn write_windows_status(status_path: &Path, json: &str) -> Result<()> {
-    let coven_home = status_path
-        .parent()
-        .context("daemon status path has no Coven home")?;
-    let staging_directory = resolve_windows_status_staging_directory(
-        coven_home,
-        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
-    )?;
+fn write_windows_status(
+    coven_home: &Path,
+    status: &DaemonStatus,
+    configured_staging_directory: Option<std::ffi::OsString>,
+    configured_supervisor_sid: Option<std::ffi::OsString>,
+    configured_bootstrap_root: Option<std::ffi::OsString>,
+) -> Result<()> {
+    let staging_directory =
+        resolve_windows_status_staging_directory(coven_home, configured_staging_directory)?;
+    if windows_status_write_requires_private_home(coven_home, &staging_directory) {
+        ensure_private_coven_home(coven_home)?;
+    } else {
+        validate_windows_external_status_configuration(
+            coven_home,
+            &staging_directory,
+            configured_supervisor_sid,
+            configured_bootstrap_root,
+        )?;
+    }
+    let json = serde_json::to_string_pretty(status).context("failed to serialize daemon status")?;
     coven_client::write_owner_only_windows_daemon_status_with_staging(
         coven_home,
         &staging_directory,
         json.as_bytes(),
     )
     .map_err(anyhow::Error::new)
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_access_allowed_ace_type(ace_type: u8) -> bool {
+    ace_type == 0
+}
+
+#[cfg(any(windows, test))]
+fn same_windows_volume_name(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(windows)]
+fn windows_volume_name(path: &Path) -> Result<std::ffi::OsString> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetVolumeNameForVolumeMountPointW, GetVolumePathNameW,
+    };
+
+    const MAX_WINDOWS_PATH_CHARS: usize = 32_768;
+    let encoded: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut mount_point = vec![0_u16; MAX_WINDOWS_PATH_CHARS];
+    if unsafe {
+        GetVolumePathNameW(
+            encoded.as_ptr(),
+            mount_point.as_mut_ptr(),
+            mount_point.len() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to resolve volume for {}", path.display()));
+    }
+    let mount_point_length = mount_point
+        .iter()
+        .position(|value| *value == 0)
+        .context("Windows volume mount point was not terminated")?;
+    mount_point.truncate(mount_point_length + 1);
+    let mut volume_name = vec![0_u16; MAX_WINDOWS_PATH_CHARS];
+    if unsafe {
+        GetVolumeNameForVolumeMountPointW(
+            mount_point.as_ptr(),
+            volume_name.as_mut_ptr(),
+            volume_name.len() as u32,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("failed to identify volume for {}", path.display()));
+    }
+    let volume_name_length = volume_name
+        .iter()
+        .position(|value| *value == 0)
+        .context("Windows volume name was not terminated")?;
+    Ok(std::ffi::OsString::from_wide(
+        &volume_name[..volume_name_length],
+    ))
+}
+
+#[cfg(windows)]
+fn ensure_same_windows_status_volume(coven_home: &Path, staging_directory: &Path) -> Result<()> {
+    let home_volume = windows_volume_name(coven_home)?;
+    let staging_volume = windows_volume_name(staging_directory)?;
+    if !same_windows_volume_name(&home_volume, &staging_volume) {
+        anyhow::bail!("COVEN_WINDOWS_STATUS_STAGING_DIR must be on the same volume as COVEN_HOME");
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_status_write_requires_private_home(coven_home: &Path, staging_directory: &Path) -> bool {
+    if coven_home == staging_directory {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        match (
+            std::fs::canonicalize(coven_home),
+            std::fs::canonicalize(staging_directory),
+        ) {
+            (Ok(coven_home), Ok(staging_directory)) => coven_home == staging_directory,
+            _ => false,
+        }
+    }
+    #[cfg(not(windows))]
+    false
 }
 
 #[cfg(windows)]
@@ -2271,6 +2381,247 @@ fn resolve_windows_status_staging_directory(
         anyhow::bail!("COVEN_WINDOWS_STATUS_STAGING_DIR must be absolute");
     }
     Ok(staging_directory)
+}
+
+fn ensure_windows_supervised_or_private_coven_home(coven_home: &Path) -> Result<()> {
+    #[cfg(windows)]
+    if std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR").is_some() {
+        validate_windows_external_status_environment(coven_home)?;
+        return Ok(());
+    }
+    ensure_private_coven_home(coven_home)
+}
+
+#[cfg(windows)]
+fn validate_windows_external_status_environment(coven_home: &Path) -> Result<PathBuf> {
+    let staging_directory = resolve_windows_status_staging_directory(
+        coven_home,
+        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR"),
+    )?;
+    if windows_status_write_requires_private_home(coven_home, &staging_directory) {
+        ensure_private_coven_home(coven_home)?;
+        return Ok(staging_directory);
+    }
+    validate_windows_external_status_configuration(
+        coven_home,
+        &staging_directory,
+        std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID"),
+        std::env::var_os("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT"),
+    )?;
+    Ok(staging_directory)
+}
+
+#[cfg(windows)]
+fn validate_windows_external_status_configuration(
+    coven_home: &Path,
+    staging_directory: &Path,
+    configured_supervisor_sid: Option<std::ffi::OsString>,
+    configured_bootstrap_root: Option<std::ffi::OsString>,
+) -> Result<()> {
+    ensure_same_windows_status_volume(coven_home, &staging_directory)?;
+    let supervisor_sid = configured_supervisor_sid
+        .filter(|value| !value.is_empty())
+        .context("COVEN_WINDOWS_STATUS_STAGING_SUPERVISOR_SID is required with external staging")?;
+    let bootstrap_root = configured_bootstrap_root
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .context("OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT is required with external staging")?;
+    validate_windows_supervised_status_directory(&bootstrap_root, &supervisor_sid, false, true)?;
+    let bootstrap_root = std::fs::canonicalize(&bootstrap_root)
+        .context("failed to resolve supervised Windows bootstrap root")?;
+    for (label, path) in [
+        ("COVEN_HOME", coven_home),
+        ("COVEN_WINDOWS_STATUS_STAGING_DIR", staging_directory),
+    ] {
+        let path = std::fs::canonicalize(path)
+            .with_context(|| format!("failed to resolve supervised {label}"))?;
+        if !path.starts_with(&bootstrap_root) || path == bootstrap_root {
+            anyhow::bail!("{label} must be contained below OPENCOVEN_WINDOWS_BOOTSTRAP_ROOT");
+        }
+    }
+    validate_windows_supervised_status_directory(coven_home, &supervisor_sid, false, false)?;
+    validate_windows_supervised_status_directory(&staging_directory, &supervisor_sid, true, true)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_windows_supervised_status_directory(
+    path: &Path,
+    supervisor_sid: &std::ffi::OsStr,
+    staging: bool,
+    require_protected: bool,
+) -> Result<()> {
+    use std::{mem::size_of, os::windows::ffi::OsStrExt};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation,
+        Authorization::{ConvertStringSidToSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT},
+        EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, ACCESS_ALLOWED_ACE,
+        ACE_HEADER, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        SE_DACL_PROTECTED,
+    };
+
+    let metadata = std::fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to inspect supervised status directory {}",
+            path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: path is not a real directory",
+            path.display()
+        );
+    }
+    let encoded: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            encoded.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        anyhow::bail!(
+            "failed to inspect supervised status directory security {}: Windows error {status}",
+            path.display()
+        );
+    }
+    let _descriptor = WindowsLocalAllocation(descriptor);
+    let current = current_windows_user_sid()?;
+    if owner.is_null() || dacl.is_null() || unsafe { EqualSid(owner, current.as_ptr()) } == 0 {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: owner or DACL is not trusted",
+            path.display()
+        );
+    }
+    let mut control = 0;
+    let mut revision = 0;
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect supervised status directory DACL control");
+    }
+    let protected = control & SE_DACL_PROTECTED != 0;
+    if require_protected && !protected {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL is not protected",
+            path.display()
+        );
+    }
+    if !protected {
+        let parent = path
+            .parent()
+            .context("inherited supervised status directory has no parent security boundary")?;
+        if parent == path {
+            anyhow::bail!("inherited supervised status directory reached its filesystem root");
+        }
+        validate_windows_supervised_status_directory(parent, supervisor_sid, false, false)?;
+    }
+
+    let convert_sid = |value: &std::ffi::OsStr, label: &str| -> Result<WindowsLocalAllocation> {
+        let encoded: Vec<u16> = value.encode_wide().chain(std::iter::once(0)).collect();
+        let mut sid = std::ptr::null_mut();
+        if unsafe { ConvertStringSidToSidW(encoded.as_ptr(), &mut sid) } == 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("failed to parse {label} SID"));
+        }
+        Ok(WindowsLocalAllocation(sid))
+    };
+    let system = convert_sid(std::ffi::OsStr::new("S-1-5-18"), "SYSTEM")?;
+    let administrators = convert_sid(std::ffi::OsStr::new("S-1-5-32-544"), "Administrators")?;
+    let supervisor = convert_sid(supervisor_sid, "status supervisor")?;
+    let owner_rights = convert_sid(std::ffi::OsStr::new("S-1-3-4"), "Owner Rights")?;
+    const DIRECTORY_FLAGS: u8 = 0x01 | 0x02;
+    const CHILD_FILE_ONLY_FLAGS: u8 = 0x01 | 0x08;
+    const INHERITED_ACE: u8 = 0x10;
+    const FILE_ALL_ACCESS: u32 = 0x001f01ff;
+    const FILE_MODIFY_ACCESS: u32 = 0x001301bf;
+    const READ_CONTROL: u32 = 0x00020000;
+    let directory_flags = DIRECTORY_FLAGS | if protected { 0 } else { INHERITED_ACE };
+    let mut expected = vec![
+        (system.0, FILE_ALL_ACCESS, directory_flags, false),
+        (administrators.0, FILE_ALL_ACCESS, directory_flags, false),
+        (supervisor.0, FILE_ALL_ACCESS, directory_flags, false),
+        (
+            current.as_ptr().cast(),
+            FILE_MODIFY_ACCESS,
+            directory_flags,
+            false,
+        ),
+        (owner_rights.0, READ_CONTROL, directory_flags, false),
+    ];
+    if staging {
+        expected.push((
+            current.as_ptr().cast(),
+            FILE_ALL_ACCESS,
+            CHILD_FILE_ONLY_FLAGS,
+            false,
+        ));
+    }
+    let mut acl = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut acl as *mut ACL_SIZE_INFORMATION).cast(),
+            size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    } == 0
+        || acl.AceCount as usize != expected.len()
+    {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL entry count is not exact",
+            path.display()
+        );
+    }
+    for index in 0..acl.AceCount {
+        let mut entry = std::ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut entry) } == 0 || entry.is_null() {
+            return Err(std::io::Error::last_os_error())
+                .context("failed to inspect supervised status directory DACL");
+        }
+        let header = unsafe { &*entry.cast::<ACE_HEADER>() };
+        if !is_windows_access_allowed_ace_type(header.AceType)
+            || usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            anyhow::bail!(
+                "refusing to use supervised status directory {}: DACL entry is not allow-only",
+                path.display()
+            );
+        }
+        let ace = unsafe { &*entry.cast::<ACCESS_ALLOWED_ACE>() };
+        let ace_sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        let Some(expected_entry) = expected.iter_mut().find(|candidate| {
+            !candidate.3
+                && candidate.1 == ace.Mask
+                && candidate.2 == ace.Header.AceFlags
+                && unsafe { EqualSid(candidate.0, ace_sid) } != 0
+        }) else {
+            anyhow::bail!(
+                "refusing to use supervised status directory {}: DACL entry is not trusted",
+                path.display()
+            );
+        };
+        expected_entry.3 = true;
+    }
+    if expected.iter().any(|entry| !entry.3) {
+        anyhow::bail!(
+            "refusing to use supervised status directory {}: DACL entry is missing",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn read_status(coven_home: &Path) -> Result<Option<DaemonStatus>> {
@@ -3594,7 +3945,7 @@ fn canonical_lifecycle_home(coven_home: &Path) -> Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        ensure_private_coven_home(coven_home)?;
+        ensure_windows_supervised_or_private_coven_home(coven_home)?;
         Ok(coven_home.to_path_buf())
     }
 }
@@ -4171,7 +4522,7 @@ pub(crate) fn daemon_serve_lock_path(coven_home: &Path) -> PathBuf {
 /// when the file closes — normal exit, panic, or termination — so it never
 /// wedges shut.
 fn try_acquire_serve_lock(coven_home: &Path) -> Result<Option<std::fs::File>> {
-    ensure_private_coven_home(coven_home)?;
+    ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let path = daemon_serve_lock_path(coven_home);
     let file = crate::state_lock::open_lock_file(&path)
         .with_context(|| format!("failed to open serve lock {}", path.display()))?;
@@ -5562,11 +5913,164 @@ mod tests {
         );
     }
 
+    #[test]
+    fn external_windows_status_staging_does_not_require_home_acl_rewrite() {
+        let coven_home = Path::new(r"C:\isolated\profile\.coven");
+
+        assert!(windows_status_write_requires_private_home(
+            coven_home, coven_home
+        ));
+        assert!(!windows_status_write_requires_private_home(
+            coven_home,
+            Path::new(r"C:\isolated\status-staging")
+        ));
+    }
+
+    #[test]
+    fn supervised_status_acl_accepts_only_access_allowed_aces() {
+        assert!(is_windows_access_allowed_ace_type(0));
+        assert!(!is_windows_access_allowed_ace_type(1));
+        assert!(!is_windows_access_allowed_ace_type(9));
+    }
+
+    #[test]
+    fn windows_volume_names_compare_case_insensitively() {
+        assert!(same_windows_volume_name(
+            std::ffi::OsStr::new(r"\\?\Volume{ABC}\"),
+            std::ffi::OsStr::new(r"\\?\volume{abc}\")
+        ));
+        assert!(!same_windows_volume_name(
+            std::ffi::OsStr::new(r"\\?\Volume{ABC}\"),
+            std::ffi::OsStr::new(r"\\?\Volume{DEF}\")
+        ));
+    }
+
+    #[cfg(windows)]
+    fn apply_supervised_windows_directory_security(
+        path: &Path,
+        supervisor_sid: &str,
+        staging: bool,
+    ) -> Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SetNamedSecurityInfoW,
+                SE_FILE_OBJECT,
+            },
+            GetSecurityDescriptorDacl, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+
+        let owner = current_windows_user_sid()?;
+        let owner_sid = owner.to_sddl_string()?;
+        let child_only = if staging {
+            format!("(A;OIIO;FA;;;{owner_sid})")
+        } else {
+            String::new()
+        };
+        let sddl = format!(
+            "O:{owner_sid}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{supervisor_sid})(A;OICI;0x001301bf;;;{owner_sid}){child_only}(A;OICI;RC;;;OW)"
+        );
+        let encoded: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded.as_ptr(),
+                1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error()).context("convert restrictive test DACL");
+        }
+        let _descriptor = WindowsLocalAllocation(descriptor);
+        let mut dacl_present = 0;
+        let mut dacl = std::ptr::null_mut();
+        let mut dacl_defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+            || dacl_present == 0
+            || dacl.is_null()
+        {
+            anyhow::bail!("restrictive test descriptor had no DACL");
+        }
+        let mut encoded_path: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                encoded_path.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                owner.as_ptr(),
+                std::ptr::null_mut(),
+                dacl,
+                std::ptr::null_mut(),
+            )
+        };
+        if status != 0 {
+            anyhow::bail!("apply restrictive test DACL: Windows error {status}");
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_status_uses_external_staging_without_resecuring_existing_home() -> Result<()> {
+        const SUPERVISOR_SID: &str = "S-1-5-19";
+        let root = tempfile::tempdir()?;
+        let profile = root.path().join("profile");
+        let coven_home = profile.join(".coven");
+        let staging = root.path().join("staging");
+        apply_supervised_windows_directory_security(root.path(), SUPERVISOR_SID, false)?;
+        std::fs::create_dir(&profile)?;
+        std::fs::create_dir(&staging)?;
+        std::fs::create_dir(&coven_home)?;
+        apply_supervised_windows_directory_security(&staging, SUPERVISOR_SID, true)?;
+        let status = DaemonStatus {
+            pid: 42,
+            started_at: "2026-09-10T00:00:00Z".to_owned(),
+            socket: "coven-daemon-test.sock".to_owned(),
+            process_creation_time: None,
+        };
+
+        write_windows_status(
+            &coven_home,
+            &status,
+            Some(staging.clone().into_os_string()),
+            Some(std::ffi::OsString::from(SUPERVISOR_SID)),
+            Some(root.path().as_os_str().to_owned()),
+        )?;
+
+        assert_eq!(
+            parse_daemon_status(
+                &coven_client::read_windows_daemon_status_for_lifecycle(&coven_home)
+                    .map_err(anyhow::Error::new)?
+                    .context("read staged status")?
+            )?,
+            status
+        );
+        assert_eq!(std::fs::read_dir(&staging)?.count(), 0);
+        Ok(())
+    }
+
     fn write_test_daemon_status_text(coven_home: &Path, contents: &str) -> Result<()> {
         #[cfg(windows)]
         {
             ensure_private_coven_home(coven_home)?;
-            write_windows_status(&daemon_status_path(coven_home), contents)
+            coven_client::write_owner_only_windows_daemon_status(coven_home, contents.as_bytes())
+                .map_err(anyhow::Error::new)
         }
         #[cfg(not(windows))]
         {
