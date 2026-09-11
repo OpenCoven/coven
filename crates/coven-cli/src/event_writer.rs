@@ -15,7 +15,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use rusqlite::{Connection, ErrorCode};
+use rusqlite::{Connection, ErrorCode, TransactionBehavior};
 use serde::Serialize;
 use serde_json::json;
 use uuid::Uuid;
@@ -687,9 +687,7 @@ fn commit_batch(
     coven_home: &std::path::Path,
     batch: &[QueuedEvent],
 ) -> Result<usize> {
-    let transaction = conn
-        .transaction()
-        .context("failed to begin event writer transaction")?;
+    let transaction = begin_event_writer_transaction(conn)?;
     let mut committed = 0;
     let mut output: Option<store::EventRecord> = None;
     for item in batch {
@@ -748,6 +746,11 @@ fn commit_batch(
         .commit()
         .context("failed to commit event writer transaction")?;
     Ok(committed)
+}
+
+fn begin_event_writer_transaction(conn: &mut Connection) -> Result<rusqlite::Transaction<'_>> {
+    conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("failed to begin event writer transaction")
 }
 
 fn output_record(session_id: &str, data: &str, created_at: &str) -> Result<store::EventRecord> {
@@ -987,6 +990,31 @@ mod tests {
 
         assert_eq!(inserted, 1);
         assert_eq!(attempts, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn event_writer_transaction_reserves_the_write_slot_before_reads() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let path = home.path().join("writer-transaction.sqlite");
+        let setup = Connection::open(&path)?;
+        setup.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE events (id INTEGER);")?;
+        drop(setup);
+
+        let mut writer = Connection::open(&path)?;
+        writer.busy_timeout(Duration::ZERO)?;
+        let contender = Connection::open(&path)?;
+        contender.busy_timeout(Duration::ZERO)?;
+
+        let transaction = begin_event_writer_transaction(&mut writer)?;
+        let error = contender
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect_err("the event writer must reserve the SQLite write slot");
+        assert!(matches!(
+            error.sqlite_error_code(),
+            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+        ));
+        transaction.rollback()?;
         Ok(())
     }
 
