@@ -10,7 +10,8 @@ use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation}
 use super::contract::events::EventReducer;
 use super::contract::types::{AutomationId, OccurrenceId};
 use super::contract::{
-    canonicalize, sha256_hex, AutomationDefinition, AutomationReceipt, EventEnvelope,
+    canonicalize, canonicalize_without_integrity, sha256_hex, AutomationDefinition,
+    AutomationReceipt, EventEnvelope,
 };
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
@@ -885,7 +886,12 @@ fn evaluate_receipt_integrity_validation(vector: &Value) -> Result<bool, &'stati
                     return Err("conformance vector is invalid");
                 }
             }
-            ExpectedReceiptIntegrity::Rejected => has_rejected = true,
+            ExpectedReceiptIntegrity::Rejected => {
+                has_rejected = true;
+                if !structurally_valid_receipt(&case.receipt) {
+                    return Err("conformance vector is invalid");
+                }
+            }
         }
         if !valid_case_id(&case.case_id)
             || !case_ids.insert(&case.case_id)
@@ -899,6 +905,27 @@ fn evaluate_receipt_integrity_validation(vector: &Value) -> Result<bool, &'stati
     }
 
     Ok(vectors.cases.iter().all(receipt_integrity_case_matches))
+}
+
+fn structurally_valid_receipt(value: &Value) -> bool {
+    let mut candidate = value.clone();
+    if candidate
+        .get("integrity")
+        .and_then(Value::as_object)
+        .and_then(|integrity| integrity.get("value"))
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        return false;
+    }
+
+    canonicalize_without_integrity(&candidate)
+        .ok()
+        .map(|canonical| {
+            candidate["integrity"]["value"] = Value::String(sha256_hex(&canonical));
+            candidate
+        })
+        .is_some_and(|candidate| serde_json::from_value::<AutomationReceipt>(candidate).is_ok())
 }
 
 fn receipt_integrity_case_matches(case: &ReceiptIntegrityVectorCase) -> bool {
