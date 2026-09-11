@@ -336,7 +336,7 @@ impl Drop for LocalAllocation {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     struct TestHome(PathBuf);
@@ -355,7 +355,7 @@ mod tests {
         }
     }
 
-    fn assert_status_file_is_owner_only(path: &Path) {
+    pub(crate) fn assert_status_file_is_owner_only(path: &Path) {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::READ_CONTROL;
         let file = std::fs::OpenOptions::new()
