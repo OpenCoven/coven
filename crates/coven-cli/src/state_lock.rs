@@ -19,7 +19,7 @@ impl Drop for StateLock {
 }
 
 pub(crate) fn acquire_shared(coven_home: &Path) -> Result<StateLock> {
-    crate::daemon::ensure_private_coven_home(coven_home)?;
+    crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?;
     let dir = Dir::open_ambient_dir(coven_home, ambient_authority())
         .with_context(|| format!("failed to open COVEN_HOME {}", coven_home.display()))?;
     let path = coven_home.join(STATE_LOCK_FILE);
@@ -191,6 +191,21 @@ mod tests {
     #[test]
     fn platform_lock_contention_is_recognized() {
         assert!(is_lock_contended(&fs2::lock_contended_error()));
+    }
+
+    #[test]
+    fn shared_state_lock_uses_supervised_home_validation() {
+        let source = include_str!("state_lock.rs");
+        let acquire_shared = source
+            .split("pub(crate) fn acquire_shared")
+            .nth(1)
+            .and_then(|source| source.split("#[cfg(test)]").next())
+            .expect("acquire_shared source");
+
+        assert!(acquire_shared.contains(
+            "crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?"
+        ));
+        assert!(!acquire_shared.contains("crate::daemon::ensure_private_coven_home(coven_home)?"));
     }
 
     #[cfg(unix)]

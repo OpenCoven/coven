@@ -2383,7 +2383,7 @@ fn resolve_windows_status_staging_directory(
     Ok(staging_directory)
 }
 
-fn ensure_windows_supervised_or_private_coven_home(coven_home: &Path) -> Result<()> {
+pub(crate) fn ensure_windows_supervised_or_private_coven_home(coven_home: &Path) -> Result<()> {
     #[cfg(windows)]
     if std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR").is_some() {
         validate_windows_external_status_environment(coven_home)?;
