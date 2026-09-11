@@ -11748,6 +11748,7 @@ fn persist_proposal_applying_state(
     crate::proposal_store::replace_existing(claim_path, &body)
 }
 
+// Preserve the borrowed apply-intent inputs while passing the decision's captured time.
 #[allow(clippy::too_many_arguments)]
 fn append_proposal_apply_intent(
     conn: &rusqlite::Connection,
@@ -12085,6 +12086,7 @@ fn staged_edits_to_ward_edits(
         .collect()
 }
 
+// Refusal evidence shares the decision's clock without copying its borrowed inputs.
 #[allow(clippy::too_many_arguments)]
 fn append_proposal_refusal_audit(
     conn: &rusqlite::Connection,
@@ -12630,8 +12632,8 @@ fn map_deterministic_threads_clock_error(error: anyhow::Error) -> Result<ApiResp
             "threads_test_clock_not_monotonic",
             &non_monotonic.to_string(),
             Some(json!({
-                "current": non_monotonic.current,
-                "requested": non_monotonic.requested,
+                "current": non_monotonic.current.format(&time::format_description::well_known::Rfc3339)?,
+                "requested": non_monotonic.requested.format(&time::format_description::well_known::Rfc3339)?,
             })),
         );
     }
@@ -31506,15 +31508,70 @@ tier = 0
     #[test]
     fn deterministic_threads_clock_route_is_unavailable_in_default_build() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let response = handle_request_with_body(
-            "POST",
+        for route in [
             "/api/v1/internal/threads/test-clock",
-            temp.path(),
-            None,
-            Some(r#"{"capability":"fixture-cap","now":"2026-09-09T10:00:00Z"}"#),
-        )?;
+            "/api/v1/internal/threads/test-clock/tick",
+        ] {
+            let response = handle_request_with_body(
+                "POST",
+                route,
+                temp.path(),
+                None,
+                Some(r#"{"capability":"fixture-cap","now":"2026-09-09T10:00:00Z"}"#),
+            )?;
 
-        assert_eq!(response.status, 404);
+            assert_eq!(response.status, 404, "{route}: {}", response.body);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_clock_controls_require_owner_transport_and_fixture_capability(
+    ) -> Result<()> {
+        for suffix in ["", "/tick"] {
+            for (authority, capability) in [
+                (RequestAuthority::Tcp, "fixture-cap"),
+                (RequestAuthority::OwnerLocalIpc, "wrong-fixture-cap"),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let initial =
+                    seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+                let (pending, _) = stage_scheduled_reviewed_edit(
+                    home,
+                    coven_threads_core::ApprovalPath::FamiliarCoherence {
+                        veto: coven_threads_core::VetoWindow::new(
+                            std::time::Duration::from_secs(300),
+                            std::time::Duration::from_secs(60),
+                        ),
+                    },
+                    initial - time::Duration::minutes(5),
+                )?;
+                let pending_before = std::fs::read(&pending)?;
+                let mut body = json!({ "capability": capability });
+                if suffix.is_empty() {
+                    body["now"] = json!("2026-09-09T10:05:00Z");
+                }
+                let response = handle_request_with_runtime_and_authority(
+                    "POST",
+                    &format!("/api/v1/internal/threads/test-clock{suffix}"),
+                    home,
+                    None,
+                    Some(&body.to_string()),
+                    &NoopSessionRuntime,
+                    authority,
+                )?;
+
+                assert_eq!(response.status, 403, "{suffix}: {}", response.body);
+                assert_eq!(crate::threads_clock::now(home)?, initial);
+                assert_eq!(std::fs::read(&pending)?, pending_before);
+                assert_eq!(
+                    std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                    "before"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -31558,6 +31615,14 @@ tier = 0
         assert_eq!(
             backwards["error"]["code"],
             "threads_test_clock_not_monotonic"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["current"],
+            "2026-09-09T10:05:00Z"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["requested"],
+            "2026-09-09T10:04:00Z"
         );
         Ok(())
     }

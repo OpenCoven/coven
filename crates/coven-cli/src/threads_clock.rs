@@ -355,6 +355,8 @@ fn seed_fixture_for_tests_with_activation(
 
 #[cfg(all(test, feature = "threads-test-clock"))]
 fn secure_fixture_directory(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

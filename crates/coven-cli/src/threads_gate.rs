@@ -325,6 +325,7 @@ fn build_read_only_weave_state(
     )
 }
 
+// All surfaces share one captured time alongside the existing writer-specific weave inputs.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_weave_state_for_writer_at(
     conn: &Connection,
