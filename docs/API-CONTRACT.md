@@ -176,7 +176,7 @@ durability.
 | `structuredErrors`| boolean | Errors use the `{ error: { code, message, details } }` shape; session-policy admission decisions have their separately negotiated refusal shape. |
 | `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
 | `sessionLaunchPolicy` | boolean | Owner-gated local IPC accepts the exact unattended Codex launch policy. Always `false` over TCP. |
-| `sessionPolicyContracts` | string array | Refusal-only admission contracts: `["coven.session-policy.v1"]` over owner-local IPC, `[]` over TCP. Missing on older daemons; absence means unavailable. This is not a supported enforcement profile, identity proof, or grant. |
+| `sessionPolicyContracts` | string array | Refusal-only admission contracts. Currently `["coven.session-policy.v1"]` over owner-local IPC and `[]` over TCP. Missing on older daemons; absence means unavailable. This is not a supported enforcement profile, identity proof, or grant. |
 | `afs` | boolean | The AFS route family is available. |
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
 | `afsCommit` | boolean | AFS deltas can be materialized into a Git branch. |
