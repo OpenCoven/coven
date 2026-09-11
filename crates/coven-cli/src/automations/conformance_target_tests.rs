@@ -98,7 +98,7 @@ fn command_adoption_idempotency_suite_rejects_impossible_expectations() {
 
 #[test]
 fn command_adoption_idempotency_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 7] = [
+    let invalid_mutations: [fn(&mut Value); 8] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
         |vectors| vectors["cases"][0]["adoptionKey"] = json!("bad key"),
@@ -108,6 +108,11 @@ fn command_adoption_idempotency_suite_rejects_invalid_vector_shapes() {
         },
         |vectors| {
             vectors["cases"][0]["conflictingDefinition"] = vectors["cases"][0]["definition"].clone()
+        },
+        |vectors| {
+            let mut duplicate = vectors["cases"][0].clone();
+            duplicate["adoptionKey"] = json!("adopt:create:conformance:0002");
+            vectors["cases"].as_array_mut().unwrap().push(duplicate);
         },
         |vectors| {
             let mut duplicate = vectors["cases"][0].clone();
