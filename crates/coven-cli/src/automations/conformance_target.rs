@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
 use super::contract::events::EventReducer;
-use super::contract::types::{AutomationId, OccurrenceId};
+use super::contract::types::{AutomationId, OccurrenceId, Sha256Digest};
 use super::contract::{
     canonicalize, canonicalize_without_integrity, sha256_hex, AutomationDefinition,
     AutomationReceipt, EventEnvelope,
@@ -909,13 +909,15 @@ fn evaluate_receipt_integrity_validation(vector: &Value) -> Result<bool, &'stati
 
 fn structurally_valid_receipt(value: &Value) -> bool {
     let mut candidate = value.clone();
-    if candidate
+    let Some(integrity_value) = candidate
         .get("integrity")
         .and_then(Value::as_object)
         .and_then(|integrity| integrity.get("value"))
         .and_then(Value::as_str)
-        .is_none()
-    {
+    else {
+        return false;
+    };
+    if Sha256Digest::new(integrity_value.to_owned()).is_err() {
         return false;
     }
 

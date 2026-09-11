@@ -95,7 +95,7 @@ fn receipt_integrity_validation_suite_fails_closed_on_an_expectation_mismatch() 
 
 #[test]
 fn receipt_integrity_validation_suite_rejects_invalid_vector_shapes() {
-    let invalid_mutations: [fn(&mut Value); 8] = [
+    let invalid_mutations: [fn(&mut Value); 9] = [
         |vectors| vectors["schemaVersion"] = json!("unsupported"),
         |vectors| vectors["cases"][0]["caseId"] = json!("-bad-case-id"),
         |vectors| {
@@ -104,6 +104,9 @@ fn receipt_integrity_validation_suite_rejects_invalid_vector_shapes() {
         |vectors| vectors["cases"][0]["receipt"] = json!("not-an-object"),
         |vectors| {
             vectors["cases"][1]["receipt"] = json!({ "schemaVersion": "coven.automations.v1" })
+        },
+        |vectors| {
+            vectors["cases"][1]["receipt"]["integrity"]["value"] = json!("not-a-sha256-digest")
         },
         |vectors| {
             vectors["cases"][0]["expected"]["normalizedDigest"] = json!("sha256:not-a-digest");
