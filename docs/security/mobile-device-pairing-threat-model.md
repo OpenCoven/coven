@@ -58,7 +58,9 @@ Controls:
 - bounded failures
 - transcript-bound endpoint keys and requested capabilities
 - explicit endpoint verification before grant issuance
-- immediate secret erasure after terminal state
+- immediate secret erasure after cancellation or expiry
+- owner-only local cancellation with remote cancellation/expiry
+  indistinguishability
 
 ### Relay impersonation or plaintext access
 
