@@ -39,7 +39,7 @@ class CheckCiWorkflowTests(unittest.TestCase):
         self.assertIn("\n  pr-gate:\n", CI_TEXT)
         self.assertIn("name: PR gate", CI_TEXT)
         self.assertIn(
-            "if: ${{ always() && !cancelled() && github.event_name == 'pull_request' }}",
+            "if: ${{ always() && !cancelled() }}",
             CI_TEXT,
         )
 
@@ -165,6 +165,50 @@ class CheckCiWorkflowTests(unittest.TestCase):
     def test_release_includes_performance_baseline_dependency(self) -> None:
         self.assertIn('performance-baseline', RELEASE_TEXT)
         self.assertIn('needs: [build-platform, npm-dry-run, performance-baseline, verify-tag]', RELEASE_TEXT)
+
+    def test_release_requires_exact_source_acceptance_before_dependents_run(self) -> None:
+        verify_tag = RELEASE_TEXT.split("\n  verify-tag:\n", 1)[1].split(
+            "\n  performance-baseline:\n", 1
+        )[0]
+        self.assertIn("actions: read", verify_tag)
+        self.assertIn("id: tag-verification", verify_tag)
+        self.assertIn('echo "head_sha=$TAGGED_COMMIT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertIn('echo "tag_object_sha=$TAG_OBJECT_SHA" >> "$GITHUB_OUTPUT"', verify_tag)
+        self.assertIn("package-github-release.mjs verify-source-acceptance", verify_tag)
+        self.assertIn('--head-sha "$HEAD_SHA"', verify_tag)
+        self.assertIn('--tag-object-sha "$TAG_OBJECT_SHA"', verify_tag)
+        self.assertIn("--output release-source-acceptance.json", verify_tag)
+        self.assertIn(
+            "name: coven-release-source-acceptance-${{ steps.release-context.outputs.release_tag }}",
+            verify_tag,
+        )
+        self.assertIn("path: release-source-acceptance.json", verify_tag)
+        self.assertNotIn("continue-on-error:", verify_tag)
+        self.assertNotRegex(verify_tag, r"(?m)^\s+if:")
+        self.assertLess(
+            verify_tag.index("id: tag-verification"),
+            verify_tag.index("package-github-release.mjs verify-source-acceptance"),
+        )
+        self.assertLess(
+            verify_tag.index("package-github-release.mjs verify-source-acceptance"),
+            verify_tag.index("path: release-source-acceptance.json"),
+        )
+
+    def test_release_build_and_publish_jobs_cannot_bypass_source_acceptance(self) -> None:
+        # Match job blocks, not a needs string that could belong to another job.
+        jobs = dict(re.findall(
+            r"(?ms)^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+            RELEASE_TEXT.split("\njobs:\n", 1)[1],
+        ))
+        for job_name in ('performance-baseline', 'build-platform', 'npm-dry-run', 'npm-publish'):
+            with self.subTest(job=job_name):
+                job = jobs[job_name]
+                needs = re.search(r"(?m)^    needs: \[([^\]]+)\]$", job)
+                self.assertIsNotNone(needs)
+                self.assertIn('verify-tag', [name.strip() for name in needs.group(1).split(',')])
+                # Default job conditions propagate dependency failures. A status
+                # override or job-level continue-on-error would weaken that gate.
+                self.assertNotRegex(job, r"(?m)^    (if|continue-on-error):")
 
     def test_release_stress_workflow_is_bounded_and_uploads_failure_evidence(self) -> None:
         stress_text = RELEASE_STRESS_WORKFLOW.read_text(encoding='utf-8')
