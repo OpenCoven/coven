@@ -2098,6 +2098,8 @@ mod tests {
                 io::{FromRawHandle, OwnedHandle},
             },
             ptr,
+            sync::mpsc,
+            time::Duration,
         };
         use windows_sys::Win32::{
             Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
@@ -2106,6 +2108,11 @@ mod tests {
             },
         };
 
+        assert_eq!(
+            windows_status_file_share_mode(),
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ | FILE_SHARE_DELETE,
+            "status readers must retain the exact read/delete sharing contract"
+        );
         let home = StatusSharingHome::new();
         let status_path = home.path().join("daemon.json");
         let status_path_wide: Vec<u16> = status_path
@@ -2142,21 +2149,55 @@ mod tests {
             };
             assert_ne!(reader, INVALID_HANDLE_VALUE, "open status reader");
             let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
-            // Keep the reader open throughout the bounded writer operation. Dropping
-            // it before checking the result would hide a missing delete-share flag.
-            let result = match staging {
-                Some(staging) => crate::write_owner_only_windows_daemon_status_with_staging(
-                    home.path(),
-                    staging,
-                    b"{\"pid\":2}",
-                ),
-                None => crate::write_owner_only_windows_daemon_status(home.path(), b"{\"pid\":2}"),
-            };
             if allow_delete {
-                result.expect("replace status while reader remains open");
+                let home_path = home.path().to_owned();
+                let staging_path = staging.map(std::path::Path::to_owned);
+                let (result_tx, result_rx) = mpsc::channel();
+                let writer = std::thread::spawn(move || {
+                    let result = match staging_path {
+                        Some(staging) => {
+                            crate::write_owner_only_windows_daemon_status_with_staging(
+                                &home_path,
+                                &staging,
+                                b"{\"pid\":2}",
+                            )
+                        }
+                        None => crate::write_owner_only_windows_daemon_status(
+                            &home_path,
+                            b"{\"pid\":2}",
+                        ),
+                    };
+                    result_tx.send(result).expect("report status replacement");
+                });
+                // Native CI deferred MoveFileExW replacement while this reader was
+                // open. Preserve the original bounded close-and-success contract:
+                // otherwise release the reader and require bounded completion.
+                let early_result = result_rx.recv_timeout(Duration::from_millis(20));
+                drop(reader);
+                let result = match early_result {
+                    Ok(result) => result,
+                    Err(mpsc::RecvTimeoutError::Timeout) => result_rx
+                        .recv_timeout(Duration::from_secs(2))
+                        .expect("status replacement result"),
+                    Err(error) => panic!("status replacement channel failed: {error}"),
+                };
+                writer.join().expect("status replacement thread");
+                result.expect("replace status with a delete-sharing reader");
                 crate::status::tests::assert_status_file_is_owner_only(&status_path);
                 assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":2}\n");
             } else {
+                // Hold the non-delete-sharing reader for the writer's complete
+                // replacement deadline so the failure cannot be hidden by close.
+                let result = match staging {
+                    Some(staging) => crate::write_owner_only_windows_daemon_status_with_staging(
+                        home.path(),
+                        staging,
+                        b"{\"pid\":2}",
+                    ),
+                    None => {
+                        crate::write_owner_only_windows_daemon_status(home.path(), b"{\"pid\":2}")
+                    }
+                };
                 let error =
                     result.expect_err("reader without delete sharing must prevent replacement");
                 assert!(matches!(
@@ -2168,8 +2209,8 @@ mod tests {
                     }
                 ));
                 assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":1}");
+                drop(reader);
             }
-            drop(reader);
             assert_eq!(
                 temporary_files(),
                 before,
