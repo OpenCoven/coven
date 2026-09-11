@@ -503,7 +503,7 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             for path in module.SESSION_LAUNCH_POLICY_DOCS
         }
         expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
-        self.assertEqual(expected_count, 16)
+        self.assertEqual(expected_count, 17)
         for path in module.HEALTH_CAPABILITY_COUNT_DOCS:
             with self.subTest(path=path):
                 changed = dict(documents)
@@ -1450,6 +1450,53 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
             errors,
         )
 
+    def test_canonical_health_requires_exact_owner_local_session_policy(self) -> None:
+        for value in (self.MISSING, [], None, "coven.session-policy.v1",
+                      ["coven.session-policy.v2"]):
+            with self.subTest(value=value):
+                changed = self.o3_structure_documents()
+                self.mutate_health_capability(
+                    changed,
+                    "docs/API-CONTRACT.md",
+                    "`GET /api/v1/health`",
+                    "sessionPolicyContracts",
+                    value,
+                )
+                errors = module.validate_o3_document_structures(changed)
+                expected = (
+                    "missing sessionPolicyContracts" if value is self.MISSING
+                    else 'sessionPolicyContracts must equal ["coven.session-policy.v1"]'
+                )
+                self.assertIn(
+                    f"docs/API-CONTRACT.md: canonical health example {expected}",
+                    errors,
+                )
+
+    def test_canonical_capability_table_requires_session_policy_contract(
+        self,
+    ) -> None:
+        path = "docs/API-CONTRACT.md"
+        changed = self.o3_structure_documents()
+        section = module.markdown_section(
+            changed[path], "Capability fields", level=3
+        )
+        self.assertIsNotNone(section)
+        table = module.markdown_table(
+            section or "", ("Field", "Type", "Description")
+        )
+        self.assertIsNotNone(table)
+        rows = module.markdown_table_rows(
+            table, {"Field": "sessionPolicyContracts"}
+        )
+        self.assertEqual(len(rows), 1)
+        changed[path] = self.replace_once(changed[path], rows[0].source, "")
+
+        errors = module.validate_o3_document_structures(changed)
+        self.assertIn(
+            f"{path}: capability table missing sessionPolicyContracts row",
+            errors,
+        )
+
     def test_canonical_health_rejects_wrong_request_adoption_literal(self) -> None:
         changed = self.o3_structure_documents()
         self.mutate_health_capability(
@@ -2329,14 +2376,18 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         section = module.markdown_section(
             duplicate_dto[path], "Version compatibility"
         )
-        marker = "The complete current 16-field Rust health-capability DTO"
+        marker = (
+            "The complete current "
+            f"{len(module.HEALTH_CAPABILITY_FIELDS)}-field Rust "
+            "health-capability DTO"
+        )
         paragraph = module.markdown_paragraph(section or "", marker)
         self.assertIsNotNone(paragraph)
         corrupt_paragraph = (paragraph or "").replace(
             "`requestAdoptionContracts`", "`removedCapability`"
         )
         corrupt_paragraph += (
-            "\nDecoy: `requestAdoptionContracts` and "
+            "\nDecoy: `requestAdoptionContracts`, `sessionPolicyContracts`, and "
             "../../docs/API-CONTRACT.md#get-apiv1health."
         )
         duplicate_dto[path] = self.replace_once(
@@ -2347,6 +2398,34 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
         errors = module.validate_o3_document_structures(duplicate_dto)
         self.assertIn(
             f"{path}: canonical health DTO reference is ambiguous (found 2)",
+            errors,
+        )
+
+    def test_openclaw_health_dto_count_matches_current_capabilities(self) -> None:
+        path = "packages/openclaw-coven/README.md"
+        changed = self.o3_structure_documents()
+        expected_count = len(module.HEALTH_CAPABILITY_FIELDS)
+        marker = (
+            f"The complete current {expected_count}-field Rust "
+            "health-capability DTO"
+        )
+        section = module.markdown_section(
+            changed[path], "Version compatibility"
+        )
+        paragraph = module.markdown_paragraph(section or "", marker)
+        self.assertIsNotNone(paragraph)
+        stale = self.replace_once(
+            paragraph or "",
+            f"{expected_count}-field",
+            f"{expected_count - 1}-field",
+        )
+        changed[path] = self.replace_once(
+            changed[path], paragraph or "", stale
+        )
+
+        errors = module.validate_o3_document_structures(changed)
+        self.assertIn(
+            f"{path}: canonical health DTO reference is missing",
             errors,
         )
 
@@ -2444,6 +2523,26 @@ Marks only stale unowned `created` rows without launch-adoption or historical re
                         f"{path}: adopted route table missing POST {route}",
                         errors,
                     )
+
+    def test_reference_api_requires_restricted_session_route(self) -> None:
+        path = "docs/reference/api.md"
+        changed = self.o3_structure_documents()
+        section = module.markdown_section(
+            changed[path], "Sessions and events", level=2
+        )
+        self.assertIsNotNone(section)
+        row = module.markdown_route_row(
+            section or "", "POST", "/api/v1/sessions/restricted"
+        )
+        self.assertIsNotNone(row)
+        changed[path] = self.replace_once(changed[path], row or "", "")
+
+        errors = module.validate_o3_document_structures(changed)
+        self.assertIn(
+            f"{path}: session policy route table missing "
+            "POST /api/v1/sessions/restricted",
+            errors,
+        )
 
     def test_o3_error_surfaces_ignore_error_decoys(self) -> None:
         routes = (
