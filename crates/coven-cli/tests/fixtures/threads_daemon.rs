@@ -145,12 +145,22 @@ forbidden = ["(?i)ignore previous"]
             ConnectOptions::new()
                 .name(pipe.to_ns_name::<GenericNamespaced>()?)
                 .wait_mode(ConnectWaitMode::Timeout(LIFECYCLE_TIMEOUT))
-                .connect_sync()?
+                .connect_sync_as::<WindowsPipe>()?
         };
         #[cfg(windows)]
         use interprocess::local_socket::prelude::*;
         stream.set_nonblocking(true)?;
-        Ok(stream)
+        #[cfg(unix)]
+        {
+            Ok(stream)
+        }
+        #[cfg(windows)]
+        {
+            Ok(NonblockingPipe {
+                stream,
+                probe: windows_pipe_connected,
+            })
+        }
     }
 
     pub fn store(&self) -> Result<Connection> {
@@ -444,5 +454,160 @@ fn exchange_http(stream: &mut (impl Read + Write), mut request: &[u8]) -> Result
                 });
             }
         }
+    }
+}
+
+#[cfg(any(windows, test))]
+struct NonblockingPipe<S, P> {
+    stream: S,
+    probe: P,
+}
+
+#[cfg(any(windows, test))]
+impl<S: Read, P: FnMut(&S) -> io::Result<()>> Read for NonblockingPipe<S, P> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        match self.stream.read(buffer) {
+            // interprocess 2.4.4 downgrades ERROR_NO_DATA and real pipe
+            // disconnects alike to Ok(0). Retry only a still-connected pipe.
+            Ok(0) => {
+                (self.probe)(&self.stream)?;
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+            result => result,
+        }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl<S: Write, P> Write for NonblockingPipe<S, P> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.stream.write(buffer)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+#[cfg(windows)]
+type WindowsPipe = interprocess::os::windows::named_pipe::local_socket::Stream;
+
+#[cfg(windows)]
+fn windows_pipe_connected(stream: &WindowsPipe) -> io::Result<()> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    // SAFETY: the stream owns this connected pipe handle; null buffer/output
+    // pointers request only a non-consuming connection probe.
+    let connected = unsafe {
+        PeekNamedPipe(
+            stream.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if connected == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    struct ScriptedStream(VecDeque<&'static [u8]>);
+
+    impl Read for ScriptedStream {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let chunk = self.0.pop_front().expect("unexpected extra fixture read");
+            assert!(chunk.len() <= buffer.len());
+            buffer[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    impl Write for ScriptedStream {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn idle_pipe_reads_before_and_during_response_are_retried() -> Result<()> {
+        let mut pipe = NonblockingPipe {
+            stream: ScriptedStream(VecDeque::from([
+                b"".as_slice(),
+                b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n",
+                b"",
+                br#"{"ok":"#,
+                b"",
+                b"true}",
+            ])),
+            probe: |_: &ScriptedStream| Ok(()),
+        };
+        let response = exchange_http(&mut pipe, b"GET /health HTTP/1.1\r\n\r\n")?;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, serde_json::json!({"ok": true}));
+        assert!(pipe.stream.0.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn disconnected_pipe_preserves_the_probe_error() {
+        let mut pipe = NonblockingPipe {
+            stream: ScriptedStream(VecDeque::from([b"".as_slice()])),
+            probe: |_: &ScriptedStream| Err(io::Error::from_raw_os_error(109)),
+        };
+        let error = exchange_http(&mut pipe, b"request").unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error),
+            Some(109),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn socket_eof_still_rejects_an_incomplete_response() {
+        let mut socket = ScriptedStream(VecDeque::from([b"".as_slice()]));
+        let error = exchange_http(&mut socket, b"request").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("closed before a complete HTTP response"));
+    }
+
+    #[test]
+    fn empty_pipe_read_buffer_does_not_probe_or_consume_data() {
+        let mut pipe = NonblockingPipe {
+            stream: ScriptedStream(VecDeque::new()),
+            probe: |_: &ScriptedStream| panic!("empty read must not probe the pipe"),
+        };
+        assert_eq!(pipe.read(&mut []).unwrap(), 0);
+    }
+
+    #[test]
+    fn permanently_idle_pipe_still_expires_at_the_http_deadline() {
+        let mut pipe = NonblockingPipe {
+            stream: io::Cursor::new(Vec::new()),
+            probe: |_: &io::Cursor<Vec<u8>>| Ok(()),
+        };
+        let error = exchange_http(&mut pipe, b"request").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("fixture HTTP exchange timed out"));
     }
 }
