@@ -1,6 +1,6 @@
 import os from "node:os";
 import path from "node:path";
-import { z } from "openclaw/plugin-sdk/zod";
+import { z } from "zod";
 import { lstatIfExists, pathIsInside, realpathIfExists } from "./path-utils.js";
 
 export type CovenPluginConfig = {
