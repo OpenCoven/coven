@@ -331,6 +331,14 @@ Known enum values in `v1`:
 
 Clients should ignore unknown future capability ids and action ids unless they explicitly support them.
 
+Capability entries may also carry an optional `variantNegotiation` object. It
+is currently present only on `coven.automations`, where its value is the exact
+typed projection of
+[`spec/coven-automations/v1/capabilities.json`](../spec/coven-automations/v1/capabilities.json),
+including `version`, `contractProfile`, `supported`, `experimental`, `refused`,
+and `negotiationRules`. Entries without variant negotiation omit the field, so
+the catalog remains distinct from the harness manifests below.
+
 ## Harness capability manifests (`v1`)
 
 Distinct from the control-plane catalog above, `GET /api/v1/capabilities/harnesses` returns what each installed harness brings (global instructions, skills, plugins) plus Coven-owned skills, and `GET /api/v1/capabilities/:harnessId` returns a single harness's manifest. Both accept `?refresh=1` to invalidate the 5-minute scan cache. This surface keeps the snake_case field names pinned by `specs/coven-harness-capabilities/`:

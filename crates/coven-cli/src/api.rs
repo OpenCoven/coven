@@ -15767,6 +15767,18 @@ pub(crate) mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let response = handle_request("GET", "/api/v1/capabilities", temp_dir.path(), None)?;
+        let body: Value = serde_json::from_str(&response.body)?;
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-automations/v1/capabilities.json"
+        ))?;
+        let automations = body["capabilities"]
+            .as_array()
+            .and_then(|capabilities| {
+                capabilities
+                    .iter()
+                    .find(|capability| capability["id"] == "coven.automations")
+            })
+            .expect("catalog includes coven.automations");
 
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""id":"coven.sessions""#));
@@ -15775,6 +15787,8 @@ pub(crate) mod tests {
         assert!(response.body.contains(r#""id":"coven.control.actions""#));
         assert!(response.body.contains(r#""id":"desktop.automation""#));
         assert!(response.body.contains(r#""policy":"requiresApproval""#));
+        assert_eq!(automations["variantNegotiation"], expected);
+        assert!(body.get("harness_capabilities").is_none());
         Ok(())
     }
 
@@ -17511,7 +17525,7 @@ pub(crate) mod tests {
                 "id": "bad schedule!",
                 "name": "Bad",
                 "status": "PAUSED",
-                "rrule": "FREQ=HOURLY",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
                 "timezone": "local",
                 "misfire": "latest",
                 "overlap": "forbid",
@@ -17535,6 +17549,827 @@ pub(crate) mod tests {
             .contains("coven.automations.definition.create.v1"));
         assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
         assert!(!response.body.contains(r#""accepted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_preserve_validation_precedence_over_capability_refusal() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let complete_definition = json!({
+            "schemaVersion": 1,
+            "id": "validation-precedence",
+            "name": "Validation precedence",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "local",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Must not be stored."
+        });
+        let cases = [
+            ("partial", json!({"misfire": "backfill"})),
+            ("malformed-retry", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["retry"] = json!({
+                    "maxAttempts": 3,
+                    "backoffPolicy": ["linear"]
+                });
+                definition
+            }),
+            ("unknown-field", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["futureField"] = json!("must fail closed");
+                definition
+            }),
+            ("malformed-rich-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": [1]
+                    }
+                });
+                definition
+            }),
+            ("malformed-rich-schedule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "version": 1,
+                    "schedule": {
+                        "rrule": "FREQ=YEARLY;BYHOUR=not-a-number",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("missing-rich-schedule-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "schedule": {
+                        "rrule": "FREQ=DAILY",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("fixed-rich-retry-missing-seconds", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "fixed"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-flat-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["misfire"] = json!(" backfill ");
+                definition
+            }),
+            ("noncanonical-rich-union-discriminator", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": " webhook ",
+                    "version": 1,
+                    "webhook": {}
+                });
+                definition
+            }),
+            ("unsupported-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": "stream"
+                    }
+                });
+                definition
+            }),
+            ("bad-rich-delivery-target", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": 7,
+                        "mode": "atomic"
+                    }
+                });
+                definition
+            }),
+            ("rich-delivery-target-missing-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": " atomic "
+                    }
+                });
+                definition
+            }),
+            ("unsupported-rich-misfire", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "misfire": {"disposition": "backfill"}
+                });
+                definition
+            }),
+            ("unsupported-rich-concurrency", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "concurrency": {"overlap": "parallel"}
+                });
+                definition
+            }),
+            ("supported-rich-action-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["action"] = json!({
+                    "variant": "familiarInvocation",
+                    "prompt": "Run it."
+                });
+                definition
+            }),
+            ("unsupported-rich-condition-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["conditions"] = json!([{
+                    "variant": "branch",
+                    "branch": {"expression": "result.ok"}
+                }]);
+                definition
+            }),
+            ("malformed-rrule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+                definition
+            }),
+            ("malformed-retention", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": false}
+                    }
+                });
+                definition
+            }),
+        ];
+
+        for (case, definition) in cases {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:validation-precedence:{case}"),
+                "definition": definition
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 400, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "VALIDATION_FAILED", "{case}");
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_responses_and_adoptions_do_not_expose_secret_values(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let base_definition = |id: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Secret-free validation",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored."
+            })
+        };
+        let cases = [
+            (
+                "retryable-class",
+                "SECRET_RETRYABLE_CLASS must not escape",
+                {
+                    let mut definition = base_definition("secret-retryable-class");
+                    definition["retry"] = json!({
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["SECRET_RETRYABLE_CLASS must not escape"]
+                    });
+                    definition
+                },
+            ),
+            (
+                "union-discriminator",
+                "SECRET_UNION_DISCRIMINATOR must not escape",
+                {
+                    let mut definition = base_definition("secret-union-discriminator");
+                    definition["action"] = json!({
+                        "variant": "SECRET_UNION_DISCRIMINATOR must not escape",
+                        "version": 1
+                    });
+                    definition
+                },
+            ),
+            ("timezone", "SECRET_TIMEZONE must not escape", {
+                let mut definition = base_definition("secret-timezone");
+                definition["timezone"] = json!("SECRET_TIMEZONE must not escape");
+                definition
+            }),
+            ("rrule", "SECRET_RRULE_VALUE", {
+                let mut definition = base_definition("secret-rrule");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=SECRET_RRULE_VALUE");
+                definition
+            }),
+        ];
+
+        for (case, secret, invalid_definition) in cases {
+            for command_kind in ["create", "revise"] {
+                let target_id = format!("secret-free-{command_kind}-{case}");
+                let mut definition = invalid_definition.clone();
+                definition["id"] = json!(target_id);
+
+                if command_kind == "revise" {
+                    let setup = json!({
+                        "action": "coven.automations.definition.create.v1",
+                        "adoptionKey": format!("adopt:create:secret-free-setup-{case}:0001"),
+                        "definition": base_definition(&target_id)
+                    })
+                    .to_string();
+                    let response = handle_request_with_body(
+                        "POST",
+                        "/api/v1/actions",
+                        temp_dir.path(),
+                        None,
+                        Some(&setup),
+                    )?;
+                    assert_eq!(response.status, 200, "{case}: {}", response.body);
+                }
+
+                let adoption_key = format!("adopt:{command_kind}:secret-free-{case}:0001");
+                let mut request = json!({
+                    "action": format!(
+                        "coven.automations.definition.{command_kind}.v1"
+                    ),
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(1);
+                }
+                let request = request.to_string();
+
+                let first = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(first.status, 400, "{command_kind} {case}: {}", first.body);
+                let first_body: Value = serde_json::from_str(&first.body)?;
+                assert_eq!(
+                    first_body["error"]["code"], "VALIDATION_FAILED",
+                    "{command_kind} {case}"
+                );
+                assert_eq!(
+                    first_body["error"]["message"], "automation definition failed validation",
+                    "{command_kind} {case}"
+                );
+                assert!(
+                    !first.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+                assert!(
+                    !first.body.contains("CAPABILITY_UNSUPPORTED"),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+
+                let replay = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(replay.status, 400, "{command_kind} {case}: {}", replay.body);
+                assert_eq!(
+                    replay.body, first.body,
+                    "{command_kind} {case} replay changed"
+                );
+                assert!(
+                    !replay.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    replay.body
+                );
+
+                let conn = store::open_store(&store_path(temp_dir.path()))?;
+                let adoption_json: String = conn.query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    !adoption_json.contains(secret),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+                assert!(
+                    adoption_json.contains("automation definition failed validation"),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_replay_scrubs_legacy_secret_bearing_storage() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-api-{command_kind}");
+            let definition = json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Legacy validation replay",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "invalid legacy timezone",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not run."
+            });
+            let action = format!("coven.automations.definition.{command_kind}.v1");
+            let source_key = format!("adopt:{command_kind}:legacy-secret-source:0001");
+            let replay_key = format!("adopt:{command_kind}:legacy-secret-replay:0001");
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let request_for = |adoption_key: &str, definition: Value| {
+                let mut request = json!({
+                    "action": action,
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(7);
+                }
+                request
+            };
+            let source_request = request_for(&source_key, definition.clone()).to_string();
+            let source = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&source_request),
+            )?;
+            assert_eq!(source.status, 400, "{command_kind}: {}", source.body);
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let request_digest: String = conn.query_row(
+                "SELECT request_digest
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )?;
+            let secret = format!("SECRET_{command_kind}_API_VALIDATION_VALUE");
+            let legacy_response = json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": "VALIDATION_FAILED",
+                    "httpStatus": 400,
+                    "message": format!("legacy validation exposed {secret}"),
+                    "retryable": true,
+                    "details": {"submittedValue": secret},
+                    "adoption": {
+                        "key": replay_key,
+                        "conflictOutcome": "rejected"
+                    },
+                    "currentRevision": 4
+                }
+            })
+            .to_string();
+            for adoption_key in [&replay_key, &mismatch_key] {
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, request_digest, command, automation_id, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                    rusqlite::params![
+                        adoption_key,
+                        request_digest,
+                        format!("definition.{command_kind}.v1"),
+                        id,
+                        legacy_response,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )?;
+            }
+            drop(conn);
+
+            let exact_request = request_for(&replay_key, definition.clone()).to_string();
+            let replay = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(replay.status, 400, "{command_kind}: {}", replay.body);
+            let replay_body: Value = serde_json::from_str(&replay.body)?;
+            assert_eq!(replay_body["error"]["code"], "VALIDATION_FAILED");
+            assert_eq!(
+                replay_body["error"]["message"],
+                "automation definition failed validation"
+            );
+            assert_eq!(replay_body["error"]["retryable"], false);
+            assert_eq!(replay_body["error"]["currentRevision"], 4);
+            assert!(replay_body["error"].get("details").is_none());
+            assert!(replay_body["error"].get("adoption").is_none());
+            assert!(!replay.body.contains(&secret));
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let sanitized_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert!(!sanitized_response.contains(&secret));
+            drop(conn);
+
+            let repeated = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(repeated.body, replay.body);
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let repeated_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(repeated_response, sanitized_response);
+            drop(conn);
+
+            let mut changed_definition = definition;
+            changed_definition["prompt"] = json!("Changed request.");
+            let mismatch_request = request_for(&mismatch_key, changed_definition).to_string();
+            let mismatch = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&mismatch_request),
+            )?;
+            assert_eq!(mismatch.status, 409, "{command_kind}: {}", mismatch.body);
+            assert!(mismatch
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let unchanged_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&mismatch_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(unchanged_response, legacy_response);
+            assert!(unchanged_response.contains(&secret));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_refuse_unsupported_rich_policy_variants() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        for (case, policies, expected_variant) in [
+            (
+                "retry-class",
+                json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["runtime_unavailable", "ambiguous"]
+                    }
+                }),
+                "retry.safe-classes.ambiguous",
+            ),
+            (
+                "retention",
+                json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": "standard"},
+                        "runLogs": {"classification": "ephemeral"}
+                    }
+                }),
+                "retention.ephemeral",
+            ),
+        ] {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:unsupported-policy:{case}"),
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": format!("unsupported-policy-{case}"),
+                    "name": "Unsupported policy",
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Must not be stored.",
+                    "policies": policies
+                }
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 422, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "CAPABILITY_UNSUPPORTED", "{case}");
+            assert_eq!(
+                body["error"]["details"]["variant"], expected_variant,
+                "{case}"
+            );
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_durably_reject_unsupported_create_and_revise_variants() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let unsupported_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsupported-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsupported-create-http",
+                "name": "Unsupported create",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "outputTarget": "result.md",
+                "prompt": "Must not be stored."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_create: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_create["ok"], false);
+        assert_eq!(first_create["accepted"], false);
+        assert_eq!(first_create["status"], "rejected");
+        assert_eq!(first_create["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_create["error"]["message"],
+            "automation definition uses a variant not supported by the negotiated contract profile"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["variant"],
+            "outputTarget.atomic"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_create.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_create);
+
+        let mut changed_create = unsupported_create.clone();
+        changed_create["definition"]["outputTarget"] = json!("different.md");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_create.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let valid_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:revise-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Original",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Original prompt."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&valid_create.to_string()),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let unsupported_revise = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:unsupported-http:0002",
+            "expectedRevision": 1,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Must not land",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored.",
+                "action": {
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "First step"}]
+                }
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_revise: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_revise["ok"], false);
+        assert_eq!(first_revise["accepted"], false);
+        assert_eq!(first_revise["status"], "rejected");
+        assert_eq!(first_revise["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_revise["error"]["details"]["variant"],
+            "action.pipeline"
+        );
+        assert_eq!(
+            first_revise["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_revise.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_revise);
+
+        let mut changed_revise = unsupported_revise;
+        changed_revise["definition"]["action"]["variant"] = json!("batch");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition = crate::automations::store::get_definition(&conn, "revise-http")?
+            .expect("original definition remains");
+        assert_eq!(definition.revision, 1);
+        assert!(definition.definition_json.contains(r#""name":"Original""#));
+        assert!(
+            crate::automations::store::get_definition(&conn, "unsupported-create-http")?.is_none()
+        );
+        let definition_events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_events
+             WHERE stream_kind = 'automation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_events, 1);
+        let rejected_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE outcome = 'rejected'
+               AND adoption_key IN (
+                   'adopt:create:unsupported-http:0001',
+                   'adopt:revise:unsupported-http:0002'
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rejected_adoptions, 2);
         Ok(())
     }
 
@@ -18529,6 +19364,18 @@ pub(crate) mod tests {
         Ok(count.try_into()?)
     }
 
+    fn assert_adopted_launch_store_ready(coven_home: &Path) -> anyhow::Result<()> {
+        // Unlike open_store, this cannot hide cold-start migration work in a
+        // request-readiness deadline. Real daemon startup initializes first.
+        let conn = store::open_initialized_store(&store_path(coven_home))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
     fn assert_adoption_error(
         response: &ApiResponse,
         status: u16,
@@ -18979,6 +19826,8 @@ pub(crate) mod tests {
     fn adopted_launch_concurrent_replay_observes_committed_created() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let body = adopted_launch_body(
@@ -19113,6 +19962,8 @@ pub(crate) mod tests {
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let git = std::process::Command::new("git")
