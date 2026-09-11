@@ -2174,14 +2174,17 @@ mod tests {
                 // otherwise release the reader and require bounded completion.
                 let early_result = result_rx.recv_timeout(Duration::from_millis(20));
                 drop(reader);
-                let result = match early_result {
-                    Ok(result) => result,
-                    Err(mpsc::RecvTimeoutError::Timeout) => result_rx
-                        .recv_timeout(Duration::from_secs(2))
-                        .expect("status replacement result"),
-                    Err(error) => panic!("status replacement channel failed: {error}"),
+                let received = match early_result {
+                    Ok(result) => Ok(result),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        result_rx.recv_timeout(Duration::from_secs(2))
+                    }
+                    Err(error) => Err(error),
                 };
-                writer.join().expect("status replacement thread");
+                if let Err(panic) = writer.join() {
+                    std::panic::resume_unwind(panic);
+                }
+                let result = received.expect("status replacement result");
                 result.expect("replace status after reader closes");
                 crate::status::tests::assert_status_file_is_owner_only(&status_path);
                 assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":2}\n");
