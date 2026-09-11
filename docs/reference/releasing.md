@@ -155,8 +155,10 @@ That single push is the entire release. The workflow takes over from there.
    exactly one matching `CI` workflow run from a `main` push at that SHA.
    That run must have completed successfully, and its stable `PR gate` job
    from the selected run attempt must be completed with conclusion
-   `success`. The workflow records the run, attempt, required job, tag object,
-   and candidate commit in the retained
+   `success`. The verifier reads every Actions result page and refuses missing,
+   inconsistent, truncated, or unsearchably large pagination evidence. The
+   workflow records the run, attempt, required job, tag object, and candidate
+   commit in the retained
    `coven-release-source-acceptance-vX.Y.Z` JSON artifact.
 4. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
 5. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.

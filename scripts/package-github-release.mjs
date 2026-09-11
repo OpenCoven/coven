@@ -19,6 +19,8 @@ const CI_WORKFLOW_PATH = '.github/workflows/ci.yml';
 const CI_WORKFLOW_FILE = 'ci.yml';
 const DEFAULT_BRANCH = 'main';
 const REQUIRED_SOURCE_CHECKS = ['PR gate'];
+const ACTIONS_PAGE_SIZE = 100;
+const FILTERED_WORKFLOW_RUN_LIMIT = 1000;
 const REPOSITORY_URL = 'https://github.com/OpenCoven/coven';
 const NPM_REGISTRY_URL = 'https://registry.npmjs.org';
 const TRUSTED_PUBLISHER_PREDICATE =
@@ -521,6 +523,66 @@ export function verifySourceAcceptanceJobs(
   });
 }
 
+async function fetchCompleteActionsCollection({
+  ghApi,
+  endpoint,
+  collectionName,
+  description,
+  maxTotalCount
+}) {
+  const items = [];
+  let expectedTotalCount;
+  for (let page = 1; ; page += 1) {
+    const separator = endpoint.includes('?') ? '&' : '?';
+    const payload = await ghApi(
+      `${endpoint}${separator}per_page=${ACTIONS_PAGE_SIZE}&page=${page}`
+    );
+    const pageItems = payload?.[collectionName];
+    if (!Array.isArray(pageItems)) {
+      throw new Error(
+        `Refusing release: ${description} response is missing ${collectionName}.`
+      );
+    }
+    const totalCount = payload?.total_count;
+    if (!Number.isSafeInteger(totalCount) || totalCount < 0) {
+      throw new Error(
+        `Refusing release: ${description} pagination has invalid total_count ${JSON.stringify(totalCount)}.`
+      );
+    }
+    if (expectedTotalCount === undefined) {
+      expectedTotalCount = totalCount;
+      if (maxTotalCount !== undefined && totalCount > maxTotalCount) {
+        throw new Error(
+          `Refusing release: ${description} returned total_count ${totalCount}, exceeding the GitHub searchable-result limit ${maxTotalCount}.`
+        );
+      }
+    } else if (totalCount !== expectedTotalCount) {
+      throw new Error(
+        `Refusing release: ${description} pagination total_count changed from ${expectedTotalCount} to ${totalCount}.`
+      );
+    }
+    if (pageItems.length > ACTIONS_PAGE_SIZE) {
+      throw new Error(
+        `Refusing release: ${description} pagination page ${page} returned ${pageItems.length} entries, exceeding per_page=${ACTIONS_PAGE_SIZE}.`
+      );
+    }
+    if (items.length + pageItems.length > expectedTotalCount) {
+      throw new Error(
+        `Refusing release: ${description} pagination returned more entries than total_count ${expectedTotalCount}.`
+      );
+    }
+    items.push(...pageItems);
+    if (items.length === expectedTotalCount) {
+      return { total_count: expectedTotalCount, [collectionName]: items };
+    }
+    if (pageItems.length !== ACTIONS_PAGE_SIZE) {
+      throw new Error(
+        `Refusing release: ${description} pagination returned ${items.length} of total_count ${expectedTotalCount} entries.`
+      );
+    }
+  }
+}
+
 export async function resolveReleaseSourceAcceptance({
   repository,
   releaseTag,
@@ -544,13 +606,20 @@ export async function resolveReleaseSourceAcceptance({
       `Refusing release: verified tag object must be a 40-character Git SHA, got ${JSON.stringify(tagObjectSha)}.`
     );
   }
-  const workflowRuns = await ghApi(
-    `/repos/${normalizedRepository}/actions/runs?branch=${DEFAULT_BRANCH}&event=push&head_sha=${encodeURIComponent(headSha)}&per_page=100`
-  );
+  const workflowRuns = await fetchCompleteActionsCollection({
+    ghApi,
+    endpoint: `/repos/${normalizedRepository}/actions/runs?branch=${DEFAULT_BRANCH}&event=push&head_sha=${encodeURIComponent(headSha)}`,
+    collectionName: 'workflow_runs',
+    description: 'GitHub CI workflow runs',
+    maxTotalCount: FILTERED_WORKFLOW_RUN_LIMIT
+  });
   const workflow = verifySourceAcceptanceWorkflowRun(workflowRuns, { headSha });
-  const jobsPayload = await ghApi(
-    `/repos/${normalizedRepository}/actions/runs/${workflow.runId}/attempts/${workflow.runAttempt}/jobs?per_page=100`
-  );
+  const jobsPayload = await fetchCompleteActionsCollection({
+    ghApi,
+    endpoint: `/repos/${normalizedRepository}/actions/runs/${workflow.runId}/attempts/${workflow.runAttempt}/jobs`,
+    collectionName: 'jobs',
+    description: `exact-source CI run ${workflow.runId} jobs`
+  });
   const requiredChecks = verifySourceAcceptanceJobs(jobsPayload, {
     runId: workflow.runId
   });

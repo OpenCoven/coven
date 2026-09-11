@@ -40,7 +40,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
@@ -204,7 +204,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-release-perf-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Validate benchmark runner
@@ -243,7 +243,7 @@ jobs:
           targets: ${{ matrix.rust-target }}
       - name: Install native link dependencies
         if: matrix.npm-target == 'linux-x64'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
         env:
           COVEN_BUILD_VERSION: v${{ needs.verify-tag.outputs.npm_version }}

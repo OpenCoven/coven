@@ -212,6 +212,7 @@ function baseValidCiWorkflowRun() {
 
 function baseValidCiJobs() {
   return {
+    total_count: 1,
     jobs: [
       {
         id: Number(PR_GATE_JOB_ID),
@@ -1035,13 +1036,100 @@ test('resolveReleaseSourceAcceptance propagates API failures without returning a
         ghApi: async () => {
           calls += 1;
           if (calls === failureCall) throw apiError;
-          return { workflow_runs: [baseValidCiWorkflowRun()] };
+          return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
         },
         now: () => { throw new Error('must not construct a receipt after an API failure'); }
       }),
       (error) => error === apiError
     );
     assert.equal(calls, failureCall);
+  }
+});
+
+test('resolveReleaseSourceAcceptance rejects duplicate runs and gates hidden on later pages', async () => {
+  const repository = 'OpenCoven/coven';
+  for (const hiddenDuplicate of ['workflow run', 'PR gate']) {
+    await assert.rejects(
+      resolveReleaseSourceAcceptance({
+        repository,
+        releaseTag: RELEASE_TAG,
+        headSha: HEAD_SHA,
+        tagObjectSha: '1'.repeat(40),
+        ghApi: async (endpoint) => {
+          const url = new URL(`https://api.github.test${endpoint}`);
+          const page = Number(url.searchParams.get('page') ?? '1');
+          if (url.pathname === `/repos/${repository}/actions/runs`) {
+            if (hiddenDuplicate === 'workflow run') {
+              if (page === 1) {
+                return {
+                  total_count: 101,
+                  workflow_runs: [
+                    baseValidCiWorkflowRun(),
+                    ...Array.from({ length: 99 }, (_, index) => ({
+                      ...baseValidCiWorkflowRun(),
+                      id: Number(CI_RUN_ID) + index + 10,
+                      name: 'Unrelated workflow'
+                    }))
+                  ]
+                };
+              }
+              return {
+                total_count: 101,
+                workflow_runs: [
+                  { ...baseValidCiWorkflowRun(), id: Number(CI_RUN_ID) + 1 }
+                ]
+              };
+            }
+            return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
+          }
+          if (url.pathname.endsWith(`/attempts/${CI_RUN_ATTEMPT}/jobs`)) {
+            if (hiddenDuplicate === 'PR gate') {
+              if (page === 1) {
+                return {
+                  total_count: 101,
+                  jobs: [
+                    baseValidCiJobs().jobs[0],
+                    ...Array.from({ length: 99 }, (_, index) => ({
+                      ...baseValidCiJobs().jobs[0],
+                      id: Number(PR_GATE_JOB_ID) + index + 10,
+                      name: 'Unrelated job'
+                    }))
+                  ]
+                };
+              }
+              return {
+                total_count: 101,
+                jobs: [
+                  { ...baseValidCiJobs().jobs[0], id: Number(PR_GATE_JOB_ID) + 1 }
+                ]
+              };
+            }
+            return { total_count: 1, jobs: baseValidCiJobs().jobs };
+          }
+          throw new Error(`unexpected endpoint ${endpoint}`);
+        }
+      }),
+      /ambiguous/,
+      hiddenDuplicate
+    );
+  }
+});
+
+test('resolveReleaseSourceAcceptance rejects missing or inconsistent pagination metadata', async () => {
+  for (const workflowPayload of [
+    { workflow_runs: [baseValidCiWorkflowRun()] },
+    { total_count: 2, workflow_runs: [baseValidCiWorkflowRun()] }
+  ]) {
+    await assert.rejects(
+      resolveReleaseSourceAcceptance({
+        repository: 'OpenCoven/coven',
+        releaseTag: RELEASE_TAG,
+        headSha: HEAD_SHA,
+        tagObjectSha: '1'.repeat(40),
+        ghApi: async () => workflowPayload
+      }),
+      /pagination|total_count/i
+    );
   }
 });
 
@@ -1055,13 +1143,19 @@ test('resolveReleaseSourceAcceptance reads the selected rerun attempt instead of
       tagObjectSha: '1'.repeat(40),
       ghApi: async (endpoint) => {
         if (endpoint.includes('/actions/runs?')) {
-          return { workflow_runs: [{ ...baseValidCiWorkflowRun(), run_attempt: selectedAttempt }] };
+          return {
+            total_count: 1,
+            workflow_runs: [{ ...baseValidCiWorkflowRun(), run_attempt: selectedAttempt }]
+          };
         }
         assert.equal(
           endpoint,
-          `/repos/OpenCoven/coven/actions/runs/${CI_RUN_ID}/attempts/${selectedAttempt}/jobs?per_page=100`
+          `/repos/OpenCoven/coven/actions/runs/${CI_RUN_ID}/attempts/${selectedAttempt}/jobs?per_page=100&page=1`
         );
-        return { jobs: [{ ...baseValidCiJobs().jobs[0], conclusion: 'failure' }] };
+        return {
+          total_count: 1,
+          jobs: [{ ...baseValidCiJobs().jobs[0], conclusion: 'failure' }]
+        };
       }
     }),
     /required check PR gate.*must have completed successfully/
@@ -1081,13 +1175,13 @@ test('resolveReleaseSourceAcceptance records exact workflow and required-check e
       calls.push(endpoint);
       if (
         endpoint ===
-        `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`
+        `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100&page=1`
       ) {
-        return { workflow_runs: [baseValidCiWorkflowRun()] };
+        return { total_count: 1, workflow_runs: [baseValidCiWorkflowRun()] };
       }
       if (
         endpoint ===
-        `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100`
+        `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=1`
       ) {
         return baseValidCiJobs();
       }
@@ -1127,8 +1221,8 @@ test('resolveReleaseSourceAcceptance records exact workflow and required-check e
     observedAt: '2026-09-07T00:00:00.000Z'
   });
   assert.deepEqual(calls, [
-    `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100`,
-    `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100`
+    `/repos/${repository}/actions/runs?branch=main&event=push&head_sha=${HEAD_SHA}&per_page=100&page=1`,
+    `/repos/${repository}/actions/runs/${CI_RUN_ID}/attempts/${CI_RUN_ATTEMPT}/jobs?per_page=100&page=1`
   ]);
 });
 
