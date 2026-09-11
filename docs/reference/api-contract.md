@@ -5,6 +5,7 @@ read_when:
   - Auditing whether a daemon upgrade is safe
 title: "API contract"
 description: "Reference for the coven.daemon.v1 local API contract: how Coven adds fields and endpoints safely and when breaking changes require a new contract version."
+source_adjacent_reason: "Tracks the named daemon API compatibility contract implemented in this repository."
 ---
 
 > **See also:** the fuller single-page contract — shapes, error codes, cursor pagination, hub control plane — lives in [`API-CONTRACT.md`](/API-CONTRACT) (`docs/API-CONTRACT.md`). This page is the condensed versioning and negotiation summary.

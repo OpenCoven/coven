@@ -5,6 +5,7 @@ read_when:
   - Auditing what the socket exposes
 title: "Socket API"
 description: "The Coven daemon exposes a small versioned HTTP API over same-user local IPC. Reference for the coven.daemon.v1 contract under the /api/v1 prefix."
+source_adjacent_reason: "Tracks the daemon IPC and API contract implemented in this repository."
 ---
 
 Coven exposes a small versioned HTTP API over same-user local IPC. On Unix-like
