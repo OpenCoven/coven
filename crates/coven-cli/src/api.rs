@@ -57,6 +57,11 @@ fn ward_write_audit_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn threads_scheduler_pass_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(test)]
 const TEST_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -500,6 +505,9 @@ impl std::fmt::Display for RuntimeLaunchAdmissionClosedError {
 
 impl std::error::Error for RuntimeLaunchAdmissionClosedError {}
 
+pub(crate) const RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED: &str =
+    "runtime does not accept automation authority projections; no process started";
+
 pub trait SessionRuntime {
     fn launch_session(&self, launch: &SessionLaunch) -> Result<()>;
     fn launch_session_with_writer(
@@ -548,6 +556,31 @@ pub trait SessionRuntime {
         ownership_established: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
         self.launch_adopted_session(launch, writer, ownership_established)
+    }
+    /// Reports whether this runtime accepts the bounded Runtime Authority
+    /// projection supplied to automation launches.
+    fn accepts_automation_authority_projection(&self) -> bool {
+        false
+    }
+    /// Launches an automation session with the bounded authority evidence that
+    /// the execution consumer is permitted to observe.
+    ///
+    /// Runtimes must explicitly opt in before accepting authority-bound work.
+    /// This keeps a newly activated Runtime Authority adapter from silently
+    /// dropping the projection and launching with ambient authority.
+    fn launch_authorized_contained_adopted_session(
+        &self,
+        launch: &SessionLaunch,
+        authority: Option<
+            &crate::automations::authority_projection::AutomationAuthorityConsumerProjection,
+        >,
+        writer: Option<crate::maintenance_gate::WriterLease>,
+        ownership_established: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<()> {
+        if authority.is_some() {
+            anyhow::bail!(RUNTIME_AUTHORITY_PROJECTION_UNSUPPORTED);
+        }
+        self.launch_contained_adopted_session(launch, writer, ownership_established)
     }
     fn send_input(&self, session_id: &str, payload: &Value) -> Result<()>;
     fn kill_session(&self, session_id: &str) -> Result<()>;
@@ -708,6 +741,12 @@ pub(crate) fn handle_request_with_runtime_and_authority(
             &health_response_with_hub(coven_home, daemon, runtime.event_writer_health(), authority),
         ),
         ("GET", "/capabilities") => json_response(200, &control_plane::capabilities()),
+        ("GET", "/session-policy") => crate::session_policy::discovery_response(),
+        ("POST", "/sessions/restricted") => crate::session_policy::restricted_response(
+            body.map(str::as_bytes),
+            authority,
+            Utc::now().timestamp_millis(),
+        ),
         ("POST", "/afs/sessions") => afs_create(coven_home, body),
         ("GET", "/afs/sessions") => afs_list(coven_home),
         ("GET", p) if p.starts_with("/afs/sessions/") => afs_read(coven_home, p, query),
@@ -724,6 +763,11 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                     );
                 }
             };
+            if let Some(rejection) =
+                control_plane::automation_receipt_transport_rejection(&payload, authority)
+            {
+                return json_response(rejection.0, &rejection.1);
+            }
             let conn = match store::open_store(&store_path(coven_home)) {
                 Ok(conn) => conn,
                 Err(error) => {
@@ -808,6 +852,22 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 })),
             )
         }
+        #[cfg(feature = "threads-test-clock")]
+        (_, path)
+            if (path == "/internal/threads/test-clock"
+                || path == "/internal/threads/test-clock/tick")
+                && !authority.allows_ward_proposal_access() =>
+        {
+            api_error(
+                403,
+                "transport_forbidden",
+                "Deterministic Threads clock control requires the owner-gated local IPC transport.",
+                Some(json!({
+                    "requiredAuthority": "owner_local_ipc",
+                    "writeApplied": false,
+                })),
+            )
+        }
         ("GET", "/threads/proposals") => threads_proposals_response(coven_home, None, query),
         ("GET", path) if path.starts_with("/threads/proposals/") => {
             let id = path.trim_start_matches("/threads/proposals/");
@@ -833,6 +893,14 @@ pub(crate) fn handle_request_with_runtime_and_authority(
                 .trim_start_matches("/threads/proposals/")
                 .trim_end_matches("/reject");
             decide_threads_proposal(coven_home, id, "reject", body)
+        }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/threads/test-clock") => {
+            deterministic_threads_clock_response(coven_home, body)
+        }
+        #[cfg(feature = "threads-test-clock")]
+        ("POST", "/internal/threads/test-clock/tick") => {
+            deterministic_threads_tick_response(coven_home, body)
         }
         ("GET", "/skills") => json_response(200, &crate::cockpit_sources::scan_skills(coven_home)?),
         ("GET", p) if p.starts_with("/skills/eval-loop/") && !p.ends_with("/run") => {
@@ -2163,6 +2231,14 @@ fn launch_session(
             return api_error(400, "invalid_request", &error.to_string(), None);
         }
     };
+    if payload.get("sessionPolicy").is_some() {
+        return api_error(
+            400,
+            "invalid_request",
+            "sessionPolicy is not accepted on legacy launch; use /api/v1/sessions/restricted.",
+            None,
+        );
+    }
     if let Some(value) = payload.get("executionBinding") {
         let binding = match crate::execution_binding::parse(value) {
             Ok(binding) => binding,
@@ -5778,13 +5854,15 @@ fn apply_familiar_edits(
     if !protected_targets.is_empty() {
         let store_path = store_path(coven_home);
         let conn = store::open_store(&store_path)?;
-        let state = crate::threads_gate::build_weave_state(
+        let refusal_now = crate::threads_clock::now(coven_home)?;
+        let state = crate::threads_gate::build_weave_state_at(
             &conn,
             familiar_id,
             &workspace,
             &config,
             &protected_targets,
             false,
+            refusal_now,
         )?;
         let proposal_id = Uuid::new_v4().to_string();
         let payload_bytes = serde_json::to_vec(&protected_targets)?
@@ -5826,6 +5904,7 @@ fn apply_familiar_edits(
                 window_close: None,
                 channel: coven_threads_core::Channel::Mutation,
             },
+            refusal_now,
         )?;
         reservation.finish()?;
         return api_error(
@@ -5943,6 +6022,7 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Permitted => {}
     }
 
+    let apply_now = crate::threads_clock::now(coven_home)?;
     let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
         Ok(report) => (report, None),
         Err(error) => {
@@ -6094,6 +6174,7 @@ fn apply_familiar_edits(
             &workspace,
             &config,
             &report,
+            apply_now,
         )
         .err();
         if let Some(err) = persist_error {
@@ -9464,6 +9545,7 @@ fn decide_threads_proposal_inner(
     };
     let proposal_store_path = store_path(coven_home);
     let conn = store::open_store(&proposal_store_path)?;
+    let decision_now = crate::threads_clock::now(coven_home)?;
     if let Some(terminal) = proposal_terminal_event(&conn, proposal_id)? {
         release_terminal_proposal_reservations(&conn, proposal_uuid)?;
         let matches_request = matches!(
@@ -9497,12 +9579,7 @@ fn decide_threads_proposal_inner(
     let mut effective_decision = decision;
     let mut effective_expired = expired;
     if !effective_expired
-        && proposal_requires_terminal_expiry(
-            coven_home,
-            &conn,
-            proposal_uuid,
-            time::OffsetDateTime::now_utc(),
-        )
+        && proposal_requires_terminal_expiry(coven_home, &conn, proposal_uuid, decision_now)
     {
         effective_decision = "reject";
         effective_expired = true;
@@ -9554,6 +9631,7 @@ fn decide_threads_proposal_inner(
                 expected_revision: expected_revision.as_deref(),
                 revision_required,
                 expired: effective_expired,
+                now: decision_now,
             },
         ) {
             Ok(Some(claim)) => claim,
@@ -9839,13 +9917,14 @@ fn decide_threads_proposal_inner(
                 }),
             );
         }
-        let state = crate::threads_gate::build_weave_state_for_writer(
+        let state = crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &protected_targets,
             false,
+            decision_now,
             Some(&pending.writer),
         )?;
         let approval_path_label = scheduled
@@ -9887,6 +9966,7 @@ fn decide_threads_proposal_inner(
                 window_close: window_close.as_ref(),
                 channel: pending.channel,
             },
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.consume()?;
@@ -9921,7 +10001,7 @@ fn decide_threads_proposal_inner(
         durable_request
             .as_ref()
             .map(|request| request.claimed_at)
-            .unwrap_or_else(time::OffsetDateTime::now_utc),
+            .unwrap_or(decision_now),
         expired,
     ) {
         Ok(semantics) => semantics,
@@ -10065,13 +10145,14 @@ fn decide_threads_proposal_inner(
                 )
             }));
     if coherence_revalidation_failed {
-        let state = crate::threads_gate::build_weave_state(
+        let state = crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?;
         append_proposal_refusal_audit(
             &conn,
@@ -10081,6 +10162,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.release_if_unneeded()?;
         if applying_state.is_none() {
@@ -10103,13 +10185,14 @@ fn decide_threads_proposal_inner(
         && adjudication.is_blocked()
         && !coherence_rejection
     {
-        let state = crate::threads_gate::build_weave_state_for_writer(
+        let state = crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
             Some(&pending.writer),
         )?;
         claim.preserve();
@@ -10128,6 +10211,7 @@ fn decide_threads_proposal_inner(
                 window_close: None,
                 channel: pending.channel,
             },
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.consume()?;
@@ -10141,13 +10225,14 @@ fn decide_threads_proposal_inner(
         );
     }
     if adjudication.is_blocked() && !coherence_rejection {
-        let state = crate::threads_gate::build_weave_state(
+        let state = crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?;
         append_proposal_refusal_audit(
             &conn,
@@ -10157,6 +10242,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10178,32 +10264,35 @@ fn decide_threads_proposal_inner(
             .collect()
     };
     let state = if review_kind == PendingReviewKind::Coherence {
-        crate::threads_gate::build_weave_state(
+        crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &[],
             false,
+            decision_now,
         )?
     } else if scheduled.is_some() {
-        crate::threads_gate::build_weave_state_for_writer(
+        crate::threads_gate::build_weave_state_for_writer_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &gated_targets,
             false,
+            decision_now,
             Some(&pending.writer),
         )?
     } else {
-        crate::threads_gate::build_weave_state(
+        crate::threads_gate::build_weave_state_at(
             &conn,
             &familiar_id,
             &workspace,
             &config,
             &gated_targets,
             false,
+            decision_now,
         )?
     };
     if decision == "approve"
@@ -10218,6 +10307,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10248,6 +10338,7 @@ fn decide_threads_proposal_inner(
                 window_close: decision_semantics.window_close.as_ref(),
                 channel: pending.channel,
             },
+            decision_now,
         )?;
         audit_reservation.finish()?;
         maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
@@ -10311,6 +10402,7 @@ fn decide_threads_proposal_inner(
                         window_close: None,
                         channel: pending.channel,
                     },
+                    decision_now,
                 )?;
                 audit_reservation.finish()?;
                 claim.consume()?;
@@ -10429,6 +10521,7 @@ fn decide_threads_proposal_inner(
                 &pending.writer,
                 &targets,
                 pending.channel,
+                decision_now,
             )?;
             audit_reservation.finish()?;
             claim.restore_pending(&document)?;
@@ -10463,6 +10556,7 @@ fn decide_threads_proposal_inner(
                 window_close: decision_semantics.window_close.as_ref(),
                 channel: pending.channel,
                 probe_summary: applying.probe_summary.as_ref(),
+                decided_at: decision_now,
             },
         ) {
             audit_reservation.preserve()?;
@@ -10507,7 +10601,7 @@ fn decide_threads_proposal_inner(
                 state.weave.weave_hash(),
                 &request,
                 &verdict,
-                time::OffsetDateTime::now_utc(),
+                decision_now,
             )?;
             if !verdict.permits_write() {
                 append_proposal_refusal_audit(
@@ -10518,6 +10612,7 @@ fn decide_threads_proposal_inner(
                     &pending.writer,
                     &targets,
                     pending.channel,
+                    decision_now,
                 )?;
                 audit_reservation.finish()?;
                 return json_response(
@@ -10613,6 +10708,7 @@ fn decide_threads_proposal_inner(
         &targets,
         &applying,
         pending.channel,
+        decision_now,
     )?;
     audit_reservation.preserve_if_unfinished();
     if let Err(error) =
@@ -10694,6 +10790,7 @@ fn decide_threads_proposal_inner(
             &pending.writer,
             &targets,
             pending.channel,
+            decision_now,
         )?;
         audit_reservation.finish()?;
         claim.restore_pending(&document)?;
@@ -10725,6 +10822,7 @@ fn decide_threads_proposal_inner(
             window_close: decision_semantics.window_close.as_ref(),
             channel: pending.channel,
             probe_summary: probe_summary.as_ref(),
+            decided_at: decision_now,
         },
     ) {
         audit_reservation.preserve()?;
@@ -10968,10 +11066,13 @@ fn pending_document_protected_targets(
 /// Process one deterministic round-robin batch. The persistent filename cursor
 /// prevents a prefix of human-only proposals from starving later due work.
 pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> {
+    let _pass_guard = threads_scheduler_pass_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("threads proposal scheduler lock is poisoned"))?;
     let candidates = scheduler_candidate_batch(coven_home)?;
     let last_cursor = candidates.last().map(|(name, _)| name.clone());
     let mut completed = 0;
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::threads_clock::now(coven_home)?;
     for (name, path) in candidates {
         if name.ends_with(".deciding") {
             let document = match read_pending_proposal_document(&path) {
@@ -11018,7 +11119,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         };
         if !protected_targets.is_empty() {
             if let Some(proposal) = document.scheduled() {
-                if let Err(error) = ensure_proposal_window_opened_audit(coven_home, proposal) {
+                if let Err(error) = ensure_proposal_window_opened_audit(coven_home, proposal, now) {
                     crate::daemon::append_daemon_recovery_log(
                         coven_home,
                         &format!(
@@ -11102,7 +11203,7 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             let Some(proposal) = proposal else {
                 return Ok(false);
             };
-            ensure_proposal_window_opened_audit(coven_home, &proposal)?;
+            ensure_proposal_window_opened_audit(coven_home, &proposal, now)?;
             let due = match &proposal.classification().approval_path {
                 coven_threads_core::ApprovalPath::AutoRegression { veto: None } => true,
                 coven_threads_core::ApprovalPath::AutoRegression { veto: Some(_) }
@@ -11183,6 +11284,7 @@ fn recover_proposal_claim_document(
 fn ensure_proposal_window_opened_audit(
     coven_home: &Path,
     proposal: &crate::proposal_scheduler::ScheduledProposal,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let (Some(deadline), Some(earliest_close)) =
         (proposal.veto_deadline(), proposal.earliest_close())
@@ -11202,13 +11304,14 @@ fn ensure_proposal_window_opened_audit(
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
     let conn = store::open_store(&store_path(coven_home))?;
-    let state = crate::threads_gate::build_weave_state_for_writer(
+    let state = crate::threads_gate::build_weave_state_for_writer_at(
         &conn,
         &familiar_id,
         &workspace,
         &config,
         &targets,
         false,
+        now,
         Some(&pending.writer),
     )?;
     let detail = coven_threads_core::ProposalWindowAuditDetail {
@@ -11237,8 +11340,7 @@ fn ensure_proposal_window_opened_audit(
     let submitted_at = pending
         .staged_at
         .format(&time::format_description::well_known::Rfc3339)?;
-    let decided_at =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let decided_at = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_hash, decision, approver,
@@ -11280,6 +11382,7 @@ struct PendingDecisionClaimRequest<'a> {
     expected_revision: Option<&'a str>,
     revision_required: bool,
     expired: bool,
+    now: time::OffsetDateTime,
 }
 
 #[derive(Debug)]
@@ -11387,15 +11490,14 @@ impl PendingDecisionClaim {
             expected_revision,
             revision_required,
             expired,
+            now,
         } = request;
         let expiry_request = |existing: Option<&ProposalDecisionRequest>| ProposalDecisionRequest {
             decision: "reject".to_string(),
             rationale: existing
                 .and_then(|request| request.rationale.clone())
                 .or_else(|| rationale.map(str::to_string)),
-            claimed_at: existing
-                .map(|request| request.claimed_at)
-                .unwrap_or_else(time::OffsetDateTime::now_utc),
+            claimed_at: existing.map(|request| request.claimed_at).unwrap_or(now),
             expected_revision: None,
             revision_required: false,
             expired: true,
@@ -11417,14 +11519,7 @@ impl PendingDecisionClaim {
             let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
                 .context("parsing pending proposal claim before decision recovery")?;
             drop(raw);
-            if !expired
-                && proposal_retention_expired(
-                    coven_home,
-                    audit_conn,
-                    &document,
-                    time::OffsetDateTime::now_utc(),
-                )
-            {
+            if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
                 return Err(ProposalExpiredBeforeClaim.into());
             }
             if expired {
@@ -11488,14 +11583,7 @@ impl PendingDecisionClaim {
         let mut document = ProposalEnvelopeDocument::parse_preflighted(&raw)
             .context("parsing pending proposal before decision claim")?;
         drop(raw);
-        if !expired
-            && proposal_retention_expired(
-                coven_home,
-                audit_conn,
-                &document,
-                time::OffsetDateTime::now_utc(),
-            )
-        {
+        if !expired && proposal_retention_expired(coven_home, audit_conn, &document, now) {
             return Err(ProposalExpiredBeforeClaim.into());
         }
         let superseded_decision = expired
@@ -11522,7 +11610,7 @@ impl PendingDecisionClaim {
             document.decision_request = Some(ProposalDecisionRequest {
                 decision: decision.to_string(),
                 rationale: rationale.map(str::to_string),
-                claimed_at: time::OffsetDateTime::now_utc(),
+                claimed_at: now,
                 expected_revision: expected_revision.map(str::to_string),
                 revision_required,
                 expired,
@@ -11607,6 +11695,22 @@ struct ProposalDecisionRequest {
 
 fn bool_is_false(value: &bool) -> bool {
     !*value
+}
+
+#[cfg(feature = "threads-test-clock")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeterministicThreadsClockRequest {
+    capability: String,
+    #[serde(with = "time::serde::rfc3339")]
+    now: time::OffsetDateTime,
+}
+
+#[cfg(feature = "threads-test-clock")]
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeterministicThreadsTickRequest {
+    capability: String,
 }
 
 #[cfg(test)]
@@ -11896,6 +12000,8 @@ fn persist_proposal_applying_state(
     crate::proposal_store::replace_existing(claim_path, &body)
 }
 
+// Preserve the borrowed apply-intent inputs while passing the decision's captured time.
+#[allow(clippy::too_many_arguments)]
 fn append_proposal_apply_intent(
     conn: &rusqlite::Connection,
     proposal_id: &str,
@@ -11904,11 +12010,11 @@ fn append_proposal_apply_intent(
     files_touched: &[String],
     state: &ProposalApplyingState,
     channel: coven_threads_core::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let detail = serde_json::to_string(state).context("serializing proposal apply intent")?;
     let files_touched = serde_json::to_string(files_touched)?;
-    let now =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let now = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
@@ -12232,6 +12338,8 @@ fn staged_edits_to_ward_edits(
         .collect()
 }
 
+// Refusal evidence shares the decision's clock without copying its borrowed inputs.
+#[allow(clippy::too_many_arguments)]
 fn append_proposal_refusal_audit(
     conn: &rusqlite::Connection,
     proposal_id: &str,
@@ -12240,6 +12348,7 @@ fn append_proposal_refusal_audit(
     approver: &coven_threads_core::WriterId,
     files_touched: &[String],
     channel: coven_threads_core::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     append_proposal_decision_audit(
         conn,
@@ -12256,6 +12365,7 @@ fn append_proposal_refusal_audit(
             window_close: None,
             channel,
         },
+        now,
     )
 }
 
@@ -12288,6 +12398,7 @@ struct ApprovedProposalFinalization<'a> {
     window_close: Option<&'a coven_threads_core::ProposalWindowCloseAuditDetail>,
     channel: coven_threads_core::Channel,
     probe_summary: Option<&'a crate::ward_probes::ProbeSummary>,
+    decided_at: time::OffsetDateTime,
 }
 
 fn finalize_approved_proposal(
@@ -12297,13 +12408,14 @@ fn finalize_approved_proposal(
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("starting proposal approval transaction")?;
     let result = (|| -> Result<()> {
-        crate::threads_gate::append_apply_audit_records(
+        crate::threads_gate::append_apply_audit_records_at(
             conn,
             Some(finalization.proposal_id),
             finalization.familiar_id,
             finalization.weave_hash,
             finalization.apply_report,
             finalization.channel,
+            finalization.decided_at,
         )?;
         for target in finalization.gated_targets {
             let expected_bytes = finalization
@@ -12334,6 +12446,7 @@ fn finalize_approved_proposal(
                 channel: finalization.channel,
             },
             finalization.probe_summary,
+            finalization.decided_at,
         )?;
         conn.execute_batch("COMMIT")
             .context("committing proposal approval transaction")
@@ -12347,14 +12460,16 @@ fn finalize_approved_proposal(
 fn append_proposal_decision_audit(
     conn: &rusqlite::Connection,
     audit: ProposalDecisionAudit<'_>,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
-    append_proposal_decision_audit_with_probe_summary(conn, audit, None)
+    append_proposal_decision_audit_with_probe_summary(conn, audit, None, now)
 }
 
 fn append_proposal_decision_audit_with_probe_summary(
     conn: &rusqlite::Connection,
     audit: ProposalDecisionAudit<'_>,
     probe_summary: Option<&crate::ward_probes::ProbeSummary>,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let files_touched = serde_json::to_string(audit.files_touched)?;
     let detail = match audit.event_type {
@@ -12379,8 +12494,7 @@ fn append_proposal_decision_audit_with_probe_summary(
         }
         _ => None,
     };
-    let now =
-        time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?;
+    let now = now.format(&time::format_description::well_known::Rfc3339)?;
     conn.execute(
         "INSERT INTO ward_audit (
             event_type, proposal_id, familiar_id, ward_version, ward_hash,
@@ -12675,6 +12789,115 @@ pub(crate) fn current_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
+#[cfg(feature = "threads-test-clock")]
+fn deterministic_threads_clock_response(
+    coven_home: &Path,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let request: DeterministicThreadsClockRequest =
+        match serde_json::from_str(body.unwrap_or_default()) {
+            Ok(request) => request,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &format!("Deterministic Threads clock request is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+    match crate::threads_clock::set_now(coven_home, &request.capability, request.now) {
+        Ok(snapshot) => json_response(
+            200,
+            &json!({
+                "ok": true,
+                "now": snapshot.now.format(&time::format_description::well_known::Rfc3339)?,
+                "source": snapshot.source.as_str(),
+            }),
+        ),
+        Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn deterministic_threads_tick_response(
+    coven_home: &Path,
+    body: Option<&str>,
+) -> Result<ApiResponse> {
+    let request: DeterministicThreadsTickRequest =
+        match serde_json::from_str(body.unwrap_or_default()) {
+            Ok(request) => request,
+            Err(error) => {
+                return api_error(
+                    400,
+                    "invalid_request",
+                    &format!("Deterministic Threads scheduler tick request is invalid: {error}"),
+                    None,
+                );
+            }
+        };
+    let _clock_guard = crate::threads_clock::fixture_control_lock()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("deterministic Threads clock lock is poisoned"))?;
+    match crate::threads_clock::authorize_fixture(coven_home, &request.capability) {
+        Ok(snapshot) => json_response(
+            200,
+            &json!({
+                "ok": true,
+                "processed": process_due_threads_proposals(coven_home)?,
+                "now": snapshot.now.format(&time::format_description::well_known::Rfc3339)?,
+                "source": snapshot.source.as_str(),
+            }),
+        ),
+        Err(error) => map_deterministic_threads_clock_error(error),
+    }
+}
+
+#[cfg(feature = "threads-test-clock")]
+fn map_deterministic_threads_clock_error(error: anyhow::Error) -> Result<ApiResponse> {
+    if error
+        .downcast_ref::<crate::threads_clock::InactiveFixture>()
+        .is_some()
+    {
+        return api_error(
+            404,
+            "not_found",
+            "Deterministic Threads clock control is inactive for this Coven home.",
+            None,
+        );
+    }
+    if error
+        .downcast_ref::<crate::threads_clock::InvalidFixtureCapability>()
+        .is_some()
+    {
+        return api_error(
+            403,
+            "transport_forbidden",
+            "Deterministic Threads clock control rejected the supplied fixture capability.",
+            Some(json!({ "requiredAuthority": "synthetic_fixture_capability" })),
+        );
+    }
+    if let Some(non_monotonic) =
+        error.downcast_ref::<crate::threads_clock::NonMonotonicFixtureTime>()
+    {
+        return api_error(
+            409,
+            "threads_test_clock_not_monotonic",
+            &non_monotonic.to_string(),
+            Some(json!({
+                "current": non_monotonic.current.format(&time::format_description::well_known::Rfc3339)?,
+                "requested": non_monotonic.requested.format(&time::format_description::well_known::Rfc3339)?,
+            })),
+        );
+    }
+    api_error(
+        409,
+        "threads_test_clock_invalid",
+        "Deterministic Threads clock fixture is invalid.",
+        Some(json!({ "error": error.to_string() })),
+    )
+}
+
 /// The daemon has no periodic maintenance loop, so the sessions list — the
 /// endpoint Cave polls constantly — doubles as the reap tick for rows a dead
 /// `coven run` stranded in `created` (#342). Throttled so back-to-back polls
@@ -12710,6 +12933,86 @@ fn reap_stale_created_sessions_throttled(conn: &rusqlite::Connection) {
 pub(crate) mod tests {
     use super::*;
     use crate::api_routes::{COVEN_API_ROUTE_VERSION, SUPPORTED_API_ROUTE_VERSIONS};
+
+    #[test]
+    fn default_authorized_launch_refuses_before_launch_or_ownership() {
+        struct CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize,
+        }
+
+        impl SessionRuntime for CountingRuntime {
+            fn launch_session(&self, _launch: &SessionLaunch) -> Result<()> {
+                self.launches
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn send_input(&self, _session_id: &str, _payload: &Value) -> Result<()> {
+                Ok(())
+            }
+
+            fn kill_session(&self, _session_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let extension: crate::automations::contract::authority::AutomationAuthorityExtension =
+            serde_json::from_value(
+                crate::automations::contract::authority::test_support::authority_extensions_value()
+                    [crate::automations::contract::authority::AUTHORITY_EXTENSION_KEY]
+                    .clone(),
+            )
+            .unwrap();
+        let authority =
+            crate::automations::authority_projection::AutomationAuthorityConsumerProjection::from_validated(
+                &extension,
+            );
+        let launch = SessionLaunch {
+            id: "session-authority-refusal".to_string(),
+            project_root: "/work/project".to_string(),
+            cwd: "/work/project".to_string(),
+            harness: "coven-code".to_string(),
+            model: None,
+            launch_mode: HarnessLaunchMode::NonInteractive,
+            launch_policy: None,
+            prompt: "Do the thing.".to_string(),
+            title: "authority refusal".to_string(),
+            conversation: None,
+            conversation_id: None,
+            familiar_id: Some("charm".to_string()),
+            caller_familiar_id: None,
+        };
+        let runtime = CountingRuntime {
+            launches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let ownership_callbacks = std::sync::atomic::AtomicUsize::new(0);
+        let mut ownership_established = || {
+            ownership_callbacks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+
+        let error = runtime
+            .launch_authorized_contained_adopted_session(
+                &launch,
+                Some(&authority),
+                None,
+                &mut ownership_established,
+            )
+            .expect_err("the default runtime must reject authority projections");
+
+        assert_eq!(
+            error.to_string(),
+            "runtime does not accept automation authority projections; no process started"
+        );
+        assert_eq!(
+            runtime.launches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            ownership_callbacks.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
 
     struct TestWorker<T> {
         completion: std::sync::mpsc::Receiver<T>,
@@ -13076,6 +13379,49 @@ pub(crate) mod tests {
         release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
     }
 
+    struct TerminalDuringKillRuntime {
+        coven_home: std::path::PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SessionRuntime for TerminalDuringKillRuntime {
+        fn launch_session(&self, _: &SessionLaunch) -> Result<()> {
+            Ok(())
+        }
+
+        fn send_input(&self, _: &str, _: &Value) -> Result<()> {
+            Ok(())
+        }
+
+        fn kill_session(&self, session_id: &str) -> Result<()> {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::ensure!(call == 0, "duplicate runtime stop");
+            let conn = store::open_store(&store_path(&self.coven_home))?;
+            let stop_fences: i64 = conn.query_row(
+                "SELECT COUNT(*)
+                 FROM automation_stop_fences
+                 WHERE session_id = ?1 AND owner = 'cancellation'",
+                [session_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(
+                stop_fences == 1,
+                "cancellation must hold its stop fence before the terminal observation"
+            );
+            anyhow::ensure!(
+                store::update_session_terminal_if_active(
+                    &conn,
+                    session_id,
+                    "completed",
+                    Some(0),
+                    &current_timestamp(),
+                )?,
+                "the runtime race must terminalize an active session"
+            );
+            Ok(())
+        }
+    }
+
     #[test]
     fn cancellation_after_the_run_deadline_settles_as_timeout() -> anyhow::Result<()> {
         struct CountingKillRuntime(std::sync::atomic::AtomicUsize);
@@ -13259,6 +13605,371 @@ pub(crate) mod tests {
         let history = cancellation_history(temp_dir.path())?;
         assert_eq!(
             history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_authority_terminal_race_after_stop_fence_recovers_across_replays_and_restarts(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute_batch("DROP TRIGGER automation_run_authority_profile_immutable;")?;
+        conn.execute(
+            "UPDATE automation_runs
+             SET authority_profile = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                crate::automations::contract::authority::AUTHORITY_PROFILE
+            ],
+        )?;
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:authority-recovery",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "recover an authority-bound terminal session",
+        );
+        let runtime = TerminalDuringKillRuntime {
+            coven_home: temp_dir.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        for pass in 0..3 {
+            let recovered = post_cancellation(temp_dir.path(), &body, &runtime)?;
+            assert_eq!(recovered.status, 200, "pass {pass}: {}", recovered.body);
+            let recovered: Value = serde_json::from_str(&recovered.body)?;
+            assert_eq!(
+                recovered["event"]["payload"]["status"], "recovery_required",
+                "pass {pass}"
+            );
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            assert_eq!(
+                crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                    .map_err(anyhow::Error::msg)?,
+                crate::automations::runner::SettlementReport::default(),
+                "pass {pass}"
+            );
+            let lifecycle: (
+                String,
+                Option<String>,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                String,
+            ) = conn.query_row(
+                "SELECT o.state, o.failure_reason, r.status, a.state, s.status, c.state,
+                        (SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = r.id),
+                        (
+                            SELECT outcome
+                            FROM automation_command_adoptions
+                            WHERE adoption_key = c.adoption_key
+                        )
+                 FROM automation_runs AS r
+                 JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+                 JOIN automation_attempts AS a ON a.run_id = r.id
+                 JOIN sessions AS s ON s.id = a.session_id
+                 JOIN automation_cancellations AS c ON c.run_id = r.id
+                 WHERE r.id = ?1 AND a.id = ?2",
+                rusqlite::params![run_id, attempt_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                    ))
+                },
+            )?;
+            assert_eq!(
+                lifecycle,
+                (
+                    "recovery_required".to_string(),
+                    Some(
+                        "trusted runtime terminal evidence is required before Runtime Authority settlement"
+                            .to_string()
+                    ),
+                    "running".to_string(),
+                    "started".to_string(),
+                    "completed".to_string(),
+                    "recovery_required".to_string(),
+                    0,
+                    "committed".to_string(),
+                ),
+                "pass {pass}"
+            );
+            drop(conn);
+        }
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replay and restart must not reissue the runtime stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn base_terminal_race_after_stop_fence_remains_completion_won_across_replay(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:base-terminal-race",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "completion must remain authoritative",
+        );
+        let runtime = TerminalDuringKillRuntime {
+            coven_home: temp_dir.path().to_path_buf(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        for pass in 0..3 {
+            let rejected = post_cancellation(temp_dir.path(), &body, &runtime)?;
+            assert_eq!(rejected.status, 422, "pass {pass}: {}", rejected.body);
+            let rejected: Value = serde_json::from_str(&rejected.body)?;
+            assert_eq!(
+                rejected["error"]["code"], "ILLEGAL_TRANSITION",
+                "pass {pass}"
+            );
+            assert_eq!(
+                rejected["error"]["message"],
+                "automation completion already won the cancellation race",
+                "pass {pass}"
+            );
+        }
+        assert_eq!(
+            runtime.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "replay must preserve the completion-won cancellation rejection"
+        );
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert_eq!(
+            crate::automations::runner::settle_finished_runs(&conn, Utc::now())
+                .map_err(anyhow::Error::msg)?
+                .succeeded,
+            1
+        );
+        let lifecycle: (String, String, String, String, String, i64, String) = conn.query_row(
+            "SELECT o.state, r.status, a.state, s.status, c.state,
+                    (SELECT COUNT(*) FROM automation_stop_fences WHERE run_id = r.id),
+                    (
+                        SELECT outcome
+                        FROM automation_command_adoptions
+                        WHERE adoption_key = c.adoption_key
+                    )
+             FROM automation_runs AS r
+             JOIN automation_occurrences AS o ON o.id = r.occurrence_id
+             JOIN automation_attempts AS a ON a.run_id = r.id
+             JOIN sessions AS s ON s.id = a.session_id
+             JOIN automation_cancellations AS c ON c.run_id = r.id
+             WHERE r.id = ?1 AND a.id = ?2",
+            rusqlite::params![run_id, attempt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            lifecycle,
+            (
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "succeeded".to_string(),
+                "completed".to_string(),
+                "rejected".to_string(),
+                0,
+                "rejected".to_string(),
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_authority_cancellation_recovery_resumes_after_recovery_state_crash_window(
+    ) -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        conn.execute_batch("DROP TRIGGER automation_run_authority_profile_immutable;")?;
+        conn.execute(
+            "UPDATE automation_runs
+             SET authority_profile = ?2
+             WHERE id = ?1",
+            rusqlite::params![
+                run_id,
+                crate::automations::contract::authority::AUTHORITY_PROFILE
+            ],
+        )?;
+        drop(conn);
+
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:authority-recovery-crash",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "recover after authority state was held",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        crate::automations::runner::mark_terminal_stop_for_recovery(
+            &conn,
+            &run_id,
+            &session_id,
+            "cancellation stop outcome was not durably recorded",
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:authority-recovery-crash",
+                expired
+            ],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+             SET execution_expires_at = ?2
+             WHERE operation_key = ?1",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:authority-recovery-crash",
+                expired
+            ],
+        )?;
+        drop(conn);
+
+        for pass in 0..3 {
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let reconciled = crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &NoopSessionRuntime,
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?;
+            assert_eq!(reconciled, i64::from(pass == 0) as usize, "pass {pass}");
+            drop(conn);
+
+            let recovered = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+            assert_eq!(recovered.status, 200, "pass {pass}: {}", recovered.body);
+            let recovered: Value = serde_json::from_str(&recovered.body)?;
+            assert_eq!(
+                recovered["event"]["payload"]["status"], "recovery_required",
+                "pass {pass}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn base_cancellation_recovery_preserves_known_terminal_completion() -> anyhow::Result<()> {
+        let (temp_dir, run_id, attempt_id, session_id) =
+            start_running_automation_for_cancellation()?;
+        let body = cancellation_body(
+            "adopt:cancel:cancellation-target:base-terminal-recovery",
+            &run_id,
+            &attempt_id,
+            &session_id,
+            "do not hide known completion",
+        );
+        crate::automations::cancellation::set_after_stop_fence_test_hook(Some(Box::new(|| {
+            panic!("synthetic crash after durable stop ownership")
+        })));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)
+        }));
+        assert!(crashed.is_err(), "the fixture must simulate a crash");
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        crate::automations::runner::mark_active_attempts_for_restart_reconciliation(
+            &conn,
+            Utc::now(),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(store::update_session_terminal_if_active(
+            &conn,
+            &session_id,
+            "completed",
+            Some(0),
+            &current_timestamp(),
+        )?);
+        let expired = (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339();
+        conn.execute(
+            "UPDATE automation_cancellations
+             SET execution_expires_at = ?2
+             WHERE adoption_key = ?1 AND state = 'stopping'",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-terminal-recovery",
+                expired
+            ],
+        )?;
+        conn.execute(
+            "UPDATE automation_stop_fences
+             SET execution_expires_at = ?2
+             WHERE operation_key = ?1",
+            rusqlite::params![
+                "adopt:cancel:cancellation-target:base-terminal-recovery",
+                expired
+            ],
+        )?;
+
+        assert_eq!(
+            crate::automations::cancellation::reconcile_expired_cancellations(
+                &conn,
+                &NoopSessionRuntime,
+                Utc::now(),
+            )
+            .map_err(anyhow::Error::msg)?,
+            1
+        );
+        drop(conn);
+
+        let rejected = post_cancellation(temp_dir.path(), &body, &NoopSessionRuntime)?;
+        assert_eq!(rejected.status, 422, "{}", rejected.body);
+        let rejected: Value = serde_json::from_str(&rejected.body)?;
+        assert_eq!(rejected["error"]["code"], "ILLEGAL_TRANSITION");
+        let history = cancellation_history(temp_dir.path())?;
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            history["event"]["payload"]["runs"][0]["attempts"][0]["state"],
             "succeeded"
         );
         Ok(())
@@ -15478,6 +16189,18 @@ pub(crate) mod tests {
         let temp_dir = tempfile::tempdir()?;
 
         let response = handle_request("GET", "/api/v1/capabilities", temp_dir.path(), None)?;
+        let body: Value = serde_json::from_str(&response.body)?;
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-automations/v1/capabilities.json"
+        ))?;
+        let automations = body["capabilities"]
+            .as_array()
+            .and_then(|capabilities| {
+                capabilities
+                    .iter()
+                    .find(|capability| capability["id"] == "coven.automations")
+            })
+            .expect("catalog includes coven.automations");
 
         assert_eq!(response.status, 200);
         assert!(response.body.contains(r#""id":"coven.sessions""#));
@@ -15486,6 +16209,8 @@ pub(crate) mod tests {
         assert!(response.body.contains(r#""id":"coven.control.actions""#));
         assert!(response.body.contains(r#""id":"desktop.automation""#));
         assert!(response.body.contains(r#""policy":"requiresApproval""#));
+        assert_eq!(automations["variantNegotiation"], expected);
+        assert!(body.get("harness_capabilities").is_none());
         Ok(())
     }
 
@@ -17222,7 +17947,7 @@ pub(crate) mod tests {
                 "id": "bad schedule!",
                 "name": "Bad",
                 "status": "PAUSED",
-                "rrule": "FREQ=HOURLY",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
                 "timezone": "local",
                 "misfire": "latest",
                 "overlap": "forbid",
@@ -17246,6 +17971,827 @@ pub(crate) mod tests {
             .contains("coven.automations.definition.create.v1"));
         assert!(response.body.contains(r#""code":"VALIDATION_FAILED""#));
         assert!(!response.body.contains(r#""accepted":true"#));
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_preserve_validation_precedence_over_capability_refusal() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let complete_definition = json!({
+            "schemaVersion": 1,
+            "id": "validation-precedence",
+            "name": "Validation precedence",
+            "status": "PAUSED",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "timezone": "local",
+            "misfire": "latest",
+            "overlap": "forbid",
+            "timeoutMinutes": 30,
+            "runtime": "coven-code",
+            "prompt": "Must not be stored."
+        });
+        let cases = [
+            ("partial", json!({"misfire": "backfill"})),
+            ("malformed-retry", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["retry"] = json!({
+                    "maxAttempts": 3,
+                    "backoffPolicy": ["linear"]
+                });
+                definition
+            }),
+            ("unknown-field", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["futureField"] = json!("must fail closed");
+                definition
+            }),
+            ("malformed-rich-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": [1]
+                    }
+                });
+                definition
+            }),
+            ("malformed-rich-schedule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "version": 1,
+                    "schedule": {
+                        "rrule": "FREQ=YEARLY;BYHOUR=not-a-number",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("missing-rich-schedule-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": "schedule",
+                    "schedule": {
+                        "rrule": "FREQ=DAILY",
+                        "timezone": "utc"
+                    }
+                });
+                definition
+            }),
+            ("fixed-rich-retry-missing-seconds", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "fixed"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-flat-policy", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["misfire"] = json!(" backfill ");
+                definition
+            }),
+            ("noncanonical-rich-union-discriminator", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["trigger"] = json!({
+                    "variant": " webhook ",
+                    "version": 1,
+                    "webhook": {}
+                });
+                definition
+            }),
+            ("unsupported-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": "stream"
+                    }
+                });
+                definition
+            }),
+            ("bad-rich-delivery-target", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": 7,
+                        "mode": "atomic"
+                    }
+                });
+                definition
+            }),
+            ("rich-delivery-target-missing-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md"
+                    }
+                });
+                definition
+            }),
+            ("noncanonical-rich-delivery-mode", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "delivery": {
+                        "outputTarget": "nested-result.md",
+                        "mode": " atomic "
+                    }
+                });
+                definition
+            }),
+            ("unsupported-rich-misfire", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "misfire": {"disposition": "backfill"}
+                });
+                definition
+            }),
+            ("unsupported-rich-concurrency", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "concurrency": {"overlap": "parallel"}
+                });
+                definition
+            }),
+            ("supported-rich-action-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["action"] = json!({
+                    "variant": "familiarInvocation",
+                    "prompt": "Run it."
+                });
+                definition
+            }),
+            ("unsupported-rich-condition-missing-version", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["conditions"] = json!([{
+                    "variant": "branch",
+                    "branch": {"expression": "result.ok"}
+                }]);
+                definition
+            }),
+            ("malformed-rrule", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+                definition
+            }),
+            ("malformed-retention", {
+                let mut definition = complete_definition.clone();
+                definition["outputTarget"] = json!("result.md");
+                definition["policies"] = json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": false}
+                    }
+                });
+                definition
+            }),
+        ];
+
+        for (case, definition) in cases {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:validation-precedence:{case}"),
+                "definition": definition
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 400, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "VALIDATION_FAILED", "{case}");
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_responses_and_adoptions_do_not_expose_secret_values(
+    ) -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+        let base_definition = |id: &str| {
+            json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Secret-free validation",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "utc",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored."
+            })
+        };
+        let cases = [
+            (
+                "retryable-class",
+                "SECRET_RETRYABLE_CLASS must not escape",
+                {
+                    let mut definition = base_definition("secret-retryable-class");
+                    definition["retry"] = json!({
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["SECRET_RETRYABLE_CLASS must not escape"]
+                    });
+                    definition
+                },
+            ),
+            (
+                "union-discriminator",
+                "SECRET_UNION_DISCRIMINATOR must not escape",
+                {
+                    let mut definition = base_definition("secret-union-discriminator");
+                    definition["action"] = json!({
+                        "variant": "SECRET_UNION_DISCRIMINATOR must not escape",
+                        "version": 1
+                    });
+                    definition
+                },
+            ),
+            ("timezone", "SECRET_TIMEZONE must not escape", {
+                let mut definition = base_definition("secret-timezone");
+                definition["timezone"] = json!("SECRET_TIMEZONE must not escape");
+                definition
+            }),
+            ("rrule", "SECRET_RRULE_VALUE", {
+                let mut definition = base_definition("secret-rrule");
+                definition["rrule"] = json!("FREQ=DAILY;BYHOUR=SECRET_RRULE_VALUE");
+                definition
+            }),
+        ];
+
+        for (case, secret, invalid_definition) in cases {
+            for command_kind in ["create", "revise"] {
+                let target_id = format!("secret-free-{command_kind}-{case}");
+                let mut definition = invalid_definition.clone();
+                definition["id"] = json!(target_id);
+
+                if command_kind == "revise" {
+                    let setup = json!({
+                        "action": "coven.automations.definition.create.v1",
+                        "adoptionKey": format!("adopt:create:secret-free-setup-{case}:0001"),
+                        "definition": base_definition(&target_id)
+                    })
+                    .to_string();
+                    let response = handle_request_with_body(
+                        "POST",
+                        "/api/v1/actions",
+                        temp_dir.path(),
+                        None,
+                        Some(&setup),
+                    )?;
+                    assert_eq!(response.status, 200, "{case}: {}", response.body);
+                }
+
+                let adoption_key = format!("adopt:{command_kind}:secret-free-{case}:0001");
+                let mut request = json!({
+                    "action": format!(
+                        "coven.automations.definition.{command_kind}.v1"
+                    ),
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(1);
+                }
+                let request = request.to_string();
+
+                let first = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(first.status, 400, "{command_kind} {case}: {}", first.body);
+                let first_body: Value = serde_json::from_str(&first.body)?;
+                assert_eq!(
+                    first_body["error"]["code"], "VALIDATION_FAILED",
+                    "{command_kind} {case}"
+                );
+                assert_eq!(
+                    first_body["error"]["message"], "automation definition failed validation",
+                    "{command_kind} {case}"
+                );
+                assert!(
+                    !first.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+                assert!(
+                    !first.body.contains("CAPABILITY_UNSUPPORTED"),
+                    "{command_kind} {case}: {}",
+                    first.body
+                );
+
+                let replay = handle_request_with_body(
+                    "POST",
+                    "/api/v1/actions",
+                    temp_dir.path(),
+                    None,
+                    Some(&request),
+                )?;
+                assert_eq!(replay.status, 400, "{command_kind} {case}: {}", replay.body);
+                assert_eq!(
+                    replay.body, first.body,
+                    "{command_kind} {case} replay changed"
+                );
+                assert!(
+                    !replay.body.contains(secret),
+                    "{command_kind} {case}: {}",
+                    replay.body
+                );
+
+                let conn = store::open_store(&store_path(temp_dir.path()))?;
+                let adoption_json: String = conn.query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )?;
+                assert!(
+                    !adoption_json.contains(secret),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+                assert!(
+                    adoption_json.contains("automation definition failed validation"),
+                    "{command_kind} {case}: {adoption_json}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn v1_definition_validation_replay_scrubs_legacy_secret_bearing_storage() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-api-{command_kind}");
+            let definition = json!({
+                "schemaVersion": 1,
+                "id": id,
+                "name": "Legacy validation replay",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "invalid legacy timezone",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not run."
+            });
+            let action = format!("coven.automations.definition.{command_kind}.v1");
+            let source_key = format!("adopt:{command_kind}:legacy-secret-source:0001");
+            let replay_key = format!("adopt:{command_kind}:legacy-secret-replay:0001");
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let request_for = |adoption_key: &str, definition: Value| {
+                let mut request = json!({
+                    "action": action,
+                    "adoptionKey": adoption_key,
+                    "definition": definition
+                });
+                if command_kind == "revise" {
+                    request["expectedRevision"] = json!(7);
+                }
+                request
+            };
+            let source_request = request_for(&source_key, definition.clone()).to_string();
+            let source = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&source_request),
+            )?;
+            assert_eq!(source.status, 400, "{command_kind}: {}", source.body);
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let request_digest: String = conn.query_row(
+                "SELECT request_digest
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&source_key],
+                |row| row.get(0),
+            )?;
+            let secret = format!("SECRET_{command_kind}_API_VALIDATION_VALUE");
+            let legacy_response = json!({
+                "outcome": "rejected",
+                "error": {
+                    "code": "VALIDATION_FAILED",
+                    "httpStatus": 400,
+                    "message": format!("legacy validation exposed {secret}"),
+                    "retryable": true,
+                    "details": {"submittedValue": secret},
+                    "adoption": {
+                        "key": replay_key,
+                        "conflictOutcome": "rejected"
+                    },
+                    "currentRevision": 4
+                }
+            })
+            .to_string();
+            for adoption_key in [&replay_key, &mismatch_key] {
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, request_digest, command, automation_id, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                    rusqlite::params![
+                        adoption_key,
+                        request_digest,
+                        format!("definition.{command_kind}.v1"),
+                        id,
+                        legacy_response,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )?;
+            }
+            drop(conn);
+
+            let exact_request = request_for(&replay_key, definition.clone()).to_string();
+            let replay = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(replay.status, 400, "{command_kind}: {}", replay.body);
+            let replay_body: Value = serde_json::from_str(&replay.body)?;
+            assert_eq!(replay_body["error"]["code"], "VALIDATION_FAILED");
+            assert_eq!(
+                replay_body["error"]["message"],
+                "automation definition failed validation"
+            );
+            assert_eq!(replay_body["error"]["retryable"], false);
+            assert_eq!(replay_body["error"]["currentRevision"], 4);
+            assert!(replay_body["error"].get("details").is_none());
+            assert!(replay_body["error"].get("adoption").is_none());
+            assert!(!replay.body.contains(&secret));
+
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let sanitized_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert!(!sanitized_response.contains(&secret));
+            drop(conn);
+
+            let repeated = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&exact_request),
+            )?;
+            assert_eq!(repeated.body, replay.body);
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let repeated_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&replay_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(repeated_response, sanitized_response);
+            drop(conn);
+
+            let mut changed_definition = definition;
+            changed_definition["prompt"] = json!("Changed request.");
+            let mismatch_request = request_for(&mismatch_key, changed_definition).to_string();
+            let mismatch = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&mismatch_request),
+            )?;
+            assert_eq!(mismatch.status, 409, "{command_kind}: {}", mismatch.body);
+            assert!(mismatch
+                .body
+                .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+            let conn = store::open_store(&store_path(temp_dir.path()))?;
+            let unchanged_response: String = conn.query_row(
+                "SELECT response_json
+                 FROM automation_command_adoptions
+                 WHERE adoption_key = ?1",
+                [&mismatch_key],
+                |row| row.get(0),
+            )?;
+            assert_eq!(unchanged_response, legacy_response);
+            assert!(unchanged_response.contains(&secret));
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_refuse_unsupported_rich_policy_variants() -> anyhow::Result<()> {
+        let temp_dir = tempfile::tempdir()?;
+
+        for (case, policies, expected_variant) in [
+            (
+                "retry-class",
+                json!({
+                    "retry": {
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["runtime_unavailable", "ambiguous"]
+                    }
+                }),
+                "retry.safe-classes.ambiguous",
+            ),
+            (
+                "retention",
+                json!({
+                    "retention": {
+                        "occurrenceHistory": {"classification": "standard"},
+                        "runLogs": {"classification": "ephemeral"}
+                    }
+                }),
+                "retention.ephemeral",
+            ),
+        ] {
+            let body = json!({
+                "action": "coven.automations.definition.create.v1",
+                "adoptionKey": format!("adopt:create:unsupported-policy:{case}"),
+                "definition": {
+                    "schemaVersion": 1,
+                    "id": format!("unsupported-policy-{case}"),
+                    "name": "Unsupported policy",
+                    "status": "PAUSED",
+                    "rrule": "FREQ=DAILY;BYHOUR=9",
+                    "timezone": "local",
+                    "misfire": "latest",
+                    "overlap": "forbid",
+                    "timeoutMinutes": 30,
+                    "runtime": "coven-code",
+                    "prompt": "Must not be stored.",
+                    "policies": policies
+                }
+            })
+            .to_string();
+            let response = handle_request_with_body(
+                "POST",
+                "/api/v1/actions",
+                temp_dir.path(),
+                None,
+                Some(&body),
+            )?;
+
+            assert_eq!(response.status, 422, "{case}: {}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            assert_eq!(body["error"]["code"], "CAPABILITY_UNSUPPORTED", "{case}");
+            assert_eq!(
+                body["error"]["details"]["variant"], expected_variant,
+                "{case}"
+            );
+        }
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM automation_definitions", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(definition_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn control_actions_durably_reject_unsupported_create_and_revise_variants() -> anyhow::Result<()>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let unsupported_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:unsupported-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "unsupported-create-http",
+                "name": "Unsupported create",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "outputTarget": "result.md",
+                "prompt": "Must not be stored."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_create: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_create["ok"], false);
+        assert_eq!(first_create["accepted"], false);
+        assert_eq!(first_create["status"], "rejected");
+        assert_eq!(first_create["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_create["error"]["message"],
+            "automation definition uses a variant not supported by the negotiated contract profile"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["variant"],
+            "outputTarget.atomic"
+        );
+        assert_eq!(
+            first_create["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_create.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_create.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_create);
+
+        let mut changed_create = unsupported_create.clone();
+        changed_create["definition"]["outputTarget"] = json!("different.md");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_create.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let valid_create = json!({
+            "action": "coven.automations.definition.create.v1",
+            "adoptionKey": "adopt:create:revise-http:0001",
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Original",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Original prompt."
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&valid_create.to_string()),
+        )?;
+        assert_eq!(response.status, 200);
+
+        let unsupported_revise = json!({
+            "action": "coven.automations.definition.revise.v1",
+            "adoptionKey": "adopt:revise:unsupported-http:0002",
+            "expectedRevision": 1,
+            "definition": {
+                "schemaVersion": 1,
+                "id": "revise-http",
+                "name": "Must not land",
+                "status": "PAUSED",
+                "rrule": "FREQ=DAILY;BYHOUR=9",
+                "timezone": "local",
+                "misfire": "latest",
+                "overlap": "forbid",
+                "timeoutMinutes": 30,
+                "runtime": "coven-code",
+                "prompt": "Must not be stored.",
+                "action": {
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "First step"}]
+                }
+            }
+        });
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        let first_revise: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(first_revise["ok"], false);
+        assert_eq!(first_revise["accepted"], false);
+        assert_eq!(first_revise["status"], "rejected");
+        assert_eq!(first_revise["error"]["code"], "CAPABILITY_UNSUPPORTED");
+        assert_eq!(
+            first_revise["error"]["details"]["variant"],
+            "action.pipeline"
+        );
+        assert_eq!(
+            first_revise["error"]["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        assert!(first_revise.get("event").is_none());
+
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&unsupported_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 422);
+        assert_eq!(serde_json::from_str::<Value>(&response.body)?, first_revise);
+
+        let mut changed_revise = unsupported_revise;
+        changed_revise["definition"]["action"]["variant"] = json!("batch");
+        let response = handle_request_with_body(
+            "POST",
+            "/api/v1/actions",
+            temp_dir.path(),
+            None,
+            Some(&changed_revise.to_string()),
+        )?;
+        assert_eq!(response.status, 409);
+        assert!(response
+            .body
+            .contains(r#""code":"ADOPTION_REPLAY_MISMATCH""#));
+
+        let conn = store::open_store(&store_path(temp_dir.path()))?;
+        let definition = crate::automations::store::get_definition(&conn, "revise-http")?
+            .expect("original definition remains");
+        assert_eq!(definition.revision, 1);
+        assert!(definition.definition_json.contains(r#""name":"Original""#));
+        assert!(
+            crate::automations::store::get_definition(&conn, "unsupported-create-http")?.is_none()
+        );
+        let definition_events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_events
+             WHERE stream_kind = 'automation'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(definition_events, 1);
+        let rejected_adoptions: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM automation_command_adoptions
+             WHERE outcome = 'rejected'
+               AND adoption_key IN (
+                   'adopt:create:unsupported-http:0001',
+                   'adopt:revise:unsupported-http:0002'
+               )",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(rejected_adoptions, 2);
         Ok(())
     }
 
@@ -17588,6 +19134,34 @@ pub(crate) mod tests {
 
         assert_eq!(response.status, 404);
         assert!(response.body.contains(r#""code":"session_not_found""#));
+        Ok(())
+    }
+
+    #[test]
+    fn session_policy_guard_preserves_other_legacy_parsing() -> anyhow::Result<()> {
+        for authority in [RequestAuthority::OwnerLocalIpc, RequestAuthority::Tcp] {
+            let temp = tempfile::tempdir()?;
+            let runtime = RecordingRuntime::default();
+            let root = serde_json::to_string(temp.path())?;
+            let body = format!(
+                r#"{{"projectRoot":{root},"harness":"codex","prompt":"first","prompt":"last","unknown":{{"sessionPolicy":null}}}}"#
+            );
+            let response = handle_request_with_runtime_and_authority(
+                "POST",
+                "/api/v1/sessions",
+                temp.path(),
+                None,
+                Some(&body),
+                &runtime,
+                authority,
+            )?;
+            assert_eq!(response.status, 201, "{}", response.body);
+            let launches = runtime.launches.borrow();
+            assert_eq!(launches.len(), 1);
+            assert_eq!(launches[0].prompt, "last");
+            assert_eq!(launches[0].launch_mode, HarnessLaunchMode::Interactive);
+            assert!(launches[0].launch_policy.is_none());
+        }
         Ok(())
     }
 
@@ -18212,6 +19786,18 @@ pub(crate) mod tests {
         Ok(count.try_into()?)
     }
 
+    fn assert_adopted_launch_store_ready(coven_home: &Path) -> anyhow::Result<()> {
+        // Unlike open_store, this cannot hide cold-start migration work in a
+        // request-readiness deadline. Real daemon startup initializes first.
+        let conn = store::open_initialized_store(&store_path(coven_home))?;
+        assert!(store::list_sessions(&conn)?.is_empty());
+        let count: i64 = conn.query_row("SELECT COUNT(*) FROM request_adoptions", [], |row| {
+            row.get(0)
+        })?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
     fn assert_adoption_error(
         response: &ApiResponse,
         status: u16,
@@ -18662,6 +20248,8 @@ pub(crate) mod tests {
     fn adopted_launch_concurrent_replay_observes_committed_created() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let body = adopted_launch_body(
@@ -18796,6 +20384,8 @@ pub(crate) mod tests {
     ) -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         seed_familiars_toml(temp.path())?;
+        store::initialize_store(&store_path(temp.path()))?;
+        assert_adopted_launch_store_ready(temp.path())?;
         let project_root = temp.path().join("repo");
         std::fs::create_dir_all(&project_root)?;
         let git = std::process::Command::new("git")
@@ -28025,6 +29615,9 @@ forbidden = ["(?i)ignore previous"]
     fn post_familiar_edits_refuses_unsigned_protected_write() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
+        #[cfg(feature = "threads-test-clock")]
+        let refusal_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
         let workspace = seed_warded_familiar(home)?;
 
         let response = post_edits(
@@ -28051,6 +29644,18 @@ forbidden = ["(?i)ignore previous"]
             |row| row.get(0),
         )?;
         assert_eq!(rejection_count, 1);
+        #[cfg(feature = "threads-test-clock")]
+        {
+            let (submitted_at, decided_at): (String, String) = conn.query_row(
+                "SELECT submitted_at, decided_at FROM ward_audit
+                 WHERE event_type = 'proposal_rejected'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let expected = refusal_now.format(&time::format_description::well_known::Rfc3339)?;
+            assert_eq!(submitted_at, expected);
+            assert_eq!(decided_at, expected);
+        }
         let reservations: i64 = conn.query_row(
             "SELECT COUNT(*) FROM coven_ward_audit_reservations",
             [],
@@ -29497,6 +31102,55 @@ tier = 0
         })
     }
 
+    #[cfg(feature = "threads-test-clock")]
+    fn deterministic_threads_clock_time(value: &str) -> Result<time::OffsetDateTime> {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn seed_deterministic_threads_clock(
+        home: &Path,
+        capability: &str,
+        value: &str,
+    ) -> Result<time::OffsetDateTime> {
+        let now = deterministic_threads_clock_time(value)?;
+        crate::threads_clock::seed_fixture_for_tests(home, capability, now)?;
+        Ok(now)
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn advance_deterministic_threads_clock(
+        home: &Path,
+        capability: &str,
+        now: time::OffsetDateTime,
+    ) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock",
+            home,
+            None,
+            Some(
+                &json!({
+                    "capability": capability,
+                    "now": now.format(&time::format_description::well_known::Rfc3339)?,
+                })
+                .to_string(),
+            ),
+        )
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    fn tick_deterministic_threads_clock(home: &Path, capability: &str) -> Result<ApiResponse> {
+        handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock/tick",
+            home,
+            None,
+            Some(&json!({ "capability": capability }).to_string()),
+        )
+    }
+
     #[test]
     fn threads_scheduled_human_required_enforces_rationale_and_applies() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -30079,6 +31733,11 @@ tier = 0
     {
         let temp = tempfile::tempdir()?;
         let home = temp.path();
+        #[cfg(feature = "threads-test-clock")]
+        let staged_at =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        #[cfg(not(feature = "threads-test-clock"))]
+        let staged_at = time::OffsetDateTime::now_utc();
         let veto = coven_threads_core::VetoWindow::new(
             std::time::Duration::from_secs(300),
             std::time::Duration::from_secs(60),
@@ -30086,7 +31745,7 @@ tier = 0
         let (pending, proposal_id) = stage_scheduled_reviewed_edit(
             home,
             coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
-            time::OffsetDateTime::now_utc(),
+            staged_at,
         )?;
         let ward_path = home.join("familiars/sage/ward.toml");
         let ward = std::fs::read_to_string(&ward_path)?
@@ -30144,6 +31803,19 @@ tier = 0
             |row| row.get(0),
         )?;
         assert_eq!(terminal_count, 1);
+        #[cfg(feature = "threads-test-clock")]
+        {
+            let mut statement = conn.prepare(
+                "SELECT decided_at FROM ward_audit WHERE proposal_id = ?1
+                 AND event_type IN ('proposal_window_opened', 'proposal_rejected')
+                 ORDER BY id",
+            )?;
+            let timestamps = statement
+                .query_map([&proposal_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let expected = staged_at.format(&time::format_description::well_known::Rfc3339)?;
+            assert_eq!(timestamps, vec![expected.clone(), expected]);
+        }
         Ok(())
     }
 
@@ -30273,6 +31945,353 @@ tier = 0
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "threads-test-clock"))]
+    #[test]
+    fn deterministic_threads_clock_route_is_unavailable_in_default_build() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for route in [
+            "/api/v1/internal/threads/test-clock",
+            "/api/v1/internal/threads/test-clock/tick",
+        ] {
+            let response = handle_request_with_body(
+                "POST",
+                route,
+                temp.path(),
+                None,
+                Some(r#"{"capability":"fixture-cap","now":"2026-09-09T10:00:00Z"}"#),
+            )?;
+
+            assert_eq!(response.status, 404, "{route}: {}", response.body);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_clock_controls_require_owner_transport_and_fixture_capability(
+    ) -> Result<()> {
+        for suffix in ["", "/tick"] {
+            for (authority, capability) in [
+                (RequestAuthority::Tcp, "fixture-cap"),
+                (RequestAuthority::OwnerLocalIpc, "wrong-fixture-cap"),
+            ] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let initial =
+                    seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+                let (pending, _) = stage_scheduled_reviewed_edit(
+                    home,
+                    coven_threads_core::ApprovalPath::FamiliarCoherence {
+                        veto: coven_threads_core::VetoWindow::new(
+                            std::time::Duration::from_secs(300),
+                            std::time::Duration::from_secs(60),
+                        ),
+                    },
+                    initial - time::Duration::minutes(5),
+                )?;
+                let pending_before = std::fs::read(&pending)?;
+                let mut body = json!({ "capability": capability });
+                if suffix.is_empty() {
+                    body["now"] = json!("2026-09-09T10:05:00Z");
+                }
+                let response = handle_request_with_runtime_and_authority(
+                    "POST",
+                    &format!("/api/v1/internal/threads/test-clock{suffix}"),
+                    home,
+                    None,
+                    Some(&body.to_string()),
+                    &NoopSessionRuntime,
+                    authority,
+                )?;
+
+                assert_eq!(response.status, 403, "{suffix}: {}", response.body);
+                assert_eq!(crate::threads_clock::now(home)?, initial);
+                assert_eq!(std::fs::read(&pending)?, pending_before);
+                assert_eq!(
+                    std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+                    "before"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn deterministic_threads_clock_control_rejects_invalid_and_non_monotonic_inputs() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let initial = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+
+        let inactive = tick_deterministic_threads_clock(tempfile::tempdir()?.path(), capability)?;
+        assert_eq!(inactive.status, 404, "got {}", inactive.body);
+
+        let malformed = handle_request_with_body(
+            "POST",
+            "/api/v1/internal/threads/test-clock",
+            home,
+            None,
+            Some(r#"{"capability":"fixture-cap","now":"not-a-time"}"#),
+        )?;
+        assert_eq!(malformed.status, 400, "got {}", malformed.body);
+
+        let advanced = advance_deterministic_threads_clock(
+            home,
+            capability,
+            initial + time::Duration::minutes(5),
+        )?;
+        assert_eq!(advanced.status, 200, "got {}", advanced.body);
+        let advanced: Value = serde_json::from_str(&advanced.body)?;
+        assert_eq!(advanced["source"], "deterministic_fixture");
+
+        let backwards = advance_deterministic_threads_clock(
+            home,
+            capability,
+            initial + time::Duration::minutes(4),
+        )?;
+        assert_eq!(backwards.status, 409, "got {}", backwards.body);
+        let backwards: Value = serde_json::from_str(&backwards.body)?;
+        assert_eq!(
+            backwards["error"]["code"],
+            "threads_test_clock_not_monotonic"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["current"],
+            "2026-09-09T10:05:00Z"
+        );
+        assert_eq!(
+            backwards["error"]["details"]["requested"],
+            "2026-09-09T10:04:00Z"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_rejects_missing_fixture_state_before_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::remove_file(home.join("test-fixtures/threads-deterministic-clock/state.json"))?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"must not be written"}]}"#,
+        );
+        assert!(
+            response.is_err(),
+            "an active clock with missing state must fail closed"
+        );
+        assert!(!workspace.join("notes.md").exists());
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_audit_uses_deterministic_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let fixture_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"first"},{"target":"other.md","contents":"second"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let mut statement = conn.prepare(
+            "SELECT submitted_at, decided_at FROM ward_audit
+             WHERE event_type = 'apply_audit' ORDER BY id",
+        )?;
+        let timestamps = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = fixture_now.format(&time::format_description::well_known::Rfc3339)?;
+        assert_eq!(
+            timestamps,
+            vec![
+                (expected.clone(), expected.clone()),
+                (expected.clone(), expected)
+            ]
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_intake_uses_deterministic_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let fixture_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        seed_warded_familiar(home)?;
+
+        let staged = post_edits(
+            home,
+            r#"{"edits":[{"target":"reviewed/skill.md","contents":"after"}]}"#,
+        )?;
+        assert_eq!(staged.status, 202, "got {}", staged.body);
+
+        let body: Value = serde_json::from_str(&staged.body)?;
+        let pending = PathBuf::from(body["pendingPath"].as_str().context("pendingPath")?);
+        let pending_json: Value = serde_json::from_slice(&std::fs::read(&pending)?)?;
+        let staged_at_value = pending_json
+            .pointer("/pending/staged_at")
+            .or_else(|| pending_json.pointer("/pending/stagedAt"))
+            .or_else(|| pending_json.pointer("/staged_at"))
+            .cloned()
+            .context("scheduled proposal carries staged_at")?;
+        let staged_at: time::OffsetDateTime = serde_json::from_value(staged_at_value)?;
+        assert_eq!(staged_at, fixture_now);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let decided_at: String = conn.query_row(
+            "SELECT decided_at
+             FROM ward_audit
+             WHERE event_type = 'proposal_submitted'
+             ORDER BY id DESC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        let decided_at = time::OffsetDateTime::parse(
+            &decided_at,
+            &time::format_description::well_known::Rfc3339,
+        )?;
+        assert_eq!(decided_at, fixture_now);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_scheduler_tick_observes_fixture_before_min_visible_at_earliest_close_and_beyond_deadline(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let staged_at = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            staged_at,
+        )?;
+
+        let initial_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(initial_tick.status, 200, "got {}", initial_tick.body);
+        let initial_tick: Value = serde_json::from_str(&initial_tick.body)?;
+        assert_eq!(initial_tick["processed"], 0);
+
+        let before_close = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(59),
+        )?;
+        assert_eq!(before_close.status, 200, "got {}", before_close.body);
+        let before_close_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(
+            before_close_tick.status, 200,
+            "got {}",
+            before_close_tick.body
+        );
+        let before_close_tick: Value = serde_json::from_str(&before_close_tick.body)?;
+        assert_eq!(before_close_tick["processed"], 0);
+
+        let earliest_close = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(60),
+        )?;
+        assert_eq!(earliest_close.status, 200, "got {}", earliest_close.body);
+        let earliest_close_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(
+            earliest_close_tick.status, 200,
+            "got {}",
+            earliest_close_tick.body
+        );
+        let earliest_close_tick: Value = serde_json::from_str(&earliest_close_tick.body)?;
+        assert_eq!(earliest_close_tick["processed"], 0);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "before"
+        );
+
+        let deadline = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(300),
+        )?;
+        assert_eq!(deadline.status, 200, "got {}", deadline.body);
+        let deadline_tick = tick_deterministic_threads_clock(home, capability)?;
+        assert_eq!(deadline_tick.status, 200, "got {}", deadline_tick.body);
+        let deadline_tick: Value = serde_json::from_str(&deadline_tick.body)?;
+        assert_eq!(deadline_tick["processed"], 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "after"
+        );
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let opened: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(opened, 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_scheduler_restart_path_reads_persisted_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let capability = "fixture-cap";
+        let staged_at = seed_deterministic_threads_clock(home, capability, "2026-09-09T10:00:00Z")?;
+        let veto = coven_threads_core::VetoWindow::new(
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(60),
+        );
+        let (_, proposal_id) = stage_scheduled_reviewed_edit(
+            home,
+            coven_threads_core::ApprovalPath::FamiliarCoherence { veto },
+            staged_at,
+        )?;
+
+        let advanced = advance_deterministic_threads_clock(
+            home,
+            capability,
+            staged_at + time::Duration::seconds(300),
+        )?;
+        assert_eq!(advanced.status, 200, "got {}", advanced.body);
+        assert_eq!(process_due_threads_proposals(home)?, 1);
+        assert_eq!(
+            std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
+            "after"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let approved: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [&proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approved, 1);
         Ok(())
     }
 

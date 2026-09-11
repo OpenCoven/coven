@@ -16,6 +16,9 @@ pub struct Capability {
     pub status: CapabilityStatus,
     pub policy: CapabilityPolicy,
     pub actions: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant_negotiation:
+        Option<&'static crate::automations::capability_negotiation::CapabilityProfile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +81,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.travel",
@@ -86,6 +90,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.scheduler",
@@ -94,6 +99,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec![],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.control.actions",
@@ -102,6 +108,7 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Available,
                 policy: CapabilityPolicy::Allow,
                 actions: vec!["coven.capabilities.refresh"],
+                variant_negotiation: None,
             },
             Capability {
                 id: "coven.automations",
@@ -126,6 +133,7 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.events.subscribe.v1",
                     "coven.automations.tick",
                     "coven.automations.runs",
+                    "coven.automations.receipt.get.v1",
                     "coven.automations.run",
                     "coven.automations.import",
                     "coven.automations.health",
@@ -134,6 +142,9 @@ pub fn capabilities() -> CapabilityCatalog {
                     "coven.automations.occurrence.get.v1",
                     "coven.automations.unquarantine",
                 ],
+                variant_negotiation: Some(
+                    crate::automations::capability_negotiation::capability_profile(),
+                ),
             },
             Capability {
                 id: "desktop.automation",
@@ -142,9 +153,28 @@ pub fn capabilities() -> CapabilityCatalog {
                 status: CapabilityStatus::Planned,
                 policy: CapabilityPolicy::RequiresApproval,
                 actions: vec![],
+                variant_negotiation: None,
             },
         ],
     }
+}
+
+pub(crate) fn automation_receipt_transport_rejection(
+    payload: &Value,
+    authority: crate::request_authority::RequestAuthority,
+) -> Option<(u16, ControlActionResponse)> {
+    let action = payload.get("action")?.as_str()?.trim();
+    if action != "coven.automations.receipt.get.v1" || authority.allows_automation_receipt_access()
+    {
+        return None;
+    }
+    Some(typed_rejection(
+        action,
+        automation_error(
+            crate::automations::contract::error::ErrorCode::AuthorityRequired,
+            "Automation receipt reads require owner-local IPC.",
+        ),
+    ))
 }
 
 pub fn route_action(
@@ -596,6 +626,7 @@ pub fn route_action(
                 Err(error) => (400, rejected_action(action, error)),
             }
         }
+        "coven.automations.receipt.get.v1" => automation_receipt_result(conn, action, &payload),
         "coven.automations.health" => {
             let id = required_id_field(&payload, action);
             let now = chrono::Utc::now();
@@ -698,6 +729,84 @@ fn automation_event(
             payload,
         }),
     }
+}
+
+fn automation_receipt_result(
+    conn: &rusqlite::Connection,
+    action: &str,
+    payload: &Value,
+) -> (u16, ControlActionResponse) {
+    use crate::automations::contract::error::ErrorCode;
+    use crate::automations::contract::types::{PrivacyClassification, ReceiptId};
+
+    let id = match required_id_field(payload, action)
+        .and_then(|id| ReceiptId::new(id).map_err(|_| "receipt id is invalid".to_owned()))
+    {
+        Ok(id) => id,
+        Err(error) => return validation_rejection(action, error),
+    };
+    let receipt = match crate::automations::receipts::read_receipt(conn, id.as_str()) {
+        Ok(Some(receipt)) => receipt,
+        Ok(None) => {
+            return typed_rejection(
+                action,
+                automation_error(ErrorCode::NotFound, "Automation receipt is unavailable."),
+            );
+        }
+        Err(_) => {
+            return typed_rejection(
+                action,
+                automation_error(
+                    ErrorCode::Internal,
+                    "Stored automation receipt evidence could not be validated.",
+                ),
+            );
+        }
+    };
+    if !matches!(
+        receipt.privacy.classification,
+        PrivacyClassification::Public | PrivacyClassification::Operational
+    ) {
+        return typed_rejection(
+            action,
+            automation_error(
+                ErrorCode::AuthorityRequired,
+                "Receipt privacy requires a principal-aware read policy that is unavailable.",
+            ),
+        );
+    }
+    (
+        200,
+        ControlActionResponse {
+            ok: true,
+            accepted: true,
+            action: action.to_owned(),
+            status: ActionStatus::Completed,
+            reason: None,
+            error: None,
+            result: Some(json!({
+                "receipt": receipt,
+                "verification": {
+                    "status": "unverifiable",
+                    "integrity": "valid",
+                    "correlation": "valid",
+                    "receiptAuthentication": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "runtimeAuthority": {
+                        "status": "unverified",
+                        "evidence": "unavailable"
+                    },
+                    "reasons": [
+                        "PRODUCER_AUTHENTICATION_UNVERIFIED",
+                        "RUNTIME_AUTHORITY_UNVERIFIED"
+                    ]
+                }
+            })),
+            event: None,
+        },
+    )
 }
 
 fn automation_result(
@@ -1193,6 +1302,8 @@ fn automation_scheduler_status_payload(
                         "running": status.queue.running,
                         "recoveryRequired": status.queue.recovery_required,
                         "batchLimit": status.queue.batch_limit,
+                        "planningBatchLimit": status.queue.planning_batch_limit,
+                        "planningAfterDefinitionId": status.queue.planning_after_definition_id,
                         "oldestEligibleAt": status.queue.oldest_eligible_at,
                         "oldestEligibleAgeMs": status.queue.oldest_eligible_age_ms,
                     }
@@ -1420,6 +1531,7 @@ fn automation_runs_payload(
                     "outputCommit": record.output_commit,
                     "startedAt": record.started_at,
                     "finishedAt": record.finished_at,
+                    "receiptId": record.receipt_id,
                     "attempts": attempts,
                 });
                 if let Some(cancellation) = cancellation {
@@ -1537,6 +1649,31 @@ mod tests {
     struct RetryableRejectedRuntime;
 
     #[test]
+    fn automation_capability_negotiation_matches_the_packaged_profile() {
+        let catalog = serde_json::to_value(capabilities()).unwrap();
+        let expected: Value = serde_json::from_str(include_str!(
+            "../../../spec/coven-automations/v1/capabilities.json"
+        ))
+        .unwrap();
+        let capabilities = catalog["capabilities"].as_array().unwrap();
+        let automations = capabilities
+            .iter()
+            .find(|capability| capability["id"] == "coven.automations")
+            .unwrap();
+
+        assert_eq!(automations["variantNegotiation"], expected);
+        for capability in capabilities
+            .iter()
+            .filter(|capability| capability["id"] != "coven.automations")
+        {
+            assert!(
+                capability.get("variantNegotiation").is_none(),
+                "unrelated capability changed: {capability}"
+            );
+        }
+    }
+
+    #[test]
     fn tick_action_plans_but_does_not_claim_without_scheduler_authority() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("store.sqlite");
@@ -1625,6 +1762,8 @@ mod tests {
                 "running": 0,
                 "recoveryRequired": 0,
                 "batchLimit": 64,
+                "planningBatchLimit": 64,
+                "planningAfterDefinitionId": null,
                 "oldestEligibleAt": null,
                 "oldestEligibleAgeMs": null,
             })

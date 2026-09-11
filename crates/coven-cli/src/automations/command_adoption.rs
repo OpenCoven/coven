@@ -7,10 +7,15 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::capability_negotiation::{
+    capability_profile, negotiate_definition, DefinitionNegotiation, UnsupportedVariant,
+};
 use super::contract::canonical_json::{canonicalize, sha256_hex};
 use super::contract::error::{AdoptionConflictOutcome, ErrorAdoption, ErrorCode, ErrorEnvelope};
 use super::contract::types::{AdoptionKey, PositiveInteger};
 use super::definition::RoutineDefinition;
+
+const DEFINITION_VALIDATION_FAILED_MESSAGE: &str = "automation definition failed validation";
 
 pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_command_reservations (
@@ -34,11 +39,68 @@ pub const AUTOMATION_COMMAND_ADOPTIONS_SCHEMA_SQL: &str = "
     CREATE INDEX IF NOT EXISTS idx_automation_command_adoptions_automation
         ON automation_command_adoptions(automation_id, adopted_at);
 
-    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_no_update
-    BEFORE UPDATE ON automation_command_adoptions
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_immutable_columns
+    BEFORE UPDATE OF
+        adoption_key,
+        request_digest,
+        command,
+        automation_id,
+        outcome,
+        revision,
+        adopted_at
+    ON automation_command_adoptions
     BEGIN
         SELECT RAISE(ABORT, 'automation command adoptions are append-only');
     END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_immutable_rowid
+    BEFORE UPDATE ON automation_command_adoptions
+    WHEN NEW.rowid IS NOT OLD.rowid
+    BEGIN
+        SELECT RAISE(ABORT, 'automation command adoptions are append-only');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_response_update_guard
+    BEFORE UPDATE OF response_json ON automation_command_adoptions
+    WHEN NOT (
+        OLD.command IN ('definition.create.v1', 'definition.revise.v1')
+        AND OLD.outcome = 'rejected'
+        AND json_valid(OLD.response_json)
+        AND json_extract(OLD.response_json, '$.outcome') IS 'rejected'
+        AND json_extract(OLD.response_json, '$.error.code') IS 'VALIDATION_FAILED'
+        AND json_valid(NEW.response_json)
+        AND json_type(NEW.response_json, '$') IS 'object'
+        AND json_extract(NEW.response_json, '$.outcome') IS 'rejected'
+        AND json_type(NEW.response_json, '$.error') IS 'object'
+        AND json_extract(NEW.response_json, '$.error.code') IS 'VALIDATION_FAILED'
+        AND json_extract(NEW.response_json, '$.error.httpStatus') IS 400
+        AND json_extract(NEW.response_json, '$.error.message')
+            IS 'automation definition failed validation'
+        AND json_extract(NEW.response_json, '$.error.retryable') IS 0
+        AND json_extract(NEW.response_json, '$.error.currentRevision')
+            IS json_extract(OLD.response_json, '$.error.currentRevision')
+        AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.response_json)
+            WHERE key NOT IN ('outcome', 'error')
+        )
+        AND NOT EXISTS (
+            SELECT 1
+            FROM json_each(NEW.response_json, '$.error')
+            WHERE key NOT IN (
+                'code',
+                'httpStatus',
+                'message',
+                'retryable',
+                'currentRevision'
+            )
+        )
+    )
+    BEGIN
+        SELECT RAISE(ABORT, 'automation command adoptions are append-only');
+    END;
+
+    DROP TRIGGER IF EXISTS automation_command_adoptions_no_update;
 
     CREATE TRIGGER IF NOT EXISTS automation_command_adoptions_no_delete
     BEFORE DELETE ON automation_command_adoptions
@@ -235,11 +297,10 @@ pub fn execute_definition_command(
             ));
         }
     };
-    let canonical_command = canonical_command(&command)?;
-    let request_digest = sha256_hex(
-        &canonicalize(&canonical_command)
-            .context("failed to canonicalize automation definition command")?,
-    );
+    let compatible_request_digests = compatible_request_digests(&command)?;
+    let request_digest = compatible_request_digests
+        .first()
+        .expect("every automation command has a current request digest");
     let transaction = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .context("failed to begin automation command adoption transaction")?;
 
@@ -266,7 +327,7 @@ pub fn execute_definition_command(
         .context("failed to inspect automation command reservation")?
     {
         let response = if reserved_command == command_identity(&command).0
-            && reserved_digest == request_digest
+            && request_digest_matches(&reserved_digest, &compatible_request_digests)
         {
             rejected(
                 ErrorCode::CancelPending,
@@ -286,12 +347,34 @@ pub fn execute_definition_command(
         return Ok(response);
     }
 
-    if let Some(stored) = load_adoption(&transaction, adoption_key.as_str())? {
-        let response = if stored.request_digest == request_digest {
-            replay_response(stored)
-        } else {
-            replay_mismatch_response(&adoption_key, &stored)
-        };
+    if let Some(mut stored) = load_adoption(&transaction, adoption_key.as_str())? {
+        if request_digest_matches(&stored.request_digest, &compatible_request_digests) {
+            let sanitized = sanitize_v1_validation_replay(&mut stored);
+            if sanitized {
+                transaction
+                    .execute(
+                        "UPDATE automation_command_adoptions
+                         SET response_json = ?2
+                         WHERE adoption_key = ?1",
+                        params![
+                            adoption_key.as_str(),
+                            serde_json::to_string(&stored.response).context(
+                                "failed to serialize sanitized automation command response"
+                            )?,
+                        ],
+                    )
+                    .context("failed to persist sanitized automation command response")?;
+                transaction
+                    .commit()
+                    .context("failed to commit sanitized automation command replay")?;
+            } else {
+                transaction
+                    .rollback()
+                    .context("failed to close automation command replay transaction")?;
+            }
+            return Ok(replay_response(stored));
+        }
+        let response = replay_mismatch_response(&adoption_key, &stored);
         transaction
             .rollback()
             .context("failed to close automation command replay transaction")?;
@@ -429,18 +512,99 @@ fn canonical_command(command: &DefinitionCommand) -> Result<Value> {
     })
 }
 
-fn adoption_definition_preimage(definition: &Value) -> Result<Value> {
-    match RoutineDefinition::from_json(definition) {
-        Ok(definition) => Ok(json!({
-            "kind": "valid",
-            "value": serde_json::to_value(definition)
-                .context("failed to normalize routine definition for adoption")?,
-        })),
-        Err(_) => Ok(json!({
-            "kind": "invalid",
-            "value": lossless_json_fingerprint(definition),
-        })),
+fn canonical_command_digest(command: &Value) -> Result<String> {
+    Ok(sha256_hex(&canonicalize(command).context(
+        "failed to canonicalize automation definition command",
+    )?))
+}
+
+fn compatible_request_digests(command: &DefinitionCommand) -> Result<Vec<String>> {
+    let mut digests = vec![canonical_command_digest(&canonical_command(command)?)?];
+    let (command_name, definition, expected_revision) = match command {
+        DefinitionCommand::Create { definition } => ("definition.create.v1", definition, None),
+        DefinitionCommand::Revise {
+            definition,
+            expected_revision,
+        } => ("definition.revise.v1", definition, *expected_revision),
+        _ => return Ok(digests),
+    };
+
+    let mut legacy_preimages = Vec::with_capacity(3);
+    if let Ok(parsed) = RoutineDefinition::from_json(definition) {
+        let normalized = serde_json::to_value(parsed)
+            .context("failed to normalize routine definition for legacy adoption replay")?;
+        if definition == &normalized {
+            legacy_preimages.push(json!({
+                "kind": "valid",
+                "value": normalized,
+            }));
+        }
     }
+    let wire = lossless_json_fingerprint(definition);
+    legacy_preimages.push(json!({
+        "kind": "invalid",
+        "value": wire,
+    }));
+    legacy_preimages.push(json!({
+        "kind": "unsupported",
+        "value": lossless_json_fingerprint(definition),
+    }));
+
+    for definition_preimage in legacy_preimages {
+        let mut legacy = json!({
+            "command": command_name,
+            "definition": definition_preimage,
+        });
+        if command_name == "definition.revise.v1" {
+            legacy["expectedRevision"] = json!(expected_revision);
+        }
+        let digest = canonical_command_digest(&legacy)?;
+        if !digests.contains(&digest) {
+            digests.push(digest);
+        }
+    }
+    Ok(digests)
+}
+
+fn request_digest_matches(stored: &str, compatible: &[String]) -> bool {
+    compatible.iter().any(|digest| digest == stored)
+}
+
+fn sanitize_v1_validation_replay(stored: &mut StoredAdoption) -> bool {
+    if !matches!(
+        stored.command.as_str(),
+        "definition.create.v1" | "definition.revise.v1"
+    ) {
+        return false;
+    }
+    let StoredResponse::Rejected { error } = &stored.response else {
+        return false;
+    };
+    if error.code() != ErrorCode::ValidationFailed {
+        return false;
+    }
+
+    let mut sanitized = ErrorEnvelope::try_new(
+        ErrorCode::ValidationFailed,
+        DEFINITION_VALIDATION_FAILED_MESSAGE,
+        false,
+    )
+    .expect("static automation definition validation message is valid");
+    if let Some(current_revision) = error.current_revision {
+        sanitized = sanitized.with_current_revision(current_revision);
+    }
+    if error == &sanitized {
+        return false;
+    }
+    stored.response = StoredResponse::Rejected { error: sanitized };
+    true
+}
+
+fn adoption_definition_preimage(definition: &Value) -> Result<Value> {
+    Ok(json!({
+        "kind": "wire",
+        "value": lossless_json_fingerprint(definition),
+    }))
 }
 
 fn legacy_adoption_definition_preimage(definition: &Value) -> Result<Value> {
@@ -950,12 +1114,28 @@ fn apply_create(
     definition_value: &Value,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_json(definition_value)
-        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
-    {
-        Ok(definition) => definition,
-        Err(error) => {
-            return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+    let definition = match negotiate_definition(definition_value) {
+        Ok(DefinitionNegotiation::Supported(definition)) => {
+            match definition.resolve_timezone_for_persistence() {
+                Ok(definition) => definition,
+                Err(_) => {
+                    return Ok(rejected(
+                        ErrorCode::ValidationFailed,
+                        DEFINITION_VALIDATION_FAILED_MESSAGE,
+                        None,
+                    ));
+                }
+            }
+        }
+        Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
+            return Ok(capability_unsupported(unsupported));
+        }
+        Err(_) => {
+            return Ok(rejected(
+                ErrorCode::ValidationFailed,
+                DEFINITION_VALIDATION_FAILED_MESSAGE,
+                None,
+            ));
         }
     };
     if definition.status == super::definition::RoutineStatus::Disabled {
@@ -1011,12 +1191,28 @@ fn apply_revise(
     expected_revision: Option<u64>,
     adopted_at: &str,
 ) -> Result<DefinitionCommandResponse> {
-    let definition = match RoutineDefinition::from_json(definition_value)
-        .and_then(RoutineDefinition::resolve_timezone_for_persistence)
-    {
-        Ok(definition) => definition,
-        Err(error) => {
-            return Ok(rejected(ErrorCode::ValidationFailed, error, None));
+    let definition = match negotiate_definition(definition_value) {
+        Ok(DefinitionNegotiation::Supported(definition)) => {
+            match definition.resolve_timezone_for_persistence() {
+                Ok(definition) => definition,
+                Err(_) => {
+                    return Ok(rejected(
+                        ErrorCode::ValidationFailed,
+                        DEFINITION_VALIDATION_FAILED_MESSAGE,
+                        None,
+                    ));
+                }
+            }
+        }
+        Ok(DefinitionNegotiation::Unsupported(unsupported)) => {
+            return Ok(capability_unsupported(unsupported));
+        }
+        Err(_) => {
+            return Ok(rejected(
+                ErrorCode::ValidationFailed,
+                DEFINITION_VALIDATION_FAILED_MESSAGE,
+                None,
+            ));
         }
     };
     let Some(current) = current_definition_state(conn, &definition.id)? else {
@@ -1317,6 +1513,32 @@ fn rejected(
     }
 }
 
+fn capability_unsupported(unsupported: UnsupportedVariant) -> DefinitionCommandResponse {
+    let error = ErrorEnvelope::try_new(
+        ErrorCode::CapabilityUnsupported,
+        "automation definition uses a variant not supported by the negotiated contract profile",
+        false,
+    )
+    .expect("static unsupported-capability message is valid")
+    .with_details(BTreeMap::from([
+        (
+            "contractProfile".to_owned(),
+            Value::String(capability_profile().contract_profile.clone()),
+        ),
+        ("reason".to_owned(), Value::String(unsupported.reason)),
+        ("variant".to_owned(), Value::String(unsupported.variant)),
+    ]));
+    DefinitionCommandResponse {
+        outcome: DefinitionCommandOutcome::Rejected,
+        revision: None,
+        result: None,
+        error: Some(error),
+        replay_first_committed_at: None,
+        event_ref: None,
+        mutation_committed: false,
+    }
+}
+
 fn protocol_error(code: ErrorCode, message: impl Into<String>) -> ErrorEnvelope {
     let message = message.into();
     let bounded = if message.is_empty() {
@@ -1396,8 +1618,1016 @@ mod tests {
         .unwrap()
     }
 
+    fn definition_event_count(conn: &Connection, automation_id: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM automation_events
+             WHERE stream_kind = 'automation' AND stream_id = ?1",
+            [automation_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn definition_command_fingerprint(command: &DefinitionCommand) -> String {
+        sha256_hex(&canonicalize(&canonical_command(command).unwrap()).unwrap())
+    }
+
+    fn legacy_v1_command_digest(command: &DefinitionCommand, kind: &str) -> String {
+        let (command_name, definition, expected_revision) = match command {
+            DefinitionCommand::Create { definition } => ("definition.create.v1", definition, None),
+            DefinitionCommand::Revise {
+                definition,
+                expected_revision,
+            } => ("definition.revise.v1", definition, *expected_revision),
+            _ => panic!("legacy v1 definition digest requires create or revise"),
+        };
+        let value = match kind {
+            "valid" => serde_json::to_value(RoutineDefinition::from_json(definition).unwrap())
+                .expect("normalized definition serializes"),
+            "invalid" | "unsupported" => lossless_json_fingerprint(definition),
+            _ => panic!("unknown legacy definition preimage kind"),
+        };
+        let mut canonical = json!({
+            "command": command_name,
+            "definition": {
+                "kind": kind,
+                "value": value,
+            },
+        });
+        if command_name == "definition.revise.v1" {
+            canonical["expectedRevision"] = json!(expected_revision);
+        }
+        canonical_command_digest(&canonical).unwrap()
+    }
+
+    fn stored_capability_rejection(message: &str) -> (ErrorEnvelope, String) {
+        let error = rejected(ErrorCode::CapabilityUnsupported, message, None)
+            .error
+            .unwrap();
+        let stored = StoredResponse::Rejected {
+            error: error.clone(),
+        };
+        (error, serde_json::to_string(&stored).unwrap())
+    }
+
     #[test]
-    fn adoption_ledger_is_append_only() {
+    fn v1_definition_preimages_use_stable_wire_form_across_parser_and_profile_status() {
+        use super::super::capability_negotiation::{
+            preflight_definition, preflight_definition_with_profile, VariantCapability,
+        };
+
+        let valid = definition("valid-wire-preimage", "Valid wire preimage");
+        assert!(RoutineDefinition::from_json(&valid).is_ok());
+        assert_eq!(
+            adoption_definition_preimage(&valid).unwrap(),
+            json!({
+                "kind": "wire",
+                "value": lossless_json_fingerprint(&valid),
+            })
+        );
+
+        let mut parser_invalid = definition(
+            "parser-invalid-wire-preimage",
+            "Parser-invalid wire preimage",
+        );
+        parser_invalid["timezone"] = json!("not a valid timezone");
+        assert!(RoutineDefinition::from_json(&parser_invalid).is_err());
+        assert_eq!(
+            adoption_definition_preimage(&parser_invalid).unwrap(),
+            json!({
+                "kind": "wire",
+                "value": lossless_json_fingerprint(&parser_invalid),
+            })
+        );
+
+        for mut non_flat in [
+            definition("unsupported-flat-preimage", "Unsupported flat preimage"),
+            definition("unsupported-rich-preimage", "Unsupported rich preimage"),
+        ] {
+            if non_flat["id"] == "unsupported-flat-preimage" {
+                non_flat["outputTarget"] = json!("result.md");
+            } else {
+                non_flat["action"] = json!({
+                    "variant": "pipeline",
+                    "version": 1,
+                    "steps": [{"prompt": "First step"}]
+                });
+            }
+
+            assert!(
+                preflight_definition(&non_flat).is_some(),
+                "fixture must currently be capability-unsupported"
+            );
+            assert_eq!(
+                adoption_definition_preimage(&non_flat).unwrap(),
+                json!({
+                    "kind": "wire",
+                    "value": lossless_json_fingerprint(&non_flat),
+                })
+            );
+        }
+
+        let mut promoted_definition =
+            definition("promoted-flat-preimage", "Promoted flat preimage");
+        promoted_definition["outputTarget"] = json!("result.md");
+        let promoted_preimage = adoption_definition_preimage(&promoted_definition).unwrap();
+        let mut promoted_profile = capability_profile().clone();
+        promoted_profile
+            .supported
+            .delivery_policies
+            .push(VariantCapability {
+                variant: "outputTarget.atomic".to_owned(),
+                profile: None,
+                notes: None,
+            });
+        assert!(preflight_definition(&promoted_definition).is_some());
+        assert_eq!(
+            preflight_definition_with_profile(&promoted_definition, &promoted_profile),
+            None
+        );
+        assert_eq!(
+            adoption_definition_preimage(&promoted_definition).unwrap(),
+            promoted_preimage
+        );
+
+        let mut withdrawn_definition =
+            definition("withdrawn-flat-preimage", "Withdrawn flat preimage");
+        withdrawn_definition["retry"] = json!({
+            "maxAttempts": 2,
+            "backoffPolicy": "none",
+            "retryableClasses": ["runtime_unavailable"]
+        });
+        let withdrawn_preimage = adoption_definition_preimage(&withdrawn_definition).unwrap();
+        let mut withdrawn_profile = capability_profile().clone();
+        withdrawn_profile
+            .supported
+            .trigger_policies
+            .retain(|supported| supported.variant != "retry.safe-classes");
+        assert_eq!(preflight_definition(&withdrawn_definition), None);
+        assert_eq!(
+            preflight_definition_with_profile(&withdrawn_definition, &withdrawn_profile)
+                .expect("withdrawn category must refuse the definition")
+                .variant,
+            "retry.safe-classes"
+        );
+        assert_eq!(
+            adoption_definition_preimage(&withdrawn_definition).unwrap(),
+            withdrawn_preimage
+        );
+    }
+
+    #[test]
+    fn exact_replay_accepts_every_legacy_v1_definition_digest_form() {
+        let (_temp, conn) = temp_store();
+        let (stored_error, stored_response) =
+            stored_capability_rejection("stored legacy capability rejection");
+
+        for command_kind in ["create", "revise"] {
+            for legacy_kind in ["valid", "invalid", "unsupported"] {
+                let id = format!("legacy-{command_kind}-{legacy_kind}-digest");
+                let body = definition(&id, "Legacy digest");
+                let command = match command_kind {
+                    "create" => DefinitionCommand::Create {
+                        definition: body.clone(),
+                    },
+                    "revise" => DefinitionCommand::Revise {
+                        definition: body.clone(),
+                        expected_revision: Some(7),
+                    },
+                    _ => unreachable!(),
+                };
+                let adoption_key = format!("adopt:{command_kind}:legacy-{legacy_kind}-digest:0001");
+                conn.execute(
+                    "INSERT INTO automation_command_adoptions (
+                        adoption_key, request_digest, command, automation_id, outcome,
+                        revision, response_json, adopted_at
+                     ) VALUES (?1, ?2, ?3, ?4, 'rejected', NULL, ?5, ?6)",
+                    params![
+                        adoption_key,
+                        legacy_v1_command_digest(&command, legacy_kind),
+                        command_identity(&command).0,
+                        id,
+                        stored_response,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )
+                .unwrap();
+
+                let replay = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    command.clone(),
+                    "2026-09-03T09:01:00.000Z",
+                )
+                .unwrap();
+
+                assert_eq!(
+                    replay.outcome,
+                    DefinitionCommandOutcome::Rejected,
+                    "{command_kind} {legacy_kind}"
+                );
+                assert_eq!(
+                    replay.error,
+                    Some(stored_error.clone()),
+                    "{command_kind} {legacy_kind}"
+                );
+
+                if legacy_kind == "valid" {
+                    let mut default_explicit_body = body.clone();
+                    default_explicit_body["retry"] = json!({
+                        "maxAttempts": 1,
+                        "backoffPolicy": "none",
+                        "retryableClasses": []
+                    });
+                    let default_explicit_command = match command_kind {
+                        "create" => DefinitionCommand::Create {
+                            definition: default_explicit_body,
+                        },
+                        "revise" => DefinitionCommand::Revise {
+                            definition: default_explicit_body,
+                            expected_revision: Some(7),
+                        },
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        legacy_v1_command_digest(&command, legacy_kind),
+                        legacy_v1_command_digest(&default_explicit_command, legacy_kind),
+                        "{command_kind} fixture must reproduce the old normalized digest alias"
+                    );
+                    let default_explicit = execute_definition_command(
+                        &conn,
+                        &adoption_key,
+                        default_explicit_command,
+                        "2026-09-03T09:01:30.000Z",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        default_explicit.error.as_ref().map(ErrorEnvelope::code),
+                        Some(ErrorCode::AdoptionReplayMismatch),
+                        "{command_kind} explicit default retry must not match an omitted retry"
+                    );
+                }
+
+                let mut changed_body = body.clone();
+                changed_body["prompt"] = json!("Changed payload must not replay.");
+                let changed_command = match command_kind {
+                    "create" => DefinitionCommand::Create {
+                        definition: changed_body,
+                    },
+                    "revise" => DefinitionCommand::Revise {
+                        definition: changed_body,
+                        expected_revision: Some(7),
+                    },
+                    _ => unreachable!(),
+                };
+                let changed = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    changed_command,
+                    "2026-09-03T09:02:00.000Z",
+                )
+                .unwrap();
+                assert_eq!(
+                    changed.error.as_ref().map(ErrorEnvelope::code),
+                    Some(ErrorCode::AdoptionReplayMismatch),
+                    "{command_kind} {legacy_kind} changed payload"
+                );
+
+                if command_kind == "revise" {
+                    let changed_revision = execute_definition_command(
+                        &conn,
+                        &adoption_key,
+                        DefinitionCommand::Revise {
+                            definition: body,
+                            expected_revision: Some(8),
+                        },
+                        "2026-09-03T09:03:00.000Z",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        changed_revision.error.as_ref().map(ErrorEnvelope::code),
+                        Some(ErrorCode::AdoptionReplayMismatch),
+                        "{legacy_kind} changed expectedRevision"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(adoption_count(&conn), 6);
+    }
+
+    #[test]
+    fn exact_v1_validation_replay_sanitizes_legacy_response_and_mismatch_preserves_storage() {
+        let (_temp, conn) = temp_store();
+
+        for command_kind in ["create", "revise"] {
+            let id = format!("legacy-secret-{command_kind}");
+            let body = definition(&id, "Legacy secret response");
+            let command = match command_kind {
+                "create" => DefinitionCommand::Create {
+                    definition: body.clone(),
+                },
+                "revise" => DefinitionCommand::Revise {
+                    definition: body.clone(),
+                    expected_revision: Some(7),
+                },
+                _ => unreachable!(),
+            };
+            let current_revision = PositiveInteger::new(4).unwrap();
+            let secret = format!("SECRET_{command_kind}_VALIDATION_VALUE");
+            let legacy_error = ErrorEnvelope::try_new(
+                ErrorCode::ValidationFailed,
+                format!("legacy validation exposed {secret}"),
+                true,
+            )
+            .unwrap()
+            .with_details(BTreeMap::from([(
+                "submittedValue".to_owned(),
+                Value::String(secret.clone()),
+            )]))
+            .with_adoption(ErrorAdoption {
+                key: AdoptionKey::new(format!("adopt:legacy:{command_kind}:secret")).unwrap(),
+                conflict_outcome: Some(AdoptionConflictOutcome::Rejected),
+            })
+            .with_current_revision(current_revision);
+            let legacy_response = serde_json::to_string(&StoredResponse::Rejected {
+                error: legacy_error,
+            })
+            .unwrap();
+            let adoption_key = format!("adopt:{command_kind}:legacy-secret:0001");
+            conn.execute(
+                "INSERT INTO automation_command_adoptions (
+                    adoption_key, request_digest, command, automation_id, outcome,
+                    revision, response_json, adopted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'rejected', 4, ?5, ?6)",
+                params![
+                    adoption_key,
+                    legacy_v1_command_digest(&command, "valid"),
+                    command_identity(&command).0,
+                    id,
+                    legacy_response,
+                    "2026-09-03T09:00:00.000Z",
+                ],
+            )
+            .unwrap();
+
+            let replay = execute_definition_command(
+                &conn,
+                &adoption_key,
+                command.clone(),
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            let replay_error = replay.error.as_ref().unwrap();
+            assert_eq!(replay_error.code(), ErrorCode::ValidationFailed);
+            assert_eq!(
+                replay_error.message.as_str(),
+                DEFINITION_VALIDATION_FAILED_MESSAGE
+            );
+            assert!(!replay_error.retryable);
+            assert!(replay_error.details.is_none());
+            assert!(replay_error.adoption.is_none());
+            assert_eq!(
+                replay_error.current_revision.map(PositiveInteger::get),
+                Some(4)
+            );
+            let replay_json = serde_json::to_string(replay_error).unwrap();
+            assert!(!replay_json.contains(&secret));
+
+            let sanitized_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!sanitized_response.contains(&secret));
+            assert_eq!(
+                sanitized_response,
+                serde_json::to_string(&StoredResponse::Rejected {
+                    error: replay_error.clone(),
+                })
+                .unwrap()
+            );
+
+            let repeated = execute_definition_command(
+                &conn,
+                &adoption_key,
+                command.clone(),
+                "2026-09-03T09:02:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(repeated.error, replay.error);
+            let repeated_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&adoption_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(repeated_response, sanitized_response);
+
+            let mismatch_key = format!("adopt:{command_kind}:legacy-secret-mismatch:0001");
+            let mismatch_secret = format!("SECRET_{command_kind}_MISMATCH_VALUE");
+            let mismatch_error = ErrorEnvelope::try_new(
+                ErrorCode::ValidationFailed,
+                format!("legacy validation exposed {mismatch_secret}"),
+                false,
+            )
+            .unwrap()
+            .with_details(BTreeMap::from([(
+                "submittedValue".to_owned(),
+                Value::String(mismatch_secret.clone()),
+            )]));
+            let mismatch_response = serde_json::to_string(&StoredResponse::Rejected {
+                error: mismatch_error,
+            })
+            .unwrap();
+            conn.execute(
+                "INSERT INTO automation_command_adoptions (
+                    adoption_key, request_digest, command, automation_id, outcome,
+                    revision, response_json, adopted_at
+                 ) VALUES (?1, ?2, ?3, ?4, 'rejected', NULL, ?5, ?6)",
+                params![
+                    mismatch_key,
+                    legacy_v1_command_digest(&command, "valid"),
+                    command_identity(&command).0,
+                    id,
+                    mismatch_response,
+                    "2026-09-03T09:00:00.000Z",
+                ],
+            )
+            .unwrap();
+            let mut changed_body = body;
+            changed_body["retry"] = json!({
+                "maxAttempts": 1,
+                "backoffPolicy": "none",
+                "retryableClasses": []
+            });
+            let changed_command = match command_kind {
+                "create" => DefinitionCommand::Create {
+                    definition: changed_body,
+                },
+                "revise" => DefinitionCommand::Revise {
+                    definition: changed_body,
+                    expected_revision: Some(7),
+                },
+                _ => unreachable!(),
+            };
+            let mismatch = execute_definition_command(
+                &conn,
+                &mismatch_key,
+                changed_command,
+                "2026-09-03T09:03:00.000Z",
+            )
+            .unwrap();
+            assert_eq!(
+                mismatch.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::AdoptionReplayMismatch)
+            );
+            let unchanged_response: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = ?1",
+                    [&mismatch_key],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(unchanged_response, mismatch_response);
+            assert!(unchanged_response.contains(&mismatch_secret));
+        }
+    }
+
+    #[test]
+    fn reservations_accept_every_legacy_v1_definition_digest_form_only_for_exact_commands() {
+        let (_temp, conn) = temp_store();
+
+        for command_kind in ["create", "revise"] {
+            for legacy_kind in ["valid", "invalid", "unsupported"] {
+                let id = format!("reserved-{command_kind}-{legacy_kind}-digest");
+                let body = definition(&id, "Reserved legacy digest");
+                let command = match command_kind {
+                    "create" => DefinitionCommand::Create {
+                        definition: body.clone(),
+                    },
+                    "revise" => DefinitionCommand::Revise {
+                        definition: body.clone(),
+                        expected_revision: Some(3),
+                    },
+                    _ => unreachable!(),
+                };
+                let adoption_key =
+                    format!("adopt:{command_kind}:reserved-{legacy_kind}-digest:0001");
+                conn.execute(
+                    "INSERT INTO automation_command_reservations (
+                         adoption_key, request_digest, command, reserved_at
+                     ) VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        adoption_key,
+                        legacy_v1_command_digest(&command, legacy_kind),
+                        command_identity(&command).0,
+                        "2026-09-03T09:00:00.000Z",
+                    ],
+                )
+                .unwrap();
+
+                let pending = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    command.clone(),
+                    "2026-09-03T09:01:00.000Z",
+                )
+                .unwrap();
+                assert_eq!(
+                    pending.error.as_ref().map(ErrorEnvelope::code),
+                    Some(ErrorCode::CancelPending),
+                    "{command_kind} {legacy_kind}"
+                );
+
+                let mut changed_body = body;
+                changed_body["name"] = json!("Changed reservation payload");
+                let changed_command = match command_kind {
+                    "create" => DefinitionCommand::Create {
+                        definition: changed_body,
+                    },
+                    "revise" => DefinitionCommand::Revise {
+                        definition: changed_body,
+                        expected_revision: Some(3),
+                    },
+                    _ => unreachable!(),
+                };
+                let mismatch = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    changed_command,
+                    "2026-09-03T09:02:00.000Z",
+                )
+                .unwrap();
+                assert_eq!(
+                    mismatch.error.as_ref().map(ErrorEnvelope::code),
+                    Some(ErrorCode::AdoptionReplayMismatch),
+                    "{command_kind} {legacy_kind} changed payload"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_create_is_durably_rejected_without_mutation_or_event() {
+        let (_temp, conn) = temp_store();
+        let mut unsupported = definition("unsupported-create", "Unsupported");
+        unsupported["outputTarget"] = json!("result.md");
+        let command = DefinitionCommand::Create {
+            definition: unsupported.clone(),
+        };
+
+        let first = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            command.clone(),
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        let first_error = first.error.as_ref().unwrap();
+        assert_eq!(first_error.code(), ErrorCode::CapabilityUnsupported);
+        let first_error = serde_json::to_value(first_error).unwrap();
+        assert_eq!(
+            first_error["details"],
+            json!({
+                "contractProfile": "coven.automations.v1",
+                "reason": "The wire shape is reserved, but no current implementation has a pinned-revision, crash-recoverable delivery state machine. Refuse with CAPABILITY_UNSUPPORTED.",
+                "variant": "outputTarget.atomic"
+            })
+        );
+        assert!(get_definition(&conn, "unsupported-create")
+            .unwrap()
+            .is_none());
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+        assert_eq!(adoption_count(&conn), 1);
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            command,
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            serde_json::to_value(replay.error.unwrap()).unwrap(),
+            first_error
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+
+        unsupported["outputTarget"] = json!("different.md");
+        let mismatch = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported:0001",
+            DefinitionCommand::Create {
+                definition: unsupported,
+            },
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch.error.unwrap().code(),
+            ErrorCode::AdoptionReplayMismatch
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert_eq!(definition_event_count(&conn, "unsupported-create"), 0);
+    }
+
+    #[test]
+    fn unsupported_partial_create_remains_a_durable_validation_rejection() {
+        let (_temp, conn) = temp_store();
+        let command = DefinitionCommand::Create {
+            definition: json!({"misfire": "backfill"}),
+        };
+
+        let first = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            command.clone(),
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            first.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::ValidationFailed)
+        );
+        assert_eq!(adoption_count(&conn), 1);
+        assert!(list_definitions(&conn).unwrap().is_empty());
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            command,
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(replay.error, first.error);
+        assert_eq!(adoption_count(&conn), 1);
+
+        let changed = execute_definition_command(
+            &conn,
+            "adopt:create:partial-unsupported:0001",
+            DefinitionCommand::Create {
+                definition: definition("partial-unsupported", "Corrected"),
+            },
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            changed.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::AdoptionReplayMismatch)
+        );
+        assert!(list_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_create_does_not_mask_independent_validation_failures() {
+        let (_temp, conn) = temp_store();
+
+        let mut malformed_retry = definition("malformed-retry", "Malformed retry");
+        malformed_retry["outputTarget"] = json!("result.md");
+        malformed_retry["retry"] = json!({
+            "maxAttempts": 3,
+            "backoffPolicy": ["linear"]
+        });
+
+        let mut unknown_field = definition("unknown-field", "Unknown field");
+        unknown_field["outputTarget"] = json!("result.md");
+        unknown_field["futureField"] = json!("must fail closed");
+
+        let mut malformed_rich_policy =
+            definition("malformed-rich-policy", "Malformed rich policy");
+        malformed_rich_policy["outputTarget"] = json!("result.md");
+        malformed_rich_policy["policies"] = json!({
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": "runtime_unavailable"
+            }
+        });
+
+        let mut malformed_rrule = definition("malformed-rrule", "Malformed RRULE");
+        malformed_rrule["outputTarget"] = json!("result.md");
+        malformed_rrule["rrule"] = json!("FREQ=DAILY;BYHOUR=not-a-number");
+
+        let mut malformed_retention = definition("malformed-retention", "Malformed retention");
+        malformed_retention["outputTarget"] = json!("result.md");
+        malformed_retention["policies"] = json!({
+            "retention": {
+                "occurrenceHistory": {"classification": 1}
+            }
+        });
+
+        for (index, invalid) in [
+            malformed_retry,
+            unknown_field,
+            malformed_rich_policy,
+            malformed_rrule,
+            malformed_retention,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let response = execute_definition_command(
+                &conn,
+                &format!("adopt:create:unsupported-invalid:{index:04}"),
+                DefinitionCommand::Create {
+                    definition: invalid,
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(
+                response.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed),
+                "case {index}"
+            );
+        }
+
+        assert_eq!(adoption_count(&conn), 5);
+        assert!(list_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn v1_create_and_revise_validation_failures_are_secret_free_and_durable() {
+        let (_temp, conn) = temp_store();
+        let cases = [
+            (
+                "retryable-class",
+                "SECRET_RETRYABLE_CLASS must not escape",
+                {
+                    let mut value = definition("secret-retryable-class", "Secret retry class");
+                    value["retry"] = json!({
+                        "maxAttempts": 2,
+                        "backoffPolicy": "none",
+                        "retryableClasses": ["SECRET_RETRYABLE_CLASS must not escape"]
+                    });
+                    value
+                },
+            ),
+            (
+                "union-discriminator",
+                "SECRET_UNION_DISCRIMINATOR must not escape",
+                {
+                    let mut value =
+                        definition("secret-union-discriminator", "Secret union discriminator");
+                    value["action"] = json!({
+                        "variant": "SECRET_UNION_DISCRIMINATOR must not escape",
+                        "version": 1
+                    });
+                    value
+                },
+            ),
+            ("timezone", "SECRET_TIMEZONE must not escape", {
+                let mut value = definition("secret-timezone", "Secret timezone");
+                value["timezone"] = json!("SECRET_TIMEZONE must not escape");
+                value
+            }),
+            ("rrule", "SECRET_RRULE_VALUE", {
+                let mut value = definition("secret-rrule", "Secret RRULE");
+                value["rrule"] = json!("FREQ=DAILY;BYHOUR=SECRET_RRULE_VALUE");
+                value
+            }),
+        ];
+
+        for command_kind in ["create", "revise"] {
+            for (case, secret, invalid) in &cases {
+                let command = match command_kind {
+                    "create" => DefinitionCommand::Create {
+                        definition: invalid.clone(),
+                    },
+                    "revise" => DefinitionCommand::Revise {
+                        definition: invalid.clone(),
+                        expected_revision: Some(1),
+                    },
+                    _ => unreachable!(),
+                };
+                let adoption_key = format!("adopt:{command_kind}:secret-free-{case}:0001");
+                let first = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    command.clone(),
+                    "2026-09-03T09:00:00.000Z",
+                )
+                .unwrap();
+
+                assert_eq!(
+                    first.error.as_ref().map(ErrorEnvelope::code),
+                    Some(ErrorCode::ValidationFailed),
+                    "{command_kind} {case}"
+                );
+                assert_eq!(
+                    first.error.as_ref().map(|error| error.message.as_str()),
+                    Some("automation definition failed validation"),
+                    "{command_kind} {case}"
+                );
+                let first_error = serde_json::to_string(first.error.as_ref().unwrap()).unwrap();
+                assert!(!first_error.contains(secret), "{command_kind} {case}");
+                assert!(
+                    !first_error.contains("CAPABILITY_UNSUPPORTED"),
+                    "{command_kind} {case}"
+                );
+
+                let stored_json: String = conn
+                    .query_row(
+                        "SELECT response_json
+                         FROM automation_command_adoptions
+                         WHERE adoption_key = ?1",
+                        [&adoption_key],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert!(!stored_json.contains(secret), "{command_kind} {case}");
+                assert!(
+                    stored_json.contains("automation definition failed validation"),
+                    "{command_kind} {case}"
+                );
+
+                let replay = execute_definition_command(
+                    &conn,
+                    &adoption_key,
+                    command,
+                    "2026-09-03T09:01:00.000Z",
+                )
+                .unwrap();
+                assert_eq!(replay.error, first.error, "{command_kind} {case} replay");
+                let replay_error = serde_json::to_string(replay.error.as_ref().unwrap()).unwrap();
+                assert!(
+                    !replay_error.contains(secret),
+                    "{command_kind} {case} replay"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rich_policy_variants_are_refused_only_when_the_flat_definition_is_valid() {
+        let (_temp, conn) = temp_store();
+
+        let mut retry = definition("unsupported-retry-class", "Unsupported retry class");
+        retry["policies"] = json!({
+            "retry": {
+                "maxAttempts": 2,
+                "backoffPolicy": "none",
+                "retryableClasses": ["transient_dispatch", "ambiguous"]
+            }
+        });
+        let retry_response = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported-retry-class:0001",
+            DefinitionCommand::Create { definition: retry },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            retry_response.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::CapabilityUnsupported)
+        );
+        assert_eq!(
+            serde_json::to_value(retry_response.error.unwrap()).unwrap()["details"]["variant"],
+            "retry.safe-classes.ambiguous"
+        );
+
+        let mut retention = definition("unsupported-retention", "Unsupported retention");
+        retention["policies"] = json!({
+            "retention": {
+                "occurrenceHistory": {"classification": "standard"},
+                "receipts": {"classification": "extended"}
+            }
+        });
+        let retention_response = execute_definition_command(
+            &conn,
+            "adopt:create:unsupported-retention:0001",
+            DefinitionCommand::Create {
+                definition: retention,
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            retention_response.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::CapabilityUnsupported)
+        );
+        assert_eq!(
+            serde_json::to_value(retention_response.error.unwrap()).unwrap()["details"]["variant"],
+            "retention.extended"
+        );
+
+        assert_eq!(adoption_count(&conn), 2);
+        assert!(list_definitions(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsupported_revise_is_durably_rejected_without_revision_or_event_change() {
+        let (_temp, conn) = temp_store();
+        execute_definition_command(
+            &conn,
+            "adopt:create:revise-target:0001",
+            DefinitionCommand::Create {
+                definition: definition("revise-target", "Original"),
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        let mut unsupported = definition("revise-target", "Must not land");
+        unsupported["misfire"] = json!("backfill");
+        let command = DefinitionCommand::Revise {
+            definition: unsupported.clone(),
+            expected_revision: Some(1),
+        };
+        let first = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            command.clone(),
+            "2026-09-03T09:01:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+        let first_error = first.error.as_ref().unwrap();
+        assert_eq!(first_error.code(), ErrorCode::CapabilityUnsupported);
+        let first_error = serde_json::to_value(first_error).unwrap();
+        assert_eq!(first_error["details"]["variant"], "misfire.backfill");
+        assert_eq!(
+            first_error["details"]["contractProfile"],
+            "coven.automations.v1"
+        );
+        let stored = get_definition(&conn, "revise-target").unwrap().unwrap();
+        assert_eq!(stored.revision, 1);
+        assert!(stored.definition_json.contains(r#""name":"Original""#));
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        let replay = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            command,
+            "2026-09-03T09:02:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+        assert_eq!(
+            serde_json::to_value(replay.error.unwrap()).unwrap(),
+            first_error
+        );
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+
+        unsupported["misfire"] = json!("all");
+        let mismatch = execute_definition_command(
+            &conn,
+            "adopt:revise:unsupported:0002",
+            DefinitionCommand::Revise {
+                definition: unsupported,
+                expected_revision: Some(1),
+            },
+            "2026-09-03T09:03:00.000Z",
+        )
+        .unwrap();
+        assert_eq!(
+            mismatch.error.unwrap().code(),
+            ErrorCode::AdoptionReplayMismatch
+        );
+        assert_eq!(adoption_count(&conn), 2);
+        assert_eq!(definition_event_count(&conn, "revise-target"), 1);
+    }
+
+    #[test]
+    fn legacy_create_keeps_output_target_validation_behavior() {
+        let (_temp, conn) = temp_store();
+        let mut unsupported = definition("legacy-output", "Legacy output");
+        unsupported["outputTarget"] = json!("result.md");
+
+        let response = execute_definition_command(
+            &conn,
+            "legacy-output-target",
+            DefinitionCommand::LegacyCreate {
+                definition: unsupported,
+            },
+            "2026-09-03T09:00:00.000Z",
+        )
+        .unwrap();
+
+        assert_eq!(response.error.unwrap().code(), ErrorCode::ValidationFailed);
+    }
+
+    #[test]
+    fn adoption_ledger_blocks_arbitrary_updates_and_deletes() {
         let (_temp, conn) = temp_store();
         execute_definition_command(
             &conn,
@@ -1417,6 +2647,26 @@ mod tests {
                 [],
             )
             .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_command_adoptions
+                 SET response_json = '{\"outcome\":\"rejected\",\"error\":{\"code\":\"VALIDATION_FAILED\",\"httpStatus\":400,\"message\":\"automation definition failed validation\",\"retryable\":false}}'
+                 WHERE adoption_key = 'adopt:create:immutable:0001'",
+                [],
+            )
+            .is_err());
+        for rowid_alias in ["rowid", "_rowid_", "oid"] {
+            assert!(conn
+                .execute(
+                    &format!(
+                        "UPDATE automation_command_adoptions
+                         SET {rowid_alias} = {rowid_alias} + 1
+                         WHERE adoption_key = 'adopt:create:immutable:0001'"
+                    ),
+                    [],
+                )
+                .is_err());
+        }
         assert!(conn
             .execute(
                 "DELETE FROM automation_command_adoptions
@@ -1524,7 +2774,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_replay_returns_first_result_without_a_second_mutation() {
+    fn changed_wire_payload_does_not_replay_first_result() {
         let (_temp, conn) = temp_store();
         let command = DefinitionCommand::Create {
             definition: definition("daily", "Daily"),
@@ -1550,15 +2800,260 @@ mod tests {
         .unwrap();
 
         assert_eq!(first.outcome, DefinitionCommandOutcome::Committed);
-        assert_eq!(replay.outcome, DefinitionCommandOutcome::Replayed);
-        assert_eq!(replay.result, first.result);
-        assert_eq!(replay.revision, Some(1));
+        assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
         assert_eq!(
-            replay.replay_first_committed_at.as_deref(),
-            Some("2026-09-03T09:00:00.000Z")
+            replay.error.as_ref().map(ErrorEnvelope::code),
+            Some(ErrorCode::AdoptionReplayMismatch)
         );
+        assert_eq!(first.revision, Some(1));
         assert_eq!(list_definitions(&conn).unwrap().len(), 1);
         assert_eq!(adoption_count(&conn), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_command_fingerprint_is_stable_across_timezone_environments() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_COMMAND_FINGERPRINT_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_command_fingerprint_is_stable_across_timezone_environments";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let command = DefinitionCommand::Create {
+                definition: definition("stable-local-fingerprint", "Stable local fingerprint"),
+            };
+            let canonical = canonical_command(&command).unwrap();
+            assert_eq!(canonical["definition"]["kind"], "wire");
+            println!("fingerprint={}", definition_command_fingerprint(&command));
+            return;
+        }
+
+        let fingerprint_for = |timezone: &str| {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME, "--nocapture"])
+                .env(CHILD_ENV, "1")
+                .env("TZ", timezone)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child fingerprint assertion failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("fingerprint="))
+                .expect("child emitted fingerprint")
+                .to_owned()
+        };
+
+        assert_eq!(
+            fingerprint_for("Pacific/Kiritimati"),
+            fingerprint_for("America/Chicago")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_resolution_failure_is_durably_rejected_and_replayed() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_RESOLUTION_REJECTION_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_resolution_failure_is_durably_rejected_and_replayed";
+        const SECRET: &str = "SECRET_TZ_OVERRIDE must not escape";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let command = DefinitionCommand::Create {
+                definition: definition("local-resolution-failure", "Local resolution failure"),
+            };
+            unsafe {
+                std::env::set_var("TZ", SECRET);
+            }
+            let first = execute_definition_command(
+                &conn,
+                "adopt:create:local-resolution-failure:0001",
+                command.clone(),
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(first.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(
+                first.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed)
+            );
+            assert_eq!(
+                first.error.as_ref().map(|error| error.message.as_str()),
+                Some("automation definition failed validation")
+            );
+            assert!(!serde_json::to_string(first.error.as_ref().unwrap())
+                .unwrap()
+                .contains(SECRET));
+            assert!(get_definition(&conn, "local-resolution-failure")
+                .unwrap()
+                .is_none());
+            assert_eq!(definition_event_count(&conn, "local-resolution-failure"), 0);
+            assert_eq!(adoption_count(&conn), 1);
+            let stored_json: String = conn
+                .query_row(
+                    "SELECT response_json
+                     FROM automation_command_adoptions
+                     WHERE adoption_key = 'adopt:create:local-resolution-failure:0001'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!stored_json.contains(SECRET));
+
+            unsafe {
+                std::env::set_var("TZ", "Pacific/Kiritimati");
+            }
+            let replay = execute_definition_command(
+                &conn,
+                "adopt:create:local-resolution-failure:0001",
+                command,
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(replay.error, first.error);
+            assert!(get_definition(&conn, "local-resolution-failure")
+                .unwrap()
+                .is_none());
+            assert_eq!(definition_event_count(&conn, "local-resolution-failure"), 0);
+            assert_eq!(adoption_count(&conn), 1);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn revise_local_resolution_failure_is_durable_without_mutation_or_event() {
+        const CHILD_ENV: &str = "COVEN_TEST_REVISE_LOCAL_RESOLUTION_REJECTION_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::revise_local_resolution_failure_is_durable_without_mutation_or_event";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let mut original = definition("local-revise-failure", "Original");
+            original["timezone"] = json!("utc");
+            execute_definition_command(
+                &conn,
+                "adopt:create:local-revise-failure:0001",
+                DefinitionCommand::Create {
+                    definition: original,
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            let command = DefinitionCommand::Revise {
+                definition: definition("local-revise-failure", "Must not land"),
+                expected_revision: Some(1),
+            };
+            unsafe {
+                std::env::set_var("TZ", ":/tmp/coven-invalid-zoneinfo");
+            }
+            let first = execute_definition_command(
+                &conn,
+                "adopt:revise:local-resolution-failure:0002",
+                command.clone(),
+                "2026-09-03T09:01:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(
+                first.error.as_ref().map(ErrorEnvelope::code),
+                Some(ErrorCode::ValidationFailed)
+            );
+            let stored = get_definition(&conn, "local-revise-failure")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.revision, 1);
+            assert_eq!(stored.name, "Original");
+            assert_eq!(definition_event_count(&conn, "local-revise-failure"), 1);
+
+            unsafe {
+                std::env::set_var("TZ", "America/Chicago");
+            }
+            let replay = execute_definition_command(
+                &conn,
+                "adopt:revise:local-resolution-failure:0002",
+                command,
+                "2026-09-03T09:02:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(replay.outcome, DefinitionCommandOutcome::Rejected);
+            assert_eq!(replay.error, first.error);
+            let stored = get_definition(&conn, "local-revise-failure")
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.revision, 1);
+            assert_eq!(stored.name, "Original");
+            assert_eq!(definition_event_count(&conn, "local-revise-failure"), 1);
+            assert_eq!(adoption_count(&conn), 2);
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_compatibility_input_persists_the_exact_tz_override() {
+        const CHILD_ENV: &str = "COVEN_TEST_LOCAL_PERSISTENCE_CHILD";
+        const TEST_NAME: &str =
+            "automations::command_adoption::tests::local_compatibility_input_persists_the_exact_tz_override";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (_temp, conn) = temp_store();
+            let response = execute_definition_command(
+                &conn,
+                "adopt:create:exact-local-normalized:0001",
+                DefinitionCommand::Create {
+                    definition: definition("exact-local-normalized", "Exact local normalized"),
+                },
+                "2026-09-03T09:00:00.000Z",
+            )
+            .unwrap();
+
+            assert_eq!(response.outcome, DefinitionCommandOutcome::Committed);
+            let record = get_definition(&conn, "exact-local-normalized")
+                .unwrap()
+                .unwrap();
+            let stored: Value = serde_json::from_str(&record.definition_json).unwrap();
+            assert_eq!(stored["timezone"], "Pacific/Kiritimati");
+            assert_eq!(
+                response.result.unwrap()["routine"]["timezone"],
+                "Pacific/Kiritimati"
+            );
+            return;
+        }
+
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env("TZ", "Pacific/Kiritimati")
+            .status()
+            .unwrap();
+
+        assert!(status.success(), "child timezone assertion failed");
     }
 
     #[test]
@@ -1606,12 +3101,10 @@ mod tests {
             response.error.as_ref().map(ErrorEnvelope::code),
             Some(ErrorCode::ValidationFailed)
         );
-        assert!(response
-            .error
-            .unwrap()
-            .message
-            .as_str()
-            .contains("valid IANA timezone"));
+        assert_eq!(
+            response.error.unwrap().message.as_str(),
+            "automation definition failed validation"
+        );
         assert!(get_definition(&conn, "invalid-timezone").unwrap().is_none());
         assert_eq!(adoption_count(&conn), 1);
     }

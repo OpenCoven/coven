@@ -1,23 +1,19 @@
 //! Durable Automations v1 event streams.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 pub use super::types::EventRef;
-use super::types::{EventEnvelope, EventRefStream, SafeInteger, StreamKind};
-
-#[cfg(test)]
-use super::types::{EventKind, EventPayload};
-#[cfg(test)]
-use serde_json::{Map, Value};
-#[cfg(test)]
-use std::collections::HashSet;
+use super::types::{
+    EventEnvelope, EventKind, EventPayload, EventRefStream, SafeInteger, StreamKind,
+};
 
 pub const AUTOMATION_EVENTS_SCHEMA_SQL: &str = "
     CREATE TABLE IF NOT EXISTS automation_event_stream_heads (
@@ -791,7 +787,6 @@ pub fn resume_events(
     )
 }
 
-#[cfg(test)]
 #[derive(Debug, Default)]
 pub struct EventReducer {
     stream: Option<(String, String)>,
@@ -800,7 +795,6 @@ pub struct EventReducer {
     state: Value,
 }
 
-#[cfg(test)]
 impl EventReducer {
     pub fn apply(&mut self, event: &EventEnvelope) -> Result<(), EventStoreError> {
         if self.seen_event_ids.contains(event.event_id.as_str()) {
@@ -829,6 +823,14 @@ impl EventReducer {
                     expected: through,
                     actual: event.sequence.get(),
                 });
+            }
+            if let Some(cursor) = self.cursor {
+                if through <= cursor {
+                    return Err(EventStoreError::StreamOutOfOrder {
+                        expected: cursor.saturating_add(1),
+                        actual: through,
+                    });
+                }
             }
             self.state = Value::Object(
                 snapshot
@@ -1166,6 +1168,27 @@ mod tests {
         compacted.apply(&events[4]).unwrap();
 
         assert_eq!(compacted.state(), full.state());
+    }
+
+    #[test]
+    fn snapshot_cannot_rewind_an_existing_reduction() {
+        let events = [
+            occurrence_event("evtoccurrence0000000020", 0, "none", "planned"),
+            occurrence_event("evtoccurrence0000000021", 1, "planned", "eligible"),
+            occurrence_event("evtoccurrence0000000022", 2, "eligible", "claimed"),
+            occurrence_event("evtoccurrence0000000023", 3, "claimed", "running"),
+        ];
+        let mut reducer = EventReducer::default();
+        for event in &events {
+            reducer.apply(event).unwrap();
+        }
+
+        let stale_snapshot = snapshot_event("evtsnapshot00000000002", 2, 2);
+        let error = reducer.apply(&stale_snapshot).unwrap_err();
+
+        assert_eq!(error.code(), "STREAM_OUT_OF_ORDER");
+        assert_eq!(reducer.state()["state"], "running");
+        assert_eq!(reducer.state()["eventWindow"]["lastSequence"], 3);
     }
 
     #[test]

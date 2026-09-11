@@ -184,8 +184,16 @@ pub fn gate_protected_edits(conn: &Connection, req: &GateRequest<'_>) -> Result<
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
-    let state = build_weave_state(conn, familiar_id, workspace, config, gated_targets, true)?;
+    let now = crate::threads_clock::now(coven_home)?;
+    let state = build_weave_state_at(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        gated_targets,
+        true,
+        now,
+    )?;
     let familiar_uuid = state.familiar_uuid;
     let weave = state.weave;
 
@@ -266,42 +274,48 @@ pub(crate) fn build_weave_state(
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
 ) -> Result<WeaveState> {
-    build_weave_state_for_writer(
+    build_weave_state_at(
         conn,
         familiar_id,
         workspace,
         config,
         extra_targets,
         bootstrap_missing_baselines,
-        None,
+        time::OffsetDateTime::now_utc(),
     )
 }
 
-fn build_read_only_weave_state(
-    conn: &Connection,
-    familiar_id: &str,
-    workspace: &Path,
-    config: &ward::WardConfig,
-    extra_targets: &[String],
-) -> Result<WeaveState> {
-    build_weave_state_for_writer(
-        conn,
-        familiar_id,
-        workspace,
-        config,
-        extra_targets,
-        false,
-        None,
-    )
-}
-
-pub(crate) fn build_weave_state_for_writer(
+pub(crate) fn build_weave_state_at(
     conn: &Connection,
     familiar_id: &str,
     workspace: &Path,
     config: &ward::WardConfig,
     extra_targets: &[String],
     bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
+) -> Result<WeaveState> {
+    build_weave_state_for_writer_at(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        extra_targets,
+        bootstrap_missing_baselines,
+        now,
+        None,
+    )
+}
+
+// All surfaces share one captured time alongside the existing writer-specific weave inputs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_weave_state_for_writer_at(
+    conn: &Connection,
+    familiar_id: &str,
+    workspace: &Path,
+    config: &ward::WardConfig,
+    extra_targets: &[String],
+    bootstrap_missing_baselines: bool,
+    now: time::OffsetDateTime,
     writer: Option<&threads::WriterId>,
 ) -> Result<WeaveState> {
     let familiar_uuid = familiar_weave_id(familiar_id);
@@ -325,7 +339,6 @@ pub(crate) fn build_weave_state_for_writer(
     surfaces.sort();
 
     let manifest_id = load_or_create_manifest_id(conn, familiar_id)?;
-    let now = time::OffsetDateTime::now_utc();
     let mut woven = Vec::with_capacity(surfaces.len());
     for surface in &surfaces {
         let surface_id = threads::SurfaceId::new(surface.clone());
@@ -776,7 +789,14 @@ pub fn persist_apply_audit_records(
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
 ) -> Result<()> {
-    persist_apply_audit_records_on_connection(conn, familiar_id, workspace, config, report)
+    persist_apply_audit_records_on_connection(
+        conn,
+        familiar_id,
+        workspace,
+        config,
+        report,
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 pub(crate) fn persist_apply_audit_records_on_connection(
@@ -785,6 +805,7 @@ pub(crate) fn persist_apply_audit_records_on_connection(
     workspace: &Path,
     config: &ward::WardConfig,
     report: &ward::ApplyReport,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     if report.audit_records().next().is_none() {
         return Ok(());
@@ -795,14 +816,15 @@ pub(crate) fn persist_apply_audit_records_on_connection(
             .context("starting apply-audit batch transaction")?;
     }
     let result = (|| -> Result<()> {
-        let state = build_read_only_weave_state(conn, familiar_id, workspace, config, &[])?;
-        append_apply_audit_records(
+        let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
+        append_apply_audit_records_at(
             conn,
             None,
             familiar_id,
             state.weave.weave_hash(),
             report,
             threads::Channel::Mutation,
+            now,
         )?;
         if owns_transaction {
             conn.execute_batch("COMMIT")
@@ -822,17 +844,17 @@ pub(crate) fn persist_apply_audit_records_on_connection(
 /// proposal event commit as one unit. Direct writes use
 /// [`persist_apply_audit_records_on_connection`] to append within the existing
 /// transaction when present, or a dedicated transaction otherwise.
-pub(crate) fn append_apply_audit_records(
+pub(crate) fn append_apply_audit_records_at(
     conn: &Connection,
     proposal_id: Option<&str>,
     familiar_id: &str,
     ward_hash: &[u8],
     report: &ward::ApplyReport,
     channel: threads::Channel,
+    now: time::OffsetDateTime,
 ) -> Result<()> {
     let records = report.audit_records();
     let familiar_uuid = familiar_weave_id(familiar_id);
-    let now = time::OffsetDateTime::now_utc();
     let format = time::format_description::well_known::Rfc3339;
     let now_text = now.format(&format)?;
     {
@@ -933,9 +955,9 @@ pub fn stage_coherence_proposal(
         Some(fp) => threads::WriterId::new(format!("principal:{fp}")),
         None => threads::WriterId::new("client:unsigned"),
     };
-    let now = time::OffsetDateTime::now_utc();
+    let now = crate::threads_clock::now(coven_home)?;
     // Read-only weave view: coherence staging must not bootstrap baselines.
-    let state = build_weave_state(conn, familiar_id, workspace, config, &[], false)?;
+    let state = build_weave_state_at(conn, familiar_id, workspace, config, &[], false, now)?;
     let thread_id = threads::ThreadId::new();
     let (pending_path, proposal_id) = stage_pending_proposal(
         coven_home,
@@ -1190,8 +1212,15 @@ tier = 2
             .unwrap();
 
         f.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        persist_apply_audit_records_on_connection(&f.conn, "sage", &f.workspace, &config, &report)
-            .unwrap();
+        persist_apply_audit_records_on_connection(
+            &f.conn,
+            "sage",
+            &f.workspace,
+            &config,
+            &report,
+            time::OffsetDateTime::now_utc(),
+        )
+        .unwrap();
         let count_in_transaction: i64 = f
             .conn
             .query_row(

@@ -40,11 +40,22 @@ export function summarizeSamples(samples) {
   return summary;
 }
 
+function parseCountList(raw, option) {
+  const values = raw.split(',').map((token) =>
+    /^\d+$/.test(token) ? Number.parseInt(token, 10) : Number.NaN
+  );
+  if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
+    throw new Error(`${option} must contain positive integers`);
+  }
+  return values;
+}
+
 export function parseOptions(args) {
   let binary;
   let iterations = 5;
   let output;
   let sessionCounts;
+  let eventCounts;
 
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
@@ -72,11 +83,17 @@ export function parseOptions(args) {
       if (raw === 'none') {
         sessionCounts = [];
       } else {
-        const values = raw.split(',').map((value) => Number.parseInt(value, 10));
-        if (values.some((value) => !Number.isSafeInteger(value) || value <= 0)) {
-          throw new Error('--session-counts must contain positive integers');
-        }
-        sessionCounts = values;
+        sessionCounts = parseCountList(raw, '--session-counts');
+      }
+    } else if (arg === '--event-counts' || arg.startsWith('--event-counts=')) {
+      const raw = valueFor('--event-counts');
+      if (!raw) {
+        throw new Error('--event-counts requires a value');
+      }
+      if (raw === 'none') {
+        eventCounts = [];
+      } else {
+        eventCounts = parseCountList(raw, '--event-counts');
       }
     } else {
       throw new Error(`unknown option: ${arg}`);
@@ -87,7 +104,7 @@ export function parseOptions(args) {
     throw new Error('--binary is required');
   }
 
-  return { binary, iterations, output, sessionCounts };
+  return { binary, iterations, output, sessionCounts, eventCounts };
 }
 
 export function runScenario({ command, args, iterations, allowedExitCodes = [0], env }) {
@@ -324,6 +341,19 @@ export async function registerInputEvents({
   count,
   request = socketRequest
 }) {
+  // Deliberately serial, and it must stay that way. Each request writes to a
+  // live PTY, and the daemon serializes those writes; issuing them
+  // concurrently does not go faster, it wedges until the socket timeout. Two
+  // other seeding shortcuts are also ruled out: batching several newline
+  // separated lines into one request records ONE event rather than one per
+  // line, and letting the fixture harness print its own output records events
+  // chunked by PTY read size (~12 events for 1000 printed lines) instead of a
+  // predictable count. `prepareEventTail` needs exactly `count` events, so the
+  // per-request round trip is the only shape that produces a correct fixture.
+  //
+  // The practical consequence is that events cost ~29ms each here while
+  // sessions cost ~4ms, which is why `--event-counts` is defaulted lower than
+  // `--session-counts` rather than sharing one list.
   for (let index = 1; index <= count; index += 1) {
     const response = await request(socketPath, sessionInputRequest(sessionId, index));
     if (response.statusCode !== 202) {
@@ -459,7 +489,13 @@ export async function createInputHarnessFixture(fixtureRoot, environment = proce
   return { ...environment, PATH: `${binDir}:${environment.PATH ?? ''}` };
 }
 
-export function buildReport({ iterations, sessionCounts, scenarios, environment = process.env }) {
+export function buildReport({
+  iterations,
+  sessionCounts,
+  eventCounts = sessionCounts,
+  scenarios,
+  environment = process.env
+}) {
   const report = {
     schemaVersion: 1,
     platform: {
@@ -467,7 +503,7 @@ export function buildReport({ iterations, sessionCounts, scenarios, environment 
       arch: process.arch,
       node: process.version
     },
-    options: { iterations, sessionCounts },
+    options: { iterations, sessionCounts, eventCounts },
     scenarios
   };
   if (environment.GITHUB_SHA) {
@@ -679,7 +715,10 @@ export async function measureSessionLists({
   fixtureRoot,
   sessionCounts,
   environment,
-  fixtureConcurrency = 8,
+  // Session registration is a plain socket write with no PTY involved, so it
+  // parallelizes cleanly. Measured seeding of 1000 sessions: 28.9s serial,
+  // 3.9s at 8, 2.5s at 32, 2.5s at 64 - so 32 is where the curve flattens.
+  fixtureConcurrency = 32,
   iterations = 1,
   makeDirectory = (path) => mkdir(path, { recursive: true }),
   start = startDaemon,
@@ -836,6 +875,10 @@ export async function collectBenchmarkScenarios({
     env: coreEnv
   });
 
+  // Callers that predate the split still pass only `sessionCounts`; falling
+  // back to it keeps their event coverage exactly as it was.
+  const eventCounts = options.eventCounts ?? options.sessionCounts;
+
   if (options.sessionCounts.length > 0) {
     scenarios.daemon_cold_start = await measureColdStarts({
       binary: options.binary,
@@ -854,7 +897,7 @@ export async function collectBenchmarkScenarios({
       await measureEvents({
         binary: options.binary,
         fixtureRoot,
-        eventCounts: options.sessionCounts,
+        eventCounts,
         environment,
         iterations: options.iterations
       })
@@ -883,15 +926,21 @@ export async function collectBenchmarkScenarios({
 export async function main(args = process.argv.slice(2)) {
   const options = parseOptions(args);
   const sessionCounts = options.sessionCounts ?? [100, 1000, 10000];
+  // Events are seeded one PTY round trip at a time (see registerInputEvents),
+  // so a 10000-event tier costs ~5 minutes on its own - roughly seven times the
+  // whole 11100-session fixture. The default stops at 1000 and the deep tail
+  // stays reachable on demand with `--event-counts 100,1000,10000`.
+  const eventCounts = options.eventCounts ?? [100, 1000];
   const fixtureRoot = await mkdtemp(join(tmpdir(), 'coven-benchmark-'));
 
   try {
     const report = buildReport({
       iterations: options.iterations,
       sessionCounts,
+      eventCounts,
       environment: process.env,
       scenarios: await collectBenchmarkScenarios({
-        options: { ...options, sessionCounts },
+        options: { ...options, sessionCounts, eventCounts },
         fixtureRoot,
         environment: process.env
       })
