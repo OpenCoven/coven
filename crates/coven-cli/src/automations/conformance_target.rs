@@ -1,20 +1,24 @@
 use std::collections::BTreeSet;
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::Connection;
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
 use super::contract::{canonicalize, sha256_hex, AutomationDefinition};
-use super::runs::{record_run_finish, record_run_start, RunFinish, RunStart};
+use super::runs::{
+    record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
+};
 
 const TARGET_CAPABILITY_SCHEMA_VERSION: &str = "coven.automations.conformance-target-capability.v1";
 const SUITE_REQUEST_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-request.v1";
 const SUITE_RESULT_SCHEMA_VERSION: &str = "coven.automations.conformance-suite-result.v1";
 const CAPABILITY_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.capability-negotiation-vectors.v1";
+const ATTEMPT_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.attempt-terminal-immutability-vectors.v1";
 const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.definition-validation-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
@@ -23,6 +27,7 @@ const STRUCTURAL_PROFILE: &str = "structural";
 const MAX_CASES: usize = 128;
 
 pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
+pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
@@ -88,6 +93,67 @@ struct CapabilityVectorCase {
 enum ExpectedNegotiation {
     Supported,
     Unsupported { variant: String },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptTerminalVectorSet {
+    schema_version: String,
+    cases: Vec<AttemptTerminalVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttemptTerminalVectorCase {
+    case_id: String,
+    first_state: AttemptLedgerState,
+    attempted_state: AttemptLedgerState,
+    expected: ExpectedAttemptTerminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AttemptLedgerState {
+    Adopted,
+    Dispatching,
+    Started,
+    Observing,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Ambiguous,
+}
+
+impl AttemptLedgerState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Adopted => "adopted",
+            Self::Dispatching => "dispatching",
+            Self::Started => "started",
+            Self::Observing => "observing",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Ambiguous => "ambiguous",
+        }
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Ambiguous
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedAttemptTerminal {
+    update_committed: bool,
+    delete_committed: bool,
+    final_state: AttemptLedgerState,
 }
 
 #[derive(Debug, Deserialize)]
@@ -166,6 +232,7 @@ pub fn capability() -> TargetCapability {
         profiles: vec![TargetProfileCapability {
             profile: STRUCTURAL_PROFILE,
             suites: vec![
+                ATTEMPT_TERMINAL_IMMUTABILITY_SUITE,
                 CAPABILITY_NEGOTIATION_SUITE,
                 DEFINITION_VALIDATION_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
@@ -187,12 +254,55 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
     }
 
     let all_passed = match request.suite_id.as_str() {
+        ATTEMPT_TERMINAL_IMMUTABILITY_SUITE => {
+            evaluate_attempt_terminal_immutability(&request.vector)?
+        }
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
     result_for(&request.suite_id, &request.vector, all_passed)
+}
+
+fn evaluate_attempt_terminal_immutability(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: AttemptTerminalVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != ATTEMPT_TERMINAL_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !case.first_state.is_terminal()
+            || case.first_state == case.attempted_state
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+
+    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::runs::AUTOMATION_RUNS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);")
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+
+    let mut all_passed = true;
+    for (index, case) in vectors.cases.iter().enumerate() {
+        all_passed &= attempt_terminal_case_matches(&conn, case, index)?;
+    }
+    Ok(all_passed)
 }
 
 fn evaluate_capability_negotiation(vector: &Value) -> Result<bool, &'static str> {
@@ -348,6 +458,79 @@ fn run_terminal_case_matches(
     Ok(first_committed == case.expected.first_committed
         && replay_committed == case.expected.replay_committed
         && final_status == case.expected.final_status.as_str())
+}
+
+fn attempt_terminal_case_matches(
+    conn: &Connection,
+    case: &AttemptTerminalVectorCase,
+    index: usize,
+) -> Result<bool, &'static str> {
+    let automation_id = format!("conformance-attempt-automation-{index}");
+    let occurrence_id = format!("conformance-attempt-occurrence-{index}");
+    let run_id = format!("conformance-attempt-run-{index}");
+    let attempt_id = format!("conformance-attempt-{index}");
+    let adoption_key = format!("{run_id}:1");
+    let opened_at = "1970-01-01T00:00:00.000Z";
+    let settled_at = "1970-01-01T00:00:01.000Z";
+
+    conn.execute(
+        "INSERT INTO automation_occurrences
+            (id, automation_id, scheduled_for, state, attempt, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 'failed', 1, ?3, ?4)",
+        params![occurrence_id, automation_id, opened_at, settled_at],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "INSERT INTO automation_runs
+            (id, automation_id, occurrence_id, runtime, status, started_at, finished_at)
+         VALUES (?1, ?2, ?3, 'coven-code', 'failed', ?4, ?5)",
+        params![run_id, automation_id, occurrence_id, opened_at, settled_at],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+    conn.execute(
+        "INSERT INTO automation_attempts (
+            id, run_id, occurrence_id, attempt_number, adoption_key,
+            occurrence_fence_generation, dispatch_generation, state,
+            retry_classification, not_before, opened_at, settled_at
+         ) VALUES (?1, ?2, ?3, 1, ?4, 1, 1, ?5, 'initial', ?6, ?6, ?7)",
+        params![
+            attempt_id,
+            run_id,
+            occurrence_id,
+            adoption_key,
+            case.first_state.as_str(),
+            opened_at,
+            settled_at
+        ],
+    )
+    .map_err(|_| "conformance suite execution failed")?;
+
+    let update_committed = conn
+        .execute(
+            "UPDATE automation_attempts
+             SET state = ?2, state_reason = 'conformance mutation', settled_at = ?3
+             WHERE id = ?1",
+            params![attempt_id, case.attempted_state.as_str(), opened_at],
+        )
+        .is_ok();
+    let delete_committed = conn
+        .execute(
+            "DELETE FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+        )
+        .is_ok();
+    let final_state = conn
+        .query_row(
+            "SELECT state FROM automation_attempts WHERE id = ?1",
+            [&attempt_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(update_committed == case.expected.update_committed
+        && delete_committed == case.expected.delete_committed
+        && final_state.as_deref() == Some(case.expected.final_state.as_str()))
 }
 
 fn result_for(
