@@ -2182,7 +2182,7 @@ mod tests {
                     Err(error) => panic!("status replacement channel failed: {error}"),
                 };
                 writer.join().expect("status replacement thread");
-                result.expect("replace status with a delete-sharing reader");
+                result.expect("replace status after reader closes");
                 crate::status::tests::assert_status_file_is_owner_only(&status_path);
                 assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":2}\n");
             } else {
