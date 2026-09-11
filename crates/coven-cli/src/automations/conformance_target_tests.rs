@@ -94,6 +94,38 @@ fn receipt_integrity_validation_suite_fails_closed_on_an_expectation_mismatch() 
 }
 
 #[test]
+fn receipt_integrity_validation_suite_rejects_invalid_vector_shapes() {
+    let invalid_mutations: [fn(&mut Value); 6] = [
+        |vectors| vectors["schemaVersion"] = json!("unsupported"),
+        |vectors| {
+            vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+        },
+        |vectors| vectors["cases"][0]["receipt"] = json!("not-an-object"),
+        |vectors| {
+            vectors["cases"][0]["expected"]["normalizedDigest"] = json!("sha256:not-a-digest");
+        },
+        |vectors| vectors["cases"][0]["expected"] = json!({"outcome": "rejected"}),
+        |vectors| {
+            vectors["cases"][1]["expected"] = json!({
+                "outcome": "accepted",
+                "normalizedDigest":
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            });
+        },
+    ];
+
+    for mutate in invalid_mutations {
+        let mut vectors: Value =
+            serde_json::from_str(RECEIPT_INTEGRITY_VALIDATION_VECTORS).unwrap();
+        mutate(&mut vectors);
+        assert_eq!(
+            evaluate(&request_for("receipt-integrity-validation", vectors)).unwrap_err(),
+            "conformance vector is invalid"
+        );
+    }
+}
+
+#[test]
 fn occurrence_fence_uniqueness_suite_executes_the_checked_in_vectors() {
     let vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
     let response = evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap();

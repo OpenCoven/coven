@@ -163,7 +163,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements six structural suites.
+The native Coven target currently implements seven structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
