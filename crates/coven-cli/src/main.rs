@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::env::VarError;
 use std::ffi::{OsStr, OsString};
-#[cfg(unix)]
 use std::io::Read;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -71,6 +70,7 @@ mod repos_config;
 mod request_authority;
 mod reset;
 mod session_launch;
+mod session_policy;
 mod settings;
 pub mod setup;
 mod state_lock;
@@ -212,6 +212,92 @@ fn parse_nonempty_arg(value: &str) -> std::result::Result<String, String> {
 enum MemoryImportSourceArg {
     Native,
     Openclaw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DeviceScopeArg {
+    MemoryRead,
+    SessionMetadataRead,
+    ConversationRead,
+    MessageSend,
+    ToolInvocationRequest,
+    ToolExecutionApprove,
+    SecretsRead,
+    FamiliarMemoryAdmin,
+    DeviceAdmin,
+    IdentityAdmin,
+    MemoryExport,
+    IdentityExport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DeviceAssuranceArg {
+    Possession,
+    RecentUserVerification,
+    FreshUserVerification,
+    FreshBiometric,
+    StepUp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DeviceRevocationReasonArg {
+    Ordinary,
+    Lost,
+    SuspectedCompromise,
+    Retired,
+}
+
+impl From<DeviceScopeArg> for mobile_memory::grant::DeviceScope {
+    fn from(scope: DeviceScopeArg) -> Self {
+        match scope {
+            DeviceScopeArg::MemoryRead => Self::MemoryRead,
+            DeviceScopeArg::SessionMetadataRead => Self::SessionMetadataRead,
+            DeviceScopeArg::ConversationRead => Self::ConversationRead,
+            DeviceScopeArg::MessageSend => Self::MessageSend,
+            DeviceScopeArg::ToolInvocationRequest => Self::ToolInvocationRequest,
+            DeviceScopeArg::ToolExecutionApprove => Self::ToolExecutionApprove,
+            DeviceScopeArg::SecretsRead => Self::SecretsRead,
+            DeviceScopeArg::FamiliarMemoryAdmin => Self::FamiliarMemoryAdmin,
+            DeviceScopeArg::DeviceAdmin => Self::DeviceAdmin,
+            DeviceScopeArg::IdentityAdmin => Self::IdentityAdmin,
+            DeviceScopeArg::MemoryExport => Self::MemoryExport,
+            DeviceScopeArg::IdentityExport => Self::IdentityExport,
+        }
+    }
+}
+
+impl From<DeviceAssuranceArg> for mobile_memory::grant::AssuranceLevel {
+    fn from(assurance: DeviceAssuranceArg) -> Self {
+        match assurance {
+            DeviceAssuranceArg::Possession => Self::Possession,
+            DeviceAssuranceArg::RecentUserVerification => Self::RecentUserVerification,
+            DeviceAssuranceArg::FreshUserVerification => Self::FreshUserVerification,
+            DeviceAssuranceArg::FreshBiometric => Self::FreshBiometric,
+            DeviceAssuranceArg::StepUp => Self::StepUp,
+        }
+    }
+}
+
+impl From<DeviceRevocationReasonArg> for mobile_memory::device::DeviceRevocationReason {
+    fn from(reason: DeviceRevocationReasonArg) -> Self {
+        match reason {
+            DeviceRevocationReasonArg::Ordinary => Self::Ordinary,
+            DeviceRevocationReasonArg::Lost => Self::Lost,
+            DeviceRevocationReasonArg::SuspectedCompromise => Self::SuspectedCompromise,
+            DeviceRevocationReasonArg::Retired => Self::Retired,
+        }
+    }
+}
+
+fn canonical_device_scopes(
+    scopes: Vec<DeviceScopeArg>,
+) -> Result<Vec<mobile_memory::grant::DeviceScope>> {
+    let mut scopes: Vec<_> = scopes.into_iter().map(Into::into).collect();
+    scopes.sort_unstable();
+    if scopes.windows(2).any(|window| window[0] == window[1]) {
+        bail!("device grant scopes must be unique");
+    }
+    Ok(scopes)
 }
 
 impl From<MemoryImportSourceArg> for memory_import::MemoryImportSourceKind {
@@ -632,6 +718,11 @@ enum Command {
         #[arg(long, help = "Print memory files as JSON (machine-readable)")]
         json: bool,
     },
+    #[command(about = "Manage enrolled devices and their grants")]
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
     #[command(about = "Show the research loop log from ~/.coven/research/")]
     Research {
         #[arg(long, help = "Print research rows as JSON (machine-readable)")]
@@ -656,6 +747,14 @@ enum Command {
     Scheduler {
         #[command(subcommand)]
         command: SchedulerCommand,
+    },
+    #[command(
+        hide = true,
+        about = "Expose machine-facing Coven Automations protocol surfaces"
+    )]
+    Automations {
+        #[command(subcommand)]
+        command: AutomationsCommand,
     },
     #[command(about = "Inspect travel-mode handoff state (read-only)")]
     Travel {
@@ -775,6 +874,86 @@ enum MobileDeviceCommand {
 }
 
 #[derive(Subcommand, Debug)]
+enum DeviceCommand {
+    #[command(about = "List enrolled devices")]
+    List {
+        #[arg(long, help = "Print devices as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Inspect one enrolled device and its grant")]
+    Inspect {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+        #[arg(long, help = "Print device status as JSON (machine-readable)")]
+        json: bool,
+    },
+    #[command(about = "Rename an enrolled device")]
+    Rename {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+        #[arg(value_name = "NAME", value_parser = parse_nonempty_arg)]
+        name: String,
+    },
+    #[command(about = "Revoke an enrolled device")]
+    Revoke {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+        #[arg(long, value_enum, default_value = "ordinary")]
+        reason: DeviceRevocationReasonArg,
+    },
+    #[command(about = "Reissue an enrolled device grant")]
+    Grant {
+        #[command(subcommand)]
+        command: DeviceGrantCommand,
+    },
+    #[command(
+        about = "Replace a device with an already-paired device and transfer its grant policy"
+    )]
+    Rotate {
+        #[arg(value_name = "OLD_DEVICE", value_parser = parse_nonempty_arg)]
+        old_device: String,
+        #[arg(value_name = "REPLACEMENT_DEVICE", value_parser = parse_nonempty_arg)]
+        replacement_device: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum DeviceGrantCommand {
+    #[command(about = "Reissue a grant with an exact replacement policy")]
+    Reissue {
+        #[arg(value_name = "DEVICE", value_parser = parse_nonempty_arg)]
+        device: String,
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            required = true,
+            help = "Replacement scope set; repeat or comma-separate values"
+        )]
+        scope: Vec<DeviceScopeArg>,
+        #[arg(long, value_enum, default_value = "possession")]
+        minimum_assurance: DeviceAssuranceArg,
+        #[arg(
+            long,
+            value_enum,
+            value_delimiter = ',',
+            help = "Scopes that require fresh user verification"
+        )]
+        require_fresh_user_verification_for: Vec<DeviceScopeArg>,
+        #[arg(
+            long,
+            value_name = "DAYS",
+            required = true,
+            value_parser = clap::value_parser!(u16).range(1..=365),
+            help = "Grant lifetime in whole days (1-365)"
+        )]
+        expires_in_days: u16,
+        #[arg(long, help = "Restrict the grant to direct authenticated transport")]
+        direct_only: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum SessionsCommand {
     #[command(about = "Full-text search session event payloads")]
     Search {
@@ -873,6 +1052,23 @@ enum SchedulerCommand {
         #[arg(long, help = "Print the loop state as JSON (machine-readable)")]
         json: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutomationsCommand {
+    #[command(about = "Expose the native conformance target protocol")]
+    Conformance {
+        #[command(subcommand)]
+        command: AutomationsConformanceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum AutomationsConformanceCommand {
+    #[command(about = "Print the native conformance suites supported by this binary")]
+    Capability,
+    #[command(about = "Evaluate one conformance suite request from standard input")]
+    Evaluate,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1201,6 +1397,11 @@ fn main() -> Result<()> {
         Some(Command::Config {
             command: ConfigCommand::Paths { .. }
         })
+    ) || matches!(
+        &cli.command,
+        Some(Command::Automations {
+            command: AutomationsCommand::Conformance { .. }
+        })
     ) {
         return run_cli(cli);
     }
@@ -1387,6 +1588,40 @@ fn run_cli(cli: Cli) -> Result<()> {
         Some(Command::Status { json }) => observe::run_status(json),
         Some(Command::Familiars { id, json }) => observe::run_familiars(id.as_deref(), json),
         Some(Command::Skills { json }) => observe::run_skills(json),
+        Some(Command::Device { command }) => match command {
+            DeviceCommand::List { json } => mobile_memory::device::run_list(json),
+            DeviceCommand::Inspect { device, json } => {
+                mobile_memory::device::run_inspect(&device, json)
+            }
+            DeviceCommand::Rename { device, name } => {
+                mobile_memory::device::run_rename(&device, &name)
+            }
+            DeviceCommand::Revoke { device, reason } => {
+                mobile_memory::device::run_revoke(&device, reason.into())
+            }
+            DeviceCommand::Grant {
+                command:
+                    DeviceGrantCommand::Reissue {
+                        device,
+                        scope,
+                        minimum_assurance,
+                        require_fresh_user_verification_for,
+                        expires_in_days,
+                        direct_only,
+                    },
+            } => mobile_memory::device::run_reissue_grant(
+                &device,
+                canonical_device_scopes(scope)?,
+                minimum_assurance.into(),
+                canonical_device_scopes(require_fresh_user_verification_for)?,
+                expires_in_days,
+                direct_only,
+            ),
+            DeviceCommand::Rotate {
+                old_device,
+                replacement_device,
+            } => mobile_memory::device::run_rotate(&old_device, &replacement_device),
+        },
         Some(Command::Memory { command, json }) => match command {
             Some(MemoryCommand::Open) => memory_dashboard::run_open(),
             Some(MemoryCommand::Mobile { command }) => match command {
@@ -1441,6 +1676,7 @@ fn run_cli(cli: Cli) -> Result<()> {
             SchedulerCommand::Decision { id, json } => observe::run_scheduler_decision(&id, json),
             SchedulerCommand::Loop { loop_id, json } => observe::run_scheduler_loop(&loop_id, json),
         },
+        Some(Command::Automations { command }) => run_automations_command(command),
         Some(Command::Travel { command }) => match command {
             TravelCommand::State {
                 client,
@@ -3432,6 +3668,43 @@ fn launch_patch_session(request: &patch::PatchRequest) -> Result<String> {
         &current_timestamp(),
     )?;
     Ok(record.id)
+}
+
+fn run_automations_command(command: AutomationsCommand) -> Result<()> {
+    match command {
+        AutomationsCommand::Conformance { command } => match command {
+            AutomationsConformanceCommand::Capability => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&automations::conformance_target::capability())?
+                );
+                Ok(())
+            }
+            AutomationsConformanceCommand::Evaluate => {
+                let payload = read_conformance_request(io::stdin().lock())?;
+                let request = serde_json::from_str(&payload)
+                    .map_err(|_| anyhow!("conformance request is invalid"))?;
+                let response = automations::conformance_target::evaluate(&request)
+                    .map_err(|message| anyhow!(message))?;
+                println!("{}", serde_json::to_string(&response)?);
+                Ok(())
+            }
+        },
+    }
+}
+
+const MAX_CONFORMANCE_REQUEST_BYTES: usize = 1024 * 1024;
+
+fn read_conformance_request(reader: impl Read) -> Result<String> {
+    let mut payload = Vec::new();
+    reader
+        .take((MAX_CONFORMANCE_REQUEST_BYTES + 1) as u64)
+        .read_to_end(&mut payload)
+        .map_err(|_| anyhow!("conformance request is invalid"))?;
+    if payload.len() > MAX_CONFORMANCE_REQUEST_BYTES {
+        bail!("conformance request is invalid");
+    }
+    String::from_utf8(payload).map_err(|_| anyhow!("conformance request is invalid"))
 }
 
 fn run_logs_command(command: LogsCommand) -> Result<()> {
@@ -5790,6 +6063,160 @@ mod tests {
     }
 
     #[test]
+    fn device_cli_parses_management_grant_and_rotation_commands() {
+        for args in [
+            vec!["coven", "device", "list"],
+            vec!["coven", "device", "list", "--json"],
+            vec!["coven", "device", "inspect", "Val's iPhone", "--json"],
+            vec![
+                "coven",
+                "device",
+                "rename",
+                "00000000-0000-0000-0000-000000000001",
+                "Travel phone",
+            ],
+            vec![
+                "coven",
+                "device",
+                "revoke",
+                "Val's iPhone",
+                "--reason",
+                "suspected-compromise",
+            ],
+            vec![
+                "coven",
+                "device",
+                "grant",
+                "reissue",
+                "Val's iPhone",
+                "--scope",
+                "memory-read,session-metadata-read,conversation-read,message-send,tool-invocation-request,tool-execution-approve,secrets-read,familiar-memory-admin,device-admin,identity-admin,memory-export,identity-export",
+                "--minimum-assurance",
+                "fresh-biometric",
+                "--require-fresh-user-verification-for",
+                "tool-execution-approve,secrets-read",
+                "--expires-in-days",
+                "30",
+                "--direct-only",
+            ],
+            vec![
+                "coven",
+                "device",
+                "rotate",
+                "Old phone",
+                "Replacement phone",
+            ],
+        ] {
+            let parsed = Cli::try_parse_from(args)
+                .and_then(Cli::validate)
+                .expect("top-level device command must parse");
+            assert!(
+                format!("{:?}", parsed.command).starts_with("Some(Device"),
+                "device syntax must resolve to the device command, not a free-text prompt"
+            );
+        }
+    }
+
+    #[test]
+    fn device_cli_rejects_invalid_grant_and_revocation_arguments() {
+        for args in [
+            vec![
+                "coven",
+                "device",
+                "revoke",
+                "phone",
+                "--reason",
+                "stolen-ish",
+            ],
+            vec![
+                "coven",
+                "device",
+                "grant",
+                "reissue",
+                "phone",
+                "--scope",
+                "unknown-scope",
+                "--expires-in-days",
+                "30",
+            ],
+            vec![
+                "coven",
+                "device",
+                "grant",
+                "reissue",
+                "phone",
+                "--scope",
+                "memory-read",
+            ],
+            vec![
+                "coven",
+                "device",
+                "grant",
+                "reissue",
+                "phone",
+                "--scope",
+                "memory-read",
+                "--expires-in-days",
+                "0",
+            ],
+            vec![
+                "coven",
+                "device",
+                "grant",
+                "reissue",
+                "phone",
+                "--scope",
+                "memory-read",
+                "--expires-in-days",
+                "366",
+            ],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).and_then(Cli::validate).is_err(),
+                "invalid top-level device command must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn device_cli_scope_normalization_sorts_and_rejects_duplicates() {
+        assert_eq!(
+            canonical_device_scopes(vec![
+                DeviceScopeArg::ToolExecutionApprove,
+                DeviceScopeArg::MemoryRead,
+                DeviceScopeArg::SessionMetadataRead,
+            ])
+            .unwrap(),
+            vec![
+                mobile_memory::grant::DeviceScope::MemoryRead,
+                mobile_memory::grant::DeviceScope::SessionMetadataRead,
+                mobile_memory::grant::DeviceScope::ToolExecutionApprove,
+            ]
+        );
+        assert!(canonical_device_scopes(vec![
+            DeviceScopeArg::MemoryRead,
+            DeviceScopeArg::MemoryRead,
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn device_cli_help_discloses_management_and_grant_lifecycle() {
+        let mut command = Cli::command();
+        let device = command
+            .find_subcommand_mut("device")
+            .expect("top-level device command must be present");
+        let help = device.render_long_help().to_string();
+        for expected in ["list", "inspect", "rename", "revoke", "grant", "rotate"] {
+            assert!(help.contains(expected), "device help omitted {expected}");
+        }
+        let grant = device
+            .find_subcommand_mut("grant")
+            .expect("device grant command must be present");
+        assert!(grant.render_long_help().to_string().contains("reissue"));
+    }
+
+    #[test]
     fn cli_parses_hub_subcommands() {
         assert!(matches!(
             Cli::parse_from(["coven", "hub", "status"]).command,
@@ -5873,6 +6300,57 @@ mod tests {
             other => panic!("expected scheduler loop command, got {other:?}"),
         }
         assert!(Cli::try_parse_from(["coven", "scheduler", "decision"]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_automations_conformance_target_commands() {
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "conformance", "capability"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::Conformance {
+                    command: AutomationsConformanceCommand::Capability
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["coven", "automations", "conformance", "evaluate"]).command,
+            Some(Command::Automations {
+                command: AutomationsCommand::Conformance {
+                    command: AutomationsConformanceCommand::Evaluate
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn conformance_request_reader_rejects_oversized_input() {
+        let input = vec![b'x'; MAX_CONFORMANCE_REQUEST_BYTES + 1];
+
+        assert_eq!(
+            read_conformance_request(input.as_slice())
+                .unwrap_err()
+                .to_string(),
+            "conformance request is invalid"
+        );
+    }
+
+    #[test]
+    fn conformance_request_reader_accepts_bounded_input() {
+        assert_eq!(
+            read_conformance_request(br#"{"suite_id":"capability-negotiation"}"#.as_slice())
+                .unwrap(),
+            r#"{"suite_id":"capability-negotiation"}"#
+        );
+    }
+
+    #[test]
+    fn conformance_request_reader_rejects_invalid_utf8() {
+        assert_eq!(
+            read_conformance_request([0xff].as_slice())
+                .unwrap_err()
+                .to_string(),
+            "conformance request is invalid"
+        );
     }
 
     #[test]

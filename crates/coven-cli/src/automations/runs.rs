@@ -60,7 +60,7 @@ pub const AUTOMATION_ATTEMPTS_SCHEMA_SQL: &str = "
             failure_class IS NULL OR failure_class IN (
                 'transient_dispatch', 'lease_expired', 'runtime_unavailable',
                 'launch_refused', 'runtime_error', 'timeout', 'cancelled',
-                'ambiguous_evidence'
+                'ambiguous_evidence', 'runtime_authority_unsupported'
             )
         ),
         prior_attempt_number INTEGER CHECK (
@@ -324,9 +324,9 @@ pub fn record_run_finish(
         log_json,
         output_commit,
     } = finish;
-    if status != "succeeded" && status != "failed" && status != "cancelled" {
+    if !matches!(status, "succeeded" | "failed" | "cancelled" | "timed_out") {
         return Err(anyhow::anyhow!(
-            "run status must be succeeded, failed, or cancelled"
+            "run status must be succeeded, failed, cancelled, or timed_out"
         ));
     }
     let bounded_log = log_json
@@ -647,6 +647,176 @@ pub fn ensure_authority_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn ensure_runtime_authority_unsupported_failure_class(conn: &Connection) -> Result<()> {
+    let table_sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'table' AND name = 'automation_attempts'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to inspect automation_attempts schema")?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if !table_sql.contains("failure_class") || table_sql.contains("'runtime_authority_unsupported'")
+    {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        conn.is_autocommit(),
+        "automation attempt failure-class migration requires autocommit"
+    );
+    let attempt_columns = conn
+        .prepare("PRAGMA table_info(automation_attempts)")
+        .context("failed to inspect automation_attempt columns before failure-class migration")?
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("failed to query automation_attempt columns before failure-class migration")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_attempt columns before failure-class migration")?;
+    let authority_extension_source = if attempt_columns
+        .iter()
+        .any(|column| column == "authority_extension_json")
+    {
+        "authority_extension_json"
+    } else {
+        "NULL"
+    };
+    let schema_objects = conn
+        .prepare(
+            "SELECT type, name, sql
+             FROM sqlite_master
+             WHERE tbl_name = 'automation_attempts'
+               AND type IN ('index', 'trigger')
+               AND sql IS NOT NULL
+             ORDER BY type, name",
+        )
+        .context("failed to inspect automation_attempt indexes and triggers")?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .context("failed to query automation_attempt indexes and triggers")?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("failed to read automation_attempt indexes and triggers")?;
+    let foreign_keys_enabled: bool = conn
+        .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+        .context("failed to inspect SQLite foreign-key mode")?;
+    let legacy_alter_table_enabled: bool = conn
+        .query_row("PRAGMA legacy_alter_table", [], |row| row.get(0))
+        .context("failed to inspect SQLite alter-table mode")?;
+    let migration = (|| -> Result<()> {
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;",
+        )
+        .context("failed to begin automation attempt failure-class migration")?;
+        let current_table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'automation_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed to recheck automation_attempts schema during migration")?;
+        if current_table_sql.contains("'runtime_authority_unsupported'") {
+            conn.execute_batch("COMMIT")
+                .context("failed to finish concurrent automation attempt migration")?;
+            return Ok(());
+        }
+        for (object_type, name, _) in &schema_objects {
+            let quoted_name = name.replace('"', "\"\"");
+            conn.execute_batch(&format!("DROP {object_type} IF EXISTS \"{quoted_name}\";"))
+                .with_context(|| {
+                    format!("failed to drop automation_attempt schema object {name} for migration")
+                })?;
+        }
+        conn.execute_batch(
+            "ALTER TABLE automation_attempts
+                 RENAME TO automation_attempts_legacy_failure_class;",
+        )
+        .context("failed to rename legacy automation_attempts table")?;
+        conn.execute_batch(AUTOMATION_ATTEMPTS_SCHEMA_SQL)
+            .context("failed to recreate automation_attempts schema")?;
+        conn.execute_batch(&format!(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                failure_class, prior_attempt_number, prior_disposition,
+                retry_classification, authority_extension_json, not_before,
+                session_id, state_reason, opened_at, settled_at
+             )
+             SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, {authority_extension_source}, not_before,
+                    session_id, state_reason, opened_at, settled_at
+             FROM automation_attempts_legacy_failure_class;
+             DROP TABLE automation_attempts_legacy_failure_class;"
+        ))
+        .context("failed to copy automation attempts into the widened schema")?;
+        for (_, name, sql) in &schema_objects {
+            if matches!(
+                name.as_str(),
+                "idx_automation_attempts_dispatch"
+                    | "automation_attempts_terminal_immutable"
+                    | "automation_attempts_delete_terminal_refused"
+            ) {
+                continue;
+            }
+            conn.execute_batch(sql).with_context(|| {
+                format!("failed to restore automation_attempt schema object {name}")
+            })?;
+        }
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .context("failed to verify foreign keys after automation attempt migration")?;
+        anyhow::ensure!(
+            foreign_key_errors == 0,
+            "automation attempt failure-class migration produced {foreign_key_errors} foreign-key violation(s)"
+        );
+        conn.execute_batch("COMMIT")
+            .context("failed to commit automation attempt failure-class migration")
+    })();
+    let mut failure = migration.err();
+    if failure.is_some() && !conn.is_autocommit() {
+        if let Err(rollback_error) = conn.execute_batch("ROLLBACK;") {
+            let migration_error = failure.take().expect("migration failure is present");
+            failure = Some(migration_error.context(format!(
+                "failed to roll back automation attempt failure-class migration: {rollback_error}"
+            )));
+        }
+    }
+    if !legacy_alter_table_enabled {
+        if let Err(restore_error) = conn.execute_batch("PRAGMA legacy_alter_table = OFF;") {
+            failure = Some(match failure.take() {
+                Some(migration_error) => migration_error.context(format!(
+                    "also failed to restore SQLite alter-table mode: {restore_error}"
+                )),
+                None => restore_error.into(),
+            });
+        }
+    }
+    if foreign_keys_enabled {
+        if let Err(restore_error) = conn.execute_batch("PRAGMA foreign_keys = ON;") {
+            failure = Some(match failure.take() {
+                Some(migration_error) => migration_error.context(format!(
+                    "also failed to restore SQLite foreign-key mode: {restore_error}"
+                )),
+                None => restore_error.into(),
+            });
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +930,289 @@ mod tests {
         assert!(conn
             .execute("DELETE FROM automation_attempts WHERE id = 'attempt-1'", [],)
             .is_err());
+    }
+
+    #[test]
+    fn initialize_store_migrates_the_no_launch_failure_class_without_losing_attempt_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+        let legacy_attempt_schema =
+            AUTOMATION_ATTEMPTS_SCHEMA_SQL.replace(", 'runtime_authority_unsupported'", "");
+        conn.execute(
+            "INSERT INTO automation_occurrences (
+                id, automation_id, scheduled_for, state, attempt, created_at, updated_at
+             ) VALUES (
+                'occurrence-existing', 'automation-existing',
+                '2026-09-03T12:00:00.000Z', 'running', 1,
+                '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                id, project_root, harness, title, status, created_at, updated_at
+             ) VALUES (
+                'session-existing', '/work/project', 'coven-code', 'existing',
+                'created', '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_runs (
+                id, automation_id, occurrence_id, session_id, runtime, status, started_at
+             ) VALUES (
+                'run-existing', 'automation-existing', 'occurrence-existing',
+                'session-existing', 'coven-code', 'running', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, state, retry_classification,
+                authority_extension_json, not_before, opened_at
+             ) VALUES (
+                'attempt-existing', 'run-existing', 'occurrence-existing', 1,
+                'automation:run-existing:1', 1, 'dispatching', 'initial',
+                '{\"profile\":\"coven.automations.authority.v1\"}',
+                '2026-09-03T12:00:00.000Z', '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE receipt_link (
+                attempt_id TEXT NOT NULL
+                    REFERENCES automation_attempts(id) ON DELETE RESTRICT
+             );
+             INSERT INTO receipt_link (attempt_id) VALUES ('attempt-existing');
+
+             PRAGMA foreign_keys = OFF;
+             PRAGMA legacy_alter_table = ON;
+             BEGIN IMMEDIATE;
+             DROP TRIGGER automation_attempt_adoption_key_global_insert;
+             DROP TRIGGER automation_attempts_terminal_immutable;
+             DROP TRIGGER automation_attempts_delete_terminal_refused;
+             DROP TRIGGER automation_attempt_authority_immutable;
+             DROP TRIGGER automation_attempt_authority_delete_refused;
+             DROP INDEX idx_automation_attempts_dispatch;
+             ALTER TABLE automation_attempts
+                 RENAME TO automation_attempts_current_failure_class;",
+        )
+        .unwrap();
+        conn.execute_batch(&legacy_attempt_schema).unwrap();
+        conn.execute_batch(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, dispatch_generation, state,
+                failure_class, prior_attempt_number, prior_disposition,
+                retry_classification, authority_extension_json, not_before,
+                session_id, state_reason, opened_at, settled_at
+             )
+             SELECT id, run_id, occurrence_id, attempt_number, adoption_key,
+                    occurrence_fence_generation, dispatch_generation, state,
+                    failure_class, prior_attempt_number, prior_disposition,
+                    retry_classification, authority_extension_json, not_before,
+                    session_id, state_reason, opened_at, settled_at
+             FROM automation_attempts_current_failure_class;
+             DROP TABLE automation_attempts_current_failure_class;
+             CREATE INDEX idx_automation_attempts_existing_run
+                 ON automation_attempts(run_id);
+             CREATE TRIGGER automation_attempts_existing_insert
+             AFTER INSERT ON automation_attempts
+             BEGIN
+                 SELECT NEW.id;
+             END;
+             COMMIT;
+             PRAGMA legacy_alter_table = OFF;
+             PRAGMA foreign_keys = ON;",
+        )
+        .unwrap();
+        drop(conn);
+
+        initialize_store(&path).unwrap();
+        let conn = crate::store::open_initialized_store(&path).unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET failure_class = 'not_a_failure_class'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE automation_attempts
+             SET state = 'failed',
+                 failure_class = 'runtime_authority_unsupported',
+                 state_reason = 'runtime does not accept automation authority projections; no process started',
+                 settled_at = '2026-09-03T12:00:01.000Z'
+             WHERE id = 'attempt-existing'",
+            [],
+        )
+        .unwrap();
+        let preserved: (String, String, String, String) = conn
+            .query_row(
+                "SELECT run_id, occurrence_id, failure_class, authority_extension_json
+                 FROM automation_attempts
+                 WHERE id = 'attempt-existing'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                "run-existing".to_string(),
+                "occurrence-existing".to_string(),
+                "runtime_authority_unsupported".to_string(),
+                "{\"profile\":\"coven.automations.authority.v1\"}".to_string(),
+            )
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        let foreign_key_errors: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_errors, 0);
+        let receipt_parent: String = conn
+            .query_row("PRAGMA foreign_key_list(receipt_link)", [], |row| {
+                row.get(2)
+            })
+            .unwrap();
+        assert_eq!(receipt_parent, "automation_attempts");
+        for (object_type, name) in [
+            ("index", "idx_automation_attempts_dispatch"),
+            ("trigger", "automation_attempts_terminal_immutable"),
+            ("trigger", "automation_attempts_delete_terminal_refused"),
+            ("trigger", "automation_attempt_authority_immutable"),
+            ("trigger", "automation_attempt_authority_delete_refused"),
+            ("trigger", "automation_attempt_adoption_key_global_insert"),
+            ("index", "idx_automation_attempts_existing_run"),
+            ("trigger", "automation_attempts_existing_insert"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE type = ?1 AND name = ?2 AND tbl_name = 'automation_attempts'",
+                    [object_type, name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{object_type} {name} was not preserved");
+        }
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET authority_extension_json = '{}'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE automation_attempts
+                 SET state_reason = 'rewritten'
+                 WHERE id = 'attempt-existing'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn initialize_store_rolls_back_a_failed_no_launch_failure_class_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("store.sqlite");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE automation_definitions (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE automation_occurrences (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE sessions (id TEXT PRIMARY KEY NOT NULL);
+             CREATE TABLE automation_runs (id TEXT PRIMARY KEY NOT NULL);
+             INSERT INTO automation_definitions (id) VALUES ('automation-existing');
+             INSERT INTO automation_occurrences (id) VALUES ('occurrence-existing');
+             INSERT INTO sessions (id) VALUES ('session-existing');
+             INSERT INTO automation_runs (id) VALUES ('run-existing');",
+        )
+        .unwrap();
+        let malformed_attempt_schema = AUTOMATION_ATTEMPTS_SCHEMA_SQL
+            .replace(", 'runtime_authority_unsupported'", "")
+            .replace("        state_reason TEXT,\n", "");
+        conn.execute_batch(&malformed_attempt_schema).unwrap();
+        conn.execute(
+            "INSERT INTO automation_attempts (
+                id, run_id, occurrence_id, attempt_number, adoption_key,
+                occurrence_fence_generation, state, retry_classification,
+                authority_extension_json, not_before, session_id, opened_at
+             ) VALUES (
+                'attempt-existing', 'run-existing', 'occurrence-existing', 1,
+                'automation:run-existing:1', 1, 'dispatching', 'initial',
+                '{\"profile\":\"coven.automations.authority.v1\"}',
+                '2026-09-03T12:00:00.000Z', 'session-existing',
+                '2026-09-03T12:00:00.000Z'
+             )",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = initialize_store(&path)
+            .expect_err("an incompatible legacy attempt schema must fail atomically");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to copy automation attempts"),
+            "{error:#}"
+        );
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master
+                 WHERE type = 'table' AND name = 'automation_attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table_sql.contains("'runtime_authority_unsupported'"));
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM automation_attempts
+                 WHERE id = 'attempt-existing'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name = 'automation_attempts_legacy_failure_class'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -962,7 +1415,7 @@ mod tests {
             start,
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("succeeded, failed, or cancelled"));
+        assert!(format!("{error:#}").contains("succeeded, failed, cancelled, or timed_out"));
     }
 
     #[test]

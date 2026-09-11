@@ -1,0 +1,379 @@
+{
+  "schemaVersion": "coven.automations.conformance-result-vectors.v1",
+  "contractProfile": "coven.automations.v1",
+  "status": "synthetic-test-vectors",
+  "notice": "These objects exercise the result-envelope contract only. They are synthetic examples and do not claim that Coven, its daemon, any package, or any conformance profile currently passes.",
+  "cases": [
+    {
+      "name": "unsigned-audit-incomplete-valid",
+      "expectation": "accept",
+      "verificationClass": "audit_only",
+      "object": {
+        "schemaVersion": "coven.automations.conformance-result.v1",
+        "statement": {
+          "contractProfile": "coven.automations.v1",
+          "resultId": "fixture-conformance-result",
+          "decisionScope": {
+            "kind": "audit_only"
+          },
+          "source": {
+            "repository": "https://example.invalid/OpenCoven/coven",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+            "bundleSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "contractContentSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "fileCount": 19
+          },
+          "runner": {
+            "name": "fixture-conformance-runner",
+            "version": "1.0.0-test",
+            "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
+          "environment": {
+            "os": "linux",
+            "arch": "x86_64",
+            "runtime": "rust-1.89"
+          },
+          "observedAt": "2026-09-10T12:55:00.000Z",
+          "expiresAt": "2026-09-10T13:30:00.000Z",
+          "profileResults": [
+            {
+              "profile": "structural",
+              "status": "incomplete",
+              "requiredSuites": [
+                "schema-validation"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "schema-validation",
+                  "status": "incomplete"
+                }
+              ]
+            }
+          ],
+          "overallStatus": "incomplete"
+        },
+        "statementDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "aa1c589956523d9b06ca76312e80090680cc935fbbb705f88a7bbd242c1cb7f1"
+        }
+      }
+    },
+    {
+      "name": "statement-digest-tampered-invalid",
+      "expectation": "reject",
+      "expectedError": "statement_digest_mismatch",
+      "object": {
+        "schemaVersion": "coven.automations.conformance-result.v1",
+        "statement": {
+          "contractProfile": "coven.automations.v1",
+          "resultId": "tampered-conformance-result",
+          "decisionScope": {
+            "kind": "audit_only"
+          },
+          "source": {
+            "repository": "https://example.invalid/OpenCoven/coven",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+            "bundleSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "contractContentSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "fileCount": 19
+          },
+          "runner": {
+            "name": "fixture-conformance-runner",
+            "version": "1.0.0-test",
+            "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
+          "environment": {
+            "os": "linux",
+            "arch": "x86_64",
+            "runtime": "rust-1.89"
+          },
+          "observedAt": "2026-09-10T12:55:00.000Z",
+          "expiresAt": "2026-09-10T13:30:00.000Z",
+          "profileResults": [
+            {
+              "profile": "structural",
+              "status": "incomplete",
+              "requiredSuites": [
+                "schema-validation"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "schema-validation",
+                  "status": "incomplete"
+                }
+              ]
+            }
+          ],
+          "overallStatus": "incomplete"
+        },
+        "statementDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "e3e477f5825e3445f3c4b8453079267544df16a995257c38dadd9665252295aa"
+        }
+      }
+    },
+    {
+      "name": "all-not-applicable-cannot-pass",
+      "expectation": "reject",
+      "expectedError": "profile_status_inconsistent",
+      "object": {
+        "schemaVersion": "coven.automations.conformance-result.v1",
+        "statement": {
+          "contractProfile": "coven.automations.v1",
+          "resultId": "fixture-all-not-applicable",
+          "decisionScope": {
+            "kind": "audit_only"
+          },
+          "source": {
+            "repository": "https://example.invalid/OpenCoven/coven",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+            "bundleSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "contractContentSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "fileCount": 19
+          },
+          "runner": {
+            "name": "fixture-conformance-runner",
+            "version": "1.0.0-test",
+            "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
+          "environment": {
+            "os": "linux",
+            "arch": "x86_64",
+            "runtime": "rust-1.89"
+          },
+          "observedAt": "2026-09-10T12:55:00.000Z",
+          "expiresAt": "2026-09-10T13:30:00.000Z",
+          "profileResults": [
+            {
+              "profile": "structural",
+              "status": "passed",
+              "requiredSuites": [
+                "schema-validation"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "schema-validation",
+                  "status": "not_applicable"
+                }
+              ]
+            }
+          ],
+          "overallStatus": "passed"
+        },
+        "statementDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "cb654ab7431aa11468187c1c3b2769067a60e3730fda7064d78bed5588f10da3"
+        }
+      }
+    },
+    {
+      "name": "full-pass-missing-component-invalid",
+      "expectation": "reject",
+      "expectedError": "full_profile_incomplete",
+      "object": {
+        "schemaVersion": "coven.automations.conformance-result.v1",
+        "statement": {
+          "contractProfile": "coven.automations.v1",
+          "resultId": "fixture-full-missing-component",
+          "decisionScope": {
+            "kind": "audit_only"
+          },
+          "source": {
+            "repository": "https://example.invalid/OpenCoven/coven",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+          },
+          "protocolArtifact": {
+            "bundleSchemaVersion": "coven.automations.bundle.v1",
+            "sourceCommit": "0123456789abcdef0123456789abcdef01234567",
+            "bundleSha256": "1111111111111111111111111111111111111111111111111111111111111111",
+            "contractContentSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+            "fileCount": 19
+          },
+          "runner": {
+            "name": "fixture-conformance-runner",
+            "version": "1.0.0-test",
+            "artifactSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+            "vectorSetSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+          },
+          "subjectArtifact": {
+            "artifactId": "coven-cli-macos-aarch64",
+            "artifactVersion": "0.0.0-test",
+            "platform": {
+              "os": "macos",
+              "arch": "aarch64"
+            },
+            "sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+          },
+          "environment": {
+            "os": "linux",
+            "arch": "x86_64",
+            "runtime": "rust-1.89"
+          },
+          "observedAt": "2026-09-10T12:55:00.000Z",
+          "expiresAt": "2026-09-10T13:30:00.000Z",
+          "profileResults": [
+            {
+              "profile": "structural",
+              "status": "passed",
+              "requiredSuites": [
+                "schema-validation"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "schema-validation",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                  }
+                }
+              ]
+            },
+            {
+              "profile": "scheduler_reliability",
+              "status": "passed",
+              "requiredSuites": [
+                "scheduler-reliability"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "scheduler-reliability",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                }
+              ]
+            },
+            {
+              "profile": "runtime_authority",
+              "status": "passed",
+              "requiredSuites": [
+                "runtime-authority"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "runtime-authority",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  }
+                }
+              ]
+            },
+            {
+              "profile": "continuity",
+              "status": "passed",
+              "requiredSuites": [
+                "continuity"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "continuity",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                  }
+                }
+              ]
+            },
+            {
+              "profile": "interoperability",
+              "status": "passed",
+              "requiredSuites": [
+                "interoperability"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "interoperability",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              ]
+            },
+            {
+              "profile": "full",
+              "status": "passed",
+              "requiredSuites": [
+                "full-profile"
+              ],
+              "suiteResults": [
+                {
+                  "suiteId": "full-profile",
+                  "status": "passed",
+                  "evidenceDigest": {
+                    "algorithm": "sha256",
+                    "canonicalization": "jcs-rfc8785",
+                    "value": "6666666666666666666666666666666666666666666666666666666666666666"
+                  }
+                }
+              ]
+            }
+          ],
+          "overallStatus": "passed"
+        },
+        "statementDigest": {
+          "algorithm": "sha256",
+          "canonicalization": "jcs-rfc8785",
+          "value": "3c098fe6ad42c3a3e3eda07de16683dbae0acdc477d5b5b2157fc0e2492bfcf3"
+        }
+      }
+    }
+  ]
+}

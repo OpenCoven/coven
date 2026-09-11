@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -277,6 +278,58 @@ test('reproduces the immutable historical base-v1 artifact byte for byte', () =>
     bundleSha256: '512460db71d4257d7a4d33ea306578e66d9ac499d9384eb9c2b8e2b4e2e32363',
     contractContentSha256: '3c145eb92a93426ed64631f6487a8cd12903b0a49a6e752269f594ac50a779f5',
     fileCount: 17
+  });
+});
+
+test('current protocol bundle includes the conformance-result contract artifacts', () => {
+  withScratchDir('automation-protocol-conformance-result', (scratchDir) => {
+    const repoRoot = path.join(scratchDir, 'repo');
+    const sourceSpecDir = path.join(
+      repositoryRoot,
+      'spec',
+      'coven-automations',
+      'v1'
+    );
+    const specDir = path.join(repoRoot, 'spec', 'coven-automations', 'v1');
+    mkdirSync(path.dirname(specDir), { recursive: true });
+    cpSync(sourceSpecDir, specDir, { recursive: true });
+    runGit(repoRoot, ['init']);
+    runGit(repoRoot, ['config', 'user.name', 'Protocol Test']);
+    runGit(repoRoot, ['config', 'user.email', 'protocol@example.invalid']);
+    runGit(repoRoot, ['config', 'commit.gpgSign', 'false']);
+    runGit(repoRoot, ['add', '.']);
+    runGit(repoRoot, ['commit', '-m', 'test: seed current protocol']);
+    const sourceCommit = runGit(repoRoot, ['rev-parse', 'HEAD']);
+
+    const packaged = packageAutomationsProtocol({
+      repoRoot,
+      outputDir: path.join(scratchDir, 'out'),
+      sourceCommit
+    });
+    const entries = parseTarGz(readFileSync(packaged.bundlePath));
+    const entryNames = entries.map((entry) => entry.name);
+    assert.ok(
+      entryNames.includes('coven-automations-v1/conformance-result.schema.json')
+    );
+    assert.ok(
+      entryNames.includes('coven-automations-v1/conformance-result.vectors.json')
+    );
+
+    const contractManifest = JSON.parse(
+      readFileSync(path.join(specDir, 'conformance-manifest.json'), 'utf8')
+    );
+    assert.ok(contractManifest.schemas.includes('conformance-result.schema.json'));
+    assert.equal(
+      contractManifest.conformanceResultVectors,
+      'conformance-result.vectors.json'
+    );
+
+    const bundleManifest = JSON.parse(
+      entries.find((entry) => entry.name === 'manifest.json').data.toString('utf8')
+    );
+    const bundledPaths = bundleManifest.files.map((file) => file.path);
+    assert.ok(bundledPaths.includes('conformance-result.schema.json'));
+    assert.ok(bundledPaths.includes('conformance-result.vectors.json'));
   });
 });
 

@@ -370,6 +370,7 @@ pub fn append_definition_event(
     let event_kind = match input.command {
         "legacy.definition.create.v1" | "definition.create.v1" => "definition.created",
         "legacy.definition.revise.v1" | "definition.revise.v1" => "definition.revised",
+        "definition.disable.v1" => "definition.disabled",
         "legacy.definition.delete.v1" | "definition.tombstone.v1" => "definition.tombstoned",
         _ => anyhow::bail!("unsupported definition event command `{}`", input.command),
     };
