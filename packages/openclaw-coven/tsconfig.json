@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node", "vitest"]
   },
-  "include": ["index.ts", "src/**/*.ts"]
+  "include": ["index.ts", "src/**/*.ts", "src/**/*.d.ts"]
 }

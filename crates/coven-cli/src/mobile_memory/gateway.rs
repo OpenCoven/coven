@@ -31,7 +31,7 @@ use super::contract::{
     MobileOverviewTotals, MobileOverviewVerification, MobileSupersession, MobileVerificationState,
 };
 use super::identity::load_or_create_host_identity;
-use super::pairing::{PairingError, PairingManager, PairingProgress};
+use super::pairing::{PairingError, PairingLifecycleState, PairingManager, PairingProgress};
 use super::registry::DeviceRegistry;
 use super::{MAX_MOBILE_REQUEST_BYTES, MAX_MOBILE_RESPONSE_BYTES};
 
@@ -43,6 +43,7 @@ const PAIRING_LIFETIME: chrono::Duration = chrono::Duration::minutes(5);
 
 static ACTIVE_GATEWAY: LazyLock<Mutex<Option<Weak<MobileGatewayState>>>> =
     LazyLock::new(|| Mutex::new(None));
+static PAIRING_CANCELLATION_AUDIT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MobileRoute {
@@ -829,7 +830,15 @@ struct LocalPairingInvitation {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalPairingStatus {
+    state: PairingLifecycleState,
     phrase: Option<[String; 6]>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPairingCancellation {
+    state: PairingLifecycleState,
+    replayed: bool,
 }
 
 #[derive(serde::Deserialize)]
@@ -913,12 +922,38 @@ pub(crate) fn handle_local_control(
     Some((|| {
         let state = active_gateway()?;
         match (method, action) {
-            ("POST", "status") => crate::api::json_response(
-                200,
-                &LocalPairingStatus {
-                    phrase: state.pairing.phrase(id, Utc::now())?,
-                },
-            ),
+            ("POST", "status") => {
+                let status = state.pairing.status(id, Utc::now())?;
+                crate::api::json_response(
+                    200,
+                    &LocalPairingStatus {
+                        state: status.state,
+                        phrase: status.phrase,
+                    },
+                )
+            }
+            ("POST", "cancel") => {
+                let _audit_guard = PAIRING_CANCELLATION_AUDIT_LOCK
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("pairing cancellation audit lock was poisoned"))?;
+                let cancellation = state.pairing.cancel(id, Utc::now())?;
+                if cancellation.audit_required() {
+                    append_event(
+                        &state.coven_home,
+                        Utc::now(),
+                        MobileAuditEvent::PairingCancelled,
+                        None,
+                    )?;
+                    state.pairing.mark_cancellation_audited(id)?;
+                }
+                crate::api::json_response(
+                    200,
+                    &LocalPairingCancellation {
+                        state: cancellation.state(),
+                        replayed: cancellation.replayed(),
+                    },
+                )
+            }
             ("POST", "confirm") => {
                 let confirmation: LocalPairingConfirmation =
                     serde_json::from_str(body.context("pairing confirmation omitted body")?)?;
@@ -1090,8 +1125,9 @@ fn auth_error_response(error: MobileAuthError) -> MobileHttpResponse {
 
 fn pairing_error_response(error: PairingError) -> MobileHttpResponse {
     let (status, code) = match error {
-        PairingError::PairingExpired => (410, MobileErrorCode::PairingExpired),
-        PairingError::PairingConsumed => (409, MobileErrorCode::PairingConsumed),
+        PairingError::PairingExpired | PairingError::PairingConsumed => {
+            (410, MobileErrorCode::PairingExpired)
+        }
         PairingError::PairingConfirmationRequired => {
             (409, MobileErrorCode::PairingConfirmationRequired)
         }
@@ -1151,6 +1187,7 @@ mod tests {
     use sha2::Digest;
     use std::collections::HashMap;
     use std::net::{IpAddr, UdpSocket};
+    use std::sync::Barrier;
 
     static TEST_GATEWAY_LOCK: Mutex<()> = Mutex::new(());
 
@@ -1427,7 +1464,159 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&status.body).unwrap()["phrase"],
             serde_json::Value::Null
         );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&status.body).unwrap()["state"],
+            "waiting_for_device"
+        );
         assert!(!temp.path().join("mobile/pairings.json").exists());
+    }
+
+    #[test]
+    fn local_control_cancels_pairing_once_and_reports_terminal_status() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+
+        let invitation =
+            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+                .unwrap()
+                .unwrap();
+        let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
+        let id = invitation["id"].as_str().unwrap();
+        let cancel_path = format!("/api/v1/internal/mobile/pairings/{id}/cancel");
+
+        let first = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        let replay = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, 200);
+        assert_eq!(replay.status, 200);
+        let first: serde_json::Value = serde_json::from_str(&first.body).unwrap();
+        let replay: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+        assert_eq!(first["state"], "cancelled");
+        assert_eq!(first["replayed"], false);
+        assert_eq!(replay["state"], "cancelled");
+        assert_eq!(replay["replayed"], true);
+
+        let status = handle_local_control(
+            "POST",
+            &format!("/api/v1/internal/mobile/pairings/{id}/status"),
+            Some("{}"),
+        )
+        .unwrap()
+        .unwrap();
+        let status: serde_json::Value = serde_json::from_str(&status.body).unwrap();
+        assert_eq!(status["state"], "cancelled");
+        assert_eq!(status["phrase"], serde_json::Value::Null);
+
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+        assert!(!audit.contains(id));
+    }
+
+    #[test]
+    fn concurrent_local_cancellation_emits_one_audit_record() {
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+
+        let invitation =
+            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+                .unwrap()
+                .unwrap();
+        let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
+        let id = invitation["id"].as_str().unwrap();
+        let cancel_path = Arc::new(format!("/api/v1/internal/mobile/pairings/{id}/cancel"));
+        let barrier = Arc::new(Barrier::new(3));
+        let workers = (0..2)
+            .map(|_| {
+                let cancel_path = Arc::clone(&cancel_path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    handle_local_control("POST", &cancel_path, Some("{}"))
+                        .unwrap()
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let responses = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(responses.iter().all(|response| response.status == 200));
+        let mut replayed = responses
+            .iter()
+            .map(|response| {
+                serde_json::from_str::<serde_json::Value>(&response.body).unwrap()["replayed"]
+                    .as_bool()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        replayed.sort_unstable();
+        assert_eq!(replayed, [false, true]);
+        let audit = std::fs::read_to_string(temp.path().join("mobile/audit.jsonl")).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_audit_is_retried_after_an_append_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = TEST_GATEWAY_LOCK.lock().unwrap();
+        let Some((temp, config, _)) = test_listener_config() else {
+            return;
+        };
+        let _gateway = start_mobile_gateway_with_config(temp.path(), &config).unwrap();
+
+        let invitation =
+            handle_local_control("POST", "/api/v1/internal/mobile/pairings", Some("{}"))
+                .unwrap()
+                .unwrap();
+        let invitation: serde_json::Value = serde_json::from_str(&invitation.body).unwrap();
+        let id = invitation["id"].as_str().unwrap();
+        let cancel_path = format!("/api/v1/internal/mobile/pairings/{id}/cancel");
+        let audit_path = temp.path().join("mobile/audit.jsonl");
+        std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        assert!(handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .is_err());
+
+        std::fs::set_permissions(&audit_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let replay = handle_local_control("POST", &cancel_path, Some("{}"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.status, 200);
+        let replay: serde_json::Value = serde_json::from_str(&replay.body).unwrap();
+        assert_eq!(replay["state"], "cancelled");
+        assert_eq!(replay["replayed"], true);
+
+        let audit = std::fs::read_to_string(audit_path).unwrap();
+        assert_eq!(audit.matches("\"event\":\"pairing_cancelled\"").count(), 1);
+    }
+
+    #[test]
+    fn expired_and_consumed_pairings_have_the_same_remote_response() {
+        let expired = pairing_error_response(PairingError::PairingExpired);
+        let consumed = pairing_error_response(PairingError::PairingConsumed);
+        assert_eq!(expired.status, consumed.status);
+        let expired: serde_json::Value = serde_json::from_str(&expired.body).unwrap();
+        let consumed: serde_json::Value = serde_json::from_str(&consumed.body).unwrap();
+        assert_eq!(expired["error"]["code"], consumed["error"]["code"]);
+        assert_eq!(
+            expired["error"]["retryable"],
+            consumed["error"]["retryable"]
+        );
     }
 
     #[cfg(unix)]
