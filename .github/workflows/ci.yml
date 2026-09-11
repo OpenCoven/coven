@@ -111,10 +111,20 @@ jobs:
       - run: python3 scripts/check-reliability-scorecard.py
       - run: python3 scripts/check-workflows-test.py
       - run: python3 scripts/check-ci-workflow-test.py
+      - run: python3 scripts/install-native-link-dependencies-test.py
       - run: node --test scripts/package-github-release-test.mjs
       - run: node --test scripts/package-automations-protocol.test.mjs
       - run: node --test scripts/package-automations-authority-profile.test.mjs
+      - run: node --test conformance/automations/runner/conformance.test.mjs
       - run: node --test scripts/release-stress-test.mjs
+      # The benchmark harness tests also run inside `performance-baseline`,
+      # but that job is push-only, so until this step existed a pull request
+      # could break `benchmark-cli.mjs` and still show every check green -
+      # the failure only appeared after the merge landed on main. These are
+      # pure Node with no daemon or built binary involved (they pass
+      # `--binary=$(node)` with `--session-counts=none`), so they cost about a
+      # second here rather than gating behind the expensive baseline job.
+      - run: node --test scripts/benchmark-cli.test.mjs scripts/benchmark-chaos.test.mjs
       - run: scripts/check-workflows.sh
 
   automations-protocol-bundle:
@@ -216,7 +226,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-lint-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Check formatting
         run: cargo fmt --check
       - name: Clippy
@@ -241,7 +251,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-test-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo test --workspace --locked
 
   rust-test-windows:
@@ -311,7 +321,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-afs-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Clippy (coven-afs mount feature)
         run: cargo clippy -p coven-afs --features mount --all-targets -- -D warnings
       - name: Test (coven-afs mount feature)
@@ -375,7 +385,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-perf-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Validate benchmark runner
@@ -525,7 +535,7 @@ jobs:
             ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
       - run: node scripts/test-cli-prepublish.mjs --target=${{ matrix.npm-target }} --skip-build --skip-secrets-scan
         env:
@@ -572,7 +582,7 @@ jobs:
             ${{ runner.os }}-rust-npm-
       - name: Install native link dependencies (Linux only)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - run: cargo build --release --package coven-cli --target ${{ matrix.rust-target }}
       - name: Build the AFS mount export helper (macOS only)
         if: startsWith(matrix.npm-target, 'macos')
@@ -600,7 +610,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-rust-engine-
       - name: Install native link dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopenblas-dev
+        run: bash scripts/install-native-link-dependencies.sh
       - name: Build coven
         run: cargo build -p coven-cli --locked
       - name: Install the pinned engine

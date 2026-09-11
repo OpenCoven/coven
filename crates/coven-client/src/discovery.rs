@@ -69,13 +69,12 @@ impl DaemonEndpoint {
                     socket_candidate.display()
                 )));
             }
-            // Resolve symlinked ancestors and `..` before the definitive
-            // metadata checks, then retain this exact validated path.
-            let socket = std::fs::canonicalize(&socket_candidate).map_err(|source| {
-                selected_unix_socket_discovery_error(&socket_candidate, source, "resolve")
-            })?;
+            // The home already resolves symlinked ancestors and `..`. Retain
+            // the selected leaf: on macOS, canonicalizing a hard-linked socket
+            // can return its temporary publication alias, which is then unlinked.
+            let socket = socket_candidate;
             let metadata = std::fs::symlink_metadata(&socket).map_err(|source| {
-                selected_unix_socket_discovery_error(&socket_candidate, source, "inspect")
+                selected_unix_socket_discovery_error(&socket, source, "inspect")
             })?;
             if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
                 return Err(ClientError::Discovery(format!(
@@ -2042,9 +2041,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn status_file_reader_allows_an_atomic_status_replacement() {
-        use std::{ffi::OsStr, os::windows::ffi::OsStrExt, ptr, sync::mpsc, time::Duration};
+        use std::{
+            ffi::OsStr,
+            os::windows::{
+                ffi::OsStrExt,
+                io::{FromRawHandle, OwnedHandle},
+            },
+            ptr,
+            sync::mpsc,
+            time::Duration,
+        };
         use windows_sys::Win32::{
-            Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE},
+            Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
             Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
         };
 
@@ -2071,6 +2079,8 @@ mod tests {
             )
         };
         assert_ne!(reader, INVALID_HANDLE_VALUE, "open status reader");
+        // Keep the reader owned so failure paths also close the Windows handle.
+        let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
         let home_path = home.clone();
         let (result_tx, result_rx) = mpsc::channel();
         let writer = std::thread::spawn(move || {
@@ -2081,18 +2091,19 @@ mod tests {
                 ))
                 .expect("report status replacement");
         });
-        assert!(
-            result_rx.recv_timeout(Duration::from_millis(20)).is_err(),
-            "status replacement should wait for the active reader"
-        );
-        unsafe {
-            CloseHandle(reader);
-        }
-        result_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("status replacement result")
-            .expect("replace status after reader closes");
-        writer.join().expect("status replacement thread");
+        // Replacement may complete while a delete-sharing reader is open. Preserve
+        // an early success or error instead of requiring a minimum writer duration.
+        let early_result = result_rx.recv_timeout(Duration::from_millis(20));
+        drop(reader);
+        let result = match early_result {
+            Ok(result) => Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => result_rx.recv_timeout(Duration::from_secs(2)),
+            Err(error) => Err(error),
+        };
+        let result = result.expect("status replacement result");
+        let joined = writer.join();
+        result.expect("replace status after reader closes");
+        joined.expect("status replacement thread");
         assert_eq!(
             std::fs::read_to_string(&status_path).expect("read replaced status"),
             "{\"pid\":2}\n"

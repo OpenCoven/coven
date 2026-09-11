@@ -586,11 +586,12 @@ pub fn initialize_store(path: &Path) -> Result<()> {
     let conn = Connection::open(path)
         .with_context(|| format!("failed to open Coven store at {}", path.display()))?;
     configure_initializing_connection(&conn)?;
-    // The Ward audit migrator owns its own transaction because a legacy table
-    // rebuild must be atomic. Run it before our transaction for the remaining
-    // idempotent store schema work; nesting these transactions is invalid in
-    // SQLite. Its transaction also serializes concurrent Ward upgrades.
+    // Table-rebuild migrators own their transactions so they can change SQLite
+    // foreign-key mode safely and roll back atomically. Run them before the
+    // transaction for the remaining idempotent schema work.
     ensure_ward_audit_schema(&conn)?;
+    crate::automations::runs::ensure_runtime_authority_unsupported_failure_class(&conn)?;
+    crate::automations::runtime_terminal_evidence::ensure_runtime_terminal_evidence_schema(&conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .context("failed to acquire SQLite initialization transaction")?;
     let result = initialize_store_schema(&conn);
@@ -1005,6 +1006,12 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     .context("failed to initialize automation command adoption schema")?;
     crate::automations::cancellation::ensure_cancellation_schema(conn)
         .context("failed to initialize automation cancellation schema")?;
+    conn.execute_batch(crate::automations::leadership::AUTOMATION_SCHEDULER_AUTHORITY_SCHEMA_SQL)
+        .context("failed to initialize automation scheduler authority schema")?;
+    conn.execute_batch(
+        crate::automations::diagnostics::AUTOMATION_SCHEDULER_DIAGNOSTICS_SCHEMA_SQL,
+    )
+    .context("failed to initialize automation scheduler diagnostics schema")?;
     conn.execute_batch(crate::automations::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
         .context("failed to initialize automation_occurrences schema")?;
     crate::automations::occurrences::ensure_occurrence_kind(conn)?;
@@ -1013,13 +1020,17 @@ fn initialize_store_schema(conn: &Connection) -> Result<()> {
     crate::automations::runs::ensure_timeout_column(conn)?;
     conn.execute_batch(crate::automations::runs::AUTOMATION_ATTEMPTS_SCHEMA_SQL)
         .context("failed to initialize automation attempts and retry state schema")?;
-    crate::automations::command_adoption::ensure_global_adoption_key_guards(conn)?;
     crate::automations::runs::ensure_authority_columns(conn)?;
+    crate::automations::command_adoption::ensure_global_adoption_key_guards(conn)?;
     crate::automations::contract::migration::migrate_legacy_contract_metadata(conn)?;
     conn.execute_batch(crate::automations::contract::events::AUTOMATION_EVENTS_SCHEMA_SQL)
         .context("failed to initialize automation events schema")?;
     conn.execute_batch(crate::automations::receipts::AUTOMATION_RECEIPTS_SCHEMA_SQL)
         .context("failed to initialize automation receipts schema")?;
+    conn.execute_batch(
+        crate::automations::receipts::AUTOMATION_RECEIPT_AUTHORITY_EXTENSIONS_SCHEMA_SQL,
+    )
+    .context("failed to initialize automation receipt authority extensions schema")?;
     crate::automations::contract::events::backfill_definition_event_baselines(conn)
         .context("failed to backfill automation definition event baselines")?;
     crate::automations::store::migrate_durable_local_timezones(conn)?;

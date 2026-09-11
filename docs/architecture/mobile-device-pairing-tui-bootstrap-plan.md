@@ -53,12 +53,13 @@ plan extends it; nothing here starts from zero.
 
 | Capability | Current implementation | Code path |
 | --- | --- | --- |
-| Terminal pairing command | `coven memory mobile pair` renders a QR invitation, polls status, and asks the operator to confirm a six-word phrase | `crates/coven-cli/src/mobile_memory/mod.rs` (`run_pair`, `run_pair_unix`), command enum `MobileMemoryCommand` in `crates/coven-cli/src/main.rs` |
-| Pairing engine | Single-use nonce, expiry pruning, host+device phrase confirmation, idempotent completion, bounded retry windows | `crates/coven-cli/src/mobile_memory/pairing.rs` (`PairingManager`, `PendingPairing`, `PairingError`) |
+| Terminal pairing command | `coven memory mobile pair` renders a QR invitation, polls explicit lifecycle status, asks the operator to confirm a six-word phrase, and cancels incomplete pairing on decline or interruption | `crates/coven-cli/src/mobile_memory/mod.rs` (`run_pair`, `run_pair_unix`), command enum `MobileMemoryCommand` in `crates/coven-cli/src/main.rs` |
+| Pairing engine | Single-use nonce, expiry pruning, owner-only idempotent cancellation with pending-secret erasure, host+device phrase confirmation, idempotent completion, bounded retry windows | `crates/coven-cli/src/mobile_memory/pairing.rs` (`PairingManager`, `PendingPairing`, `PairingError`) |
 | Pairing v2 offer | `coven-memory://pair` URL with versioned fields and a canonical offer digest over length-prefixed fields | `crates/coven-cli/src/mobile_memory/pairing.rs` (`build_pairing_url`, `PairingOfferV2::hash`), contract in [`docs/design/mobile-pairing-protocol-v2.md`](../design/mobile-pairing-protocol-v2.md) |
 | Transcript binding v2 | Offer digest, selected/supported versions, device key, device name, and app version bound into a digest that derives the six-word phrase | `crates/coven-cli/src/mobile_memory/pairing.rs` (`PairingTranscript::V2`), fixture `crates/coven-cli/tests/fixtures/mobile-pairing-v2/transcript-vector.json` |
 | QR rendering | Unicode half-block rendering of the pairing URL plus a printed copyable URL and expiry line | `crates/coven-cli/src/mobile_memory/pairing.rs` (`render_pairing_invitation`), `qrcode` crate 0.14 in `crates/coven-cli/Cargo.toml` |
 | Device grant model | Versioned grant object with scopes, restrictions, assurance levels, audience, and exact-action intents | `crates/coven-cli/src/mobile_memory/grant.rs` (`DeviceGrant`, `DeviceScope`, `AssuranceLevel`, `DeviceActionIntent`) |
+| Device administration | Top-level privacy-safe `coven device list|inspect|rename|revoke`, bounded `device grant reissue`, and already-paired replacement-device rotation; legacy `coven memory mobile ...` remains supported | `crates/coven-cli/src/mobile_memory/device.rs`, command enums in `crates/coven-cli/src/main.rs` |
 | Request authentication | Canonical signed requests with timestamp, nonce, and body digest; replay window; per-device rate limiting | `crates/coven-cli/src/mobile_memory/auth.rs` (`canonical_request`, `MobileAuthenticator`) |
 | Host identity | Stable P-256 host key, self-signed certificate, SHA-256 public-key fingerprint pinned in the QR | `crates/coven-cli/src/mobile_memory/identity.rs` (`load_or_create_host_identity`, `HostIdentity`) |
 | Mobile gateway | Private-network rustls TLS listener with bounded routes, body caps, and inflight-connection limits; 5-minute pairing lifetime | `crates/coven-cli/src/mobile_memory/gateway.rs` (`MobileRoute`, `PAIRING_LIFETIME`) |
@@ -72,12 +73,12 @@ plan extends it; nothing here starts from zero.
 
 | Issue requirement | Today | Gap |
 | --- | --- | --- |
-| `coven device pair` / `--scope` | `coven memory mobile pair` with a fixed `memory_read` scope (`PAIRING_SCOPE_MEMORY_READ` in `pairing.rs`) | New top-level `device` command family; selectable, previewed scopes |
+| `coven device pair` / `--scope` | Device administration is top-level; pairing remains `coven memory mobile pair` with a fixed `memory_read` scope (`PAIRING_SCOPE_MEMORY_READ` in `pairing.rs`) | Add only the top-level pairing alias and selectable, previewed pairing scopes |
 | Canonical CBOR offer + compact URL-safe encoding | URL query members (JSON-flavored, not CBOR) in `build_pairing_url` | Deterministic CBOR offer and base64url encoding per §5 |
 | Universal Link/App Link | `coven-memory://pair` custom scheme only | HTTPS Universal Link carrying the offer in a fragment per §5.4 |
 | Forward-secret E2EE handshake (Noise) | TLS 1.3 transport plus phrase confirmation; no application-layer AKEX, no session keys | Noise_XK handshake per §6; new crypto dependencies |
 | Rendezvous for cross-network pairing | Gateway requires the phone to reach the host's advertised HTTPS endpoint | Relay session derived from the offer per §7; `coven-relay` already provides the room semantics |
-| Countdown / status / cancel | Expiry printed once; Ctrl-C cancels the CLI loop only | Live countdown, explicit status/cancel commands, both-endpoint cancel per §8/§10 |
+| Countdown / status / cancel | Expiry is printed once; local lifecycle status distinguishes device enrollment from confirmation, and host decline/Ctrl-C cancels through owner-only daemon control | Live countdown, public explicit status/cancel commands, and both-endpoint cancel per §8/§10 |
 | Offer-bound capability approval | Phrase binds a fixed scope string | `requested_capabilities_hash` over the exact selected scope set, bound into offer and transcript per §5/§6/§11 |
 | Short authentication phrase | Already implemented (six words, 2,048-word list, 66 bits) in `pairing.rs` | Re-derive from the Noise handshake hash per §9; keep six words |
 | Bounded failed attempts | One enrollment attempt consumes the nonce (`pairing.rs` `enroll`); phrase failures destroy pending pairings | Add a bounded handshake-attempt counter per §8.4 |
