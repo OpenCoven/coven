@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
 use super::contract::events::EventReducer;
+use super::contract::types::{AutomationId, OccurrenceId};
 use super::contract::{canonicalize, sha256_hex, AutomationDefinition, EventEnvelope};
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
@@ -509,7 +510,7 @@ fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static
             || !occurrence_ids.insert(&case.first.occurrence_id)
             || !occurrence_ids.insert(&case.second.occurrence_id)
             || !occurrence_fence_scenario_matches(case)
-            || case.expected.row_count > 2
+            || !(1..=2).contains(&case.expected.row_count)
         {
             return Err("conformance vector is invalid");
         }
@@ -526,8 +527,8 @@ fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static
 }
 
 fn valid_occurrence_fence_input(input: &OccurrenceFenceInput) -> bool {
-    valid_case_id(&input.occurrence_id)
-        && valid_case_id(&input.automation_id)
+    OccurrenceId::new(input.occurrence_id.clone()).is_ok()
+        && AutomationId::new(input.automation_id.clone()).is_ok()
         && DateTime::parse_from_rfc3339(&input.scheduled_for).is_ok_and(|timestamp| {
             timestamp
                 .with_timezone(&Utc)

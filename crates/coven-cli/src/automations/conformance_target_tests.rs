@@ -156,6 +156,28 @@ fn occurrence_fence_uniqueness_suite_rejects_noncanonical_timestamps() {
 }
 
 #[test]
+fn occurrence_fence_uniqueness_suite_rejects_contract_invalid_ids() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["first"]["automationId"] = json!("daily:notes");
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_rejects_impossible_zero_row_expectations() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["rowCount"] = json!(0);
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
 fn event_reducer_determinism_suite_executes_the_checked_in_vectors() {
     let vectors: Value = serde_json::from_str(EVENT_REDUCER_DETERMINISM_VECTORS).unwrap();
     let response = evaluate(&request_for("event-reducer-determinism", vectors)).unwrap();
