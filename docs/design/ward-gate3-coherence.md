@@ -23,6 +23,12 @@ the generic edit, proposal, approval, and recovery paths reject them. A future
 protected-write operation must have daemon-owned authenticated authority.
 Model-scored probes and any auto-approval are explicitly out of scope for v1.
 
+Proposal refusal preserves the declared Tier-0/control path after Gate-2 lexical
+normalization as well as the materialized target. An in-home symlink cannot
+demote a declared protected target, and the live materialized `ward.toml` is
+also excluded when addressed by its backing path. If a protected baseline
+cannot be read safely, refusal evidence fails closed before any mutation.
+
 ## Non-goals
 
 The following are stated non-goals for Gate 3 v1 **and for the Ward contract

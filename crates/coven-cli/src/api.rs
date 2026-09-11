@@ -5656,34 +5656,46 @@ fn proposal_decision_audit_reservation_bytes(
     store::ward_audit_reservation_bytes(conn, row_count, variable_payload)
 }
 
-fn protected_proposal_targets(adjudication: &ward::Outcome) -> Vec<String> {
-    adjudication
+fn protected_proposal_targets(
+    adjudication: &ward::Outcome,
+    ward: &ward::Ward,
+) -> Result<Vec<String>> {
+    let control_key = ward::portable_surface_key(ward::WARD_CONFIG_FILE);
+    let materialized_control_key = match ward.materialize(ward::WARD_CONFIG_FILE) {
+        Ok(target) => Some(ward::portable_surface_key(&target)),
+        // An external config cannot be a materialized in-home write target;
+        // Gate 2 still blocks attempts through its declared symlink.
+        Err(ward::BlockReason::SymlinkEscape) => None,
+        Err(reason) => anyhow::bail!("cannot materialize the active Ward control file: {reason}"),
+    };
+    Ok(adjudication
         .decisions
         .iter()
         .filter(|decision| {
+            if matches!(
+                decision.verdict,
+                ward::Verdict::Blocked {
+                    reason: ward::BlockReason::TraversalEscape
+                        | ward::BlockReason::SymlinkEscape
+                        | ward::BlockReason::Unresolvable { .. }
+                }
+            ) {
+                return false;
+            }
             let protected_surface = decision.tier == ward::Tier::Protected
-                && matches!(
-                    decision.verdict,
-                    ward::Verdict::AuthorizedProtectedChange
-                        | ward::Verdict::Blocked {
-                            reason: ward::BlockReason::Unauthorized
-                                | ward::BlockReason::CaseCollision { .. }
-                        }
-                );
-            let ward_control_surface = ward::portable_surface_key(&decision.resolved)
-                == ward::portable_surface_key(ward::WARD_CONFIG_FILE)
-                && !matches!(
-                    decision.verdict,
-                    ward::Verdict::Blocked {
-                        reason: ward::BlockReason::TraversalEscape
-                            | ward::BlockReason::SymlinkEscape
-                            | ward::BlockReason::Unresolvable { .. }
-                    }
-                );
+                || ward.declares_protected_target(&decision.target);
+            let resolved_key = ward::portable_surface_key(&decision.resolved);
+            let declared_control =
+                ward::lexical_join(Path::new(""), &decision.target).is_some_and(|target| {
+                    ward::portable_surface_key(&target.to_string_lossy()) == control_key
+                });
+            let ward_control_surface = declared_control
+                || resolved_key == control_key
+                || materialized_control_key.as_ref() == Some(&resolved_key);
             protected_surface || ward_control_surface
         })
         .map(|decision| decision.resolved.clone())
-        .collect()
+        .collect())
 }
 
 /// `POST /familiars/{id}/edits` — the Ward-enforced write path into a familiar
@@ -5850,7 +5862,7 @@ fn apply_familiar_edits(
         targets: edits.iter().map(|e| e.target.clone()).collect(),
         authorization: authorization.clone(),
     });
-    let protected_targets = protected_proposal_targets(&adjudication);
+    let protected_targets = protected_proposal_targets(&adjudication, &ward)?;
     if !protected_targets.is_empty() {
         let store_path = store_path(coven_home);
         let conn = store::open_store(&store_path)?;
@@ -5910,7 +5922,7 @@ fn apply_familiar_edits(
         return api_error(
             403,
             "protected_proposal_forbidden",
-            "Tier-0 protected surfaces cannot be changed through the proposal endpoint.",
+            "Tier-0 protected surfaces and Ward control files cannot be changed through the proposal endpoint.",
             Some(json!({ "targets": protected_targets })),
         );
     }
@@ -9898,7 +9910,7 @@ fn decide_threads_proposal_inner(
         targets: targets.clone(),
         authorization: authorization.clone(),
     });
-    let protected_targets = protected_proposal_targets(&adjudication);
+    let protected_targets = protected_proposal_targets(&adjudication, &ward)?;
     if !protected_targets.is_empty() {
         if applying_state.is_some() {
             let claim_path = claim.path.clone();
@@ -11060,7 +11072,7 @@ fn pending_document_protected_targets(
         targets: edits.into_iter().map(|edit| edit.target).collect(),
         authorization: authorization_from_writer(&pending.writer),
     });
-    Ok(protected_proposal_targets(&adjudication))
+    protected_proposal_targets(&adjudication, &ward)
 }
 
 /// Process one deterministic round-robin batch. The persistent filename cursor

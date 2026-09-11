@@ -134,6 +134,13 @@ fn ward_configuration_cannot_demote_protection_through_intake() -> Result<()> {
             })),
         )?;
         assert_protected_refusal(&response, "ward.toml");
+        assert!(
+            response.body["error"]["message"]
+                .as_str()
+                .context("refusal message")?
+                .contains("Ward control"),
+            "refusal must identify the control-file boundary: {response:?}"
+        );
         assert!(!response
             .body
             .to_string()
@@ -144,6 +151,89 @@ fn ward_configuration_cannot_demote_protection_through_intake() -> Result<()> {
         assert!(!fixture.coven_home.join("pending").exists());
         assert_no_write_authority(fixture)
     })
+}
+
+#[cfg(unix)]
+#[test]
+fn declared_protected_target_cannot_escape_its_tier_through_an_in_home_symlink() -> Result<()> {
+    for target in ["SOUL.md", "./SOUL.md", "identity/../SOUL.md"] {
+        run_journey(|fixture| {
+            let soul_path = fixture.workspace.join("SOUL.md");
+            let materialized = fixture.workspace.join("identity/live.md");
+            fs::create_dir(fixture.workspace.join("identity"))?;
+            fs::rename(&soul_path, &materialized)?;
+            std::os::unix::fs::symlink("identity/live.md", &soul_path)?;
+            let response = fixture.request(
+                "POST",
+                EDITS,
+                Some(&json!({
+                    "edits": [{"target": target, "contents": "forbidden identity replacement"}],
+                    "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                })),
+            )?;
+            assert_eq!(fs::read(&materialized)?, b"# Sage\n");
+            assert_eq!(fs::read(&soul_path)?, b"# Sage\n");
+            // A symlinked protected baseline may also prevent building safe
+            // refusal evidence. That error must still precede every write.
+            assert!(matches!(response.status, 403 | 500), "{response:?}");
+            assert_ne!(response.body["error"]["details"]["writeApplied"], true);
+            assert!(!response
+                .body
+                .to_string()
+                .contains("forbidden identity replacement"));
+            assert!(soul_path.is_symlink());
+            assert!(!fixture.coven_home.join("pending").exists());
+            assert_no_write_authority(fixture)
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_ward_control_is_refused_by_declared_and_materialized_path() -> Result<()> {
+    for target in [
+        "ward.toml",
+        "./ward.toml",
+        "config/../ward.toml",
+        "config/ward.toml",
+    ] {
+        run_journey(|fixture| {
+            let ward_path = fixture.workspace.join("ward.toml");
+            let materialized = fixture.workspace.join("config/ward.toml");
+            let before = fs::read_to_string(&ward_path)?;
+            fs::create_dir(fixture.workspace.join("config"))?;
+            fs::rename(&ward_path, &materialized)?;
+            std::os::unix::fs::symlink("config/ward.toml", &ward_path)?;
+            let replacement = before
+                .replace(
+                    r#"protected_surface = ["SOUL.md"]"#,
+                    "protected_surface = []",
+                )
+                .replace(
+                    "path = \"SOUL.md\"\ntier = 0",
+                    "path = \"SOUL.md\"\ntier = 2",
+                );
+            assert_ne!(replacement, before);
+            let response = fixture.request(
+                "POST",
+                EDITS,
+                Some(&json!({
+                    "edits": [{"target": target, "contents": replacement}],
+                    "principalKeyFingerprint": PRINCIPAL_FINGERPRINT,
+                })),
+            )?;
+            assert_protected_refusal(&response, "config/ward.toml");
+            assert_eq!(fs::read_to_string(&materialized)?, before);
+            assert_eq!(fs::read_to_string(&ward_path)?, before);
+            assert!(ward_path.is_symlink());
+            assert!(!fixture.coven_home.join("pending").exists());
+            fixture.restart_daemon()?;
+            assert_eq!(fs::read_to_string(&ward_path)?, before);
+            assert_no_write_authority(fixture)
+        })?;
+    }
+    Ok(())
 }
 
 #[test]
