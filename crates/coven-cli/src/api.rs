@@ -5959,6 +5959,7 @@ fn apply_familiar_edits(
         crate::threads_gate::GateOutcome::Permitted => {}
     }
 
+    let apply_now = crate::threads_clock::now(coven_home)?;
     let (report, apply_cleanup_error) = match ward.apply(&edits, &authorization) {
         Ok(report) => (report, None),
         Err(error) => {
@@ -6114,6 +6115,7 @@ fn apply_familiar_edits(
             &workspace,
             &config,
             &report,
+            apply_now,
         )
         .err();
         if let Some(err) = persist_error {
@@ -31623,6 +31625,63 @@ tier = 0
         assert_eq!(
             backwards["error"]["details"]["requested"],
             "2026-09-09T10:04:00Z"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_rejects_missing_fixture_state_before_writing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        let workspace = seed_warded_familiar(home)?;
+        std::fs::remove_file(home.join("test-fixtures/threads-deterministic-clock/state.json"))?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"must not be written"}]}"#,
+        );
+        assert!(
+            response.is_err(),
+            "an active clock with missing state must fail closed"
+        );
+        assert!(!workspace.join("notes.md").exists());
+        Ok(())
+    }
+
+    #[cfg(feature = "threads-test-clock")]
+    #[test]
+    fn threads_direct_apply_audit_uses_deterministic_fixture_time() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let fixture_now =
+            seed_deterministic_threads_clock(home, "fixture-cap", "2026-09-09T10:00:00Z")?;
+        seed_warded_familiar(home)?;
+
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"notes.md","contents":"first"},{"target":"other.md","contents":"second"}]}"#,
+        )?;
+        assert_eq!(response.status, 200, "{}", response.body);
+
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        let mut statement = conn.prepare(
+            "SELECT submitted_at, decided_at FROM ward_audit
+             WHERE event_type = 'apply_audit' ORDER BY id",
+        )?;
+        let timestamps = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let expected = fixture_now.format(&time::format_description::well_known::Rfc3339)?;
+        assert_eq!(
+            timestamps,
+            vec![
+                (expected.clone(), expected.clone()),
+                (expected.clone(), expected)
+            ]
         );
         Ok(())
     }
