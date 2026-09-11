@@ -9,7 +9,7 @@ title: "Releasing Coven to npm and GitHub Releases"
 
 Coven publishes the `@opencoven/cli` wrapper and its four native platform packages (`@opencoven/cli-macos`, `@opencoven/cli-macos-x64`, `@opencoven/cli-linux-x64`, `@opencoven/cli-windows`) automatically from the **Release npm packages** GitHub Actions workflow.
 
-The release is **driven by a signed git tag**. No `workflow_dispatch`, no manual approval click, no long-lived npm token: a maintainer runs `git tag -s vX.Y.Z` + `git push`, and the workflow verifies the tag signature, runs the full gate matrix, dry-runs, then publishes using **npm trusted publishing over GitHub Actions OIDC**, attaching a provenance attestation to every package.
+The release is **driven by a signed git tag**. No `workflow_dispatch`, no manual approval click, no long-lived npm token: a maintainer runs `git tag -s vX.Y.Z` + `git push`, and the workflow verifies the tag signature, requires the canonical `PR gate` to have succeeded on the exact tagged commit's `main` push, runs the full release gate matrix, dry-runs, then publishes using **npm trusted publishing over GitHub Actions OIDC**, attaching a provenance attestation to every package.
 
 Source package versions stay `0.0.0` in the repo. The published version comes from the tag name (`v0.0.17` → `0.0.17`) and is stamped into the wrapper and native packages at publish time by `scripts/publish-npm.mjs`.
 
@@ -71,7 +71,10 @@ You can leave the `npm-publish` environment itself in place or remove it — the
 
 ### Preflight
 
-1. Confirm `main` CI is green for the exact commit you intend to release.
+1. Confirm `main` CI is green for the exact commit you intend to release. The
+   tag workflow independently verifies the `CI` push run and its `PR gate` job
+   through the GitHub API; a green ancestor, pull-request-only run, missing
+   result, or skipped/cancelled/failed gate is refused.
 2. Run the local pre-publish smoke test from a clean checkout:
    ```sh
    node scripts/test-cli-prepublish.mjs
@@ -148,10 +151,19 @@ That single push is the entire release. The workflow takes over from there.
 
 1. **Release gates** — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test --workspace --locked`, `python3 scripts/check-secrets.py`.
 2. **Verify signed release tag** — confirms the pushed ref is an annotated tag (not lightweight) and that GitHub has cryptographically verified the maintainer's signature. The workflow consults `gh api /repos/{owner}/{repo}/git/tags/{sha}` and requires `.verification.verified == true`. Any other state aborts the release.
-3. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
-4. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
-5. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
-6. **Automations contract bundles** — starting with `v0.4.4`, rebuilds both
+3. **Verify exact-source acceptance** — resolves the tagged commit and requires
+   exactly one matching `CI` workflow run from a `main` push at that SHA.
+   That run must have completed successfully, and its stable `PR gate` job
+   from the selected run attempt must be completed with conclusion
+   `success`. The verifier reads every Actions result page and refuses missing,
+   inconsistent, truncated, or unsearchably large pagination evidence. The
+   workflow records the run, attempt, required job, tag object, and candidate
+   commit in the retained
+   `coven-release-source-acceptance-vX.Y.Z` JSON artifact.
+4. **Build platform binaries** — matrix builds the release binary for `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `x86_64-pc-windows-msvc`, then uploads each as an artifact.
+5. **npm publish dry-run** — repacks the wrapper and native packages at the tag version and runs `npm publish --dry-run` for each. This is the same code path as the real publish minus the registry write, so a failure here means the real publish would also fail.
+6. **npm publish** — authenticates via GitHub Actions OIDC (`permissions: id-token: write`), then runs `npm publish --provenance --access public` for the four native packages and the wrapper. Each published tarball gets a provenance attestation linking it to this exact workflow run and commit SHA, visible on each package's npm page.
+7. **Automations contract bundles** — starting with `v0.4.4`, rebuilds both
    `spec/coven-automations/v1/` and the separately advertised
    `spec/coven-automations/authority/v1/` companion profile from the exact
    tagged commit into deterministic source-bound bundles. Each embedded
@@ -159,6 +171,27 @@ That single push is the entire release. The workflow takes over from there.
    `contractContentSha256`. The authority bundle never replaces or relabels the
    base bundle. GitHub-only recovery of older tags preserves their original
    four-archive-plus-checksum asset contract.
+
+### Exact-source checkpoint boundary
+
+The source-acceptance artifact records the preflight observation before release
+builds. It is not a final publication receipt: it contains no registry outcome,
+artifact digests, channel reconciliation, or repository-protection snapshot.
+The workflow does not repeat the CI lookup immediately before registry writes.
+
+The required source check is currently the versioned `PR gate` name in
+`scripts/package-github-release.mjs`; the verifier does not discover repository
+required checks dynamically. Changing that policy requires updating the
+verifier and its workflow-contract tests together. A green pull-request run
+does not replace the required `main` push run for the actual tagged commit.
+The preflight applies to tagged sources containing this workflow change;
+merging it does not retrofit older tags or their release workflows.
+
+[Issue #805](https://github.com/OpenCoven/coven/issues/805) also requires
+administrator enforcement, required pull-request review, protected release-tag
+governance, explicit break-glass evidence, release-channel synchronization, and
+a durable final receipt with publication and artifact outcomes. Passing this
+source preflight does not establish those controls or authorize a release.
 
 ### Postflight
 
