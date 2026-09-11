@@ -37,6 +37,7 @@ All error responses use the structured envelope documented in the [API contract]
 |---|---|---|---|
 | GET | `/api/v1/api-version` | Read the legacy route-family token. | `{ apiVersion: "v1", supportedApiVersions: ["v1"] }` |
 | GET | `/api/v1/health` | Daemon reachability, version, capabilities, pid, hub summary, event-writer state, and local storage pressure. | `{ ok, apiVersion, covenVersion, capabilities, daemon, hub, eventWriter, storage }` |
+| GET | `/api/v1/session-policy` | Inert restricted-admission discovery; no runtime effects or enforcement grant. | `{ contract, enforcement: "unavailable", supportedProfiles: [], reason }` |
 | GET | `/api/v1/capabilities` | Control-plane capability catalog with policy hints and action ids. | `{ capabilities: [...] }` |
 | GET | `/api/v1/capabilities/harnesses` | Aggregate of harness-native capability manifests plus Coven skills (`?refresh=1` re-scans). | `{ coven_skills, harness_capabilities, scanned_at }` |
 | GET | `/api/v1/capabilities/:harness` | One harness's capability manifest (`?refresh=1` re-scans). | manifest object · `404 harness_not_found` |
@@ -58,11 +59,12 @@ return the stored `result` without a second event. The corresponding
 `.get.v1` and `.list.v1` actions expose authority revisions; `.list.v1` accepts
 `includeTombstoned: true` to include retained tombstones.
 
-The health `capabilities` object currently contains all 16 fields:
+The health `capabilities` object currently contains all 17 fields:
 `sessions`, `events`, `travel`, `scheduler`, `hub`, `executorDispatch`,
 `eventCursor`, `structuredErrors`, `sessionHandoff`, `sessionLaunchPolicy`,
 `afs`, `afsMount`, `afsCommit`, `afsCommitDryRun`,
-`executionBindingContracts`, and `requestAdoptionContracts`. The
+`executionBindingContracts`, `requestAdoptionContracts`, and
+`sessionPolicyContracts`. The
 `sessionLaunchPolicy` field is `true` only over owner-gated local IPC and is
 always `false` over TCP; Host and Origin allowlists do not elevate TCP
 authority. `daemon` is either `null` or
@@ -82,12 +84,22 @@ before storage exhaustion rather than treating a reachable daemon as healthy.
 `writerBacklogEvents` and `writerBacklogBytes` mirror the same live queue
 snapshot reported by `eventWriter`.
 
+`sessionPolicyContracts` advertises `["coven.session-policy.v1"]` only over
+owner-local IPC (`[]` over TCP). This is a refusal-only admission contract, not
+enforcement support. `POST /api/v1/sessions/restricted` takes the closed request
+documented in the [session-policy contract](../API-CONTRACT.md#session-policy-admission-covensession-policyv1).
+It returns a correlated HTTP 409 `enforcement_unavailable` refusal for a valid
+request, or structured 400/403/409 errors, without store/familiar/runtime access.
+Top-level `sessionPolicy` on legacy `POST /api/v1/sessions` returns
+`400 invalid_request`; clients must not downgrade or automatically retry.
+
 ## Sessions and events
 
 | Method | Path | Purpose | Body / query | Success | Errors |
 |---|---|---|---|---|---|
 | GET | `/api/v1/sessions` | List sessions. | — | `SessionRecord[]` | — |
 | POST | `/api/v1/sessions` | Launch an unbound project-scoped harness session. A bound request is rejected and must use the adopted route. `launchPolicy` requires `capabilities.sessionLaunchPolicy === true`; its initial exact contract is `{ approval: "never", sandbox: "workspace-write", addDirs?: string[] }` for Codex `nonInteractive`, with every additional directory absolute, existing, canonicalized, and explicitly listed (including an external mission workspace when named). The field is owner-local-IPC-only; TCP returns `403 forbidden`. | `{ projectRoot, cwd?, harness, prompt, title?, launchMode?, launchPolicy?, conversation?, conversationId? }` | `201 SessionRecord` | `400 invalid_request`, `request_adoption_required`, `request_adoption_invalid`; `403 forbidden`; `500 launch_failed` |
+| POST | `/api/v1/sessions/restricted` | Request refusal-only `coven.session-policy.v1` admission over owner-local IPC. No session is launched. | Closed session-policy request | — (always refuses) | `400 invalid_request`; `403 forbidden`; `409 enforcement_unavailable`, `session_policy_expired` |
 | POST | `/api/v1/adopted-sessions` | Durably adopt and launch a bound session. | Normal launch fields plus complete `executionBinding` and closed `requestAdoption` metadata. | `201 SessionRecord` first adoption; `200 SessionRecord` exact replay | O2 errors; `400 request_adoption_required`, `request_adoption_invalid`, `request_adoption_unsupported`; `409 request_adoption_conflict`; synchronous post-adoption HTTP errors carry marker-only `{"adopted":true,"delivery":"not_asserted"}` details |
 | POST | `/api/v1/sessions/external` | Register (or idempotently re-register) an externally launched session. `requestAdoption` rejection precedes `executionBinding` rejection. | session descriptor | `201` new / `200` existing | `400 invalid_request` for malformed JSON or missing/invalid required registration fields; `400 request_adoption_invalid` wins when both reserved members are supplied; otherwise `400 execution_binding_invalid`; `409 session_id_conflict` |
 | GET | `/api/v1/sessions/:id` | Fetch one session. | — | `SessionRecord` | `404 session_not_found` |
@@ -478,7 +490,7 @@ Full hub request/response shapes live in the [API contract](/API-CONTRACT).
 GET /api/v1/health
 ```
 
-The response provides the active named `apiVersion`, all 16 health
+The response provides the active named `apiVersion`, all 17 health
 `capabilities` fields, and optional daemon metadata (`pid`, `startedAt`, and
 `socket`) plus the optional hub summary. Treat a dependent operation as
 unavailable until its required capability fields have been checked.

@@ -1,0 +1,23 @@
+{
+  "contract": "coven.session-policy.v1",
+  "admissionTimeUnixMs": 1799999700000,
+  "encoding": "UTF-8",
+  "trailingNewline": "LF",
+  "request": {
+    "file": "request.json",
+    "bytes": 421,
+    "digest": "sha256:c61bac56f84d1f3fddd5e70da35a7e8906f9bd4bac769b5d4ad61769dae83fdb"
+  },
+  "refusal": {
+    "file": "refusal.json",
+    "status": 409,
+    "bytes": 315,
+    "digest": "sha256:1bf9aa54fb9a3409c0930bec116cee455082de3d87aa6a3a9fab31e9866750f7"
+  },
+  "discovery": {
+    "file": "discovery.json",
+    "status": 200,
+    "bytes": 133,
+    "digest": "sha256:ffb4acff5c59079dd2c1477c5f4c1ecb167faa29e1090488cfd64cac5af84306"
+  }
+}

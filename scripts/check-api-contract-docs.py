@@ -136,6 +136,7 @@ HEALTH_CAPABILITY_FIELDS = (
     "afsCommitDryRun",
     "executionBindingContracts",
     "requestAdoptionContracts",
+    "sessionPolicyContracts",
 )
 O3_REQUIRED_LITERALS = (
     "/api/v1/adopted-sessions",
@@ -271,6 +272,7 @@ EXPECTED_HEALTH_CAPABILITIES = {
     "afsCommitDryRun": True,
     "executionBindingContracts": [EXECUTION_BINDING_CONTRACT],
     "requestAdoptionContracts": [REQUEST_ADOPTION_CONTRACT],
+    "sessionPolicyContracts": ["coven.session-policy.v1"],
 }
 EXPECTED_HEALTH_FIELDS = {
     "ok": True,
@@ -278,7 +280,11 @@ EXPECTED_HEALTH_FIELDS = {
 }
 EXPECTED_HEALTH_CONTRACTS = {
     field: EXPECTED_HEALTH_CAPABILITIES[field]
-    for field in ("executionBindingContracts", "requestAdoptionContracts")
+    for field in (
+        "executionBindingContracts",
+        "requestAdoptionContracts",
+        "sessionPolicyContracts",
+    )
 }
 ADOPTED_INPUT_FIRST_RESULT = {
     "adopted": True,
@@ -1119,6 +1125,45 @@ def validate_capability_value_table(
                 f"{path}: capability table {field} Description cell must document "
                 f"exact current value {expected_json_text(expected)}"
             )
+
+
+def validate_session_policy_route_table(
+    documents: dict[str, str], errors: list[str]
+) -> None:
+    path = "docs/reference/api.md"
+    section = require_markdown_section(
+        documents,
+        path,
+        "Sessions and events",
+        level=2,
+        errors=errors,
+    )
+    if section is None:
+        return
+    table = require_markdown_table(
+        section,
+        ("Method", "Path", "Purpose", "Body / query", "Success", "Errors"),
+        path=path,
+        label="session policy route",
+        errors=errors,
+    )
+    if table is None:
+        return
+
+    rows = markdown_table_rows(
+        table,
+        {"Method": "POST", "Path": "/api/v1/sessions/restricted"},
+    )
+    if not rows:
+        errors.append(
+            f"{path}: session policy route table missing "
+            "POST /api/v1/sessions/restricted"
+        )
+    elif len(rows) != 1:
+        errors.append(
+            f"{path}: session policy route table has ambiguous "
+            "POST /api/v1/sessions/restricted row"
+        )
 
 
 def whole_cell_code_expression(cell: str) -> str | None:
@@ -2388,6 +2433,7 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
         )
 
     validate_capability_value_table(documents, errors)
+    validate_session_policy_route_table(documents, errors)
 
     expected_count = len(HEALTH_CAPABILITY_FIELDS)
     for path, (heading, marker) in HEALTH_CAPABILITY_LISTS.items():
@@ -2465,7 +2511,8 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
     dto_claims = (
         markdown_paragraphs(
             compatibility,
-            "The complete current 16-field Rust health-capability DTO",
+            "The complete current "
+            f"{len(HEALTH_CAPABILITY_FIELDS)}-field Rust health-capability DTO",
         )
         if compatibility
         else []
@@ -2480,9 +2527,10 @@ def validate_o3_document_structures(documents: dict[str, str]) -> list[str]:
     elif not all(
         literal in dto_claims[0]
         for literal in (
-            "16-field",
+            f"{len(HEALTH_CAPABILITY_FIELDS)}-field",
             "../../docs/API-CONTRACT.md#get-apiv1health",
             "`requestAdoptionContracts`",
+            "`sessionPolicyContracts`",
         )
     ):
         errors.append(f"{openclaw_path}: canonical health DTO reference is missing")

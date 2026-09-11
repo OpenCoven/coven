@@ -35,7 +35,7 @@ proof of `coven.daemon.v1` support.
 - Clients should read `/api/v1/health` before assuming any response shape from other endpoints.
 - Legacy unversioned routes such as `GET /health` remain early-MVP aliases; new clients should use `/api/v1`.
 - Control-plane clients should discover capabilities before sending action ids.
-- All API failures are returned as structured `{ "error": { "code", "message", "details" } }` envelopes.
+- API errors use structured `{ "error": { "code", "message", "details" } }` envelopes. The separately negotiated session-policy contract also defines a closed HTTP 409 admission refusal, not a launch success.
 - Events include a monotonic `seq` cursor for incremental reads.
 - Event payloads are redacted by default before API display.
 
@@ -113,7 +113,8 @@ setting any of them requests the envelope.
     "afsCommit": true,
     "afsCommitDryRun": true,
     "executionBindingContracts": ["psyche.execution_binding.v1"],
-    "requestAdoptionContracts": ["psyche.request_adoption.v1"]
+    "requestAdoptionContracts": ["psyche.request_adoption.v1"],
+    "sessionPolicyContracts": ["coven.session-policy.v1"]
   },
   "daemon": {
     "pid": 12345,
@@ -172,9 +173,10 @@ durability.
 | `hub`             | boolean | Hub control-plane APIs (node registry, routing, queues) are available. |
 | `executorDispatch`| boolean | Hub-outbound executor poll/dispatch APIs are available.          |
 | `eventCursor`     | string  | Cursor type supported; `"sequence"` means `afterSeq` is stable.  |
-| `structuredErrors`| boolean | All errors use the `{ error: { code, message, details } }` shape.|
+| `structuredErrors`| boolean | Errors use the `{ error: { code, message, details } }` shape; session-policy admission decisions have their separately negotiated refusal shape. |
 | `sessionHandoff` | boolean | Durable generation-fenced session handoff routes are available. |
 | `sessionLaunchPolicy` | boolean | Owner-gated local IPC accepts the exact unattended Codex launch policy. Always `false` over TCP. |
+| `sessionPolicyContracts` | string array | Refusal-only admission contracts. Currently `["coven.session-policy.v1"]` over owner-local IPC and `[]` over TCP. Missing on older daemons; absence means unavailable. This is not a supported enforcement profile, identity proof, or grant. |
 | `afs` | boolean | The AFS route family is available. |
 | `afsMount` | string or `false` | Active mount backend, or `false` when mount-backed access is unavailable. |
 | `afsCommit` | boolean | AFS deltas can be materialized into a Git branch. |
@@ -207,7 +209,7 @@ flowchart TD
   ErrInvalid & ErrNotFound & ErrSession & ErrLive & ErrLaunch & ErrSend & ErrKill & ErrRuntime & ErrInternal -->|"{ error: { code, message, details } }"| Client[Client branches on code]
 ```
 
-All API errors use the following stable envelope. Clients must branch on `error.code`, not `error.message`:
+API errors use the following stable envelope. Clients must branch on `error.code`, not `error.message`. A valid restricted session-policy request instead receives the explicitly documented HTTP 409 admission-refusal decision below; it is never an accepted launch:
 
 ```json
 {
@@ -230,6 +232,7 @@ All API errors use the following stable envelope. Clients must branch on `error.
 | `not_found`            | 404         | Generic route not found.                         |
 | `invalid_request`      | 400 or 404  | Malformed request, unknown harness id, missing required field, or unsupported API version. |
 | `forbidden`            | 403         | The request asks TCP to exercise an owner-local-IPC-only capability such as `launchPolicy`. |
+| `session_policy_expired` | 409 | The restricted request's admission deadline is at or before server admission time. This is a structured error, not a correlated refusal or a running-process lease. |
 | `transport_forbidden`  | 403         | A proposal read or mutation was sent over optional loopback TCP instead of owner-gated local IPC. |
 | `ward_audit_capacity_exceeded` | 507 | The append-only Ward ledger or its WAL has no reserved durable capacity; no new mutation is admitted. |
 | `session_not_found`    | 404         | Session id does not exist.                       |
@@ -531,6 +534,12 @@ Unknown action ids return `400` and fail closed:
 
 ## `POST /api/v1/sessions`
 
+Any top-level `sessionPolicy` member, including `null`, returns
+`400 invalid_request` before familiar lookup, store creation, or launch. Restricted
+requests must use `POST /api/v1/sessions/restricted`; clients must not retry them
+on this legacy endpoint. Apart from this downgrade guard, legacy launch parsing,
+unknown-field handling, defaults, and behavior remain unchanged.
+
 Launches a daemon-managed harness session. `model` is optional; when present,
 the daemon forwards the provider-qualified id through the selected harness
 adapter's declared `strip_provider` or `preserve` transform. Clients that omit
@@ -578,6 +587,98 @@ this forbidden legacy location returns `request_adoption_invalid` at
 `requestAdoption`. See
 [Psyche execution binding contract (`v1`)](#psyche-execution-binding-contract-v1)
 and [Psyche request-adoption contract (`v1`)](#psyche-request-adoption-contract-v1).
+
+## Session-policy admission (`coven.session-policy.v1`)
+
+The canonical cross-client contract and deterministic JSON fixtures live at
+[`spec/coven-session-policy/v1/README.md`](../spec/coven-session-policy/v1/README.md).
+This initial version is **refusal-only**: no verified positive enforcement backend
+exists. No supported profile, accepted response, session ID, receipt, effective
+grant, or new harness adapter is supplied by this contract.
+
+Response bodies from these two session-policy endpoints are limited to **16,384
+UTF-8 bytes**, including whitespace, for discovery, refusal, and structured
+errors of any HTTP status. Consumers enforce the limit while reading, before
+JSON parsing, and reject oversized or invalid-UTF-8 bodies without truncating,
+assuming `not_started`, or retrying/falling back. The closed discovery/refusal
+shapes are intrinsically small; this does not alter the existing health response
+contract or turn its capability advertisement into an enforcement grant.
+
+`GET /api/v1/session-policy` is inert on both owner-local IPC and TCP: it does not
+open a store, resolve a familiar or path, inspect runtime state, or launch anything.
+It returns:
+
+```json
+{"contract":"coven.session-policy.v1","enforcement":"unavailable","supportedProfiles":[],"reason":"no_verified_enforcement_backend"}
+```
+
+`POST /api/v1/sessions/restricted` requires owner-local IPC independently of its
+body. TCP returns `403 forbidden` before the body is read. The owner-local boundary
+accepts at most 1,048,576 raw UTF-8 bytes and validates a closed typed JSON object:
+
+```json
+{
+  "contract": "coven.session-policy.v1",
+  "requestId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "invocationId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "profile": "workspace-readonly-no-network.v1",
+  "expiresAtUnixMs": 1800000000000,
+  "launch": {
+    "projectRoot": "/example/project",
+    "cwd": "/example/project",
+    "harness": "codex",
+    "familiarId": "sage",
+    "launchMode": "nonInteractive",
+    "prompt": "Review the supplied material.",
+    "title": "Wand review"
+  }
+}
+```
+
+All fields are required and nonnull; both objects reject unknown and duplicate
+members, arrays in place of objects, wrong types, invalid Unicode, and NUL-bearing
+strings. The IDs must be lowercase canonical hyphenated UUIDs. The only known
+profile is `workspace-readonly-no-network.v1`, which requests project-root-confined
+reads, no filesystem writes, no subsequent child processes, and no network,
+including provider traffic. Knowing the profile does not imply support.
+
+`expiresAtUnixMs` must be an integer in the JavaScript safe-integer range, strictly
+after server admission time and no more than 300,000 ms later. This is an admission
+deadline, not a process lease. Strings are bounded in UTF-8 bytes: paths 4,096 each,
+harness/familiar IDs 128 each, prompt 1,000,000, title 512. Only title may be empty;
+familiar IDs cannot have surrounding whitespace. `launchMode` is exactly
+`nonInteractive`. Bundled harness IDs are `codex`, `claude`, `coven-code`, and
+`copilot`; configured external adapters are not inspected. The closed schema
+intrinsically keeps valid JSON depth below 16. Paths remain opaque and are not
+resolved or granted at this refusal boundary.
+
+Unknown contract/profile/harness, malformed fields, excessive body/string size,
+and excessively future deadlines return structured `400 invalid_request`.
+Elapsed deadlines return structured `409 session_policy_expired`. Complete field
+validation precedes deadline evaluation. None of these paths accesses the store,
+familiar resolver, or runtime.
+
+A valid current request returns HTTP **409**, with exactly:
+
+```json
+{"contract":"coven.session-policy.v1","requestId":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","invocationId":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","requestDigest":"sha256:c61bac56f84d1f3fddd5e70da35a7e8906f9bd4bac769b5d4ad61769dae83fdb","decision":"rejected","code":"enforcement_unavailable","admission":"not_started"}
+```
+
+That digest binds the **exact transmitted bytes** of the compact shared
+`fixtures/request.json`, including its trailing LF, at the fixture's injected
+admission time `1799999700000`; it does not hash the indented example above.
+Whitespace or Unicode encoding changes intentionally change the digest. Freeze
+and send the same bytes once; do not canonicalize or reserialize them for binding.
+The echoed IDs and SHA-256 correlate a refusal, not a signature, authentication,
+grant, or proof that any other process is stopped.
+
+Only this well-formed correlated refusal asserts `not_started`. Clients must not
+derive that state from generic errors, timeouts, cancellation, malformed responses,
+or disconnection, and must not retry/fall back to legacy launch automatically.
+An accepted response is invalid under this version. Positive backend support and
+its accepted-response/lifecycle contract require separate review and a newly
+negotiated revision; existing Codex workspace-write flags and automation authority
+do not satisfy this profile.
 
 ## Session record shape (`v1`)
 
