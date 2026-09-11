@@ -111,7 +111,7 @@ struct AttemptTerminalVectorCase {
     expected: ExpectedAttemptTerminal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum AttemptLedgerState {
     Adopted,
@@ -276,6 +276,7 @@ fn evaluate_attempt_terminal_immutability(vector: &Value) -> Result<bool, &'stat
     }
 
     let mut case_ids = BTreeSet::new();
+    let mut terminal_states = BTreeSet::new();
     for case in &vectors.cases {
         if !valid_case_id(&case.case_id)
             || !case_ids.insert(&case.case_id)
@@ -284,6 +285,10 @@ fn evaluate_attempt_terminal_immutability(vector: &Value) -> Result<bool, &'stat
         {
             return Err("conformance vector is invalid");
         }
+        terminal_states.insert(case.first_state);
+    }
+    if terminal_states.len() != 5 {
+        return Err("conformance vector is invalid");
     }
 
     let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;

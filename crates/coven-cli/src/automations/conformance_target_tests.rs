@@ -114,6 +114,17 @@ fn attempt_terminal_immutability_suite_rejects_noop_updates() {
 }
 
 #[test]
+fn attempt_terminal_immutability_suite_requires_every_terminal_state() {
+    let mut vectors: Value = serde_json::from_str(ATTEMPT_TERMINAL_IMMUTABILITY_VECTORS).unwrap();
+    vectors["cases"].as_array_mut().unwrap().pop();
+
+    assert_eq!(
+        evaluate(&request_for("attempt-terminal-immutability", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
 fn definition_validation_suite_executes_the_checked_in_vectors() {
     let vectors: Value = serde_json::from_str(DEFINITION_VALIDATION_VECTORS).unwrap();
     let response = evaluate(&request_for("definition-validation", vectors)).unwrap();
