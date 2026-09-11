@@ -6074,7 +6074,7 @@ mod tests {
         let status = DaemonStatus {
             pid: 42,
             started_at: "2026-09-10T00:00:00Z".to_owned(),
-            socket: "coven-daemon-test.sock".to_owned(),
+            socket: windows_pipe_name(&coven_home)?,
             process_creation_time: None,
         };
 
