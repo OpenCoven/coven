@@ -13,6 +13,9 @@ const DEFINITION_VALIDATION_VECTORS: &str =
 const EVENT_REDUCER_DETERMINISM_VECTORS: &str = include_str!(
     "../../../../conformance/automations/runner/event-reducer-determinism.vectors.json"
 );
+const OCCURRENCE_FENCE_UNIQUENESS_VECTORS: &str = include_str!(
+    "../../../../conformance/automations/runner/occurrence-fence-uniqueness.vectors.json"
+);
 
 fn request_for(suite_id: &str, vector: Value) -> Value {
     json!({
@@ -56,10 +59,99 @@ fn capability_advertises_the_native_structural_suites() {
                     CAPABILITY_NEGOTIATION_SUITE,
                     "definition-validation",
                     "event-reducer-determinism",
+                    "occurrence-fence-uniqueness",
                     RUN_TERMINAL_MONOTONICITY_SUITE
                 ]
             }]
         })
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_executes_the_checked_in_vectors() {
+    let vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    let response = evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Passed);
+    assert_eq!(response.evidence.as_ref().unwrap()["executedCases"], 3);
+    assert_eq!(response.evidence.as_ref().unwrap()["passedCases"], 3);
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_fails_closed_on_an_expectation_mismatch() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["secondCommitted"] = json!(true);
+
+    let response = evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_requires_all_scenarios() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"].as_array_mut().unwrap().pop();
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_rejects_duplicate_case_ids() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][1]["caseId"] = vectors["cases"][0]["caseId"].clone();
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_rejects_reused_occurrence_ids() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][1]["first"]["occurrenceId"] =
+        vectors["cases"][0]["first"]["occurrenceId"].clone();
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_rejects_mismatched_scenarios() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["second"]["scheduledFor"] = json!("2026-08-31T09:00:00.000Z");
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
+    );
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_checks_first_row_preservation() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["expected"]["firstPreserved"] = json!(false);
+
+    let response = evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap();
+
+    assert_eq!(response.status, TargetSuiteStatus::Failed);
+    assert_eq!(response.evidence, None);
+}
+
+#[test]
+fn occurrence_fence_uniqueness_suite_rejects_noncanonical_timestamps() {
+    let mut vectors: Value = serde_json::from_str(OCCURRENCE_FENCE_UNIQUENESS_VECTORS).unwrap();
+    vectors["cases"][0]["first"]["scheduledFor"] = json!("2026-08-30T09:00:00Z");
+
+    assert_eq!(
+        evaluate(&request_for("occurrence-fence-uniqueness", vectors)).unwrap_err(),
+        "conformance vector is invalid"
     );
 }
 
