@@ -2041,8 +2041,58 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn status_file_reader_allows_an_atomic_status_replacement() {
+        // The protected producer supplies the same staging boundary used by the
+        // CLI. The low-level writer does not read CLI configuration itself.
+        let staging =
+            std::env::var_os("COVEN_WINDOWS_STATUS_STAGING_DIR").map(std::path::PathBuf::from);
+        if let Some(path) = &staging {
+            assert!(path.is_absolute(), "status staging must be absolute");
+            assert!(path.is_dir(), "status staging must exist");
+        }
+        assert_status_replacement_sharing(staging.as_deref());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn status_file_reader_allows_explicit_staging_replacement() {
+        let staging = StatusSharingHome::new();
+        assert_status_replacement_sharing(Some(staging.path()));
+    }
+
+    #[cfg(windows)]
+    struct StatusSharingHome(std::path::PathBuf);
+
+    #[cfg(windows)]
+    impl StatusSharingHome {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                ".coven-status-sharing-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).expect("create status replacement home");
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for StatusSharingHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_status_replacement_sharing(staging: Option<&std::path::Path>) {
         use std::{
-            ffi::OsStr,
             os::windows::{
                 ffi::OsStrExt,
                 io::{FromRawHandle, OwnedHandle},
@@ -2053,62 +2103,128 @@ mod tests {
         };
         use windows_sys::Win32::{
             Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE},
-            Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING},
+            Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, OPEN_EXISTING,
+            },
         };
 
-        let home =
-            std::env::temp_dir().join(format!(".coven-client-status-share-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&home);
-        std::fs::create_dir(&home).expect("create status replacement home");
-        let status_path = home.join("daemon.json");
-        std::fs::write(&status_path, b"{\"pid\":1}").expect("write current status");
-        let status_path_wide: Vec<u16> = OsStr::new(&status_path)
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
-
-        let reader = unsafe {
-            CreateFileW(
-                status_path_wide.as_ptr(),
-                GENERIC_READ,
-                windows_status_file_share_mode(),
-                ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                ptr::null_mut(),
-            )
-        };
-        assert_ne!(reader, INVALID_HANDLE_VALUE, "open status reader");
-        // Keep the reader owned so failure paths also close the Windows handle.
-        let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
-        let home_path = home.clone();
-        let (result_tx, result_rx) = mpsc::channel();
-        let writer = std::thread::spawn(move || {
-            result_tx
-                .send(crate::write_owner_only_windows_daemon_status(
-                    &home_path,
-                    b"{\"pid\":2}",
-                ))
-                .expect("report status replacement");
-        });
-        // Replacement may complete while a delete-sharing reader is open. Preserve
-        // an early success or error instead of requiring a minimum writer duration.
-        let early_result = result_rx.recv_timeout(Duration::from_millis(20));
-        drop(reader);
-        let result = match early_result {
-            Ok(result) => Ok(result),
-            Err(mpsc::RecvTimeoutError::Timeout) => result_rx.recv_timeout(Duration::from_secs(2)),
-            Err(error) => Err(error),
-        };
-        let result = result.expect("status replacement result");
-        let joined = writer.join();
-        result.expect("replace status after reader closes");
-        joined.expect("status replacement thread");
         assert_eq!(
-            std::fs::read_to_string(&status_path).expect("read replaced status"),
-            "{\"pid\":2}\n"
+            windows_status_file_share_mode(),
+            windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ | FILE_SHARE_DELETE,
+            "status readers must retain the exact read/delete sharing contract"
         );
-        std::fs::remove_dir_all(home).expect("remove status replacement home");
+        let home = StatusSharingHome::new();
+        let status_path = home.path().join("daemon.json");
+        let status_path_wide: Vec<u16> = status_path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
+        let temporary_files = || {
+            let prefix = format!(".daemon-status-{}-", std::process::id());
+            std::fs::read_dir(staging.unwrap_or(home.path()))
+                .expect("read status staging")
+                .map(|entry| entry.expect("read status staging entry").file_name())
+                .filter(|name| name.to_string_lossy().starts_with(&prefix))
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        for allow_delete in [true, false] {
+            let before = temporary_files();
+            std::fs::write(&status_path, b"{\"pid\":1}").expect("write current status");
+            let share = if allow_delete {
+                windows_status_file_share_mode()
+            } else {
+                windows_status_file_share_mode() & !FILE_SHARE_DELETE
+            };
+            let reader = unsafe {
+                CreateFileW(
+                    status_path_wide.as_ptr(),
+                    GENERIC_READ,
+                    share,
+                    ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    ptr::null_mut(),
+                )
+            };
+            assert_ne!(reader, INVALID_HANDLE_VALUE, "open status reader");
+            let reader = unsafe { OwnedHandle::from_raw_handle(reader) };
+            if allow_delete {
+                let home_path = home.path().to_owned();
+                let staging_path = staging.map(std::path::Path::to_owned);
+                let (result_tx, result_rx) = mpsc::channel();
+                let writer = std::thread::spawn(move || {
+                    let result = match staging_path {
+                        Some(staging) => {
+                            crate::write_owner_only_windows_daemon_status_with_staging(
+                                &home_path,
+                                &staging,
+                                b"{\"pid\":2}",
+                            )
+                        }
+                        None => crate::write_owner_only_windows_daemon_status(
+                            &home_path,
+                            b"{\"pid\":2}",
+                        ),
+                    };
+                    result_tx.send(result).expect("report status replacement");
+                });
+                // Native CI deferred MoveFileExW replacement while this reader was
+                // open. Preserve the original bounded close-and-success contract:
+                // otherwise release the reader and require bounded completion.
+                let early_result = result_rx.recv_timeout(Duration::from_millis(20));
+                drop(reader);
+                let received = match early_result {
+                    Ok(result) => Ok(result),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        result_rx.recv_timeout(Duration::from_secs(2))
+                    }
+                    Err(error) => Err(error),
+                };
+                if let Err(panic) = writer.join() {
+                    std::panic::resume_unwind(panic);
+                }
+                let result = received.expect("status replacement result");
+                result.expect("replace status after reader closes");
+                crate::status::tests::assert_status_file_is_owner_only(&status_path);
+                assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":2}\n");
+            } else {
+                // Hold the non-delete-sharing reader for the writer's complete
+                // replacement deadline so the failure cannot be hidden by close.
+                let result = match staging {
+                    Some(staging) => crate::write_owner_only_windows_daemon_status_with_staging(
+                        home.path(),
+                        staging,
+                        b"{\"pid\":2}",
+                    ),
+                    None => {
+                        crate::write_owner_only_windows_daemon_status(home.path(), b"{\"pid\":2}")
+                    }
+                };
+                let error =
+                    result.expect_err("reader without delete sharing must prevent replacement");
+                assert!(matches!(
+                    error,
+                    crate::ClientError::Io {
+                        operation:
+                            "failed to write owner-only Windows daemon status: replace-status-file",
+                        ..
+                    }
+                ));
+                assert_eq!(std::fs::read(&status_path).unwrap(), b"{\"pid\":1}");
+                drop(reader);
+            }
+            assert_eq!(
+                temporary_files(),
+                before,
+                "writer must clean its temporary files"
+            );
+            assert_eq!(
+                std::fs::read_dir(home.path()).unwrap().count(),
+                1,
+                "only the destination status should remain"
+            );
+        }
     }
 }
 
