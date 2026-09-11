@@ -125,6 +125,7 @@ The checked-in
 [`capability-negotiation.vectors.json`](capability-negotiation.vectors.json),
 [`definition-validation.vectors.json`](definition-validation.vectors.json),
 [`event-reducer-determinism.vectors.json`](event-reducer-determinism.vectors.json),
+[`occurrence-fence-uniqueness.vectors.json`](occurrence-fence-uniqueness.vectors.json),
 and
 [`run-terminal-monotonicity.vectors.json`](run-terminal-monotonicity.vectors.json)
 files contain the current nonempty vector sets.
@@ -146,6 +147,7 @@ The runner invokes the target directly without a shell.
         "capability-negotiation",
         "definition-validation",
         "event-reducer-determinism",
+        "occurrence-fence-uniqueness",
         "run-terminal-monotonicity"
       ]
     }
@@ -159,7 +161,7 @@ For each advertised suite, the runner invokes
 expects one `coven.automations.conformance-suite-result.v1` object on standard
 output.
 
-The native Coven target currently implements five structural suites.
+The native Coven target currently implements six structural suites.
 `attempt-terminal-immutability` executes every terminal attempt state against
 the production SQLite ledger and proves that later updates and deletion are
 refused. `capability-negotiation` executes the checked-in cases against Rust's
@@ -170,6 +172,10 @@ normalized JCS digest matches and rejecting a tampered definition.
 `event-reducer-determinism` replays a portable event stream through the native
 Rust reducer both canonically and with an exact duplicate delivery, requiring
 the same normalized final state and expected digest.
+`occurrence-fence-uniqueness` executes a portable three-case matrix against the
+production SQLite occurrence schema, proving that one automation cannot claim
+the same scheduled slot twice while different automations may share a slot and
+one automation may claim distinct slots.
 `run-terminal-monotonicity` executes the checked-in settlement and replay cases
 against the real Rust run ledger in an isolated in-memory store, proving that a
 later terminal observation cannot rewrite the first committed terminal state.

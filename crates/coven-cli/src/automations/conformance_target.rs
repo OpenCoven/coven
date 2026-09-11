@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -8,6 +8,7 @@ use sha2::{Digest, Sha256};
 
 use super::capability_negotiation::{negotiate_definition, DefinitionNegotiation};
 use super::contract::events::EventReducer;
+use super::contract::types::{AutomationId, OccurrenceId};
 use super::contract::{canonicalize, sha256_hex, AutomationDefinition, EventEnvelope};
 use super::runs::{
     record_run_finish, record_run_start, RunFinish, RunStart, AUTOMATION_ATTEMPTS_SCHEMA_SQL,
@@ -24,6 +25,8 @@ const DEFINITION_VALIDATION_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.definition-validation-vectors.v1";
 const EVENT_REDUCER_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.event-reducer-determinism-vectors.v1";
+const OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION: &str =
+    "coven.automations.occurrence-fence-uniqueness-vectors.v1";
 const RUN_TERMINAL_VECTOR_SCHEMA_VERSION: &str =
     "coven.automations.run-terminal-monotonicity-vectors.v1";
 const STRUCTURAL_PROFILE: &str = "structural";
@@ -33,6 +36,7 @@ pub const CAPABILITY_NEGOTIATION_SUITE: &str = "capability-negotiation";
 pub const ATTEMPT_TERMINAL_IMMUTABILITY_SUITE: &str = "attempt-terminal-immutability";
 pub const DEFINITION_VALIDATION_SUITE: &str = "definition-validation";
 pub const EVENT_REDUCER_DETERMINISM_SUITE: &str = "event-reducer-determinism";
+pub const OCCURRENCE_FENCE_UNIQUENESS_SUITE: &str = "occurrence-fence-uniqueness";
 pub const RUN_TERMINAL_MONOTONICITY_SUITE: &str = "run-terminal-monotonicity";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -203,6 +207,47 @@ struct EventReducerVectorCase {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OccurrenceFenceVectorSet {
+    schema_version: String,
+    cases: Vec<OccurrenceFenceVectorCase>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OccurrenceFenceVectorCase {
+    case_id: String,
+    scenario: OccurrenceFenceScenario,
+    first: OccurrenceFenceInput,
+    second: OccurrenceFenceInput,
+    expected: ExpectedOccurrenceFence,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OccurrenceFenceScenario {
+    DuplicateSlot,
+    DifferentAutomation,
+    DifferentSlot,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OccurrenceFenceInput {
+    occurrence_id: String,
+    automation_id: String,
+    scheduled_for: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedOccurrenceFence {
+    first_preserved: bool,
+    second_committed: bool,
+    row_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunTerminalVectorSet {
     schema_version: String,
     cases: Vec<RunTerminalVectorCase>,
@@ -256,6 +301,7 @@ pub fn capability() -> TargetCapability {
                 CAPABILITY_NEGOTIATION_SUITE,
                 DEFINITION_VALIDATION_SUITE,
                 EVENT_REDUCER_DETERMINISM_SUITE,
+                OCCURRENCE_FENCE_UNIQUENESS_SUITE,
                 RUN_TERMINAL_MONOTONICITY_SUITE,
             ],
         }],
@@ -281,6 +327,7 @@ pub fn evaluate(request: &Value) -> Result<TargetSuiteResult, &'static str> {
         CAPABILITY_NEGOTIATION_SUITE => evaluate_capability_negotiation(&request.vector)?,
         DEFINITION_VALIDATION_SUITE => evaluate_definition_validation(&request.vector)?,
         EVENT_REDUCER_DETERMINISM_SUITE => evaluate_event_reducer_determinism(&request.vector)?,
+        OCCURRENCE_FENCE_UNIQUENESS_SUITE => evaluate_occurrence_fence_uniqueness(&request.vector)?,
         RUN_TERMINAL_MONOTONICITY_SUITE => evaluate_run_terminal_monotonicity(&request.vector)?,
         _ => return Err("conformance suite is unsupported"),
     };
@@ -439,6 +486,109 @@ fn event_reducer_case_matches(case: &EventReducerVectorCase) -> Result<bool, &'s
         canonicalize(canonical.state()).map_err(|_| "conformance suite execution failed")?;
     let observed_digest = format!("sha256:{}", sha256_hex(&canonical_state));
     Ok(canonical.state() == duplicated.state() && observed_digest == case.expected_state_digest)
+}
+
+fn evaluate_occurrence_fence_uniqueness(vector: &Value) -> Result<bool, &'static str> {
+    let vectors: OccurrenceFenceVectorSet =
+        serde_json::from_value(vector.clone()).map_err(|_| "conformance vector is invalid")?;
+    if vectors.schema_version != OCCURRENCE_FENCE_VECTOR_SCHEMA_VERSION
+        || vectors.cases.is_empty()
+        || vectors.cases.len() > MAX_CASES
+    {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut case_ids = BTreeSet::new();
+    let mut occurrence_ids = BTreeSet::new();
+    let mut scenarios = BTreeSet::new();
+    for case in &vectors.cases {
+        if !valid_case_id(&case.case_id)
+            || !case_ids.insert(&case.case_id)
+            || !scenarios.insert(case.scenario)
+            || !valid_occurrence_fence_input(&case.first)
+            || !valid_occurrence_fence_input(&case.second)
+            || !occurrence_ids.insert(&case.first.occurrence_id)
+            || !occurrence_ids.insert(&case.second.occurrence_id)
+            || !occurrence_fence_scenario_matches(case)
+            || !(1..=2).contains(&case.expected.row_count)
+        {
+            return Err("conformance vector is invalid");
+        }
+    }
+    if scenarios.len() != 3 {
+        return Err("conformance vector is invalid");
+    }
+
+    let mut all_passed = true;
+    for case in &vectors.cases {
+        all_passed &= occurrence_fence_case_matches(case)?;
+    }
+    Ok(all_passed)
+}
+
+fn valid_occurrence_fence_input(input: &OccurrenceFenceInput) -> bool {
+    OccurrenceId::new(input.occurrence_id.clone()).is_ok()
+        && AutomationId::new(input.automation_id.clone()).is_ok()
+        && DateTime::parse_from_rfc3339(&input.scheduled_for).is_ok_and(|timestamp| {
+            timestamp
+                .with_timezone(&Utc)
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+                == input.scheduled_for
+        })
+}
+
+fn occurrence_fence_scenario_matches(case: &OccurrenceFenceVectorCase) -> bool {
+    let same_automation = case.first.automation_id == case.second.automation_id;
+    let same_slot = case.first.scheduled_for == case.second.scheduled_for;
+    match case.scenario {
+        OccurrenceFenceScenario::DuplicateSlot => same_automation && same_slot,
+        OccurrenceFenceScenario::DifferentAutomation => !same_automation && same_slot,
+        OccurrenceFenceScenario::DifferentSlot => same_automation && !same_slot,
+    }
+}
+
+fn occurrence_fence_case_matches(case: &OccurrenceFenceVectorCase) -> Result<bool, &'static str> {
+    let conn = Connection::open_in_memory().map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::store::AUTOMATION_DEFINITIONS_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    conn.execute_batch(super::occurrences::AUTOMATION_OCCURRENCES_SCHEMA_SQL)
+        .map_err(|_| "conformance suite execution failed")?;
+    let recorded_at = "1970-01-01T00:00:00.000Z";
+    let insert = |input: &OccurrenceFenceInput| {
+        conn.execute(
+            "INSERT INTO automation_occurrences
+                (id, automation_id, scheduled_for, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)",
+            params![
+                input.occurrence_id,
+                input.automation_id,
+                input.scheduled_for,
+                recorded_at
+            ],
+        )
+    };
+
+    insert(&case.first).map_err(|_| "conformance suite execution failed")?;
+    let second_committed = insert(&case.second).is_ok();
+    let row_count = conn
+        .query_row("SELECT COUNT(*) FROM automation_occurrences", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(|_| "conformance suite execution failed")
+        .and_then(|count| {
+            usize::try_from(count).map_err(|_| "conformance suite execution failed")
+        })?;
+    let first_preserved: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM automation_occurrences WHERE id = ?1)",
+            [&case.first.occurrence_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| "conformance suite execution failed")?;
+
+    Ok(first_preserved == case.expected.first_preserved
+        && second_committed == case.expected.second_committed
+        && row_count == case.expected.row_count)
 }
 
 fn evaluate_run_terminal_monotonicity(vector: &Value) -> Result<bool, &'static str> {
