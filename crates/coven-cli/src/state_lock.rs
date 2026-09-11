@@ -194,18 +194,43 @@ mod tests {
     }
 
     #[test]
-    fn shared_state_lock_uses_supervised_home_validation() {
-        let source = include_str!("state_lock.rs");
-        let acquire_shared = source
-            .split("pub(crate) fn acquire_shared")
-            .nth(1)
-            .and_then(|source| source.split("#[cfg(test)]").next())
-            .expect("acquire_shared source");
-
-        assert!(acquire_shared.contains(
-            "crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?"
-        ));
-        assert!(!acquire_shared.contains("crate::daemon::ensure_private_coven_home(coven_home)?"));
+    fn lock_initializers_use_supervised_home_validation() {
+        for (label, source, start, end) in [
+            (
+                "shared state",
+                include_str!("state_lock.rs"),
+                "pub(crate) fn acquire_shared",
+                "#[cfg(test)]",
+            ),
+            (
+                "adoption",
+                include_str!("adoption_gate.rs"),
+                "    pub fn acquire(",
+                "\n}\n\nfn lock_path",
+            ),
+            (
+                "automations leadership",
+                include_str!("automations/leadership.rs"),
+                "    pub(crate) fn acquire(",
+                "\n    pub(crate) fn fence",
+            ),
+        ] {
+            let source = source
+                .split(start)
+                .nth(1)
+                .and_then(|source| source.split(end).next())
+                .unwrap_or_else(|| panic!("{label} lock source"));
+            assert!(
+                source.contains(
+                    "crate::daemon::ensure_windows_supervised_or_private_coven_home(coven_home)?"
+                ),
+                "{label} lock did not validate the supervised home"
+            );
+            assert!(
+                !source.contains("crate::daemon::ensure_private_coven_home(coven_home)?"),
+                "{label} lock directly hardened the supervised home"
+            );
+        }
     }
 
     #[cfg(unix)]
