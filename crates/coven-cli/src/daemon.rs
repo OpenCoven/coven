@@ -6067,6 +6067,7 @@ mod tests {
         std::fs::create_dir(&profile)?;
         std::fs::create_dir(&coven_home)?;
         std::fs::create_dir(&staging)?;
+        set_current_windows_owner(&profile)?;
         set_current_windows_owner(&coven_home)?;
         apply_supervised_windows_directory_security(root.path(), SUPERVISOR_SID, false)?;
         apply_supervised_windows_directory_security(&staging, SUPERVISOR_SID, true)?;
