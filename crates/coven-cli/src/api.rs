@@ -9658,6 +9658,16 @@ fn proposal_retention_expired(
     if bound_proposal_expiry_transition(coven_home, conn, document)?.is_some() {
         return Ok(true);
     }
+    match opened_window_rejection_proof(conn, document) {
+        Ok(Some(_)) => return Ok(false),
+        Ok(None) => {}
+        Err(error) if invalid_scheduled_submission_authority(&error) => {
+            // Let the receipt gate quarantine corrupt evidence without first
+            // replacing its original request with a new expiry decision.
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    }
     if document
         .scheduled()
         .is_some_and(|proposal| proposal.veto_deadline().is_some())
@@ -10219,9 +10229,13 @@ fn decide_threads_proposal_inner(
         audit_reservation.release_if_unneeded()?;
         return json_response(409, &json!({ "blocked": true, "why": "proposal-corrupt" }));
     }
+    let mut opened_window_rejection = None;
     if document.scheduled().is_some() {
-        match scheduled_submission_authority_for_document(coven_home, &conn, &document) {
-            Ok(_) => {}
+        match validate_scheduled_submission_document(coven_home, &conn, &document) {
+            Ok(ScheduledSubmissionValidation::Verified) => {}
+            Ok(ScheduledSubmissionValidation::RejectOpenedWindow(proof)) => {
+                opened_window_rejection = Some(proof);
+            }
             Err(error)
                 if error
                     .downcast_ref::<HistoricalDecisionReviewRequired>()
@@ -10414,6 +10428,56 @@ fn decide_threads_proposal_inner(
     if applying_state.is_some() {
         claim.preserve();
     }
+    // Revision/replacement cleanup must not discard an unauthenticated request
+    // and its bound reservation before decision-origin evidence is checked.
+    let decision_origin = match trusted_decision_approver(
+        &conn,
+        proposal_id,
+        &reservation_decision,
+        durable_request.as_ref(),
+        applying_state.is_some(),
+    ) {
+        Ok(origin) => origin,
+        Err(error)
+            if error
+                .downcast_ref::<HistoricalDecisionReviewRequired>()
+                .is_some() =>
+        {
+            if applying_state.is_none() {
+                claim.restore_pending(&document)?;
+                audit_reservation.finish()?;
+            } else {
+                claim.preserve();
+                audit_reservation.preserve()?;
+            }
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-decision-review-required",
+                    "proposalId": proposal_id,
+                    "terminal": false,
+                    "error": error.to_string(),
+                }),
+            );
+        }
+        Err(error) if invalid_proposal_decision_origin(&error) => {
+            return quarantine_proposal_recovery_claim(
+                coven_home,
+                &mut claim,
+                audit_reservation,
+                proposal_id,
+                "decision-origin",
+                "proposal-decision-origin-invalid",
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            claim.preserve();
+            audit_reservation.preserve()?;
+            return Err(error);
+        }
+    };
     let phase5_shape = document.scheduled().is_some();
     let actual_revision = document.revision()?;
     if let Some(request) = durable_request.as_ref() {
@@ -10499,54 +10563,41 @@ fn decide_threads_proposal_inner(
             }
         }
     }
-    let decision_origin = match trusted_decision_approver(
-        &conn,
-        proposal_id,
-        &reservation_decision,
-        durable_request.as_ref(),
-        applying_state.is_some(),
-    ) {
-        Ok(origin) => origin,
-        Err(error)
-            if error
-                .downcast_ref::<HistoricalDecisionReviewRequired>()
-                .is_some() =>
-        {
-            if applying_state.is_none() {
-                claim.restore_pending(&document)?;
-                audit_reservation.finish()?;
-            } else {
-                claim.preserve();
-                audit_reservation.preserve()?;
-            }
-            return json_response(
-                409,
-                &json!({
-                    "blocked": true,
-                    "why": "proposal-decision-review-required",
-                    "proposalId": proposal_id,
-                    "terminal": false,
-                    "error": error.to_string(),
-                }),
-            );
-        }
-        Err(error) if invalid_proposal_decision_origin(&error) => {
-            return quarantine_proposal_recovery_claim(
-                coven_home,
-                &mut claim,
-                audit_reservation,
-                proposal_id,
-                "decision-origin",
-                "proposal-decision-origin-invalid",
-                &error.to_string(),
-            );
-        }
-        Err(error) => {
-            claim.preserve();
-            audit_reservation.preserve()?;
-            return Err(error);
-        }
-    };
+    // The pinned audit contract requires a nonempty approver on human paths.
+    // This reserved sentinel records absence of historical attribution, not a
+    // human or the proposal writer; approval detail also marks it as unknown.
+    let historical_unknown_actor = matches!(
+        decision_origin,
+        TrustedProposalDecisionOrigin::Legacy | TrustedProposalDecisionOrigin::HistoricalRequest
+    )
+    .then(|| coven_threads_core::WriterId::new(HISTORICAL_UNKNOWN_DECISION_ACTOR));
+    let decision_approver = decision_origin
+        .approver()
+        .or(historical_unknown_actor.as_ref());
+    if let Some(proof) = opened_window_rejection {
+        claim.preserve();
+        append_open_window_revalidation_failure(
+            &conn,
+            pending,
+            &proof.opened,
+            &proof.approval_path_label,
+            decision_approver,
+            note.as_deref(),
+            decision_now,
+        )?;
+        audit_reservation.finish()?;
+        maybe_fail_proposal_decision(ProposalDecisionFailpoint::AuditBeforeCleanup, proposal_id)?;
+        claim.consume()?;
+        return json_response(
+            409,
+            &json!({
+                "blocked": true,
+                "why": "proposal-window-state-inconsistent",
+                "proposalId": proposal_id,
+                "terminal": true,
+            }),
+        );
+    }
     if decision == "approve"
         && matches!(&decision_origin, TrustedProposalDecisionOrigin::Automatic)
         && scheduled.is_none_or(|proposal| {
@@ -10567,17 +10618,6 @@ fn decide_threads_proposal_inner(
             "automatic approval cannot satisfy a human-only approval path",
         );
     }
-    // The pinned audit contract requires a nonempty approver on human paths.
-    // This reserved sentinel records absence of historical attribution, not a
-    // human or the proposal writer; approval detail also marks it as unknown.
-    let historical_unknown_actor = matches!(
-        decision_origin,
-        TrustedProposalDecisionOrigin::Legacy | TrustedProposalDecisionOrigin::HistoricalRequest
-    )
-    .then(|| coven_threads_core::WriterId::new(HISTORICAL_UNKNOWN_DECISION_ACTOR));
-    let decision_approver = decision_origin
-        .approver()
-        .or(historical_unknown_actor.as_ref());
     let verify_apply_intent_actor = decision_origin.verify_apply_intent_actor();
     if decision == "approve" {
         if let Err(error) = ward::validate_staged_edit_budget(&pending.edits) {
@@ -12582,9 +12622,13 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             }
         };
         let conn = store::open_store(&store_path(coven_home))?;
+        let mut rejection_only = false;
         if document.scheduled().is_some() {
-            match scheduled_submission_authority_for_document(coven_home, &conn, &document) {
-                Ok(_) => {}
+            match validate_scheduled_submission_document(coven_home, &conn, &document) {
+                Ok(ScheduledSubmissionValidation::Verified) => {}
+                Ok(ScheduledSubmissionValidation::RejectOpenedWindow(_)) => {
+                    rejection_only = true;
+                }
                 Err(error)
                     if error
                         .downcast_ref::<HistoricalDecisionReviewRequired>()
@@ -12615,7 +12659,8 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
         }
         let mut opened_window =
             proposal_window_opened(&conn, &document.pending().id.0.to_string())?;
-        let retention_expired = proposal_retention_expired(coven_home, &conn, &document, now)?;
+        let retention_expired =
+            !rejection_only && proposal_retention_expired(coven_home, &conn, &document, now)?;
         drop(conn);
         if document
             .scheduled()
@@ -12646,10 +12691,11 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
             }
             opened_window = true;
         }
-        let mut revalidation_required = opened_window
-            && document
-                .scheduled()
-                .is_none_or(|proposal| proposal.veto_deadline().is_none());
+        let mut revalidation_required = rejection_only
+            || (opened_window
+                && document
+                    .scheduled()
+                    .is_none_or(|proposal| proposal.veto_deadline().is_none()));
         if revalidation_required {
             crate::daemon::append_daemon_recovery_log(
                 coven_home,
@@ -13023,6 +13069,252 @@ fn scheduled_submission_authority_for_document(
         document.identity_evidence,
         Some((coven_home, document)),
     )
+}
+
+enum ScheduledSubmissionValidation {
+    Verified,
+    RejectOpenedWindow(OpenedWindowRejectionProof),
+}
+
+struct OpenedWindowRejectionProof {
+    opened: ProposalWindowContext,
+    approval_path_label: String,
+}
+
+struct RecordedOpenedWindow {
+    familiar_id: String,
+    weave_hash: Vec<u8>,
+    detail: String,
+    files_touched: String,
+    channel: String,
+    submitted_at: String,
+    decided_at: String,
+    decision: String,
+    approver: Option<String>,
+    thread_id: Option<String>,
+}
+
+fn validate_scheduled_submission_document(
+    coven_home: &Path,
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<ScheduledSubmissionValidation> {
+    match scheduled_submission_authority_for_document(coven_home, conn, document) {
+        Ok(_) => Ok(ScheduledSubmissionValidation::Verified),
+        Err(error) if invalid_scheduled_submission_authority(&error) => {
+            match opened_window_rejection_proof(conn, document)? {
+                Some(proof) => Ok(ScheduledSubmissionValidation::RejectOpenedWindow(proof)),
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn opened_window_evidence_column_error(error: rusqlite::Error) -> anyhow::Error {
+    match error {
+        error @ (rusqlite::Error::InvalidColumnType(..)
+        | rusqlite::Error::FromSqlConversionFailure(..)
+        | rusqlite::Error::IntegralValueOutOfRange(..)
+        | rusqlite::Error::QueryReturnedNoRows) => invalid_submission_authority(format!(
+            "original opened-window evidence is invalid: {error}"
+        )),
+        error => anyhow::Error::new(error).context("loading original opened-window evidence"),
+    }
+}
+
+fn opened_window_rejection_proof(
+    conn: &rusqlite::Connection,
+    document: &ProposalEnvelopeDocument,
+) -> Result<Option<OpenedWindowRejectionProof>> {
+    let Some(scheduled) = document.scheduled() else {
+        return Ok(None);
+    };
+    if document.review_kind.is_some()
+        || document.decision_state.is_some()
+        || scheduled.veto_deadline().is_some()
+        || !matches!(
+            scheduled.classification().approval_path,
+            coven_threads_core::ApprovalPath::HumanApproval
+                | coven_threads_core::ApprovalPath::HumanApprovalWithRationale
+        )
+    {
+        return Ok(None);
+    }
+    let id = document.pending().id.to_string();
+    let (openings, has_intent): (i64, bool) = conn.query_row(
+        "SELECT COUNT(*), EXISTS (
+             SELECT 1 FROM ward_audit WHERE proposal_id = ?1
+             AND decision = 'proposal-apply-intent'
+         ) FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+        [&id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if openings != 1 || has_intent {
+        return Ok(None);
+    }
+    let (detail, receipt_thread, receipt_decision, receipt_approver, receipt_decided_at): (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT detail, thread_id, decision, approver, decided_at FROM ward_audit
+         WHERE proposal_id = ?1 AND event_type = 'proposal_submitted' LIMIT 1",
+            [&id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(opened_window_evidence_column_error)?;
+    let staged_at = document
+        .pending()
+        .staged_at
+        .format(&time::format_description::well_known::Rfc3339)?;
+    let thread_id = document.pending().thread_id.0.to_string();
+    if receipt_thread.as_deref() != Some(thread_id.as_str())
+        || receipt_decision != "staged:scheduled"
+        || receipt_approver.is_some()
+        || receipt_decided_at != staged_at
+    {
+        return Err(invalid_submission_authority(
+            "original submission provenance does not match the scheduled proposal",
+        ));
+    }
+    let receipt: Value = serde_json::from_str(&detail).map_err(|error| {
+        invalid_submission_authority(format!("original submission detail is invalid: {error}"))
+    })?;
+    let classification = receipt.get("classification").ok_or_else(|| {
+        invalid_submission_authority("original submission classification is missing")
+    })?;
+    let classification: coven_threads_core::ProposalClassification =
+        serde_json::from_value(classification.clone()).map_err(|error| {
+            invalid_submission_authority(format!("original classification is invalid: {error}"))
+        })?;
+    // Reconstruct only to prove the original receipt. This value never enters
+    // execution or replaces the contradictory on-disk proposal.
+    let original = crate::proposal_scheduler::ScheduledProposal::try_new(
+        scheduled.pending().clone(),
+        classification,
+        scheduled.materialized_diff().clone(),
+    )
+    .map_err(|error| {
+        invalid_submission_authority(format!(
+            "original scheduled authority is invalid: {error:#}"
+        ))
+    })?;
+    let (Some(deadline), Some(earliest_close)) =
+        (original.veto_deadline(), original.earliest_close())
+    else {
+        return Ok(None);
+    };
+    let mut without_path_change = scheduled.classification().clone();
+    without_path_change.approval_path = original.classification().approval_path.clone();
+    if serde_json::to_value(&without_path_change)?
+        != serde_json::to_value(original.classification())?
+    {
+        return Ok(None);
+    }
+    let (familiar_id, weave_hash) =
+        match scheduled_submission_authority(conn, &original, document.identity_evidence) {
+            Ok(authority) => authority,
+            Err(error)
+                if error
+                    .downcast_ref::<HistoricalDecisionReviewRequired>()
+                    .is_some() =>
+            {
+                return Err(invalid_submission_authority(
+                    "original opened-window receipt lacks a bound current identity record",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+    let opened = conn
+        .query_row(
+            "SELECT familiar_id, ward_hash, detail, files_touched, channel, submitted_at,
+                    decided_at, decision, approver, thread_id
+             FROM ward_audit WHERE proposal_id = ?1 AND event_type = 'proposal_window_opened'",
+            [&id],
+            |row| {
+                Ok(RecordedOpenedWindow {
+                    familiar_id: row.get(0)?,
+                    weave_hash: row.get(1)?,
+                    detail: row.get(2)?,
+                    files_touched: row.get(3)?,
+                    channel: row.get(4)?,
+                    submitted_at: row.get(5)?,
+                    decided_at: row.get(6)?,
+                    decision: row.get(7)?,
+                    approver: row.get(8)?,
+                    thread_id: row.get(9)?,
+                })
+            },
+        )
+        .map_err(opened_window_evidence_column_error)?;
+    let targets: Vec<String> = serde_json::from_str(&opened.files_touched).map_err(|error| {
+        invalid_submission_authority(format!("original window targets are invalid: {error}"))
+    })?;
+    let expected_targets: Vec<&str> = original
+        .pending()
+        .edits
+        .iter()
+        .map(|edit| edit.surface.as_str())
+        .collect();
+    let format = time::format_description::well_known::Rfc3339;
+    let opened_at = time::OffsetDateTime::parse(&opened.decided_at, &format).map_err(|error| {
+        invalid_submission_authority(format!("original window time is invalid: {error}"))
+    })?;
+    let label = original.classification().approval_path.display_label();
+    let expected_detail = coven_threads_core::ProposalWindowAuditDetail {
+        approval_path_label: label.to_string(),
+        deadline,
+        earliest_close,
+        evidence_replay_hash_hex: original
+            .classification()
+            .evidence_replay_hash
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+        affected_regions: original
+            .classification()
+            .affected_regions
+            .iter()
+            .map(|region| region.as_str().to_string())
+            .collect(),
+    };
+    let detail: Value = serde_json::from_str(&opened.detail).map_err(|error| {
+        invalid_submission_authority(format!("original window detail is invalid: {error}"))
+    })?;
+    if opened.familiar_id != familiar_id
+        || opened.weave_hash != weave_hash
+        || targets != expected_targets
+        || opened.channel != format!("{:?}", original.pending().channel).to_lowercase()
+        || opened.submitted_at != staged_at
+        || opened_at < original.pending().staged_at
+        || opened.decision != "window-opened"
+        || opened.approver.is_some()
+        || opened.thread_id.is_some()
+        || detail != serde_json::to_value(expected_detail)?
+    {
+        return Err(invalid_submission_authority(
+            "original opened window does not match its complete submission authority",
+        ));
+    }
+    Ok(Some(OpenedWindowRejectionProof {
+        opened: ProposalWindowContext {
+            familiar_id,
+            weave_hash,
+        },
+        approval_path_label: label.to_string(),
+    }))
 }
 
 fn historical_submission_identity_is_bound(
@@ -38371,6 +38663,910 @@ tier = 0
             replacement.body
         );
         Ok(())
+    }
+
+    mod threads_opened_window_repair {
+        use super::*;
+
+        fn open_proposal(home: &Path) -> Result<(PathBuf, String)> {
+            seed_retired_ward_familiar(home, accepted_retired_ward())?;
+            migrate_retired_ward(home)?;
+            let response = post_edits(
+                home,
+                r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+            )?;
+            assert_eq!(response.status, 202, "{}", response.body);
+            let body: Value = serde_json::from_str(&response.body)?;
+            let path = PathBuf::from(body["pendingPath"].as_str().context("pending path")?);
+            let id = body["proposalId"]
+                .as_str()
+                .context("proposal id")?
+                .to_string();
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            Ok((path, id))
+        }
+
+        fn erase_window(path: &Path) -> Result<()> {
+            let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            value["classification"]["approval_path"] = json!({"kind": "human_approval"});
+            value["lifecycle"] = json!({"state": "awaiting_human_approval"});
+            value["veto_deadline"] = Value::Null;
+            value["earliest_close"] = Value::Null;
+            let raw = serde_json::to_vec_pretty(&value)?;
+            ProposalEnvelopeDocument::parse_preflighted(&raw)?;
+            crate::proposal_store::replace_existing(path, &raw)
+        }
+
+        fn assert_closed(home: &Path, id: &str, approver: Option<&str>) -> Result<()> {
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                b"before tools\n"
+            );
+            let conn = store::open_store(&store_path(home))?;
+            let (opened, terminals, writes): (i64, i64, i64) = conn.query_row(
+                "SELECT SUM(event_type = 'proposal_window_opened'),
+                        SUM(event_type IN ('proposal_approved', 'proposal_rejected', 'proposal_vetoed')),
+                        SUM(event_type IN ('proposal_approved', 'apply_audit')
+                            OR decision = 'proposal-apply-intent')
+                 FROM ward_audit WHERE proposal_id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!((opened, terminals, writes), (1, 1, 0));
+            let (decision, actor, detail): (String, Option<String>, String) = conn.query_row(
+                "SELECT decision, approver, detail FROM ward_audit
+                 WHERE proposal_id = ?1 AND event_type = 'proposal_rejected'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(decision, "revalidation_failed");
+            assert_eq!(actor.as_deref(), approver);
+            let detail: coven_threads_core::ProposalWindowCloseAuditDetail =
+                serde_json::from_str(&detail)?;
+            assert_eq!(
+                detail.reason,
+                coven_threads_core::WindowCloseReason::RevalidationFailed
+            );
+            assert_eq!(detail.replay_hash_matched, Some(false));
+            Ok(())
+        }
+
+        #[test]
+        fn decision_closes_only_the_original_window_even_past_retention() -> Result<()> {
+            for days in [0, 31] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let staged_at = time::OffsetDateTime::now_utc();
+                let (path, id) =
+                    crate::threads_clock::with_test_time(home, staged_at, || open_proposal(home))?;
+                erase_window(&path)?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    staged_at + time::Duration::days(days),
+                    || -> Result<()> {
+                        let body = scheduled_decision_body(home, &id, None)?;
+                        let response = decide_threads_proposal(home, &id, "approve", Some(&body))?;
+                        assert_eq!(response.status, 409, "{}", response.body);
+                        let body: Value = serde_json::from_str(&response.body)?;
+                        assert_eq!(body["why"], "proposal-window-state-inconsistent");
+                        assert_eq!(body["terminal"], true);
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        let replay = decide_threads_proposal(home, &id, "approve", Some("{}"))?;
+                        assert_eq!(replay.status, 409, "{}", replay.body);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&replay.body)?["why"],
+                            "proposal-already-decided"
+                        );
+                        let replay = decide_threads_proposal(home, &id, "reject", Some("{}"))?;
+                        assert_eq!(replay.status, 200, "{}", replay.body);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&replay.body)?["idempotent"],
+                            true
+                        );
+                        Ok(())
+                    },
+                )?;
+                assert!(!path.exists());
+                assert_closed(home, &id, Some(OWNER_LOCAL_DECISION_ACTOR))?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_closes_without_inventing_human_or_expiry_authority() -> Result<()> {
+            for days in [0, 31] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let staged_at = time::OffsetDateTime::now_utc();
+                let (path, id) =
+                    crate::threads_clock::with_test_time(home, staged_at, || open_proposal(home))?;
+                erase_window(&path)?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    staged_at + time::Duration::days(days),
+                    || -> Result<()> {
+                        assert_eq!(process_due_threads_proposals(home)?, 1);
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        Ok(())
+                    },
+                )?;
+                assert!(!path.exists());
+                assert_closed(home, &id, None)?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn durable_automatic_rejection_recovers_without_human_attribution() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ClaimBeforeValidation,
+                id.clone(),
+            )));
+            assert!(decide_threads_proposal_automatic(home, &id, "reject", None).is_err());
+            let document = read_pending_proposal_document(&path)?;
+            let request = document
+                .decision_request
+                .context("durable automatic request")?;
+            assert_eq!(request.decision, "reject");
+            assert!(request.decision_actor.is_none());
+            assert!(!request.expired);
+            assert_eq!(process_due_threads_proposals(home)?, 1);
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert_closed(home, &id, None)
+        }
+
+        #[test]
+        fn capacity_and_post_audit_restart_keep_one_terminal() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            let original = std::fs::read(&path)?;
+            let conn = store::open_store(&store_path(home))?;
+            let limit: i64 = conn.query_row(
+                "SELECT limit_bytes FROM coven_ward_audit_capacity WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            conn.execute(
+                "UPDATE coven_ward_audit_capacity SET limit_bytes = used_bytes WHERE singleton = 1",
+                [],
+            )?;
+            drop(conn);
+            let body = scheduled_decision_body(home, &id, None)?;
+            let response = decide_threads_proposal(home, &id, "approve", Some(&body))?;
+            assert_eq!(response.status, 507, "{}", response.body);
+            assert_eq!(std::fs::read(&path)?, original);
+            let conn = store::open_store(&store_path(home))?;
+            assert!(proposal_terminal_event(&conn, &id)?.is_none());
+            conn.execute(
+                "UPDATE coven_ward_audit_capacity SET limit_bytes = ?1 WHERE singleton = 1",
+                [limit],
+            )?;
+            drop(conn);
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::AuditBeforeCleanup,
+                id.clone(),
+            )));
+            assert!(decide_threads_proposal(home, &id, "approve", Some(&body)).is_err());
+            assert_closed(home, &id, Some(OWNER_LOCAL_DECISION_ACTOR))?;
+            assert!(find_any_pending_decision_claim(home, &id).is_some());
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(find_any_pending_decision_claim(home, &id).is_none());
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert_closed(home, &id, Some(OWNER_LOCAL_DECISION_ACTOR))?;
+            let conn = store::open_store(&store_path(home))?;
+            let reservations: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM coven_ward_audit_reservations WHERE token LIKE ?1",
+                [format!("proposal:{id}:%")],
+                |row| row.get(0),
+            )?;
+            assert_eq!(reservations, 0);
+            Ok(())
+        }
+
+        fn audit_source(conn: &rusqlite::Connection, id: &str, event: &str) -> Result<Value> {
+            let mut value: Value = conn.query_row(
+                "SELECT familiar_id, ward_hash, detail, files_touched, channel,
+                        submitted_at, decided_at, decision, approver, thread_id
+                 FROM ward_audit WHERE proposal_id = ?1 AND event_type = ?2",
+                rusqlite::params![id, event],
+                |row| {
+                    Ok(json!({
+                        "familiar": row.get::<_, String>(0)?,
+                        "hash": row.get::<_, Vec<u8>>(1)?,
+                        "detail": row.get::<_, String>(2)?,
+                        "targets": row.get::<_, String>(3)?,
+                        "channel": row.get::<_, String>(4)?,
+                        "submitted_at": row.get::<_, String>(5)?,
+                        "decided_at": row.get::<_, String>(6)?,
+                        "decision": row.get::<_, String>(7)?,
+                        "approver": row.get::<_, Option<String>>(8)?,
+                        "thread_id": row.get::<_, Option<String>>(9)?,
+                    }))
+                },
+            )?;
+            value["detail"] =
+                serde_json::from_str(value["detail"].as_str().context("audit detail")?)?;
+            value["targets"] =
+                serde_json::from_str(value["targets"].as_str().context("audit targets")?)?;
+            Ok(value)
+        }
+
+        fn append_audit_copy(
+            conn: &rusqlite::Connection,
+            id: &str,
+            event: &str,
+            value: &Value,
+        ) -> Result<()> {
+            let hash: Vec<u8> = serde_json::from_value(value["hash"].clone())?;
+            conn.execute(
+                "INSERT INTO ward_audit (event_type, proposal_id, familiar_id, ward_hash,
+                 detail, files_touched, channel, submitted_at, decided_at, decision, approver, thread_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                rusqlite::params![
+                    event,
+                    id,
+                    value["familiar"].as_str().context("familiar")?,
+                    hash,
+                    serde_json::to_string(&value["detail"])?,
+                    serde_json::to_string(&value["targets"])?,
+                    value["channel"].as_str().context("channel")?,
+                    value["submitted_at"].as_str().context("submitted time")?,
+                    value["decided_at"].as_str().context("decided time")?,
+                    value["decision"].as_str().context("decision")?,
+                    value["approver"].as_str(),
+                    value["thread_id"].as_str(),
+                ],
+            )?;
+            Ok(())
+        }
+
+        fn fork_evidence(
+            home: &Path,
+            path: &Path,
+            id: &str,
+            change: &str,
+        ) -> Result<(PathBuf, String)> {
+            let conn = store::open_store(&store_path(home))?;
+            let mut receipt = audit_source(&conn, id, "proposal_submitted")?;
+            let mut opening = audit_source(&conn, id, "proposal_window_opened")?;
+            let new_id = Uuid::new_v4().to_string();
+            let mut value: Value = serde_json::from_slice(&std::fs::read(path)?)?;
+            value["pending"]["id"] = json!(new_id);
+            value["classification"]["proposal_id"] = json!(new_id);
+            receipt["detail"]["classification"]["proposal_id"] = json!(new_id);
+            match change {
+                "valid" => {}
+                "receipt-missing" | "receipt-duplicate" | "opening-missing"
+                | "opening-duplicate" => {}
+                "receipt-detail" => receipt["detail"] = json!("malformed receipt"),
+                "receipt-hash" => receipt["hash"] = json!(vec![0_u8; 31]),
+                "receipt-identity" => {
+                    receipt["detail"]["identity_evidence"] = json!(vec![0_u8; 32])
+                }
+                "receipt-legacy-identity" => {
+                    receipt["detail"]
+                        .as_object_mut()
+                        .context("receipt detail")?
+                        .remove("identity_evidence");
+                }
+                "receipt-targets" => receipt["targets"] = json!(["HEARTBEAT.md"]),
+                "receipt-time" => receipt["submitted_at"] = json!("2000-01-01T00:00:00Z"),
+                "receipt-familiar" => receipt["familiar"] = json!("other"),
+                "receipt-channel" => receipt["channel"] = json!("reflection"),
+                "receipt-extra" => receipt["detail"]["unbound"] = json!(true),
+                "receipt-thread" => receipt["thread_id"] = json!(Uuid::new_v4()),
+                "receipt-decision" => receipt["decision"] = json!("staged:coherence"),
+                "receipt-decided-time" => receipt["decided_at"] = json!("2000-01-01T00:00:00Z"),
+                "receipt-approver" => receipt["approver"] = json!("principal:forged"),
+                "receipt-classification-id" => {
+                    receipt["detail"]["classification"]["proposal_id"] = json!(Uuid::new_v4())
+                }
+                "opening-hash" => opening["hash"] = json!(vec![0_u8; 32]),
+                "opening-familiar" => opening["familiar"] = json!("other"),
+                "opening-targets" => opening["targets"] = json!(["HEARTBEAT.md"]),
+                "opening-channel" => opening["channel"] = json!("reflection"),
+                "opening-time" => opening["submitted_at"] = json!("2000-01-01T00:00:00Z"),
+                "opening-before-stage" => opening["decided_at"] = json!("2000-01-01T00:00:00Z"),
+                "opening-deadline" => {
+                    let format = time::format_description::well_known::Rfc3339;
+                    let deadline = time::OffsetDateTime::parse(
+                        opening["detail"]["deadline"].as_str().context("deadline")?,
+                        &format,
+                    )?;
+                    opening["detail"]["deadline"] =
+                        json!((deadline + time::Duration::seconds(1)).format(&format)?);
+                }
+                "opening-earliest" => {
+                    opening["detail"]["earliest_close"] = json!("2000-01-01T00:00:00Z")
+                }
+                "opening-replay" => {
+                    opening["detail"]["evidence_replay_hash_hex"] = json!("00".repeat(32))
+                }
+                "opening-regions" => {
+                    opening["detail"]["affected_regions"] = json!(["heartbeat_behavior"])
+                }
+                "opening-label" => opening["detail"]["approval_path_label"] = json!("human_review"),
+                "opening-approver" => opening["approver"] = json!("principal:forged"),
+                "opening-decision" => opening["decision"] = json!("forged"),
+                "opening-thread" => opening["thread_id"] = json!(Uuid::new_v4()),
+                _ => anyhow::bail!("unknown evidence mutation {change}"),
+            }
+            let raw = serde_json::to_vec_pretty(&value)?;
+            let document = ProposalEnvelopeDocument::parse_preflighted(&raw)?;
+            let new_path = home.join("pending").join(document.pending().file_name());
+            crate::proposal_store::publish_new(home, &new_path, &raw)?;
+            crate::proposal_store::remove_existing(path)?;
+            // Each copied proposal gets its own append-only rows; original
+            // receipts and audit triggers are never changed for these controls.
+            for _ in 0..if change == "receipt-missing" {
+                0
+            } else if change == "receipt-duplicate" {
+                2
+            } else {
+                1
+            } {
+                append_audit_copy(&conn, &new_id, "proposal_submitted", &receipt)
+                    .with_context(|| format!("inserting {change} submission control"))?;
+            }
+            for _ in 0..if change == "opening-missing" {
+                0
+            } else if change == "opening-duplicate" {
+                2
+            } else {
+                1
+            } {
+                append_audit_copy(&conn, &new_id, "proposal_window_opened", &opening)
+                    .with_context(|| format!("inserting {change} opening control"))?;
+            }
+            Ok((new_path, new_id))
+        }
+
+        fn assert_no_terminal(home: &Path, id: &str) -> Result<()> {
+            let conn = store::open_store(&store_path(home))?;
+            assert!(proposal_terminal_event(&conn, id)?.is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn both_gates_quarantine_unbound_or_malformed_original_evidence() -> Result<()> {
+            for scheduler in [false, true] {
+                for change in [
+                    "receipt-missing",
+                    "receipt-duplicate",
+                    "opening-missing",
+                    "opening-duplicate",
+                    "receipt-detail",
+                    "receipt-hash",
+                    "receipt-identity",
+                    "receipt-legacy-identity",
+                    "receipt-targets",
+                    "receipt-time",
+                    "receipt-familiar",
+                    "receipt-channel",
+                    "receipt-extra",
+                    "receipt-thread",
+                    "receipt-decision",
+                    "receipt-decided-time",
+                    "receipt-approver",
+                    "receipt-classification-id",
+                    "opening-hash",
+                    "opening-familiar",
+                    "opening-targets",
+                    "opening-channel",
+                    "opening-time",
+                    "opening-before-stage",
+                    "opening-deadline",
+                    "opening-earliest",
+                    "opening-replay",
+                    "opening-regions",
+                    "opening-label",
+                    "opening-approver",
+                    "opening-decision",
+                    "opening-thread",
+                ] {
+                    let temp = tempfile::tempdir()?;
+                    let home = temp.path();
+                    let (path, id) = open_proposal(home)?;
+                    let (path, id) = fork_evidence(home, &path, &id, change)?;
+                    erase_window(&path)?;
+                    if scheduler {
+                        assert_eq!(process_due_threads_proposals(home)?, 0, "{change}");
+                    } else {
+                        let body = scheduled_decision_body(home, &id, None)?;
+                        let response = decide_threads_proposal(home, &id, "approve", Some(&body))?;
+                        assert_eq!(response.status, 409, "{change}: {}", response.body);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&response.body)?["quarantined"],
+                            true,
+                            "{change}: {}",
+                            response.body
+                        );
+                    }
+                    assert!(!path.exists(), "{change}");
+                    assert!(home.join("pending/quarantine").exists(), "{change}");
+                    assert_no_terminal(home, &id)?;
+                    assert_eq!(
+                        std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                        b"before tools\n"
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn forged_origin_cannot_be_replaced_by_expiry_or_rejection_proof() -> Result<()> {
+            for change in ["actor", "claim-time", "purpose"] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let now = time::OffsetDateTime::now_utc();
+                let (path, id) =
+                    crate::threads_clock::with_test_time(home, now, || open_proposal(home))?;
+                erase_window(&path)?;
+                set_proposal_decision_failpoint(Some((
+                    ProposalDecisionFailpoint::ClaimBeforeValidation,
+                    id.clone(),
+                )));
+                assert!(decide_threads_proposal_automatic(home, &id, "reject", None).is_err());
+                let mut document = read_pending_proposal_document(&path)?;
+                let request = document
+                    .decision_request
+                    .as_mut()
+                    .context("automatic request")?;
+                match change {
+                    "actor" => request.decision_actor = Some("principal:forged".to_string()),
+                    "claim-time" => request.claimed_at -= time::Duration::seconds(1),
+                    "purpose" => {
+                        let conn = store::open_store(&store_path(home))?;
+                        conn.execute("UPDATE coven_ward_audit_reservations SET purpose = 'forged' WHERE token = ?1", [format!("proposal:{id}:reject")])?;
+                    }
+                    _ => unreachable!(),
+                }
+                crate::proposal_store::replace_existing(
+                    &path,
+                    &document.serialize_with_decision(document.decision_request.as_ref(), None)?,
+                )?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    now + time::Duration::days(31),
+                    || -> Result<()> {
+                        assert_eq!(process_due_threads_proposals(home)?, 0, "{change}");
+                        Ok(())
+                    },
+                )?;
+                assert!(!path.exists());
+                assert!(home.join("pending/quarantine").exists());
+                assert_no_terminal(home, &id)?;
+            }
+            Ok(())
+        }
+
+        fn rejection_reservation(home: &Path, id: &str) -> Result<Option<(String, i64)>> {
+            use rusqlite::OptionalExtension;
+
+            let conn = store::open_store(&store_path(home))?;
+            conn.query_row(
+                "SELECT purpose, reserved_bytes FROM coven_ward_audit_reservations
+                 WHERE token = ?1",
+                [format!("proposal:{id}:reject")],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .context("reading rejection reservation")
+        }
+
+        fn forged_cleanup_request(home: &Path, change: &str) -> Result<(PathBuf, String)> {
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ClaimBeforeValidation,
+                id.clone(),
+            )));
+            assert!(decide_threads_proposal_automatic(home, &id, "reject", None).is_err());
+            let mut document = read_pending_proposal_document(&path)?;
+            let conn = store::open_store(&store_path(home))?;
+            assert_eq!(
+                trusted_decision_approver(
+                    &conn,
+                    &id,
+                    "reject",
+                    document.decision_request.as_ref(),
+                    false,
+                )?,
+                TrustedProposalDecisionOrigin::Automatic
+            );
+            let actual_revision = document.revision()?;
+            let request = document
+                .decision_request
+                .as_mut()
+                .context("automatic request")?;
+            request.decision_actor = Some("principal:forged".to_string());
+            if change.contains("wrong-revision") {
+                let wrong_revision = "0".repeat(64);
+                assert_ne!(wrong_revision, actual_revision);
+                request.expected_revision = Some(wrong_revision);
+            }
+            if change.contains("missing-revision") {
+                request.revision_required = true;
+                request.expected_revision = None;
+            }
+            if change.contains("replacement") {
+                request.replacement_proposal_id = Some(Uuid::new_v4());
+                request.replacement_proposal_revision = Some("0".repeat(64));
+            }
+            crate::proposal_store::replace_existing(
+                &path,
+                &document.serialize_with_decision(document.decision_request.as_ref(), None)?,
+            )?;
+            Ok((path, id))
+        }
+
+        fn assert_forged_cleanup_quarantines(days: i64, change: &str) -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let now = time::OffsetDateTime::now_utc();
+            let (path, id) = crate::threads_clock::with_test_time(home, now, || {
+                forged_cleanup_request(home, change)
+            })?;
+            let evidence = std::fs::read(&path)?;
+            let reservation = rejection_reservation(home, &id)?.context("bound reservation")?;
+            let conn = store::open_store(&store_path(home))?;
+            let submission = audit_source(&conn, &id, "proposal_submitted")?;
+            let opening = audit_source(&conn, &id, "proposal_window_opened")?;
+            drop(conn);
+            crate::threads_clock::with_test_time(
+                home,
+                now + time::Duration::days(days),
+                || -> Result<()> {
+                    let first = process_due_threads_proposals(home)?;
+                    let first_reservation = rejection_reservation(home, &id)?;
+                    let first_quarantined = home.join("pending/quarantine").is_dir();
+                    let second = process_due_threads_proposals(home)?;
+                    assert_eq!(
+                        (first, second),
+                        (0, 0),
+                        "{change}, day {days}: cleanup must not launder the request on pass two"
+                    );
+                    assert!(
+                        first_quarantined,
+                        "{change}, day {days}: first pass must quarantine"
+                    );
+                    assert_eq!(first_reservation.as_ref(), Some(&reservation));
+                    assert_eq!(
+                        rejection_reservation(home, &id)?.as_ref(),
+                        Some(&reservation)
+                    );
+                    Ok(())
+                },
+            )?;
+            assert!(!path.exists());
+            assert!(find_any_pending_decision_claim(home, &id).is_none());
+            let quarantine = std::fs::read_dir(home.join("pending/quarantine"))?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            assert_eq!(quarantine.len(), 1);
+            assert!(quarantine[0]
+                .file_name()
+                .to_string_lossy()
+                .contains("decision-origin"));
+            assert_eq!(std::fs::read(quarantine[0].path())?, evidence);
+            assert_no_terminal(home, &id)?;
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                b"before tools\n"
+            );
+            let conn = store::open_store(&store_path(home))?;
+            assert!(load_proposal_apply_intent(&conn, &id)?.is_none());
+            assert_eq!(audit_source(&conn, &id, "proposal_submitted")?, submission);
+            assert_eq!(audit_source(&conn, &id, "proposal_window_opened")?, opening);
+            Ok(())
+        }
+
+        #[test]
+        fn forged_origin_revision_cleanup_two_passes() -> Result<()> {
+            assert_forged_cleanup_quarantines(0, "wrong-revision")
+        }
+
+        #[test]
+        fn forged_origin_revision_cleanup_two_passes_past_retention() -> Result<()> {
+            assert_forged_cleanup_quarantines(31, "wrong-revision")
+        }
+
+        #[test]
+        fn forged_origin_missing_revision_and_replacement_cleanup() -> Result<()> {
+            for days in [0, 31] {
+                for change in [
+                    "missing-revision",
+                    "replacement",
+                    "wrong-revision-and-replacement",
+                    "missing-revision-and-replacement",
+                ] {
+                    assert_forged_cleanup_quarantines(days, change)?;
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn valid_origin_revision_cleanup_retains_normal_retry() -> Result<()> {
+            for days in [0, 31] {
+                for missing in [false, true] {
+                    let temp = tempfile::tempdir()?;
+                    let home = temp.path();
+                    let now = time::OffsetDateTime::now_utc();
+                    let (path, id) =
+                        crate::threads_clock::with_test_time(home, now, || open_proposal(home))?;
+                    let body = json!({
+                        "expectedRevision": (!missing).then(|| proposal_revision_from_pending(&path)).transpose()?,
+                        "replacementProposalId": Uuid::new_v4(),
+                        "replacementProposalRevision": "0".repeat(64),
+                    }).to_string();
+                    set_proposal_decision_failpoint(Some((
+                        ProposalDecisionFailpoint::ClaimBeforeValidation,
+                        id.clone(),
+                    )));
+                    assert!(decide_threads_proposal(home, &id, "reject", Some(&body)).is_err());
+                    erase_window(&path)?;
+                    crate::threads_clock::with_test_time(
+                        home,
+                        now + time::Duration::days(days),
+                        || -> Result<()> {
+                            let response =
+                                decide_threads_proposal_automatic(home, &id, "reject", None)?;
+                            assert_eq!(response.status, 409, "{}", response.body);
+                            assert_eq!(
+                                serde_json::from_str::<Value>(&response.body)?["why"],
+                                if missing {
+                                    "proposal-revision-required"
+                                } else {
+                                    "proposal-revision-mismatch"
+                                }
+                            );
+                            assert!(read_pending_proposal_document(&path)?
+                                .decision_request
+                                .is_none());
+                            assert!(rejection_reservation(home, &id)?.is_none());
+                            assert!(!home.join("pending/quarantine").exists());
+                            assert_no_terminal(home, &id)?;
+                            assert_eq!(process_due_threads_proposals(home)?, 1);
+                            assert_eq!(process_due_threads_proposals(home)?, 0);
+                            assert_closed(home, &id, None)
+                        },
+                    )?;
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn valid_origin_bad_replacement_preserves_its_bound_request() -> Result<()> {
+            for days in [0, 31] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let now = time::OffsetDateTime::now_utc();
+                let (path, id) =
+                    crate::threads_clock::with_test_time(home, now, || open_proposal(home))?;
+                erase_window(&path)?;
+                let body = json!({
+                    "replacementProposalId": Uuid::new_v4(),
+                    "replacementProposalRevision": "0".repeat(64),
+                })
+                .to_string();
+                set_proposal_decision_failpoint(Some((
+                    ProposalDecisionFailpoint::ClaimBeforeValidation,
+                    id.clone(),
+                )));
+                assert!(
+                    decide_threads_proposal_automatic(home, &id, "reject", Some(&body)).is_err()
+                );
+                let evidence = std::fs::read(&path)?;
+                let reservation = rejection_reservation(home, &id)?.context("bound reservation")?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    now + time::Duration::days(days),
+                    || -> Result<()> {
+                        let response =
+                            decide_threads_proposal_automatic(home, &id, "reject", None)?;
+                        assert_eq!(response.status, 409, "{}", response.body);
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&response.body)?["why"],
+                            "proposal-replacement-not-found"
+                        );
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        assert_eq!(process_due_threads_proposals(home)?, 0);
+                        Ok(())
+                    },
+                )?;
+                let claim =
+                    find_pending_decision_claim(home, &id, "reject").context("retained claim")?;
+                assert_eq!(std::fs::read(claim)?, evidence);
+                assert_eq!(
+                    rejection_reservation(home, &id)?.as_ref(),
+                    Some(&reservation)
+                );
+                assert!(!home.join("pending/quarantine").exists());
+                assert_no_terminal(home, &id)?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn copied_canonical_evidence_still_proves_only_rejection() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            let (path, id) = fork_evidence(home, &path, &id, "valid")?;
+            erase_window(&path)?;
+            assert_eq!(process_due_threads_proposals(home)?, 1);
+            assert_closed(home, &id, None)
+        }
+
+        #[test]
+        fn changed_thread_cannot_inherit_the_original_opened_window() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            let mut value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            value["pending"]["thread_id"] = json!(Uuid::new_v4());
+            crate::proposal_store::replace_existing(&path, &serde_json::to_vec_pretty(&value)?)?;
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(home.join("pending/quarantine").exists());
+            assert_no_terminal(home, &id)
+        }
+
+        #[test]
+        fn applying_sidecar_alone_is_not_rejection_authority() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            let document = read_pending_proposal_document(&path)?;
+            let state = ProposalApplyingState {
+                decision: "approve".to_string(),
+                recovery_commitment: vec![0; 32],
+                baseline_snapshot: None,
+                weave_hash: vec![0; 32],
+                before_images: Vec::new(),
+                rationale: None,
+                probe_summary: None,
+            };
+            crate::proposal_store::replace_existing(
+                &path,
+                &document.serialize_with_decision(None, Some(&state))?,
+            )?;
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(home.join("pending/quarantine").exists());
+            assert_no_terminal(home, &id)
+        }
+
+        #[test]
+        fn malformed_review_kind_cannot_bypass_decision_origin() -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            erase_window(&path)?;
+            set_proposal_decision_failpoint(Some((
+                ProposalDecisionFailpoint::ClaimBeforeValidation,
+                id.clone(),
+            )));
+            assert!(decide_threads_proposal_automatic(home, &id, "reject", None).is_err());
+            let mut value: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+            value["reviewKind"] = json!("automatic");
+            value["decisionRequest"]["decisionActor"] = json!("principal:forged");
+            crate::proposal_store::replace_existing(&path, &serde_json::to_vec_pretty(&value)?)?;
+            let response = decide_threads_proposal_automatic(home, &id, "reject", None)?;
+            assert_eq!(response.status, 409, "{}", response.body);
+            assert_eq!(
+                serde_json::from_str::<Value>(&response.body)?["quarantined"],
+                true
+            );
+            assert_no_terminal(home, &id)
+        }
+
+        #[test]
+        fn applied_effects_remain_preserved_even_if_the_sidecar_is_removed() -> Result<()> {
+            for orphan in [false, true] {
+                let temp = tempfile::tempdir()?;
+                let home = temp.path();
+                let now = time::OffsetDateTime::now_utc();
+                let (_, id) =
+                    crate::threads_clock::with_test_time(home, now, || open_proposal(home))?;
+                crate::threads_clock::with_test_time(
+                    home,
+                    now + time::Duration::hours(2),
+                    || -> Result<()> {
+                        set_proposal_decision_failpoint(Some((
+                            ProposalDecisionFailpoint::ApplyBeforeAudit,
+                            id.clone(),
+                        )));
+                        let body = scheduled_decision_body(home, &id, None)?;
+                        assert!(decide_threads_proposal(home, &id, "approve", Some(&body)).is_err());
+                        Ok(())
+                    },
+                )?;
+                let claim =
+                    find_pending_decision_claim(home, &id, "approve").context("applying claim")?;
+                assert_eq!(
+                    std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                    b"after tools\n"
+                );
+                erase_window(&claim)?;
+                if orphan {
+                    let document = read_pending_proposal_document(&claim)?;
+                    crate::proposal_store::replace_existing(
+                        &claim,
+                        &document
+                            .serialize_with_decision(document.decision_request.as_ref(), None)?,
+                    )?;
+                }
+                let evidence = std::fs::read(&claim)?;
+                assert_eq!(process_due_threads_proposals(home)?, 0);
+                assert!(!claim.exists());
+                let quarantined = std::fs::read_dir(home.join("pending/quarantine"))?
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                assert_eq!(quarantined.len(), 1);
+                assert_eq!(std::fs::read(quarantined[0].path())?, evidence);
+                assert_eq!(
+                    std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                    b"after tools\n"
+                );
+                let conn = store::open_store(&store_path(home))?;
+                assert!(load_proposal_apply_intent(&conn, &id)?.is_some());
+                assert_no_terminal(home, &id)?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn canonical_but_replaced_materialized_evidence_cannot_close_the_original_window(
+        ) -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let home = temp.path();
+            let (path, id) = open_proposal(home)?;
+            let document = read_pending_proposal_document(&path)?;
+            let scheduled = document.scheduled().context("scheduled proposal")?;
+            let mut pending = scheduled.pending().clone();
+            pending.edits[0].contents =
+                coven_threads_core::StagedContents::from_bytes(b"forged tools\n");
+            let diff = coven_threads_core::MaterializedDiff::try_new(vec![
+                coven_threads_core::SurfaceDiff {
+                    surface: pending.edits[0].surface.clone(),
+                    before: Some(b"before tools\n".to_vec()),
+                    after: Some(b"forged tools\n".to_vec()),
+                },
+            ])
+            .map_err(anyhow::Error::msg)?;
+            let evidence =
+                coven_threads_core::SurfaceRegionRegistry::default_registry().classify_all(&diff);
+            let mut classification = scheduled.classification().clone();
+            classification.approval_path = coven_threads_core::ApprovalPath::HumanApproval;
+            classification.evidence_replay_hash =
+                coven_threads_core::evidence_replay_hash(&diff, &evidence);
+            let forged = crate::proposal_scheduler::ScheduledProposal::try_new(
+                pending,
+                classification,
+                diff,
+            )?;
+            let mut value = serde_json::to_value(forged)?;
+            value["identityEvidence"] = json!(document.identity_evidence);
+            let raw = serde_json::to_vec_pretty(&value)?;
+            ProposalEnvelopeDocument::parse_preflighted(&raw)?;
+            crate::proposal_store::replace_existing(&path, &raw)?;
+            assert_eq!(process_due_threads_proposals(home)?, 0);
+            assert!(home.join("pending/quarantine").exists());
+            assert_no_terminal(home, &id)?;
+            assert_eq!(
+                std::fs::read(home.join("familiars/sage/TOOLS.md"))?,
+                b"before tools\n"
+            );
+            Ok(())
+        }
     }
 
     mod publication_reconcile {

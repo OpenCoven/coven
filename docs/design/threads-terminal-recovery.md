@@ -66,6 +66,17 @@ rejected, never normalized into approval. Once a terminal row is durable,
 repeated recovery consumes leftover pending state and reservations without
 appending another terminal row or applying edits again.
 
+For a current scheduled proposal relabelled as human-only, receipt divergence
+can admit **rejection only** when the canonical original authority, complete
+submission receipt, and exactly one matching opened-window record remain
+provable. The reconstructed classification is never executed or persisted.
+Decision-origin checks precede revision/replacement cleanup as well as
+terminalization, even past retention. Invalid-origin claims are quarantined with
+their bound reservations retained, not reset for a fresh automatic decision.
+Any applying sidecar or durable apply intent excludes this proof, including
+an intent whose sidecar was removed. Malformed or unbound receipts, openings,
+or legacy lane sidecars remain corruption rather than a trusted close context.
+
 ## Quarantine is not a close
 
 An interrupted apply with unverifiable or inconsistent committed intent is
