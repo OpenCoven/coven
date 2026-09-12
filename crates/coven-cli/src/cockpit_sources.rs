@@ -59,7 +59,7 @@ struct FamiliarsFile {
     familiar: Vec<FamiliarEntry>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub(crate) struct FamiliarEntry {
     pub(crate) id: String,
     pub(crate) name: Option<String>,
