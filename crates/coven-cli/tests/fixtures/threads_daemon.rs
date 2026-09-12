@@ -19,6 +19,17 @@ pub const PRINCIPAL_FINGERPRINT: &str = "fpr-e2e-synthetic";
 const LIFECYCLE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub fn run_journey(journey: impl FnOnce(&mut ThreadsFixture) -> Result<()>) -> Result<()> {
+    // These are authority journeys, not concurrent cold-start throughput tests.
+    // Keep native Windows process admission within its strict lifecycle budget,
+    // as in windows_daemon_lifecycle; transport-only tests remain concurrent.
+    #[cfg(windows)]
+    let _admission = {
+        static ADMISSION: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        ADMISSION
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
     let mut fixture = ThreadsFixture::start()?;
     let result = journey(&mut fixture);
     match (result, fixture.stop_daemon()) {
