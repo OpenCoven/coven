@@ -1700,6 +1700,7 @@ impl Ward {
             outcome.decisions,
             &expected_before,
             mode,
+            None,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1765,6 +1766,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            None,
         )?;
         Ok(ApplyReport { changes })
     }
@@ -1786,6 +1788,14 @@ impl Ward {
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
         let anchored_home = AnchoredHome::open(&self.home)
             .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
+        let ward_config = if mode == ApprovedApplyMode::Initial {
+            Some(
+                open_expected_ward_config(&anchored_home, &self.config)
+                    .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?,
+            )
+        } else {
+            None
+        };
         let proposal = Proposal {
             targets: edits.iter().map(|edit| edit.target.clone()).collect(),
             authorization: authorization.clone(),
@@ -1822,6 +1832,7 @@ impl Ward {
             outcome.decisions,
             expected_before,
             mode,
+            ward_config.as_ref(),
         )?;
         Ok(ApplyReport { changes })
     }
@@ -2046,6 +2057,25 @@ impl PartialEq<&Path> for AnchoredEntry {
     }
 }
 
+fn open_expected_ward_config(
+    home: &AnchoredHome,
+    expected: &WardConfig,
+) -> Result<ExpectedControlFile> {
+    let path = AnchoredEntry::new(
+        Arc::clone(&home.dir),
+        &home.absolute,
+        OsStr::new(WARD_CONFIG_FILE),
+    );
+    let observed = open_regular_file_without_following_links(&path)?
+        .context("Ward config disappeared before approved apply")?;
+    let raw = std::str::from_utf8(&observed.contents).context("Ward config is not UTF-8")?;
+    let current = WardConfig::from_toml_str(raw).context("Ward config became invalid")?;
+    if &current != expected {
+        bail!("Ward config changed before approved apply");
+    }
+    Ok(ExpectedControlFile { path, observed })
+}
+
 struct AnchoredParent {
     dir: Arc<Dir>,
     absolute: PathBuf,
@@ -2073,6 +2103,11 @@ impl ApprovedWritePaths {
 struct OpenRegularFile {
     file: std::fs::File,
     contents: Vec<u8>,
+}
+
+struct ExpectedControlFile {
+    path: AnchoredEntry,
+    observed: OpenRegularFile,
 }
 
 struct PreparedDirectWrite<'a> {
@@ -2672,6 +2707,7 @@ fn write_atomically_if_unchanged(
     decisions: Vec<Decision>,
     expected_before: &BTreeMap<String, Option<Vec<u8>>>,
     mode: ApprovedApplyMode,
+    expected_control: Option<&ExpectedControlFile>,
 ) -> Result<Vec<AppliedChange>> {
     validate_approved_edit_budget(edits, expected_before)
         .map_err(|error| approved_apply_error(error, ApprovedApplyFailure::NoWrite))?;
@@ -2920,6 +2956,17 @@ fn write_atomically_if_unchanged(
     })();
     if let Err(error) = final_verification {
         return fail_after_conditional_rollback(&prepared, &swapped, error);
+    }
+    if let Some(control) = expected_control {
+        if let Err(error) = verify_installed_regular_target(
+            &control.path,
+            &control.observed.contents,
+            &control.observed.file,
+            "Ward config disappeared during approved apply",
+            "Ward config changed during approved apply",
+        ) {
+            return fail_after_conditional_rollback(&prepared, &swapped, error);
+        }
     }
 
     let changes = approved_apply_changes(&prepared);
@@ -4628,7 +4675,11 @@ fn set_conditional_rollback_backup_replacement(
 }
 
 #[cfg(test)]
-fn set_conditional_atomic_replacement(trigger: PathBuf, target: PathBuf, replacement: Vec<u8>) {
+pub(crate) fn set_conditional_atomic_replacement(
+    trigger: PathBuf,
+    target: PathBuf,
+    replacement: Vec<u8>,
+) {
     conditional_atomic_replacement_hook()
         .lock()
         .expect("conditional atomic replacement hook lock poisoned")
@@ -8640,6 +8691,7 @@ tier = 1
             vec![decision],
             &BTreeMap::from([(edit.target.clone(), Some(b"before".to_vec()))]),
             ApprovedApplyMode::Initial,
+            None,
         );
 
         #[cfg(not(windows))]

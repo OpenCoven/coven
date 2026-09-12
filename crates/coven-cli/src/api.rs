@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use chrono::{Duration, SecondsFormat, Utc};
 use flate2::{write::GzEncoder, Compression};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -9920,6 +9921,7 @@ fn decide_threads_proposal_inner(
                 opened,
                 approval_path_label,
                 None,
+                None,
                 decision_now,
             )?;
             audit_reservation.finish()?;
@@ -10024,6 +10026,10 @@ fn decide_threads_proposal_inner(
     };
     let scheduled = document.scheduled();
     let pending = document.pending();
+    let decision_approver = durable_request
+        .as_ref()
+        .map_or(revision_required, |request| request.revision_required)
+        .then_some(&pending.writer);
     if decision == "approve" {
         if let Err(error) = ward::validate_staged_edit_budget(&pending.edits) {
             if let Some(limit) = ward::ward_edit_budget_failure(&error) {
@@ -10063,6 +10069,17 @@ fn decide_threads_proposal_inner(
         .map(|proposal| proposal.classification().approval_path.display_label())
         .unwrap_or("human_review");
     let mut opened_window = proposal_window_context(&conn, proposal_id)?;
+    if scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some())
+        && opened_window.is_none()
+    {
+        ensure_proposal_window_opened_audit_with_conn(
+            coven_home,
+            &conn,
+            scheduled.expect("guard established scheduled proposal"),
+            decision_now,
+        )?;
+        opened_window = proposal_window_context(&conn, proposal_id)?;
+    }
     let familiar_id = match human_familiar_id_for_weave(coven_home, pending.familiar_id) {
         Ok(Some(familiar_id)) => familiar_id,
         Ok(None) | Err(_) if applying_state.is_some() => {
@@ -10086,6 +10103,7 @@ fn decide_threads_proposal_inner(
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10134,6 +10152,7 @@ fn decide_threads_proposal_inner(
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10158,17 +10177,10 @@ fn decide_threads_proposal_inner(
         }
         Err(error) => return Err(error),
     };
-    if scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some()) {
-        if !proposal_window_opened(&conn, proposal_id)? {
-            ensure_proposal_window_opened_audit_with_conn(
-                coven_home,
-                &conn,
-                scheduled.expect("guard established scheduled proposal"),
-                decision_now,
-            )?;
-            opened_window = proposal_window_context(&conn, proposal_id)?;
-        }
-    } else if applying_state.is_some() && opened_window.is_some() {
+    if !scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some())
+        && applying_state.is_some()
+        && opened_window.is_some()
+    {
         return quarantine_proposal_recovery_claim(
             coven_home,
             &mut claim,
@@ -10178,28 +10190,31 @@ fn decide_threads_proposal_inner(
             "proposal-recovery-window-state-inconsistent",
             "applied recovery state conflicts with an opened veto window",
         );
-    } else if let Some(opened) = opened_window.as_ref() {
-        claim.preserve();
-        append_open_window_revalidation_failure(
-            &conn,
-            proposal_id,
-            pending,
-            opened,
-            approval_path_label,
-            note.as_deref(),
-            decision_now,
-        )?;
-        audit_reservation.finish()?;
-        claim.consume()?;
-        return json_response(
-            409,
-            &json!({
-                "blocked": true,
-                "why": "proposal-window-state-inconsistent",
-                "proposalId": proposal_id,
-                "terminal": true,
-            }),
-        );
+    } else if !scheduled.is_some_and(|proposal| proposal.veto_deadline().is_some()) {
+        if let Some(opened) = opened_window.as_ref() {
+            claim.preserve();
+            append_open_window_revalidation_failure(
+                &conn,
+                proposal_id,
+                pending,
+                opened,
+                approval_path_label,
+                decision_approver,
+                note.as_deref(),
+                decision_now,
+            )?;
+            audit_reservation.finish()?;
+            claim.consume()?;
+            return json_response(
+                409,
+                &json!({
+                    "blocked": true,
+                    "why": "proposal-window-state-inconsistent",
+                    "proposalId": proposal_id,
+                    "terminal": true,
+                }),
+            );
+        }
     }
     let authorization = authorization_from_writer(&pending.writer);
     let edits = match staged_edits_to_ward_edits(pending) {
@@ -10233,6 +10248,7 @@ fn decide_threads_proposal_inner(
                     .as_ref()
                     .expect("guard established opened window context"),
                 approval_path_label,
+                decision_approver,
                 note.as_deref(),
                 decision_now,
             )?;
@@ -10320,7 +10336,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: &weave_hash,
-                approver: Some(&pending.writer),
+                approver: decision_approver,
                 files_touched: &targets,
                 decision: "protected-target-not-proposable",
                 approval_rationale: note.as_deref(),
@@ -10549,7 +10565,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     familiar_id: &familiar_id,
                     weave_hash: &weave_hash,
-                    approver: Some(&pending.writer),
+                    approver: decision_approver,
                     files_touched: &targets,
                     decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
                     approval_rationale: note.as_deref(),
@@ -10567,7 +10583,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 &familiar_id,
                 &weave_hash,
-                &pending.writer,
+                decision_approver,
                 &targets,
                 pending.channel,
                 decision_now,
@@ -10626,7 +10642,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: &weave_hash,
-                approver: Some(&pending.writer),
+                approver: decision_approver,
                 files_touched: &targets,
                 decision: window_close
                     .as_ref()
@@ -10667,7 +10683,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -10746,7 +10762,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     familiar_id: &familiar_id,
                     weave_hash: &weave_hash,
-                    approver: Some(&pending.writer),
+                    approver: decision_approver,
                     files_touched: &targets,
                     decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
                     approval_rationale: note.as_deref(),
@@ -10789,7 +10805,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -10815,7 +10831,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 familiar_id: &familiar_id,
                 weave_hash: state.weave.weave_hash(),
-                approver: (!expired).then_some(&pending.writer),
+                approver: (!expired).then_some(decision_approver).flatten(),
                 files_touched: &targets,
                 decision: decision_semantics.rejection_decision,
                 approval_rationale: note.as_deref(),
@@ -10978,7 +10994,7 @@ fn decide_threads_proposal_inner(
                         proposal_id,
                         familiar_id: &familiar_id,
                         weave_hash: state.weave.weave_hash(),
-                        approver: Some(&pending.writer),
+                        approver: decision_approver,
                         files_touched: &targets,
                         decision: window_close
                             .as_ref()
@@ -11111,7 +11127,7 @@ fn decide_threads_proposal_inner(
                 proposal_id,
                 &familiar_id,
                 &applying.weave_hash,
-                &pending.writer,
+                decision_approver,
                 &targets,
                 pending.channel,
                 decision_now,
@@ -11139,7 +11155,7 @@ fn decide_threads_proposal_inner(
                 familiar_id: &familiar_id,
                 workspace: &workspace,
                 weave_hash: &applying.weave_hash,
-                approver: &pending.writer,
+                approver: decision_approver,
                 apply_report: &report,
                 gated_targets: &gated_targets,
                 approved_bytes: &approved_bytes,
@@ -11202,7 +11218,7 @@ fn decide_threads_proposal_inner(
                     proposal_id,
                     &familiar_id,
                     state.weave.weave_hash(),
-                    &pending.writer,
+                    decision_approver,
                     &targets,
                     pending.channel,
                     decision_now,
@@ -11388,7 +11404,7 @@ fn decide_threads_proposal_inner(
             proposal_id,
             &familiar_id,
             state.weave.weave_hash(),
-            &pending.writer,
+            decision_approver,
             &targets,
             pending.channel,
             decision_now,
@@ -11413,7 +11429,7 @@ fn decide_threads_proposal_inner(
             familiar_id: &familiar_id,
             workspace: &workspace,
             weave_hash: state.weave.weave_hash(),
-            approver: &pending.writer,
+            approver: decision_approver,
             apply_report: &report,
             gated_targets: &gated_targets,
             approved_bytes: &approved_bytes,
@@ -11737,13 +11753,27 @@ pub(crate) fn process_due_threads_proposals(coven_home: &Path) -> Result<usize> 
                 continue;
             }
         };
-        let (opened_window, retention_expired) = {
+        let (mut opened_window, retention_expired) = {
             let conn = store::open_store(&store_path(coven_home))?;
             (
                 proposal_window_opened(&conn, &document.pending().id.0.to_string())?,
                 proposal_retention_expired(coven_home, &conn, &document, now),
             )
         };
+        if document
+            .scheduled()
+            .is_some_and(|proposal| proposal.veto_deadline().is_some())
+            && !opened_window
+        {
+            ensure_proposal_window_opened_audit(
+                coven_home,
+                document
+                    .scheduled()
+                    .expect("guard established scheduled proposal"),
+                now,
+            )?;
+            opened_window = true;
+        }
         let mut revalidation_required = opened_window
             && document
                 .scheduled()
@@ -11995,27 +12025,46 @@ fn ensure_proposal_window_opened_audit_with_conn(
     if proposal_window_opened(conn, &pending.id.0.to_string())? {
         return Ok(());
     }
-    let Some(familiar_id) = human_familiar_id_for_weave(coven_home, pending.familiar_id)? else {
-        anyhow::bail!("scheduled proposal familiar is missing");
-    };
-    let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
-    let config =
-        ward::WardConfig::load(&workspace)?.context("scheduled proposal Ward is not configured")?;
     let targets: Vec<String> = pending
         .edits
         .iter()
         .map(|edit| edit.surface.as_str().to_string())
         .collect();
-    let state = crate::threads_gate::build_weave_state_for_writer_at(
-        conn,
-        &familiar_id,
-        &workspace,
-        &config,
-        &targets,
-        false,
-        now,
-        Some(&pending.writer),
-    )?;
+    let submitted_authority: Option<(String, Vec<u8>)> = conn
+        .query_row(
+            "SELECT familiar_id, ward_hash
+             FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_submitted'
+             ORDER BY rowid ASC
+             LIMIT 1",
+            [pending.id.0.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (familiar_id, weave_hash) = if let Some((familiar_id, weave_hash)) = submitted_authority {
+        anyhow::ensure!(
+            crate::threads_gate::familiar_weave_id(&familiar_id) == pending.familiar_id,
+            "scheduled proposal submission familiar does not match its pending envelope"
+        );
+        (familiar_id, weave_hash)
+    } else {
+        let familiar_id = human_familiar_id_for_weave(coven_home, pending.familiar_id)?
+            .context("scheduled proposal familiar is missing")?;
+        let workspace = crate::cockpit_sources::familiar_workspace(coven_home, &familiar_id);
+        let config = ward::WardConfig::load(&workspace)?
+            .context("scheduled proposal Ward is not configured")?;
+        let state = crate::threads_gate::build_weave_state_for_writer_at(
+            conn,
+            &familiar_id,
+            &workspace,
+            &config,
+            &targets,
+            false,
+            now,
+            Some(&pending.writer),
+        )?;
+        (familiar_id, state.weave.weave_hash().to_vec())
+    };
     let detail = coven_threads_core::ProposalWindowAuditDetail {
         approval_path_label: proposal
             .classification()
@@ -12056,9 +12105,9 @@ fn ensure_proposal_window_opened_audit_with_conn(
             coven_threads_core::AuditEventType::ProposalWindowOpened.tag(),
             pending.id.0.to_string(),
             familiar_id,
-            state.weave.weave_hash(),
+            weave_hash,
             "window-opened",
-            pending.writer.as_str(),
+            Option::<String>::None,
             detail,
             files_touched,
             format!("{:?}", pending.channel).to_lowercase(),
@@ -13045,6 +13094,7 @@ fn append_open_window_revalidation_failure(
     pending: &coven_threads_core::PendingProposal,
     opened: &ProposalWindowContext,
     approval_path_label: &str,
+    approver: Option<&coven_threads_core::WriterId>,
     rationale: Option<&str>,
     now: time::OffsetDateTime,
 ) -> Result<()> {
@@ -13065,7 +13115,7 @@ fn append_open_window_revalidation_failure(
             proposal_id,
             familiar_id: &opened.familiar_id,
             weave_hash: &opened.weave_hash,
-            approver: Some(&pending.writer),
+            approver,
             files_touched: &files_touched,
             decision: coven_threads_core::WindowCloseReason::RevalidationFailed.tag(),
             approval_rationale: rationale,
@@ -13216,7 +13266,7 @@ fn append_proposal_refusal_audit(
     proposal_id: &str,
     familiar_id: &str,
     weave_hash: &[u8],
-    approver: &coven_threads_core::WriterId,
+    approver: Option<&coven_threads_core::WriterId>,
     files_touched: &[String],
     channel: coven_threads_core::Channel,
     now: time::OffsetDateTime,
@@ -13228,7 +13278,7 @@ fn append_proposal_refusal_audit(
             proposal_id,
             familiar_id,
             weave_hash,
-            approver: Some(approver),
+            approver,
             files_touched,
             decision: "proposal-revalidation-failed",
             approval_rationale: None,
@@ -13259,7 +13309,7 @@ struct ApprovedProposalFinalization<'a> {
     familiar_id: &'a str,
     workspace: &'a Path,
     weave_hash: &'a [u8],
-    approver: &'a coven_threads_core::WriterId,
+    approver: Option<&'a coven_threads_core::WriterId>,
     apply_report: &'a ward::ApplyReport,
     gated_targets: &'a [String],
     approved_bytes: &'a BTreeMap<String, Vec<u8>>,
@@ -13308,7 +13358,7 @@ fn finalize_approved_proposal(
                 proposal_id: finalization.proposal_id,
                 familiar_id: finalization.familiar_id,
                 weave_hash: finalization.weave_hash,
-                approver: Some(finalization.approver),
+                approver: finalization.approver,
                 files_touched: finalization.files_touched,
                 decision: "approved",
                 approval_rationale: finalization.rationale,
@@ -34298,7 +34348,10 @@ tier = 0
             );
         std::fs::write(&ward_path, ward)?;
 
-        assert_eq!(process_due_threads_proposals(home)?, 1);
+        let completed = process_due_threads_proposals(home)?;
+        let recovery_log =
+            std::fs::read_to_string(home.join("daemon-recovery.log")).unwrap_or_default();
+        assert_eq!(completed, 1, "{recovery_log}");
         assert!(!pending.exists());
         assert_eq!(
             std::fs::read_to_string(home.join("familiars/sage/reviewed/skill.md"))?,
@@ -37448,6 +37501,13 @@ tier = 0
             std::fs::read_to_string(workspace.join("HEARTBEAT.md"))?,
             "after heartbeat\n"
         );
+        let approver: Option<String> = conn.query_row(
+            "SELECT approver FROM ward_audit
+             WHERE proposal_id = ?1 AND event_type = 'proposal_approved'",
+            [proposal_id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(approver, None, "automatic apply has no human approver");
         assert!(!pending_path.exists(), "replayed proposal must be consumed");
         Ok(())
     }
@@ -37528,6 +37588,121 @@ tier = 0
             coven_threads_core::WindowCloseReason::RevalidationFailed
         );
         assert_eq!(close.replay_hash_matched, Some(false));
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduled_rolls_back_when_approval_policy_changes_during_apply() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        retime_scheduled_proposal(
+            &pending,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        )?;
+        let decision_body = scheduled_decision_body(home, proposal_id, None)?;
+
+        let ward_path = workspace.join("ward.toml");
+        let ward = std::fs::read_to_string(&ward_path)?
+            .replace(
+                "[approval_tiers.familiar_review]",
+                "[approval_tiers.human_review]",
+            )
+            .replace(
+                "gate = \"familiar_coherence_check\"",
+                "gate = \"human_approval\"",
+            );
+        let strengthened = ward
+            .lines()
+            .filter(|line| {
+                !line.starts_with("human_veto_window_hours")
+                    && !line.starts_with("min_visible_seconds")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let canonical_workspace = workspace.canonicalize()?;
+        ward::set_conditional_atomic_replacement(
+            canonical_workspace.join("TOOLS.md"),
+            canonical_workspace.join("ward.toml"),
+            format!("{strengthened}\n").into_bytes(),
+        );
+
+        let response = handle_request_with_body(
+            "POST",
+            &format!("/api/v1/threads/proposals/{proposal_id}/approve"),
+            home,
+            None,
+            Some(&decision_body),
+        )?;
+
+        assert_eq!(response.status, 500, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        assert_eq!(body["error"]["code"], "ward_apply_failed");
+        assert_eq!(body["error"]["details"]["writeApplied"], false);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        assert!(pending.exists(), "rolled-back proposal remains retryable");
+        Ok(())
+    }
+
+    #[test]
+    fn threads_scheduler_closes_window_when_ward_breaks_before_first_pass() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path();
+        let workspace = seed_retired_ward_familiar(home, accepted_retired_ward())?;
+        migrate_retired_ward(home)?;
+        let response = post_edits(
+            home,
+            r#"{"edits":[{"target":"TOOLS.md","contents":"after tools\n"}]}"#,
+        )?;
+        assert_eq!(response.status, 202, "got {}", response.body);
+        let body: Value = serde_json::from_str(&response.body)?;
+        let proposal_id = body["proposalId"].as_str().context("proposal id")?;
+        let pending = PathBuf::from(
+            body["pendingPath"]
+                .as_str()
+                .context("pending proposal path")?,
+        );
+        retime_scheduled_proposal(
+            &pending,
+            time::OffsetDateTime::now_utc() - time::Duration::hours(2),
+        )?;
+        std::fs::write(workspace.join("ward.toml"), "invalid = [")?;
+
+        let completed = process_due_threads_proposals(home)?;
+        let recovery_log =
+            std::fs::read_to_string(home.join("daemon-recovery.log")).unwrap_or_default();
+        assert_eq!(completed, 1, "{recovery_log}");
+        assert!(!pending.exists(), "invalid live authority is terminal");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md"))?,
+            "before tools\n"
+        );
+        let conn = store::open_store(&home.join("coven.sqlite3"))?;
+        for event_type in ["proposal_window_opened", "proposal_rejected"] {
+            let count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM ward_audit
+                 WHERE proposal_id = ?1 AND event_type = ?2",
+                rusqlite::params![proposal_id, event_type],
+                |row| row.get(0),
+            )?;
+            assert_eq!(count, 1, "{event_type}");
+        }
         Ok(())
     }
 
